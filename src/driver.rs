@@ -41,106 +41,21 @@ pub(crate) fn parse_windbg_addr(tok: &str) -> Option<u64> {
     u64::from_str_radix(&cleaned, 16).ok()
 }
 
-/// The resolved target of a direct branch/call is the last parenthesized address
-/// WinDbg prints on the line ("... (fffff803`3e2547f0)"). Register/memory-indirect
-/// operands print no such address (or the *pointer's* address, which callers
-/// exclude via the `[` guard in [`parse_uf`]) and are not followed.
-fn branch_target(line: &str) -> Option<u64> {
-    let open = line.rfind('(')?;
-    let rest = &line[open..];
-    let close = rest.find(')')?;
-    parse_windbg_addr(&rest[..=close])
-}
-
-/// The control-flow behavior of one instruction, used to walk *within* a function.
-/// Only *direct*, resolvable targets are carried; memory-indirect (`call qword ptr
-/// [..]`) and register-indirect (`call rax`) operands become the `*Indirect` variants
-/// with no target, so a REACHABLE verdict never rests on a guessed edge.
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum Flow {
-    /// Falls through to the next instruction (the common case).
-    Fallthrough,
-    /// Direct `call`: schedules the target, then falls through.
-    Call(u64),
-    /// Indirect `call`: falls through (target unknown, not followed).
-    CallIndirect,
-    /// Unconditional direct `jmp`: control goes to the target only (no fall-through).
-    Jmp(u64),
-    /// Indirect `jmp` (function pointer / jump table): flow stops; target not followed.
-    JmpIndirect,
-    /// Conditional branch (je/jne/jz/jg/...): the target OR the next instruction.
-    Branch(u64),
-    /// `ret`/`iret`: flow stops.
-    Return,
-    /// A `noreturn` trap — `int 29h` (`__fastfail`/stack-cookie failure), `int 3`,
-    /// `ud2`, `hlt`: execution stops, so the walk must not fall through it.
-    Trap,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq)]
-struct Insn {
-    addr: u64,
-    flow: Flow,
-}
-
-/// One function's `uf` disassembly as an ordered instruction list.
-#[derive(Debug, Default, PartialEq)]
-struct UfBlock {
-    /// First instruction address (the function entry), if any lines parsed.
-    entry: Option<u64>,
-    /// Every instruction, in listing order, with its control-flow classification.
-    insns: Vec<Insn>,
-}
-
-/// Classifies one `uf` instruction line into a [`Flow`]. A memory-operand (`[..]`)
-/// line has no directly-resolvable target; otherwise the target is the parenthesized
-/// address WinDbg prints ([`branch_target`]).
-fn classify_flow(line: &str, mnem: &str) -> Flow {
-    let target = if line.contains('[') {
-        None
-    } else {
-        branch_target(line)
-    };
-    if mnem.starts_with("ret") || mnem.starts_with("iret") {
-        Flow::Return
-    } else if mnem == "jmp" {
-        target.map_or(Flow::JmpIndirect, Flow::Jmp)
-    } else if mnem.starts_with("call") {
-        target.map_or(Flow::CallIndirect, Flow::Call)
-    } else if mnem.starts_with('j') {
-        // A conditional branch; a jcc without a resolvable rel target just falls through.
-        target.map_or(Flow::Fallthrough, Flow::Branch)
-    } else if mnem == "ud2" || mnem == "hlt" || mnem == "int" || mnem == "int3" || mnem == "int1" {
-        // `noreturn` traps: `int 29h`/`int 3` (WinDbg emits mnemonic `int` + operand),
-        // a single `int3` token, `ud2`, `hlt`. Execution stops here.
-        Flow::Trap
-    } else {
-        Flow::Fallthrough
-    }
-}
-
-/// Parses `uf <fn>` output. Each instruction line is `<addr> <bytes> <mnem> <ops>`;
-/// label lines ("module!Foo:"), blanks, and jump-table data lines have no leading
-/// address token and are skipped.
-fn parse_uf(text: &str) -> UfBlock {
-    let mut b = UfBlock::default();
-    for line in text.lines() {
-        let mut toks = line.split_whitespace();
-        let Some(addr) = toks.next().and_then(parse_windbg_addr) else {
-            continue;
-        };
-        let _bytes = toks.next(); // raw opcode-bytes column
-        if b.entry.is_none() {
-            b.entry = Some(addr);
-        }
-        let flow = match toks.next() {
-            Some(mnem) => classify_flow(line, mnem),
-            None => Flow::Fallthrough, // address with no mnemonic — treat as a bare line
-        };
-        b.insns.push(Insn { addr, flow });
-    }
-    b
-}
+/// The control-flow classification a walk needs, and where it now comes from.
+///
+/// It used to be recovered here, from the `uf` line: a mnemonic table plus "the last
+/// parenthesised address on the line is the target". Both halves have been retired into
+/// [`dbgscope::dbgeng::Instruction`], which decodes the **encoding** instead — because the mnemonic
+/// table was never finished (a software interrupt's vector, `xbegin`, `xabort`, `hlt` each arrived
+/// as a separate defect) and because a symbol's own punctuation kept severing operands: a comma
+/// inside `std::map<int,int>`, a parenthesis inside `operator()`, a bracket inside `operator[]`,
+/// each one turning a direct call into an indirect one that this walk then dropped.
+///
+/// So the walk reads [`Instruction::flow`] and nothing textual. What is still read out of `uf` is
+/// the one thing it uniquely knows and the encoding cannot say: **which addresses belong to this
+/// function**, across the several unwind regions MSVC splits one into. That parse is now the
+/// address column alone.
+use dbgscope::dbgeng::{Flow, Instruction};
 
 /// Instructions reachable from `start` by walking *inside* one function — following
 /// fall-through, direct conditional branches, and direct `jmp`s that stay in the
@@ -157,45 +72,56 @@ struct FnWalk {
 
 /// Returns `None` if `start` is not an instruction boundary in `block` (the caller
 /// then falls back to the function entry).
-fn walk_function(block: &UfBlock, start: u64) -> Option<FnWalk> {
+fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
     let idx: HashMap<u64, usize> = block
-        .insns
         .iter()
         .enumerate()
-        .map(|(i, x)| (x.addr, i))
+        .map(|(i, x)| (x.address, i))
         .collect();
     let start_i = *idx.get(&start)?;
     let mut reachable: HashSet<u64> = HashSet::new();
     let mut external: Vec<(u64, u64, &'static str)> = Vec::new();
     let mut stack = vec![start_i];
     while let Some(i) = stack.pop() {
-        let insn = block.insns[i];
-        if !reachable.insert(insn.addr) {
+        let insn = &block[i];
+        if !reachable.insert(insn.address) {
             continue;
         }
-        let next = (i + 1 < block.insns.len()).then_some(i + 1);
-        match insn.flow {
-            Flow::Return | Flow::JmpIndirect | Flow::Trap => {}
-            Flow::Jmp(t) => match idx.get(&t) {
-                Some(&j) => stack.push(j),
-                None => external.push((insn.addr, t, "jmp")),
-            },
-            Flow::Branch(t) => {
+        let next = (i + 1 < block.len()).then_some(i + 1);
+        // A destination inside this function's listing is an edge within it; one outside is an
+        // edge leaving it. `None` is an indirect transfer and is never followed, which is what
+        // keeps a REACHABLE verdict from ever resting on a guessed edge.
+        let mut leave = |site: u64, to: Option<u64>, kind| {
+            if let Some(t) = to {
                 match idx.get(&t) {
                     Some(&j) => stack.push(j),
-                    None => external.push((insn.addr, t, "jmp")),
+                    None => external.push((site, t, kind)),
                 }
+            }
+        };
+        match insn.flow {
+            // `Unreadable` stops the walk for the same reason a `ret` does: there is no
+            // instruction here, so there is nothing after it either.
+            Flow::Return | Flow::Trap | Flow::Unreadable => {}
+            Flow::Jmp(t) => {
+                // An unconditional jump has no fall-through, so an *indirect* one ends the path.
+                leave(insn.address, t, "jmp");
+            }
+            Flow::Branch(t) => {
+                leave(insn.address, t, "jmp");
                 if let Some(n) = next {
                     stack.push(n);
                 }
             }
             Flow::Call(t) => {
-                external.push((insn.addr, t, "call"));
+                leave(insn.address, t, "call");
                 if let Some(n) = next {
                     stack.push(n);
                 }
             }
-            Flow::CallIndirect | Flow::Fallthrough => {
+            // `Unknown` falls through with the rest: an instruction set this build does not
+            // decode still has an instruction there, and stopping would drop the function's tail.
+            Flow::Fallthrough | Flow::Unknown => {
                 if let Some(n) = next {
                     stack.push(n);
                 }
@@ -206,6 +132,35 @@ fn walk_function(block: &UfBlock, start: u64) -> Option<FnWalk> {
         reachable,
         external,
     })
+}
+
+/// The addresses a `uf` listing names, grouped into the runs the engine can disassemble in one
+/// go: `(start, instruction count)`.
+///
+/// `uf` lists a function in flow order, in blocks separated by label lines, and consecutive
+/// listed addresses are usually **contiguous** even across a label — measured on
+/// `mountmgr!MountMgrDeviceControl`, where the whole 376-instruction routine is a handful of runs
+/// rather than 376 of them. A real gap is where one unwind region ends and the next begins; on
+/// that routine the largest is 319 bytes.
+///
+/// So a run breaks where the next address is not within one instruction's reach of the last, or
+/// goes backwards. Sixteen bytes is the longest an x86 instruction can be, which makes the test
+/// "could this plausibly be the next instruction" rather than a tuning knob.
+pub(crate) fn listing_runs(addresses: &[u64]) -> Vec<(u64, usize)> {
+    /// The longest an x86 instruction can be.
+    const REACH: u64 = 16;
+
+    let mut runs: Vec<(u64, usize)> = Vec::new();
+    let mut previous: Option<u64> = None;
+    for &address in addresses {
+        let continues = previous.is_some_and(|p| address > p && address - p <= REACH);
+        match runs.last_mut() {
+            Some((_, len)) if continues => *len += 1,
+            _ => runs.push((address, 1)),
+        }
+        previous = Some(address);
+    }
+    runs
 }
 
 /// The first address token in `lm m <module>` output is the module's live start
@@ -302,20 +257,12 @@ pub(crate) struct SegmentRecipe {
 /// Maps each instruction address to its mnemonic+operands text (address and raw-bytes
 /// columns dropped). Mirrors [`parse_uf`]'s tokenization so the recipe can read operands
 /// `parse_uf` discards.
-fn uf_text_map(text: &str) -> HashMap<u64, String> {
-    let mut m = HashMap::new();
-    for line in text.lines() {
-        let mut toks = line.split_whitespace();
-        let Some(addr) = toks.next().and_then(parse_windbg_addr) else {
-            continue;
-        };
-        let _bytes = toks.next(); // raw opcode-bytes column
-        let rest: Vec<&str> = toks.collect();
-        if !rest.is_empty() {
-            m.insert(addr, rest.join(" "));
-        }
-    }
-    m
+fn instruction_text(block: &[Instruction]) -> HashMap<u64, String> {
+    block
+        .iter()
+        .filter(|instruction| !instruction.text.is_empty())
+        .map(|instruction| (instruction.address, instruction.text.clone()))
+        .collect()
 }
 
 /// Instructions that set flags a following `jcc` reads.
@@ -408,43 +355,43 @@ fn branch_relation(jcc: &str, taken: bool) -> Option<&'static str> {
 /// `goal` is not reachable within the function. Follows the same edges as
 /// [`walk_function`]; a global visited-set bounds it and guarantees termination.
 fn find_path(
-    block: &UfBlock,
+    block: &[Instruction],
     idx: &HashMap<u64, usize>,
     start: u64,
     goal: u64,
 ) -> Option<Vec<(u64, bool)>> {
     fn dfs(
-        block: &UfBlock,
+        block: &[Instruction],
         idx: &HashMap<u64, usize>,
         i: usize,
         goal: u64,
         visited: &mut HashSet<usize>,
         acc: &mut Vec<(u64, bool)>,
     ) -> bool {
-        let insn = block.insns[i];
-        if insn.addr == goal {
+        let insn = &block[i];
+        if insn.address == goal {
             return true;
         }
         if !visited.insert(i) {
             return false;
         }
-        let next = (i + 1 < block.insns.len()).then_some(i + 1);
+        let next = (i + 1 < block.len()).then_some(i + 1);
         match insn.flow {
-            Flow::Return | Flow::JmpIndirect | Flow::Trap => false,
-            Flow::Jmp(t) => match idx.get(&t) {
+            Flow::Return | Flow::Trap | Flow::Unreadable => false,
+            Flow::Jmp(t) => match t.and_then(|t| idx.get(&t)) {
                 Some(&j) => dfs(block, idx, j, goal, visited, acc),
                 None => false,
             },
             Flow::Branch(t) => {
-                if let Some(&j) = idx.get(&t) {
-                    acc.push((insn.addr, true));
+                if let Some(&j) = t.and_then(|t| idx.get(&t)) {
+                    acc.push((insn.address, true));
                     if dfs(block, idx, j, goal, visited, acc) {
                         return true;
                     }
                     acc.pop();
                 }
                 if let Some(n) = next {
-                    acc.push((insn.addr, false));
+                    acc.push((insn.address, false));
                     if dfs(block, idx, n, goal, visited, acc) {
                         return true;
                     }
@@ -452,7 +399,7 @@ fn find_path(
                 }
                 false
             }
-            Flow::Call(_) | Flow::CallIndirect | Flow::Fallthrough => match next {
+            Flow::Call(_) | Flow::Fallthrough | Flow::Unknown => match next {
                 Some(n) => dfs(block, idx, n, goal, visited, acc),
                 None => false,
             },
@@ -467,7 +414,7 @@ fn find_path(
 /// Classifies one on-path branch decision into a [`BranchStep`]: the concrete direction the
 /// path took plus the decoded predicate feeding it.
 fn branch_step(
-    block: &UfBlock,
+    block: &[Instruction],
     idx: &HashMap<u64, usize>,
     textmap: &HashMap<u64, String>,
     site: u64,
@@ -498,14 +445,14 @@ fn branch_step(
 /// (`field relation value`); a `test`/`and` yields a bitwise mask test (`(field & value)
 /// relation 0`); other setters carry no relation (only the raw text is trustworthy).
 fn decode_predicate(
-    block: &UfBlock,
+    block: &[Instruction],
     textmap: &HashMap<u64, String>,
     bi: usize,
     jcc: &str,
     took_taken: bool,
 ) -> Option<Predicate> {
     for k in (bi.saturating_sub(6)..bi).rev() {
-        let Some(raw) = textmap.get(&block.insns[k].addr) else {
+        let Some(raw) = textmap.get(&block[k].address) else {
             continue;
         };
         let Some(mnem) = raw.split_whitespace().next() else {
@@ -541,7 +488,7 @@ pub(crate) fn path_recipe(
     from: &str,
     seed_start: Option<u64>,
     rpt: &Report,
-    mut uf: impl FnMut(&str) -> Option<String>,
+    mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
 ) -> Vec<SegmentRecipe> {
     let Some(from_entry) = rpt.from_entry else {
         return Vec::new();
@@ -567,22 +514,20 @@ pub(crate) fn path_recipe(
 
     let mut recipes = Vec::new();
     for (arg, want_start, goal, goal_is_exit) in segs {
-        let Some(text) = uf(&arg) else { continue };
-        let block = parse_uf(&text);
+        let Some(block) = uf(&arg) else { continue };
         let idx: HashMap<u64, usize> = block
-            .insns
             .iter()
             .enumerate()
-            .map(|(i, x)| (x.addr, i))
+            .map(|(i, x)| (x.address, i))
             .collect();
         // Fall back to the function entry if the requested start isn't a boundary
         // (mirrors `reachability`'s handling of an unaligned seed).
         let start = if idx.contains_key(&want_start) {
             want_start
         } else {
-            block.entry.unwrap_or(want_start)
+            block.first().map_or(want_start, |i| i.address)
         };
-        let textmap = uf_text_map(&text);
+        let textmap = instruction_text(&block);
         let mut steps: Vec<BranchStep> = find_path(&block, &idx, start, goal)
             .unwrap_or_default()
             .into_iter()
@@ -594,7 +539,7 @@ pub(crate) fn path_recipe(
         // gates nothing, so only `Flow::Branch` needs a step.)
         if goal_is_exit
             && let Some(&gi) = idx.get(&goal)
-            && matches!(block.insns[gi].flow, Flow::Branch(_))
+            && matches!(block[gi].flow, Flow::Branch(_))
         {
             let jcc = textmap
                 .get(&goal)
@@ -712,7 +657,7 @@ pub(crate) fn reachability(
     target: u64,
     max_functions: usize,
     max_depth: usize,
-    mut uf: impl FnMut(&str) -> Option<String>,
+    mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
 ) -> Report {
     let mut visited: HashSet<u64> = HashSet::new(); // walk start addresses already done
     let mut enqueued: HashSet<u64> = HashSet::new(); // target tokens scheduled
@@ -739,11 +684,10 @@ pub(crate) fn reachability(
             rpt.bound_hit = true;
             continue;
         }
-        let Some(text) = uf(&arg) else {
+        let Some(block) = uf(&arg) else {
             continue; // disassembly failed — prune this branch
         };
-        let block = parse_uf(&text);
-        let Some(entry) = block.entry else {
+        let Some(entry) = block.first().map(|i| i.address) else {
             continue;
         };
         // Enter discovered functions at their call/jmp target (`token`); enter the
@@ -869,38 +813,43 @@ pub(crate) fn format_report(r: &Report) -> String {
 mod tests {
     use super::*;
 
-    #[test]
-    fn parse_uf_classifies_flow_and_skips_indirect() {
-        // A function with a direct call, a conditional branch, a memory-indirect call
-        // (which must classify as CallIndirect, not a resolved target), an unconditional
-        // jmp, and a ret.
-        let text = "\
-mydriver!Dispatch:
-fffff803`3e254750 4c8bdc          mov     r11,rsp
-fffff803`3e254758 e893000000      call    mydriver!Helper (fffff803`3e2547f0)
-fffff803`3e25475d 85c0            test    eax,eax
-fffff803`3e25475f 0f8541000000    jne     mydriver!Dispatch+0x56 (fffff803`3e2547a6)
-fffff803`3e254765 ff15aabbccdd    call    qword ptr [mydriver!Ptr (fffff803`3e260000)]
-fffff803`3e25476b e9c0000000      jmp     mydriver!Tail (fffff803`3e254830)
-fffff803`3e254770 c3              ret
-";
-        let b = parse_uf(text);
-        assert_eq!(b.entry, Some(0xfffff803_3e254750));
-        assert_eq!(b.insns.len(), 7); // 7 instruction lines; the label line is not one
-        let flows: Vec<Flow> = b.insns.iter().map(|i| i.flow).collect();
-        assert_eq!(
-            flows,
-            vec![
-                Flow::Fallthrough,                 // mov
-                Flow::Call(0xfffff803_3e2547f0),   // direct call
-                Flow::Fallthrough,                 // test
-                Flow::Branch(0xfffff803_3e2547a6), // jne
-                Flow::CallIndirect,                // call qword ptr [..]
-                Flow::Jmp(0xfffff803_3e254830),    // jmp
-                Flow::Return,                      // ret
-            ]
-        );
+    /// One instruction as the walk sees it: an address, the flow it carries, and the rendering
+    /// the recipe reads its predicate out of.
+    ///
+    /// The flow is **stated** rather than encoded in a fake mnemonic, which is the point of the
+    /// rework these fixtures came through: classifying control flow is no longer this module's
+    /// job, so a test of the walk should not have to spell an instruction convincingly enough to
+    /// be classified. It says what the instruction does and the walk is tested on that.
+    fn insn(address: u64, flow: Flow, text: &str) -> Instruction {
+        Instruction {
+            address,
+            bytes: String::new(),
+            text: text.to_string(),
+            mnemonic: text
+                .split_whitespace()
+                .next()
+                .unwrap_or_default()
+                .to_string(),
+            operands: Vec::new(),
+            flow,
+        }
     }
+
+    /// A function: an entry `nop` at `entry`, then the given instructions in listing order.
+    fn uf_fn(entry: u64, body: Vec<Instruction>) -> Vec<Instruction> {
+        std::iter::once(insn(entry, Flow::Fallthrough, "nop"))
+            .chain(body)
+            .collect()
+    }
+
+    /// A disassembler over a fixed set of functions, keyed the way the walk asks for them.
+    fn functions(entries: &[(&str, Vec<Instruction>)]) -> HashMap<String, Vec<Instruction>> {
+        entries
+            .iter()
+            .map(|(k, v)| ((*k).to_string(), v.clone()))
+            .collect()
+    }
+
     #[test]
     fn parse_lm_base_reads_module_start() {
         let text = "\
@@ -911,36 +860,130 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(parse_lm_base(text), Some(0xfffff803_3e250000));
         assert_eq!(parse_lm_base("Unable to enumerate modules\n"), None);
     }
-    /// Builds a `uf` block whose entry is `entry`, with the given follow-on lines
-    /// appended (each already a full `uf` instruction line).
-    fn uf_fn(label: &str, entry: u64, body: &[&str]) -> String {
-        let mut s = format!("{label}:\n{} 90              nop\n", fmt_addr(entry));
-        for l in body {
-            s.push_str(l);
-            s.push('\n');
+
+    /// The runs a real `uf` listing groups into, and where its gaps actually are.
+    ///
+    /// The addresses are lifted verbatim from `uf mountmgr!MountMgrDeviceControl` on a 26100
+    /// image, which is what makes this fixture worth more than a composed one: it shows that
+    /// consecutive listed addresses stay contiguous **across a block label** — `…4793` is a
+    /// two-byte `je` and `…4795` is the next line, under a new label — so a run is not a basic
+    /// block and grouping by label would multiply the engine calls for nothing. And it shows what
+    /// a real gap looks like: `…4d49` to `…4e88`, 319 bytes, where one unwind region ends.
+    #[test]
+    fn a_listing_groups_into_runs_at_its_real_gaps() {
+        // The routine's opening block, running through two label boundaries.
+        let contiguous: Vec<u64> = vec![
+            0xfffff805_5ec04750,
+            0xfffff805_5ec04755,
+            0xfffff805_5ec0475a,
+            0xfffff805_5ec0475b,
+            0xfffff805_5ec0475d,
+            0xfffff805_5ec0475f,
+            0xfffff805_5ec04761,
+            0xfffff805_5ec04763,
+            0xfffff805_5ec04767,
+            0xfffff805_5ec0476e,
+            // label: MountMgrDeviceControl+0x45
+            0xfffff805_5ec04795,
+        ];
+        assert_eq!(
+            listing_runs(&contiguous[..10]),
+            vec![(0xfffff805_5ec04750, 10)],
+            "one contiguous block should be one run"
+        );
+
+        // `…476e` to `…4795` is 39 bytes — a gap, and the label between them is not what makes
+        // it one. The pair either side of a label that *is* contiguous stays in one run.
+        assert_eq!(
+            listing_runs(&contiguous),
+            vec![(0xfffff805_5ec04750, 10), (0xfffff805_5ec04795, 1)]
+        );
+        assert_eq!(
+            listing_runs(&[0xfffff805_5ec04793, 0xfffff805_5ec04795]),
+            vec![(0xfffff805_5ec04793, 2)],
+            "a label between two contiguous addresses must not split the run"
+        );
+
+        // The routine's largest real gap: the end of one unwind region to the start of the next.
+        assert_eq!(
+            listing_runs(&[0xfffff805_5ec04d49, 0xfffff805_5ec04e88]),
+            vec![(0xfffff805_5ec04d49, 1), (0xfffff805_5ec04e88, 1)]
+        );
+
+        // A backwards step is a new run too — nothing guarantees a listing is monotonic.
+        assert_eq!(
+            listing_runs(&[0x2000, 0x2004, 0x1000]),
+            vec![(0x2000, 2), (0x1000, 1)]
+        );
+        assert!(listing_runs(&[]).is_empty());
+    }
+
+    /// Every flow variant, and what the walk does with it.
+    ///
+    /// This replaces the two tests that used to assert a mnemonic table's output. That
+    /// classification now happens in `dbgscope`, from the encoding, so what is left to pin here
+    /// is the half this module still owns: which edges a walk takes given a flow. The two
+    /// variants worth the most are the new ones — `Unknown` continues, because an instruction set
+    /// this build cannot decode still has an instruction there, and `Unreadable` stops, because
+    /// it does not.
+    #[test]
+    fn the_walk_takes_the_edges_the_flow_carries() {
+        let one = |flow: Flow| {
+            let block = uf_fn(
+                0x1000,
+                vec![insn(0x1004, flow, "x"), insn(0x1008, Flow::Return, "ret")],
+            );
+            let walk = walk_function(&block, 0x1000).expect("entry is an instruction");
+            (
+                walk.reachable.contains(&0x1008),
+                walk.external.iter().map(|e| (e.1, e.2)).collect::<Vec<_>>(),
+            )
+        };
+
+        // Continues past the instruction, and leaves no edge.
+        for flow in [Flow::Fallthrough, Flow::Unknown, Flow::Call(None)] {
+            let (continues, external) = one(flow);
+            assert!(
+                continues,
+                "{flow:?} should continue to the next instruction"
+            );
+            assert!(external.is_empty(), "{flow:?} left an edge: {external:?}");
         }
-        s
+
+        // Stops, and leaves no edge.
+        for flow in [Flow::Return, Flow::Trap, Flow::Unreadable, Flow::Jmp(None)] {
+            let (continues, external) = one(flow);
+            assert!(!continues, "{flow:?} should stop the walk");
+            assert!(external.is_empty(), "{flow:?} left an edge: {external:?}");
+        }
+
+        // Leaves an edge. A call also continues; an unconditional jump does not.
+        assert_eq!(
+            one(Flow::Call(Some(0x2000))),
+            (true, vec![(0x2000, "call")])
+        );
+        assert_eq!(one(Flow::Jmp(Some(0x2000))), (false, vec![(0x2000, "jmp")]));
+        assert_eq!(
+            one(Flow::Branch(Some(0x2000))),
+            (true, vec![(0x2000, "jmp")])
+        );
     }
 
     #[test]
     fn reachability_direct_call_chain() {
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
-            uf_fn(
-                "A",
-                0x1000,
-                &[&format!(
-                    "{} e8xx call A!B ({})",
-                    fmt_addr(0x1004),
-                    fmt_addr(0x2000)
-                )],
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![insn(0x1004, Flow::Call(Some(0x2000)), "call A!B")],
+                ),
             ),
-        );
-        m.insert(
-            "0x2000".to_string(),
-            uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2008))]),
-        );
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2008, Flow::Return, "ret")]),
+            ),
+        ]);
         let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
         assert!(r.verdict_reachable);
         assert_eq!(r.from_entry, Some(0x1000));
@@ -950,23 +993,19 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
     #[test]
     fn reachability_follows_tail_jmp() {
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
-            uf_fn(
-                "A",
-                0x1000,
-                &[&format!(
-                    "{} e9xx jmp A!B ({})",
-                    fmt_addr(0x1004),
-                    fmt_addr(0x2000)
-                )],
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![insn(0x1004, Flow::Jmp(Some(0x2000)), "jmp A!B")],
+                ),
             ),
-        );
-        m.insert(
-            "0x2000".to_string(),
-            uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2008))]),
-        );
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2008, Flow::Return, "ret")]),
+            ),
+        ]);
         let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
         assert!(r.verdict_reachable);
         assert_eq!(r.path, vec![(0x1004, "jmp", 0x2000)]);
@@ -974,11 +1013,10 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
     #[test]
     fn reachability_target_in_seed_is_zero_hops() {
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
-            uf_fn("A", 0x1000, &[&format!("{} c3 ret", fmt_addr(0x1004))]),
-        );
+        let m = functions(&[(
+            "start",
+            uf_fn(0x1000, vec![insn(0x1004, Flow::Return, "ret")]),
+        )]);
         let r = reachability("start", None, 0x1004, 256, 32, |a| m.get(a).cloned());
         assert!(r.verdict_reachable);
         assert_eq!(r.containing_fn, Some(0x1000));
@@ -987,19 +1025,13 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
     #[test]
     fn reachability_indirect_only_is_not_reached() {
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
+        let m = functions(&[(
+            "start",
             uf_fn(
-                "A",
                 0x1000,
-                &[&format!(
-                    "{} ff15aa call qword ptr [A!Ptr ({})]",
-                    fmt_addr(0x1004),
-                    fmt_addr(0x9000)
-                )],
+                vec![insn(0x1004, Flow::Call(None), "call qword ptr [A!Ptr]")],
             ),
-        );
+        )]);
         // The target sits behind the indirect call, which is never followed.
         let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
         assert!(!r.verdict_reachable);
@@ -1008,31 +1040,22 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
     #[test]
     fn reachability_cycle_terminates() {
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
-            uf_fn(
-                "A",
-                0x1000,
-                &[&format!(
-                    "{} e8xx call A!B ({})",
-                    fmt_addr(0x1004),
-                    fmt_addr(0x2000)
-                )],
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![insn(0x1004, Flow::Call(Some(0x2000)), "call A!B")],
+                ),
             ),
-        );
-        m.insert(
-            "0x2000".to_string(),
-            uf_fn(
-                "B",
-                0x2000,
-                &[&format!(
-                    "{} e8xx call B!A ({})",
-                    fmt_addr(0x2004),
-                    fmt_addr(0x1000)
-                )],
+            (
+                "0x2000",
+                uf_fn(
+                    0x2000,
+                    vec![insn(0x2004, Flow::Call(Some(0x1000)), "call B!A")],
+                ),
             ),
-        );
+        ]);
         // Target is absent — the A<->B cycle must not loop forever.
         let r = reachability("start", None, 0x7777, 256, 32, |a| m.get(a).cloned());
         assert!(!r.verdict_reachable);
@@ -1041,23 +1064,19 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
     #[test]
     fn reachability_respects_function_bound() {
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
-            uf_fn(
-                "A",
-                0x1000,
-                &[&format!(
-                    "{} e8xx call A!B ({})",
-                    fmt_addr(0x1004),
-                    fmt_addr(0x2000)
-                )],
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![insn(0x1004, Flow::Call(Some(0x2000)), "call A!B")],
+                ),
             ),
-        );
-        m.insert(
-            "0x2000".to_string(),
-            uf_fn("B", 0x2000, &[&format!("{} c3 ret", fmt_addr(0x2004))]),
-        );
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
+            ),
+        ]);
         // Bound to a single function: B (which contains the target) is never explored.
         let r = reachability("start", None, 0x2004, 1, 32, |a| m.get(a).cloned());
         assert!(!r.verdict_reachable);
@@ -1067,33 +1086,24 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
     #[test]
     fn reachability_scopes_from_mid_function_start() {
-        // A single dispatch function: the entry does an indirect jump-table `jmp`
-        // (which we don't follow), then two independent switch-case blocks. `uf` of
-        // any address returns the whole function, so a mid-function `from` must NOT
-        // treat the *other* case as reachable.
-        let dispatch = format!(
-            "Dispatch:\n\
-             {} 90 nop\n\
-             {} ff2500000000 jmp qword ptr [Dispatch!tbl ({})]\n\
-             {} 90 nop\n\
-             {} c3 ret\n\
-             {} 90 nop\n\
-             {} c3 ret\n",
-            fmt_addr(0x1000), // entry
-            fmt_addr(0x1004), // indirect jump-table switch
-            fmt_addr(0x9000), // (table pointer address, not a code target)
-            fmt_addr(0x1008), // case 1 block
-            fmt_addr(0x100c), // case 1 body (target A)
-            fmt_addr(0x1010), // case 2 block
-            fmt_addr(0x1014), // case 2 body (target B)
+        // A single dispatch function: the entry does an indirect jump-table `jmp` (which is not
+        // followed), then two independent switch-case blocks. Disassembling any address returns
+        // the whole function, so a mid-function `from` must NOT treat the *other* case as
+        // reachable.
+        let dispatch = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Jmp(None), "jmp qword ptr [Dispatch!tbl]"),
+                insn(0x1008, Flow::Fallthrough, "nop"), // case 1 block
+                insn(0x100c, Flow::Return, "ret"),      // case 1 body (target A)
+                insn(0x1010, Flow::Fallthrough, "nop"), // case 2 block
+                insn(0x1014, Flow::Return, "ret"),      // case 2 body (target B)
+            ],
         );
-        // `uf` of any address in the function returns the whole function. `&mut uf`
-        // implements FnMut, so the same disassembler can drive several walks.
         let mut uf = |a: &str| match a {
             "0x1008" | "0x1000" => Some(dispatch.clone()),
             _ => None,
         };
-
         // Starting inside case 1 (seed_start resolved to 0x1008), case 1's body IS reachable.
         assert!(reachability("0x1008", Some(0x1008), 0x100c, 256, 32, &mut uf).verdict_reachable);
         // ...but case 2's body is NOT reachable from case 1 (no intra-function path).
@@ -1103,38 +1113,21 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
     }
 
     #[test]
-    fn parse_uf_classifies_traps() {
-        // WinDbg emits `int 29h` / `int 3` as mnemonic `int` + operand; plus `ud2`/`hlt`.
-        let text = "\
-mydriver!Guard:
-fffff803`3e254750 cd29            int     29h
-fffff803`3e254752 0f0b            ud2
-fffff803`3e254754 f4              hlt
-fffff803`3e254755 cc              int     3
-";
-        let flows: Vec<Flow> = parse_uf(text).insns.iter().map(|i| i.flow).collect();
-        assert_eq!(flows, vec![Flow::Trap, Flow::Trap, Flow::Trap, Flow::Trap]);
-    }
-
-    #[test]
     fn reachability_stops_at_trap() {
-        // A function: entry, a call, then `int 29h` (fastfail, noreturn), then a block
-        // that is reachable ONLY by falling through the trap. It must not be reachable.
-        let func = format!(
-            "Guard:\n\
-             {} 90 nop\n\
-             {} cd29 int 29h\n\
-             {} 90 nop\n\
-             {} c3 ret\n",
-            fmt_addr(0x1000), // entry
-            fmt_addr(0x1004), // int 29h — execution stops here
-            fmt_addr(0x1006), // dead code, only reachable by falling through the trap
-            fmt_addr(0x1007),
+        // A function: entry, then a `noreturn` trap, then a block reachable ONLY by falling
+        // through it. It must not be reachable.
+        let guard = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Trap, "int 29h"),    // execution stops here
+                insn(0x1006, Flow::Fallthrough, "nop"), // dead code behind the trap
+                insn(0x1007, Flow::Return, "ret"),
+            ],
         );
-        let mut uf = |a: &str| (a == "0x1000").then(|| func.clone());
+        let mut uf = |a: &str| (a == "0x1000").then(|| guard.clone());
         // The entry (before the trap) is reachable...
         assert!(reachability("0x1000", Some(0x1000), 0x1000, 256, 32, &mut uf).verdict_reachable);
-        // ...but code after the trap is not (the walk stops at `int 29h`).
+        // ...but code after the trap is not (the walk stops at the trap).
         assert!(!reachability("0x1000", Some(0x1000), 0x1006, 256, 32, &mut uf).verdict_reachable);
     }
 
@@ -1142,28 +1135,22 @@ fffff803`3e254755 cc              int     3
 
     #[test]
     fn recipe_forced_direction_decodes_ioctl_predicate() {
-        // Handler: `cmp [rdx+18h],222003h; jne bail`. The target block is the jne
-        // fall-through, so the branch is forced to fall through, and the compare decodes
-        // to `IoControlCode == 0x222003` (displacement +0x18, the IO_STACK_LOCATION offset).
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "Handler".to_string(),
+        // Handler: `cmp [rdx+18h],222003h; jne bail`. The target block is the jne fall-through,
+        // so the branch is forced to fall through, and the compare decodes to
+        // `IoControlCode == 0x222003` (displacement +0x18, the IO_STACK_LOCATION offset).
+        let m = functions(&[(
+            "Handler",
             uf_fn(
-                "Handler",
                 0x1000,
-                &[
-                    &format!("{} 813a cmp dword ptr [rdx+18h],222003h", fmt_addr(0x1004)),
-                    &format!(
-                        "{} 7506 jne Handler+0x10 ({})",
-                        fmt_addr(0x1008),
-                        fmt_addr(0x1010)
-                    ),
-                    &format!("{} 90 nop", fmt_addr(0x100c)), // target: jne fall-through
-                    &format!("{} c3 ret", fmt_addr(0x100e)),
-                    &format!("{} c3 ret", fmt_addr(0x1010)), // bail: jne taken
+                vec![
+                    insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+18h],222003h"),
+                    insn(0x1008, Flow::Branch(Some(0x1010)), "jne Handler+0x10"),
+                    insn(0x100c, Flow::Fallthrough, "nop"), // target: jne fall-through
+                    insn(0x100e, Flow::Return, "ret"),
+                    insn(0x1010, Flow::Return, "ret"), // bail: jne taken
                 ],
             ),
-        );
+        )]);
         let rpt = reachability("Handler", Some(0x1000), 0x100c, 256, 32, |a| {
             m.get(a).cloned()
         });
@@ -1191,27 +1178,21 @@ fffff803`3e254755 cc              int     3
     #[test]
     fn recipe_reports_concrete_direction_even_when_other_side_reaches() {
         // Both successors of the `je` can reach the goal, but the recipe reports the concrete
-        // direction the path took (a sound sufficient condition) rather than "don't care" —
-        // an alternate successor usually reaches the goal only via its own conditions.
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "Merge".to_string(),
+        // direction the path took (a sound sufficient condition) rather than "don't care" — an
+        // alternate successor usually reaches the goal only via its own conditions.
+        let m = functions(&[(
+            "Merge",
             uf_fn(
-                "Merge",
                 0x1000,
-                &[
-                    &format!("{} 85c0 test eax,eax", fmt_addr(0x1004)),
-                    &format!(
-                        "{} 7404 je Merge+0x10 ({})",
-                        fmt_addr(0x1008),
-                        fmt_addr(0x1010)
-                    ),
-                    &format!("{} 90 nop", fmt_addr(0x100c)), // fall-through, then into 0x1010
-                    &format!("{} 90 nop", fmt_addr(0x1010)), // goal (also the je target)
-                    &format!("{} c3 ret", fmt_addr(0x1012)),
+                vec![
+                    insn(0x1004, Flow::Fallthrough, "test eax,eax"),
+                    insn(0x1008, Flow::Branch(Some(0x1010)), "je Merge+0x10"),
+                    insn(0x100c, Flow::Fallthrough, "nop"), // fall-through, then into 0x1010
+                    insn(0x1010, Flow::Fallthrough, "nop"), // goal (also the je target)
+                    insn(0x1012, Flow::Return, "ret"),
                 ],
             ),
-        );
+        )]);
         let rpt = reachability("Merge", Some(0x1000), 0x1010, 256, 32, |a| {
             m.get(a).cloned()
         });
@@ -1228,25 +1209,19 @@ fffff803`3e254755 cc              int     3
     fn recipe_bit_test_predicate_renders_as_mask() {
         // `test [rdx+10h],20h; jne target` means `(InputBufferLength & 0x20) != 0`, not the
         // `cmp`-style `!= 0x20` — the recipe must render the bitwise mask form.
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "Handler".to_string(),
+        let m = functions(&[(
+            "Handler",
             uf_fn(
-                "Handler",
                 0x1000,
-                &[
-                    &format!("{} f742 test dword ptr [rdx+10h],20h", fmt_addr(0x1004)),
-                    &format!(
-                        "{} 7504 jne Handler+0x10 ({})",
-                        fmt_addr(0x1008),
-                        fmt_addr(0x1010)
-                    ),
-                    &format!("{} c3 ret", fmt_addr(0x100c)),
-                    &format!("{} 90 nop", fmt_addr(0x1010)), // target: jne taken
-                    &format!("{} c3 ret", fmt_addr(0x1012)),
+                vec![
+                    insn(0x1004, Flow::Fallthrough, "test dword ptr [rdx+10h],20h"),
+                    insn(0x1008, Flow::Branch(Some(0x1010)), "jne Handler+0x10"),
+                    insn(0x100c, Flow::Return, "ret"),
+                    insn(0x1010, Flow::Fallthrough, "nop"), // target: jne taken
+                    insn(0x1012, Flow::Return, "ret"),
                 ],
             ),
-        );
+        )]);
         let rpt = reachability("Handler", Some(0x1000), 0x1010, 256, 32, |a| {
             m.get(a).cloned()
         });
@@ -1269,41 +1244,36 @@ fffff803`3e254755 cc              int     3
 
     #[test]
     fn recipe_spans_call_path_with_one_segment_per_function() {
-        // A (length gate) calls B (field gate) which contains the target. The recipe has
-        // one segment per function, each routing to the next hop's site / the target.
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
-            uf_fn(
-                "A",
-                0x1000,
-                &[
-                    &format!("{} 817a10 cmp dword ptr [rdx+10h],20h", fmt_addr(0x1004)),
-                    &format!("{} 7208 jb A+0x14 ({})", fmt_addr(0x1008), fmt_addr(0x1014)),
-                    &format!("{} e8xx call A!B ({})", fmt_addr(0x100c), fmt_addr(0x2000)),
-                    &format!("{} c3 ret", fmt_addr(0x1011)),
-                    &format!("{} c3 ret", fmt_addr(0x1014)), // bail: jb taken
-                ],
+        // A (length gate) calls B (field gate) which contains the target. The recipe has one
+        // segment per function, each routing to the next hop's site / the target.
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![
+                        insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+10h],20h"),
+                        insn(0x1008, Flow::Branch(Some(0x1014)), "jb A+0x14"),
+                        insn(0x100c, Flow::Call(Some(0x2000)), "call A!B"),
+                        insn(0x1011, Flow::Return, "ret"),
+                        insn(0x1014, Flow::Return, "ret"), // bail: jb taken
+                    ],
+                ),
             ),
-        );
-        m.insert(
-            "0x2000".to_string(),
-            uf_fn(
-                "B",
-                0x2000,
-                &[
-                    &format!("{} 803808 cmp byte ptr [rax+8h],1", fmt_addr(0x2004)),
-                    &format!(
-                        "{} 7506 jne B+0x10 ({})",
-                        fmt_addr(0x2008),
-                        fmt_addr(0x2010)
-                    ),
-                    &format!("{} 90 nop", fmt_addr(0x200c)), // target: jne fall-through
-                    &format!("{} c3 ret", fmt_addr(0x200e)),
-                    &format!("{} c3 ret", fmt_addr(0x2010)),
-                ],
+            (
+                "0x2000",
+                uf_fn(
+                    0x2000,
+                    vec![
+                        insn(0x2004, Flow::Fallthrough, "cmp byte ptr [rax+8h],1"),
+                        insn(0x2008, Flow::Branch(Some(0x2010)), "jne B+0x10"),
+                        insn(0x200c, Flow::Fallthrough, "nop"), // target: jne fall-through
+                        insn(0x200e, Flow::Return, "ret"),
+                        insn(0x2010, Flow::Return, "ret"),
+                    ],
+                ),
             ),
-        );
+        ]);
         let rpt = reachability("start", None, 0x200c, 256, 32, |a| m.get(a).cloned());
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x100c, "call", 0x2000)]);
@@ -1325,33 +1295,32 @@ fffff803`3e254755 cc              int     3
 
     #[test]
     fn recipe_captures_conditional_branch_that_exits_the_function() {
-        // A leaves to B via `jne B` — a conditional branch whose target is outside A's
-        // block. The hop site is the branch itself, so the recipe must record "take this
-        // branch" (taking it is what leaves A toward B), not stop short of it.
-        let mut m: HashMap<String, String> = HashMap::new();
-        m.insert(
-            "start".to_string(),
-            uf_fn(
-                "A",
-                0x1000,
-                &[
-                    &format!("{} 813a cmp dword ptr [rdx+18h],222003h", fmt_addr(0x1004)),
-                    &format!("{} 7506 jne B ({})", fmt_addr(0x1008), fmt_addr(0x2000)), // exits A
-                    &format!("{} c3 ret", fmt_addr(0x100c)),
-                ],
+        // A leaves to B via `jne B` — a conditional branch whose target is outside A's block.
+        // The hop site is the branch itself, so the recipe must record "take this branch"
+        // (taking it is what leaves A toward B), not stop short of it.
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![
+                        insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+18h],222003h"),
+                        insn(0x1008, Flow::Branch(Some(0x2000)), "jne B"), // exits A
+                        insn(0x100c, Flow::Return, "ret"),
+                    ],
+                ),
             ),
-        );
-        m.insert(
-            "0x2000".to_string(),
-            uf_fn(
-                "B",
-                0x2000,
-                &[
-                    &format!("{} 90 nop", fmt_addr(0x2004)), // target
-                    &format!("{} c3 ret", fmt_addr(0x2006)),
-                ],
+            (
+                "0x2000",
+                uf_fn(
+                    0x2000,
+                    vec![
+                        insn(0x2004, Flow::Fallthrough, "nop"), // target
+                        insn(0x2006, Flow::Return, "ret"),
+                    ],
+                ),
             ),
-        );
+        ]);
         let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned());
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x1008, "jmp", 0x2000)]);
