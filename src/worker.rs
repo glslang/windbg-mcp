@@ -6251,6 +6251,10 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // decodes to `Flow::Unknown`, and the walk stops at those, so the answer would be a NOT
     // REACHABLE that says nothing: not "the graph was explored and it is not there" but "nothing
     // could be read". An honest refusal beats a verdict shaped like an answer.
+    //
+    // Lifting it is issue #297, and what it waits on is dbgscope: decoding ARM64 instructions
+    // into `Flow` (dbgscope#148) and its unwind record into an extent (dbgscope#146). One says
+    // where control goes and the other where a function ends; the walk itself needs no change.
     let set = e.instruction_set();
     if !set.operands_are_read() {
         // Named as the machine type an operator would recognise, not as a `Debug` rendering: the
