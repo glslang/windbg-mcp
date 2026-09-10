@@ -5,7 +5,8 @@ about one boot of one machine, and the same function is somewhere else after a r
 host, or in the disassembler you have the image open in. This is what to use instead, and a worked
 example of the join it makes possible.
 
-The tools that emit it are `crash_triage`, `backtrace` and `disassemble`. None of them knows that a
+The tools that emit it are `crash_triage`, `backtrace`, `disassemble` and
+`reachable_from_dispatch`. None of them knows that a
 disassembler exists, and that is the design: the coordinate is a form anything can join against,
 not an integration with something in particular.
 
@@ -13,15 +14,23 @@ not an integration with something in particular.
 
 **`(module, image identity, RVA)`** — never a bare virtual address.
 
-- **`module` + `rva`** come back on every frame and every instruction. The RVA is the offset from
-  the image's load base, computed from what the engine reports, and it survives the reboot the
-  address does not.
+- **`module` + `rva`** come back on every frame, every instruction and every address of a
+  reachability answer. The RVA is the offset from the image's load base, computed from what the
+  engine reports, and it survives the reboot the address does not.
 - **The image identity** is the PE `TimeDateStamp` + `SizeOfImage` pair, on every `modules` row as
   `timestamp` and `size`. It is what a symbol server is keyed by, which is not a coincidence: it is
   the industry's existing answer to "is this the same binary".
 
 Both halves are needed. The RVA says *where*; the identity says *in which build*, and a
 decompilation of the wrong build is a silent wrong answer rather than an error.
+
+**The identity is carried once per image, not once per address**, and a tool that names many
+addresses says so in its own field: `reachable_from_dispatch` returns an `images[]` beside its
+locations, each entry the `module` name a location holds plus that image's `image_name` and
+`identity`. The reason is arithmetic rather than taste — an identity is 150-odd bytes of GUID,
+timestamp and size, and a call path with its branch recipe names the same two or three images
+across dozens of addresses. `modules` is the other place to read one, for any address whose tool
+does not carry it.
 
 **Neither half is promised.** `module` and `rva` travel together and are absent when the engine
 places the address in no loaded module — a freed pool page, an unloaded driver, a corrupted return

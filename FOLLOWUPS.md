@@ -1,9 +1,9 @@
 # Follow-ups
 
-Deferred work, in sixteen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in fifteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
-the MCP `2026-07-28` extensions (tasks, apps), item 13 from the bounded-command coverage review (#46,
-2026-08-02), item 15 from the private worker channel (#65 / #72, 2026-08-04), item 19 from
+the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
+2026-08-04), item 19 from
 `walk_memory` (#103, 2026-08-13), item 27 from completing the coordinate work (#156–#158,
 2026-08-18), item 32 from running the debugger tier on the ARM64 runner image that replaces
 `windows-11-arm` in September 2026, items 33 and 39 from driving the server with a **local model** —
@@ -26,8 +26,9 @@ reach on three different clocks (2026-08-31) — and item 58 from
 [#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
 call that names a target's machine turns out to name the *processor's* (2026-09-05).
 Each item notes its repo, why it was deferred, and where it picks up. See
-[`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and the
-2026-08-02 entries that item 13 extends.
+[`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
+2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
+[`DONE.md`](./DONE.md).
 
 **Items that have landed are in [`DONE.md`](./DONE.md), under the numbers they were filed with**,
 which is why the numbering here is sparse — its index is the list of them, and is the one list, so
@@ -199,27 +200,6 @@ iframe host.
   text — they are the ones whose structure is a graph or a tree rather than a record, which is the
   same reason they were the candidates for Apps. The plumbing they would need now exists
   (`src/structured.rs`, `proto::Output`), so the remaining work is their shapes, not the seam.
-
-## 13. [windbg-mcp] A job-level deadline for `reachable_from_dispatch`
-
-`reachable_from_dispatch` runs its whole breadth-first walk — up to `max_functions` × one `uf`
-command each — inside a *single* engine job. Both `max_functions` (default 256) and `max_depth`
-(default 32) come from the caller and are uncapped, so a large enough pair pins that session's
-engine for as long as the walk takes. That is the same wedge the bounded path fixed, arriving by a
-different route — smaller now that it costs one session rather than the server, but still a session
-that answers nothing until the walk ends.
-
-- **Why the bounded path doesn't reach it:** the bounded path bounds *one* command string. Here no
-  individual `uf` is the problem — the aggregate is.
-- **Where it picks up:** the walk already drives every disassembly through one `&mut uf` closure
-  (`src/server.rs`), which is the natural place to check a deadline and stop with a partial,
-  honestly-labelled verdict — "NOT REACHABLE within the budget" is already the tool's contract for
-  an exhausted bound, so a time bound reports as a bound rather than as a new failure mode.
-  A cap on `max_functions` is the cheaper half-measure; it bounds the walk in nodes, not seconds.
-- **Why deferred:** the defaults are safe (a 256-function walk against a loaded dump is seconds),
-  so this is reachable only by a caller asking for it. Recorded by the coverage review in
-  DECISIONS.md (2026-08-02) rather than fixed there, because it needs a different mechanism than
-  the review's subject.
 
 ## 15. [windbg-mcp] Make handle inheritance a property of the spawn, not of the process
 
@@ -793,7 +773,7 @@ its op is its own; this one is not, for the reason below.
   symbol load blocks the one thread the session has, so no poll between calls can run, and the
   job-level deadline held only once each command carried it too. That `uf` is
   `execute_command_bounded` on the remainder of the caller's clock now, and the same deadline is in
-  scope for these three `resolve` calls whenever somebody threads a budget through the helper.
+  scope for those two `resolve` calls whenever somebody threads a budget through the helper.
 - **What would close it:** a `patience_ms` on `EngineOp::Disassemble`, and `resolve` taking a
   budget and running `execute_command_bounded`. Done together, `resolve` leaves the allowlist in
   `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for`, which is where
@@ -865,11 +845,3 @@ searches that thread's stack. Found by Codex on
 
 **Where it picks up.** `worker::exception_triage` in `src/worker.rs`, `fault::render`'s `STACK`
 line, and dbgscope's `src/dbgeng.rs` beside `current_thread_system_id`.
-
-## 60. [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge
-
-Preserve `reachable_from_dispatch` text while exposing typed paths and branch recipes.
-Attribute coordinate-bearing addresses to modules on the worker's engine thread and carry
-PE matching metadata plus RVA. This is separate from the bridge's guarded breakpoint,
-run-to, memory, and current-location contracts. Runtime coverage, if imported later, must
-mean observed execution only; an unobserved location is not proof of unreachability.
