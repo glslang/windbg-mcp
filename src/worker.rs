@@ -6403,6 +6403,14 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // that becomes "could not disassemble `from`" against a symbol that was fine, and on the
         // last queued function it becomes a clean NOT REACHABLE claiming the graph was fully
         // explored. The reason goes in a cell the walk's own `halt` closure reads.
+        // **The typed decodes below carry no bound of their own, and dbgscope has none to give
+        // them.** `disassemble` renders each line, so it resolves symbols, so a module with
+        // deferred ones can send it to a symbol server mid-loop — and a poll between calls cannot
+        // run while one is inside the engine. The `uf` above is bounded because a *command* can
+        // be; a typed call needs `disassemble_bounded`, which is
+        // [dbgscope#149](https://github.com/glslang/dbgscope/issues/149) and the sibling of #95's
+        // question about `read_memory`. Until then the bound here is the number of calls rather
+        // than the time they take, which is the honest description of it.
         let mut decoded: HashMap<u64, Instruction> = HashMap::new();
         for (start, count) in listing_runs(&listing) {
             if let Some(why) = expired(e) {

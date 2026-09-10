@@ -31,7 +31,10 @@
   short the same way is labelled `INCOMPLETE`, because a prefix of a recipe is not a weaker
   version of one — satisfying it does not put control on the target. Each disassembly the walk
   runs carries that remaining time as its own bound, so one blocked on a deferred symbol load
-  aborts rather than outliving the call that asked for it and pinning the session behind it.
+  aborts rather than outliving the call that asked for it and pinning the session behind it. The
+  typed instruction decodes underneath it are bounded by their *number* rather than by their time,
+  because the debugger bindings have no bounded form of that call yet
+  ([dbgscope#149](https://github.com/glslang/dbgscope/issues/149)).
 - A `NOT REACHABLE` also says when part of the graph it explored **could not be seen**. An
   instruction whose bytes will not read, or whose encoding this build does not decode, stops the
   walk where it is; the report counts those, withholds the claim that the reachable call graph was
