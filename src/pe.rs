@@ -355,6 +355,7 @@ pub fn read_imports(
         }
         let pointer = image.bitness.pointer();
 
+        let mut library_terminated = false;
         for slot_index in 0..MAX_IMPORTS_PER_LIBRARY {
             if halt() {
                 return Err(PeError::Interrupted);
@@ -367,6 +368,7 @@ pub fn read_imports(
                 Bitness::Bits64 => u64_at(&entry, 0)?,
             };
             if value == 0 {
+                library_terminated = true;
                 break;
             }
             let ordinal_flag = match image.bitness {
@@ -383,6 +385,15 @@ pub fn read_imports(
                 library: library.clone(),
                 name,
                 slot,
+            });
+        }
+        // Running out of entries is not the same as reaching the end of them. Stopping here and
+        // returning `Ok` drops every later import of this library in silence, which is how a
+        // hazard scan comes to report that a dangerous API is absent when it is merely past the
+        // cut — the same defect as the directory bound above, one level down.
+        if !library_terminated {
+            return Err(PeError::Malformed {
+                reason: "a library imports more functions than an image plausibly does",
             });
         }
     }
@@ -407,7 +418,14 @@ fn read_c_string(
     at: &mut impl FnMut(u32, usize) -> Result<Vec<u8>, PeError>,
 ) -> Result<String, PeError> {
     let raw = at(rva, MAX_NAME)?;
-    let end = raw.iter().position(|&byte| byte == 0).unwrap_or(raw.len());
+    // No terminator inside the bound means this is not a name that fits the bound — and taking
+    // the buffer as one turns a hazardous import into a *different*, unmatched string, which a
+    // sink list then fails to recognise. The truncation would be invisible in the result.
+    let Some(end) = raw.iter().position(|&byte| byte == 0) else {
+        return Err(PeError::Malformed {
+            reason: "an import or library name runs past the length a name may have",
+        });
+    };
     Ok(String::from_utf8_lossy(&raw[..end]).into_owned())
 }
 
@@ -687,6 +705,46 @@ mod tests {
                 Err(PeError::Malformed { .. })
             ),
             "a directory with no terminator inside its size must not read as complete"
+        );
+    }
+
+    /// A per-library list that runs out of entries, and a name that runs out of bytes, are both
+    /// refused rather than shortened.
+    ///
+    /// Same rule as the directory bound, one level down, and the same consequence for a hazard
+    /// scan: an import list cut at its cap omits every later function in silence, and a name taken
+    /// without its terminator becomes a *different* string that a sink list will not match. Either
+    /// way the answer is "that API is not imported" and the truncation leaves no trace.
+    #[test]
+    fn a_list_or_a_name_that_overruns_its_bound_is_refused() {
+        // A lookup table with no zero terminator inside the per-library cap. Filled with a valid
+        // ordinal entry so every entry decodes and only the missing terminator is at issue.
+        let mut endless = driver_image();
+        let ordinal = 0x8000_0000_0000_0007u64.to_le_bytes();
+        for slot in 0..(MAX_IMPORTS_PER_LIBRARY + 1) {
+            put(&mut endless.bytes, 0x2040 + slot * 8, &ordinal);
+        }
+        let image = read_image(BASE, |at, len| endless.read(at, len)).unwrap();
+        assert!(
+            matches!(
+                read_imports(&image, |at, len| endless.read(at, len), || false),
+                Err(PeError::Malformed { .. })
+            ),
+            "an import list that fills its cap must not read as a complete one"
+        );
+
+        // A name with no NUL for the whole bounded read.
+        let mut endless_name = driver_image();
+        for offset in 0..(MAX_NAME + 8) {
+            put(&mut endless_name.bytes, 0x2112 + offset, b"A");
+        }
+        let image = read_image(BASE, |at, len| endless_name.read(at, len)).unwrap();
+        assert!(
+            matches!(
+                read_imports(&image, |at, len| endless_name.read(at, len), || false),
+                Err(PeError::Malformed { .. })
+            ),
+            "a name with no terminator must not be accepted truncated"
         );
     }
 
