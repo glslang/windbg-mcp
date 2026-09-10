@@ -29,7 +29,17 @@
   stopped it: a walk that ran out of time did *not* explore the graph it was bounded to, so it
   says so rather than reporting that the reachable call graph was fully explored. A recipe cut
   short the same way is labelled `INCOMPLETE`, because a prefix of a recipe is not a weaker
-  version of one — satisfying it does not put control on the target.
+  version of one — satisfying it does not put control on the target. Each disassembly the walk
+  runs carries that remaining time as its own bound, so one blocked on a deferred symbol load
+  aborts rather than outliving the call that asked for it and pinning the session behind it.
+- A `NOT REACHABLE` also says when part of the graph it explored **could not be seen**. An
+  instruction whose bytes will not read, or whose encoding this build does not decode, stops the
+  walk where it is; the report counts those, withholds the claim that the reachable call graph was
+  fully explored, and names the remedy. On a kernel minidump that is the ordinary case rather than
+  a corner of one: a minidump carries no driver code pages at all until an executable image path is
+  set and the module reloaded. Such an instruction is a **barrier** and is never stepped over —
+  skipping it would join the instruction before it to whatever follows and invent an edge, which is
+  the one thing a sound `REACHABLE` verdict must never rest on.
 - The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`) walk the allocator's own
   descriptors through dbgscope rather than shelling out to `!pool`/`!poolused`, so all four read
   one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.

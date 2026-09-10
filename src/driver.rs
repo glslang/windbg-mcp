@@ -73,6 +73,11 @@ struct FnWalk {
     /// Edges leaving the function, gathered only from reachable instructions:
     /// (site, target, "call"/"jmp").
     external: Vec<(u64, u64, &'static str)>,
+    /// How many reachable instructions the walk stopped at **blind** — no instruction could be
+    /// read there, or its encoding was not decoded. A `ret` is an end; these are places the walk
+    /// could not see past, and they are the difference between a graph that was explored and one
+    /// that merely ran out.
+    blind: usize,
 }
 
 /// Returns `None` if `start` is not an instruction boundary in `block` (the caller
@@ -86,6 +91,7 @@ fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
     let start_i = *idx.get(&start)?;
     let mut reachable: HashSet<u64> = HashSet::new();
     let mut external: Vec<(u64, u64, &'static str)> = Vec::new();
+    let mut blind = 0usize;
     let mut stack = vec![start_i];
     while let Some(i) = stack.pop() {
         let insn = &block[i];
@@ -117,7 +123,12 @@ fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
             // bounds, so an unknown edge has to cost the second and never the first. (A target
             // whose set is not decoded is refused outright before the walk starts; this is the
             // guard for the odd undecodable encoding on a set that otherwise is.)
-            Flow::Return | Flow::Trap | Flow::Unreadable | Flow::Unknown => {}
+            Flow::Return | Flow::Trap => {}
+            // Counted, not merely obeyed. Both of these end a path for want of information rather
+            // than because control ends there, so a NOT REACHABLE resting on one is a verdict
+            // about what could not be read. The count is what stops the report claiming the
+            // reachable call graph was fully explored when part of it was never visible.
+            Flow::Unreadable | Flow::Unknown => blind += 1,
             Flow::Jmp(t) => {
                 // An unconditional jump has no fall-through, so an *indirect* one ends the path.
                 leave(insn.address, t, "jmp");
@@ -144,7 +155,40 @@ fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
     Some(FnWalk {
         reachable,
         external,
+        blind,
     })
+}
+
+/// The decoded instructions in the **listing's** order, with a barrier wherever one is missing.
+///
+/// Two facts about the walk meet here. It reads an instruction's fall-through as the next
+/// *element* of the block rather than as the next address, because a function split across unwind
+/// regions is contiguous in the listing and not in memory. And a listed address can fail to
+/// decode — an unmapped page, a dump that captured no code there — however it was asked for.
+///
+/// So an address that did not decode may not simply be left out: dropping it joins its
+/// predecessor to whatever came after the hole, across a `ret` or a branch, and a target beyond
+/// the hole is then REACHABLE through an edge that exists nowhere but in this vector. The barrier
+/// is [`Flow::Unreadable`], which says there is no instruction here — the walk stops, every real
+/// edge before it survives, and [`Report::blind`] counts it so the verdict does not read as a
+/// graph that was fully explored.
+pub(crate) fn in_listing_order(
+    listing: &[u64],
+    decoded: &mut HashMap<u64, Instruction>,
+) -> Vec<Instruction> {
+    listing
+        .iter()
+        .map(|&address| {
+            decoded.remove(&address).unwrap_or(Instruction {
+                address,
+                bytes: String::new(),
+                text: String::new(),
+                mnemonic: String::new(),
+                operands: Vec::new(),
+                flow: Flow::Unreadable,
+            })
+        })
+        .collect()
 }
 
 /// The addresses a `uf` listing names, grouped into the runs the engine can disassemble in one
@@ -697,6 +741,11 @@ pub(crate) struct Report {
     /// [`Self::bound_hit`] because the remedies are: a bound is raised on the next call, a
     /// deadline means the *call* ran out of patience, and an interrupt means somebody asked.
     pub(crate) halted: Option<Halt>,
+    /// How many reachable instructions the walk could not see past: bytes that would not read,
+    /// or an encoding this build does not decode. A third way for a NOT REACHABLE to be
+    /// incomplete, and the one with a remedy neither of the others has — a dump missing its code
+    /// pages needs an image search path, not a larger bound or a longer clock.
+    blind: usize,
 }
 
 /// Walks the call/branch graph from `from`, running `uf(arg)` for each discovered
@@ -738,6 +787,7 @@ pub(crate) fn reachability(
         max_functions,
         max_depth,
         halted: None,
+        blind: 0,
     };
 
     while let Some((arg, token, depth)) = queue.pop_front() {
@@ -778,6 +828,7 @@ pub(crate) fn reachability(
         }
         rpt.funcs_explored += 1;
         rpt.max_depth_seen = rpt.max_depth_seen.max(depth);
+        rpt.blind += walk.blind;
 
         if walk.reachable.contains(&target) {
             rpt.verdict_reachable = true;
@@ -875,10 +926,28 @@ pub(crate) fn format_report(r: &Report) -> String {
                 "  Bound hit: {}\n",
                 if r.bound_hit {
                     "yes — raise max_functions/max_depth and retry"
+                } else if r.blind > 0 {
+                    // The claim of a full exploration is withheld rather than qualified below,
+                    // because it is the sentence a reader stops at.
+                    "no"
                 } else {
                     "no — the reachable call graph was fully explored"
                 }
             )),
+        }
+        // The third way a NOT REACHABLE can be incomplete, beside a bound and a halt, and the one
+        // whose remedy is neither a larger number nor a longer clock. A walk that stopped at bytes
+        // it could not read explored a graph with holes in it — and on a kernel minidump, which
+        // carries no driver code pages at all until an image search path is set, that is the
+        // normal case rather than a corner of one.
+        if r.blind > 0 {
+            out.push_str(&format!(
+                "  Not fully visible: the walk stopped at {} reachable instruction(s) whose bytes \
+                 could\n           not be read, or whose encoding this build does not decode. On a \
+                 dump that is\n           usually missing code pages, set an executable image path \
+                 and `.reload /f`.\n",
+                r.blind
+            ));
         }
     }
     out.push_str(&format!(
@@ -1268,6 +1337,117 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "a halt inside the last segment's decode must reach the rendering"
         );
         assert!(format_recipe(&recipes, stopped).contains("INCOMPLETE"));
+    }
+
+    /// A listed address that would not decode becomes a barrier, because dropping it makes up an
+    /// edge that exists nowhere in the target.
+    ///
+    /// The walk reads a fall-through as the *next element* of the block, which it must, since a
+    /// function split across unwind regions is contiguous in the listing and not in memory. That
+    /// makes a hole in the vector a splice: the instruction before it is joined to whatever came
+    /// after, across a `ret` here, and a target on the far side is reported REACHABLE through an
+    /// edge nothing in the target provides. Both halves are asserted, the spliced block included,
+    /// because the wrong answer is the thing worth pinning — a barrier that stopped working would
+    /// otherwise show up only as a verdict nobody could check.
+    #[test]
+    fn an_address_that_would_not_decode_is_a_barrier_rather_than_a_hole() {
+        let listing = [0x1000u64, 0x1004, 0x1008];
+        // The `ret` at 0x1004 is the one that would not decode: an unmapped page, or a dump that
+        // captured no code there. The engine answered for its neighbours and not for it.
+        let mut decoded: HashMap<u64, Instruction> = [
+            (0x1000, insn(0x1000, Flow::Fallthrough, "nop")),
+            (0x1008, insn(0x1008, Flow::Return, "ret")),
+        ]
+        .into_iter()
+        .collect();
+
+        let block = in_listing_order(&listing, &mut decoded);
+        assert_eq!(block.len(), 3, "the listing keeps its length: {block:?}");
+        assert_eq!(block[1].address, 0x1004);
+        assert_eq!(block[1].flow, Flow::Unreadable);
+
+        let walk = walk_function(&block, 0x1000).expect("the entry is an instruction");
+        assert!(
+            !walk.reachable.contains(&0x1008),
+            "the walk must stop at the hole, not step over it: {walk:?}",
+            walk = walk.reachable
+        );
+        assert_eq!(walk.blind, 1, "and must count that it stopped blind");
+
+        // What dropping it would have said. Same two decoded instructions, no barrier between
+        // them — and the walk now falls straight through to an address it has no edge to.
+        let spliced = vec![
+            insn(0x1000, Flow::Fallthrough, "nop"),
+            insn(0x1008, Flow::Return, "ret"),
+        ];
+        let joined = walk_function(&spliced, 0x1000).expect("the entry is an instruction");
+        assert!(
+            joined.reachable.contains(&0x1008),
+            "the spliced block is what the barrier exists to prevent"
+        );
+    }
+
+    /// A walk that stopped at bytes it could not read must not report a clean sweep.
+    ///
+    /// This is the halt rule one step along, for a fact about the *target* rather than about this
+    /// server's patience — and with a remedy neither of the other two has. A kernel minidump
+    /// carries no driver code pages at all until an executable image path is set, so a NOT
+    /// REACHABLE from one is routinely a verdict about what could not be read; rendered as "the
+    /// reachable call graph was fully explored" it reads as proof the code is not there.
+    #[test]
+    fn a_walk_that_could_not_read_the_code_does_not_claim_a_full_sweep() {
+        let blind = functions(&[(
+            "start",
+            vec![
+                insn(0x1000, Flow::Fallthrough, "nop"),
+                insn(0x1004, Flow::Unreadable, ""),
+                insn(0x1008, Flow::Return, "ret"),
+            ],
+        )]);
+        let rpt = reachability(
+            "start",
+            None,
+            0x1008,
+            256,
+            32,
+            |a| blind.get(a).cloned(),
+            never,
+        );
+        assert!(!rpt.verdict_reachable);
+        assert_eq!(rpt.halted, None, "nothing stopped this walk; it went blind");
+        let text = format_report(&rpt);
+        assert!(
+            !text.contains("fully explored"),
+            "a graph with holes in it was not fully explored: {text}"
+        );
+        assert!(text.contains("Not fully visible"), "{text}");
+        assert!(
+            text.contains("image path"),
+            "the remedy is the point of saying it: {text}"
+        );
+
+        // The same shape with every instruction readable still gets the plain sweep, so the
+        // sentence above is about the holes rather than about every NOT REACHABLE.
+        let clear = functions(&[(
+            "start",
+            vec![
+                insn(0x1000, Flow::Fallthrough, "nop"),
+                insn(0x1004, Flow::Return, "ret"),
+                insn(0x1008, Flow::Return, "ret"),
+            ],
+        )]);
+        let seen = reachability(
+            "start",
+            None,
+            0x1008,
+            256,
+            32,
+            |a| clear.get(a).cloned(),
+            never,
+        );
+        let text = format_report(&seen);
+        assert!(text.contains("fully explored"), "{text}");
+        assert!(!text.contains("Not fully visible"), "{text}");
     }
 
     /// The runs a real `uf` listing groups into, and where its gaps actually are.
