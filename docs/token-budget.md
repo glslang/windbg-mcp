@@ -7,8 +7,9 @@ answer this server returns. That makes payload size a correctness-adjacent prope
 call that spends 13k tokens has not failed, but it has taken the space the investigation needed.
 Nothing measured this until [`tests/mcp_smoke.rs`](../tests/mcp_smoke.rs) grew the two tests below,
 and the numbers turned out to be larger than anyone had guessed — a careful reading of the source
-put the tool surface at 90–130 KB, and the wire was 391 KB. It is 177 KB now, and finding 1 below
-is where the other 217 KB went.
+put the tool surface at 90–130 KB, and the wire was 391 KB. Finding 1 below is where 217 KB of that
+went, taking it to 177 KB — figures from that measurement, not from today's surface, which has
+gained tools and output schemas since and stood at 221,179 B on 2026-09-10.
 
 ## Two costs, and they are not the same
 
@@ -441,12 +442,19 @@ and an insertion would still shift them.
 
 The **ceilings** (`MODEL_VISIBLE_CEILING`, `WIRE_CEILING`, `WORST_TOOL_CEILING` in
 `tests/mcp_smoke.rs`) stop what the golden cannot: a golden re-recorded on every diff is a rubber
-stamp, and thirty accepted 2% growths are a doubling nobody voted for. They sit ~15% over today's
-figures. Raising one is a normal thing to do — a new tool has to fit somewhere — but do it in its
-own commit, with the reason, and update the tables here. **Lowering one is the same act**, and
-`WIRE_CEILING` has now been both: 412,000 → 460,000 for `PdbInfo`, then → 205,000 when finding 1
-landed. A ceiling left where a fix found it is a ceiling that would have absorbed the next
-regression in silence.
+stamp, and thirty accepted 2% growths are a doubling nobody voted for. Raising one is a normal thing
+to do — a new tool has to fit somewhere — but do it in its own commit, with the reason, and update
+the tables here. **Lowering one is the same act**, and `WIRE_CEILING` has been both: 412,000 →
+460,000 for `PdbInfo`, then → 205,000 when finding 1 landed, and 225,000 today. A ceiling left where
+a fix found it is a ceiling that would have absorbed the next regression in silence.
+
+**How much room is left is a measurement, not a policy**, and it is not the "~15% over" this
+paragraph used to claim for all three. Measured 2026-09-10, after `reachable_from_dispatch` grew an
+`outputSchema`: the wire is 221,179 B against 225,000 (**1.7%**), the model-visible surface 84,506
+against 88,000 (4.1%), and the worst single tool 10,021 against 11,200 (11.8%). The wire is the one
+to watch, and it is deliberately not being raised ahead of the tools that will need it — a ceiling
+raised for work not yet done is the silence this whole section is against. The next tool to add an
+output schema raises it, with its own arithmetic.
 
 Result budgets are **not** goldened. Their sizes move with what the runner can resolve: a symbol
 server that answers turns `deferred` into paths and grows `lm` a column, and the debugger tier runs
