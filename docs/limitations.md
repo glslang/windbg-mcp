@@ -14,7 +14,8 @@
   for no other — so on an ARM64 target, which this server otherwise supports, every instruction's
   flow is unknown and any verdict would be about what could not be read rather than about the
   target. The refusal names the machine type. Analysis that needs no control flow is unaffected
-  there: `modules`, `read_memory`, `backtrace` and `disassemble` all work.
+  there: `modules`, `read_memory`, `backtrace` and `disassemble` all work. Lifting this is
+  [#297](https://github.com/glslang/windbg-mcp/issues/297).
 - `reachable_from_dispatch` is a **static** call-graph walk: it follows direct calls and
   cross-function tail jumps but **not** indirect calls through function pointers or unresolved
   compiler jump tables, and it stops at any instruction whose flow it could not decode. So a
