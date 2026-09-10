@@ -159,6 +159,22 @@ impl std::fmt::Display for ImportName {
     }
 }
 
+/// What an image's import table yielded, and what it could not.
+///
+/// The second field exists because an empty answer and an unanswerable one must not look alike.
+/// A descriptor whose `OriginalFirstThunk` is zero — a **bound** import — has real slots and no
+/// lookup table, so its names live only in the import address table, which this deliberately does
+/// not read. Reporting nothing for it would tell a hazard scan that the driver imports fewer
+/// functions than it does, and "imports no dangerous API" is exactly the answer that must never
+/// be produced by silence.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ImportTable {
+    pub imports: Vec<Import>,
+    /// Libraries whose imports could not be named, and why they could not: bound imports, whose
+    /// names are only in the table this cannot read.
+    pub unnamed_libraries: Vec<String>,
+}
+
 /// One imported function, and the address of the slot a call goes through.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Import {
@@ -292,10 +308,10 @@ pub fn read_imports(
     image: &Image,
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
     mut halt: impl FnMut() -> bool,
-) -> Result<Vec<Import>, PeError> {
+) -> Result<ImportTable, PeError> {
     let (directory, size) = image.import_directory;
     if directory == 0 || size == 0 {
-        return Ok(Vec::new());
+        return Ok(ImportTable::default());
     }
     let mut at = |rva: u32, len: usize| -> Result<Vec<u8>, PeError> {
         let address = image.va(rva);
@@ -303,7 +319,7 @@ pub fn read_imports(
     };
 
     let descriptors = at(directory, size.min(MAX_LIBRARIES as u32 * 20) as usize)?;
-    let mut imports = Vec::new();
+    let mut table = ImportTable::default();
     for index in 0..(descriptors.len() / 20) {
         if halt() {
             return Err(PeError::Interrupted);
@@ -319,7 +335,13 @@ pub fn read_imports(
         let library = read_c_string(name_rva, &mut at)?;
         // Bound imports leave no lookup table; the IAT is then the only array there is, and its
         // entries are addresses rather than name RVAs.
-        let names_from = if lookup != 0 { lookup } else { 0 };
+        // A bound import: real slots, no lookup table, names only in the IAT. Recorded by name
+        // rather than skipped, so a caller can say "this library's imports are not nameable here"
+        // instead of reporting a driver that imports less than it does.
+        if lookup == 0 {
+            table.unnamed_libraries.push(library);
+            continue;
+        }
         let pointer = image.bitness.pointer();
 
         for slot_index in 0..MAX_IMPORTS_PER_LIBRARY {
@@ -327,11 +349,7 @@ pub fn read_imports(
                 return Err(PeError::Interrupted);
             }
             let slot = image.va(iat) + (slot_index * pointer) as u64;
-            if names_from == 0 {
-                // Nothing to name it with that does not require reading the slot.
-                break;
-            }
-            let entry_rva = names_from + (slot_index * pointer) as u32;
+            let entry_rva = lookup + (slot_index * pointer) as u32;
             let entry = at(entry_rva, pointer)?;
             let value = match image.bitness {
                 Bitness::Bits32 => u32(&entry, 0)? as u64,
@@ -350,14 +368,14 @@ pub fn read_imports(
                 // IMAGE_IMPORT_BY_NAME: a two-byte hint, then the name.
                 ImportName::Named(read_c_string((value as u32) + 2, &mut at)?)
             };
-            imports.push(Import {
+            table.imports.push(Import {
                 library: library.clone(),
                 name,
                 slot,
             });
         }
     }
-    Ok(imports)
+    Ok(table)
 }
 
 /// The imports indexed by the slot a call goes through, which is how a call site is named.
@@ -509,8 +527,9 @@ mod tests {
         fake.unreadable.push((BASE + 0x3000, BASE + 0x4000));
 
         let image = read_image(BASE, |at, len| fake.read(at, len)).expect("the headers read");
-        let imports =
-            read_imports(&image, |at, len| fake.read(at, len), || false).expect("imports read");
+        let imports = read_imports(&image, |at, len| fake.read(at, len), || false)
+            .expect("imports read")
+            .imports;
 
         assert_eq!(imports.len(), 3, "{imports:#?}");
         assert!(imports.iter().all(|i| i.library == "ntoskrnl.exe"));
@@ -588,10 +607,35 @@ mod tests {
         put(&mut fake.bytes, 0x174, &0u32.to_le_bytes());
 
         let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        assert_eq!(
+            read_imports(&image, |at, len| fake.read(at, len), || false).unwrap(),
+            ImportTable::default()
+        );
+    }
+
+    /// A library with no lookup table is **named as unnameable**, not silently skipped.
+    ///
+    /// A bound import has real slots and no `OriginalFirstThunk`, so its names live only in the
+    /// import address table this deliberately does not read. Dropping it would tell a hazard scan
+    /// that the driver imports fewer functions than it does — and "imports no dangerous API" is
+    /// exactly the answer that must never come from silence.
+    #[test]
+    fn a_library_with_no_lookup_table_is_reported_rather_than_skipped() {
+        let mut fake = driver_image();
+        // Clear OriginalFirstThunk, leaving the name and the IAT: a bound import.
+        put(&mut fake.bytes, 0x2000, &0u32.to_le_bytes());
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        let table = read_imports(&image, |at, len| fake.read(at, len), || false).unwrap();
+
         assert!(
-            read_imports(&image, |at, len| fake.read(at, len), || false)
-                .unwrap()
-                .is_empty()
+            table.imports.is_empty(),
+            "nothing can be named without a lookup table: {table:?}"
+        );
+        assert_eq!(
+            table.unnamed_libraries,
+            vec!["ntoskrnl.exe".to_string()],
+            "the library must be reported, not dropped: {table:?}"
         );
     }
 
@@ -634,7 +678,9 @@ mod tests {
         assert_eq!(image.bitness, Bitness::Bits32);
         assert_eq!(image.import_directory, (0x2000, 40));
 
-        let imports = read_imports(&image, |at, len| fake.read(at, len), || false).unwrap();
+        let imports = read_imports(&image, |at, len| fake.read(at, len), || false)
+            .unwrap()
+            .imports;
         assert_eq!(
             imports
                 .iter()
@@ -664,7 +710,9 @@ mod tests {
     fn imports_index_by_the_slot_a_call_goes_through() {
         let fake = driver_image();
         let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
-        let imports = read_imports(&image, |at, len| fake.read(at, len), || false).unwrap();
+        let imports = read_imports(&image, |at, len| fake.read(at, len), || false)
+            .unwrap()
+            .imports;
         let index = imports_by_slot(&imports);
 
         assert_eq!(

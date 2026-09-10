@@ -484,6 +484,20 @@ fn heap_op(query: HeapOp) -> EngineOp {
     }
 }
 
+/// A reachability bound: the caller's, defaulted, and capped — a **ceiling only**.
+///
+/// Its own function so the rule is testable, which a clamp written inline at the call site was
+/// not: the first version of it clamped the *floor* to 1 as well, and the walk's own tests could
+/// not see that because they call the walk directly.
+///
+/// The floor matters because zero is meaningful. The walk enters the seed at depth 0 and refuses
+/// `depth > max_depth`, so `max_depth: 0` asks for "this function and no callee" — and raising it
+/// to 1 answers a different question, reporting REACHABLE for a target in a direct callee with
+/// nothing in the answer to say the request was widened.
+fn walk_bound(asked: Option<usize>, default: usize, ceiling: usize) -> usize {
+    asked.unwrap_or(default).min(ceiling)
+}
+
 /// Ceilings on the reachability walk's bounds.
 ///
 /// Deliberately far above the defaults of 256 and 32: a caller with a big dispatch graph has a
@@ -4440,11 +4454,8 @@ impl WindbgServer {
                     // (`FOLLOWUPS.md` item 13). The ceilings are far above the defaults — this
                     // bounds the absurd rather than the ambitious, and the deadline the pump
                     // fills in below is what bounds the ordinary case.
-                    max_functions: args
-                        .max_functions
-                        .unwrap_or(256)
-                        .clamp(1, MAX_WALK_FUNCTIONS),
-                    max_depth: args.max_depth.unwrap_or(32).clamp(1, MAX_WALK_DEPTH),
+                    max_functions: walk_bound(args.max_functions, 256, MAX_WALK_FUNCTIONS),
+                    max_depth: walk_bound(args.max_depth, 32, MAX_WALK_DEPTH),
                     recipe: args.recipe.unwrap_or(true),
                     // Filled in by the supervisor's pump when this job reaches the front of its
                     // session's queue, exactly as the allocator ops' is.
@@ -4927,6 +4938,35 @@ fn text_of(result: &CallToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A reachability bound is capped and never raised.
+    ///
+    /// The cap is the point of the function — an uncapped pair could pin the session's engine for
+    /// as long as the walk took (`FOLLOWUPS.md` item 13). The *floor* is the point of this test:
+    /// zero is a meaningful depth, meaning "this function and no callee", and the first version of
+    /// this clamped it up to 1. That widened the caller's question without saying so, and the
+    /// walk's own tests could not catch it because they call the walk directly and never see this.
+    #[test]
+    fn a_reachability_bound_is_capped_and_never_raised() {
+        // Zero survives, which is the whole reason this is a `min` and not a `clamp`.
+        assert_eq!(walk_bound(Some(0), 32, MAX_WALK_DEPTH), 0);
+        assert_eq!(walk_bound(Some(0), 256, MAX_WALK_FUNCTIONS), 0);
+
+        // A caller's value passes through until it meets the ceiling.
+        assert_eq!(walk_bound(Some(7), 32, MAX_WALK_DEPTH), 7);
+        assert_eq!(
+            walk_bound(Some(usize::MAX), 32, MAX_WALK_DEPTH),
+            MAX_WALK_DEPTH
+        );
+        assert_eq!(
+            walk_bound(Some(usize::MAX), 256, MAX_WALK_FUNCTIONS),
+            MAX_WALK_FUNCTIONS
+        );
+
+        // And the defaults are what a caller who named nothing gets, unaltered.
+        assert_eq!(walk_bound(None, 32, MAX_WALK_DEPTH), 32);
+        assert_eq!(walk_bound(None, 256, MAX_WALK_FUNCTIONS), 256);
+    }
 
     #[test]
     fn a_pool_match_threshold_must_be_nonzero() {
