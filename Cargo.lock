@@ -164,9 +164,10 @@ dependencies = [
 [[package]]
 name = "dbgscope"
 version = "0.1.0"
-source = "git+https://github.com/glslang/dbgscope?rev=bb26d44cacff77113fe4f6c049c62249054ccf6d#bb26d44cacff77113fe4f6c049c62249054ccf6d"
+source = "git+https://github.com/glslang/dbgscope?rev=43ce25923fde464aa49bf821e1283a205f897970#43ce25923fde464aa49bf821e1283a205f897970"
 dependencies = [
  "hex",
+ "iced-x86",
  "thiserror",
  "windows",
  "windows-core",
@@ -413,6 +414,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f31827a206f56af32e590ba56d5d2d085f558508192593743f16b2306495269f"
 dependencies = [
  "cc",
+]
+
+[[package]]
+name = "iced-x86"
+version = "1.21.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7c447cff8c7f384a7d4f741cfcff32f75f3ad02b406432e8d6c878d56b1edf6b"
+dependencies = [
+ "lazy_static",
 ]
 
 [[package]]

@@ -28,6 +28,12 @@
 //! supplies the one closure that touches DbgEng. A read that fails is [`PeError::Unreadable`]
 //! naming what could not be read, never a zero silently parsed as a structure.
 
+// Nothing outside the tests reads this module yet — the driver tools that will are the next
+// commits — and twenty `dead_code` warnings would bury a real one in the meantime. **Delete this
+// the moment `driver_hazards` consumes it**; if it is still here when the tool surface has that
+// tool, the suppression has outlived its reason.
+#![allow(dead_code)]
+
 use std::collections::BTreeMap;
 
 /// What went wrong, in terms a caller can render as an outcome rather than a message.
