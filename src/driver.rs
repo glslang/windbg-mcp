@@ -57,6 +57,11 @@ pub(crate) fn parse_windbg_addr(tok: &str) -> Option<u64> {
 /// address column alone.
 use dbgscope::dbgeng::{Flow, Instruction};
 
+/// Shared with [`crate::walk`] rather than duplicated: "the caller's patience ran out" and
+/// "somebody asked this session to stop" are the same two facts here as there, and a second
+/// two-variant enum would only make a caller translate between them.
+use crate::walk::Halt;
+
 /// Instructions reachable from `start` by walking *inside* one function — following
 /// fall-through, direct conditional branches, and direct `jmp`s that stay in the
 /// function — and stopping at `ret` or an unfollowed indirect/jump-table `jmp`. This
@@ -489,6 +494,7 @@ pub(crate) fn path_recipe(
     seed_start: Option<u64>,
     rpt: &Report,
     mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
+    mut halt: impl FnMut() -> Option<Halt>,
 ) -> Vec<SegmentRecipe> {
     let Some(from_entry) = rpt.from_entry else {
         return Vec::new();
@@ -514,6 +520,12 @@ pub(crate) fn path_recipe(
 
     let mut recipes = Vec::new();
     for (arg, want_start, goal, goal_is_exit) in segs {
+        // The recipe re-disassembles one function per hop, so it is bounded on the same terms as
+        // the walk that produced the path. A recipe cut short is a shorter recipe, not a failure:
+        // the verdict above it stands either way.
+        if halt().is_some() {
+            break;
+        }
         let Some(block) = uf(&arg) else { continue };
         let idx: HashMap<u64, usize> = block
             .iter()
@@ -638,6 +650,10 @@ pub(crate) struct Report {
     bound_hit: bool,
     max_functions: usize,
     max_depth: usize,
+    /// Why the walk gave up before exhausting the graph, when it did. Distinct from
+    /// [`Self::bound_hit`] because the remedies are: a bound is raised on the next call, a
+    /// deadline means the *call* ran out of patience, and an interrupt means somebody asked.
+    halted: Option<Halt>,
 }
 
 /// Walks the call/branch graph from `from`, running `uf(arg)` for each discovered
@@ -658,6 +674,7 @@ pub(crate) fn reachability(
     max_functions: usize,
     max_depth: usize,
     mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
+    mut halt: impl FnMut() -> Option<Halt>,
 ) -> Report {
     let mut visited: HashSet<u64> = HashSet::new(); // walk start addresses already done
     let mut enqueued: HashSet<u64> = HashSet::new(); // target tokens scheduled
@@ -677,9 +694,18 @@ pub(crate) fn reachability(
         bound_hit: false,
         max_functions,
         max_depth,
+        halted: None,
     };
 
     while let Some((arg, token, depth)) = queue.pop_front() {
+        // Polled once per function and **before** its disassembly, which is where a bound has to
+        // sit when the loop's body is the expensive part: checking afterwards would let an
+        // interrupt arrive during one `uf` and still pay for the next one's round trips. Same
+        // rule, and the same reason, as [`crate::walk::run`].
+        if let Some(why) = halt() {
+            rpt.halted = Some(why);
+            break;
+        }
         if rpt.funcs_explored >= max_functions || depth > max_depth {
             rpt.bound_hit = true;
             continue;
@@ -783,14 +809,27 @@ pub(crate) fn format_report(r: &Report) -> String {
         }
     } else {
         out.push_str("VERDICT: NOT REACHABLE (within bounds)\n");
-        out.push_str(&format!(
-            "  Bound hit: {}\n",
-            if r.bound_hit {
-                "yes — raise max_functions/max_depth and retry"
-            } else {
-                "no — the reachable call graph was fully explored"
+        // The halt outranks the bound in the rendering, because it changes what the verdict
+        // means: a walk that ran out of *time* did not explore the graph it was bounded to, so
+        // "raise the bounds and retry" would be the wrong advice.
+        match r.halted {
+            Some(Halt::Deadline) => out.push_str(
+                "  Stopped: the call ran out of time — the graph was NOT fully explored. Raise \
+                 the\n           server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS) or narrow \
+                 `from`.\n",
+            ),
+            Some(Halt::Interrupted) => {
+                out.push_str("  Stopped: interrupted — the graph was NOT fully explored.\n")
             }
-        ));
+            None => out.push_str(&format!(
+                "  Bound hit: {}\n",
+                if r.bound_hit {
+                    "yes — raise max_functions/max_depth and retry"
+                } else {
+                    "no — the reachable call graph was fully explored"
+                }
+            )),
+        }
     }
     out.push_str(&format!(
         "  Functions explored: {} (bound {})   Max depth reached: {} (bound {})\n",
@@ -812,6 +851,12 @@ pub(crate) fn format_report(r: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A walk that is never asked to stop. Named rather than a bare closure at every call site,
+    /// so a test that *is* about halting reads differently from the fifteen that are not.
+    fn never() -> Option<Halt> {
+        None
+    }
 
     /// One instruction as the walk sees it: an address, the flow it carries, and the rendering
     /// the recipe reads its predicate out of.
@@ -859,6 +904,89 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 ";
         assert_eq!(parse_lm_base(text), Some(0xfffff803_3e250000));
         assert_eq!(parse_lm_base("Unable to enumerate modules\n"), None);
+    }
+
+    /// A walk that is asked to stop, stops — and says so instead of reporting a clean sweep.
+    ///
+    /// This is `FOLLOWUPS.md` item 13. Before it there was no time bound at all: this walk has no
+    /// command behind it for dbgscope's watchdog to bound, so polling between functions was the
+    /// only bound there could be, and a large enough `max_functions`/`max_depth` pair pinned the
+    /// session's engine for as long as the walk took.
+    ///
+    /// The rendering matters as much as the stopping. A walk that ran out of time did **not**
+    /// explore the graph it was bounded to, so reporting "the reachable call graph was fully
+    /// explored" — which is what a bound-less NOT REACHABLE says — would be a false negative
+    /// dressed as a clean answer.
+    #[test]
+    fn a_walk_that_is_halted_says_so_rather_than_claiming_a_clean_sweep() {
+        // A chain of three functions, so there is something left to explore when the halt lands.
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![insn(0x1004, Flow::Call(Some(0x2000)), "call A!B")],
+                ),
+            ),
+            (
+                "0x2000",
+                uf_fn(
+                    0x2000,
+                    vec![insn(0x2004, Flow::Call(Some(0x3000)), "call B!C")],
+                ),
+            ),
+            (
+                "0x3000",
+                uf_fn(0x3000, vec![insn(0x3004, Flow::Return, "ret")]),
+            ),
+        ]);
+
+        for (why, rendered) in [
+            (Halt::Deadline, "ran out of time"),
+            (Halt::Interrupted, "interrupted"),
+        ] {
+            // Halts once the seed has been explored, so the walk has started and not finished.
+            let mut polls = 0;
+            let r = reachability(
+                "start",
+                None,
+                0x3004,
+                256,
+                32,
+                |a| m.get(a).cloned(),
+                || {
+                    polls += 1;
+                    (polls > 1).then_some(why)
+                },
+            );
+            assert!(!r.verdict_reachable, "{why:?}");
+            assert_eq!(r.halted, Some(why));
+            assert!(
+                !r.bound_hit,
+                "{why:?}: a halt is not a bound, and the remedies differ"
+            );
+            assert_eq!(r.funcs_explored, 1, "{why:?}: it stopped where it was told");
+
+            let text = format_report(&r);
+            assert!(text.contains(rendered), "{why:?}: {text}");
+            assert!(
+                !text.contains("the reachable call graph was fully explored"),
+                "{why:?}: a halted walk must not claim a clean sweep: {text}"
+            );
+            assert!(
+                !text.contains("Bound hit"),
+                "{why:?}: raising the bounds is the wrong remedy for a halt: {text}"
+            );
+        }
+
+        // And a walk nobody stops still reports the sweep it really did.
+        let r = reachability("start", None, 0x9999, 256, 32, |a| m.get(a).cloned(), never);
+        assert_eq!(r.halted, None);
+        assert!(
+            format_report(&r).contains("the reachable call graph was fully explored"),
+            "{}",
+            format_report(&r)
+        );
     }
 
     /// The runs a real `uf` listing groups into, and where its gaps actually are.
@@ -984,7 +1112,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2008, Flow::Return, "ret")]),
             ),
         ]);
-        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned(), never);
         assert!(r.verdict_reachable);
         assert_eq!(r.from_entry, Some(0x1000));
         assert_eq!(r.containing_fn, Some(0x2000));
@@ -1006,7 +1134,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2008, Flow::Return, "ret")]),
             ),
         ]);
-        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned(), never);
         assert!(r.verdict_reachable);
         assert_eq!(r.path, vec![(0x1004, "jmp", 0x2000)]);
     }
@@ -1017,7 +1145,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "start",
             uf_fn(0x1000, vec![insn(0x1004, Flow::Return, "ret")]),
         )]);
-        let r = reachability("start", None, 0x1004, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x1004, 256, 32, |a| m.get(a).cloned(), never);
         assert!(r.verdict_reachable);
         assert_eq!(r.containing_fn, Some(0x1000));
         assert!(r.path.is_empty());
@@ -1033,7 +1161,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         )]);
         // The target sits behind the indirect call, which is never followed.
-        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned(), never);
         assert!(!r.verdict_reachable);
         assert!(!r.bound_hit); // graph exhausted, not a bound
     }
@@ -1057,7 +1185,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         ]);
         // Target is absent — the A<->B cycle must not loop forever.
-        let r = reachability("start", None, 0x7777, 256, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x7777, 256, 32, |a| m.get(a).cloned(), never);
         assert!(!r.verdict_reachable);
         assert_eq!(r.funcs_explored, 2);
     }
@@ -1078,7 +1206,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         ]);
         // Bound to a single function: B (which contains the target) is never explored.
-        let r = reachability("start", None, 0x2004, 1, 32, |a| m.get(a).cloned());
+        let r = reachability("start", None, 0x2004, 1, 32, |a| m.get(a).cloned(), never);
         assert!(!r.verdict_reachable);
         assert!(r.bound_hit);
         assert_eq!(r.funcs_explored, 1);
@@ -1105,11 +1233,19 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             _ => None,
         };
         // Starting inside case 1 (seed_start resolved to 0x1008), case 1's body IS reachable.
-        assert!(reachability("0x1008", Some(0x1008), 0x100c, 256, 32, &mut uf).verdict_reachable);
+        assert!(
+            reachability("0x1008", Some(0x1008), 0x100c, 256, 32, &mut uf, never).verdict_reachable
+        );
         // ...but case 2's body is NOT reachable from case 1 (no intra-function path).
-        assert!(!reachability("0x1008", Some(0x1008), 0x1014, 256, 32, &mut uf).verdict_reachable);
+        assert!(
+            !reachability("0x1008", Some(0x1008), 0x1014, 256, 32, &mut uf, never)
+                .verdict_reachable
+        );
         // From the entry, the switch cases are unreachable — the jump table isn't followed.
-        assert!(!reachability("0x1000", Some(0x1000), 0x1008, 256, 32, &mut uf).verdict_reachable);
+        assert!(
+            !reachability("0x1000", Some(0x1000), 0x1008, 256, 32, &mut uf, never)
+                .verdict_reachable
+        );
     }
 
     #[test]
@@ -1126,9 +1262,14 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         );
         let mut uf = |a: &str| (a == "0x1000").then(|| guard.clone());
         // The entry (before the trap) is reachable...
-        assert!(reachability("0x1000", Some(0x1000), 0x1000, 256, 32, &mut uf).verdict_reachable);
+        assert!(
+            reachability("0x1000", Some(0x1000), 0x1000, 256, 32, &mut uf, never).verdict_reachable
+        );
         // ...but code after the trap is not (the walk stops at the trap).
-        assert!(!reachability("0x1000", Some(0x1000), 0x1006, 256, 32, &mut uf).verdict_reachable);
+        assert!(
+            !reachability("0x1000", Some(0x1000), 0x1006, 256, 32, &mut uf, never)
+                .verdict_reachable
+        );
     }
 
     // ---- reachability: path recipe ----------------------------------------
@@ -1151,12 +1292,18 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 ],
             ),
         )]);
-        let rpt = reachability("Handler", Some(0x1000), 0x100c, 256, 32, |a| {
-            m.get(a).cloned()
-        });
+        let rpt = reachability(
+            "Handler",
+            Some(0x1000),
+            0x100c,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            never,
+        );
         assert!(rpt.verdict_reachable);
 
-        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned());
+        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].start, 0x1000);
         assert_eq!(recipes[0].goal, 0x100c);
@@ -1193,12 +1340,18 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 ],
             ),
         )]);
-        let rpt = reachability("Merge", Some(0x1000), 0x1010, 256, 32, |a| {
-            m.get(a).cloned()
-        });
+        let rpt = reachability(
+            "Merge",
+            Some(0x1000),
+            0x1010,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            never,
+        );
         assert!(rpt.verdict_reachable);
 
-        let recipes = path_recipe("Merge", Some(0x1000), &rpt, |a| m.get(a).cloned());
+        let recipes = path_recipe("Merge", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].steps.len(), 1);
         assert_eq!(recipes[0].steps[0].required, Direction::Taken);
@@ -1222,12 +1375,18 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 ],
             ),
         )]);
-        let rpt = reachability("Handler", Some(0x1000), 0x1010, 256, 32, |a| {
-            m.get(a).cloned()
-        });
+        let rpt = reachability(
+            "Handler",
+            Some(0x1000),
+            0x1010,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            never,
+        );
         assert!(rpt.verdict_reachable);
 
-        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned());
+        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
         let step = &recipes[0].steps[0];
         assert_eq!(step.required, Direction::Taken);
         let p = step.predicate.as_ref().expect("predicate decoded");
@@ -1274,11 +1433,11 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 ),
             ),
         ]);
-        let rpt = reachability("start", None, 0x200c, 256, 32, |a| m.get(a).cloned());
+        let rpt = reachability("start", None, 0x200c, 256, 32, |a| m.get(a).cloned(), never);
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x100c, "call", 0x2000)]);
 
-        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned());
+        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(recipes.len(), 2);
         // Segment 1: A, routing from entry to the call site.
         assert_eq!(recipes[0].start, 0x1000);
@@ -1321,11 +1480,11 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 ),
             ),
         ]);
-        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned());
+        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x1008, "jmp", 0x2000)]);
 
-        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned());
+        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(recipes.len(), 2);
         // Segment 1 (A): the exit branch is captured as a required "take" with its predicate.
         assert_eq!(recipes[0].steps.len(), 1);

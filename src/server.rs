@@ -484,6 +484,15 @@ fn heap_op(query: HeapOp) -> EngineOp {
     }
 }
 
+/// Ceilings on the reachability walk's bounds.
+///
+/// Deliberately far above the defaults of 256 and 32: a caller with a big dispatch graph has a
+/// real reason to raise them, and the thing being prevented is not ambition but a pair large
+/// enough to pin the session's engine for as long as the walk takes. The *time* bound is the
+/// deadline the pump fills in; this is only the bound on work.
+const MAX_WALK_FUNCTIONS: usize = 4096;
+const MAX_WALK_DEPTH: usize = 256;
+
 /// Parses a decimal or `0x`-prefixed hex integer.
 pub(crate) fn parse_u64(s: &str) -> Result<u64, String> {
     let t = s.trim();
@@ -4426,9 +4435,20 @@ impl WindbgServer {
                     address: args.address,
                     module: args.module,
                     rva: args.rva,
-                    max_functions: args.max_functions.unwrap_or(256),
-                    max_depth: args.max_depth.unwrap_or(32),
+                    // Clamped, not merely defaulted. Both came from the caller uncapped, and a
+                    // large enough pair pinned the session's engine for as long as the walk took
+                    // (`FOLLOWUPS.md` item 13). The ceilings are far above the defaults — this
+                    // bounds the absurd rather than the ambitious, and the deadline the pump
+                    // fills in below is what bounds the ordinary case.
+                    max_functions: args
+                        .max_functions
+                        .unwrap_or(256)
+                        .clamp(1, MAX_WALK_FUNCTIONS),
+                    max_depth: args.max_depth.unwrap_or(32).clamp(1, MAX_WALK_DEPTH),
                     recipe: args.recipe.unwrap_or(true),
+                    // Filled in by the supervisor's pump when this job reaches the front of its
+                    // session's queue, exactly as the allocator ops' is.
+                    patience_ms: 0,
                 }),
             )
             .await;

@@ -1735,7 +1735,18 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             let address = resolve_coordinate(e, coordinate.as_deref(), address, 1)?;
             run_to_address(e, &address, timeout_ms)
         }
-        EngineOp::Reachability(args) => reachable(e, args).map(Output::text).map_err(Failed::from),
+        EngineOp::Reachability(args) => {
+            // Whatever is left of the caller's patience once the queue has had its share. Unlike
+            // a walk this is not refused for want of time: a walk with no time reads nothing and
+            // reports an empty table that looks like a target with no nodes, while a reachability
+            // walk that stops early reports NOT REACHABLE *with the reason attached* — which is
+            // the same shape as hitting a bound, and already a thing a caller must read.
+            let patience = Duration::from_millis(u64::from(args.patience_ms));
+            let deadline = Instant::now() + walk_budget(patience, queued).unwrap_or_default();
+            reachable(e, args, deadline)
+                .map(Output::text)
+                .map_err(Failed::from)
+        }
         EngineOp::CrashTriage {
             frames,
             analyze,
@@ -6216,7 +6227,7 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
     ))
 }
 
-fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
+fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<String, String> {
     // Resolve the target VA: an absolute address, or module+RVA rebased against the module's
     // live base from `lm m <module>`. Both sides go through `resolve`, so a value pasted from
     // WinDbg — a `hi`lo` backtick address or a digit-only 32-bit address — reads consistently.
@@ -6289,6 +6300,19 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
         )
     };
 
+    // The interrupt is asked about first, for the reason `walk_memory`'s closure records: both
+    // can be true in one poll, and reporting a deadline for a break the caller just asked for
+    // sends them to the timeout setting instead of to their own request.
+    let mut halt = || {
+        if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        }
+    };
+
     let rpt = reachability(
         &args.from,
         seed_start,
@@ -6296,6 +6320,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
         args.max_functions,
         args.max_depth,
         &mut uf,
+        &mut halt,
     );
 
     if rpt.from_entry.is_none() {
@@ -6310,7 +6335,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
     // branch each on-path `jcc` must take, and what it tests).
     let mut out = format_report(&rpt);
     if rpt.verdict_reachable && args.recipe {
-        let recipes = path_recipe(&args.from, seed_start, &rpt, &mut uf);
+        let recipes = path_recipe(&args.from, seed_start, &rpt, &mut uf, &mut halt);
         out.push_str(&format_recipe(&recipes));
     }
     Ok(out)
