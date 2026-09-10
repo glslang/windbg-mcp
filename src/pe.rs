@@ -313,8 +313,29 @@ pub fn read_imports(
     if directory == 0 || size == 0 {
         return Ok(ImportTable::default());
     }
+    // Every read is bounded by the image, and the arithmetic is checked.
+    //
+    // Without this, an RVA past `SizeOfImage` is added to the base and handed to the reader — and
+    // on a live target the memory just past a driver is *the next module*, which reads perfectly
+    // well. A malformed or adversarial image would then have its "imports" answered out of a
+    // neighbour's bytes, with nothing in the result to say so. A start outside the image is
+    // refused; a length that would run past its end is clipped to it, because a name near the end
+    // is legitimately shorter than the bounded read asks for, and a structure that comes back
+    // short fails its own field parse.
     let mut at = |rva: u32, len: usize| -> Result<Vec<u8>, PeError> {
-        let address = image.va(rva);
+        if rva >= image.size_of_image {
+            return Err(PeError::Malformed {
+                reason: "an import table entry points outside the image",
+            });
+        }
+        let room = (image.size_of_image - rva) as usize;
+        let len = len.min(room);
+        let address = image
+            .base
+            .checked_add(u64::from(rva))
+            .ok_or(PeError::Malformed {
+                reason: "an import table entry's address overflowed",
+            })?;
         read(address, len).ok_or(PeError::Unreadable { at: address, len })
     };
 
@@ -338,8 +359,12 @@ pub fn read_imports(
         let lookup = u32(&descriptors, offset)?;
         let name_rva = u32(&descriptors, offset + 12)?;
         let iat = u32(&descriptors, offset + 16)?;
-        // The table ends at an all-zero descriptor.
-        if lookup == 0 && name_rva == 0 && iat == 0 {
+        // The table ends at an **all-zero** descriptor, which is all five fields and not the
+        // three that happen to be read above: a descriptor with a stamp or a forwarder chain left
+        // over would otherwise end the table early and drop every library after it.
+        let stamp = u32(&descriptors, offset + 4)?;
+        let forwarder = u32(&descriptors, offset + 8)?;
+        if lookup == 0 && name_rva == 0 && iat == 0 && stamp == 0 && forwarder == 0 {
             terminated = true;
             break;
         }
@@ -745,6 +770,48 @@ mod tests {
                 Err(PeError::Malformed { .. })
             ),
             "a name with no terminator must not be accepted truncated"
+        );
+    }
+
+    /// An import table that points outside the image is refused, not answered from a neighbour.
+    ///
+    /// On a live target the memory just past a driver is *the next module*, which reads perfectly
+    /// well — so an RVA past `SizeOfImage` added blindly to the base gives a read that succeeds
+    /// and describes something else entirely. The image's "imports" would then be another
+    /// module's bytes, with nothing in the answer to say so.
+    #[test]
+    fn an_import_table_pointing_outside_the_image_is_refused() {
+        // The lookup table moved past the end of the image, into what would be the next module.
+        let mut outside = driver_image();
+        put(&mut outside.bytes, 0x2000, &0x9000u32.to_le_bytes());
+        let image = read_image(BASE, |at, len| outside.read(at, len)).unwrap();
+        assert_eq!(image.size_of_image, 0x4000);
+        assert!(
+            matches!(
+                read_imports(&image, |at, len| outside.read(at, len), || false),
+                Err(PeError::Malformed { .. })
+            ),
+            "an RVA past the image must not be read from whatever is mapped there"
+        );
+    }
+
+    /// The table ends at an **all-zero** descriptor, which is five fields and not three.
+    ///
+    /// A descriptor with a leftover stamp or forwarder chain, and zeroes elsewhere, would end the
+    /// table early — dropping every library after it in the silence this module keeps promising
+    /// not to.
+    #[test]
+    fn a_descriptor_is_a_terminator_only_when_every_field_is_zero() {
+        let mut stamped = driver_image();
+        // The terminator at 0x2014 keeps a nonzero TimeDateStamp, and a second real library
+        // follows it, so ending early is visible as a missing import rather than as an error.
+        put(&mut stamped.bytes, 0x2014 + 4, &1u32.to_le_bytes());
+
+        let image = read_image(BASE, |at, len| stamped.read(at, len)).unwrap();
+        let read = read_imports(&image, |at, len| stamped.read(at, len), || false);
+        assert!(
+            matches!(read, Err(PeError::Malformed { .. })),
+            "a descriptor that is not all-zero must not end the table: {read:?}"
         );
     }
 

@@ -9,12 +9,26 @@
   can hit `0xD000010A` (that PID is a transient launcher) — attach to a classic Win32 process.
 - `read_memory` takes a numeric/`0x`-hex address only; for register/symbol expressions use
   `execute` with `db`/`dd` (e.g. `db @rip`).
-- `reachable_from_dispatch` is a **static** call-graph walk over `uf` disassembly: it follows
-  direct calls and cross-function tail jumps but **not** indirect calls through function pointers
-  or unresolved compiler jump tables. So a `REACHABLE` verdict is sound (a concrete static path
-  exists, and the path is reported), while `NOT REACHABLE` is best-effort within the explored
-  bounds. If the dispatch uses a `switch(IoControlCode)` jump table (common), pass the specific
-  handler VA as `from` to scope past it, or confirm dynamically with a breakpoint + `go`.
+- `reachable_from_dispatch` is **x86/x64 only**, and refuses anything else by name. It follows an
+  instruction's control flow, which this build decodes from the encoding for those two sets and
+  for no other — so on an ARM64 target, which this server otherwise supports, every instruction's
+  flow is unknown and any verdict would be about what could not be read rather than about the
+  target. The refusal names the machine type. Analysis that needs no control flow is unaffected
+  there: `modules`, `read_memory`, `backtrace` and `disassemble` all work.
+- `reachable_from_dispatch` is a **static** call-graph walk: it follows direct calls and
+  cross-function tail jumps but **not** indirect calls through function pointers or unresolved
+  compiler jump tables, and it stops at any instruction whose flow it could not decode. So a
+  `REACHABLE` verdict is sound (a concrete static path exists, and the path is reported), while
+  `NOT REACHABLE` is best-effort within the explored bounds. If the dispatch uses a
+  `switch(IoControlCode)` jump table (common), pass the specific handler VA as `from` to scope
+  past it, or confirm dynamically with a breakpoint + `go`.
+- That walk is bounded by **what is left of the caller's own timeout**
+  (`WINDBG_MCP_CALL_TIMEOUT_SECS`, less what it waited its turn on the session) as well as by
+  `max_functions` and `max_depth`. The three are different bounds and the report says which one
+  stopped it: a walk that ran out of time did *not* explore the graph it was bounded to, so it
+  says so rather than reporting that the reachable call graph was fully explored. A recipe cut
+  short the same way is labelled `INCOMPLETE`, because a prefix of a recipe is not a weaker
+  version of one — satisfying it does not put control on the target.
 - The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`) walk the allocator's own
   descriptors through dbgscope rather than shelling out to `!pool`/`!poolused`, so all four read
   one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.

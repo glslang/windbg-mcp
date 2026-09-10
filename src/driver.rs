@@ -510,9 +510,9 @@ pub(crate) fn path_recipe(
     rpt: &Report,
     mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
     mut halt: impl FnMut() -> Option<Halt>,
-) -> Vec<SegmentRecipe> {
+) -> (Vec<SegmentRecipe>, Option<Halt>) {
     let Some(from_entry) = rpt.from_entry else {
-        return Vec::new();
+        return (Vec::new(), None);
     };
     // (uf arg, requested start, goal, goal_is_exit) per function on the path. `goal_is_exit`
     // is true when the goal is a hop *site* (control leaves the function there) rather than
@@ -534,11 +534,16 @@ pub(crate) fn path_recipe(
     }
 
     let mut recipes = Vec::new();
+    let mut stopped = None;
     for (arg, want_start, goal, goal_is_exit) in segs {
         // The recipe re-disassembles one function per hop, so it is bounded on the same terms as
         // the walk that produced the path. A recipe cut short is a shorter recipe, not a failure:
         // the verdict above it stands either way.
-        if halt().is_some() {
+        if let Some(why) = halt() {
+            // Recorded rather than merely obeyed: a recipe cut short is a *shorter* recipe, and
+            // rendered without saying so it reads as the full set of conditions for reaching the
+            // target. A caller acting on it would satisfy some of the gates and none of the rest.
+            stopped = Some(why);
             break;
         }
         let Some(block) = uf(&arg) else { continue };
@@ -583,7 +588,7 @@ pub(crate) fn path_recipe(
         }
         recipes.push(SegmentRecipe { start, goal, steps });
     }
-    recipes
+    (recipes, stopped)
 }
 
 /// Renders the annotation for a decoded [`Predicate`]. A bitwise (`test`/`and`) setter is
@@ -604,9 +609,24 @@ fn render_predicate(p: &Predicate) -> String {
 }
 
 /// Renders the path recipe, appended after [`format_report`] on a REACHABLE verdict.
-pub(crate) fn format_recipe(recipes: &[SegmentRecipe]) -> String {
+pub(crate) fn format_recipe(recipes: &[SegmentRecipe], stopped: Option<Halt>) -> String {
     let mut out = String::new();
     out.push_str("\nPath recipe (input that keeps control on the path to the target)\n");
+    // Said *before* the segments rather than after them, because the sentence changes what the
+    // segments below are: not the conditions for reaching the target, but some of them. A caller
+    // acting on a prefix satisfies part of the gate and none of the rest, and nothing in a
+    // shortened list says it was shortened.
+    match stopped {
+        Some(Halt::Deadline) => out.push_str(
+            "  INCOMPLETE: the call ran out of time. What follows is a prefix of the recipe,\n           \
+             not the whole of it — satisfying it does not put control on the target.\n",
+        ),
+        Some(Halt::Interrupted) => out.push_str(
+            "  INCOMPLETE: interrupted. What follows is a prefix of the recipe, not the whole\n           \
+             of it.\n",
+        ),
+        None => {}
+    }
     out.push_str(
         "  Note: the IOCTL dispatch switch is an indirect jump table the static walk does\n",
     );
@@ -1123,6 +1143,61 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(find_path(&block, &idx, 0x1000, 0x1004), Some(Vec::new()));
     }
 
+    /// A recipe cut short says so, because a prefix of it is not a weaker version of it.
+    ///
+    /// The verdict above a recipe can land just before the deadline, leaving the segments to be
+    /// gathered with no time to gather them. Rendered without a word, the result reads as the
+    /// conditions for reaching the target — and a caller satisfying them puts control part of the
+    /// way there and nowhere near the rest.
+    #[test]
+    fn a_recipe_stopped_early_is_not_rendered_as_the_whole_recipe() {
+        // Two functions, so there are two segments and a halt can land between them.
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![
+                        insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+18h],222003h"),
+                        insn(0x1008, Flow::Branch(Some(0x1014)), "jne A+0x14"),
+                        insn(0x100c, Flow::Call(Some(0x2000)), "call A!B"),
+                        insn(0x1011, Flow::Return, "ret"),
+                        insn(0x1014, Flow::Return, "ret"),
+                    ],
+                ),
+            ),
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
+            ),
+        ]);
+        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        assert!(rpt.verdict_reachable);
+
+        // Halts after the first segment, which is what a deadline reached mid-recipe looks like.
+        let mut segments = 0;
+        let (recipes, stopped) = path_recipe(
+            "start",
+            None,
+            &rpt,
+            |a| m.get(a).cloned(),
+            || {
+                segments += 1;
+                (segments > 1).then_some(Halt::Deadline)
+            },
+        );
+
+        assert_eq!(stopped, Some(Halt::Deadline));
+        assert_eq!(recipes.len(), 1, "one segment of two: {recipes:?}");
+        let text = format_recipe(&recipes, stopped);
+        assert!(text.contains("INCOMPLETE"), "{text}");
+
+        // And a recipe nobody stops is rendered without the caveat.
+        let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        assert_eq!(none, None);
+        assert!(!format_recipe(&whole, none).contains("INCOMPLETE"));
+    }
+
     /// The runs a real `uf` listing groups into, and where its gaps actually are.
     ///
     /// The addresses are lifted verbatim from `uf mountmgr!MountMgrDeviceControl` on a 26100
@@ -1460,7 +1535,9 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         );
         assert!(rpt.verdict_reachable);
 
-        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) =
+            path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].start, 0x1000);
         assert_eq!(recipes[0].goal, 0x100c);
@@ -1474,7 +1551,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(p.value, Some(0x222003));
         assert_eq!(p.relation, Some("==")); // jne, fall-through ⇒ equality holds
 
-        let rendered = format_recipe(&recipes);
+        let rendered = format_recipe(&recipes, None);
         assert!(rendered.contains("IoControlCode == 0x222003"), "{rendered}");
         assert!(rendered.contains("must fall through"), "{rendered}");
     }
@@ -1508,11 +1585,13 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         );
         assert!(rpt.verdict_reachable);
 
-        let recipes = path_recipe("Merge", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) =
+            path_recipe("Merge", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].steps.len(), 1);
         assert_eq!(recipes[0].steps[0].required, Direction::Taken);
-        assert!(format_recipe(&recipes).contains("must take"));
+        assert!(format_recipe(&recipes, None).contains("must take"));
     }
 
     #[test]
@@ -1543,7 +1622,9 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         );
         assert!(rpt.verdict_reachable);
 
-        let recipes = path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) =
+            path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        assert_eq!(stopped, None, "these fixtures never halt");
         let step = &recipes[0].steps[0];
         assert_eq!(step.required, Direction::Taken);
         let p = step.predicate.as_ref().expect("predicate decoded");
@@ -1552,9 +1633,9 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(p.value, Some(0x20));
         assert_eq!(p.relation, Some("!=")); // jne taken ⇒ bit set
         assert!(
-            format_recipe(&recipes).contains("(InputBufferLength & 0x20) != 0"),
+            format_recipe(&recipes, None).contains("(InputBufferLength & 0x20) != 0"),
             "{}",
-            format_recipe(&recipes)
+            format_recipe(&recipes, None)
         );
     }
 
@@ -1594,7 +1675,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x100c, "call", 0x2000)]);
 
-        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 2);
         // Segment 1: A, routing from entry to the call site.
         assert_eq!(recipes[0].start, 0x1000);
@@ -1641,7 +1723,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x1008, "jmp", 0x2000)]);
 
-        let recipes = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 2);
         // Segment 1 (A): the exit branch is captured as a required "take" with its predicate.
         assert_eq!(recipes[0].steps.len(), 1);
