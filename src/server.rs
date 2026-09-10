@@ -4441,6 +4441,19 @@ impl WindbgServer {
                 return tool_error(e);
             }
         }
+        // Refused rather than raised. Zero is meaningful for `max_depth` — "this function and no
+        // callee" — and meaningless for `max_functions`: the walk counts the seed itself, so a
+        // budget of none inspects nothing at all, leaves `from_entry` unset, and comes back as
+        // "could not disassemble `from`", sending someone to check a symbol that was fine. The
+        // two fields differ here for that reason and not by oversight.
+        if args.max_functions == Some(0) {
+            return tool_error(
+                "`max_functions` must be at least 1: the walk counts the seed function itself, \
+                 so a budget of zero explores nothing and can say nothing about the target. To \
+                 ask for the seed and no callee, pass `max_depth: 0`."
+                    .to_string(),
+            );
+        }
         let out = self
             .run(
                 args.session_id.as_deref(),

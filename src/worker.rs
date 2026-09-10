@@ -1753,7 +1753,12 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
                     format!(
-                        "This reachability walk was not run: it reached the engine with {}s of                          its caller's timeout left, which is not enough to disassemble a function                          and report back before that timeout expires. Nothing was read. It waited                          {}s behind other work on this session; issue it when the session is                          idle, or raise the server's call timeout                          (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        "This reachability walk was not run: it reached the engine with {}s of \
+                         its caller's timeout left, which is not enough to disassemble a function \
+                         and report back before that timeout expires. Nothing was read. It waited \
+                         {}s behind other work on this session; issue it when the session is \
+                         idle, or raise the server's call timeout \
+                         (WINDBG_MCP_CALL_TIMEOUT_SECS).",
                         patience.saturating_sub(queued).as_secs(),
                         queued.as_secs(),
                     ),
@@ -6299,6 +6304,11 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // and no encoding says where a function ends — so it answers the extent, and the engine's
     // typed disassembly answers everything else. That is the whole of the text dependency this
     // walk now has, against a mnemonic table and an operand parser before it.
+    // Shared between the two closures the walk is given: the decoder records why it stopped, and
+    // the poll below reports it. A `Cell` rather than a flag on either closure, because both are
+    // handed to `reachability` separately and neither can see the other.
+    let halted: std::cell::Cell<Option<walk::Halt>> = std::cell::Cell::new(None);
+
     let mut uf = |arg: &str| -> Option<Vec<Instruction>> {
         let text = match e.execute_command(&format!("uf {arg}")) {
             Ok(t) if t.contains('`') || t.contains(':') => t,
@@ -6319,15 +6329,28 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // can be many regions, and a listing whose grouped decodes miss many addresses adds a
         // retry each — an unbounded number of engine calls between two of the walk's own polls,
         // which is the bound this was supposed to add rather than move.
-        let expired =
-            |e: &DebugEngine| Instant::now() >= deadline || matches!(e.interrupted(), Ok(true));
+        // **What it finds is recorded, not merely acted on.** Returning `None` alone reads to the
+        // walk as an ordinary disassembly failure, which prunes the branch silently: on the seed
+        // that becomes "could not disassemble `from`" against a symbol that was fine, and on the
+        // last queued function it becomes a clean NOT REACHABLE claiming the graph was fully
+        // explored. The reason goes in a cell the walk's own `halt` closure reads.
+        let expired = |e: &DebugEngine| -> Option<walk::Halt> {
+            if matches!(e.interrupted(), Ok(true)) {
+                Some(walk::Halt::Interrupted)
+            } else if Instant::now() >= deadline {
+                Some(walk::Halt::Deadline)
+            } else {
+                None
+            }
+        };
 
         let mut decoded: HashMap<u64, Instruction> = HashMap::new();
         for (start, count) in listing_runs(&listing) {
-            if expired(e) {
+            if let Some(why) = expired(e) {
                 // Pruned rather than returned half-decoded: a function missing instructions is a
-                // function missing edges, and the walk's own poll fires next and labels the
-                // report as halted rather than as a graph fully explored.
+                // function missing edges. The reason is recorded first, so the walk reports a
+                // halt rather than a graph it never finished.
+                halted.set(Some(why));
                 return None;
             }
             decoded.extend(
@@ -6344,7 +6367,8 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // an edge or a target in the dropped part reads as NOT REACHABLE. Anything missing is
         // asked for on its own, which is the answer the ungrouped version would have given.
         for &address in &listing {
-            if expired(e) {
+            if let Some(why) = expired(e) {
+                halted.set(Some(why));
                 return None;
             }
             if !decoded.contains_key(&address)
@@ -6369,6 +6393,11 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // can be true in one poll, and reporting a deadline for a break the caller just asked for
     // sends them to the timeout setting instead of to their own request.
     let mut halt = || {
+        // The decoder's own stop comes first: it already happened, and re-deriving it from the
+        // clock would report a deadline for what was an interrupt.
+        if let Some(why) = halted.get() {
+            return Some(why);
+        }
         if matches!(e.interrupted(), Ok(true)) {
             Some(walk::Halt::Interrupted)
         } else if Instant::now() >= deadline {
@@ -6389,11 +6418,27 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     );
 
     if rpt.from_entry.is_none() {
-        return Err(format!(
-            "could not disassemble `from` ({}): `uf` returned no function. Check the \
-             symbol/address and that the module is loaded.",
-            args.from
-        ));
+        // A halt outranks the symbol. The seed's own disassembly can be cut short by the deadline
+        // or an interrupt, which leaves `from_entry` unset exactly as a bad symbol does — and
+        // sending someone to check a `from` that was fine is the wrong end of the problem.
+        return Err(match rpt.halted {
+            Some(walk::Halt::Deadline) => format!(
+                "the walk from `{}` ran out of time before its first function could be \
+                 disassembled. Nothing was explored. Raise the server's call timeout \
+                 (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue this when the session is idle.",
+                args.from
+            ),
+            Some(walk::Halt::Interrupted) => format!(
+                "the walk from `{}` was interrupted before its first function could be \
+                 disassembled. Nothing was explored.",
+                args.from
+            ),
+            None => format!(
+                "could not disassemble `from` ({}): `uf` returned no function. Check the \
+                 symbol/address and that the module is loaded.",
+                args.from
+            ),
+        });
     }
 
     // On a REACHABLE verdict, re-walk the path functions to emit the directional recipe (which

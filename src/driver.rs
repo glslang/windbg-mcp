@@ -392,7 +392,12 @@ fn find_path(
         }
         let next = (i + 1 < block.len()).then_some(i + 1);
         match insn.flow {
-            Flow::Return | Flow::Trap | Flow::Unreadable => false,
+            // `Unknown` stops here for the same reason it stops the walk, and the reason is
+            // sharper: this DFS picks *a* route and reports its branch conditions as sufficient
+            // to reach the goal. Continuing through an instruction whose flow is not known can
+            // invent a route the walk never took, and then the recipe contradicts the proof
+            // above it — conditions for a path that does not exist.
+            Flow::Return | Flow::Trap | Flow::Unreadable | Flow::Unknown => false,
             Flow::Jmp(t) => match t.and_then(|t| idx.get(&t)) {
                 Some(&j) => dfs(block, idx, j, goal, visited, acc),
                 None => false,
@@ -414,7 +419,7 @@ fn find_path(
                 }
                 false
             }
-            Flow::Call(_) | Flow::Fallthrough | Flow::Unknown => match next {
+            Flow::Call(_) | Flow::Fallthrough => match next {
                 Some(n) => dfs(block, idx, n, goal, visited, acc),
                 None => false,
             },
@@ -664,7 +669,7 @@ pub(crate) struct Report {
     /// Why the walk gave up before exhausting the graph, when it did. Distinct from
     /// [`Self::bound_hit`] because the remedies are: a bound is raised on the next call, a
     /// deadline means the *call* ran out of patience, and an interrupt means somebody asked.
-    halted: Option<Halt>,
+    pub(crate) halted: Option<Halt>,
 }
 
 /// Walks the call/branch graph from `from`, running `uf(arg)` for each discovered
@@ -763,6 +768,13 @@ pub(crate) fn reachability(
                 queue.push_back((format!("0x{t:x}"), Some(t), depth + 1));
             }
         }
+    }
+    // Polled once more after the queue drains. The poll above runs at the *top* of an iteration,
+    // so a halt that lands while the **last** function is being decoded is never seen there — and
+    // the report would then say the reachable call graph was fully explored, which is the one
+    // sentence a halted walk must not produce.
+    if rpt.halted.is_none() {
+        rpt.halted = halt();
     }
     rpt
 }
@@ -1031,6 +1043,84 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         // Depth 1 reaches it, which is what makes the line above a bound rather than an accident.
         let wider = reachability("start", None, 0x2004, 256, 1, |a| m.get(a).cloned(), never);
         assert!(wider.verdict_reachable, "{wider:?}");
+    }
+
+    /// A halt that lands while the **last** function is decoding is still reported.
+    ///
+    /// The in-loop poll runs at the top of an iteration, so a stop that happens during the last
+    /// queued function's disassembly is never seen there: the queue drains, the loop ends, and the
+    /// report says the reachable call graph was fully explored. That is the one sentence a halted
+    /// walk must not produce, and it is why there is a poll after the loop as well.
+    #[test]
+    fn a_halt_on_the_last_function_is_not_reported_as_a_clean_sweep() {
+        let m = functions(&[(
+            "start",
+            uf_fn(0x1000, vec![insn(0x1004, Flow::Return, "ret")]),
+        )]);
+
+        // Nothing to stop on the way in; the stop arrives while the only function is decoding,
+        // which is what the disassembler closure does when its own deadline expires.
+        // A `Cell` because both closures need it, which is exactly the shape the worker uses to
+        // carry its decoder's halt out to its poll.
+        let decoded = std::cell::Cell::new(false);
+        let r = reachability(
+            "start",
+            None,
+            0x9999,
+            256,
+            32,
+            |a| {
+                decoded.set(true);
+                m.get(a).cloned()
+            },
+            || decoded.get().then_some(Halt::Deadline),
+        );
+
+        assert!(!r.verdict_reachable);
+        assert_eq!(r.halted, Some(Halt::Deadline), "{r:?}");
+        let text = format_report(&r);
+        assert!(
+            !text.contains("the reachable call graph was fully explored"),
+            "a walk stopped on its last function claimed a clean sweep: {text}"
+        );
+    }
+
+    /// The recipe's own traversal stops at unknown flow too, or it can contradict the proof.
+    ///
+    /// The walk reports REACHABLE by a route it could follow. This DFS then picks *a* route and
+    /// reports its branches as the conditions for reaching the goal — so walking through an
+    /// instruction whose flow is not known invents a route, and presents that route's conditions
+    /// as sufficient for a path the walk never took.
+    ///
+    /// The goal here is reachable **only** through the undecoded instruction, so a DFS that
+    /// continues finds a route and a DFS that stops finds none. An earlier version of this test
+    /// offered two routes and was vacuous: the DFS tries a branch's taken edge first, so it found
+    /// the decoded route either way and could not tell the two behaviours apart.
+    #[test]
+    fn the_recipe_does_not_route_through_an_unknown_instruction() {
+        let block = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Unknown, "(undecoded)"),
+                insn(0x1008, Flow::Fallthrough, "nop"), // the goal, behind the unknown
+                insn(0x100c, Flow::Return, "ret"),
+            ],
+        );
+        let idx: HashMap<u64, usize> = block
+            .iter()
+            .enumerate()
+            .map(|(i, x)| (x.address, i))
+            .collect();
+
+        assert_eq!(
+            find_path(&block, &idx, 0x1000, 0x1008),
+            None,
+            "the recipe invented a route through an instruction whose flow is not known"
+        );
+
+        // And a goal reached without crossing one is still routed to, so the line above is a
+        // refusal rather than a DFS that finds nothing.
+        assert_eq!(find_path(&block, &idx, 0x1000, 0x1004), Some(Vec::new()));
     }
 
     /// The runs a real `uf` listing groups into, and where its gaps actually are.
