@@ -63,6 +63,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 7](#7-dbgscope--windbg-mcp-on-demand-engine-interrupt--done-2026-08-10) — [dbgscope + windbg-mcp] On-demand engine interrupt — done (2026-08-10)
 - [Item 10](#10-windbg-mcp-process-per-session--done-2026-08-02-issue-61) — [windbg-mcp] Process-per-session — done (2026-08-02, issue #61)
 - [Item 12](#12-dbgscope-validate-the-opener-split-against-a-live-kdnet-target--done-2026-08-02) — [dbgscope] Validate the opener split against a live KDNET target — done (2026-08-02)
+- [Item 13](#13-windbg-mcp-a-job-level-deadline-for-reachable_from_dispatch--done-2026-09-10-296) — [windbg-mcp] A job-level deadline for `reachable_from_dispatch` — done (2026-09-10, #296)
 - [Item 14](#14-dbgscope-make-arming-the-bounded-watchdog-free--done-2026-08-25-upstream-2026-08-31-here) — [dbgscope] Make arming the bounded watchdog ~free — done (2026-08-25 upstream, 2026-08-31 here)
 - [Item 16](#16-windbg-mcp-exercise-a-mutating-debug_batch-against-a-live-kernel-target--done) — [windbg-mcp] Exercise a *mutating* `debug_batch` against a live kernel target — done
 - [Item 17](#17-windbg-mcp-let-a-debug_batch-step-call-a-typed-tool-starting-with-the-pool-queries--done) — [windbg-mcp] Let a `debug_batch` step call a typed tool, starting with the pool queries — done
@@ -94,6 +95,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 51](#51-windbg-mcp--dbgscope-end_session-on-a-user-mode-attach-kills-the-process-it-attached-to--done-2026-08-28) — [windbg-mcp + dbgscope] `end_session` on a user-mode attach kills the process it attached to — done (2026-08-28)
 - [Item 55](#55-windbg-mcp-a-retired-handle-cannot-release-its-own-session--done-2026-08-31) — [windbg-mcp] A retired handle cannot release its own session — done (2026-08-31)
 - [Item 57](#57-windbg-mcp-ioctl_trace-installs-a-breakpoint-and-reports-nothing-about-it--done-2026-09-02) — [windbg-mcp] `ioctl_trace` installs a breakpoint and reports nothing about it — done (2026-09-02)
+- [Item 60](#60-windbg-mcp-structured-dispatch-reachability-paths-for-the-binary-ninja-bridge--done-2026-09-10) — [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge — done (2026-09-10)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -270,6 +272,44 @@ next caller does not have to measure it again.
 
 - **Tracked as:** [glslang/dbgscope#73](https://github.com/glslang/dbgscope/issues/73) — closed
   2026-08-14.
+
+## 13. [windbg-mcp] A job-level deadline for `reachable_from_dispatch` — **done** (2026-09-10, #296)
+
+**What it was filed for.** The walk ran its whole breadth-first traversal — up to `max_functions`
+disassemblies — inside a single engine job, with `max_functions` (256) and `max_depth` (32) coming
+from the caller **uncapped** and nothing polled between them. A large enough pair pinned that
+session's engine for as long as the walk took: the same wedge the bounded path fixed, arriving by a
+route the bounded path could not reach.
+
+**What landed.** `ReachabilityOp` carries a `patience_ms` the supervisor's pump fills, as the
+allocator ops' does, and the walk polls it between functions **and once after its queue drains** —
+the second of those is not symmetry, it is the only place a halt reached while decoding the *last*
+function can be seen. The bounds are clamped at 4,096 functions and 256 depth, far above the
+defaults: what is prevented is absurdity, not ambition. And half the fix is the rendering, because a
+walk that ran out of time did not explore the graph it was *bounded* to either — a halt outranks the
+bound in the report, and "the reachable call graph was fully explored" is a sentence a halted walk
+must never produce. A recipe cut short the same way is labelled `INCOMPLETE`: a prefix of a recipe
+is not a weaker version of one, and satisfying it does not put control on the target.
+
+**This entry's central claim was wrong, and that is why it is worth keeping.** It said "no
+individual `uf` is the problem — the aggregate is", and deferred any per-command bound on that
+basis; item 56 then repeated the reasoning. Review round six measured it and it does not hold: a
+`uf` blocked on a deferred symbol load blocks the one thread the session has, so **no poll between
+calls can run while it does**, and a job-level deadline is unenforceable without one. The `uf` is
+`execute_command_bounded` on the remainder of the caller's clock now, with a `walk_budget_ms` that
+refuses to run a command whose budget rounds down to zero — zero arms no watchdog, which would make
+the call with least time to spare the only unbounded one in the walk.
+
+**What is still unbounded, and is not this server's to fix.** The typed instruction decodes under
+that `uf` have no bound of their own: `disassemble` renders each line, so it resolves symbols, and
+dbgscope has no bounded form of that call. Filed as
+[dbgscope#149](https://github.com/glslang/dbgscope/issues/149), cited at the call site and in
+`docs/limitations.md`, which says what the bound there actually is — the number of calls, not the
+time they take.
+
+- **Where it landed:** `src/driver.rs` (the walk and its rendering), `src/worker.rs` (`reachable`,
+  `walk_budget_ms`, `halt_for`), `src/server.rs` (`walk_bound` and the two ceilings),
+  `src/proto.rs` (`ReachabilityOp::patience_ms`).
 
 ## 14. [dbgscope] Make arming the bounded watchdog ~free — **done** (2026-08-25 upstream, 2026-08-31 here)
 
@@ -3216,3 +3256,50 @@ defence.
 
 **Where it picks up.** `ioctl_trace` in `src/server.rs`, `EngineOp::SetBreakpoint` in
 `src/proto.rs`, and `worker::set_breakpoint`.
+## 60. [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge — **done** (2026-09-10)
+
+**What it was filed for.** `reachable_from_dispatch` answered in prose alone, so a program that
+wanted to act on a path had to parse the rendering — and the addresses in it were bare virtual
+addresses, which are facts about one boot of one machine and join to nothing.
+
+**What landed.** The tool declares an `outputSchema` and returns `structured::Reachability` beside
+the text it always returned, which is unchanged: both halves are built from the same `Report`,
+neither derived from the other, because deriving one from the other is how the two come to disagree
+about a figure. The typed answer carries the verdict, the call path as `{site, kind, callee}` hops,
+the branch recipe as a segment per function with a decoded predicate per step, and each of the three
+independent reasons a `not_reachable` may be incomplete — a work bound, a halt, and instructions the
+walk could not see past. `structured_report` lives in `src/driver.rs` and takes a **closure** for
+turning an address into a location, exactly as every other pass in that file takes one: attribution
+is an engine call and that file has never seen an engine, which is also what makes the mapping
+unit-testable against a locator a test invents.
+
+**The entry read "carry PE matching metadata plus RVA" as a per-address field, and measuring said
+otherwise.** Built that way first, and it works: every location was self-describing, carrying its
+module, image name, timestamp, size and PDB GUID. On the real `mountmgr` walk that is the same
+150-odd bytes repeated across a path, a containing function, and five recipe steps — one image, said
+eleven times. The identity is a property of the **image**, so it moved to an `images[]` beside the
+locations and each location carries the module name and RVA that key into it. That is also what the
+tools emitting the most addresses already do: `disassemble` and `backtrace` carry `module` + `rva`
+and no identity. Payload on that walk: 1,979 B of values against 1,472 B of text.
+
+**And `from` is an `Option`.** A walk whose seed never disassembled has explored nothing to have a
+verdict about, and the tool reports that as an error rather than a verdict — so the field is
+unreachable through the tool. It was briefly a zero address instead, which is a coordinate nobody
+produced; a missing field is the smaller lie.
+
+**Attribution is one call per module, not one per address.** `worker::Attributor` holds a single
+module and re-asks only when an address falls outside it, which is right for everything it
+attributes: a disassembly is a contiguous range, and a call path is a driver's own routines with an
+occasional hop into `nt`. The guess can only save a call, never change an answer.
+
+**What this does not do.** The last sentence of the original entry is a constraint on work that has
+not happened rather than a deliverable: if runtime coverage is ever imported, it must mean *observed
+execution* only, and an unobserved location is still not proof of unreachability. The verdict here
+stays asymmetric for the same reason — `reachable` is sound, `not_reachable` is best-effort within
+everything that bounded the walk.
+
+- **Where it landed:** `src/structured.rs` (`Reachability`, `CodeLocation`, `ImageRef` and the
+  enums beside them), `src/driver.rs` (`structured_report`), `src/worker.rs` (`Attributor`),
+  `src/server.rs` (the schema and the typed refusals), `docs/structured-results.md`,
+  `docs/coordinates.md`.
+

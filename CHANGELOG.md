@@ -7,6 +7,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **`reachable_from_dispatch` answers with values as well as prose**, with a matching
+  `outputSchema` — the text is unchanged and both halves are built from the same walk, so they
+  cannot disagree. The verdict, the call path as `{site, kind, callee}` hops, and the branch recipe
+  as a segment per function with the compare feeding each branch decoded. Every address carries the
+  `module` + `rva` coordinate that survives a reboot, and each image's identity is carried **once**
+  in an `images[]` beside them rather than repeated on every address — a real driver's path names
+  the same image a dozen times, and an identity is 150-odd bytes of GUID, timestamp and size.
+  `FOLLOWUPS.md` item 60. See [`docs/coordinates.md`](docs/coordinates.md).
+
+  The verdict is not a boolean, and the typed answer says so in three separate fields: `reachable`
+  is sound, while `not_reachable` may be incomplete because a work bound stopped it (`bound_hit`),
+  because the clock or an interrupt did (`stopped`), or because instructions in the graph could not
+  be read or decoded (`blind_stops`). The three have different remedies, which is why they are three
+  fields and not one.
+
+### Changed
+
+- **The dispatch walk is bounded in time, and its work bounds are capped** (`FOLLOWUPS.md` item 13).
+  `max_functions` and `max_depth` came from the caller uncapped and nothing was polled between
+  functions, so a large enough pair pinned that session's engine for as long as the walk took. The
+  walk now carries what is left of the caller's own timeout, each `uf` it runs is bounded by the
+  remainder rather than merely polled around, and the bounds are clamped at 4,096 functions and 256
+  depth — far above the defaults of 256 and 32.
+
+  Half of that is the rendering. A walk that ran out of time did not explore the graph it was
+  *bounded* to either, so a halt outranks the bound in the report and "the reachable call graph was
+  fully explored" is a sentence a halted walk no longer produces. A recipe cut short is labelled
+  `INCOMPLETE`, because a prefix of a recipe is not a weaker version of one — satisfying it does not
+  put control on the target.
+
+- **The walk reads decoded control flow instead of parsing a disassembly listing**, which deletes a
+  class of wrong answer rather than fixing instances of it: a symbol containing a comma, a
+  parenthesis or a bracket used to turn a direct call into an indirect one, and a dropped direct
+  edge is a `NOT REACHABLE` that should have been `REACHABLE`.
+
+- **`reachable_from_dispatch` refuses a target whose instruction set this build does not decode**,
+  naming the machine type, rather than returning a verdict about what could not be read. On ARM64
+  every instruction's flow is unknown, so the walk would have reported everything as reachable.
+  Lifting the refusal is [#297](https://github.com/glslang/windbg-mcp/issues/297).
+
+- **A `NOT REACHABLE` says when part of the graph it explored could not be seen.** An instruction
+  whose bytes will not read, or whose encoding is not decoded, stops the walk where it is and is
+  counted; such an instruction is a barrier and is never stepped over, since skipping one would
+  join the instruction before it to whatever follows and invent an edge.
+
 ## [0.16.0] - 2026-09-07
 
 ### Added
