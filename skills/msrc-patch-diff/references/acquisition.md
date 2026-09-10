@@ -101,3 +101,11 @@ It closes its comparison and workspace. It leaves the views open by default;
 `quit_on_finish=True` requests exit of that disposable GUI; confirm it actually
 exits before recording quit acceptance. This is a direct companion API
 capture, not an MCP transport or live WinDbg test.
+
+If a previous capture shows generation changes caused by displaying the target
+function, rerun in a fresh disposable GUI with `prepare_target_rva` set to that
+target RVA (an integer, for example `0x1000`). The helper navigates there and waits
+for analysis before taking its baseline, recording this preparation in the capture.
+It still checks generations across comparison and result navigation. Use an RVA
+from the exact target build's prior capture; preparation does not establish CVE
+relevance or justify accepting generation changes during the measured run.

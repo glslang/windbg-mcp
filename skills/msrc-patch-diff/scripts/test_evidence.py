@@ -14,6 +14,36 @@ import gui_capture
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_target_preparation_navigates_then_finishes_analysis(self):
+        target = Path("target.dll").resolve()
+        reference_view, target_view = Mock(), Mock()
+        reference_view.file.original_filename = str(Path("reference.dll").resolve())
+        target_view.file.original_filename = str(target)
+        target_view.start = 0x180000000
+        workspace = Mock()
+        workspace.acquire.side_effect = [
+            (None, reference_view, None, None),
+            (None, target_view, None, None),
+        ]
+        calls = []
+        workspace.navigate.side_effect = lambda *args: calls.append("navigate") or {"rva": "0x1000"}
+        target_view.update_analysis_and_wait.side_effect = lambda: calls.append("analysis")
+        result = gui_capture.prepare_target(
+            workspace, [{"binary_id": "reference"}, {"binary_id": "target"}], target, 0x1000
+        )
+        workspace.coordinate.assert_called_once_with(target_view, 0x180001000)
+        workspace.navigate.assert_called_once_with("target", workspace.coordinate.return_value)
+        self.assertEqual(calls, ["navigate", "analysis"])
+        self.assertEqual(result["stage"], "before_baseline")
+        reference_view.update_analysis_and_wait.assert_not_called()
+
+    def test_target_preparation_refuses_invalid_rva_and_missing_view(self):
+        for rva in (-1, True, "0x1000"):
+            with self.subTest(rva=rva), self.assertRaises(ValueError):
+                gui_capture.prepare_target(Mock(), [], Path("target.dll"), rva)
+        with self.assertRaisesRegex(ValueError, "target view unavailable"):
+            gui_capture.prepare_target(Mock(), [], Path("target.dll"), 0x1000)
+
     def test_capture_survives_cleanup_failures_and_still_requests_quit(self):
         for failures in (
             {"comparison_close"},
