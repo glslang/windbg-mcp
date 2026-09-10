@@ -1184,7 +1184,26 @@
         "readOnly": true
       },
       "name": "reachable_from_dispatch",
-      "output": null,
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/Reachability",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
       "params": [
         "address: string|null",
         "from: string",

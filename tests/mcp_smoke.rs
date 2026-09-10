@@ -2788,6 +2788,15 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ("heap_census", json!({}), "error"),
         ("heap_diagnostics", json!({}), "error"),
         ("crash_triage", json!({}), "error"),
+        // Well-formed arguments, so this takes the session refusal rather than the argument one.
+        // Both of its own refusals -- a `max_functions` of zero and a field carrying a command
+        // breaker -- are answered before a session is looked for, and are covered by
+        // `a_reachability_walk_with_no_budget_is_refused_before_a_session_is_needed`.
+        (
+            "reachable_from_dispatch",
+            json!({ "from": "nt!IopXxxControlFile", "address": "nt!KeBugCheckEx" }),
+            "error",
+        ),
         // A well-formed request, so it takes the *session* refusal path like every row above it
         // rather than the argument one — which this tool also has, and which is checked in
         // `a_malformed_walk_is_refused_before_a_session_is_needed`.
@@ -3216,6 +3225,58 @@ fn a_malformed_walk_is_refused_before_a_session_is_needed() {
         text_of(&too_many["result"]).contains("at most"),
         "the refusal must name the cap, got:\n{}",
         text_of(&too_many["result"])
+    );
+}
+
+/// Both of `reachable_from_dispatch`'s own refusals happen **before a session is chosen**, and
+/// both now carry `structuredContent`.
+///
+/// The second half is what this is really for. The tool declares an `outputSchema` as of this
+/// change, and a schema-bearing tool that answers a refusal in prose alone leaves a caller
+/// branching on `category` with nothing to branch on -- the one case they most need to read. Both
+/// refusals are facts about the request rather than about a target, so they are answered with
+/// nothing open at all: a check that reached the session registry would come back "no session"
+/// instead, and the two messages send a caller to opposite places.
+#[test]
+fn a_reachability_walk_with_no_budget_is_refused_before_a_session_is_needed() {
+    let mut server = Server::started();
+
+    let none = server.call_tool(
+        "reachable_from_dispatch",
+        json!({ "from": "nt!IopXxxControlFile", "address": "nt!KeBugCheckEx", "max_functions": 0 }),
+        STEP,
+    );
+    assert!(
+        is_tool_error(&none),
+        "a budget of zero functions is refused"
+    );
+    let text = text_of(&none["result"]);
+    assert!(
+        text.contains("max_depth: 0"),
+        "the refusal must name what the caller probably meant, got:
+{text}"
+    );
+    assert!(
+        !text.contains("session"),
+        "this is refused before any session is needed, got:
+{text}"
+    );
+    assert_eq!(
+        none["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "a caller branches on the category, not the wording: {none}"
+    );
+
+    // And a field carrying a command breaker, which is refused on the same path for a different
+    // reason: `from` reaches the debugger's expression evaluator.
+    let breaker = server.call_tool(
+        "reachable_from_dispatch",
+        json!({ "from": "nt!Foo; .shell -x", "address": "nt!KeBugCheckEx" }),
+        STEP,
+    );
+    assert!(is_tool_error(&breaker), "{breaker}");
+    assert_eq!(
+        breaker["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "{breaker}"
     );
 }
 
@@ -7874,6 +7935,109 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
 /// other typed row the typed half is the larger one, and a text-only tool has the one channel
 /// either way. That is what a rule stated as a floor looks like while nothing has broken it — the
 /// ratio rule beneath is the same shape, and `registers` is the row it was written for.
+/// The reachability walk answers with **values** as well as prose, and every address in them
+/// carries the coordinate that outlives the address.
+///
+/// Not in [`tool_results_stay_within_their_budget`]'s table, deliberately: every row there is a
+/// call that succeeds on a kernel dump whatever resolves, and this one needs a *symbol* to walk
+/// from. On a host whose symbol server is unreachable it fails rather than shrinking, which would
+/// make that tier flaky about the environment instead of watchful about the code -- so it stands
+/// down here instead, and measures its own payload where it does run.
+///
+/// The walk is deliberately the smallest interesting one: a function to itself, which is
+/// `reachable` in zero hops and needs no build-specific knowledge of what calls what. What it
+/// pins is the mapping rather than the target -- a verdict, a coordinate on each address, and the
+/// text half still present beside the values.
+#[test]
+fn a_reachability_answer_carries_coordinates_and_its_own_rendering() {
+    let Some(dump) = target_tier() else { return };
+    let mut server = Server::started();
+    let open = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&open, "tools/call open_dump");
+
+    let response = server.call_tool(
+        "reachable_from_dispatch",
+        json!({ "from": "nt!KeBugCheckEx", "address": "nt!KeBugCheckEx" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "tools/call reachable_from_dispatch");
+    let result = &response["result"];
+    if is_tool_error(result) {
+        let text = text_of(result);
+        // The one environmental failure: no PDB for `nt`, so there is no symbol to walk from.
+        // Every other error is this server's and fails the tier.
+        assert!(
+            text.contains("could not resolve") || text.contains("could not disassemble"),
+            "reachability failed for a reason that is not the host's:
+{text}"
+        );
+        skip(&format!("nt resolved no symbol on this host: {text}"));
+        return;
+    }
+
+    // `Outcome` is internally tagged, so the payload's fields sit beside `status` rather than
+    // under a wrapper of their own.
+    let data = &result["structuredContent"];
+    assert_eq!(data["status"], "ok", "{result}");
+    assert_eq!(data["verdict"], "reachable", "{data}");
+    assert_eq!(
+        data["path"].as_array().map(Vec::len),
+        Some(0),
+        "a function reaches itself in zero hops: {data}"
+    );
+    assert!(
+        data["containing_function"].is_object(),
+        "a reachable verdict names the function holding the target: {data}"
+    );
+
+    // The coordinate, which is the half of this that survives a reboot. Both ends of the walk
+    // carry a module and an RVA, and both are in the image whose symbol was asked for.
+    for end in ["from", "target"] {
+        assert_eq!(data[end]["module"], "nt", "{end}: {data}");
+        assert!(
+            data[end]["rva"]
+                .as_str()
+                .is_some_and(|r| r.starts_with("0x")),
+            "{end} carries an RVA: {data}"
+        );
+        assert!(
+            data[end]["address"]
+                .as_str()
+                .is_some_and(|a| a.starts_with("0x")),
+            "{end} still carries the address itself: {data}"
+        );
+    }
+
+    // And the identity is carried **once**, beside the locations rather than on each of them.
+    let images = data["images"].as_array().expect("images is a list");
+    assert_eq!(images.len(), 1, "one image was named: {data}");
+    assert_eq!(images[0]["module"], "nt", "{data}");
+    assert!(
+        images[0]["identity"]["timestamp"].is_number() && images[0]["identity"]["size"].is_number(),
+        "the identity a symbol server is keyed by: {data}"
+    );
+    assert!(
+        !data["from"].as_object().unwrap().contains_key("identity"),
+        "a location carries the module name, not a copy of its identity: {data}"
+    );
+
+    // Both halves, and the text one unchanged: a caller reading the rendering has a walkthrough
+    // written against it, and this tool grew values rather than replacing prose with them.
+    let text = text_of(result);
+    assert!(text.contains("VERDICT: REACHABLE"), "{text}");
+    assert!(text.contains("IOCTL dispatch reachability"), "{text}");
+
+    // Sized where it runs rather than left unmeasured. The typed half of a zero-hop walk is small;
+    // what this catches is a coordinate growing a field per address, which is the shape that would
+    // make a real driver's path expensive.
+    let model = data.to_string().len();
+    assert!(
+        model < 4_000,
+        "a zero-hop reachability answer is {model} B of values, which is more than this shape          should cost: {data}"
+    );
+    ran("reachability answers with coordinates and its own rendering");
+}
+
 #[test]
 fn tool_results_stay_within_their_budget() {
     let Some(dump) = target_tier() else { return };

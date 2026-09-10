@@ -16,6 +16,8 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 
+use crate::structured;
+
 // ---- IOCTL dispatch reachability (static call-graph walk) ----------------
 //
 // Answers "is the code block at <target> reachable from the IOCTL dispatch
@@ -989,6 +991,105 @@ pub(crate) fn format_report(r: &Report) -> String {
     out
 }
 
+/// The same walk as values, for a caller that will do something with the answer rather than read
+/// it.
+///
+/// **`locate` is a closure for the reason every other pass in this module takes one**: turning an
+/// address into a module and an RVA is an engine call, and this file has never seen an engine. The
+/// worker supplies one that caches per module; a test supplies one that invents them, which is what
+/// makes the mapping below testable at all.
+///
+/// The text rendering is not derived from this and this is not derived from the text — both are
+/// built from the same [`Report`], which is what keeps them from disagreeing. `recipe` is `None`
+/// when the caller asked for none.
+pub(crate) fn structured_report(
+    r: &Report,
+    recipe: Option<(&[SegmentRecipe], Option<Halt>)>,
+    mut locate: impl FnMut(u64) -> structured::CodeLocation,
+) -> structured::Reachability {
+    let halt = |h: Halt| match h {
+        Halt::Deadline => structured::WalkHalt::Deadline,
+        Halt::Interrupted => structured::WalkHalt::Interrupted,
+    };
+    structured::Reachability {
+        // Filled in by the caller, from the attributor whose `locate` it passed: this file has
+        // never seen an engine, and the images are what that closure learned on the way.
+        images: Vec::new(),
+        verdict: if r.verdict_reachable {
+            structured::ReachabilityVerdict::Reachable
+        } else {
+            structured::ReachabilityVerdict::NotReachable
+        },
+        // Absent rather than invented when the seed never disassembled. The worker turns that into
+        // an error rather than a verdict — a walk whose first function could not be read has
+        // explored nothing to have a verdict about — so this is unreachable through the tool, and
+        // a zero here would be a coordinate nobody produced.
+        from: r.from_entry.map(&mut locate),
+        target: locate(r.target),
+        containing_function: r.containing_fn.map(&mut locate),
+        path: r
+            .path
+            .iter()
+            .map(|&(site, kind, callee)| structured::ReachabilityHop {
+                site: locate(site),
+                kind: match kind {
+                    "call" => structured::HopKind::Call,
+                    _ => structured::HopKind::Jmp,
+                },
+                callee: locate(callee),
+            })
+            .collect(),
+        functions_explored: r.funcs_explored,
+        max_functions: r.max_functions,
+        max_depth_reached: r.max_depth_seen,
+        max_depth: r.max_depth,
+        bound_hit: r.bound_hit,
+        stopped: r.halted.map(halt),
+        blind_stops: r.blind,
+        recipe: recipe.map(|(segments, _)| {
+            segments
+                .iter()
+                .map(|segment| structured::RecipeSegment {
+                    start: locate(segment.start),
+                    goal: locate(segment.goal),
+                    steps: segment
+                        .steps
+                        .iter()
+                        .map(|step| structured::BranchStep {
+                            site: locate(step.site),
+                            jcc: step.jcc.clone(),
+                            required: match step.required {
+                                Direction::Taken => structured::BranchDirection::Taken,
+                                Direction::Fallthrough => structured::BranchDirection::Fallthrough,
+                            },
+                            predicate: step.predicate.as_ref().map(|p| {
+                                structured::BranchPredicate {
+                                    raw: p.raw.clone(),
+                                    field: p.field.map(|f| match f {
+                                        IoField::IoControlCode => {
+                                            structured::IoStackField::IoControlCode
+                                        }
+                                        IoField::InputBufferLength => {
+                                            structured::IoStackField::InputBufferLength
+                                        }
+                                        IoField::OutputBufferLength => {
+                                            structured::IoStackField::OutputBufferLength
+                                        }
+                                    }),
+                                    value: p.value.map(|v| format!("{v:#x}")),
+                                    relation: p.relation.map(str::to_string),
+                                    mask: p.mask,
+                                }
+                            }),
+                        })
+                        .collect(),
+                })
+                .collect()
+        }),
+        recipe_stopped: recipe.and_then(|(_, stopped)| stopped).map(halt),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1295,6 +1396,202 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(none, None);
         assert!(!format_recipe(&whole, none).contains("INCOMPLETE"));
+    }
+
+    /// A location as a test supplies one: the address, and a module derived from it.
+    ///
+    /// The real one is an engine call per module. What matters here is that every address the
+    /// mapping reports goes *through* it — a field built from `fmt_addr` directly would carry no
+    /// coordinate, and would look right in every assertion that only read the address.
+    fn located(address: u64) -> structured::CodeLocation {
+        structured::CodeLocation {
+            address: format!("{address:#x}"),
+            module: Some("drv".to_string()),
+            rva: Some(format!("{:#x}", address.saturating_sub(0x1000))),
+            attribution_failed: false,
+        }
+    }
+
+    /// The typed answer says what the rendering says, address for address.
+    ///
+    /// Both halves are built from one [`Report`] rather than one from the other, so what this
+    /// pins is the mapping: a hop's kind, a branch's required direction, an immediate as hex, and
+    /// that **every** address went through `locate` rather than being formatted in place. The
+    /// last of those is the one a reader cannot check by eye — an address that skipped the
+    /// closure carries no module and no RVA, and reads as an ordinary unattributed location.
+    #[test]
+    fn the_typed_answer_carries_every_address_through_the_locator() {
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![
+                        insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+18h],222003h"),
+                        insn(0x1008, Flow::Branch(Some(0x1014)), "jne A+0x14"),
+                        insn(0x100c, Flow::Call(Some(0x2000)), "call A!B"),
+                        insn(0x1011, Flow::Return, "ret"),
+                        insn(0x1014, Flow::Return, "ret"),
+                    ],
+                ),
+            ),
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
+            ),
+        ]);
+        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        assert!(rpt.verdict_reachable);
+        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+
+        let mut asked: Vec<u64> = Vec::new();
+        let typed = structured_report(&rpt, Some((&recipes, stopped)), |address| {
+            asked.push(address);
+            located(address)
+        });
+
+        assert_eq!(typed.verdict, structured::ReachabilityVerdict::Reachable);
+        let from = typed.from.as_ref().expect("the seed disassembled");
+        assert_eq!(from.address, "0x1000");
+        assert_eq!(from.rva.as_deref(), Some("0x0"));
+        assert_eq!(typed.target.address, "0x2004");
+        assert_eq!(
+            typed
+                .containing_function
+                .as_ref()
+                .map(|c| c.address.clone()),
+            Some("0x2000".to_string())
+        );
+        assert_eq!(typed.functions_explored, rpt.funcs_explored);
+        assert_eq!(typed.max_functions, 256);
+        assert_eq!(typed.max_depth, 32);
+        assert_eq!(typed.blind_stops, 0);
+        assert_eq!(typed.stopped, None);
+        assert_eq!(typed.recipe_stopped, None);
+
+        assert_eq!(typed.path.len(), 1, "{:?}", typed.path);
+        assert_eq!(typed.path[0].kind, structured::HopKind::Call);
+        assert_eq!(typed.path[0].site.address, "0x100c");
+        assert_eq!(typed.path[0].callee.address, "0x2000");
+
+        let segments = typed.recipe.as_ref().expect("a recipe was asked for");
+        assert_eq!(segments.len(), 2, "{segments:?}");
+        let step = &segments[0].steps[0];
+        assert_eq!(step.site.address, "0x1008");
+        assert_eq!(step.jcc, "jne");
+        assert_eq!(step.required, structured::BranchDirection::Fallthrough);
+        let predicate = step.predicate.as_ref().expect("the compare above the jcc");
+        assert_eq!(
+            predicate.field,
+            Some(structured::IoStackField::IoControlCode)
+        );
+        assert_eq!(
+            predicate.value.as_deref(),
+            Some("0x222003"),
+            "the immediate is hex, as every other address-shaped field here is"
+        );
+
+        // Every address in the answer, and no address that is not in it. Read off the closure
+        // rather than off the fields, because a field built without it would still read correctly.
+        asked.sort_unstable();
+        asked.dedup();
+        assert_eq!(
+            asked,
+            vec![0x1000, 0x1008, 0x100c, 0x2000, 0x2004],
+            "each of these is a field of the answer, and each must be attributable"
+        );
+    }
+
+    /// A cross-function tail jump is a `jmp` hop, and the two halts are kept apart.
+    ///
+    /// The kinds matter to a caller reconstructing the path: a `call` returns and a `jmp` does
+    /// not, so reading one as the other misdescribes what the target is reached *by*. And the
+    /// walk's halt and the recipe's are separate fields because they are separate passes — a walk
+    /// that finished and a recipe that did not is an ordinary outcome, and one field would have to
+    /// pick which of the two it meant.
+    #[test]
+    fn a_tail_jump_is_a_jmp_hop_and_the_two_halts_stay_apart() {
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![insn(0x1004, Flow::Jmp(Some(0x2000)), "jmp A!B")],
+                ),
+            ),
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
+            ),
+        ]);
+        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        assert!(rpt.verdict_reachable);
+
+        let typed = structured_report(
+            &rpt,
+            Some((&[] as &[SegmentRecipe], Some(Halt::Interrupted))),
+            located,
+        );
+        assert_eq!(typed.path[0].kind, structured::HopKind::Jmp);
+        assert_eq!(
+            typed.stopped, None,
+            "the walk finished; only the recipe was stopped"
+        );
+        assert_eq!(
+            typed.recipe_stopped,
+            Some(structured::WalkHalt::Interrupted),
+            "and an interrupt is not a deadline"
+        );
+
+        // No recipe asked for is `None` rather than an empty list: a caller that reads an empty
+        // recipe as "no conditions" would be told the target is reached unconditionally.
+        let none = structured_report(&rpt, None, located);
+        assert!(none.recipe.is_none(), "{:?}", none.recipe);
+        assert!(none.recipe_stopped.is_none());
+    }
+
+    /// A `not_reachable` verdict carries each of the three reasons it may be incomplete.
+    #[test]
+    fn a_not_reachable_answer_carries_why_it_might_be_wrong() {
+        let m = functions(&[(
+            "start",
+            vec![
+                insn(0x1000, Flow::Fallthrough, "nop"),
+                insn(0x1004, Flow::Unreadable, ""),
+                insn(0x1008, Flow::Return, "ret"),
+            ],
+        )]);
+        // Halts once the seed has been explored, not before it: a walk stopped at the very top
+        // never disassembles its seed, and the tool reports that as an error rather than as a
+        // verdict, so it is not a state this mapping ever sees.
+        let mut polls = 0;
+        let rpt = reachability(
+            "start",
+            None,
+            0x1008,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            || {
+                polls += 1;
+                (polls > 1).then_some(Halt::Deadline)
+            },
+        );
+        let typed = structured_report(&rpt, None, located);
+        assert_eq!(typed.verdict, structured::ReachabilityVerdict::NotReachable);
+        assert!(
+            typed.from.is_some(),
+            "the seed disassembled; only the walk past it was stopped"
+        );
+        assert_eq!(typed.stopped, Some(structured::WalkHalt::Deadline));
+        assert_eq!(
+            typed.blind_stops, rpt.blind,
+            "an instruction the walk could not see past is a third kind of incompleteness"
+        );
+        assert!(
+            typed.containing_function.is_none(),
+            "nothing contains a target that was not reached"
+        );
     }
 
     /// The recipe follows a call whose target is in the same listing, because the walk does.
