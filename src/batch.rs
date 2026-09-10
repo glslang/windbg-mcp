@@ -40,9 +40,10 @@ use std::time::Duration;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
+use crate::driver::fmt_addr;
 use crate::proto::PoolOp;
 use crate::server::{
-    EXEC_WAIT_MS, Quotes, changes_debug_target, fmt_addr, parse_eval, reject_command_breakers,
+    EXEC_WAIT_MS, Quotes, changes_debug_target, parse_eval, reject_command_breakers,
 };
 
 /// The most steps one batch may carry, per block.

@@ -15,6 +15,7 @@
 mod batch;
 mod cast;
 mod client;
+mod driver;
 mod engine;
 mod fault;
 mod kdconn;

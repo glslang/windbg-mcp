@@ -45,7 +45,7 @@
 //! # Engine-free
 //!
 //! [`run`] takes a reader closure rather than a `DebugEngine`, exactly as
-//! [`crate::server::reachability`] takes a disassembler: the traversal, the span coalescing, the
+//! [`crate::driver::reachability`] takes a disassembler: the traversal, the span coalescing, the
 //! loop detection and the rendering are all testable against a fake address space, and the worker
 //! supplies the one closure that touches DbgEng.
 
@@ -336,7 +336,7 @@ fn offset_name(offset: i64) -> String {
 /// Parses an address in any form a caller is likely to paste — the same rule `pool_chunk` uses, so
 /// a chunk address copied out of one tool goes into this one.
 fn parse_addr(text: &str) -> Result<u64, String> {
-    crate::server::parse_windbg_addr(text).map_or_else(|| crate::server::parse_u64(text), Ok)
+    crate::driver::parse_windbg_addr(text).map_or_else(|| crate::server::parse_u64(text), Ok)
 }
 
 /// A [`Source`] with its `start` expression resolved to a number.
