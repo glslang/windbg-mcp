@@ -438,7 +438,7 @@ mod tests {
         bytes[offset..offset + value.len()].copy_from_slice(value);
     }
 
-    const BASE: u64 = 0xfffff800_0000_0000;
+    const BASE: u64 = 0xffff_f800_0000_0000;
 
     /// A PE32+ driver: three sections, one imported library, three imports — two by name and one
     /// by ordinal — with the import address table in the writable section.
@@ -671,6 +671,6 @@ mod tests {
             index.get(&(BASE + 0x3008)).map(|i| i.name.to_string()),
             Some("ProbeForRead".to_string())
         );
-        assert!(index.get(&(BASE + 0x3018)).is_none());
+        assert!(!index.contains_key(&(BASE + 0x3018)));
     }
 }
