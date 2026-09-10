@@ -396,7 +396,12 @@ pub fn read_imports(
     // here: reading the first `MAX_LIBRARIES` and returning `Ok` drops the rest in silence, and a
     // hazard scan reading that concludes a dangerous import is absent when it is merely past the
     // cut. A plausible image does not have this many.
-    if size as usize / 20 > MAX_LIBRARIES {
+    //
+    // The `+ 1` is the **terminator**, which is a descriptor and is not a library. Without it the
+    // limit is off by one against its own sentence: an image importing exactly `MAX_LIBRARIES`
+    // libraries carries `MAX_LIBRARIES + 1` descriptors and would be refused for having one more
+    // library than it has.
+    if size as usize / 20 > MAX_LIBRARIES + 1 {
         return Err(PeError::Malformed {
             reason: "the import directory names more libraries than an image plausibly has",
         });
@@ -736,6 +741,53 @@ mod tests {
             read_imports(&image, |at, len| fake.read(at, len), || false).unwrap(),
             ImportTable::default()
         );
+    }
+
+    /// The library limit counts libraries, and the terminator is not one.
+    ///
+    /// An import directory holding `MAX_LIBRARIES` libraries has `MAX_LIBRARIES + 1` descriptors,
+    /// the all-zero one that ends the array being a descriptor and not a library. A bound compared
+    /// against the raw slot count is therefore off by one against the sentence it enforces, and
+    /// refuses the very image the limit was written to permit — reported as malformed, which is
+    /// the answer that stops a hazard scan rather than shortening it.
+    #[test]
+    fn the_library_limit_leaves_room_for_the_descriptor_that_ends_the_array() {
+        /// Builds an image whose import directory holds `libraries` real descriptors plus the
+        /// terminator, every one of them naming the same library and the same single import.
+        fn image_importing(libraries: usize) -> FakeImage {
+            let mut fake = driver_image();
+            let size = (libraries + 1) * 20;
+            put(&mut fake.bytes, 0x170, &0x2000u32.to_le_bytes());
+            put(&mut fake.bytes, 0x174, &(size as u32).to_le_bytes());
+            for index in 0..libraries {
+                let at = 0x2000 + index * 20;
+                put(&mut fake.bytes, at, &0x2600u32.to_le_bytes()); // OriginalFirstThunk
+                put(&mut fake.bytes, at + 12, &0x2700u32.to_le_bytes()); // Name
+                let iat = 0x3000 + (index as u32) * 8;
+                put(&mut fake.bytes, at + 16, &iat.to_le_bytes()); // FirstThunk
+            }
+            // The terminator, and the one lookup table and name every descriptor shares.
+            put(&mut fake.bytes, 0x2000 + libraries * 20, &[0u8; 20]);
+            put(&mut fake.bytes, 0x2600, &0x2710u64.to_le_bytes());
+            put(&mut fake.bytes, 0x2608, &0u64.to_le_bytes());
+            put(&mut fake.bytes, 0x2700, b"lib.sys\0");
+            put(&mut fake.bytes, 0x2712, b"Func\0");
+            fake
+        }
+
+        let fake = image_importing(MAX_LIBRARIES);
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        let table = read_imports(&image, |at, len| fake.read(at, len), || false)
+            .expect("an image with exactly the permitted number of libraries is not malformed");
+        assert_eq!(table.imports.len(), MAX_LIBRARIES);
+
+        // One more library is one more than the limit, and is refused as it always was.
+        let fake = image_importing(MAX_LIBRARIES + 1);
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        assert!(matches!(
+            read_imports(&image, |at, len| fake.read(at, len), || false),
+            Err(PeError::Malformed { .. })
+        ));
     }
 
     /// An image that declares no data directories has none, and the section table is not one.
