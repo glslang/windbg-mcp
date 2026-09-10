@@ -451,6 +451,7 @@ impl EngineOp {
             | Self::Heap { patience_ms, .. }
             | Self::CrashTriage { patience_ms, .. }
             | Self::Walk(WalkOp { patience_ms, .. })
+            | Self::Reachability(ReachabilityOp { patience_ms, .. })
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
             _ => None,
         }
@@ -548,6 +549,13 @@ pub struct ReachabilityOp {
     pub max_functions: usize,
     pub max_depth: usize,
     pub recipe: bool,
+    /// **It now carries one**, and the absence used to be the defect. This walk has no command
+    /// behind it for dbgscope's watchdog to bound, so between-function checking was the only
+    /// bound there could be and there was none: `max_functions` and `max_depth` came from the
+    /// caller uncapped, and a large enough pair pinned the session's engine for as long as the
+    /// walk took (`FOLLOWUPS.md` item 13). The bounds are clamped now as well, but a clamp is a
+    /// bound on *work* and this is a bound on *time*, which is what a caller's timeout is.
+    pub patience_ms: u32,
 }
 
 /// The pool tools' arguments, after the supervisor has applied its defaults.
