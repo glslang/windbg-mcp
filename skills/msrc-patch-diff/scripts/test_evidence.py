@@ -2,14 +2,59 @@
 
 import copy
 import hashlib
+import json
 import struct
+import tempfile
 import unittest
+from pathlib import Path
+from unittest.mock import Mock
 
 import evidence
 import gui_capture
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_capture_survives_cleanup_failures_and_still_requests_quit(self):
+        for failures in (
+            {"comparison_close"},
+            {"workspace_shutdown"},
+            {"comparison_close", "workspace_shutdown", "quit_request"},
+        ):
+            with self.subTest(failures=failures), tempfile.TemporaryDirectory() as folder:
+                output = Path(folder)
+                report = {"ok": False, "error": "original analysis failure"}
+                calls = []
+
+                def action(stage):
+                    saved = json.loads((output / "capture.json").read_text())
+                    self.assertEqual(saved["error"], report["error"])
+                    calls.append(stage)
+                    if stage in failures:
+                        raise RuntimeError(stage)
+
+                workspace = Mock()
+                workspace.similarity.close.side_effect = lambda _: action("comparison_close")
+                workspace.shutdown.side_effect = lambda: action("workspace_shutdown")
+                gui_capture.finalize_capture(
+                    report, output, workspace, "comparison", lambda: action("quit_request")
+                )
+                saved = json.loads((output / "capture.json").read_text())
+                self.assertEqual(calls, ["comparison_close", "workspace_shutdown", "quit_request"])
+                self.assertEqual({e["stage"] for e in saved["cleanup_errors"]}, failures)
+                self.assertEqual(saved["error"], "original analysis failure")
+                self.assertFalse(saved["ok"])
+
+    def test_cleanup_failure_invalidates_otherwise_successful_capture(self):
+        with tempfile.TemporaryDirectory() as folder:
+            workspace = Mock()
+            workspace.shutdown.side_effect = RuntimeError("shutdown failed")
+            output = Path(folder)
+            gui_capture.finalize_capture({"ok": True}, output, workspace, None)
+            saved = json.loads((output / "capture.json").read_text())
+            self.assertFalse(saved["ok"])
+            self.assertIn("shutdown failed", saved["cleanup_errors"][0]["error"])
+            workspace.similarity.close.assert_not_called()
+
     def test_provenance_omits_signed_redirect_credentials(self):
         source = "https://msdl.microsoft.com/download/symbols/a.dll/1234/a.dll"
         final = "https://example.blob.core.windows.net/file?sv=1&sig=secret#token"

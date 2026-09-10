@@ -1,4 +1,4 @@
 interface:
   display_name: "MSRC Patch Diff"
   short_description: "Compare Windows CVE fixes with BN Personal and BinDiff"
-  default_prompt: "Use $msrc-patch-diff to investigate CVE-2026-83498, acquire the current and previous stable builds for one Windows product, and compare the affected binaries with BN Personal."
+  default_prompt: "Use $msrc-patch-diff with gpt-daybreak-blue-latest under Codex to investigate CVE-2026-83498, acquire current and previous stable builds for one Windows product, and compare candidate binaries with BN Personal."

@@ -58,6 +58,30 @@ def full_acceptance(status, analysis_unchanged, inputs_unchanged):
     )
 
 
+def finalize_capture(report, output, workspace, comparison_id, request_quit=None):
+    def save():
+        (output / "capture.json").write_text(json.dumps(report, indent=2) + "\n")
+
+    def attempt(stage, action):
+        try:
+            action()
+        except Exception:  # noqa: BLE001 -- retain cleanup failures with the original evidence
+            report.setdefault("cleanup_errors", []).append(
+                {"stage": stage, "error": traceback.format_exc()}
+            )
+            report["ok"] = False
+        save()
+
+    # Preserve evidence even if native cleanup never returns.
+    save()
+    if workspace is not None:
+        if comparison_id is not None:
+            attempt("comparison_close", lambda: workspace.similarity.close(comparison_id))
+        attempt("workspace_shutdown", workspace.shutdown)
+    if request_quit is not None:
+        attempt("quit_request", request_quit)
+
+
 def run(reference, target, bindiff, output, quit_on_finish):
     import binaryninja as bn
     from binaryninjaui import UIContext
@@ -157,13 +181,15 @@ def run(reference, target, bindiff, output, quit_on_finish):
     except Exception:  # noqa: BLE001 -- persist native API failures in the acceptance artifact
         report["error"] = traceback.format_exc()
     finally:
-        if workspace:
-            if comparison_id:
-                workspace.similarity.close(comparison_id)
-            workspace.shutdown()
-        (output / "capture.json").write_text(json.dumps(report, indent=2) + "\n")
-        if quit_on_finish:
-            bn.execute_on_main_thread(lambda: QCoreApplication.instance().quit())
+        finalize_capture(
+            report,
+            output,
+            workspace,
+            comparison_id,
+            (lambda: bn.execute_on_main_thread(lambda: QCoreApplication.instance().quit()))
+            if quit_on_finish
+            else None,
+        )
 
 
 def start(reference, target, bindiff, output, quit_on_finish=False):

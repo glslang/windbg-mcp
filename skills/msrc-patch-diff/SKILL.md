@@ -10,6 +10,26 @@ an explicit release pair, verified downloads, paginated similarity results, and 
 report separating observed changes from CVE attribution. Use BN6 Personal and the
 companion's external BinDiff backend. Ultimate support is tentative and not required.
 
+## Codex model
+
+Use `gpt-daybreak-blue-latest` for this investigation when running under Codex,
+unless the user explicitly selects another model. If the current session uses a
+different model and model-selecting delegation is available, delegate the CVE
+investigation to that exact model, passing the CVE, product, architecture and
+existing evidence paths. Otherwise ask the user to select it in Codex before
+continuing the investigation. Report unavailable model access rather than silently
+substituting another model. Other agent hosts keep their configured model.
+
+For a new Codex CLI session:
+
+```console
+codex --model gpt-daybreak-blue-latest '$msrc-patch-diff for CVE-2026-83498 on Windows 11 24H2 ARM64'
+```
+
+The skill's UI prompt expresses this preference; it does not change the session
+model by itself. [Daybreak Blue](https://developers.openai.com/api/docs/models/gpt-daybreak-blue-latest)
+is the selected model for this defensive patch-comparison workflow.
+
 ## Establish the comparison
 
 1. Read the MSRC page and retrieve its CVRF record with
