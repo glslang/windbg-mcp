@@ -38,11 +38,18 @@
 - A `NOT REACHABLE` also says when part of the graph it explored **could not be seen**. An
   instruction whose bytes will not read, or whose encoding this build does not decode, stops the
   walk where it is; the report counts those, withholds the claim that the reachable call graph was
-  fully explored, and names the remedy. On a kernel minidump that is the ordinary case rather than
-  a corner of one: a minidump carries no driver code pages at all until an executable image path is
-  set and the module reloaded. Such an instruction is a **barrier** and is never stepped over —
-  skipping it would join the instruction before it to whatever follows and invent an edge, which is
-  the one thing a sound `REACHABLE` verdict must never rest on.
+  fully explored, and names the remedy. Such an instruction is a **barrier** and is never stepped
+  over — skipping it would join the instruction before it to whatever follows and invent an edge,
+  which is the one thing a sound `REACHABLE` verdict must never rest on.
+- On a **dump**, whether a driver's code reads at all depends on whether the engine can obtain its
+  image, and the dump's type does not predict it — probe rather than assume. Measured on the
+  x64 kernel minidump under `docs/samples/`, with no executable image path set: every code RVA
+  probed across `mountmgr` read and the walk returned a complete answer. What a dump never yields
+  is a driver's **writable** pages, so the import address table reads as `????` however the code is
+  obtained — which is why imports are named from the read-only import lookup table and no slot is
+  ever dereferenced. When code will not read, the remedies are a symbol path that can serve the
+  image binary (the Microsoft symbol server serves images as well as symbols) or `.exepath` plus
+  `.reload /f` for a driver it does not have.
 - The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`) walk the allocator's own
   descriptors through dbgscope rather than shelling out to `!pool`/`!poolused`, so all four read
   one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.

@@ -956,16 +956,18 @@ pub(crate) fn format_report(r: &Report) -> String {
             )),
         }
         // The third way a NOT REACHABLE can be incomplete, beside a bound and a halt, and the one
-        // whose remedy is neither a larger number nor a longer clock. A walk that stopped at bytes
-        // it could not read explored a graph with holes in it — and on a kernel minidump, which
-        // carries no driver code pages at all until an image search path is set, that is the
-        // normal case rather than a corner of one.
+        // whose remedy is neither a larger number nor a longer clock: a walk that stopped at bytes
+        // it could not read explored a graph with holes in it. The remedy names both routes to an
+        // image and claims nothing about how often this happens — measured on the sample kernel
+        // minidump, a driver's whole image reads with no executable image path set at all, so the
+        // dump's type does not predict it.
         if r.blind > 0 {
             out.push_str(&format!(
                 "  Not fully visible: the walk stopped at {} reachable instruction(s) whose bytes \
                  could\n           not be read, or whose encoding this build does not decode. On a \
-                 dump that is\n           usually missing code pages, set an executable image path \
-                 and `.reload /f`.\n",
+                 dump the image is\n           what supplies code: use a symbol path that serves \
+                 image binaries, or set an\n           executable image path and `.reload /f` for a \
+                 driver it does not have.\n",
                 r.blind
             ));
         }
@@ -1458,10 +1460,10 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
     /// A walk that stopped at bytes it could not read must not report a clean sweep.
     ///
     /// This is the halt rule one step along, for a fact about the *target* rather than about this
-    /// server's patience — and with a remedy neither of the other two has. A kernel minidump
-    /// carries no driver code pages at all until an executable image path is set, so a NOT
-    /// REACHABLE from one is routinely a verdict about what could not be read; rendered as "the
-    /// reachable call graph was fully explored" it reads as proof the code is not there.
+    /// server's patience — and with a remedy neither of the other two has. On a dump a driver's
+    /// code reads only if the engine can obtain its image, so a NOT REACHABLE from one can be a
+    /// verdict about what could not be read; rendered as "the reachable call graph was fully
+    /// explored" it reads as proof the code is not there.
     #[test]
     fn a_walk_that_could_not_read_the_code_does_not_claim_a_full_sweep() {
         let blind = functions(&[(

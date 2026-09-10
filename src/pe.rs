@@ -9,11 +9,15 @@
 //!
 //! The obvious implementation reads the pointer in the import address table and asks the engine
 //! what symbol it resolves to. **That does not work on a dump**, and the measurement is worth
-//! keeping: against `docs/samples/081226-2187-01.dmp`, a kernel minidump carries no driver pages
-//! at all, and an executable image search path brings back only what the *file* can supply —
-//! headers, `.text`, and the read-only import structures. The IAT is writable, its runtime
-//! contents were never captured, and the file cannot stand in for them: `dps mountmgr+0x9000 L6`
-//! is six rows of `????????` on a session where the same image's code disassembles perfectly.
+//! keeping: against `docs/samples/081226-2187-01.dmp`, `db mountmgr+0x9000` is rows of `????????`
+//! on a session where every other RVA probed across the same image reads and the code
+//! disassembles perfectly. The IAT is writable, its runtime contents were never captured, and no
+//! image file can stand in for them — whatever supplies the code, that page is gone.
+//!
+//! Which is the durable half of it. Whether a driver's *code* reads on a dump varies with what the
+//! engine can obtain, and is not predicted by the dump's type: the same minidump reads mountmgr's
+//! whole image with no executable image path set at all. So the rule below is not a workaround for
+//! a cold session — it is the only way a slot is ever named, on a live target as much as on a dump.
 //!
 //! So a slot is named **structurally**. `OriginalFirstThunk` — the import *lookup* table — lives
 //! in a read-only section and holds one entry per import, in the same order as the IAT, so the
@@ -27,6 +31,18 @@
 //! [`crate::walk::run`] does, so the parsing tests against a fake address space and the worker
 //! supplies the one closure that touches DbgEng. A read that fails is [`PeError::Unreadable`]
 //! naming what could not be read, never a zero silently parsed as a structure.
+//!
+//! # This belongs in dbgscope, and not yet
+//!
+//! Reading an image out of a target is a primitive, and dbgscope is where the target-memory
+//! abstractions live — so this is tracked to move there
+//! ([dbgscope#150](https://github.com/glslang/dbgscope/issues/150)). Not now: its only consumer
+//! today is its own tests, and a shape lifted before a real consumer has exercised it is the wrong
+//! shape frozen. The moment is once `driver_hazards` is naming call sites from it. The issue lists
+//! the properties a lift must keep — the reader closure, the halt, the two error kinds, and
+//! refusing rather than truncating — which are the same properties that ruled out a third-party
+//! parser: `goblin`, `object` and `pelite` all want a contiguous slice, and a loaded image in a
+//! dump has holes in it.
 
 // Nothing outside the tests reads this module yet — the driver tools that will are the next
 // commits — and twenty `dead_code` warnings would bury a real one in the meantime. **Delete this
