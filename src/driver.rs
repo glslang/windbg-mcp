@@ -588,6 +588,13 @@ pub(crate) fn path_recipe(
         }
         recipes.push(SegmentRecipe { start, goal, steps });
     }
+    // Polled once more after the loop, for the reason the walk needs the same thing: the poll at
+    // the top of an iteration cannot see a halt that lands *inside* the disassembler on the last
+    // segment. There `uf` returns `None`, the arm continues, the loop ends — and a recipe missing
+    // its final segment would render as the whole of one.
+    if stopped.is_none() {
+        stopped = halt();
+    }
     (recipes, stopped)
 }
 
@@ -894,6 +901,7 @@ pub(crate) fn format_report(r: &Report) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::cell::Cell;
 
     /// A walk that is never asked to stop. Named rather than a bare closure at every call site,
     /// so a test that *is* about halting reads differently from the fifteen that are not.
@@ -1196,6 +1204,70 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(none, None);
         assert!(!format_recipe(&whole, none).contains("INCOMPLETE"));
+    }
+
+    /// A halt that lands *inside* the disassembler on the **final** segment still shortens the
+    /// recipe, and must still say so.
+    ///
+    /// The poll at the top of an iteration cannot see it: by the time the deadline is reached the
+    /// last segment has already been admitted, and what the worker's closure does is record the
+    /// halt and answer `None`. That arm continues, the loop ends, and without the poll after it
+    /// the recipe renders as a complete one — a caller satisfying every condition in it would
+    /// still not put control on the target. This is the same gap as the walk's, one function
+    /// along, and it is invisible to the mid-recipe test above because that one halts *between*
+    /// segments where the top poll can see it.
+    #[test]
+    fn a_halt_inside_the_last_segments_disassembly_still_shortens_the_recipe() {
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![
+                        insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+18h],222003h"),
+                        insn(0x1008, Flow::Branch(Some(0x1014)), "jne A+0x14"),
+                        insn(0x100c, Flow::Call(Some(0x2000)), "call A!B"),
+                        insn(0x1011, Flow::Return, "ret"),
+                        insn(0x1014, Flow::Return, "ret"),
+                    ],
+                ),
+            ),
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
+            ),
+        ]);
+        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        assert!(rpt.verdict_reachable);
+
+        // The shape the worker has: the deadline is noticed by whatever fetches the listing, which
+        // records it and answers with no listing. Nothing else ever reports it.
+        let recorded: Cell<Option<Halt>> = Cell::new(None);
+        let (recipes, stopped) = path_recipe(
+            "start",
+            None,
+            &rpt,
+            |a| {
+                if a == "0x2000" {
+                    recorded.set(Some(Halt::Deadline));
+                    return None;
+                }
+                m.get(a).cloned()
+            },
+            || recorded.get(),
+        );
+
+        assert_eq!(
+            recipes.len(),
+            1,
+            "the second segment never decoded: {recipes:?}"
+        );
+        assert_eq!(
+            stopped,
+            Some(Halt::Deadline),
+            "a halt inside the last segment's decode must reach the rendering"
+        );
+        assert!(format_recipe(&recipes, stopped).contains("INCOMPLETE"));
     }
 
     /// The runs a real `uf` listing groups into, and where its gaps actually are.

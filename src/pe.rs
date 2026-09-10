@@ -137,7 +137,34 @@ impl Image {
         self.sections.iter().filter(|section| section.executable())
     }
 
-    /// An RVA as a virtual address in this image.
+    /// An RVA as a virtual address in this image, **checked against the image's own bounds**.
+    ///
+    /// The one door. An RVA past `SizeOfImage` added to the base lands in whatever is mapped next
+    /// — on a live target, the next module — and every use of that address is then about some
+    /// other image with nothing to say so. Whether the address is *read* or merely *reported* does
+    /// not change that: an import slot this crate never dereferences is still an address a caller
+    /// will attribute to this image, so it comes through here too. `len` is what will be reached
+    /// from it, and zero asks only whether the start is inside.
+    pub fn checked_va(&self, rva: u32, len: usize) -> Result<u64, PeError> {
+        let end = u64::from(rva)
+            .checked_add(len as u64)
+            .ok_or(PeError::Malformed {
+                reason: "an image offset and length overflowed",
+            })?;
+        if rva >= self.size_of_image || end > u64::from(self.size_of_image) {
+            return Err(PeError::Malformed {
+                reason: "an image offset points outside the image",
+            });
+        }
+        self.base
+            .checked_add(u64::from(rva))
+            .ok_or(PeError::Malformed {
+                reason: "an image address overflowed",
+            })
+    }
+
+    /// An RVA as a virtual address, unchecked. Prefer [`Self::checked_va`]; this is for a caller
+    /// that has already bounded the RVA itself.
     pub fn va(&self, rva: u32) -> u64 {
         self.base + u64::from(rva)
     }
@@ -310,8 +337,18 @@ pub fn read_imports(
     mut halt: impl FnMut() -> bool,
 ) -> Result<ImportTable, PeError> {
     let (directory, size) = image.import_directory;
-    if directory == 0 || size == 0 {
-        return Ok(ImportTable::default());
+    // Absent means **both** are zero. One of the two alone is a directory whose coordinates
+    // disagree, and reading that as "no imports" is the silent wrong answer this module keeps
+    // being asked not to give: a nonzero RVA with a zero size hides a real descriptor table, and a
+    // hazard scan over it reports no dangerous imports.
+    match (directory, size) {
+        (0, 0) => return Ok(ImportTable::default()),
+        (0, _) | (_, 0) => {
+            return Err(PeError::Malformed {
+                reason: "the import directory has a size without an address, or the reverse",
+            });
+        }
+        _ => {}
     }
     // Every read is bounded by the image, and the arithmetic is checked.
     //
@@ -323,19 +360,12 @@ pub fn read_imports(
     // is legitimately shorter than the bounded read asks for, and a structure that comes back
     // short fails its own field parse.
     let mut at = |rva: u32, len: usize| -> Result<Vec<u8>, PeError> {
-        if rva >= image.size_of_image {
-            return Err(PeError::Malformed {
-                reason: "an import table entry points outside the image",
-            });
-        }
-        let room = (image.size_of_image - rva) as usize;
+        // Clipped to the image rather than refused for overrunning it: a name near the end is
+        // legitimately shorter than the bounded read asks for, and a fixed-size structure that
+        // comes back short fails its own field parse. The *start* is still bounded.
+        let room = image.size_of_image.saturating_sub(rva) as usize;
         let len = len.min(room);
-        let address = image
-            .base
-            .checked_add(u64::from(rva))
-            .ok_or(PeError::Malformed {
-                reason: "an import table entry's address overflowed",
-            })?;
+        let address = image.checked_va(rva, len)?;
         read(address, len).ok_or(PeError::Unreadable { at: address, len })
     };
 
@@ -385,7 +415,15 @@ pub fn read_imports(
             if halt() {
                 return Err(PeError::Interrupted);
             }
-            let slot = image.va(iat) + (slot_index * pointer) as u64;
+            // Never dereferenced, and still bounded: a caller attributes this address to *this*
+            // image, so a `FirstThunk` outside it would have an indirect call into a neighbour
+            // reported as this driver's import.
+            let slot_rva = u32::try_from(iat as usize + slot_index * pointer).map_err(|_| {
+                PeError::Malformed {
+                    reason: "an import address table entry lies outside a 32-bit image offset",
+                }
+            })?;
+            let slot = image.checked_va(slot_rva, pointer)?;
             let entry_rva = lookup + (slot_index * pointer) as u32;
             let entry = at(entry_rva, pointer)?;
             let value = match image.bitness {
@@ -671,6 +709,53 @@ mod tests {
         assert_eq!(
             read_imports(&image, |at, len| fake.read(at, len), || false).unwrap(),
             ImportTable::default()
+        );
+    }
+
+    /// Absent is **both** coordinates zero. One without the other is a contradiction, and the
+    /// tempting reading of it — "close enough to absent" — is the silent wrong answer: a nonzero
+    /// RVA with a zero size hides a real descriptor table, and a hazard scan over the result
+    /// reports a driver that imports nothing dangerous because it read nothing at all.
+    #[test]
+    fn an_import_directory_with_one_coordinate_missing_is_refused() {
+        for (rva, size, what) in [
+            (0x2000u32, 0u32, "an address with no size"),
+            (0, 40, "a size with no address"),
+        ] {
+            let mut fake = driver_image();
+            put(&mut fake.bytes, 0x170, &rva.to_le_bytes());
+            put(&mut fake.bytes, 0x174, &size.to_le_bytes());
+
+            let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+            let read = read_imports(&image, |at, len| fake.read(at, len), || false);
+            assert!(
+                matches!(read, Err(PeError::Malformed { .. })),
+                "{what} is not an absent directory: {read:?}"
+            );
+        }
+    }
+
+    /// A slot this crate never dereferences is still bounded by the image.
+    ///
+    /// The import address table is the one address here that is *reported* rather than read, and
+    /// that is exactly why the bound is easy to leave off it. It does not help: a caller matching
+    /// an indirect call against these slots attributes them to this image, so a `FirstThunk`
+    /// running past the end would name a neighbouring module's memory as this driver's import.
+    /// The read side cannot catch it, because there is no read.
+    #[test]
+    fn an_import_slot_past_the_end_of_the_image_is_refused_though_it_is_never_read() {
+        let mut fake = driver_image();
+        // Eight bytes short of the end: the first slot fits exactly, the second does not.
+        put(&mut fake.bytes, 0x2010, &0x3ff8u32.to_le_bytes());
+        // And nothing in that range reads, which is what says the refusal came from the bound.
+        fake.unreadable.push((BASE + 0x3ff8, BASE + 0x4008));
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        assert_eq!(image.size_of_image, 0x4000);
+        let read = read_imports(&image, |at, len| fake.read(at, len), || false);
+        assert!(
+            matches!(read, Err(PeError::Malformed { .. })),
+            "a slot past the image must not be handed back as this image's: {read:?}"
         );
     }
 
