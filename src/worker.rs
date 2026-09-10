@@ -33,7 +33,7 @@
 //! can ask for the same thing, and the binding ([`Running`]) that decides *which job* the request
 //! reaches. See `AGENTS.md` and the `DECISIONS.md` entry for the invariant and its boundary.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::num::NonZeroUsize;
 use std::os::windows::io::{AsRawHandle, FromRawHandle, RawHandle};
@@ -44,8 +44,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
-    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, InterruptHandle, Interruption,
-    RunToOutcome, WaitOutcome,
+    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, Instruction, InterruptHandle,
+    Interruption, RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
@@ -57,8 +57,8 @@ use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
 use crate::driver::{
-    fmt_addr, format_recipe, format_report, parse_lm_base, parse_windbg_addr, path_recipe,
-    reachability,
+    fmt_addr, format_recipe, format_report, listing_runs, parse_lm_base, parse_windbg_addr,
+    path_recipe, reachability,
 };
 use crate::fault;
 use crate::proto::{
@@ -6245,12 +6245,48 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp) -> Result<String, String> {
     let seed_start = resolve(e, &args.from);
 
     // A real `uf` lists backtick addresses or at least a "module!Func:" label; error text
-    // ("Couldn't resolve...", "no code") lacks both and prunes the branch. parse_uf then
-    // discards any non-disassembly. Held in a `&mut` binding so the same disassembler drives
-    // both the walk and the recipe.
-    let mut uf = |arg: &str| match e.execute_command(&format!("uf {arg}")) {
-        Ok(t) if t.contains('`') || t.contains(':') => Some(t),
-        _ => None,
+    // ("Couldn't resolve...", "no code") lacks both and prunes the branch. Held in a `&mut`
+    // binding so the same disassembler drives both the walk and the recipe.
+    //
+    // **`uf` is still run, and only its address column is still read.** It is the one thing that
+    // knows which addresses belong to a function — MSVC splits one across several unwind regions,
+    // and no encoding says where a function ends — so it answers the extent, and the engine's
+    // typed disassembly answers everything else. That is the whole of the text dependency this
+    // walk now has, against a mnemonic table and an operand parser before it.
+    let mut uf = |arg: &str| -> Option<Vec<Instruction>> {
+        let text = match e.execute_command(&format!("uf {arg}")) {
+            Ok(t) if t.contains('`') || t.contains(':') => t,
+            _ => return None,
+        };
+        let listing: Vec<u64> = text
+            .lines()
+            .filter_map(|line| line.split_whitespace().next().and_then(parse_windbg_addr))
+            .collect();
+        if listing.is_empty() {
+            return None;
+        }
+        // Fetched in **runs** rather than one instruction at a time: consecutive listing lines
+        // are contiguous inside a region, so a function is a handful of calls rather than one
+        // per instruction. A gap wider than the longest x86 instruction starts a new run, which
+        // is also what separates one region from the next.
+        let mut decoded: HashMap<u64, Instruction> = HashMap::new();
+        for (start, count) in listing_runs(&listing) {
+            decoded.extend(
+                e.disassemble(start, count)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|instruction| (instruction.address, instruction)),
+            );
+        }
+        // Emitted in the **listing's** order, not in address order. The walk takes the next
+        // element as an instruction's fall-through, and for a function split across regions
+        // those two orders are not the same.
+        Some(
+            listing
+                .iter()
+                .filter_map(|address| decoded.remove(address))
+                .collect(),
+        )
     };
 
     let rpt = reachability(
