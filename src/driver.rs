@@ -57,7 +57,7 @@ pub(crate) fn parse_windbg_addr(tok: &str) -> Option<u64> {
 /// the one thing it uniquely knows and the encoding cannot say: **which addresses belong to this
 /// function**, across the several unwind regions MSVC splits one into. That parse is now the
 /// address column alone.
-use dbgscope::dbgeng::{Flow, Instruction};
+use dbgscope::dbgeng::{Effect, Flow, Instruction};
 
 /// Shared with [`crate::walk`] rather than duplicated: "the caller's patience ran out" and
 /// "somebody asked this session to stop" are the same two facts here as there, and a second
@@ -188,8 +188,12 @@ pub(crate) fn in_listing_order(
                 mnemonic: String::new(),
                 operands: Vec::new(),
                 flow: Flow::Unreadable,
-                // Nothing decoded, so nothing is claimed — the same "not asked" the flow says.
+                // Nothing decoded, so nothing is claimed — the same "not asked" the flow says,
+                // and the same answer every field the decoder fills gives here.
                 privileged: false,
+                effect: Effect::Other,
+                condition: None,
+                writes_flags: false,
             })
         })
         .collect()
@@ -1211,6 +1215,10 @@ mod tests {
             flow,
             // The walk asks nothing about privilege; `crate::hazards` is where that is read.
             privileged: false,
+            // Nor about what the instruction does to its operands: it reads the flow and the text.
+            effect: Effect::Other,
+            condition: None,
+            writes_flags: false,
         }
     }
 
