@@ -6550,7 +6550,18 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     // structure — which on a dump is the ordinary case for anything outside the read-only
     // sections. `read_memory` is bounded by its own size rather than by the clock; these are
     // header-sized reads, not a walk.
-    let read = |at: u64, len: usize| e.read_memory(at, len).ok();
+    // **The reader is confined to the module, so no header field can send it out.** Bounding the
+    // *image* is not enough and the ordering is why: `read_image` locates the section table from
+    // `SizeOfOptionalHeader`, which is a number in the image being parsed, and reads it before any
+    // caller has had a chance to apply an extent. Every other field is the same shape. Putting the
+    // bound on the reader puts it before all of them at once, and leaves nothing to order.
+    //
+    // A read that would cross the end is refused rather than clipped, which comes back as
+    // `PeError::Unreadable` naming what could not be read — true, and the same answer those bytes
+    // would give if the module simply ended there.
+    let read = |at: u64, len: usize| {
+        within_module(base, loaded_size, at, len).then(|| e.read_memory(at, len).ok())?
+    };
     let mut image = pe::read_image(base, read).map_err(|why| pe_failure(module, &why, None))?;
     // **The loader's extent wins.** `SizeOfImage` is read out of the image's own header, which on
     // an untrusted driver is memory that driver may have written: advertise a larger one and every
@@ -6611,6 +6622,24 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     let report =
         hazards::structured_report(module, base, &scan, |address| attributor.locate(e, address));
     Ok(Output::typed(hazards::render(&report), report))
+}
+
+/// Whether a read falls inside the module the loader mapped.
+///
+/// `size` of zero means the engine reported none, in which case there is nothing to bound against
+/// and the read goes ahead — the state this was in before the bound existed, kept rather than
+/// turned into a refusal of every read on a target that cannot say how big its modules are.
+fn within_module(base: u64, size: u32, at: u64, len: usize) -> bool {
+    if size == 0 {
+        return true;
+    }
+    let Some(end) = at.checked_add(len as u64) else {
+        return false;
+    };
+    let Some(module_end) = base.checked_add(u64::from(size)) else {
+        return false;
+    };
+    at >= base && end <= module_end
 }
 
 /// The extent to trust for an image: the smaller of what its header claims and what the loader
@@ -7108,6 +7137,71 @@ mod tests {
              including the ones inside a helper: `resolve` runs an unbounded `? <expr>`, and a \
              symbol fetch there blocks the session's one thread with no poll able to run. Use \
              `resolve_within` with what `remaining` reports."
+        );
+    }
+
+    /// Every read the PE parser makes is confined to the module the loader mapped.
+    ///
+    /// Bounding the *image* is not enough, and the ordering is the reason: `read_image` locates the
+    /// section table from `SizeOfOptionalHeader`, a number in the image being parsed, and reads it
+    /// before any caller can apply an extent. Every other header field is the same shape. The bound
+    /// belongs on the reader, where it precedes all of them at once and there is no order to get
+    /// wrong.
+    #[test]
+    fn the_pe_reader_cannot_leave_the_module() {
+        let base = 0xffff_f800_0000_0000u64;
+        let size = 0x10000u32;
+        assert!(within_module(base, size, base, 64), "the header page is in");
+        assert!(
+            within_module(base, size, base + 0xfff0, 16),
+            "and so is a read ending exactly at the end"
+        );
+        assert!(
+            !within_module(base, size, base + 0xfff0, 17),
+            "one byte past it is not"
+        );
+        assert!(
+            !within_module(base, size, base - 8, 64),
+            "and neither is one starting before the module"
+        );
+        assert!(
+            !within_module(base, size, base + 0x20000, 8),
+            "nor the next image entirely"
+        );
+        assert!(
+            !within_module(base, size, u64::MAX - 4, 64),
+            "a length that overflows is refused rather than wrapped"
+        );
+        assert!(
+            within_module(base, 0, base + 0x100000, 8),
+            "an engine that reported no size leaves nothing to bound against"
+        );
+
+        // And that the scan's reader is the bounded one. The closure needs an engine, so what is
+        // checked is that it is still built from this.
+        let code = include_str!("worker.rs")
+            .split_once(
+                "
+#[cfg(test)]",
+            )
+            .expect("this module has a test half")
+            .0;
+        let body = code
+            .split_once(
+                "
+fn driver_hazards(",
+            )
+            .expect("this module has a `driver_hazards`")
+            .1;
+        let body = body
+            .split_once(
+                "
+fn ",
+            )
+            .map_or(body, |(body, _)| body);
+        assert!(
+            body.contains("within_module(base, loaded_size, at, len)"),
+            "`driver_hazards` reads the image unbounded again, so a header field can send the              parser into whatever is mapped after the module."
         );
     }
 
