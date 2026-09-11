@@ -7086,6 +7086,38 @@ mod tests {
         );
     }
 
+    /// The driver scan runs **no debugger command at all**, which is what lets its `module`
+    /// argument go unscreened.
+    ///
+    /// The tool used to reject a name containing a command separator, because the name reached
+    /// `lm m <module>`. It is matched against the typed module inventory now, so the screen
+    /// protected nothing and refused something — a loaded module whose name legally contains a
+    /// separator would be listed by `modules` and then turned away here as an injection attempt.
+    ///
+    /// Removing a screen is only as safe as the reason it is unnecessary, and that reason is a
+    /// property of this function rather than a promise about it. If a command ever comes back to
+    /// this path, the caller's text becomes grammar again and this fails rather than the screen
+    /// being missed.
+    #[test]
+    fn the_driver_scan_runs_no_command() {
+        let code = include_str!("worker.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this module has a test half")
+            .0;
+        let body = code
+            .split_once("\nfn driver_hazards(")
+            .expect("this module has a `driver_hazards`")
+            .1;
+        let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
+        assert!(
+            !body.contains("execute_command"),
+            "`driver_hazards` builds a debugger command again. Its `module` argument is a \
+             caller's text and is no longer screened for the separators that would run a second \
+             one, because nothing interpolated it — restore the screen, or resolve through the \
+             typed inventory as this does."
+        );
+    }
+
     /// The preliminaries carry the deadline too, and a run they cut short yields no value.
     ///
     /// Resolving `address`, resolving `from` and reading a module's base all run **before** the

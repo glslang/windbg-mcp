@@ -4444,11 +4444,13 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<DriverHazardsArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        // `module` reaches `lm m <module>`, so it is screened for the separators that would run a
-        // second command — the same door `reachable_from_dispatch`'s operands go through.
-        if let Err(e) = reject_command_breakers("module", &args.module, Quotes::Rejected) {
-            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id.clone());
-        }
+        // **No command-breaker screen, and its removal is the point rather than an omission.**
+        // `module` reached `lm m <module>` in the first draft, so it was screened for the
+        // separators that would run a second command. It is matched against the module inventory
+        // now and never interpolated into anything, so the screen protects nothing and refuses
+        // something: a loaded module whose name legally contains a separator would be listed by
+        // `modules` and then rejected here as an injection attempt. A screen is for text that
+        // reaches a grammar, and this text no longer does.
         let out = self
             .run(
                 args.session_id.as_deref(),

@@ -398,7 +398,17 @@ pub fn scan(
     let mut halted = None;
     let mut cap_hit = false;
 
-    'sections: for section in image.code_sections() {
+    // **Sorted, and each range clamped past the last**, so every byte is decoded at most once. A
+    // malformed header can declare two executable sections covering the same addresses, and
+    // scanning both counts every call site and every privileged instruction in the overlap twice
+    // — which would make `call_site_count` and `privileged_count`, documented as exact, quietly
+    // inflated. Clamping rather than refusing, because the bytes are real and scanning them once
+    // is the right answer; what is dropped is the second visit, not the code.
+    let mut code: Vec<&pe::Section> = image.code_sections().collect();
+    code.sort_by_key(|section| section.rva);
+    let mut past = 0u64;
+
+    'sections: for section in code {
         // **The whole span, not just its start.** `checked_va(rva, 0)` asks only whether the
         // section begins inside the image, and a header claiming a `virtual_size` that runs past
         // `SizeOfImage` would then have this decode straight out of the module and into whatever
@@ -434,7 +444,9 @@ pub fn scan(
             }
         };
 
-        let mut at = start;
+        // The overlap with everything already scanned is skipped rather than decoded again.
+        let mut at = start.max(past);
+        past = past.max(end);
         // One entry per **contiguous** decoded run rather than one per section. A section with a
         // hole in it used to come back as a single range starting where the section starts and
         // counting only the bytes that read — a shape that cannot say where the hole was, and
@@ -1232,6 +1244,64 @@ mod tests {
         assert_eq!(
             sink.call_site_count, found.privileged_count,
             "the fixture emits one of each per pair, so the two counts agree — which is what says              both are counting rather than both being capped"
+        );
+    }
+
+    /// Overlapping executable sections are decoded **once**, so the counts stay exact.
+    ///
+    /// A malformed header can declare two sections covering the same addresses. Scanned per
+    /// section, every call site and every privileged instruction in the overlap is counted twice —
+    /// and those counts are documented as exact, which is precisely the kind of claim that is worth
+    /// nothing once it is quietly wrong. The bytes are real, so the second visit is what is
+    /// dropped rather than the code.
+    #[test]
+    fn overlapping_executable_sections_are_decoded_once() {
+        let mut image = image();
+        // A second executable section covering the first, declared after it.
+        image.sections.push(pe::Section {
+            name: ".text2".to_string(),
+            rva: 0x1000,
+            virtual_size: 0x100,
+            characteristics: 0x6000_0020,
+        });
+        let imports = [import("memcpy", BASE + 0x3008)];
+        let block = vec![
+            call_slot(BASE + 0x1000, BASE + 0x3008),
+            insn(BASE + 0x1006, "f4", "hlt", Flow::Trap, Vec::new()),
+            insn(BASE + 0x1007, "c3", "ret", Flow::Return, Vec::new()),
+        ];
+
+        let run = |image: &pe::Image| {
+            let mut decoded_from: Vec<u64> = Vec::new();
+            let found = scan(
+                image,
+                &imports,
+                |at, _| {
+                    decoded_from.push(at);
+                    (at == BASE + 0x1000).then(|| block.clone())
+                },
+                never,
+            );
+            (found, decoded_from)
+        };
+
+        let (found, overlapped) = run(&image);
+        assert_eq!(
+            found.sinks[0].call_site_count, 1,
+            "the overlapping range is not counted twice: {:?}",
+            found.sinks
+        );
+        assert_eq!(found.privileged_count, 1, "{:?}", found.privileged);
+
+        // And it costs nothing to decode either: the same image without the duplicate section asks
+        // the decoder exactly the same questions. Compared rather than asserted as a literal,
+        // because a section is scanned in windows and the number of them is not the point.
+        let mut single = image.clone();
+        single.sections.pop();
+        let (_, plain) = run(&single);
+        assert_eq!(
+            overlapped, plain,
+            "the overlap is skipped, not decoded again: {overlapped:x?}"
         );
     }
 
