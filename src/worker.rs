@@ -6339,25 +6339,59 @@ fn resolve(e: &DebugEngine, expr: &str) -> Option<u64> {
 /// A run that was **cut short parses nothing**: the output up to a Ctrl+Break is a prefix, and a
 /// prefix of an evaluator's answer is a number that is not the one asked for. The local fallbacks
 /// below it still apply, since they read the caller's own text and need no engine at all.
-fn resolve_within(e: &DebugEngine, expr: &str, budget: u32) -> Option<u64> {
-    e.execute_command_bounded(&format!("? {expr}"), budget)
+fn resolve_within(e: &DebugEngine, expr: &str, budget: u32) -> Result<Option<u64>, Interruption> {
+    let evaluated = e
+        .execute_command_bounded(&format!("? {expr}"), budget)
         .ok()
-        .and_then(evaluated)
+        .map(finished)
+        .transpose()?
+        .flatten();
+    Ok(evaluated
         .as_deref()
         .and_then(parse_eval)
+        // The local fallbacks read the caller's own text and need no engine, so they still apply
+        // to a `?` that simply did not answer.
         .or_else(|| parse_windbg_addr(expr))
-        .or_else(|| parse_u64(expr).ok())
+        .or_else(|| parse_u64(expr).ok()))
 }
 
-/// The output of an evaluation that **finished**, or nothing.
+/// The output of a command that **finished**, or the interruption that stopped it.
 ///
-/// A named function rather than a `filter` at the call site, because what it refuses is a value
-/// rather than an error: the text a Ctrl+Break leaves behind is a *prefix* of the evaluator's
-/// answer, and a prefix of a number parses perfectly well into a different number. That is a wrong
-/// address to walk from, reported as an address the caller asked for, and nothing downstream can
-/// tell. Discarding it costs the local fallbacks nothing — they read the caller's own text.
-fn evaluated(run: CommandRun) -> Option<String> {
-    run.cut_short.is_none().then_some(run.output)
+/// Two rules in one place, and the second is what a first version of this got wrong by returning
+/// an `Option`. A cut-short run's text is a *prefix*: a prefix of an evaluator's answer parses into
+/// a different number, and a prefix of a module listing can carry enough of an address token to
+/// parse as a base — either is a wrong value reported as the one that was asked for. And **the
+/// reason has to survive**, because a caller told "could not resolve that symbol" when what
+/// happened was their own `interrupt`, or this call's clock, is sent to check a symbol that was
+/// fine. The same distinction `resolve_start` draws for the allocator walk, one op along.
+fn finished(run: CommandRun) -> Result<Option<String>, Interruption> {
+    match run.cut_short {
+        Some(why) => Err(why),
+        None => Ok(Some(run.output)),
+    }
+}
+
+/// A command this op stopped, as the failure its caller branches on.
+///
+/// `what` names the step, for the reason [`remaining`] does: these run before the walk, so "your
+/// symbol is wrong" and "you interrupted it" and "the clock ran out" are three different next
+/// moves and only one of them is about the argument.
+fn cut_short_failure(why: Interruption, what: &str) -> Failed {
+    match why {
+        Interruption::Deadline { after_ms } => Failed::categorised(
+            structured::ErrorCategory::Timeout,
+            format!(
+                "{what} was still running after {after_ms}ms, which was all the time this call \
+                 had left, so it was stopped and the walk never began. Resolving a symbol can \
+                 send the debugger to a symbol server: pass a numeric address instead, or raise \
+                 the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS)."
+            ),
+        ),
+        Interruption::OnRequest => Failed::categorised(
+            structured::ErrorCategory::Interrupted,
+            format!("{what} was interrupted before the walk began, so nothing was read."),
+        ),
+    }
 }
 
 fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, Failed> {
@@ -6525,6 +6559,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
                 a,
                 remaining(deadline, "the target address was resolved")?,
             )
+            .map_err(|why| cut_short_failure(why, &format!("resolving `address` = `{a}`")))?
             .ok_or_else(|| {
                 Failed::categorised(
                     structured::ErrorCategory::Debugger,
@@ -6534,19 +6569,27 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         }
         (None, Some(m), Some(r)) => {
             let rva = resolve_within(e, r, remaining(deadline, "the rva was resolved")?)
+                .map_err(|why| cut_short_failure(why, &format!("resolving `rva` = `{r}`")))?
                 .ok_or_else(|| {
                     Failed::categorised(
                         structured::ErrorCategory::Debugger,
                         format!("could not resolve rva `{r}`"),
                     )
                 })?;
+            // The listing goes through the same door as the evaluation, and for the sharper half
+            // of its reason: a prefix of `lm` can carry enough of an address token to parse as a
+            // base, and a wrong base makes every RVA in the answer wrong with nothing to say so.
             let lm = e
                 .execute_command_bounded(
                     &format!("lm m {m}"),
                     remaining(deadline, "the module's base was read")?,
                 )
-                .map_err(|why| Failed::from(es(why)))?
-                .output;
+                .map_err(|why| Failed::from(es(why)))
+                .and_then(|run| {
+                    finished(run)
+                        .map_err(|why| cut_short_failure(why, &format!("reading `{m}`'s base")))
+                })?
+                .unwrap_or_default();
             let base = parse_lm_base(&lm).ok_or_else(|| {
                 Failed::categorised(
                     structured::ErrorCategory::Debugger,
@@ -6571,7 +6614,11 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
     // Resolve `from` to a numeric VA so a mid-function start (a handler scoped past a switch)
     // is honored; `None` (unresolvable) starts at the entry.
-    let seed_start = resolve_within(e, &args.from, remaining(deadline, "`from` was resolved")?);
+    // A `from` that will not resolve starts the walk at the entry, which is an answer. A `from`
+    // whose resolution was **stopped** is not: the walk would silently begin somewhere else and
+    // report a verdict about a different question, so it propagates.
+    let seed_start = resolve_within(e, &args.from, remaining(deadline, "`from` was resolved")?)
+        .map_err(|why| cut_short_failure(why, &format!("resolving `from` = `{}`", args.from)))?;
 
     // A real `uf` lists backtick addresses or at least a "module!Func:" label; error text
     // ("Couldn't resolve...", "no code") lacks both and prunes the branch. Held in a `&mut`
@@ -6885,26 +6932,42 @@ mod tests {
             "a live deadline is a budget"
         );
 
-        // And the value half: a finished run is read, a broken one is not.
-        let finished = CommandRun {
+        // And the value half: a finished run is read, a broken one yields the reason instead.
+        let ran = CommandRun {
             output: "Evaluate expression: 4096 = 00000000`00001000".to_string(),
             cut_short: None,
             target_gone: false,
         };
-        assert!(evaluated(finished).is_some());
-        for why in [
-            Interruption::OnRequest,
-            Interruption::Deadline { after_ms: 10 },
+        assert!(finished(ran).expect("nothing stopped it").is_some());
+        for (why, category) in [
+            (
+                Interruption::OnRequest,
+                structured::ErrorCategory::Interrupted,
+            ),
+            (
+                Interruption::Deadline { after_ms: 10 },
+                structured::ErrorCategory::Timeout,
+            ),
         ] {
             let broken = CommandRun {
-                output: "Evaluate expression: 40".to_string(),
+                // Long enough to parse as an address on its own, which is the point: a prefix of
+                // an answer is not a shorter answer, it is a different one.
+                output: "Evaluate expression: 4096 = 00000000`0000".to_string(),
                 cut_short: Some(why),
                 target_gone: false,
             };
             assert_eq!(
-                evaluated(broken),
-                None,
-                "{why:?}: a prefix of an answer is not a shorter answer"
+                finished(broken).expect_err("a stopped run is not a value"),
+                why
+            );
+            // And the reason reaches the caller as their own next move rather than as a symbol
+            // they should go and check.
+            let failure = cut_short_failure(why, "resolving `address` = `drv!Handler`");
+            assert_eq!(failure.category, Some(category), "{failure:?}");
+            assert!(
+                failure.message.contains("drv!Handler"),
+                "the step is named: {}",
+                failure.message
             );
         }
     }
