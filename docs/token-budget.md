@@ -339,18 +339,18 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 19.2% |
-   | `inspect` | 10 | 13,152 | 15.3% |
-   | `session` | 10 | 12,817 | 15% |
-   | `exec` | 8 | 11,309 | 13.2% |
-   | `batch` | 1 | 10,021 | 11.7% |
-   | `crash` | 3 | 7,427 | 8.7% |
-   | `ttd` | 9 | 6,829 | 8% |
-   | `ioctl` | 7 | 7,704 | 9% |
+   | `allocator` | 10 | 16,457 | 18.9% |
+   | `inspect` | 10 | 13,152 | 15.1% |
+   | `session` | 10 | 12,817 | 14.7% |
+   | `exec` | 8 | 11,309 | 13% |
+   | `batch` | 1 | 10,021 | 11.5% |
+   | `crash` | 3 | 7,427 | 8.5% |
+   | `ttd` | 9 | 6,829 | 7.8% |
+   | `ioctl` | 8 | 9,071 | 10.4% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 58 | 85,716 |
+   | *(absent)* | 59 | 87,083 |
    | `session,inspect,exec,crash` | 31 | 43,784 |
    | `session,inspect,crash` | 23 | 32,322 |
    | `crash` | 13 | 19,078 |

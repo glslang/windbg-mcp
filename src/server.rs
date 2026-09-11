@@ -1378,6 +1378,17 @@ pub struct DriverObjectArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct IoctlMapArgs {
+    /// The IOCTL dispatch routine: a symbol (`mountmgr!MountMgrDeviceControl`) or an address.
+    /// It is the `MajorFunction` table's index 0x0e, which a driver object's dispatch table names.
+    pub dispatch: String,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DriverHazardsArgs {
     /// The driver to scan, as `modules` lists it, e.g. "mydriver". The image must be readable in
     /// this session: on a dump that means the engine can obtain the binary.
@@ -4466,6 +4477,47 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Which control codes a driver's IOCTL dispatch routine accepts, recovered from
+    /// its own code and decoded: device type, function, method and required access,
+    /// with the site that recognises each code and the routine it reaches. Follows
+    /// compare chains, the `sub`-and-compare form, and a switch's jump table when the
+    /// bounds check and the table's base were both recovered. An indirect transfer it
+    /// cannot resolve is listed rather than dropped, so a map that is a lower bound
+    /// says so; sizes are proven-exact or absent.
+    #[rmcp::tool(
+        annotations(
+            title = "Map a dispatch routine's IOCTL codes",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::IoctlMap>>()
+    )]
+    async fn ioctl_map(
+        &self,
+        Parameters(args): Parameters<IoctlMapArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // `dispatch` reaches `uf <dispatch>` in the worker, which is a command, so it is screened
+        // exactly as the walk's `from` is. `driver_hazards` dropped its screen because its
+        // argument stopped reaching a grammar; this one still does.
+        if let Err(e) = reject_command_breakers("dispatch", &args.dispatch, Quotes::Rejected) {
+            // `typed_error` rather than `tool_error`: this tool declares an `outputSchema`, so
+            // every result it returns carries `structuredContent`, a refusal included.
+            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id.clone());
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::IoctlMap {
+                    dispatch: args.dispatch,
+                    // Filled in by the supervisor's pump when this job reaches the front of its
+                    // session's queue, exactly as the walk's is.
+                    patience_ms: 0,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// Static, best-effort control-flow reachability: is the code block at `address`
     /// (or `module`+`rva`) reachable from the IOCTL dispatch routine `from`? Runs a
     /// bounded breadth-first walk over the call graph via repeated `uf` disassembly,
@@ -4792,6 +4844,16 @@ const TOOL_NOTES: &[ToolNote] = &[
         note: "It also breaks in a run `continue_async` started — the same Ctrl+Break — but \
                `break_in` is the one to use there: it is bound to the run's own handle, so it \
                cannot land on whatever the session started next.",
+    },
+    ToolNote {
+        tool: "ioctl_map",
+        names: &["driver_object", "decode_ioctl"],
+        note: "`driver_object` names the dispatch routine to pass here -- the MajorFunction                table's index 0x0e -- and `decode_ioctl` takes one code apart on its own.",
+    },
+    ToolNote {
+        tool: "driver_object",
+        names: &["ioctl_map"],
+        note: "`ioctl_map` recovers the control codes that dispatch routine accepts.",
     },
     ToolNote {
         tool: "open_dump",

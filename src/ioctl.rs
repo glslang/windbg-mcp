@@ -1,0 +1,1745 @@
+//! Which control codes a dispatch routine accepts, read off the driver's own code.
+//!
+//! The question `decode_ioctl` answers for one code, asked of a whole driver: given
+//! `MajorFunction[IRP_MJ_DEVICE_CONTROL]`, which codes does it recognise, and where does each one
+//! go. What comes back is a case per recognised code, with the site that recognised it and the
+//! block it routes to, so a reader can go and look rather than take the list on trust.
+//!
+//! # How a code is recovered
+//!
+//! Two shapes, and the answer says which produced each case.
+//!
+//! - **A compare chain.** `cmp r13d, 6D0008h` / `je handler` is one case, and a driver with a
+//!   handful of codes is usually nothing else. `sub eax, 6D0034h` is the same statement written
+//!   as arithmetic, and is followed rather than skipped: the register is *rebased*, so every
+//!   compare after it is against a code offset by what was subtracted, and a pass that ignored it
+//!   would report the neighbouring codes wrongly rather than not at all.
+//! - **A jump table.** A dense run of codes becomes a bounds check, an indexed load and an
+//!   indirect jump, and the table is in the image. It is followed **only** when the base, the
+//!   scale and a bounded entry count were all recovered; anything else is recorded as an
+//!   unresolved transfer, because a table read at a guessed address is a list of plausible
+//!   addresses rather than an answer.
+//!
+//! # What decides the control code
+//!
+//! The code is `IO_STACK_LOCATION.Parameters.DeviceIoControl.IoControlCode`, which a dispatch
+//! routine reaches as `[[Irp+0xb8]+0x18]`. This pass tracks that chain from the dispatch
+//! routine's second argument, so `[rdx+0xb8]` into a register and `+0x18` off *that* register is
+//! the control code and nothing else is. A driver whose chain this cannot follow — the pointer
+//! came from a callee, the listing began mid-function — falls back to the bare `+0x18`
+//! displacement, which is the heuristic `FOLLOWUPS.md` item 5 bounds, and [`Map::code_proved`]
+//! says which of the two produced the answer. The distinction matters because `+0x18` off an
+//! arbitrary register is an extremely ordinary thing for code to do.
+//!
+//! # Engine-free
+//!
+//! Like [`crate::pe`], [`crate::hazards`] and [`crate::driver`], every entry point takes closures
+//! rather than a `DebugEngine`: a decoded function, a reader for the image's own bytes, and a
+//! halt poll. So every case below is unit-tested against a hand-built instruction list with no
+//! debugger anywhere near it.
+
+use std::collections::HashMap;
+
+use dbgscope::dbgeng::{Flow, Instruction, Operand};
+
+use crate::walk::Halt;
+
+/// Bounds. A malformed or hostile driver decides how much work this is, so every list the answer
+/// carries has a cap and a count beside it that stays exact.
+///
+/// The numbers are far past what a real driver produces — the largest dispatch routine measured
+/// here recognises 28 codes — and are here to bound the absurd rather than to shape an answer.
+pub(crate) const MAX_CASES: usize = 4096;
+/// The most entries followed out of one jump table. A table is `entries * 4` bytes of reads, so
+/// this is also what bounds the reading.
+pub(crate) const MAX_TABLE_ENTRIES: usize = 4096;
+/// The most instructions examined in one dispatch routine.
+pub(crate) const MAX_INSTRUCTIONS: usize = 64 * 1024;
+/// How often the halt poll runs while walking the listing.
+const POLL_EVERY: usize = 256;
+/// How far back from an indirect `jmp` the table pattern is looked for, and how far forward from a
+/// case's landing site a handler and a size check are.
+const WINDOW: usize = 24;
+
+/// How a case was recovered, which is what says how much of it to trust.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Recovery {
+    /// A compare against the control code, with a conditional branch reading its flags.
+    Compare,
+    /// An entry in a resolved jump table.
+    JumpTable,
+}
+
+impl Recovery {
+    pub(crate) fn name(self) -> &'static str {
+        match self {
+            Self::Compare => "compare",
+            Self::JumpTable => "jump_table",
+        }
+    }
+}
+
+/// A size the dispatch code requires of a buffer, and whether it is the size or a floor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SizeCheck {
+    /// The value compared against.
+    pub(crate) value: u32,
+    /// Where the compare is.
+    pub(crate) at: u64,
+    /// True when the path continues only if the length **equals** this — an exact size. False for
+    /// a floor or a ceiling, which is evidence about the check rather than the buffer's size.
+    pub(crate) exact: bool,
+}
+
+/// One control code the dispatch routine recognises.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Case {
+    pub(crate) code: u32,
+    pub(crate) recovered: Recovery,
+    /// The instruction that recognises this code: the compare, or the indirect jump whose table
+    /// holds it.
+    pub(crate) site: u64,
+    /// Where control goes when the code matches.
+    pub(crate) lands: u64,
+    /// The routine the case block reaches, when it reaches one directly — a `call` or a tail
+    /// `jmp` to a fixed address within [`WINDOW`] instructions of the landing site. `None` means
+    /// the work is inline, or is reached through a pointer, not that there is none.
+    pub(crate) handler: Option<u64>,
+    /// The input length the case requires, when the case block proves one.
+    pub(crate) in_size: Option<SizeCheck>,
+    /// The output length the case requires, when the case block proves one.
+    pub(crate) out_size: Option<SizeCheck>,
+}
+
+/// One resolved jump table, kept as evidence for the cases it produced.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Table {
+    /// The indirect `jmp` the table feeds.
+    pub(crate) at: u64,
+    /// Where the table is.
+    pub(crate) table: u64,
+    /// How many entries the bounds check admits.
+    pub(crate) entries: usize,
+    /// How many were read and turned into cases. Less than `entries` means the read stopped.
+    pub(crate) followed: usize,
+}
+
+/// What a dispatch routine accepts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Map {
+    /// Where the dispatch routine is.
+    pub(crate) dispatch: u64,
+    /// Whether the control code was reached through the IRP's stack location (`[[Irp+0xb8]+0x18]`)
+    /// rather than through the bare `+0x18` displacement.
+    ///
+    /// **An empty case list means different things on either side of this.** Proved, it says the
+    /// routine reads the control code and compares it against nothing this pass could follow.
+    /// Unproved, it may equally mean the routine never read a control code at all, and the map is
+    /// then about some other `+0x18`.
+    pub(crate) code_proved: bool,
+    /// The recognised codes, in the order the routine recognises them, up to [`MAX_CASES`].
+    pub(crate) cases: Vec<Case>,
+    /// How many were found, exact however many are listed.
+    pub(crate) case_count: usize,
+    /// The jump tables that were followed.
+    pub(crate) tables: Vec<Table>,
+    /// Indirect transfers that were **not** followed, by address: an unresolved switch, a call
+    /// through a pointer. Each one is a place a code could be recognised and was not, which is
+    /// what stops a short case list reading as a complete one.
+    pub(crate) unresolved: Vec<u64>,
+    /// Why the walk stopped early, when it did.
+    pub(crate) halted: Option<Halt>,
+    /// True when a bound above ended something early.
+    pub(crate) cap_hit: bool,
+    /// Instructions examined.
+    pub(crate) examined: usize,
+}
+
+/// What this pass believes a register holds.
+///
+/// Deliberately tiny: the three facts a control-code recovery needs, and nothing else. Anything
+/// not modelled **clears** the register rather than being ignored, because a stale belief about a
+/// register is how a compare against something else is reported as a control code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Value {
+    /// The IRP, which a dispatch routine is handed in `rdx`.
+    Irp,
+    /// The IRP's current stack location.
+    StackLocation,
+    /// `(code - offset) >> shift`, where `code` is the control code. Both are what the dispatch
+    /// arithmetic has done to it so far, so a compare against this register is a statement about
+    /// the code itself.
+    Code { offset: i64, shift: u32 },
+    /// `Parameters.DeviceIoControl.InputBufferLength`.
+    InputLength,
+    /// `Parameters.DeviceIoControl.OutputBufferLength`.
+    OutputLength,
+    /// A constant address, from a RIP-relative `lea` — what a jump table is indexed against.
+    Address(u64),
+}
+
+/// `IO_STACK_LOCATION` offsets, and the one in the IRP that finds it.
+const IRP_CURRENT_STACK_LOCATION: i64 = 0xb8;
+const IO_CONTROL_CODE: i64 = 0x18;
+const INPUT_BUFFER_LENGTH: i64 = 0x10;
+const OUTPUT_BUFFER_LENGTH: i64 = 0x08;
+
+/// The 64-bit register a name belongs to, so `eax`, `ax` and `al` are one register and `r13d` is
+/// `r13`.
+///
+/// A dispatch routine reads the control code as a **dword** and compares the same register as a
+/// qword two instructions later; tracking the spellings separately would lose the value at the
+/// first width change.
+fn family(name: &str) -> Option<&'static str> {
+    const WIDE: [&str; 16] = [
+        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
+        "r13", "r14", "r15",
+    ];
+    let name = name.trim();
+    for wide in WIDE {
+        if name == wide {
+            return Some(wide);
+        }
+    }
+    // eax/ax/al/ah -> rax, and the same shape for the other three legacy names.
+    const LEGACY: [(&str, [&str; 4]); 8] = [
+        ("rax", ["eax", "ax", "al", "ah"]),
+        ("rcx", ["ecx", "cx", "cl", "ch"]),
+        ("rdx", ["edx", "dx", "dl", "dh"]),
+        ("rbx", ["ebx", "bx", "bl", "bh"]),
+        ("rsp", ["esp", "sp", "spl", ""]),
+        ("rbp", ["ebp", "bp", "bpl", ""]),
+        ("rsi", ["esi", "si", "sil", ""]),
+        ("rdi", ["edi", "di", "dil", ""]),
+    ];
+    for (wide, narrow) in LEGACY {
+        if narrow.contains(&name) {
+            return Some(wide);
+        }
+    }
+    // r8d/r8w/r8b and friends.
+    for wide in WIDE {
+        if let Some(rest) = name.strip_prefix(wide)
+            && matches!(rest, "d" | "w" | "b")
+        {
+            return Some(wide);
+        }
+    }
+    None
+}
+
+/// The registers a `call` may return over, which is what makes a belief about one stale.
+const VOLATILE: [&str; 7] = ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"];
+
+/// The register an operand names, if it names one.
+fn register_of(operand: &Operand) -> Option<&'static str> {
+    match operand {
+        Operand::Register(name) => family(name),
+        _ => None,
+    }
+}
+
+/// The immediate an operand carries, if it carries one.
+fn immediate_of(operand: &Operand) -> Option<u64> {
+    match operand {
+        Operand::Immediate(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// What the flags a conditional branch reads say about the compare that set them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Relation {
+    /// Equality: the branch is taken when the compared values are the same.
+    Equal,
+    /// Inequality: taken when they differ.
+    NotEqual,
+    /// Above: taken when the left side is greater, which is what a bounds check branches on.
+    Above,
+    /// Anything else, which is modelled as "some order" and never as a case.
+    Order,
+}
+
+fn relation_of(mnemonic: &str) -> Option<Relation> {
+    Some(match mnemonic {
+        "je" | "jz" => Relation::Equal,
+        "jne" | "jnz" => Relation::NotEqual,
+        "ja" | "jnbe" | "jae" | "jnb" | "jg" | "jnle" | "jge" | "jnl" => Relation::Above,
+        "jb" | "jnae" | "jbe" | "jna" | "jl" | "jnge" | "jle" | "jng" => Relation::Order,
+        _ => return None,
+    })
+}
+
+/// A bounds check the walk has passed: `cmp index, N` / `ja default`, which is the only thing
+/// that gives a jump table a length.
+///
+/// Kept as a short history rather than read off the register state at the jump, because the
+/// pattern in between **overwrites the index register** with the table entry it loads: by the time
+/// the indirect jump arrives, the register that was the index holds an address, and the fact that
+/// it was bounded lives nowhere else.
+#[derive(Debug, Clone, Copy)]
+struct Bound {
+    /// Where in the listing the check was, so a stale one can be dropped.
+    at_index: usize,
+    /// The register checked.
+    register: &'static str,
+    /// What it held: `(code - offset) >> shift`.
+    offset: i64,
+    shift: u32,
+    /// The largest index the check admits.
+    limit: u64,
+}
+
+/// The state one compare leaves for the branch that reads it.
+#[derive(Debug, Clone, Copy)]
+struct Compared {
+    /// The control code the compare is about, when it is about one.
+    code: Option<u64>,
+    /// The register compared and what it held, for a bounds check feeding a jump table.
+    index: Option<(&'static str, i64, u32)>,
+    /// The bound, when the compare was against an immediate.
+    bound: Option<u64>,
+    /// Where the compare is.
+    at: u64,
+}
+
+/// Recovers the control codes a dispatch routine accepts.
+///
+/// `block` is the routine's instructions in listing order — what `uf` produces, and what
+/// [`crate::driver::in_listing_order`] guarantees has a barrier wherever one could not be read.
+/// `read` serves the image's own bytes for a jump table, and answers `None` for an address that
+/// will not read, which ends that table rather than the map.
+pub(crate) fn map(
+    dispatch: u64,
+    block: &[Instruction],
+    mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    mut halt: impl FnMut() -> Option<Halt>,
+) -> Map {
+    let mut state: HashMap<&'static str, Value> = HashMap::new();
+    // The second argument of a dispatch routine. Believed from the first instruction, and
+    // overwritten the moment anything writes to it, which is what a prologue's `mov rbx,rdx`
+    // does — the belief travels rather than being pinned to the register.
+    state.insert("rdx", Value::Irp);
+
+    let mut cases: Vec<Case> = Vec::new();
+    let mut case_count = 0usize;
+    let mut tables: Vec<Table> = Vec::new();
+    let mut unresolved: Vec<u64> = Vec::new();
+    let mut halted = None;
+    let mut cap_hit = false;
+    let mut code_proved = false;
+    let mut examined = 0usize;
+    let mut compared: Option<Compared> = None;
+    let mut bounds: Vec<Bound> = Vec::new();
+
+    for (i, instruction) in block.iter().enumerate() {
+        if i >= MAX_INSTRUCTIONS {
+            cap_hit = true;
+            break;
+        }
+        if i % POLL_EVERY == 0
+            && let Some(why) = halt()
+        {
+            halted = Some(why);
+            break;
+        }
+        examined += 1;
+
+        // A branch reading the flags of the compare before it is where a case is made, so it is
+        // handled before the state update that clears `compared`.
+        if let Flow::Branch(target) = instruction.flow {
+            if let (Some(was), Some(relation)) = (compared, relation_of(&instruction.mnemonic)) {
+                match (relation, was.code) {
+                    // `cmp code, N` / `je handler` -- the case is at the branch target. A branch
+                    // whose destination the encoding does not give is a case whose landing site is
+                    // unknown, and a case has to say where it goes to be worth reporting.
+                    (Relation::Equal, Some(code)) => {
+                        if let Some(target) = target {
+                            push_case(
+                                &mut cases,
+                                &mut case_count,
+                                &mut cap_hit,
+                                code,
+                                Recovery::Compare,
+                                was.at,
+                                target,
+                            );
+                        }
+                    }
+                    // `cmp code, N` / `jne next` -- the case is what follows, since the branch is
+                    // the *rejection*. Recorded at the next instruction's address rather than at
+                    // the branch's, so the landing site is code that runs for this case.
+                    (Relation::NotEqual, Some(code)) => {
+                        if let Some(next) = block.get(i + 1) {
+                            push_case(
+                                &mut cases,
+                                &mut case_count,
+                                &mut cap_hit,
+                                code,
+                                Recovery::Compare,
+                                was.at,
+                                next.address,
+                            );
+                        }
+                    }
+                    // `cmp index, N` / `ja default` is the bounds check a jump table needs, and
+                    // the one thing that survives the load overwriting the index register.
+                    (Relation::Above, _) => {
+                        if let (Some((register, offset, shift)), Some(limit)) =
+                            (was.index, was.bound)
+                        {
+                            bounds.push(Bound {
+                                at_index: i,
+                                register,
+                                offset,
+                                shift,
+                                limit,
+                            });
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            compared = None;
+            clobber(&mut state, instruction);
+            continue;
+        }
+
+        // An indirect transfer is either a jump table this can follow or a hole in the answer.
+        if matches!(instruction.flow, Flow::Jmp(None) | Flow::Call(None)) {
+            let start = i.saturating_sub(WINDOW);
+            bounds.retain(|bound| bound.at_index >= start);
+            match follow_table(
+                &block[start..i],
+                instruction.address,
+                &bounds,
+                &state,
+                &mut read,
+            ) {
+                Some((table, found)) => {
+                    for (code, lands) in found {
+                        push_case(
+                            &mut cases,
+                            &mut case_count,
+                            &mut cap_hit,
+                            code,
+                            Recovery::JumpTable,
+                            instruction.address,
+                            lands,
+                        );
+                    }
+                    tables.push(table);
+                }
+                None => unresolved.push(instruction.address),
+            }
+            compared = None;
+            clobber(&mut state, instruction);
+            continue;
+        }
+
+        compared = update(&mut state, instruction, &mut code_proved);
+        // A **direct** call reaches here rather than the arms above, and it returns over the
+        // volatile registers exactly as an indirect one does. Forgetting them only on the
+        // indirect path would leave a compare against whatever a callee returned reported as a
+        // control code, which is the shape of wrong answer this pass exists to avoid.
+        clobber(&mut state, instruction);
+    }
+
+    if halted.is_none() {
+        // Polled once more after the loop: a halt landing during the last window would otherwise
+        // leave a map that reads as a routine fully walked.
+        halted = halt();
+    }
+
+    // The handler and the size proofs are read off the block the case lands in, which is why they
+    // are a second pass: a case made at a compare near the top of a routine lands hundreds of
+    // instructions further down.
+    let index: HashMap<u64, usize> = block
+        .iter()
+        .enumerate()
+        .map(|(i, instruction)| (instruction.address, i))
+        .collect();
+    for case in &mut cases {
+        if let Some(&at) = index.get(&case.lands) {
+            let end = (at + WINDOW).min(block.len());
+            case.handler = handler_in(&block[at..end]);
+            let (input, output) = sizes_in(&block[at..end]);
+            case.in_size = input;
+            case.out_size = output;
+        }
+    }
+
+    Map {
+        dispatch,
+        code_proved,
+        cases,
+        case_count,
+        tables,
+        unresolved,
+        halted,
+        cap_hit,
+        examined,
+    }
+}
+
+/// Records a case, keeping the count exact once the list stops growing.
+#[allow(clippy::too_many_arguments)]
+fn push_case(
+    cases: &mut Vec<Case>,
+    count: &mut usize,
+    cap_hit: &mut bool,
+    code: u64,
+    recovered: Recovery,
+    site: u64,
+    lands: u64,
+) {
+    // A control code is a `ULONG`. A compare against a wider immediate is a compare against
+    // something else, whatever register it used.
+    let Ok(code) = u32::try_from(code) else {
+        return;
+    };
+    *count += 1;
+    if cases.len() >= MAX_CASES {
+        *cap_hit = true;
+        return;
+    }
+    cases.push(Case {
+        code,
+        recovered,
+        site,
+        lands,
+        handler: None,
+        in_size: None,
+        out_size: None,
+    });
+}
+
+/// Applies one instruction to the register state, and reports the compare it leaves behind.
+fn update(
+    state: &mut HashMap<&'static str, Value>,
+    instruction: &Instruction,
+    code_proved: &mut bool,
+) -> Option<Compared> {
+    let operands = &instruction.operands;
+    let mnemonic = instruction.mnemonic.as_str();
+
+    // A compare writes no register and is the only thing a branch reads.
+    if mnemonic == "cmp" {
+        return compare(state, instruction, code_proved);
+    }
+    // `test reg,reg` after a `sub` is the same statement about zero, but every other `test` is a
+    // mask; neither makes a case, and both end the compare before them.
+    if matches!(mnemonic, "test" | "push" | "nop" | "int" | "ret") {
+        return None;
+    }
+
+    let Some(destination) = operands.first().and_then(register_of) else {
+        // Writes memory, or nothing this models. A store through a register does not change what
+        // the register holds, so the state stands.
+        return None;
+    };
+
+    match mnemonic {
+        "mov" | "movzx" | "movsxd" | "movsx" | "lea" => {
+            let value = source_value(state, operands.get(1), mnemonic, code_proved);
+            set(state, destination, value);
+            None
+        }
+        "sub" => match (state.get(destination).copied(), operands.get(1)) {
+            // `sub eax, 6D0034h` rebases the code: the register now holds `code - (offset + K)`,
+            // and the `je` that follows is a case for that value rather than for zero.
+            (Some(Value::Code { offset, shift }), Some(operand)) => {
+                let immediate = immediate_of(operand)?;
+                let offset = offset.checked_add(immediate as i64)?;
+                set(state, destination, Some(Value::Code { offset, shift }));
+                Some(Compared {
+                    code: (shift == 0).then_some(offset as u64),
+                    index: Some((destination, offset, shift)),
+                    bound: Some(0),
+                    at: instruction.address,
+                })
+            }
+            _ => {
+                set(state, destination, None);
+                None
+            }
+        },
+        "add" => {
+            match (state.get(destination).copied(), operands.get(1)) {
+                (Some(Value::Code { offset, shift }), Some(operand)) => {
+                    let immediate = immediate_of(operand)?;
+                    let offset = offset.checked_sub(immediate as i64)?;
+                    set(state, destination, Some(Value::Code { offset, shift }));
+                }
+                // An `add` of anything else -- a table entry to its base, most often -- leaves a
+                // value this does not model.
+                _ => set(state, destination, None),
+            }
+            None
+        }
+        "shr" | "sar" => {
+            match (state.get(destination).copied(), operands.get(1)) {
+                (Some(Value::Code { offset, shift }), Some(operand)) => {
+                    let by = immediate_of(operand)? as u32;
+                    set(
+                        state,
+                        destination,
+                        shift
+                            .checked_add(by)
+                            .map(|shift| Value::Code { offset, shift }),
+                    );
+                }
+                _ => set(state, destination, None),
+            }
+            None
+        }
+        _ => {
+            set(state, destination, None);
+            None
+        }
+    }
+}
+
+/// What a `mov`-shaped instruction's source is worth.
+fn source_value(
+    state: &HashMap<&'static str, Value>,
+    source: Option<&Operand>,
+    mnemonic: &str,
+    code_proved: &mut bool,
+) -> Option<Value> {
+    match source? {
+        Operand::Register(name) => state.get(family(name)?).copied(),
+        Operand::Memory(memory) => {
+            // `lea` takes the address rather than what is at it, which is how a jump table's base
+            // reaches a register.
+            if mnemonic == "lea" {
+                return memory.address.map(Value::Address);
+            }
+            let base = memory.base.as_deref().and_then(family);
+            let held = base.and_then(|base| state.get(base).copied());
+            match (held, memory.displacement) {
+                (Some(Value::Irp), IRP_CURRENT_STACK_LOCATION) => Some(Value::StackLocation),
+                (Some(Value::StackLocation), IO_CONTROL_CODE) => {
+                    *code_proved = true;
+                    Some(Value::Code {
+                        offset: 0,
+                        shift: 0,
+                    })
+                }
+                (Some(Value::StackLocation), INPUT_BUFFER_LENGTH) => Some(Value::InputLength),
+                (Some(Value::StackLocation), OUTPUT_BUFFER_LENGTH) => Some(Value::OutputLength),
+                // The fallback the module doc describes: a `+0x18` off a register whose chain was
+                // not followed. Believed, because a listing that starts mid-function or a driver
+                // that fetches the stack location in a helper would otherwise answer nothing --
+                // and `code_proved` stays false, which is where that doubt is carried.
+                (None, IO_CONTROL_CODE) if base.is_some() => Some(Value::Code {
+                    offset: 0,
+                    shift: 0,
+                }),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+/// Reads a `cmp`, which is where a case and a bounds check both begin.
+fn compare(
+    state: &HashMap<&'static str, Value>,
+    instruction: &Instruction,
+    code_proved: &mut bool,
+) -> Option<Compared> {
+    let left = instruction.operands.first()?;
+    let right = instruction.operands.get(1);
+    let bound = right.and_then(immediate_of);
+
+    // `cmp dword ptr [rdx+18h], 222003h` -- the code compared where it lives, with no register in
+    // between, which is what a compiler emits for a small switch.
+    if let Operand::Memory(_) = left
+        && let Some(Value::Code { offset, shift }) =
+            source_value(state, Some(left), "mov", code_proved)
+        && shift == 0
+    {
+        return Some(Compared {
+            code: bound.map(|value| value.wrapping_add(offset as u64)),
+            index: None,
+            bound,
+            at: instruction.address,
+        });
+    }
+
+    let register = register_of(left)?;
+    match state.get(register).copied()? {
+        Value::Code { offset, shift } => Some(Compared {
+            // A shifted register is an index into a table, not a code: the low bits the shift
+            // dropped are not this compare's to claim. The compare is still reported, because it
+            // is exactly the bounds check a jump table needs — dropping it here would lose the
+            // table's length, which is the one thing that makes a table followable.
+            code: match shift {
+                0 => bound.map(|value| value.wrapping_add(offset as u64)),
+                _ => None,
+            },
+            index: Some((register, offset, shift)),
+            bound,
+            at: instruction.address,
+        }),
+        _ => None,
+    }
+}
+
+/// Forgets what a call or a branch may have changed.
+fn clobber(state: &mut HashMap<&'static str, Value>, instruction: &Instruction) {
+    if matches!(instruction.flow, Flow::Call(_)) {
+        for volatile in VOLATILE {
+            state.remove(volatile);
+        }
+    }
+}
+
+/// Sets or clears one register's value.
+fn set(state: &mut HashMap<&'static str, Value>, register: &'static str, value: Option<Value>) {
+    match value {
+        Some(value) => {
+            state.insert(register, value);
+        }
+        None => {
+            state.remove(register);
+        }
+    }
+}
+
+/// Follows an indirect jump's table, when every part of it was recovered.
+///
+/// Returns the table and the `(code, target)` pairs it holds, or `None` for a transfer that is
+/// not a table this can resolve — which the caller records as unresolved rather than dropping.
+fn follow_table(
+    window: &[Instruction],
+    at: u64,
+    bounds: &[Bound],
+    state: &HashMap<&'static str, Value>,
+    read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Option<(Table, Vec<(u64, u64)>)> {
+    // The indexed load: `mov eax, dword ptr [rbase+rindex*4+disp]`, whose base is an address this
+    // pass watched a `lea` put there, and whose index is a register a bounds check covered.
+    // Without the check the table has no length, and a table read to a guessed length is a list of
+    // addresses that happen to be there.
+    let mut found = None;
+    for instruction in window.iter().rev() {
+        let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
+            continue;
+        };
+        if memory.scale != 4 {
+            continue;
+        }
+        let Some(index) = memory.index.as_deref().and_then(family) else {
+            continue;
+        };
+        let Some(bound) = bounds.iter().rev().find(|bound| bound.register == index) else {
+            continue;
+        };
+        let base = match memory.base.as_deref().and_then(family) {
+            Some(base) => match state.get(base).copied() {
+                Some(Value::Address(address)) => Some(address),
+                _ => None,
+            },
+            // An absolute table with no base register at all -- the 32-bit shape.
+            None => memory.address,
+        }?;
+        let start = base.checked_add_signed(memory.displacement)?;
+        found = Some((start, base, *bound));
+        break;
+    }
+    let (start, base, bound) = found?;
+    let (offset, shift) = (bound.offset, bound.shift);
+    let entries = usize::try_from(bound.limit.checked_add(1)?).ok()?;
+    if entries == 0 || entries > MAX_TABLE_ENTRIES {
+        return None;
+    }
+
+    let bytes = read(start, entries.checked_mul(4)?)?;
+    let mut found = Vec::new();
+    for (index, entry) in bytes.as_chunks::<4>().0.iter().enumerate() {
+        let rva = u32::from_le_bytes(*entry);
+        let target = base.wrapping_add(u64::from(rva));
+        let code = ((index as u64) << shift).wrapping_add(offset as u64);
+        found.push((code, target));
+    }
+    Some((
+        Table {
+            at,
+            table: start,
+            entries,
+            followed: found.len(),
+        },
+        found,
+    ))
+}
+
+/// The routine a case block reaches directly, when it reaches one.
+fn handler_in(window: &[Instruction]) -> Option<u64> {
+    for instruction in window {
+        match instruction.flow {
+            Flow::Call(Some(target)) | Flow::Jmp(Some(target)) => return Some(target),
+            // A branch means the block is doing its own work before it decides, and whatever it
+            // calls after that is not this case's handler.
+            Flow::Branch(_) | Flow::Return | Flow::Unreadable | Flow::Unknown => return None,
+            _ => {}
+        }
+    }
+    None
+}
+
+/// The buffer-length checks a case block makes, when it makes them against a literal.
+///
+/// **Exact only when the path continues on equality.** `cmp [sp+10h],20h` / `jne fail` says the
+/// case requires exactly 0x20 input bytes; the same compare with `jb fail` says 0x20 is a floor,
+/// which is evidence about the check and not the size of the buffer, and the two are told apart
+/// here rather than by whoever reads the answer.
+fn sizes_in(window: &[Instruction]) -> (Option<SizeCheck>, Option<SizeCheck>) {
+    let mut input = None;
+    let mut output = None;
+    let mut pending: Option<(i64, u32, u64)> = None;
+    for instruction in window {
+        if instruction.mnemonic == "cmp" {
+            pending = None;
+            if let Some(Operand::Memory(memory)) = instruction.operands.first()
+                && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
+                && let Ok(value) = u32::try_from(value)
+            {
+                pending = Some((memory.displacement, value, instruction.address));
+            }
+            continue;
+        }
+        if let Flow::Branch(_) = instruction.flow {
+            if let Some((displacement, value, at)) = pending.take() {
+                let exact = matches!(instruction.mnemonic.as_str(), "jne" | "jnz" | "je" | "jz");
+                let check = SizeCheck { value, at, exact };
+                match displacement {
+                    INPUT_BUFFER_LENGTH => input = input.or(Some(check)),
+                    OUTPUT_BUFFER_LENGTH => output = output.or(Some(check)),
+                    _ => {}
+                }
+            }
+            continue;
+        }
+        // Anything between a compare and its branch invalidates the pairing rather than being
+        // assumed harmless.
+        if !instruction.operands.is_empty() {
+            pending = None;
+        }
+    }
+    (input, output)
+}
+
+/// A control code taken apart: device type, function, method and required access.
+///
+/// The same four fields `decode_ioctl` reports for one code, from the same bit layout, as values
+/// rather than as a rendering: `DeviceType` is bits 16-31, `RequiredAccess` 14-15, `FunctionCode`
+/// 2-13 and `Method` 0-1.
+pub(crate) fn decoded(code: u32) -> (u32, u32, &'static str, &'static str) {
+    let device_type = (code >> 16) & 0xffff;
+    let function = (code >> 2) & 0xfff;
+    let method = match code & 0x3 {
+        0 => "buffered",
+        1 => "in_direct",
+        2 => "out_direct",
+        _ => "neither",
+    };
+    let access = match (code >> 14) & 0x3 {
+        0 => "any",
+        1 => "read",
+        2 => "write",
+        _ => "read_write",
+    };
+    (device_type, function, method, access)
+}
+
+/// The map as the typed result, with every address turned into a coordinate by `locate`.
+pub(crate) fn structured_report(
+    found: &Map,
+    mut locate: impl FnMut(u64) -> crate::structured::CodeLocation,
+) -> crate::structured::IoctlMap {
+    use crate::structured;
+    let rva_of = |location: &structured::CodeLocation| location.rva.clone();
+    structured::IoctlMap {
+        // Filled in by the caller, which is the only side that holds the attributor these
+        // coordinates came from.
+        images: Vec::new(),
+        dispatch: locate(found.dispatch),
+        code_proved: found.code_proved,
+        cases: found
+            .cases
+            .iter()
+            .map(|case| {
+                let (device_type, function, method, access) = decoded(case.code);
+                let lands = locate(case.lands);
+                let handler = case.handler.map(&mut locate);
+                let mut evidence = Vec::new();
+                for (field, check) in [("input", case.in_size), ("output", case.out_size)] {
+                    if let Some(check) = check {
+                        evidence.push(structured::LengthCheck {
+                            field: field.to_string(),
+                            value: check.value,
+                            exact: check.exact,
+                            at: locate(check.at),
+                        });
+                    }
+                }
+                structured::IoctlCase {
+                    code: format!("{:#010x}", case.code),
+                    device_type,
+                    function,
+                    method: method.to_string(),
+                    required_access: access.to_string(),
+                    dispatch_rva: handler.as_ref().and_then(rva_of),
+                    case_rva: rva_of(&lands),
+                    // Only a proven exact check is a size. The floors are in `evidence` above,
+                    // which is where the shared shape puts them and why these are two fields
+                    // rather than one with a flag.
+                    in_size: case
+                        .in_size
+                        .filter(|check| check.exact)
+                        .map(|check| check.value),
+                    out_size: case
+                        .out_size
+                        .filter(|check| check.exact)
+                        .map(|check| check.value),
+                    recovered: case.recovered.name().to_string(),
+                    at: locate(case.site),
+                    evidence,
+                }
+            })
+            .collect(),
+        case_count: found.case_count,
+        tables: found
+            .tables
+            .iter()
+            .map(|table| structured::JumpTable {
+                at: locate(table.at),
+                table: structured::addr(table.table),
+                entries: table.entries,
+                followed: table.followed,
+            })
+            .collect(),
+        unresolved: found.unresolved.iter().map(|at| locate(*at)).collect(),
+        stopped: found.halted.map(|halt| match halt {
+            Halt::Deadline => crate::structured::WalkHalt::Deadline,
+            Halt::Interrupted => crate::structured::WalkHalt::Interrupted,
+        }),
+        cap_hit: found.cap_hit,
+    }
+}
+
+/// The map as the tool's text, which is what a reader without a structured client sees.
+pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
+    let mut out = String::new();
+    let where_ =
+        |location: &crate::structured::CodeLocation| match (&location.module, &location.rva) {
+            (Some(module), Some(rva)) => format!("{module}+{rva}"),
+            _ => location.address.clone(),
+        };
+    out.push_str(&format!("IOCTL map of {}\n", where_(&report.dispatch)));
+    if !report.code_proved {
+        out.push_str(
+            "  [!] the control code was taken from a `+0x18` displacement this could not trace \
+             back to the IRP, so these compares may be about another structure\n",
+        );
+    }
+    if report.cases.is_empty() {
+        out.push_str("  No control codes recovered\n");
+    } else {
+        let listed = if report.case_count > report.cases.len() {
+            format!(", first {} listed", report.cases.len())
+        } else {
+            String::new()
+        };
+        out.push_str(&format!("  {} code(s){listed}:\n", report.case_count));
+        for case in &report.cases {
+            out.push_str(&format!(
+                "    {}  device 0x{:04x} function 0x{:03x} {} {}  -> {}\n",
+                case.code,
+                case.device_type,
+                case.function,
+                case.method,
+                case.required_access,
+                case.dispatch_rva
+                    .clone()
+                    .or_else(|| case.case_rva.clone())
+                    .unwrap_or_else(|| where_(&case.at)),
+            ));
+            for check in &case.evidence {
+                out.push_str(&format!(
+                    "        {} length {} {}\n",
+                    check.field,
+                    if check.exact { "==" } else { "checked against" },
+                    check.value
+                ));
+            }
+        }
+    }
+    for table in &report.tables {
+        out.push_str(&format!(
+            "  Jump table at {} ({} of {} entries followed) for the switch at {}\n",
+            table.table,
+            table.followed,
+            table.entries,
+            where_(&table.at)
+        ));
+    }
+    if !report.unresolved.is_empty() {
+        out.push_str(&format!(
+            "  [!] {} indirect transfer(s) not followed, so this is a lower bound rather than \
+             the set: {}\n",
+            report.unresolved.len(),
+            report
+                .unresolved
+                .iter()
+                .map(where_)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if let Some(stopped) = &report.stopped {
+        out.push_str(&format!(
+            "  [!] stopped early ({}), so codes after that point were never read\n",
+            match stopped {
+                crate::structured::WalkHalt::Deadline => "the call's clock ran out",
+                crate::structured::WalkHalt::Interrupted => "interrupted",
+            }
+        ));
+    }
+    if report.cap_hit {
+        out.push_str("  [!] a bound ended a list early; the counts stay exact\n");
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use dbgscope::dbgeng::MemoryOperand;
+
+    const DISPATCH: u64 = 0xfffff803_3e254750;
+
+    /// One instruction, built from what the decoder would report rather than from a rendering:
+    /// these tests are about the fields, and a fixture that spelled instructions in text would be
+    /// testing a parser this module does not have.
+    fn insn(address: u64, mnemonic: &str, operands: Vec<Operand>, flow: Flow) -> Instruction {
+        Instruction {
+            address,
+            bytes: String::new(),
+            text: String::new(),
+            mnemonic: mnemonic.to_string(),
+            operands,
+            flow,
+            privileged: false,
+        }
+    }
+
+    fn reg(name: &str) -> Operand {
+        Operand::Register(name.to_string())
+    }
+
+    fn imm(value: u64) -> Operand {
+        Operand::Immediate(value)
+    }
+
+    /// `[base+displacement]`.
+    fn mem(base: &str, displacement: i64) -> Operand {
+        Operand::Memory(MemoryOperand {
+            size: Some(4),
+            segment: None,
+            base: Some(base.to_string()),
+            index: None,
+            scale: 1,
+            displacement,
+            address: None,
+        })
+    }
+
+    /// `[base+index*4+displacement]` -- a jump table's load.
+    fn indexed(
+        base: Option<&str>,
+        index: &str,
+        displacement: i64,
+        address: Option<u64>,
+    ) -> Operand {
+        Operand::Memory(MemoryOperand {
+            size: Some(4),
+            segment: None,
+            base: base.map(str::to_string),
+            index: Some(index.to_string()),
+            scale: 4,
+            displacement,
+            address,
+        })
+    }
+
+    /// A RIP-relative `lea`'s operand: an address and nothing at run time contributing to it.
+    fn at_address(address: u64) -> Operand {
+        Operand::Memory(MemoryOperand {
+            size: None,
+            segment: None,
+            base: Some("rip".to_string()),
+            index: None,
+            scale: 1,
+            displacement: 0,
+            address: Some(address),
+        })
+    }
+
+    /// The prologue every dispatch routine has: the stack location out of the IRP, the control
+    /// code out of the stack location.
+    fn prologue(at: u64) -> Vec<Instruction> {
+        vec![
+            insn(
+                at,
+                "mov",
+                vec![reg("rax"), mem("rdx", IRP_CURRENT_STACK_LOCATION)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                at + 4,
+                "mov",
+                vec![reg("r13d"), mem("rax", IO_CONTROL_CODE)],
+                Flow::Fallthrough,
+            ),
+        ]
+    }
+
+    fn never() -> Option<Halt> {
+        None
+    }
+
+    fn unreadable(_: u64, _: usize) -> Option<Vec<u8>> {
+        None
+    }
+
+    /// A compare chain is the ordinary shape, and each `cmp`/`je` pair is one case.
+    #[test]
+    fn a_compare_chain_recovers_a_case_per_code() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x6d0008)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("r13d"), imm(0x6d4020)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1a, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert!(found.code_proved, "the chain from the IRP was followed");
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.recovered))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6d0008, 0x900, Recovery::Compare),
+                (0x6d4020, 0x980, Recovery::Compare),
+            ],
+            "{:?}",
+            found.cases
+        );
+        assert_eq!(found.case_count, 2);
+    }
+
+    /// `sub eax, 6D0034h` is a compare written as arithmetic, and the codes after it are offset
+    /// by what it subtracted.
+    ///
+    /// Taken from `mountmgr`, where this exact instruction sits in the middle of the chain: a pass
+    /// that ignored the `sub` would read the `cmp eax,4` two instructions later as the control
+    /// code `0x4`, which is not a code the driver accepts and is not a code at all.
+    #[test]
+    fn a_rebased_register_is_read_against_what_was_subtracted() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x6d0034)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0xa00))),
+            insn(
+                DISPATCH + 0x17,
+                "cmp",
+                vec![reg("eax"), imm(4)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1a, "je", Vec::new(), Flow::Branch(Some(0xa80))),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x6d0034, 0xa00), (0x6d0038, 0xa80)],
+            "the `sub` rebases the register and the `cmp` after it is relative: {:?}",
+            found.cases
+        );
+    }
+
+    /// A `call` between the load and the compare leaves the register holding whatever the callee
+    /// returned, and a compare against that is not a control code.
+    ///
+    /// The case that makes this visible needs the code in a **volatile** register: in a preserved
+    /// one the value really does survive the call, so a pass that forgot nothing would agree with
+    /// one that forgets the right registers, and the test would pass on the wrong rule.
+    #[test]
+    fn a_call_forgets_the_registers_it_may_return_over() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "call",
+                vec![Operand::Target(0xdead)],
+                Flow::Call(Some(0xdead)),
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("eax"), imm(0x6d0008)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x16, "je", Vec::new(), Flow::Branch(Some(0xb00))),
+            // The same compare on the callee-saved register the code was read into still counts.
+            insn(
+                DISPATCH + 0x1c,
+                "cmp",
+                vec![reg("r13d"), imm(0x6d4020)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x22, "je", Vec::new(), Flow::Branch(Some(0xb80))),
+            insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert_eq!(
+            found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
+            vec![0x6d4020],
+            "`eax` did not survive the call and `r13d` did: {:?}",
+            found.cases
+        );
+    }
+
+    /// A bounded jump table becomes one case per entry, read out of the image.
+    #[test]
+    fn a_bounded_jump_table_becomes_a_case_per_entry() {
+        const IMAGE: u64 = 0xfffff803_3e250000;
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "shr",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x17,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1d,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2b,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2e, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let table_at = IMAGE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at && len == 12).then(|| {
+                [0x1000u32, 0x1100, 0x1200]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, read, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.recovered))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc004, IMAGE + 0x1000, Recovery::JumpTable),
+                (0x6dc008, IMAGE + 0x1100, Recovery::JumpTable),
+                (0x6dc00c, IMAGE + 0x1200, Recovery::JumpTable),
+            ],
+            "the shift is the stride between codes: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.tables,
+            vec![Table {
+                at: DISPATCH + 0x2e,
+                table: table_at,
+                entries: 3,
+                followed: 3,
+            }]
+        );
+        assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+    }
+
+    /// An indirect jump with no bounds check is **recorded**, not dropped.
+    ///
+    /// Which is the whole difference between a short answer and a wrong one: a driver whose switch
+    /// this cannot resolve must not read as a driver that accepts the two codes before it.
+    #[test]
+    fn an_unresolved_transfer_is_recorded_rather_than_dropped() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x6d0008)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(
+                DISPATCH + 0x14,
+                "jmp",
+                vec![mem("rbx", 0x40)],
+                Flow::Jmp(None),
+            ),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+        assert_eq!(
+            found.unresolved,
+            vec![DISPATCH + 0x14],
+            "the switch this could not follow is in the answer"
+        );
+        assert!(found.tables.is_empty());
+    }
+
+    /// A table whose bytes will not read produces no cases and leaves the jump unresolved, rather
+    /// than a table of whatever the reader returned.
+    #[test]
+    fn a_table_that_will_not_read_leaves_the_jump_unresolved() {
+        const IMAGE: u64 = 0xfffff803_3e250000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "ja", Vec::new(), Flow::Branch(Some(0xfa11))),
+            insn(
+                DISPATCH + 0x14,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1b,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", 0x9000, None)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x22, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x22]);
+    }
+
+    /// A table with no bounds check is **not** followed, however readable its bytes are.
+    ///
+    /// The fixture is the resolved one minus the `cmp`/`ja`, with a reader that would happily
+    /// serve a table: so a pass that guessed a length would produce cases here, and the assertion
+    /// that there are none is about the guess rather than about the read. A length invented by
+    /// the analyser is a list of addresses that happen to follow the table, reported as codes the
+    /// driver accepts.
+    #[test]
+    fn a_table_with_no_bounds_check_is_not_followed() {
+        const IMAGE: u64 = 0xfffff803_3e250000;
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "shr",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1d,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2b,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2e, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let served = std::cell::Cell::new(0usize);
+        let read = |_: u64, len: usize| {
+            served.set(served.get() + 1);
+            Some(vec![0u8; len])
+        };
+
+        let found = map(DISPATCH, &block, read, never);
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert!(found.tables.is_empty(), "{:?}", found.tables);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x2e]);
+        assert_eq!(
+            served.get(),
+            0,
+            "nothing was read: a table with no length is not read at a guessed one"
+        );
+    }
+
+    /// A `+0x18` this could not trace to the IRP still answers, and says that it could not.
+    #[test]
+    fn a_code_not_traced_to_the_irp_is_answered_and_flagged() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg("r13d"), mem("rbx", IO_CONTROL_CODE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xa, "je", Vec::new(), Flow::Branch(Some(0xc00))),
+            insn(DISPATCH + 0x10, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+        assert_eq!(found.cases[0].code, 0x222003);
+        assert!(
+            !found.code_proved,
+            "the chain was not followed and the answer says so"
+        );
+    }
+
+    /// An exact length is told apart from a floor, because only one of them is a size.
+    #[test]
+    fn an_exact_length_check_is_told_apart_from_a_floor() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("r13d"), imm(0x222007)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x60)),
+            ),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+            // The first case: exactly 0x20 input bytes or the path leaves.
+            insn(
+                DISPATCH + 0x40,
+                "cmp",
+                vec![mem("rax", INPUT_BUFFER_LENGTH), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x47,
+                "jne",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(DISPATCH + 0x4d, "ret", Vec::new(), Flow::Return),
+            // The second: 0x20 is a floor, which says nothing about the buffer's size.
+            insn(
+                DISPATCH + 0x60,
+                "cmp",
+                vec![mem("rax", INPUT_BUFFER_LENGTH), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x67,
+                "jb",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(DISPATCH + 0x6d, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        let sizes: Vec<_> = found
+            .cases
+            .iter()
+            .map(|case| (case.code, case.in_size.map(|size| (size.value, size.exact))))
+            .collect();
+        assert_eq!(
+            sizes,
+            vec![
+                (0x222003, Some((0x20, true))),
+                (0x222007, Some((0x20, false))),
+            ],
+            "{:?}",
+            found.cases
+        );
+    }
+
+    /// The handler is the first direct transfer out of the case block, and a block that decides
+    /// something first has none to report.
+    #[test]
+    fn the_handler_is_the_first_direct_transfer_from_the_landing_site() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("r13d"), imm(0x222007)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x60)),
+            ),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+            insn(
+                DISPATCH + 0x40,
+                "mov",
+                vec![reg("rcx"), reg("rdx")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x43,
+                "call",
+                vec![Operand::Target(0x5000)],
+                Flow::Call(Some(0x5000)),
+            ),
+            insn(DISPATCH + 0x48, "ret", Vec::new(), Flow::Return),
+            insn(
+                DISPATCH + 0x60,
+                "test",
+                vec![reg("rax"), reg("rax")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x63,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x69,
+                "call",
+                vec![Operand::Target(0x6000)],
+                Flow::Call(Some(0x6000)),
+            ),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.handler))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, Some(0x5000)), (0x222007, None)],
+            "a block that branches before it calls has no single handler: {:?}",
+            found.cases
+        );
+    }
+
+    /// The case list is bounded and the count stays exact past the bound.
+    #[test]
+    fn the_case_list_is_bounded_and_the_count_stays_exact() {
+        let mut block = prologue(DISPATCH);
+        let mut at = DISPATCH + 8;
+        for index in 0..(MAX_CASES + 16) {
+            block.push(insn(
+                at,
+                "cmp",
+                vec![reg("r13d"), imm(0x222000 + index as u64)],
+                Flow::Fallthrough,
+            ));
+            block.push(insn(
+                at + 6,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(0x900 + index as u64)),
+            ));
+            at += 12;
+        }
+
+        let found = map(DISPATCH, &block, unreadable, never);
+
+        assert_eq!(found.cases.len(), MAX_CASES, "the list stops");
+        assert_eq!(
+            found.case_count,
+            MAX_CASES + 16,
+            "and the count does not: {}",
+            found.case_count
+        );
+        assert!(found.cap_hit);
+    }
+
+    /// A halted walk says so rather than answering as one that finished.
+    #[test]
+    fn a_halted_walk_says_so() {
+        let mut block = prologue(DISPATCH);
+        let mut at = DISPATCH + 8;
+        for index in 0..1024u64 {
+            block.push(insn(
+                at,
+                "cmp",
+                vec![reg("r13d"), imm(0x222000 + index)],
+                Flow::Fallthrough,
+            ));
+            block.push(insn(at + 6, "je", Vec::new(), Flow::Branch(Some(0x900))));
+            at += 12;
+        }
+        let mut polls = 0;
+        let halt = || {
+            polls += 1;
+            (polls > 1).then_some(Halt::Deadline)
+        };
+
+        let found = map(DISPATCH, &block, unreadable, halt);
+
+        assert_eq!(found.halted, Some(Halt::Deadline));
+        assert!(
+            found.examined < block.len(),
+            "the walk stopped where the halt landed: {} of {}",
+            found.examined,
+            block.len()
+        );
+    }
+}

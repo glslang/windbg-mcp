@@ -9,6 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`ioctl_map` — which control codes a dispatch routine accepts.** Recovered from the driver's own code and decoded: device type, function code, method and required access, with the site that recognises each code and the routine it reaches. It follows compare chains, the `sub`-and-compare form a rebased switch compiles to, and a jump table when the bounds check and the table's base were both recovered.
+
+  **What it could not follow is in the answer.** Every indirect transfer it did not resolve is listed, so a map that is a lower bound says so rather than reading as a complete set; a table is never read at a guessed length; and `code_proved` says whether the control code was traced from the IRP or taken from a bare `+0x18` displacement, which is what an empty case list turns on. Sizes are proven-exact or absent, with floors kept separately as evidence. The case fields are the shared IOCTL-case shape a Binary Ninja or Ghidra companion answers in, so the same driver recovered on either side is the same record. See [`docs/structured-results.md`](docs/structured-results.md) and [`docs/limitations.md`](docs/limitations.md).
+
 - **`driver_hazards` — what a driver's image says it can do.** The sensitive APIs it imports with
   the call sites that reach them, and the privileged instructions in its code (`rdmsr`, `out`,
   `mov cr3`). Imports are named from the driver's own import table, so a stripped third-party

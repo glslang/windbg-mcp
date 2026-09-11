@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 58,
+  "toolCount": 59,
   "tools": [
     {
       "hints": {
@@ -862,6 +862,43 @@
       ],
       "required": [],
       "title": "Interrupt the running operation"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "ioctl_map",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/IoctlMap",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "dispatch: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "dispatch"
+      ],
+      "title": "Map a dispatch routine's IOCTL codes"
     },
     {
       "hints": {

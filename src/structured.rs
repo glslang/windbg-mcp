@@ -2360,6 +2360,127 @@ pub struct Reachability {
     pub recipe_stopped: Option<WalkHalt>,
 }
 
+/// One buffer-length check a case block makes against a literal.
+///
+/// Kept beside the sizes rather than folded into them, because a floor and a size are different
+/// facts and only one of them is a size. `cmp [sp+10h],20h` / `jb fail` proves the case needs *at
+/// least* 0x20 input bytes and proves nothing about what it reads; the same compare with `jne
+/// fail` proves the length is exactly that. A reader deciding what to send needs the first as
+/// evidence and the second as the answer.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LengthCheck {
+    /// `input` or `output` — which of the two lengths is compared.
+    pub field: String,
+    /// The value it is compared against.
+    pub value: u32,
+    /// True when the path continues only on equality, which is what makes it a size.
+    pub exact: bool,
+    pub at: CodeLocation,
+}
+
+/// One control code a dispatch routine accepts, decoded.
+///
+/// The field names are the shared IOCTL-case shape a Binary Ninja or Ghidra companion answers in
+/// (`docs/binja-windbg-mcp-plan.md`), so a case recovered here and a case recovered there are the
+/// same record about the same driver. The decoded halves — device type, function, method, access —
+/// are derived from [`Self::code`] and are what `decode_ioctl` reports for one code on its own.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IoctlCase {
+    /// The control code — `0x0022e004`.
+    pub code: String,
+    /// Bits 16-31.
+    pub device_type: u32,
+    /// Bits 2-13.
+    pub function: u32,
+    /// `buffered`, `in_direct`, `out_direct` or `neither` — bits 0-1. `neither` is the one that
+    /// hands the driver raw user-mode pointers.
+    pub method: String,
+    /// `any`, `read`, `write` or `read_write` — bits 14-15, and what the I/O manager gates the
+    /// handle on. `any` means the code is delivered on a handle opened with no access at all.
+    pub required_access: String,
+    /// The RVA of the routine this case reaches, when the case block reaches one directly.
+    ///
+    /// Absent means the work is inline in the dispatch routine, or is reached through a pointer —
+    /// never that the code is unhandled.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_rva: Option<String>,
+    /// The RVA of the block this code routes to. Absent only for a case whose landing site is in
+    /// no module the session knows.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub case_rva: Option<String>,
+    /// The input length this case requires, when a check in the case block **proves** one.
+    ///
+    /// Null is "not proven", never "no requirement": a length checked against a computed value, or
+    /// checked in a callee, leaves nothing here. Floors and ceilings are in [`Self::evidence`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub in_size: Option<u32>,
+    /// The output length this case requires, on the same terms as [`Self::in_size`].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub out_size: Option<u32>,
+    /// How this case was recovered: `compare` for a compare against the control code, `jump_table`
+    /// for an entry in a resolved switch table.
+    pub recovered: String,
+    /// Where the code is recognised — the compare, or the indirect jump whose table holds it.
+    pub at: CodeLocation,
+    /// The length checks found in the case block, including the ones that are not sizes.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub evidence: Vec<LengthCheck>,
+}
+
+/// One resolved jump table, as evidence for the cases it produced.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct JumpTable {
+    /// The indirect jump it feeds.
+    pub at: CodeLocation,
+    /// Where the table is.
+    pub table: String,
+    /// How many entries the bounds check admits.
+    pub entries: usize,
+    /// How many were read and turned into cases.
+    pub followed: usize,
+}
+
+/// What control codes a driver's dispatch routine accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IoctlMap {
+    /// Every image the locations below name, with the identity they are joined in. The same split
+    /// [`Reachability`] makes, and for the same reason: a map names one image dozens of times.
+    pub images: Vec<ImageRef>,
+    /// The dispatch routine the map is about, after the debugger resolved what was asked for.
+    pub dispatch: CodeLocation,
+    /// Whether the control code was traced from the IRP (`[[Irp+0xb8]+0x18]`) rather than taken
+    /// from the bare `+0x18` displacement.
+    ///
+    /// **What an empty `cases` means turns on this.** True, it says the routine reads the control
+    /// code and this pass could follow no comparison of it. False, it may equally mean the routine
+    /// never read a control code and the compares below are about some other structure — a
+    /// displacement is not a type.
+    pub code_proved: bool,
+    /// The codes recognised, in the order the routine recognises them. **A case per site**: a
+    /// driver that compares one code in two places is two records, because they are two places to
+    /// go and look.
+    pub cases: Vec<IoctlCase>,
+    /// How many were found, exact however many are listed.
+    pub case_count: usize,
+    /// The jump tables that were followed.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tables: Vec<JumpTable>,
+    /// Indirect transfers that were **not** followed: a switch whose table could not be resolved,
+    /// a call through a pointer.
+    ///
+    /// This is what stops a short list reading as a complete one. Every entry is a place a code
+    /// could be recognised and was not, so a map with entries here is a lower bound on what the
+    /// driver accepts rather than the set.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub unresolved: Vec<CodeLocation>,
+    /// Why the walk stopped early, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WalkHalt>,
+    /// True when a bound ended a list early — the cases, or one table's entries.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cap_hit: bool,
+}
+
 /// One sensitive API a driver imports, and where its code reaches it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct ImportedSink {

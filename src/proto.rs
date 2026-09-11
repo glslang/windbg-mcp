@@ -306,6 +306,17 @@ pub enum EngineOp {
         /// filled in by the supervisor's pump.
         patience_ms: u32,
     },
+    /// Which control codes a driver's dispatch routine accepts, recovered from its own code.
+    ///
+    /// One indivisible job for the reason [`Self::Reachability`] is: it disassembles a function
+    /// and reads the image behind it, which is a run of engine calls rather than one.
+    IoctlMap {
+        /// The dispatch routine, as a symbol or an address -- what `uf` would take.
+        dispatch: String,
+        /// Whatever is left of the caller's own clock when this reaches the front of the queue,
+        /// filled in by the supervisor's pump.
+        patience_ms: u32,
+    },
     /// A pool query. Like [`Self::Reachability`] this is one indivisible job: a query may have
     /// to walk every pool page, and letting another call for the same session interleave would
     /// let the walk describe a target that moved underneath it.
@@ -466,6 +477,7 @@ impl EngineOp {
             | Self::Walk(WalkOp { patience_ms, .. })
             | Self::Reachability(ReachabilityOp { patience_ms, .. })
             | Self::DriverHazards { patience_ms, .. }
+            | Self::IoctlMap { patience_ms, .. }
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
             _ => None,
         }

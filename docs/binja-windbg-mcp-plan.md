@@ -114,6 +114,8 @@ The default `groups: "all"` enables every group, including `similarity`. An expl
 - Put bounded dispatch-to-sink traversal in an optional `ioctl_map` analysis, disabled for ordinary map calls and enabled by `driver_surface`. Default depth is 2 and the function limit is 128; enforce hard maxima of depth 8 and 1,024 functions, with cancellation and deadline checks.
 - Implement `driver_surface` as a composite over the same four core functions. Preserve per-section success, partial, unavailable, and error outcomes, including prerequisites and traversal bounds. A failed dispatch recovery must not discard import or security evidence.
 
+The native side implements this shape: `ioctl_map` in `windbg-mcp` emits exactly these fields (plus `recovered`, `at` and an `evidence[]` of length checks), recovered from the debugger's own disassembly of the dispatch routine. A companion answering the same shape is joined to it by `module`+RVA.
+
 Define one shared IOCTL-case shape using `code`, `device_type`, `function`, `method`, `required_access`, `dispatch_rva`, `case_rva`, `in_size`, and `out_size`. Derive decoded fields from the numeric code. Size fields contain proven exact sizes or `null`; retain minimum/conditional checks separately as evidence. Multiple case sites remain separate records. Exclude `predicted_reachable`.
 
 Correct the playbook example: `0x0022e004` requires read and write access. Probe evidence records observed sites and analysis coverage; it does not certify safe buffer handling or establish a vulnerability.
