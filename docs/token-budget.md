@@ -340,17 +340,17 @@ None of these is a bug. They are recorded because they were invisible, and
    | group | tools | bytes | share |
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,457 | 19.2% |
-   | `inspect` | 10 | 13,152 | 15.4% |
+   | `inspect` | 10 | 13,152 | 15.3% |
    | `session` | 10 | 12,817 | 15% |
    | `exec` | 8 | 11,309 | 13.2% |
    | `batch` | 1 | 10,021 | 11.7% |
    | `crash` | 3 | 7,427 | 8.7% |
    | `ttd` | 9 | 6,829 | 8% |
-   | `ioctl` | 7 | 7,653 | 8.9% |
+   | `ioctl` | 7 | 7,704 | 9% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 58 | 85,665 |
+   | *(absent)* | 58 | 85,716 |
    | `session,inspect,exec,crash` | 31 | 43,784 |
    | `session,inspect,crash` | 23 | 32,322 |
    | `crash` | 13 | 19,078 |

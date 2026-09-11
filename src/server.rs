@@ -4426,7 +4426,8 @@ impl WindbgServer {
 
     /// What a driver's image says it can do: the sensitive APIs it imports with the
     /// call sites that reach them, and the privileged instructions in its code
-    /// (`rdmsr`, `out`, `mov cr3`). Imports are named from the driver's own import
+    /// (`rdmsr`, `out`, `mov cr3`, and every other one the decoder calls
+    /// privileged). Imports are named from the driver's own import
     /// table, so a stripped third-party binary answers as well as one with symbols.
     /// Evidence rather than a verdict: an import is not a call, an absent import
     /// excludes nothing since a driver can resolve an export at run time, and a call

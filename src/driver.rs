@@ -188,6 +188,8 @@ pub(crate) fn in_listing_order(
                 mnemonic: String::new(),
                 operands: Vec::new(),
                 flow: Flow::Unreadable,
+                // Nothing decoded, so nothing is claimed — the same "not asked" the flow says.
+                privileged: false,
             })
         })
         .collect()
@@ -1207,6 +1209,8 @@ mod tests {
                 .to_string(),
             operands: Vec::new(),
             flow,
+            // The walk asks nothing about privilege; `crate::hazards` is where that is read.
+            privileged: false,
         }
     }
 
