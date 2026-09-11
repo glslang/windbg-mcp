@@ -9,7 +9,7 @@ Nothing measured this until [`tests/mcp_smoke.rs`](../tests/mcp_smoke.rs) grew t
 and the numbers turned out to be larger than anyone had guessed — a careful reading of the source
 put the tool surface at 90–130 KB, and the wire was 391 KB. Finding 1 below is where 217 KB of that
 went, taking it to 177 KB — figures from that measurement, not from today's surface, which has
-gained tools and output schemas since and stood at 221,179 B on 2026-09-10.
+gained tools and output schemas since and stood at 221,341 B on 2026-09-10.
 
 ## Two costs, and they are not the same
 
@@ -450,8 +450,11 @@ a fix found it is a ceiling that would have absorbed the next regression in sile
 
 **How much room is left is a measurement, not a policy**, and it is not the "~15% over" this
 paragraph used to claim for all three. Measured 2026-09-10, after `reachable_from_dispatch` grew an
-`outputSchema`: the wire is 221,179 B against 225,000 (**1.7%**), the model-visible surface 84,506
-against 88,000 (4.1%), and the worst single tool 10,021 against 11,200 (11.8%). The wire is the one
+`outputSchema` and a scoped-start location: the wire is 221,341 B against 225,000 (**1.7%**), the
+model-visible surface 84,506 against 88,000 (4.1%), and the worst single tool 10,021 against 11,200
+(11.8%). Those are the figures the test **prints**, not ones derived from the golden: its "wire" is
+the golden's `payload`, and reading the neighbouring `wire` key instead is how the first draft of
+this paragraph came to be 162 bytes wrong. The wire is the one
 to watch, and it is deliberately not being raised ahead of the tools that will need it — a ceiling
 raised for work not yet done is the silence this whole section is against. The next tool to add an
 output schema raises it, with its own arithmetic.
