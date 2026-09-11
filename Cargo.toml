@@ -10,7 +10,7 @@ repository = "https://github.com/glslang/windbg-mcp"
 license = "MIT"
 
 [dependencies]
-dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "883bdb5cfc4111f4d8aef138c5634a3cfc71369e" }
+dbgscope = { git = "https://github.com/glslang/dbgscope", rev = "aa7c8214d40413c6cd2f305502a4314d7d910207" }
 # 3.2.0 is a floor, not a preference, and by now for two unrelated reasons. Every 3.x before 3.1.1
 # generates a `tools/list` that omits SEP-2549's required `ttlMs`/`cacheScope`, which a spec-strict
 # `2026-07-28` client rejects outright — the server connects and appears to expose no tools at all

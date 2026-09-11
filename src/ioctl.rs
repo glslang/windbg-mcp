@@ -31,16 +31,23 @@
 //! says which of the two produced the answer. The distinction matters because `+0x18` off an
 //! arbitrary register is an extremely ordinary thing for code to do.
 //!
-//! # How this is derived, and what that costs
+//! # How this is derived
 //!
-//! A **linear pass** over the listing: register facts carried instruction to instruction, restored
-//! at a region boundary, with a window looked backwards from an indirect jump and forwards from a
-//! case's landing site. It answers `mountmgr` exactly as a hand decode did — and every guard below
-//! about a fact not carrying across a boundary is there because a review round found the pass
-//! carrying one. A block-structured walk answers those structurally rather than one guard at a
-//! time, which is
-//! [#306](https://github.com/glslang/windbg-mcp/issues/306); this module's entry point is what that
-//! would keep, and these tests are what would check it.
+//! A **walk over the function's blocks**, not down its listing. `uf` prints a function's basic
+//! blocks one after another, so reading the listing straight through carries register facts across
+//! seams control flow never crosses -- a shared epilogue's `pop r13`, the block after a `ret` that
+//! is entered from a branch elsewhere. [`crate::cfg`] recovers the blocks and the edges from the
+//! flow the decoder already answers, and the facts here travel along those edges: what a block
+//! knows is what **every** path into it agrees on, a bounds check holds on the path it admits and
+//! not on the one it rejects, and a case block is read with the facts of the path that reaches it.
+//!
+//! That is a rewrite of an earlier straight-line pass ([#306](https://github.com/glslang/windbg-mcp/issues/306)),
+//! and the reason for it is worth keeping: thirteen review findings across four rounds were all one
+//! sentence -- the pass carried a fact across a boundary it had not earned -- and each fix was a
+//! guard, with the guards becoming where the next finding landed. A graph answers them by
+//! construction. The measure that it is the same analysis is `mountmgr`: the same control codes,
+//! from the same two tables, with two more *sites* found because two blocks the straight-line pass
+//! had lost the code register in are reached along an edge.
 //!
 //! # Engine-free
 //!
@@ -49,10 +56,11 @@
 //! halt poll. So every case below is unit-tested against a hand-built instruction list with no
 //! debugger anywhere near it.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 
-use dbgscope::dbgeng::{Flow, Instruction, Operand};
+use dbgscope::dbgeng::{Condition, Effect, Flow, Instruction, Operand};
 
+use crate::cfg;
 use crate::walk::Halt;
 
 /// Bounds. A malformed or hostile driver decides how much work this is, so every list the answer
@@ -64,13 +72,6 @@ pub(crate) const MAX_CASES: usize = 4096;
 /// The most entries followed out of one jump table. A table is `entries * 4` bytes of reads, so
 /// this is also what bounds the reading.
 pub(crate) const MAX_TABLE_ENTRIES: usize = 4096;
-/// The most instructions examined in one dispatch routine.
-pub(crate) const MAX_INSTRUCTIONS: usize = 64 * 1024;
-/// How often the halt poll runs while walking the listing.
-const POLL_EVERY: usize = 256;
-/// How far back from an indirect `jmp` the table pattern is looked for, and how far forward from a
-/// case's landing site a handler and a size check are.
-const WINDOW: usize = 24;
 
 /// How a case was recovered, which is what says how much of it to trust.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -261,152 +262,58 @@ impl Layout {
     };
 }
 
-/// The 64-bit register a name belongs to, so `eax`, `ax` and `al` are one register and `r13d` is
-/// `r13`.
+/// What the walk knows on one path into a block.
 ///
-/// A dispatch routine reads the control code as a **dword** and compares the same register as a
-/// qword two instructions later; tracking the spellings separately would lose the value at the
-/// first width change.
-fn family(name: &str) -> Option<&'static str> {
-    const WIDE: [&str; 16] = [
-        "rax", "rcx", "rdx", "rbx", "rsp", "rbp", "rsi", "rdi", "r8", "r9", "r10", "r11", "r12",
-        "r13", "r14", "r15",
-    ];
-    let name = name.trim();
-    for wide in WIDE {
-        if name == wide {
-            return Some(wide);
-        }
-    }
-    // eax/ax/al/ah -> rax, and the same shape for the other three legacy names.
-    const LEGACY: [(&str, [&str; 4]); 8] = [
-        ("rax", ["eax", "ax", "al", "ah"]),
-        ("rcx", ["ecx", "cx", "cl", "ch"]),
-        ("rdx", ["edx", "dx", "dl", "dh"]),
-        ("rbx", ["ebx", "bx", "bl", "bh"]),
-        ("rsp", ["esp", "sp", "spl", ""]),
-        ("rbp", ["ebp", "bp", "bpl", ""]),
-        ("rsi", ["esi", "si", "sil", ""]),
-        ("rdi", ["edi", "di", "dil", ""]),
-    ];
-    for (wide, narrow) in LEGACY {
-        if narrow.contains(&name) {
-            return Some(wide);
-        }
-    }
-    // r8d/r8w/r8b and friends.
-    for wide in WIDE {
-        if let Some(rest) = name.strip_prefix(wide)
-            && matches!(rest, "d" | "w" | "b")
-        {
-            return Some(wide);
-        }
-    }
-    None
+/// **Facts travel along edges, not down the listing.** That is the whole difference between this
+/// and the pass it replaces: `uf` prints a function's blocks in sequence, so carrying a register's
+/// meaning from one instruction to the next carries it across seams control flow never crosses —
+/// a shared epilogue's `pop r13`, the block after a `ret` that is entered from a branch elsewhere.
+/// Every such carry was a guard, and the guards were where the next defect landed (#306).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct Facts {
+    /// What each register holds, by the full-width register the decoder names.
+    registers: BTreeMap<String, Value>,
+    /// An index bound that holds **on this path**: `cmp eax,50h` / `ja default` leaves it on the
+    /// fall-through edge and not on the branch's, which is what makes a jump table's length a
+    /// fact about the path that reaches it rather than about the listing near it.
+    bound: Option<Bound>,
 }
 
-/// The registers a `call` may return over, which is what makes a belief about one stale.
-const VOLATILE: [&str; 7] = ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"];
-
-/// The register an operand names, if it names one.
-fn register_of(operand: &Operand) -> Option<&'static str> {
-    match operand {
-        Operand::Register(name) => family(name),
-        _ => None,
-    }
-}
-
-/// The immediate an operand carries, if it carries one.
-fn immediate_of(operand: &Operand) -> Option<u64> {
-    match operand {
-        Operand::Immediate(value) => Some(*value),
-        _ => None,
-    }
-}
-
-/// What the flags a conditional branch reads say about the compare that set them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Relation {
-    /// Equality: the branch is taken when the compared values are the same.
-    Equal,
-    /// Inequality: taken when they differ.
-    NotEqual,
-    /// **Unsigned** above: `cmp index,N` / `ja default` leaves `0..=N` on the path, so a table
-    /// behind it has `N + 1` entries.
-    Above,
-    /// **Unsigned** above-or-equal: `jae default` leaves `0..N`, so a table behind it has `N`.
+impl Facts {
+    /// What two paths into one block agree on.
     ///
-    /// Kept apart from [`Self::Above`] because the difference is one table entry, and one entry
-    /// past the end of a table is a dword of whatever follows it -- which becomes a control code
-    /// the driver is reported as accepting whenever it happens to resolve inside the image.
-    AboveOrEqual,
-    /// Anything else, which is modelled as "some order" and never as a case or a bound. The
-    /// **signed** comparisons are deliberately here: `jg` proves nothing about an unsigned index,
-    /// and a table is indexed as unsigned.
-    Order,
+    /// A fact that is not on every edge is not a fact at the join: a register holding the control
+    /// code on one path and something else on another holds neither here. Dropping it is what
+    /// makes the answer sound; keeping it is what a straight-line pass does by accident.
+    fn join(&mut self, other: &Facts) -> bool {
+        let mut changed = false;
+        self.registers.retain(|register, value| {
+            let agrees = other.registers.get(register) == Some(value);
+            changed |= !agrees;
+            agrees
+        });
+        if self.bound != other.bound {
+            changed |= self.bound.is_some();
+            self.bound = None;
+        }
+        changed
+    }
 }
 
-fn relation_of(mnemonic: &str) -> Option<Relation> {
-    Some(match mnemonic {
-        "je" | "jz" => Relation::Equal,
-        "jne" | "jnz" => Relation::NotEqual,
-        "ja" | "jnbe" => Relation::Above,
-        "jae" | "jnb" | "jnc" => Relation::AboveOrEqual,
-        "jb" | "jnae" | "jc" | "jbe" | "jna" | "jg" | "jnle" | "jge" | "jnl" | "jl" | "jnge"
-        | "jle" | "jng" => Relation::Order,
-        _ => return None,
-    })
-}
-
-/// A bounds check the walk has passed: `cmp index, N` / `ja default`, which is the only thing
-/// that gives a jump table a length.
+/// How many times the block walk may sweep the function before the facts stop moving.
 ///
-/// Kept as a short history rather than read off the register state at the jump, because the
-/// pattern in between **overwrites the index register** with the table entry it loads: by the time
-/// the indirect jump arrives, the register that was the index holds an address, and the fact that
-/// it was bounded lives nowhere else.
-#[derive(Debug, Clone, Copy)]
-struct Bound {
-    /// Where in the listing the check was, so a stale one can be dropped.
-    at_index: usize,
-    /// The compare's address, which is what says whether anything wrote the index *since* it.
-    at: u64,
-    /// The register checked.
-    register: &'static str,
-    /// What it held: `(code - offset) >> shift`.
-    offset: i64,
-    shift: u32,
-    /// The largest index the check admits.
-    limit: u64,
-    /// Whether the index came from a control code traced to the IRP.
-    proved: bool,
-    /// Where the check sends an index past that -- the switch's **default**, which is also what
-    /// every unused slot of its table holds.
-    default: Option<u64>,
-}
-
-/// The state one compare leaves for the branch that reads it.
-#[derive(Debug, Clone, Copy)]
-struct Compared {
-    /// The control code the compare is about, when it is about one.
-    code: Option<u64>,
-    /// Whether the value compared was traced from the IRP rather than taken from a bare
-    /// displacement.
-    proved: bool,
-    /// The register compared and what it held, for a bounds check feeding a jump table.
-    index: Option<(&'static str, i64, u32)>,
-    /// The bound, when the compare was against an immediate.
-    bound: Option<u64>,
-    /// Where the compare is.
-    at: u64,
-}
+/// A forward analysis in reverse post-order converges in about one sweep per loop nesting level,
+/// and a dispatch routine has one or two. This is far past that, and is here so a shape nobody
+/// anticipated ends the walk with [`Map::cap_hit`] set rather than spinning.
+const MAX_SWEEPS: usize = 32;
 
 /// Recovers the control codes a dispatch routine accepts.
 ///
 /// `block` is the routine's instructions in listing order — what `uf` produces, and what
 /// [`crate::driver::in_listing_order`] guarantees has a barrier wherever one could not be read.
 /// `read` serves the image's own bytes for a jump table, and answers `None` for an address that
-/// will not read, which ends that table rather than the map.
+/// will not read, which ends that table rather than the map. `in_image` says whether an address is
+/// code in this driver, which is what a table recognised by accident fails.
 pub(crate) fn map(
     dispatch: u64,
     block: &[Instruction],
@@ -415,279 +322,184 @@ pub(crate) fn map(
     in_image: impl Fn(u64) -> bool,
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> Map {
-    let mut state: HashMap<&'static str, Value> = HashMap::new();
-    // The second argument of a dispatch routine. Believed from the first instruction, and
-    // overwritten the moment anything writes to it, which is what a prologue's `mov rbx,rdx`
-    // does — the belief travels rather than being pinned to the register.
-    if let Some(register) = layout.irp_register {
-        state.insert(register, Value::Irp);
+    let graph = cfg::graph(block);
+    let index_of: HashMap<u64, usize> = block
+        .iter()
+        .enumerate()
+        .map(|(index, instruction)| (instruction.address, index))
+        .collect();
+
+    let mut halted = None;
+    let mut cap_hit = false;
+
+    // The facts on the way **into** each block, which is what the sweeps below settle.
+    let mut entry: Vec<Option<Facts>> = vec![None; graph.blocks.len()];
+    if !graph.blocks.is_empty() {
+        let mut initial = Facts::default();
+        // The second argument of a dispatch routine, where the calling convention passes it in a
+        // register at all. Believed at the entry block and nowhere else: a block reached from
+        // somewhere gets what that path left, which is what a prologue's `mov rbx,rdx` means.
+        if let Some(register) = layout.irp_register {
+            initial.registers.insert(register.to_string(), Value::Irp);
+        }
+        entry[0] = Some(initial);
     }
 
+    let order = graph.walk_order();
+    for sweep in 0.. {
+        if sweep >= MAX_SWEEPS {
+            cap_hit = true;
+            break;
+        }
+        // Polled per sweep rather than per instruction: a sweep is the unit of work here, and a
+        // routine large enough for the clock to matter has many blocks rather than one long one.
+        if let Some(why) = halt() {
+            halted = Some(why);
+            break;
+        }
+        let mut moved = false;
+        for &index in &order {
+            let Some(facts) = entry[index].clone() else {
+                continue;
+            };
+            let run = simulate(
+                index, &graph, block, &index_of, facts, layout, None, &in_image,
+            );
+            for (successor, facts) in run.to {
+                match &mut entry[successor] {
+                    Some(existing) => moved |= existing.join(&facts),
+                    slot @ None => {
+                        *slot = Some(facts);
+                        moved = true;
+                    }
+                }
+            }
+        }
+        if !moved {
+            break;
+        }
+    }
+
+    // The recording pass, over facts that have stopped moving. Separate from the sweeps above
+    // because a case found twice is a case reported twice, and the sweeps are how many times a
+    // block is walked.
     let mut cases: Vec<Case> = Vec::new();
     let mut case_count = 0usize;
     let mut tables: Vec<Table> = Vec::new();
     let mut unresolved: Vec<u64> = Vec::new();
-    let mut halted = None;
-    let mut cap_hit = false;
     let mut traced = false;
-    let mut examined = 0usize;
     let mut blind = 0usize;
-    let mut compared: Option<Compared> = None;
-    let mut bounds: Vec<Bound> = Vec::new();
-    // The state as it stood when the control code was first in a register, kept to be restored at
-    // a region boundary. See `ended` below for why.
-    let mut entry_state: Option<HashMap<&'static str, Value>> = None;
-    let mut ended = false;
-
-    for (i, instruction) in block.iter().enumerate() {
-        if i >= MAX_INSTRUCTIONS {
-            cap_hit = true;
+    let mut examined = 0usize;
+    let mut reader = ReadOnce {
+        read: &mut read,
+        served: 0,
+    };
+    for &index in &order {
+        // Polled per block here as well as per sweep above: the sweeps settle the facts and this
+        // is the walk that reads them, so a halt landing between the two would otherwise record
+        // the whole routine after the caller had gone.
+        if halted.is_some() {
             break;
         }
-        if i % POLL_EVERY == 0
-            && let Some(why) = halt()
-        {
+        if let Some(why) = halt() {
             halted = Some(why);
             break;
         }
-        examined += 1;
-
-        // **A listing is a rendering of a graph, and belief does not flow across a region
-        // boundary.** `uf` prints a function's blocks one after another, so the instruction after
-        // a `ret` or an unconditional `jmp` is not reached from the one before it -- it is
-        // reached from a branch somewhere else, with whatever that path left in the registers. A
-        // straight-line pass that carried state across those seams read `mountmgr`'s shared
-        // epilogue, saw its `pop r13` restore the caller's register, and lost the control code
-        // for the whole rest of the routine: two of its codes were recovered and five were not.
-        //
-        // So a region boundary restores the state to what it was when the control code was first
-        // loaded, which is the state every one of those blocks is in fact entered with. It is an
-        // assumption rather than a proof -- a block entered with that register holding something
-        // else would be read wrongly -- and it is the same assumption a person reading the
-        // listing makes, for the same reason: the compare chain is one routine's, and its blocks
-        // are its own.
-        if ended {
-            state = entry_state.clone().unwrap_or_default();
-            compared = None;
-            bounds.clear();
-        }
-        ended = matches!(
-            instruction.flow,
-            Flow::Return | Flow::Trap | Flow::Jmp(_) | Flow::Unreadable
-        );
-        // An instruction that could not be read, or whose encoding this build does not decode, is
-        // counted rather than merely stepped over: the compare that recognises a code may be
-        // exactly there, and a case list short by one reads like a complete one.
-        if matches!(instruction.flow, Flow::Unreadable | Flow::Unknown) {
-            blind += 1;
-        }
-
-        // A branch reading the flags of the compare before it is where a case is made, so it is
-        // handled before the state update that clears `compared`.
-        if let Flow::Branch(target) = instruction.flow {
-            if let (Some(was), Some(relation)) = (compared, relation_of(&instruction.mnemonic)) {
-                match (relation, was.code) {
-                    // `cmp code, N` / `je handler` -- the case is at the branch target. A branch
-                    // whose destination the encoding does not give is a case whose landing site is
-                    // unknown, and a case has to say where it goes to be worth reporting.
-                    (Relation::Equal, Some(code)) => {
-                        if let Some(target) = target {
-                            push_case(
-                                &mut cases,
-                                &mut case_count,
-                                &mut cap_hit,
-                                code,
-                                Recovery::Compare,
-                                was.at,
-                                target,
-                                was.proved,
-                            );
-                        }
-                    }
-                    // `cmp code, N` / `jne next` -- the case is what follows, since the branch is
-                    // the *rejection*. Recorded at the next instruction's address rather than at
-                    // the branch's, so the landing site is code that runs for this case.
-                    (Relation::NotEqual, Some(code)) => {
-                        if let Some(next) = block.get(i + 1) {
-                            push_case(
-                                &mut cases,
-                                &mut case_count,
-                                &mut cap_hit,
-                                code,
-                                Recovery::Compare,
-                                was.at,
-                                next.address,
-                                was.proved,
-                            );
-                        }
-                    }
-                    // `cmp index, N` / `ja default` is the bounds check a jump table needs, and
-                    // the one thing that survives the load overwriting the index register. The
-                    // exclusive form admits one fewer index, which is one table entry.
-                    (relation @ (Relation::Above | Relation::AboveOrEqual), _) => {
-                        if let (Some((register, offset, shift)), Some(limit)) =
-                            (was.index, was.bound)
-                            && let Some(limit) = match relation {
-                                Relation::Above => Some(limit),
-                                _ => limit.checked_sub(1),
-                            }
-                        {
-                            bounds.push(Bound {
-                                at_index: i,
-                                at: was.at,
-                                register,
-                                offset,
-                                shift,
-                                limit,
-                                proved: was.proved,
-                                // The branch's own target: an index past the bound goes to the
-                                // switch's default, and so does every slot of the table the
-                                // compiler had no case for.
-                                default: target,
-                            });
-                        }
-                    }
-                    _ => {}
-                }
-            }
-            compared = None;
-            clobber(&mut state, instruction);
-            continue;
-        }
-
-        // An indirect **jump** is either a jump table this can follow or a hole in the answer. An
-        // indirect *call* is neither: a driver reaches its imports through the IAT, so a dispatch
-        // routine is full of them and not one of them decides on a control code. Listing those as
-        // places a code might be recognised made `mountmgr` report seventeen, every one an import
-        // thunk -- noise that makes the list nobody can act on out of the one field that says the
-        // answer is a lower bound.
-        if matches!(instruction.flow, Flow::Jmp(None)) {
-            let start = i.saturating_sub(WINDOW);
-            bounds.retain(|bound| bound.at_index >= start);
-            match follow_table(
-                &block[start..i],
-                instruction,
-                instruction.address,
-                &bounds,
-                &state,
-                &mut read,
+        let Some(facts) = entry[index].clone() else {
+            // A block no path reaches is still walked for what it *contains* -- a case block
+            // selected only by a table is reached by nothing this graph knows -- but with nothing
+            // believed about any register, which is the honest state to read it in.
+            let run = simulate(
+                index,
+                &graph,
+                block,
+                &index_of,
+                Facts::default(),
+                layout,
+                Some(&mut reader),
                 &in_image,
-            ) {
-                Some(resolved) => {
-                    for (code, lands) in resolved.cases {
-                        push_case(
-                            &mut cases,
-                            &mut case_count,
-                            &mut cap_hit,
-                            code,
-                            Recovery::JumpTable,
-                            instruction.address,
-                            lands,
-                            resolved.proved,
-                        );
-                    }
-                    tables.push(resolved.table);
-                }
-                None => unresolved.push(instruction.address),
-            }
-            compared = None;
-            clobber(&mut state, instruction);
+            );
+            record(
+                run,
+                &mut cases,
+                &mut case_count,
+                &mut cap_hit,
+                &mut tables,
+                &mut unresolved,
+                &mut traced,
+                &mut blind,
+                &mut examined,
+            );
             continue;
-        }
-
-        compared = update(&mut state, instruction, layout, &mut traced);
-        // The first moment the control code is in a register is the state every block of the
-        // dispatch chain is entered with, so it is what a region boundary restores.
-        if entry_state.is_none()
-            && state.values().any(|value| {
-                matches!(
-                    value,
-                    Value::Code {
-                        offset: 0,
-                        shift: 0,
-                        ..
-                    }
-                )
-            })
-        {
-            entry_state = Some(state.clone());
-        }
-        // A **direct** call reaches here rather than the arms above, and it returns over the
-        // volatile registers exactly as an indirect one does. Forgetting them only on the
-        // indirect path would leave a compare against whatever a callee returned reported as a
-        // control code, which is the shape of wrong answer this pass exists to avoid.
-        clobber(&mut state, instruction);
+        };
+        let run = simulate(
+            index,
+            &graph,
+            block,
+            &index_of,
+            facts,
+            layout,
+            Some(&mut reader),
+            &in_image,
+        );
+        record(
+            run,
+            &mut cases,
+            &mut case_count,
+            &mut cap_hit,
+            &mut tables,
+            &mut unresolved,
+            &mut traced,
+            &mut blind,
+            &mut examined,
+        );
     }
 
     if halted.is_none() {
-        // Polled once more after the loop: a halt landing during the last window would otherwise
+        // Polled once more after the walk: a halt landing during the last sweep would otherwise
         // leave a map that reads as a routine fully walked.
         halted = halt();
     }
 
-    // The handler and the size proofs are read off the block the case lands in, which is why they
-    // are a second pass: a case made at a compare near the top of a routine lands hundreds of
-    // instructions further down.
-    let index: HashMap<u64, usize> = block
-        .iter()
-        .enumerate()
-        .map(|(i, instruction)| (instruction.address, i))
-        .collect();
-    // The registers the IRP's stack location was watched into, which is what a length check's
-    // base has to be one of. Taken from the state at the top of the dispatch chain, for the same
-    // reason that state is what a region boundary restores: it is what every case block is
-    // entered with. A case that re-derives the pointer into some other register is one whose
-    // length checks are not reported, which is the direction to be wrong in.
-    let stack_registers: Vec<&'static str> = entry_state
-        .unwrap_or_default()
-        .iter()
-        .filter(|(_, value)| matches!(value, Value::StackLocation))
-        .map(|(register, _)| *register)
-        .collect();
-    // Whether the block at an address sets an NTSTATUS error and returns, which is the only thing
-    // in this routine that says which side of a branch the driver treats as success.
-    let fails = |at: u64| {
-        index.get(&at).is_some_and(|&at| {
-            let end = (at + WINDOW).min(block.len());
-            failure_block(&block[at..end])
-        })
-    };
+    // What each case's landing block says about it: the routine it reaches, whether the block
+    // handles the code or refuses it, and the length checks it makes. Read from the **block** and
+    // the facts on the way into it, so a window is never needed and a register's meaning is the
+    // one this path gave it.
     for case in &mut cases {
-        if let Some(&at) = index.get(&case.lands) {
-            let end = (at + WINDOW).min(block.len());
-            let window = &block[at..end];
-            case.handler = handler_in(window);
-            // Rejected if the landing block fails, handled if it reaches a routine, and unknown
-            // otherwise -- which is an ordinary outcome and is why this is not a `bool`.
-            // **A call is not an acceptance**, which is the trap this three-way answer exists
-            // for: the ordinary rejection calls a completion routine too, and reading that as the
-            // handler publishes the completion routine as this code's. So `true` needs a routine
-            // reached *and* no error status anywhere in the block -- the absence of a visible
-            // rejection rather than proof of handling, which is what its documentation says.
-            case.accepted = match (failure_block(window), case.handler, error_status(window)) {
-                (true, _, _) => Some(false),
-                (false, Some(_), false) => Some(true),
-                _ => None,
-            };
-            // And a rejection has no handler to report: what it reaches is the completion routine
-            // that refuses the request, and naming that as this code's handler is a name a reader
-            // would go and look up.
-            if case.accepted == Some(false) {
-                case.handler = None;
-            }
-            let (input, output) = sizes_in(window, layout, &stack_registers, &fails);
-            case.in_size = input;
-            case.out_size = output;
+        let Some(at) = index_of.get(&case.lands).and_then(|&at| graph.holding(at)) else {
+            continue;
+        };
+        let facts = entry[at].clone().unwrap_or_default();
+        let instructions = &block[graph.blocks[at].start..graph.blocks[at].end];
+        case.handler = handler_in(instructions);
+        let refuses = refuses_in(at, &graph, block);
+        case.accepted = match (refuses, case.handler, error_status(instructions)) {
+            (true, _, _) => Some(false),
+            (false, Some(_), false) => Some(true),
+            _ => None,
+        };
+        if case.accepted == Some(false) {
+            // A rejection has no handler to report: what it reaches is whatever completes the
+            // request, and naming that as this code's handler is a name a reader would look up.
+            case.handler = None;
         }
+        let (input, output) = sizes_in(instructions, &facts, layout, &|address| {
+            index_of
+                .get(&address)
+                .and_then(|&at| graph.holding(at))
+                .is_some_and(|at| refuses_in(at, &graph, block))
+        });
+        case.in_size = input;
+        case.out_size = output;
     }
 
     Map {
         dispatch,
-        // **Every reported case, not any one load.** A routine that compares some other
-        // structure's `+0x18` field and later reads the real control code would otherwise have the
-        // first case borrow the second's credibility -- and the first is exactly the one a reader
-        // needs warning about. With no cases at all this says whether the code was read, which is
-        // what makes an empty answer readable.
+        // **Every reported case, not any one load.** A routine that compares some other structure's
+        // `+0x18` field and later reads the real control code would otherwise have the first case
+        // borrow the second's credibility -- and the first is exactly the one a reader needs
+        // warning about. With no cases at all this says whether the code was read, which is what
+        // makes an empty answer readable.
         code_proved: traced && cases.iter().all(|case| case.proved),
         cases,
         case_count,
@@ -697,6 +509,213 @@ pub(crate) fn map(
         cap_hit,
         examined,
         blind,
+    }
+}
+
+/// The image reader, with a count of what it was asked for.
+///
+/// Handed to one pass rather than to every sweep: a table is read when the answer is recorded, so
+/// the number of reads is the number of tables and not the number of times the walk swept.
+struct ReadOnce<'a> {
+    read: &'a mut dyn FnMut(u64, usize) -> Option<Vec<u8>>,
+    served: usize,
+}
+
+/// What walking one block produced.
+struct Run {
+    /// The facts on each edge out of this block.
+    to: Vec<(usize, Facts)>,
+    /// `(code, lands, site, proved)` for each case this block's terminator recognises.
+    cases: Vec<(u64, u64, u64, bool)>,
+    /// A jump table this block's terminator was resolved through.
+    table: Option<Resolved>,
+    /// An indirect transfer this block ends in that was **not** resolved.
+    unresolved: Option<u64>,
+    /// Whether a control code was traced from the IRP anywhere in this block.
+    traced: bool,
+    blind: usize,
+    examined: usize,
+}
+
+/// Folds one block's findings into the answer.
+#[allow(clippy::too_many_arguments)]
+fn record(
+    run: Run,
+    cases: &mut Vec<Case>,
+    case_count: &mut usize,
+    cap_hit: &mut bool,
+    tables: &mut Vec<Table>,
+    unresolved: &mut Vec<u64>,
+    traced: &mut bool,
+    blind: &mut usize,
+    examined: &mut usize,
+) {
+    *traced |= run.traced;
+    *blind += run.blind;
+    *examined += run.examined;
+    for (code, lands, site, proved) in run.cases {
+        push_case(
+            cases,
+            case_count,
+            cap_hit,
+            code,
+            Recovery::Compare,
+            site,
+            lands,
+            proved,
+        );
+    }
+    if let Some(resolved) = run.table {
+        for (code, lands) in resolved.cases {
+            push_case(
+                cases,
+                case_count,
+                cap_hit,
+                code,
+                Recovery::JumpTable,
+                resolved.table.at,
+                lands,
+                resolved.proved,
+            );
+        }
+        tables.push(resolved.table);
+    }
+    if let Some(at) = run.unresolved {
+        unresolved.push(at);
+    }
+}
+
+/// Walks one block: what its instructions do to the facts, and what its terminator recognises.
+///
+/// `reader` is `Some` only on the pass that records, so a table is read once however many times the
+/// walk sweeps.
+#[allow(clippy::too_many_arguments)]
+fn simulate(
+    index: usize,
+    graph: &cfg::Graph,
+    listing: &[Instruction],
+    index_of: &HashMap<u64, usize>,
+    entry: Facts,
+    layout: Layout,
+    reader: Option<&mut ReadOnce<'_>>,
+    in_image: &impl Fn(u64) -> bool,
+) -> Run {
+    let block = &graph.blocks[index];
+    let mut facts = entry;
+    let mut compared: Option<Compared> = None;
+    let mut traced = false;
+    let mut blind = 0usize;
+    let mut cases = Vec::new();
+    let mut table = None;
+    let mut unresolved = None;
+
+    let instructions = &listing[block.start..block.end];
+    let terminator = instructions.len().saturating_sub(1);
+    for (position, instruction) in instructions.iter().enumerate() {
+        if matches!(instruction.flow, Flow::Unreadable | Flow::Unknown) {
+            blind += 1;
+        }
+        if position == terminator {
+            break;
+        }
+        compared = update(&mut facts, instruction, layout, &mut traced);
+    }
+
+    let last = instructions.last();
+    // The terminator reads the flags the block left and decides where control goes.
+    if let Some(last) = last {
+        match last.flow {
+            Flow::Branch(target) => {
+                if let (Some(was), Some(condition)) = (compared.as_ref(), last.condition) {
+                    match (condition, was.code) {
+                        (Condition::Equal, Some(code)) => {
+                            if let Some(target) = target {
+                                cases.push((code, target, was.at, was.proved));
+                            }
+                        }
+                        (Condition::NotEqual, Some(code)) => {
+                            // The branch is the *rejection*, so the case is what follows.
+                            if let Some(next) = listing.get(block.end) {
+                                cases.push((code, next.address, was.at, was.proved));
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Flow::Jmp(None) | Flow::Call(None) if matches!(last.flow, Flow::Jmp(None)) => {
+                // Everything **before** the jump: the jump reads the register the chain is walked
+                // back from, and taking it for a definition of that register ends the walk at its
+                // own first step.
+                match follow_table(&instructions[..terminator], last, &facts, reader, in_image) {
+                    Some(resolved) => table = Some(resolved),
+                    None => unresolved = Some(last.address),
+                }
+            }
+            _ => {
+                // A call at the end of a block is ordinary: the block continues after it, and the
+                // callee is not this function's edge. Its effect on the registers is the one thing
+                // that matters here.
+                compared = update(&mut facts, last, layout, &mut traced);
+            }
+        }
+    }
+
+    // The facts on each edge. A bounds check narrows only the path where the index is in range,
+    // which is what makes a table's length a fact about the path rather than about the listing.
+    let mut to = Vec::new();
+    let fall_through = listing
+        .get(block.end)
+        .and_then(|next| index_of.get(&next.address))
+        .and_then(|&at| graph.holding(at));
+    let mut carried = facts.clone();
+    carried.bound = None;
+    if let (Some(last), Some(was)) = (last, compared.as_ref())
+        && let (Flow::Branch(target), Some(condition)) = (last.flow, last.condition)
+        && matches!(
+            condition,
+            Condition::UnsignedAbove | Condition::UnsignedAboveOrEqual
+        )
+        && let (Some((register, offset, shift)), Some(limit)) = (was.index.clone(), was.bound)
+        && let Some(limit) = match condition {
+            Condition::UnsignedAbove => Some(limit),
+            _ => limit.checked_sub(1),
+        }
+    {
+        let mut bounded = carried.clone();
+        bounded.bound = Some(Bound {
+            register,
+            offset,
+            shift,
+            limit,
+            // An index past the bound goes where this branch goes, and so does every slot of the
+            // table the compiler had no case for.
+            default: target,
+            proved: was.proved,
+        });
+        if let Some(fall_through) = fall_through {
+            to.push((fall_through, bounded));
+        }
+        if let Some(taken) = target
+            .and_then(|target| index_of.get(&target))
+            .and_then(|&at| graph.holding(at))
+        {
+            to.push((taken, carried.clone()));
+        }
+    } else {
+        for &successor in &graph.blocks[index].successors {
+            to.push((successor, carried.clone()));
+        }
+    }
+
+    Run {
+        to,
+        cases,
+        table,
+        unresolved,
+        traced,
+        blind,
+        examined: instructions.len(),
     }
 }
 
@@ -735,45 +754,97 @@ fn push_case(
     });
 }
 
-/// Applies one instruction to the register state, and reports the compare it leaves behind.
+/// The full-width register an operand names, which is the decoder's answer rather than a table's.
+fn register_full(operand: &Operand) -> Option<String> {
+    match operand {
+        Operand::Register(register) => Some(register.full.clone()),
+        _ => None,
+    }
+}
+
+/// The immediate an operand carries, if it carries one.
+fn immediate_of(operand: &Operand) -> Option<u64> {
+    match operand {
+        Operand::Immediate(value) => Some(*value),
+        _ => None,
+    }
+}
+
+/// The registers a `call` may return over, which is what makes a belief about one stale.
+const VOLATILE: [&str; 7] = ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"];
+
+/// The state one compare leaves for the branch that reads it.
+#[derive(Debug, Clone)]
+struct Compared {
+    /// The control code the compare is about, when it is about one.
+    code: Option<u64>,
+    /// Whether the value compared was traced from the IRP rather than taken from a displacement.
+    proved: bool,
+    /// The register compared and what it held, for a bounds check feeding a jump table.
+    index: Option<(String, i64, u32)>,
+    /// The bound, when the compare was against an immediate.
+    bound: Option<u64>,
+    /// Where the compare is.
+    at: u64,
+}
+
+/// A bounds check that holds on the path carrying it: `cmp index,N` / `ja default`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Bound {
+    /// The register checked, by its full-width name.
+    register: String,
+    /// What it held: `(code - offset) >> shift`.
+    offset: i64,
+    shift: u32,
+    /// The largest index the check admits.
+    limit: u64,
+    /// Where an index past it goes — the switch's **default**, which is also what every unused
+    /// slot of its table holds.
+    default: Option<u64>,
+    /// Whether the index came from a control code traced to the IRP.
+    proved: bool,
+}
+
+/// Applies one instruction to the facts, and reports the compare it leaves behind.
 fn update(
-    state: &mut HashMap<&'static str, Value>,
+    facts: &mut Facts,
     instruction: &Instruction,
     layout: Layout,
     traced: &mut bool,
 ) -> Option<Compared> {
-    let operands = &instruction.operands;
-    let mnemonic = instruction.mnemonic.as_str();
-
     // A compare writes no register and is the only thing a branch reads.
-    if mnemonic == "cmp" {
-        return compare(state, instruction, layout, traced);
+    if instruction.effect == Effect::Compare {
+        return compare(facts, instruction, layout, traced);
     }
-    // `test reg,reg` after a `sub` is the same statement about zero, but every other `test` is a
-    // mask; neither makes a case, and both end the compare before them.
-    if matches!(mnemonic, "test" | "push" | "nop" | "int" | "ret") {
+    // A call returns over the volatile registers, so a belief about one does not survive it.
+    if matches!(instruction.flow, Flow::Call(_)) {
+        for volatile in VOLATILE {
+            facts.registers.remove(volatile);
+        }
+    }
+    // Neither of these writes a register, and `test` is the other thing that writes only flags.
+    if matches!(instruction.effect, Effect::Test | Effect::Push) {
         return None;
     }
-
-    let Some(destination) = operands.first().and_then(register_of) else {
+    let operands = &instruction.operands;
+    let Some(destination) = operands.first().and_then(register_full) else {
         // Writes memory, or nothing this models. A store through a register does not change what
-        // the register holds, so the state stands.
+        // the register holds, so the facts stand.
         return None;
     };
+    let held = facts.registers.get(&destination).cloned();
 
-    match mnemonic {
-        "mov" | "movzx" | "movsxd" | "movsx" | "lea" => {
-            // `lea eax,[r13-6DC004h]` is `sub` without touching the flags, and a compiler uses it
-            // exactly where a switch is rebased before a bounds check. Read as an address it is
-            // nothing -- there is no absolute in it -- so without this arm the jump table that
-            // follows has no index and the whole dense run of codes is lost.
-            let rebased = match (mnemonic, operands.get(1)) {
-                ("lea", Some(Operand::Memory(memory))) if memory.index.is_none() => {
+    match instruction.effect {
+        Effect::Move | Effect::LoadAddress => {
+            // `lea eax,[r13-6DC004h]` is a `sub` that leaves the flags alone, and a compiler emits
+            // it exactly where a switch is rebased before its bounds check. Read as an address it
+            // is nothing, so without this the table that follows has no index.
+            let rebased = match (instruction.effect, operands.get(1)) {
+                (Effect::LoadAddress, Some(Operand::Memory(memory))) if memory.index.is_none() => {
                     match memory
                         .base
-                        .as_deref()
-                        .and_then(family)
-                        .and_then(|base| state.get(base))
+                        .as_ref()
+                        .and_then(|base| facts.registers.get(&base.full))
                     {
                         Some(Value::Code {
                             offset,
@@ -791,130 +862,120 @@ fn update(
                 }
                 _ => None,
             };
-            let value =
-                rebased.or_else(|| source_value(state, operands.get(1), mnemonic, layout, traced));
-            set(state, destination, value);
-            None
+            let value = rebased.or_else(|| source_value(facts, instruction, layout, traced));
+            set(facts, &destination, value);
         }
-        "sub" => match (state.get(destination).copied(), operands.get(1)) {
-            // `sub eax, 6D0034h` rebases the code: the register now holds `code - (offset + K)`,
-            // and the `je` that follows is a case for that value rather than for zero.
+        // `sub eax, 6D0034h` rebases the code: the register now holds `code - (offset + K)`, and
+        // the `je` that follows is a case for that value rather than for zero.
+        Effect::Subtract => match (held, operands.get(1).and_then(immediate_of)) {
             (
                 Some(Value::Code {
                     offset,
                     shift,
                     proved,
                 }),
-                Some(operand),
+                Some(immediate),
             ) => {
-                let immediate = immediate_of(operand)?;
-                let offset = offset.checked_add(immediate as i64)?;
+                let Some(offset) = offset.checked_add(immediate as i64) else {
+                    set(facts, &destination, None);
+                    return None;
+                };
                 set(
-                    state,
-                    destination,
+                    facts,
+                    &destination,
                     Some(Value::Code {
                         offset,
                         shift,
                         proved,
                     }),
                 );
-                Some(Compared {
+                return Some(Compared {
                     code: (shift == 0).then_some(offset as u64),
+                    proved,
                     index: Some((destination, offset, shift)),
                     bound: Some(0),
                     at: instruction.address,
-                    proved,
-                })
+                });
             }
-            _ => {
-                set(state, destination, None);
-                None
-            }
+            _ => set(facts, &destination, None),
         },
-        "add" => {
-            match (state.get(destination).copied(), operands.get(1)) {
-                (
-                    Some(Value::Code {
+        Effect::Add => match (held, operands.get(1).and_then(immediate_of)) {
+            (
+                Some(Value::Code {
+                    offset,
+                    shift,
+                    proved,
+                }),
+                Some(immediate),
+            ) => {
+                let value = offset
+                    .checked_sub(immediate as i64)
+                    .map(|offset| Value::Code {
                         offset,
                         shift,
                         proved,
-                    }),
-                    Some(operand),
-                ) => {
-                    let immediate = immediate_of(operand)?;
-                    let offset = offset.checked_sub(immediate as i64)?;
-                    set(
-                        state,
-                        destination,
-                        Some(Value::Code {
-                            offset,
-                            shift,
-                            proved,
-                        }),
-                    );
-                }
-                // An `add` of anything else -- a table entry to its base, most often -- leaves a
-                // value this does not model.
-                _ => set(state, destination, None),
+                    });
+                set(facts, &destination, value);
             }
-            None
-        }
-        "shr" | "sar" => {
-            match (state.get(destination).copied(), operands.get(1)) {
-                (
-                    Some(Value::Code {
-                        offset,
-                        shift,
-                        proved,
-                    }),
-                    Some(operand),
-                ) => {
-                    let by = immediate_of(operand)? as u32;
-                    set(
-                        state,
-                        destination,
-                        shift.checked_add(by).map(|shift| Value::Code {
-                            offset,
-                            shift,
-                            proved,
-                        }),
-                    );
-                }
-                _ => set(state, destination, None),
+            // An `add` of anything else -- a table entry to its base, most often -- leaves a value
+            // this does not model.
+            _ => set(facts, &destination, None),
+        },
+        Effect::ShiftRight => match (held, operands.get(1).and_then(immediate_of)) {
+            (
+                Some(Value::Code {
+                    offset,
+                    shift,
+                    proved,
+                }),
+                Some(by),
+            ) => {
+                let value = shift.checked_add(by as u32).map(|shift| Value::Code {
+                    offset,
+                    shift,
+                    proved,
+                });
+                set(facts, &destination, value);
             }
-            None
-        }
-        _ => {
-            set(state, destination, None);
-            None
-        }
+            _ => set(facts, &destination, None),
+        },
+        _ => set(facts, &destination, None),
     }
+    None
 }
 
 /// What a `mov`-shaped instruction's source is worth.
 fn source_value(
-    state: &HashMap<&'static str, Value>,
-    source: Option<&Operand>,
-    mnemonic: &str,
+    facts: &Facts,
+    instruction: &Instruction,
     layout: Layout,
     traced: &mut bool,
 ) -> Option<Value> {
-    match source? {
-        Operand::Register(name) => state.get(family(name)?).copied(),
+    match instruction.operands.get(1)? {
+        // A copy carries the value only if it carries **all** of it: `movzx ecx,ax` is two bytes
+        // of a `ULONG`, and a compare against that is a statement about part of a field.
+        Operand::Register(register) => match instruction.effect {
+            // **A copy carries the value only if it carries all of it.** `movzx ecx,ax` is two
+            // bytes of a `ULONG`, and a compare against that is a statement about part of a field
+            // reported as one about the field. The exact question is the source register's
+            // *width*, which is glslang/dbgscope#154; until that lands this excludes the widening
+            // loads by name, which catches `movzx` and `movsx` and leaves a narrow plain `mov`
+            // between two registers as the hole that field closes.
+            Effect::Move if instruction.mnemonic == "mov" => {
+                facts.registers.get(&register.full).cloned()
+            }
+            _ => None,
+        },
         Operand::Memory(memory) => {
             // `lea` takes the address rather than what is at it, which is how a jump table's base
             // reaches a register.
-            if mnemonic == "lea" {
+            if instruction.effect == Effect::LoadAddress {
                 return memory.address.map(Value::Address);
             }
-            let base = memory.base.as_deref().and_then(family);
-            let held = base.and_then(|base| state.get(base).copied());
-            // **A partial read of the control code is not the control code.** `movzx eax,word ptr
-            // [rdx+18h]` inspects the function and method bits and nothing above them, so a
-            // compare after it is a statement about part of the value; reported as a whole code it
-            // invents a device type out of the two bytes nobody read. A `ULONG` field is read four
-            // bytes at a time, and anything else at that displacement is refused rather than
-            // widened. The same for the two lengths, which are `ULONG`s too.
+            let base = memory.base.as_ref().map(|base| base.full.clone());
+            let held = base.as_ref().and_then(|base| facts.registers.get(base));
+            // **A partial read of a `ULONG` is not the field.** Reported as one it invents the
+            // bits nobody read -- a device type out of two bytes of a control code.
             let dword = memory.size == Some(4);
             match (held, memory.displacement) {
                 (Some(Value::Irp), d) if d == layout.current_stack_location => {
@@ -934,10 +995,11 @@ fn source_value(
                 (Some(Value::StackLocation), d) if d == layout.output_length && dword => {
                     Some(Value::OutputLength)
                 }
-                // The fallback the module doc describes: a `+0x18` off a register whose chain was
-                // not followed. Believed, because a listing that starts mid-function or a driver
-                // that fetches the stack location in a helper would otherwise answer nothing --
-                // and `code_proved` stays false, which is where that doubt is carried.
+                // The fallback the module doc describes: the control code's displacement off a
+                // register whose chain was not followed. Believed, because a listing that starts
+                // mid-function or a driver that fetches the stack location in a helper would
+                // otherwise answer nothing -- and every case says `proved: false`, which is where
+                // that doubt is carried.
                 (None, d) if d == layout.control_code && dword && base.is_some() => {
                     Some(Value::Code {
                         offset: 0,
@@ -954,36 +1016,40 @@ fn source_value(
 
 /// Reads a `cmp`, which is where a case and a bounds check both begin.
 fn compare(
-    state: &HashMap<&'static str, Value>,
+    facts: &Facts,
     instruction: &Instruction,
     layout: Layout,
     traced: &mut bool,
 ) -> Option<Compared> {
     let left = instruction.operands.first()?;
-    let right = instruction.operands.get(1);
-    let bound = right.and_then(immediate_of);
+    let bound = instruction.operands.get(1).and_then(immediate_of);
 
     // `cmp dword ptr [rdx+18h], 222003h` -- the code compared where it lives, with no register in
     // between, which is what a compiler emits for a small switch.
-    if let Operand::Memory(_) = left
-        && let Some(Value::Code {
+    if let Operand::Memory(_) = left {
+        let mut probe = instruction.clone();
+        probe.operands = vec![Operand::Immediate(0), left.clone()];
+        probe.effect = Effect::Move;
+        if let Some(Value::Code {
             offset,
             shift,
             proved,
-        }) = source_value(state, Some(left), "mov", layout, traced)
-        && shift == 0
-    {
-        return Some(Compared {
-            code: bound.map(|value| value.wrapping_add(offset as u64)),
-            index: None,
-            bound,
-            at: instruction.address,
-            proved,
-        });
+        }) = source_value(facts, &probe, layout, traced)
+            && shift == 0
+        {
+            return Some(Compared {
+                code: bound.map(|value| value.wrapping_add(offset as u64)),
+                proved,
+                index: None,
+                bound,
+                at: instruction.address,
+            });
+        }
+        return None;
     }
 
-    let register = register_of(left)?;
-    match state.get(register).copied()? {
+    let register = register_full(left)?;
+    match facts.registers.get(&register)? {
         Value::Code {
             offset,
             shift,
@@ -991,38 +1057,28 @@ fn compare(
         } => Some(Compared {
             // A shifted register is an index into a table, not a code: the low bits the shift
             // dropped are not this compare's to claim. The compare is still reported, because it
-            // is exactly the bounds check a jump table needs — dropping it here would lose the
-            // table's length, which is the one thing that makes a table followable.
+            // is the bounds check a jump table needs.
             code: match shift {
-                0 => bound.map(|value| value.wrapping_add(offset as u64)),
+                0 => bound.map(|value| value.wrapping_add(*offset as u64)),
                 _ => None,
             },
-            index: Some((register, offset, shift)),
+            proved: *proved,
+            index: Some((register.clone(), *offset, *shift)),
             bound,
             at: instruction.address,
-            proved,
         }),
         _ => None,
     }
 }
 
-/// Forgets what a call or a branch may have changed.
-fn clobber(state: &mut HashMap<&'static str, Value>, instruction: &Instruction) {
-    if matches!(instruction.flow, Flow::Call(_)) {
-        for volatile in VOLATILE {
-            state.remove(volatile);
-        }
-    }
-}
-
 /// Sets or clears one register's value.
-fn set(state: &mut HashMap<&'static str, Value>, register: &'static str, value: Option<Value>) {
+fn set(facts: &mut Facts, register: &str, value: Option<Value>) {
     match value {
         Some(value) => {
-            state.insert(register, value);
+            facts.registers.insert(register.to_string(), value);
         }
         None => {
-            state.remove(register);
+            facts.registers.remove(register);
         }
     }
 }
@@ -1035,84 +1091,66 @@ struct Resolved {
     proved: bool,
 }
 
-/// Follows an indirect jump's table, when every part of it was recovered.
+/// Follows an indirect jump's table, when every part of it was recovered from **this block**.
 ///
-/// Returns the table and the `(code, target)` pairs it holds, or `None` for a transfer that is
-/// not a table this can resolve — which the caller records as unresolved rather than dropping.
+/// Three things have to hold, and each is a way a table is otherwise invented: the load has to
+/// define the register the jump reads, the index has to be one a bounds check on this path covered,
+/// and every entry has to be code in this image.
 fn follow_table(
-    window: &[Instruction],
+    instructions: &[Instruction],
     jump: &Instruction,
-    at: u64,
-    bounds: &[Bound],
-    state: &HashMap<&'static str, Value>,
-    read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    facts: &Facts,
+    reader: Option<&mut ReadOnce<'_>>,
     in_image: &impl Fn(u64) -> bool,
 ) -> Option<Resolved> {
-    // **The load has to feed *this* jump**, which is a question about dataflow and not about
-    // proximity. Taking the last scale-4 indexed load in the window instead reads an unrelated
-    // array indexed by the same bounded register -- ordinary code, a few instructions before a
-    // jump through some other register -- as the switch table, and every dword of that array that
-    // happens to resolve inside the image becomes a control code. Worse, the real jump is then not
-    // listed as unresolved, so nothing says the switch was missed.
-    //
-    // So the chain is walked backwards from the jump's own register: `jmp rcx` <- `add rcx,rdx`
-    // (an accumulation, so the chain continues through `rcx`) <- `mov ecx,[rdx+rax*4+5B80h]`,
-    // which is the load. Anything else writing the register on the way ends it.
+    let reader = reader?;
+    let bound = facts.bound.clone()?;
+
     // **The 32-bit form jumps through the table itself**: `jmp dword ptr [table+eax*4]`, with no
-    // register in between and the entry an absolute address rather than an offset from the image.
-    // Refusing every memory-operand jump left dense switches on exactly the targets `Layout::X86`
-    // exists to serve permanently unresolved.
-    let ((dword_load, dword_memory), added) = match jump.operands.first() {
+    // register in between and the entry a whole address rather than an offset from the image.
+    let ((_load, memory), added) = match jump.operands.first() {
         Some(Operand::Memory(memory)) if memory.scale == 4 && memory.index.is_some() => {
             ((jump, memory), None)
         }
         Some(Operand::Register(register)) => {
-            let mut wanted = family(register)?;
+            let mut wanted = register.full.clone();
             let mut found = None;
-            let mut added: Option<&'static str> = None;
-            for instruction in window.iter().rev() {
+            let mut added: Option<String> = None;
+            for instruction in instructions.iter().rev() {
                 // **Only an instruction that *defines* the register continues the chain.** A
-                // `cmp rcx,[base+rax*4+table]` has the register as its first operand and writes
-                // nothing but the flags, and reading that as the load turns an unrelated array
-                // into a table whenever its dwords resolve inside the image -- while also taking
-                // the real jump off the unresolved list, so nothing says the switch was missed.
-                if matches!(instruction.mnemonic.as_str(), "cmp" | "test" | "push") {
+                // `cmp rcx,[base+rax*4+table]` reads it and writes nothing but the flags, and
+                // reading that as the load turns an unrelated array into a table.
+                if matches!(
+                    instruction.effect,
+                    Effect::Compare | Effect::Test | Effect::Push
+                ) {
                     continue;
                 }
-                let Some(written) = instruction.operands.first().and_then(register_of) else {
+                let Some(written) = instruction.operands.first().and_then(register_full) else {
                     continue;
                 };
                 if written != wanted {
                     continue;
                 }
                 match instruction.operands.get(1) {
-                    // The indexed load this whole function is about, and only from an instruction
-                    // whose job is to load.
                     Some(Operand::Memory(memory))
                         if memory.scale == 4
                             && memory.index.is_some()
-                            && matches!(
-                                instruction.mnemonic.as_str(),
-                                "mov" | "movzx" | "movsx" | "movsxd"
-                            ) =>
+                            && instruction.effect == Effect::Move =>
                     {
                         found = Some((instruction, memory));
                         break;
                     }
                     // `add rcx,rdx` folds the image base into the entry: the value being followed
-                    // is still the one in `rcx`, so the chain continues through the same register.
-                    // **Which register was added is recorded**, because that — and not the memory
-                    // operand's base — is what execution adds to every entry.
-                    Some(Operand::Register(source)) if instruction.mnemonic == "add" => {
-                        added = Some(family(source)?);
+                    // is still the one in `rcx`. **Which register was added is recorded**, because
+                    // that -- and not the load's base -- is what execution adds to every entry.
+                    Some(Operand::Register(source)) if instruction.effect == Effect::Add => {
+                        added = Some(source.full.clone());
                         continue;
                     }
-                    // A copy: follow the register it came from.
-                    Some(Operand::Register(source)) if instruction.mnemonic == "mov" => {
-                        wanted = family(source)?;
+                    Some(Operand::Register(source)) if instruction.effect == Effect::Move => {
+                        wanted = source.full.clone();
                     }
-                    // Anything else -- an immediate, a different memory shape, an instruction this
-                    // does not model -- ends the chain, and with it the claim that this is a table.
                     _ => return None,
                 }
             }
@@ -1120,147 +1158,101 @@ fn follow_table(
         }
         _ => return None,
     };
-    let table_index = dword_memory.index.as_deref().and_then(family)?;
-    // **What an entry means depends on which form this is.** A 64-bit switch holds offsets from
-    // the image base the compiler loaded into a register, which is why the same register appears
-    // in the load and in the `add` after it. A 32-bit one jumps straight through the table and its
-    // entries are whole addresses, so adding anything to them lands nowhere.
-    let table = match dword_memory.base.as_deref().and_then(family) {
-        Some(base) => match state.get(base).copied() {
-            Some(Value::Address(address)) => address,
-            _ => return None,
-        },
-        // An absolute table with no base register at all — the 32-bit shape.
-        None => 0,
+
+    let index = memory.index.as_ref()?.full.clone();
+    if index != bound.register {
+        return None;
     }
-    .checked_add_signed(dword_memory.displacement)?;
-    // **What an entry means is decided by what the code adds to it.** A 64-bit switch folds the
-    // image base in with an `add`, so its entries are offsets from *that register's* value; a
-    // 32-bit one adds nothing and its entries are whole addresses. Taking the memory operand's
-    // base instead agrees with a compiler's own switch, where they are the same register, and
-    // disagrees silently with anything else — producing addresses that can still land inside the
-    // image and so pass every check after this one.
-    let entry_base = match added {
-        Some(register) => match state.get(register).copied() {
-            Some(Value::Address(address)) => Some(address),
-            _ => return None,
-        },
-        None => None,
-    };
-
-    // **Which register the bounds check covered decides the shape, and getting this wrong is how a
-    // table reads as eighty-one entries of whatever follows it.** MSVC's dense switch has *two*
-    // tables: a byte per index saying which case it is, then a dword per case holding its RVA. It
-    // reuses one register for both -- `movzx eax,byte ptr [rdx+rax+5B90h]` overwrites the index
-    // with the case number -- so the dword load's index register carries the same *name* as the
-    // bounded one and none of its meaning. Matching on the name alone read `mountmgr`'s
-    // eighty-one-entry byte map as eighty-one dword entries, and reported a hundred and sixty
-    // control codes the driver does not accept.
-    //
-    // So the byte load is looked for first, and the bound has to belong to *its* index.
-    let byte_map = window.iter().rev().find_map(|instruction| {
-        let written = instruction.operands.first().and_then(register_of)?;
-        if written != table_index {
-            return None;
-        }
-        let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
-            return None;
-        };
-        // A byte per index, so scale 1 and a size of one byte where the decoder reports it.
-        (memory.scale == 1 && memory.size.unwrap_or(1) == 1).then_some(memory)
-    });
-
-    let (bound, map) = match byte_map {
-        Some(memory) => {
-            let index = memory.index.as_deref().and_then(family)?;
-            let bound = *bounds.iter().rev().find(|bound| bound.register == index)?;
-            let entries = usize::try_from(bound.limit.checked_add(1)?).ok()?;
-            if entries == 0 || entries > MAX_TABLE_ENTRIES {
-                return None;
-            }
-            let map_at = table_base(memory, state)?.checked_add_signed(memory.displacement)?;
-            (bound, Some((map_at, entries)))
-        }
-        None => {
-            // The one-table shape: the dword table is indexed by the bounded register itself.
-            let bound = *bounds
-                .iter()
-                .rev()
-                .find(|bound| bound.register == table_index)?;
-            // And nothing may have written that register **between the check and the load**, or
-            // the name is all that matches. The byte map above is one such writer; this rules out
-            // the rest. Bounded by the compare's own address rather than by a count of
-            // instructions, because the window is a slice and the check may be anywhere in it.
-            // The 32-bit form's "load" is the jump itself, which is past the window rather than
-            // in it: everything here precedes it either way.
-            let position = window
-                .iter()
-                .position(|instruction| instruction.address == dword_load.address)
-                .unwrap_or(window.len());
-            let overwritten = window[..position].iter().any(|instruction| {
-                instruction.address > bound.at
-                    && instruction.operands.first().and_then(register_of) == Some(table_index)
-            });
-            if overwritten {
-                return None;
-            }
-            (bound, None)
-        }
-    };
-
     let entries = usize::try_from(bound.limit.checked_add(1)?).ok()?;
     if entries == 0 || entries > MAX_TABLE_ENTRIES {
         return None;
     }
 
-    // The case each index selects: itself in the one-table shape, the byte map's value in the
-    // two-table one.
-    let cases: Vec<usize> = match map {
-        Some((map_at, map_entries)) => read(map_at, map_entries)?
-            .into_iter()
-            .map(usize::from)
-            .collect(),
+    let table = match memory.base.as_ref() {
+        Some(base) => match facts.registers.get(&base.full) {
+            Some(Value::Address(address)) => *address,
+            _ => return None,
+        },
+        // An absolute table with no base register at all -- the 32-bit shape.
+        None => 0,
+    }
+    .checked_add_signed(memory.displacement)?;
+    let entry_base = match &added {
+        Some(register) => match facts.registers.get(register) {
+            Some(Value::Address(address)) => Some(*address),
+            _ => return None,
+        },
+        None => None,
+    };
+
+    // **MSVC's dense switch has two tables**: a byte per index saying which case it is, then a
+    // dword per case holding its RVA. It reuses one register for both, so the dword load's index
+    // carries the bounded register's name and none of its meaning unless the byte map is read too.
+    let byte_map = instructions.iter().rev().find_map(|instruction| {
+        if instruction.effect != Effect::Move {
+            return None;
+        }
+        let written = instruction.operands.first().and_then(register_full)?;
+        if written != index {
+            return None;
+        }
+        let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
+            return None;
+        };
+        (memory.scale == 1 && memory.size.unwrap_or(1) == 1).then_some(memory)
+    });
+
+    let cases: Vec<usize> = match byte_map {
+        Some(map) => {
+            let at = match map.base.as_ref() {
+                Some(base) => match facts.registers.get(&base.full) {
+                    Some(Value::Address(address)) => *address,
+                    _ => return None,
+                },
+                None => 0,
+            }
+            .checked_add_signed(map.displacement)?;
+            reader.served += 1;
+            (reader.read)(at, entries)?
+                .into_iter()
+                .map(usize::from)
+                .collect()
+        }
         None => (0..entries).collect(),
     };
     let dwords = cases.iter().copied().max()?.checked_add(1)?;
     if dwords > MAX_TABLE_ENTRIES {
         return None;
     }
-    let bytes = read(table, dwords.checked_mul(4)?)?;
+    reader.served += 1;
+    let bytes = (reader.read)(table, dwords.checked_mul(4)?)?;
     let rvas = bytes.as_chunks::<4>().0;
 
     let mut found = Vec::new();
-    for (index, case) in cases.iter().enumerate() {
+    for (position, case) in cases.iter().enumerate() {
         let entry = u32::from_le_bytes(*rvas.get(*case)?);
         let target = match entry_base {
             Some(base) => base.wrapping_add(u64::from(entry)),
             None => u64::from(entry),
         };
-        // **A slot that goes to the default is not a case.** A dense table covers every index
-        // between its bounds, and a compiler fills the ones it has no case for with the same block
-        // the bounds check jumps to -- so `mountmgr`'s two 81-entry tables hold 21 codes and 60
-        // rejections each. Reporting those as codes the driver accepts is the same error as
-        // reporting the byte map as addresses, one level up: the answer looks four times richer
-        // and is wrong about three quarters of it. The default is the bounds check's own branch
-        // target, so this is read off the code rather than inferred from the entries repeating.
+        // **A slot that goes to the default is not a case.** A dense table covers every index in
+        // its range, and a compiler fills the ones it has no case for with the block the bounds
+        // check jumps to -- so `mountmgr`'s two 81-entry tables hold 13 codes each.
         if bound.default == Some(target) {
             continue;
         }
-        // **Every entry has to be code in this image, or the table is not this table.** The
-        // patterns above are recognised from a handful of instructions, and a shape that matches
-        // by accident reads whatever follows the address it computed -- string data, a relocation,
-        // the next function's bytes -- and turns it into control codes the driver is reported as
-        // accepting. One entry outside the image says the bytes are not a jump table, so the whole
-        // table is refused and the jump is recorded as unresolved, which is the honest answer.
+        // **Every entry has to be code in this image, or the table is not this table.** A shape
+        // that matches by accident reads whatever is at the address it computed and turns it into
+        // control codes; one entry outside the image says the bytes are not a jump table.
         if !in_image(target) {
             return None;
         }
-        let code = ((index as u64) << bound.shift).wrapping_add(bound.offset as u64);
+        let code = ((position as u64) << bound.shift).wrapping_add(bound.offset as u64);
         found.push((code, target));
     }
     Some(Resolved {
         table: Table {
-            at,
+            at: jump.address,
             table,
             entries,
             followed: found.len(),
@@ -1270,68 +1262,64 @@ fn follow_table(
     })
 }
 
-/// The address a table's base register holds, or the absolute one an operand carries.
-fn table_base(
-    memory: &dbgscope::dbgeng::MemoryOperand,
-    state: &HashMap<&'static str, Value>,
-) -> Option<u64> {
-    match memory.base.as_deref().and_then(family) {
-        Some(base) => match state.get(base).copied() {
-            Some(Value::Address(address)) => Some(address),
-            _ => None,
-        },
-        // An absolute table with no base register at all -- the 32-bit shape.
-        None => memory.address,
-    }
-}
-
 /// Whether an NTSTATUS **error** value is set anywhere in a block before it leaves.
 ///
-/// The severity field is the signal, not a list of codes: the top two bits set is the definition of
-/// an error status, so `STATUS_INVALID_DEVICE_REQUEST`, `STATUS_INVALID_PARAMETER` and
-/// `STATUS_BUFFER_TOO_SMALL` all answer without being named. Where it goes does not matter -- a
-/// register on the way to a `ret`, or a store into the IRP before a completion call -- because
-/// what is being asked is whether this block is refusing the request.
-fn error_status(window: &[Instruction]) -> bool {
-    for instruction in window {
-        if instruction.mnemonic == "mov"
-            && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
-            && let Ok(value) = u32::try_from(value)
-            && value >> 30 == 0b11
-        {
+/// The severity field is the signal rather than a list of codes: the top two bits set is the
+/// definition of an error status, so `STATUS_INVALID_DEVICE_REQUEST`, `STATUS_INVALID_PARAMETER`
+/// and `STATUS_BUFFER_TOO_SMALL` all answer without being named. Where it goes does not matter — a
+/// register on the way to a `ret`, or a store into the IRP before a completion call — because what
+/// is being asked is whether this block is refusing the request.
+fn error_status(instructions: &[Instruction]) -> bool {
+    instructions.iter().any(|instruction| {
+        instruction.effect == Effect::Move
+            && instruction
+                .operands
+                .get(1)
+                .and_then(immediate_of)
+                .and_then(|value| u32::try_from(value).ok())
+                .is_some_and(|value| value >> 30 == 0b11)
+    })
+}
+
+/// Whether the block at `index` **refuses** the request, following the tail jumps a shared
+/// epilogue is reached through.
+///
+/// A case block that is one `jmp shared_error_tail` is the ordinary way to share an
+/// invalid-request epilogue, and reading it as a handler presents the error tail as this code's
+/// routine. The graph already has that edge, so following it is a lookup rather than a guess —
+/// bounded to a few hops, since a chain longer than that is not an epilogue.
+fn refuses_in(index: usize, graph: &cfg::Graph, listing: &[Instruction]) -> bool {
+    let mut at = index;
+    for _ in 0..3 {
+        let block = &graph.blocks[at];
+        let instructions = &listing[block.start..block.end];
+        if failure_block(instructions) {
             return true;
         }
-        // A branch means the block has not finished deciding, and a return means it has.
-        if matches!(
-            instruction.flow,
-            Flow::Branch(_) | Flow::Jmp(_) | Flow::Return | Flow::Unreadable | Flow::Unknown
-        ) {
-            return false;
+        // Only an unconditional tail jump is followed: a block that decides something is deciding
+        // it, and whatever it reaches is not simply this block's answer.
+        let tail = instructions
+            .last()
+            .is_some_and(|last| matches!(last.flow, Flow::Jmp(Some(_))));
+        match (tail, block.successors.as_slice()) {
+            (true, [next]) => at = *next,
+            _ => return false,
         }
     }
     false
 }
 
-/// Whether a block is a **failure path**: it sets an NTSTATUS error and returns, with or without
-/// completing the IRP on the way out.
-///
-/// This is the one piece of evidence that says which side of a branch the driver treats as success,
-/// and without it neither a case nor a size means what it reads like. `cmp code,N` /
-/// `je invalid_request` and `cmp code,N` / `je handler` are the same instructions with opposite
-/// meanings; so are `cmp length,20h` / `jne fail` and `cmp length,20h` / `jne handler`.
+/// Whether a block sets an NTSTATUS error and returns, with or without completing the IRP on the
+/// way out.
 ///
 /// **The call is part of the shape rather than the end of it.** The ordinary rejection stores the
 /// status into the IRP and calls a completion routine before returning, so a scan that stopped at
 /// the first call would see a block that calls something and report the completion routine as this
 /// code's handler.
-///
-/// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
-/// here, and every caller treats that as "could not tell" rather than as "this is the success
-/// path".
-fn failure_block(window: &[Instruction]) -> bool {
+fn failure_block(instructions: &[Instruction]) -> bool {
     let mut status = false;
-    for instruction in window {
-        if instruction.mnemonic == "mov"
+    for instruction in instructions {
+        if instruction.effect == Effect::Move
             && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
             && let Ok(value) = u32::try_from(value)
             && value >> 30 == 0b11
@@ -1352,8 +1340,8 @@ fn failure_block(window: &[Instruction]) -> bool {
 }
 
 /// The routine a case block reaches directly, when it reaches one.
-fn handler_in(window: &[Instruction]) -> Option<u64> {
-    for instruction in window {
+fn handler_in(instructions: &[Instruction]) -> Option<u64> {
+    for instruction in instructions {
         match instruction.flow {
             Flow::Call(Some(target)) | Flow::Jmp(Some(target)) => return Some(target),
             // A branch means the block is doing its own work before it decides, and whatever it
@@ -1367,57 +1355,38 @@ fn handler_in(window: &[Instruction]) -> Option<u64> {
 
 /// The buffer-length checks a case block makes against a literal.
 ///
-/// Three things have to hold before a compare here is a statement about a buffer at all, and each
-/// of them is a way an answer would otherwise be invented.
+/// Three things have to hold before a compare here is a statement about a buffer, and each is a way
+/// an answer would otherwise be invented.
 ///
-/// **The base must hold the IO_STACK_LOCATION.** A displacement is not a type: `cmp [rsp+10h],20h`
-/// is a stack slot, and `[rbx+10h]` is whatever `rbx` is. Only a register this walk watched the
-/// stack location reach counts, which is why the set is passed in rather than re-derived here.
+/// **The base must hold the IO_STACK_LOCATION**, on the path that reaches this block — a
+/// displacement is not a type, `cmp [rsp+10h],20h` is a stack slot, and a case that overwrites the
+/// register first is comparing something else. The facts say which register holds what here, and
+/// they are updated through the block, so a write retires it without a list.
 ///
-/// **The region ends at a terminator.** `uf` prints a function's blocks in sequence, so a case
-/// that returns before checking anything would otherwise inherit the next sibling case's compare
-/// and publish it as its own requirement.
+/// **The field is a `ULONG`**, so a narrower compare constrains part of one and is not its size.
 ///
-/// **Exact means the path continues on equality**, which is `jne` -- the branch leaves on
-/// inequality and the case block falls through. `cmp length,0` / `je failure` is the opposite: the
-/// continuing path is *not* equal, and reading it as an exact size reports a case that requires a
-/// zero-length buffer. So a `je` yields evidence and never a size.
+/// **Exact means the path continues on equality *and* the other edge fails.** `jne` says equality
+/// falls through; only the branch target being a refusal says the fall-through is the accepted
+/// path. `cmp length,20h` / `jne handler` has the success on the other edge, and `cmp length,0` /
+/// `je failure` rejects zero rather than requiring it.
 fn sizes_in(
-    window: &[Instruction],
+    instructions: &[Instruction],
+    entry: &Facts,
     layout: Layout,
-    stack_registers: &[&'static str],
-    fails: &impl Fn(u64) -> bool,
+    refuses: &impl Fn(u64) -> bool,
 ) -> (Option<SizeCheck>, Option<SizeCheck>) {
+    let mut facts = entry.clone();
+    let mut traced = false;
     let mut input = None;
     let mut output = None;
     let mut pending: Option<(i64, u32, u64)> = None;
-    // **The snapshot is where the case starts, not what it keeps.** The registers holding the IO
-    // stack location are read at the top of the dispatch chain, and a case block is free to
-    // overwrite one before it compares anything -- `mov rax,<some other pointer>` then
-    // `cmp [rax+10h],20h` is a field of some other structure, and a `jne` to a failure block would
-    // promote it to an exact input length. So a register stops counting the moment this block
-    // writes to it. A block that re-derives the pointer into the same register loses it too, which
-    // is the conservative direction: a length check not reported against one invented.
-    let mut live: Vec<&'static str> = stack_registers.to_vec();
-    for instruction in window {
-        // The case's own region ends here, and what follows belongs to the next one.
-        if matches!(
-            instruction.flow,
-            Flow::Return | Flow::Trap | Flow::Jmp(_) | Flow::Unreadable
-        ) {
-            break;
-        }
-        // Anything that writes a register retires it, and a compare writes none.
-        if !matches!(instruction.mnemonic.as_str(), "cmp" | "test" | "push")
-            && let Some(written) = instruction.operands.first().and_then(register_of)
-        {
-            live.retain(|register| *register != written);
-        }
-        if instruction.mnemonic == "cmp" {
+    for instruction in instructions {
+        if instruction.effect == Effect::Compare {
             pending = None;
             if let Some(Operand::Memory(memory)) = instruction.operands.first()
-                && let Some(base) = memory.base.as_deref().and_then(family)
-                && live.contains(&base)
+                && memory.size == Some(4)
+                && let Some(base) = memory.base.as_ref()
+                && facts.registers.get(&base.full) == Some(&Value::StackLocation)
                 && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
                 && let Ok(value) = u32::try_from(value)
             {
@@ -1427,15 +1396,8 @@ fn sizes_in(
         }
         if let Flow::Branch(target) = instruction.flow {
             if let Some((displacement, value, at)) = pending.take() {
-                // **Exact needs both halves.** The mnemonic says equality continues by falling
-                // through; it does not say the fall-through is the path that handles the code.
-                // `cmp length,20h` / `jne handler` is the same instruction pair with the success
-                // on the other edge, and reporting 0x20 there is a requirement the driver does not
-                // have. So the branch has to be the one that *leaves*: its target sets an NTSTATUS
-                // error and returns. Without that evidence the check is still reported, as
-                // evidence rather than as a size.
-                let exact = matches!(instruction.mnemonic.as_str(), "jne" | "jnz")
-                    && target.is_some_and(fails);
+                let exact = instruction.condition == Some(Condition::NotEqual)
+                    && target.is_some_and(refuses);
                 let check = SizeCheck { value, at, exact };
                 match displacement {
                     d if d == layout.input_length => input = input.or(Some(check)),
@@ -1445,8 +1407,9 @@ fn sizes_in(
             }
             continue;
         }
-        // Anything between a compare and its branch invalidates the pairing rather than being
-        // assumed harmless.
+        // Everything else updates the facts, which is what retires a base the block overwrites --
+        // and a compare's pairing with its branch, which anything in between invalidates.
+        update(&mut facts, instruction, layout, &mut traced);
         if !instruction.operands.is_empty() {
             pending = None;
         }
@@ -1660,14 +1623,49 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use dbgscope::dbgeng::MemoryOperand;
+    use dbgscope::dbgeng::{MemoryOperand, RegisterOperand};
 
     const DISPATCH: u64 = 0xfffff803_3e254750;
 
-    /// One instruction, built from what the decoder would report rather than from a rendering:
-    /// these tests are about the fields, and a fixture that spelled instructions in text would be
-    /// testing a parser this module does not have.
+    /// One instruction as the **decoder** reports it.
+    ///
+    /// The effect and the condition are spelled out from the mnemonic here because that is where
+    /// they come from on a real target — iced answers them, and this module reads the fields
+    /// rather than the spelling. A fixture stating them is stating data, like an instruction's
+    /// bytes; deriving them from whatever the code under test uses would be the fixture agreeing
+    /// with itself.
     fn insn(address: u64, mnemonic: &str, operands: Vec<Operand>, flow: Flow) -> Instruction {
+        let effect = match mnemonic {
+            "mov" | "movzx" | "movsx" | "movsxd" => Effect::Move,
+            "lea" => Effect::LoadAddress,
+            "cmp" => Effect::Compare,
+            "test" => Effect::Test,
+            "add" => Effect::Add,
+            "sub" => Effect::Subtract,
+            "shl" | "sal" => Effect::ShiftLeft,
+            "shr" | "sar" => Effect::ShiftRight,
+            "and" => Effect::BitAnd,
+            "or" => Effect::BitOr,
+            "xor" => Effect::BitXor,
+            "push" => Effect::Push,
+            "pop" => Effect::Pop,
+            // Every transfer of control, and everything else: `Flow` is what says where control
+            // goes, and this says what the operands were done to.
+            _ => Effect::Other,
+        };
+        let condition = match mnemonic {
+            "je" | "jz" => Some(Condition::Equal),
+            "jne" | "jnz" => Some(Condition::NotEqual),
+            "ja" | "jnbe" => Some(Condition::UnsignedAbove),
+            "jae" | "jnb" | "jnc" => Some(Condition::UnsignedAboveOrEqual),
+            "jb" | "jnae" | "jc" => Some(Condition::UnsignedBelow),
+            "jbe" | "jna" => Some(Condition::UnsignedBelowOrEqual),
+            "jg" | "jnle" => Some(Condition::SignedGreater),
+            "jge" | "jnl" => Some(Condition::SignedGreaterOrEqual),
+            "jl" | "jnge" => Some(Condition::SignedLess),
+            "jle" | "jng" => Some(Condition::SignedLessOrEqual),
+            _ => None,
+        };
         Instruction {
             address,
             bytes: String::new(),
@@ -1676,23 +1674,69 @@ mod tests {
             operands,
             flow,
             privileged: false,
+            effect,
+            condition,
+            writes_flags: matches!(
+                effect,
+                Effect::Compare
+                    | Effect::Test
+                    | Effect::Add
+                    | Effect::Subtract
+                    | Effect::ShiftLeft
+                    | Effect::ShiftRight
+                    | Effect::BitAnd
+                    | Effect::BitOr
+                    | Effect::BitXor
+            ),
+        }
+    }
+
+    /// A register as the decoder names it: the printed spelling, and the full-width register it is
+    /// part of.
+    ///
+    /// Spelled out for the same reason the effects above are — on a target it is the decoder's
+    /// answer, and it is per bitness, so a fixture that computed it would be sharing whatever the
+    /// code under test uses to decide.
+    fn named(name: &str) -> RegisterOperand {
+        let full = match name {
+            "rax" | "eax" | "ax" | "al" | "ah" => "rax",
+            "rbx" | "ebx" | "bx" | "bl" => "rbx",
+            "rcx" | "ecx" | "cx" | "cl" => "rcx",
+            "rdx" | "edx" | "dx" | "dl" => "rdx",
+            "rsi" | "esi" | "si" => "rsi",
+            "rdi" | "edi" | "di" => "rdi",
+            "rbp" | "ebp" => "rbp",
+            "rsp" | "esp" => "rsp",
+            "r12" | "r12d" => "r12",
+            "r13" | "r13d" => "r13",
+            "rip" | "eip" => "rip",
+            other => other,
+        };
+        RegisterOperand {
+            name: name.to_string(),
+            full: full.to_string(),
         }
     }
 
     fn reg(name: &str) -> Operand {
-        Operand::Register(name.to_string())
+        Operand::Register(named(name))
     }
 
     fn imm(value: u64) -> Operand {
         Operand::Immediate(value)
     }
 
-    /// `[base+displacement]`.
+    /// `[base+displacement]`, a dword read — the width every field this module reads has.
     fn mem(base: &str, displacement: i64) -> Operand {
+        sized(base, displacement, Some(4))
+    }
+
+    /// The same at a width a caller picks, for the tests about what a partial read is worth.
+    fn sized(base: &str, displacement: i64, size: Option<u32>) -> Operand {
         Operand::Memory(MemoryOperand {
-            size: Some(4),
+            size,
             segment: None,
-            base: Some(base.to_string()),
+            base: Some(named(base)),
             index: None,
             scale: 1,
             displacement,
@@ -1710,8 +1754,8 @@ mod tests {
         Operand::Memory(MemoryOperand {
             size: Some(4),
             segment: None,
-            base: base.map(str::to_string),
-            index: Some(index.to_string()),
+            base: base.map(named),
+            index: Some(named(index)),
             scale: 4,
             displacement,
             address,
@@ -1723,7 +1767,7 @@ mod tests {
         Operand::Memory(MemoryOperand {
             size: None,
             segment: None,
-            base: Some("rip".to_string()),
+            base: Some(named("rip")),
             index: None,
             scale: 1,
             displacement: 0,
@@ -1855,19 +1899,18 @@ mod tests {
         );
     }
 
-    /// A listing is a rendering of a **graph**, and the blocks after an epilogue are entered with
-    /// the control code still in its register.
+    /// The compare chain continues past a shared epilogue, because the facts travel along the
+    /// **edge** rather than down the listing.
     ///
-    /// `uf` prints a function's blocks one after another, so a straight-line pass carries state
-    /// across seams that control flow never crosses. `mountmgr` has a shared epilogue in the middle
-    /// of its compare chain -- `pop r13` restoring the caller's register, then `ret` -- and reading
-    /// that as the instruction before the next compare loses the control code for the whole rest of
-    /// the routine: two of its seven codes were recovered and five were not, which is the failure
-    /// this fixture is that driver's shape of.
+    /// `uf` prints a function's blocks in sequence, and a compiler puts a shared epilogue in the
+    /// middle of a compare chain: `mountmgr` has `pop r13` there, restoring the caller's register,
+    /// with the rest of its codes compared in blocks printed after it. A pass reading the listing
+    /// straight through loses the control code at that `pop` and reported two of that driver's
+    /// seven compare-chain codes.
     ///
-    /// The rule is an assumption rather than a proof, and the test says which: the state is
-    /// restored to what it was when the code was first loaded, because that is what every block of
-    /// one dispatch chain is entered with.
+    /// The fixture is that shape: the second compare's block is reached by the branch **before**
+    /// the epilogue, and the epilogue is printed between them. Nothing but the edge connects the
+    /// two, which is what makes this about the edge.
     #[test]
     fn the_chain_continues_past_an_epilogue() {
         let mut block = prologue(DISPATCH);
@@ -1878,25 +1921,40 @@ mod tests {
                 vec![reg("r13d"), imm(0x222003)],
                 Flow::Fallthrough,
             ),
-            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
-            // The shared epilogue, in the middle of the chain exactly as a compiler emits it.
-            insn(DISPATCH + 0x14, "pop", vec![reg("r13")], Flow::Fallthrough),
-            insn(DISPATCH + 0x16, "ret", Vec::new(), Flow::Return),
-            // A block reached from a branch somewhere else, with the code still in `r13d`.
+            // Not this code: on to the block after the epilogue.
             insn(
-                DISPATCH + 0x17,
+                DISPATCH + 0xe,
+                "jne",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x20)),
+            ),
+            // This code: the case block, which falls through to the epilogue.
+            insn(
+                DISPATCH + 0x14,
+                "call",
+                vec![Operand::Target(0x5000)],
+                Flow::Call(Some(0x5000)),
+            ),
+            // The shared epilogue, restoring the caller's register on the way out.
+            insn(DISPATCH + 0x19, "pop", vec![reg("r13")], Flow::Fallthrough),
+            insn(DISPATCH + 0x1b, "ret", Vec::new(), Flow::Return),
+            // And the rest of the chain, printed after it and reached from before it.
+            insn(
+                DISPATCH + 0x20,
                 "cmp",
                 vec![reg("r13d"), imm(0x222007)],
                 Flow::Fallthrough,
             ),
-            insn(DISPATCH + 0x1d, "je", Vec::new(), Flow::Branch(Some(0x980))),
-            insn(DISPATCH + 0x23, "ret", Vec::new(), Flow::Return),
+            insn(DISPATCH + 0x26, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
         ]);
 
         let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
 
+        let mut codes: Vec<u32> = found.cases.iter().map(|case| case.code).collect();
+        codes.sort_unstable();
         assert_eq!(
-            found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
+            codes,
             vec![0x222003, 0x222007],
             "the compare after the epilogue is still about the control code: {:?}",
             found.cases
@@ -2074,7 +2132,7 @@ mod tests {
                     Operand::Memory(MemoryOperand {
                         size: None,
                         segment: None,
-                        base: Some("r13".to_string()),
+                        base: Some(named("r13")),
                         index: None,
                         scale: 1,
                         displacement: -0x6dc004,
@@ -2109,8 +2167,8 @@ mod tests {
                     Operand::Memory(MemoryOperand {
                         size: Some(1),
                         segment: None,
-                        base: Some("rdx".to_string()),
-                        index: Some("rax".to_string()),
+                        base: Some(named("rdx")),
+                        index: Some(named("rax")),
                         scale: 1,
                         displacement: MAP,
                         address: None,
@@ -2640,7 +2698,7 @@ mod tests {
                         Operand::Memory(MemoryOperand {
                             size: Some(width),
                             segment: None,
-                            base: Some("rax".to_string()),
+                            base: Some(named("rax")),
                             index: None,
                             scale: 1,
                             displacement: 0x18,
@@ -2874,6 +2932,152 @@ mod tests {
             "the overwritten base is not the stack location any more: {:?}",
             found.cases
         );
+    }
+
+    /// A fact that is not on **every** path into a block is not a fact there.
+    ///
+    /// One path leaves the control code in `r13d` and the other overwrites it, so at the block
+    /// they both reach the register holds neither — and a compare there is a compare against
+    /// something unknown. A walk that kept whichever value it saw last would report it as a
+    /// control code, which is the straight-line reading of a listing that has two ways in.
+    ///
+    /// The second half of the fixture is the same block reached from one path only, so what is
+    /// asserted is the join rather than the compare: the same instructions, one edge fewer, do
+    /// produce a case.
+    #[test]
+    fn a_fact_on_one_path_is_not_a_fact_at_the_join() {
+        let joined = |overwrite: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "test",
+                    vec![reg("al"), reg("al")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xa,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x20)),
+                ),
+                // The other path through: it puts something else in the register, or does not.
+                insn(
+                    DISPATCH + 0x10,
+                    if overwrite { "mov" } else { "nop" },
+                    if overwrite {
+                        vec![reg("r13d"), mem("rbx", 0x40)]
+                    } else {
+                        Vec::new()
+                    },
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x16,
+                    "jmp",
+                    Vec::new(),
+                    Flow::Jmp(Some(DISPATCH + 0x20)),
+                ),
+                // Reached from both.
+                insn(
+                    DISPATCH + 0x20,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x26, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert!(
+            joined(true).cases.is_empty(),
+            "one path overwrote the register: {:?}",
+            joined(true).cases
+        );
+        assert_eq!(
+            joined(false)
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x222003],
+            "and with both paths agreeing it is the control code: {:?}",
+            joined(false).cases
+        );
+    }
+
+    /// A bounds check holds on the path it **admits**, and not on the one it rejects.
+    ///
+    /// `cmp index,N` / `ja default` says nothing about the index on the branch it takes — that is
+    /// the path where the index is out of range. A walk that carried the bound to both successors
+    /// would let a table be read at the default's block, which is the one place the index is known
+    /// *not* to be in range.
+    #[test]
+    fn a_bound_rides_the_edge_it_admits() {
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            // Out of range: to the block below, which has a table-shaped tail of its own.
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x30)),
+            ),
+            insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
+            // The default's block: the same instructions a resolved switch has, on the one path
+            // where the index is known to be out of range.
+            insn(
+                DISPATCH + 0x30,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x37,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x3e,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x41, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let served = std::cell::Cell::new(0usize);
+        let read = |_: u64, len: usize| {
+            served.set(served.get() + 1);
+            Some(vec![0u8; len])
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x41]);
+        assert_eq!(served.get(), 0, "nothing was read on the rejected path");
     }
 
     /// An indirect jump with no bounds check is **recorded**, not dropped.

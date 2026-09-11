@@ -14,6 +14,7 @@
 
 mod batch;
 mod cast;
+mod cfg;
 mod client;
 mod driver;
 mod engine;

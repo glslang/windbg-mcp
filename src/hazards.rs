@@ -228,8 +228,8 @@ impl PrivilegeKind {
 fn privilege_kind(instruction: &Instruction) -> Option<PrivilegeKind> {
     let control_register = || {
         instruction.operands.iter().any(|operand| match operand {
-            Operand::Register(name) => {
-                let name = name.as_str();
+            Operand::Register(register) => {
+                let name = register.name.as_str();
                 (name.starts_with("cr") || name.starts_with("dr"))
                     && name[2..].chars().all(|c| c.is_ascii_digit())
                     && name.len() > 2
@@ -836,8 +836,38 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
 
 #[cfg(test)]
 mod tests {
+
+    /// A register operand as the decoder reports one: the printed name, and the full-width
+    /// register it is part of.
+    ///
+    /// The pairs are spelled out rather than derived, because a fixture that computed them would
+    /// be sharing whatever the code under test uses to decide — and the answer is the decoder's on
+    /// a real target, so here it is data like an instruction's bytes.
+    fn register(name: &str) -> RegisterOperand {
+        let full = match name {
+            "rax" | "eax" | "ax" | "al" | "ah" => "rax",
+            "rbx" | "ebx" | "bx" | "bl" => "rbx",
+            "rcx" | "ecx" | "cx" | "cl" => "rcx",
+            "rdx" | "edx" | "dx" | "dl" => "rdx",
+            "rsi" | "esi" | "si" => "rsi",
+            "rdi" | "edi" | "di" => "rdi",
+            "rbp" | "ebp" => "rbp",
+            "rsp" | "esp" => "rsp",
+            "r13" | "r13d" => "r13",
+            "r12" | "r12d" => "r12",
+            "rip" | "eip" => "rip",
+            // A control register, a segment, anything else: itself, and a fixture naming one this
+            // does not know has to say so rather than get a plausible answer.
+            other => other,
+        };
+        RegisterOperand {
+            name: name.to_string(),
+            full: full.to_string(),
+        }
+    }
+
     use super::*;
-    use dbgscope::dbgeng::MemoryOperand;
+    use dbgscope::dbgeng::{Effect, MemoryOperand, RegisterOperand};
 
     const BASE: u64 = 0xffff_f800_0000_0000;
 
@@ -892,6 +922,11 @@ mod tests {
             operands,
             flow,
             privileged: false,
+            // The scan reads the flow, the operands and the mnemonic; the decoder's other answers
+            // are not what these fixtures are about.
+            effect: Effect::Other,
+            condition: None,
+            writes_flags: false,
         }
     }
 
@@ -923,7 +958,7 @@ mod tests {
             vec![Operand::Memory(MemoryOperand {
                 size: Some(8),
                 segment: None,
-                base: Some("rip".to_string()),
+                base: Some(register("rip")),
                 index: None,
                 scale: 1,
                 displacement: 0,
@@ -967,7 +1002,7 @@ mod tests {
                 "ffd0",
                 "call",
                 Flow::Call(None),
-                vec![Operand::Register("rax".to_string())],
+                vec![Operand::Register(register("rax"))],
             ),
             // Loading the slot is not calling through it: the driver takes the pointer's value,
             // which is a different fact and must not be reported as a call site.
@@ -977,11 +1012,11 @@ mod tests {
                 "mov",
                 Flow::Fallthrough,
                 vec![
-                    Operand::Register("rax".to_string()),
+                    Operand::Register(register("rax")),
                     Operand::Memory(MemoryOperand {
                         size: Some(8),
                         segment: None,
-                        base: Some("rip".to_string()),
+                        base: Some(register("rip")),
                         index: None,
                         scale: 1,
                         displacement: 0,
@@ -998,7 +1033,7 @@ mod tests {
                 vec![Operand::Memory(MemoryOperand {
                     size: Some(8),
                     segment: None,
-                    base: Some("rip".to_string()),
+                    base: Some(register("rip")),
                     index: None,
                     scale: 1,
                     displacement: 0,
@@ -1067,8 +1102,8 @@ mod tests {
                 "mov",
                 Flow::Fallthrough,
                 vec![
-                    Operand::Register("rax".to_string()),
-                    Operand::Register("cr3".to_string()),
+                    Operand::Register(register("rax")),
+                    Operand::Register(register("cr3")),
                 ],
             ),
             insn(
@@ -1077,8 +1112,8 @@ mod tests {
                 "mov",
                 Flow::Fallthrough,
                 vec![
-                    Operand::Register("rax".to_string()),
-                    Operand::Register("rbx".to_string()),
+                    Operand::Register(register("rax")),
+                    Operand::Register(register("rbx")),
                 ],
             ),
             privileged_insn(
@@ -1094,8 +1129,8 @@ mod tests {
                 "out",
                 Flow::Fallthrough,
                 vec![
-                    Operand::Register("dx".to_string()),
-                    Operand::Register("al".to_string()),
+                    Operand::Register(register("dx")),
+                    Operand::Register(register("al")),
                 ],
             ),
             privileged_insn(
@@ -1165,7 +1200,7 @@ mod tests {
                 vec![Operand::Memory(MemoryOperand {
                     size: None,
                     segment: None,
-                    base: Some("rax".to_string()),
+                    base: Some(register("rax")),
                     index: None,
                     scale: 1,
                     displacement: 0,
