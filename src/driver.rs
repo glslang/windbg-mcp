@@ -748,6 +748,10 @@ pub(crate) struct Report {
     pub(crate) verdict_reachable: bool,
     /// Resolved entry of the `from` function (None if `from` didn't disassemble).
     pub(crate) from_entry: Option<u64>,
+    /// Where the seed function's intra-function walk actually **began**, which is the entry unless
+    /// `from` named an address inside it. Not the address the caller passed: an address that is
+    /// not an instruction boundary falls back to the entry, and this is what was used.
+    pub(crate) seed_start: Option<u64>,
     target: u64,
     /// Entry of the function containing `target`, when reachable.
     containing_fn: Option<u64>,
@@ -810,6 +814,7 @@ pub(crate) fn reachability(
         max_depth,
         halted: None,
         blind: 0,
+        seed_start: None,
     };
 
     while let Some((arg, token, depth)) = queue.pop_front() {
@@ -847,6 +852,13 @@ pub(crate) fn reachability(
         }
         if token.is_none() {
             rpt.from_entry = Some(entry);
+            // **Where the walk actually began, which is not always the entry.** A `from` naming a
+            // handler inside a dispatch routine scopes the intra-function walk past the switch,
+            // and the verdict depends on it: from one case block, a sibling case is *not*
+            // reachable. Reported only as the entry, an answer cannot be reproduced — a consumer
+            // re-running it from there would explore the sibling cases this walk excluded and get
+            // a different, weaker result with nothing to say why.
+            rpt.seed_start = Some(start_used);
         }
         rpt.funcs_explored += 1;
         rpt.max_depth_seen = rpt.max_depth_seen.max(depth);
@@ -910,6 +922,20 @@ pub(crate) fn format_report(r: &Report) -> String {
     match r.from_entry {
         Some(e) => out.push_str(&format!("  from   : entry {}\n", fmt_addr(e))),
         None => out.push_str("  from   : <unresolved>\n"),
+    }
+    // Printed **only when it differs from the entry**, which is what keeps every existing
+    // rendering byte-identical: a `from` naming a function resolves to its entry and there is
+    // nothing extra to say. When it differs, the verdict depends on it — the walk was scoped past
+    // a dispatch switch, so sibling cases were excluded — and an answer that named only the entry
+    // could not be reproduced from what it printed.
+    if let (Some(entry), Some(start)) = (r.from_entry, r.seed_start)
+        && start != entry
+    {
+        out.push_str(&format!(
+            "  scoped : the walk began at {}, inside that function — sibling paths\n           \
+             reachable only from the entry were NOT explored\n",
+            fmt_addr(start)
+        ));
     }
     out.push_str(&format!("  target : {}\n", fmt_addr(r.target)));
     if r.verdict_reachable {
@@ -1025,6 +1051,13 @@ pub(crate) fn structured_report(
         // explored nothing to have a verdict about — so this is unreachable through the tool, and
         // a zero here would be a coordinate nobody produced.
         from: r.from_entry.map(&mut locate),
+        // Only when it differs from the entry, so the field's presence *is* the statement that
+        // this walk was scoped. Equal to the entry it would say nothing and cost a location on
+        // every answer.
+        started_at: r
+            .seed_start
+            .filter(|start| Some(*start) != r.from_entry)
+            .map(&mut locate),
         target: locate(r.target),
         containing_function: r.containing_fn.map(&mut locate),
         path: r
@@ -1396,6 +1429,65 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
         assert_eq!(none, None);
         assert!(!format_recipe(&whole, none).contains("INCOMPLETE"));
+    }
+
+    /// A walk scoped past a dispatch switch reports **where it began**, on both channels.
+    ///
+    /// The verdict depends on that address: from one switch case, a sibling case is not reachable,
+    /// which is the whole point of scoping and is what `reachability_scopes_from_mid_function_start`
+    /// pins. An answer that reported only the function entry could not be reproduced from what it
+    /// said — a consumer re-running it from there explores the siblings this walk excluded and
+    /// reaches a different, weaker result with nothing to say why. It is absent when the walk began
+    /// at the entry, so its *presence* is the statement that scoping happened.
+    #[test]
+    fn a_walk_scoped_past_a_switch_says_where_it_began() {
+        // The dispatch shape: an unfollowed jump table, then two independent case blocks.
+        let dispatch = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Jmp(None), "jmp qword ptr [Dispatch!tbl]"),
+                insn(0x1008, Flow::Fallthrough, "nop"),
+                insn(0x100c, Flow::Return, "ret"),
+                insn(0x1010, Flow::Fallthrough, "nop"),
+                insn(0x1014, Flow::Return, "ret"),
+            ],
+        );
+        let mut uf = |a: &str| match a {
+            "0x1008" | "0x1000" => Some(dispatch.clone()),
+            _ => None,
+        };
+
+        // Scoped into case 1, whose body is reachable and whose sibling is not.
+        let rpt = reachability("0x1008", Some(0x1008), 0x100c, 256, 32, &mut uf, never);
+        assert!(rpt.verdict_reachable);
+        assert_eq!(rpt.from_entry, Some(0x1000), "the function is the same one");
+
+        let typed = structured_report(&rpt, None, located);
+        let started = typed
+            .started_at
+            .as_ref()
+            .expect("a scoped walk says where it began");
+        assert_eq!(started.address, "0x1008");
+        assert_ne!(
+            typed.from.as_ref().map(|f| f.address.clone()),
+            Some(started.address.clone()),
+            "the entry and the start are different facts, and both are reported"
+        );
+        let text = format_report(&rpt);
+        assert!(text.contains("scoped"), "{text}");
+        assert!(text.contains(&fmt_addr(0x1008)), "{text}");
+
+        // And a walk from the entry says nothing extra, on either channel: there is nothing to
+        // say, and every existing rendering stays byte-identical.
+        let plain = reachability("0x1000", Some(0x1000), 0x1004, 256, 32, &mut uf, never);
+        assert!(plain.verdict_reachable);
+        assert!(
+            structured_report(&plain, None, located)
+                .started_at
+                .is_none(),
+            "an unscoped walk began at the entry it already reports"
+        );
+        assert!(!format_report(&plain).contains("scoped"));
     }
 
     /// A location as a test supplies one: the address, and a module derived from it.

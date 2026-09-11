@@ -2301,6 +2301,18 @@ pub struct Reachability {
     /// nothing filled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<CodeLocation>,
+    /// Where the walk **began** inside that function, when that is not its entry.
+    ///
+    /// A `from` naming a handler inside a dispatch routine scopes the walk past the switch, and
+    /// the verdict depends on it: from one case block a sibling case is not reachable. So this is
+    /// the address an answer has to be reproduced from -- re-running from [`Self::from`] would
+    /// explore the siblings this walk excluded and reach a different, weaker result.
+    ///
+    /// Absent when the walk began at the entry, which is every `from` naming a function. It is
+    /// also the address actually used rather than the one asked for: a `from` that is not an
+    /// instruction boundary falls back to the entry, and this says so by being absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub started_at: Option<CodeLocation>,
     /// The target, after the debugger resolved `address` or `module`+`rva`.
     pub target: CodeLocation,
     /// The entry of the function holding the target. Present only on a `reachable` verdict.

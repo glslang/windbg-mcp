@@ -22,7 +22,9 @@
   `REACHABLE` verdict is sound (a concrete static path exists, and the path is reported), while
   `NOT REACHABLE` is best-effort within the explored bounds. If the dispatch uses a
   `switch(IoControlCode)` jump table (common), pass the specific handler VA as `from` to scope
-  past it, or confirm dynamically with a breakpoint + `go`.
+  past it, or confirm dynamically with a breakpoint + `go`. **A walk scoped that way says so**, in
+  both channels, because the verdict depends on where it began: from one case block a sibling case
+  is not reachable, so the same question asked from the function's entry is a different question.
 - That walk is bounded by **what is left of the caller's own timeout**
   (`WINDBG_MCP_CALL_TIMEOUT_SECS`, less what it waited its turn on the session) as well as by
   `max_functions` and `max_depth`. The three are different bounds and the report says which one
