@@ -29,6 +29,7 @@ mod progress;
 mod proto;
 mod record;
 mod schema;
+mod sd;
 mod server;
 mod service;
 mod structured;
