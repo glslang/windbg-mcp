@@ -208,6 +208,11 @@ pub struct Import {
 const MAX_SECTIONS: usize = 96;
 const MAX_LIBRARIES: usize = 64;
 const MAX_IMPORTS_PER_LIBRARY: usize = 8192;
+/// And the **total**, which the two above do not bound: multiplied out they permit half a million
+/// imports, each an owned name and an owned library string, which is hundreds of megabytes held
+/// before any consumer sees a single one. A plausible driver imports a few hundred; the largest
+/// system components a few thousand. This is far past both and bounds the absurd.
+const MAX_IMPORTS_TOTAL: usize = 16 * 1024;
 const MAX_NAME: usize = 512;
 
 /// Reads an image's headers and section table.
@@ -460,6 +465,13 @@ pub fn read_imports(
                 // IMAGE_IMPORT_BY_NAME: a two-byte hint, then the name.
                 ImportName::Named(read_c_string((value as u32) + 2, &mut at)?)
             };
+            // Checked as the table grows rather than after it, which is the whole point: a limit
+            // enforced on a finished list is a limit enforced after the memory was spent.
+            if table.imports.len() >= MAX_IMPORTS_TOTAL {
+                return Err(PeError::Malformed {
+                    reason: "the image imports more functions in total than a plausible one does",
+                });
+            }
             table.imports.push(Import {
                 library: library.clone(),
                 name,
@@ -720,6 +732,61 @@ mod tests {
         assert_eq!(
             read_imports(&image, |at, len| fake.read(at, len), || false).unwrap(),
             ImportTable::default()
+        );
+    }
+
+    /// The **total** is bounded too, which neither of the other two limits does.
+    ///
+    /// Sixty-four libraries of eight thousand imports each is within both of them and is half a
+    /// million owned names and library strings — hundreds of megabytes held before a consumer sees
+    /// one, on an image nobody chose to trust. The bound is checked as the table grows rather than
+    /// after it, because a limit enforced on a finished list is a limit enforced after the memory
+    /// was already spent.
+    #[test]
+    fn the_total_number_of_imports_is_bounded_as_the_table_grows() {
+        // **Three libraries**, each just inside the per-library limit and summing past the total.
+        // One library cannot test this: a table long enough to cross the total runs into
+        // `MAX_IMPORTS_PER_LIBRARY` first, so the first draft of this fixture was green against a
+        // build with no total bound at all -- passing on the neighbouring rule.
+        let per_library = MAX_IMPORTS_PER_LIBRARY - 1;
+        assert!(
+            per_library * 3 > MAX_IMPORTS_TOTAL,
+            "the fixture must be able to cross the total without crossing the per-library limit"
+        );
+        let mut fake = driver_image();
+        fake.bytes.resize(0x80000, 0);
+        put(&mut fake.bytes, 0xf8 + 56, &0x80000u32.to_le_bytes()); // SizeOfImage
+        put(&mut fake.bytes, 0x174, &80u32.to_le_bytes()); // import directory size: four slots
+        for library in 0..3usize {
+            let descriptor = 0x2000 + library * 20;
+            let lookup = 0x10000 + library * 0x20000;
+            put(&mut fake.bytes, descriptor, &(lookup as u32).to_le_bytes());
+            put(&mut fake.bytes, descriptor + 12, &0x2100u32.to_le_bytes());
+            put(
+                &mut fake.bytes,
+                descriptor + 16,
+                &((0x60000 + library * 0x8000) as u32).to_le_bytes(),
+            );
+            for index in 0..per_library {
+                put(
+                    &mut fake.bytes,
+                    lookup + index * 8,
+                    &0x2110u64.to_le_bytes(),
+                );
+            }
+            put(
+                &mut fake.bytes,
+                lookup + per_library * 8,
+                &0u64.to_le_bytes(),
+            );
+        }
+        put(&mut fake.bytes, 0x2000 + 3 * 20, &[0u8; 20]);
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        let read = read_imports(&image, |at, len| fake.read(at, len), || false);
+        assert!(
+            matches!(read, Err(PeError::Malformed { .. })),
+            "a table this large is refused rather than built: {read:?}"
         );
     }
 
