@@ -2426,10 +2426,17 @@ pub struct DriverHazards {
     pub sinks: Vec<ImportedSink>,
     /// The privileged instructions found, in address order.
     pub privileged: Vec<PrivilegedInstruction>,
-    /// What was decoded. A section missing from here was not scanned at all — unreadable, or past
-    /// the byte cap — and anything it contains is absent from the two lists above for that reason
-    /// rather than because the driver does not contain it.
+    /// What was decoded, one entry per **contiguous** run. A section with a hole in it appears
+    /// twice, which is what lets a reader see where the hole was.
     pub scanned: Vec<ScannedRange>,
+    /// Executable ranges that were **not** decoded and therefore say nothing: bytes that would not
+    /// read, and any part of a section whose declared span ran past the image.
+    ///
+    /// Separate from [`Self::stopped`] and [`Self::cap_hit`] because it is a different fact with a
+    /// different remedy — the scan ran to the end and part of the code was simply not there. It is
+    /// also what qualifies an empty `privileged` or a short `sinks`: without it, a dump missing one
+    /// page reports a driver with no privileged instructions and nothing says a page was missing.
+    pub unreadable: Vec<ScannedRange>,
     /// Imports that are **not** on the list, counted rather than listed. The number is what says
     /// whether a short `sinks` means a small driver or a narrow list.
     pub other_imports: usize,

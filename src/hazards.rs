@@ -262,6 +262,14 @@ pub struct Scan {
     pub sinks: Vec<Sink>,
     pub privileged: Vec<Privileged>,
     pub scanned: Vec<Scanned>,
+    /// Executable ranges that were **not** decoded, and therefore say nothing: bytes that would
+    /// not read, and any part of a section whose declared span ran past the image.
+    ///
+    /// Separate from [`Self::halted`] and [`Self::cap_hit`] because it is a different fact with a
+    /// different remedy — the scan ran to the end and part of the code was simply not there. Left
+    /// silent, a dump missing one page reports a driver with no privileged instructions and
+    /// nothing anywhere says a page was missing.
+    pub unreadable: Vec<Scanned>,
     /// Imports this driver holds that are **not** on the list, counted rather than listed: the
     /// number is what says whether a short `sinks` means a small driver or a narrow list.
     pub other_imports: usize,
@@ -327,37 +335,83 @@ pub fn scan(
 
     let mut privileged = Vec::new();
     let mut scanned = Vec::new();
+    let mut unreadable: Vec<Scanned> = Vec::new();
     let mut budget = MAX_SCAN_BYTES;
     let mut halted = None;
     let mut cap_hit = false;
 
     'sections: for section in image.code_sections() {
+        // **The whole span, not just its start.** `checked_va(rva, 0)` asks only whether the
+        // section begins inside the image, and a header claiming a `virtual_size` that runs past
+        // `SizeOfImage` would then have this decode straight out of the module and into whatever
+        // is mapped next — on a live target, the next driver — reporting its calls and its
+        // privileged instructions as this one's. A span that does not fit is **clamped to the
+        // image and recorded as a gap**, rather than skipped: what is genuinely inside is still
+        // worth scanning, and what was cut has to be visible for the same reason every other
+        // shortfall here does.
         let Ok(start) = image.checked_va(section.rva, 0) else {
             continue;
         };
-        let size = u64::from(section.virtual_size);
+        let declared = u64::from(section.virtual_size);
+        let end = match image.checked_va(section.rva, section.virtual_size as usize) {
+            Ok(_) => start.saturating_add(declared),
+            Err(_) => {
+                let inside = u64::from(image.size_of_image.saturating_sub(section.rva));
+                unreadable.push(Scanned {
+                    section: section.name.clone(),
+                    start: start.saturating_add(inside),
+                    bytes: declared.saturating_sub(inside),
+                });
+                start.saturating_add(inside)
+            }
+        };
+
         let mut at = start;
-        let end = start.saturating_add(size);
-        let mut covered = 0u64;
+        // One entry per **contiguous** decoded run rather than one per section. A section with a
+        // hole in it used to come back as a single range starting where the section starts and
+        // counting only the bytes that read — a shape that cannot say where the hole was, and
+        // whose `start` is wrong for everything after it.
+        let mut run: Option<(u64, u64)> = None;
+        let close = |run: &mut Option<(u64, u64)>, scanned: &mut Vec<Scanned>| {
+            if let Some((from, bytes)) = run.take()
+                && bytes > 0
+            {
+                scanned.push(Scanned {
+                    section: section.name.clone(),
+                    start: from,
+                    bytes,
+                });
+            }
+        };
         while at < end {
             if let Some(why) = halt() {
                 halted = Some(why);
+                close(&mut run, &mut scanned);
                 break 'sections;
             }
             if budget == 0 {
                 cap_hit = true;
+                close(&mut run, &mut scanned);
                 break 'sections;
             }
             let want = WINDOW.min(end - at).min(budget);
             let Some(block) = decode(at, want as usize) else {
-                // A window that would not read is skipped rather than ending the scan: a driver
-                // whose `.text` is partly paged out still answers for the rest of it, and what was
-                // covered is what `scanned` reports.
+                // A window that would not read is skipped rather than ending the scan — a driver
+                // whose `.text` is partly absent still answers for the rest of it — but it is
+                // **recorded**. Left silent, a dump missing one page reports a driver with no
+                // privileged instructions, and nothing anywhere says a page was missing.
+                close(&mut run, &mut scanned);
+                unreadable.push(Scanned {
+                    section: section.name.clone(),
+                    start: at,
+                    bytes: want,
+                });
                 at = at.saturating_add(want);
                 budget = budget.saturating_sub(want);
                 continue;
             };
             if block.is_empty() {
+                close(&mut run, &mut scanned);
                 break;
             }
             for instruction in &block {
@@ -381,25 +435,25 @@ pub fn scan(
             let next = last.address.saturating_add(instruction_len(last));
             let consumed = next.saturating_sub(at);
             if consumed == 0 {
+                close(&mut run, &mut scanned);
                 break;
             }
-            covered += consumed.min(want);
-            budget = budget.saturating_sub(consumed.min(want));
+            let taken = consumed.min(want);
+            match &mut run {
+                Some((_, bytes)) => *bytes += taken,
+                None => run = Some((at, taken)),
+            }
+            budget = budget.saturating_sub(taken);
             at = next;
         }
-        if covered > 0 {
-            scanned.push(Scanned {
-                section: section.name.clone(),
-                start,
-                bytes: covered,
-            });
-        }
+        close(&mut run, &mut scanned);
     }
 
     Scan {
         sinks: sinks.into_values().collect(),
         privileged,
         scanned,
+        unreadable,
         other_imports,
         unnamed_libraries: Vec::new(),
         halted,
@@ -476,15 +530,8 @@ pub fn structured_report(
                 mnemonic: found.mnemonic.clone(),
             })
             .collect(),
-        scanned: scan
-            .scanned
-            .iter()
-            .map(|range| structured::ScannedRange {
-                section: range.section.clone(),
-                start: structured::addr(range.start),
-                bytes: range.bytes,
-            })
-            .collect(),
+        scanned: scan.scanned.iter().map(scanned_range).collect(),
+        unreadable: scan.unreadable.iter().map(scanned_range).collect(),
         other_imports: scan.other_imports,
         unnamed_libraries: scan.unnamed_libraries.clone(),
         stopped: scan.halted.map(|halt| match halt {
@@ -492,6 +539,15 @@ pub fn structured_report(
             Halt::Interrupted => structured::WalkHalt::Interrupted,
         }),
         cap_hit: scan.cap_hit,
+    }
+}
+
+/// One covered or missing range, as the typed result carries it.
+fn scanned_range(range: &Scanned) -> crate::structured::ScannedRange {
+    crate::structured::ScannedRange {
+        section: range.section.clone(),
+        start: crate::structured::addr(range.start),
+        bytes: range.bytes,
     }
 }
 
@@ -509,6 +565,19 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
 
     // Said above the findings rather than below them, because it changes what an empty list means:
     // a caveat has to arrive before the conclusion it qualifies.
+    //
+    // **Code that would not read gets its own line**, separate from a halt and from the cap,
+    // because it is a different fact with a different remedy: the scan ran to the end and part of
+    // the driver was simply not there. Without it, a dump missing one page prints "Privileged
+    // instructions: none" and nothing anywhere says a page was missing.
+    if !report.unreadable.is_empty() {
+        let bytes: u64 = report.unreadable.iter().map(|range| range.bytes).sum();
+        out.push_str(&format!(
+            "  INCOMPLETE: {bytes} bytes of this driver's code could not be read, so what is\n           \
+             below is what was found rather than what is there. On a dump the image is what\n           \
+             supplies those bytes.\n"
+        ));
+    }
     if report.stopped.is_some() || report.cap_hit {
         let why = match (report.stopped, report.cap_hit) {
             (Some(crate::structured::WalkHalt::Deadline), _) => "the call ran out of time",
@@ -552,8 +621,10 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     }
 
     let scanned: u64 = report.scanned.iter().map(|range| range.bytes).sum();
+    let missed: u64 = report.unreadable.iter().map(|range| range.bytes).sum();
     out.push_str(&format!(
-        "  Scanned {scanned} bytes across {} section(s); {} other import(s) not on the list\n",
+        "  Scanned {scanned} bytes in {} run(s), {missed} not read; {} other import(s) not on \
+         the list\n",
         report.scanned.len(),
         report.other_imports
     ));
@@ -906,9 +977,15 @@ mod tests {
         assert_eq!(found.scanned[0].bytes, 4, "{:?}", found.scanned);
     }
 
-    /// A window that will not read is skipped; the scan goes on and says what it covered.
+    /// A window that will not read is skipped, **and recorded**; the scan goes on.
+    ///
+    /// Silence here is the expensive kind. A dump missing one page of a driver's `.text` would
+    /// otherwise produce an ordinary-looking report saying "Privileged instructions: none" -- a
+    /// positive claim about code nobody decoded. And the ranges that *were* covered are reported
+    /// one per contiguous run rather than one per section, because a single entry starting where
+    /// the section starts cannot say where the hole was and is wrong about everything after it.
     #[test]
-    fn an_unreadable_window_does_not_end_the_scan() {
+    fn an_unreadable_window_is_recorded_rather_than_skipped_in_silence() {
         let image = image();
         let found = scan(&image, &[], |_, _| None, never);
         assert!(
@@ -916,8 +993,89 @@ mod tests {
             "nothing was covered, and nothing claims to have been: {:?}",
             found.scanned
         );
+        assert_eq!(
+            found.unreadable.len(),
+            1,
+            "the whole section could not be read, and says so: {:?}",
+            found.unreadable
+        );
+        assert_eq!(found.unreadable[0].start, BASE + 0x1000);
+        assert_eq!(found.unreadable[0].bytes, 0x100);
         assert_eq!(found.halted, None, "an unreadable page is not a halt");
         assert!(!found.cap_hit);
+
+        // And a hole *between* readable runs leaves two ranges with the right starts. The section
+        // has to span three windows for that, since an unreadable window covers whatever is left
+        // of a shorter one -- which is why the fixture above could only ever show a single gap.
+        let mut wide = image;
+        wide.size_of_image = 0x40000;
+        wide.sections[0].virtual_size = 0x30000;
+        // Each readable window is consumed whole, so the scan advances a window at a time rather
+        // than a byte at a time.
+        let filler = |at: u64, want: usize| {
+            vec![insn(
+                at,
+                &"90".repeat(want),
+                "nop",
+                Flow::Fallthrough,
+                Vec::new(),
+            )]
+        };
+        let hole = scan(
+            &wide,
+            &[],
+            |at, want| (at != BASE + 0x11000).then(|| filler(at, want)),
+            never,
+        );
+        assert_eq!(hole.scanned.len(), 2, "{:?}", hole.scanned);
+        assert_eq!(hole.scanned[0].start, BASE + 0x1000);
+        assert_eq!(hole.unreadable.len(), 1, "{:?}", hole.unreadable);
+        assert_eq!(hole.unreadable[0].start, BASE + 0x11000);
+        assert_eq!(
+            hole.scanned[1].start,
+            hole.unreadable[0].start + hole.unreadable[0].bytes,
+            "the run after the hole starts after it, not at the section: {:?}",
+            hole.scanned
+        );
+    }
+
+    /// A section whose declared span runs past the image is **clamped and recorded**, never
+    /// followed out of the module.
+    ///
+    /// `checked_va(rva, 0)` asks only whether a section begins inside the image. A header claiming
+    /// a `virtual_size` that overruns it would then have the scan decode straight into whatever is
+    /// mapped next -- on a live target, the next driver -- and report its calls and its privileged
+    /// instructions as this one's. That is the failure `Image::checked_va` exists to prevent, and
+    /// the zero-length door is how it was walked around.
+    #[test]
+    fn a_section_that_overruns_the_image_is_clamped_and_says_so() {
+        let mut image = image();
+        // The image is 0x4000; this section claims to run to 0x11000.
+        image.sections[0].virtual_size = 0x10000;
+
+        let mut asked: Vec<u64> = Vec::new();
+        let found = scan(
+            &image,
+            &[],
+            |at, len| {
+                asked.push(at + len as u64);
+                None
+            },
+            never,
+        );
+        let furthest = asked.iter().copied().max().unwrap_or_default();
+        assert!(
+            furthest <= BASE + u64::from(image.size_of_image),
+            "the scan read to {furthest:#x}, past the image's own end: {asked:x?}"
+        );
+        assert!(
+            found
+                .unreadable
+                .iter()
+                .any(|range| range.start == BASE + u64::from(image.size_of_image)),
+            "the part cut off is recorded rather than silently dropped: {:?}",
+            found.unreadable
+        );
     }
 
     /// A halt stops the scan and is reported, rather than leaving a partial answer that reads like
