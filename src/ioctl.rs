@@ -120,7 +120,9 @@ pub(crate) struct Table {
     pub(crate) table: u64,
     /// How many entries the bounds check admits.
     pub(crate) entries: usize,
-    /// How many were read and turned into cases. Less than `entries` means the read stopped.
+    /// How many of those entries became cases. The difference is the slots that go to the
+    /// switch's **default** -- a dense table covers every index in its range, and a compiler fills
+    /// the ones it has no case for with the block the bounds check jumps to.
     pub(crate) followed: usize,
 }
 
@@ -281,6 +283,8 @@ fn relation_of(mnemonic: &str) -> Option<Relation> {
 struct Bound {
     /// Where in the listing the check was, so a stale one can be dropped.
     at_index: usize,
+    /// The compare's address, which is what says whether anything wrote the index *since* it.
+    at: u64,
     /// The register checked.
     register: &'static str,
     /// What it held: `(code - offset) >> shift`.
@@ -288,6 +292,9 @@ struct Bound {
     shift: u32,
     /// The largest index the check admits.
     limit: u64,
+    /// Where the check sends an index past that -- the switch's **default**, which is also what
+    /// every unused slot of its table holds.
+    default: Option<u64>,
 }
 
 /// The state one compare leaves for the branch that reads it.
@@ -313,6 +320,7 @@ pub(crate) fn map(
     dispatch: u64,
     block: &[Instruction],
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    in_image: impl Fn(u64) -> bool,
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> Map {
     let mut state: HashMap<&'static str, Value> = HashMap::new();
@@ -331,6 +339,10 @@ pub(crate) fn map(
     let mut examined = 0usize;
     let mut compared: Option<Compared> = None;
     let mut bounds: Vec<Bound> = Vec::new();
+    // The state as it stood when the control code was first in a register, kept to be restored at
+    // a region boundary. See `ended` below for why.
+    let mut entry_state: Option<HashMap<&'static str, Value>> = None;
+    let mut ended = false;
 
     for (i, instruction) in block.iter().enumerate() {
         if i >= MAX_INSTRUCTIONS {
@@ -344,6 +356,30 @@ pub(crate) fn map(
             break;
         }
         examined += 1;
+
+        // **A listing is a rendering of a graph, and belief does not flow across a region
+        // boundary.** `uf` prints a function's blocks one after another, so the instruction after
+        // a `ret` or an unconditional `jmp` is not reached from the one before it -- it is
+        // reached from a branch somewhere else, with whatever that path left in the registers. A
+        // straight-line pass that carried state across those seams read `mountmgr`'s shared
+        // epilogue, saw its `pop r13` restore the caller's register, and lost the control code
+        // for the whole rest of the routine: two of its codes were recovered and five were not.
+        //
+        // So a region boundary restores the state to what it was when the control code was first
+        // loaded, which is the state every one of those blocks is in fact entered with. It is an
+        // assumption rather than a proof -- a block entered with that register holding something
+        // else would be read wrongly -- and it is the same assumption a person reading the
+        // listing makes, for the same reason: the compare chain is one routine's, and its blocks
+        // are its own.
+        if ended {
+            state = entry_state.clone().unwrap_or_default();
+            compared = None;
+            bounds.clear();
+        }
+        ended = matches!(
+            instruction.flow,
+            Flow::Return | Flow::Trap | Flow::Jmp(_) | Flow::Unreadable
+        );
 
         // A branch reading the flags of the compare before it is where a case is made, so it is
         // handled before the state update that clears `compared`.
@@ -390,10 +426,15 @@ pub(crate) fn map(
                         {
                             bounds.push(Bound {
                                 at_index: i,
+                                at: was.at,
                                 register,
                                 offset,
                                 shift,
                                 limit,
+                                // The branch's own target: an index past the bound goes to the
+                                // switch's default, and so does every slot of the table the
+                                // compiler had no case for.
+                                default: target,
                             });
                         }
                     }
@@ -405,8 +446,13 @@ pub(crate) fn map(
             continue;
         }
 
-        // An indirect transfer is either a jump table this can follow or a hole in the answer.
-        if matches!(instruction.flow, Flow::Jmp(None) | Flow::Call(None)) {
+        // An indirect **jump** is either a jump table this can follow or a hole in the answer. An
+        // indirect *call* is neither: a driver reaches its imports through the IAT, so a dispatch
+        // routine is full of them and not one of them decides on a control code. Listing those as
+        // places a code might be recognised made `mountmgr` report seventeen, every one an import
+        // thunk -- noise that makes the list nobody can act on out of the one field that says the
+        // answer is a lower bound.
+        if matches!(instruction.flow, Flow::Jmp(None)) {
             let start = i.saturating_sub(WINDOW);
             bounds.retain(|bound| bound.at_index >= start);
             match follow_table(
@@ -415,6 +461,7 @@ pub(crate) fn map(
                 &bounds,
                 &state,
                 &mut read,
+                &in_image,
             ) {
                 Some((table, found)) => {
                     for (code, lands) in found {
@@ -438,6 +485,21 @@ pub(crate) fn map(
         }
 
         compared = update(&mut state, instruction, &mut code_proved);
+        // The first moment the control code is in a register is the state every block of the
+        // dispatch chain is entered with, so it is what a region boundary restores.
+        if entry_state.is_none()
+            && state.values().any(|value| {
+                matches!(
+                    value,
+                    Value::Code {
+                        offset: 0,
+                        shift: 0
+                    }
+                )
+            })
+        {
+            entry_state = Some(state.clone());
+        }
         // A **direct** call reaches here rather than the arms above, and it returns over the
         // volatile registers exactly as an indirect one does. Forgetting them only on the
         // indirect path would leave a compare against whatever a callee returned reported as a
@@ -541,7 +603,31 @@ fn update(
 
     match mnemonic {
         "mov" | "movzx" | "movsxd" | "movsx" | "lea" => {
-            let value = source_value(state, operands.get(1), mnemonic, code_proved);
+            // `lea eax,[r13-6DC004h]` is `sub` without touching the flags, and a compiler uses it
+            // exactly where a switch is rebased before a bounds check. Read as an address it is
+            // nothing -- there is no absolute in it -- so without this arm the jump table that
+            // follows has no index and the whole dense run of codes is lost.
+            let rebased = match (mnemonic, operands.get(1)) {
+                ("lea", Some(Operand::Memory(memory))) if memory.index.is_none() => {
+                    match memory
+                        .base
+                        .as_deref()
+                        .and_then(family)
+                        .and_then(|base| state.get(base))
+                    {
+                        Some(Value::Code { offset, shift }) => offset
+                            .checked_sub(memory.displacement)
+                            .map(|offset| Value::Code {
+                                offset,
+                                shift: *shift,
+                            }),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            };
+            let value =
+                rebased.or_else(|| source_value(state, operands.get(1), mnemonic, code_proved));
             set(state, destination, value);
             None
         }
@@ -718,61 +804,154 @@ fn follow_table(
     bounds: &[Bound],
     state: &HashMap<&'static str, Value>,
     read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    in_image: &impl Fn(u64) -> bool,
 ) -> Option<(Table, Vec<(u64, u64)>)> {
-    // The indexed load: `mov eax, dword ptr [rbase+rindex*4+disp]`, whose base is an address this
-    // pass watched a `lea` put there, and whose index is a register a bounds check covered.
-    // Without the check the table has no length, and a table read to a guessed length is a list of
-    // addresses that happen to be there.
-    let mut found = None;
+    // The last indexed load before the jump: `mov ecx, dword ptr [rdx+rax*4+5B80h]`, whose base is
+    // an address this pass watched a `lea` put there. Everything else hangs off it.
+    let mut dword = None;
     for instruction in window.iter().rev() {
         let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
             continue;
         };
-        if memory.scale != 4 {
+        if memory.scale != 4 || memory.index.is_none() {
             continue;
         }
-        let Some(index) = memory.index.as_deref().and_then(family) else {
-            continue;
-        };
-        let Some(bound) = bounds.iter().rev().find(|bound| bound.register == index) else {
-            continue;
-        };
-        let base = match memory.base.as_deref().and_then(family) {
-            Some(base) => match state.get(base).copied() {
-                Some(Value::Address(address)) => Some(address),
-                _ => None,
-            },
-            // An absolute table with no base register at all -- the 32-bit shape.
-            None => memory.address,
-        }?;
-        let start = base.checked_add_signed(memory.displacement)?;
-        found = Some((start, base, *bound));
+        dword = Some((instruction, memory));
         break;
     }
-    let (start, base, bound) = found?;
-    let (offset, shift) = (bound.offset, bound.shift);
+    let (dword_load, dword_memory) = dword?;
+    let table_index = dword_memory.index.as_deref().and_then(family)?;
+    let base = table_base(dword_memory, state)?;
+    let table = base.checked_add_signed(dword_memory.displacement)?;
+
+    // **Which register the bounds check covered decides the shape, and getting this wrong is how a
+    // table reads as eighty-one entries of whatever follows it.** MSVC's dense switch has *two*
+    // tables: a byte per index saying which case it is, then a dword per case holding its RVA. It
+    // reuses one register for both -- `movzx eax,byte ptr [rdx+rax+5B90h]` overwrites the index
+    // with the case number -- so the dword load's index register carries the same *name* as the
+    // bounded one and none of its meaning. Matching on the name alone read `mountmgr`'s
+    // eighty-one-entry byte map as eighty-one dword entries, and reported a hundred and sixty
+    // control codes the driver does not accept.
+    //
+    // So the byte load is looked for first, and the bound has to belong to *its* index.
+    let byte_map = window.iter().rev().find_map(|instruction| {
+        let written = instruction.operands.first().and_then(register_of)?;
+        if written != table_index {
+            return None;
+        }
+        let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
+            return None;
+        };
+        // A byte per index, so scale 1 and a size of one byte where the decoder reports it.
+        (memory.scale == 1 && memory.size.unwrap_or(1) == 1).then_some(memory)
+    });
+
+    let (bound, map) = match byte_map {
+        Some(memory) => {
+            let index = memory.index.as_deref().and_then(family)?;
+            let bound = *bounds.iter().rev().find(|bound| bound.register == index)?;
+            let entries = usize::try_from(bound.limit.checked_add(1)?).ok()?;
+            if entries == 0 || entries > MAX_TABLE_ENTRIES {
+                return None;
+            }
+            let map_at = table_base(memory, state)?.checked_add_signed(memory.displacement)?;
+            (bound, Some((map_at, entries)))
+        }
+        None => {
+            // The one-table shape: the dword table is indexed by the bounded register itself.
+            let bound = *bounds
+                .iter()
+                .rev()
+                .find(|bound| bound.register == table_index)?;
+            // And nothing may have written that register **between the check and the load**, or
+            // the name is all that matches. The byte map above is one such writer; this rules out
+            // the rest. Bounded by the compare's own address rather than by a count of
+            // instructions, because the window is a slice and the check may be anywhere in it.
+            let position = window
+                .iter()
+                .position(|instruction| instruction.address == dword_load.address)?;
+            let overwritten = window[..position].iter().any(|instruction| {
+                instruction.address > bound.at
+                    && instruction.operands.first().and_then(register_of) == Some(table_index)
+            });
+            if overwritten {
+                return None;
+            }
+            (bound, None)
+        }
+    };
+
     let entries = usize::try_from(bound.limit.checked_add(1)?).ok()?;
     if entries == 0 || entries > MAX_TABLE_ENTRIES {
         return None;
     }
 
-    let bytes = read(start, entries.checked_mul(4)?)?;
+    // The case each index selects: itself in the one-table shape, the byte map's value in the
+    // two-table one.
+    let cases: Vec<usize> = match map {
+        Some((map_at, map_entries)) => read(map_at, map_entries)?
+            .into_iter()
+            .map(usize::from)
+            .collect(),
+        None => (0..entries).collect(),
+    };
+    let dwords = cases.iter().copied().max()?.checked_add(1)?;
+    if dwords > MAX_TABLE_ENTRIES {
+        return None;
+    }
+    let bytes = read(table, dwords.checked_mul(4)?)?;
+    let rvas = bytes.as_chunks::<4>().0;
+
     let mut found = Vec::new();
-    for (index, entry) in bytes.as_chunks::<4>().0.iter().enumerate() {
-        let rva = u32::from_le_bytes(*entry);
-        let target = base.wrapping_add(u64::from(rva));
-        let code = ((index as u64) << shift).wrapping_add(offset as u64);
+    for (index, case) in cases.iter().enumerate() {
+        let rva = rvas.get(*case)?;
+        let target = base.wrapping_add(u64::from(u32::from_le_bytes(*rva)));
+        // **A slot that goes to the default is not a case.** A dense table covers every index
+        // between its bounds, and a compiler fills the ones it has no case for with the same block
+        // the bounds check jumps to -- so `mountmgr`'s two 81-entry tables hold 21 codes and 60
+        // rejections each. Reporting those as codes the driver accepts is the same error as
+        // reporting the byte map as addresses, one level up: the answer looks four times richer
+        // and is wrong about three quarters of it. The default is the bounds check's own branch
+        // target, so this is read off the code rather than inferred from the entries repeating.
+        if bound.default == Some(target) {
+            continue;
+        }
+        // **Every entry has to be code in this image, or the table is not this table.** The
+        // patterns above are recognised from a handful of instructions, and a shape that matches
+        // by accident reads whatever follows the address it computed -- string data, a relocation,
+        // the next function's bytes -- and turns it into control codes the driver is reported as
+        // accepting. One entry outside the image says the bytes are not a jump table, so the whole
+        // table is refused and the jump is recorded as unresolved, which is the honest answer.
+        if !in_image(target) {
+            return None;
+        }
+        let code = ((index as u64) << bound.shift).wrapping_add(bound.offset as u64);
         found.push((code, target));
     }
     Some((
         Table {
             at,
-            table: start,
+            table,
             entries,
             followed: found.len(),
         },
         found,
     ))
+}
+
+/// The address a table's base register holds, or the absolute one an operand carries.
+fn table_base(
+    memory: &dbgscope::dbgeng::MemoryOperand,
+    state: &HashMap<&'static str, Value>,
+) -> Option<u64> {
+    match memory.base.as_deref().and_then(family) {
+        Some(base) => match state.get(base).copied() {
+            Some(Value::Address(address)) => Some(address),
+            _ => None,
+        },
+        // An absolute table with no base register at all -- the 32-bit shape.
+        None => memory.address,
+    }
 }
 
 /// The routine a case block reaches directly, when it reaches one.
@@ -1115,6 +1294,15 @@ mod tests {
         None
     }
 
+    /// The image the fixtures live in. A jump-table entry outside it is what says the bytes were
+    /// not a jump table, so the guard is a real range here rather than a closure that says yes.
+    const IMAGE_BASE: u64 = 0xfffff803_3e250000;
+    const IMAGE_SIZE: u64 = 0x0010_0000;
+
+    fn in_image(address: u64) -> bool {
+        (IMAGE_BASE..IMAGE_BASE + IMAGE_SIZE).contains(&address)
+    }
+
     /// A compare chain is the ordinary shape, and each `cmp`/`je` pair is one case.
     #[test]
     fn a_compare_chain_recovers_a_case_per_code() {
@@ -1137,7 +1325,7 @@ mod tests {
             insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert!(found.code_proved, "the chain from the IRP was followed");
         assert_eq!(
@@ -1189,7 +1377,7 @@ mod tests {
             insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert_eq!(
             found
@@ -1199,6 +1387,54 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![(0x6d0034, 0xa00), (0x6d0038, 0xa80)],
             "the `sub` rebases the register and the `cmp` after it is relative: {:?}",
+            found.cases
+        );
+    }
+
+    /// A listing is a rendering of a **graph**, and the blocks after an epilogue are entered with
+    /// the control code still in its register.
+    ///
+    /// `uf` prints a function's blocks one after another, so a straight-line pass carries state
+    /// across seams that control flow never crosses. `mountmgr` has a shared epilogue in the middle
+    /// of its compare chain -- `pop r13` restoring the caller's register, then `ret` -- and reading
+    /// that as the instruction before the next compare loses the control code for the whole rest of
+    /// the routine: two of its seven codes were recovered and five were not, which is the failure
+    /// this fixture is that driver's shape of.
+    ///
+    /// The rule is an assumption rather than a proof, and the test says which: the state is
+    /// restored to what it was when the code was first loaded, because that is what every block of
+    /// one dispatch chain is entered with.
+    #[test]
+    fn the_chain_continues_past_an_epilogue() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            // The shared epilogue, in the middle of the chain exactly as a compiler emits it.
+            insn(DISPATCH + 0x14, "pop", vec![reg("r13")], Flow::Fallthrough),
+            insn(DISPATCH + 0x16, "ret", Vec::new(), Flow::Return),
+            // A block reached from a branch somewhere else, with the code still in `r13d`.
+            insn(
+                DISPATCH + 0x17,
+                "cmp",
+                vec![reg("r13d"), imm(0x222007)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1d, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(DISPATCH + 0x23, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
+
+        assert_eq!(
+            found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
+            vec![0x222003, 0x222007],
+            "the compare after the epilogue is still about the control code: {:?}",
             found.cases
         );
     }
@@ -1243,7 +1479,7 @@ mod tests {
             insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert_eq!(
             found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
@@ -1320,7 +1556,7 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, read, never);
+        let found = map(DISPATCH, &block, read, in_image, never);
 
         assert_eq!(
             found
@@ -1348,6 +1584,293 @@ mod tests {
         assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
     }
 
+    /// MSVC's dense switch has **two** tables, and reading it as one is how a map invents codes.
+    ///
+    /// A byte per index says which case that index is, and a dword per case holds its RVA --
+    /// `movzx eax,byte ptr [rdx+rax+5B90h]` then `mov ecx,dword ptr [rdx+rax*4+5B80h]`, which is
+    /// `mountmgr` verbatim. The register is reused for both, so the dword load's index carries the
+    /// bounded register's *name* and none of its meaning: a pass matching on the name read that
+    /// driver's 81-entry byte map as 81 dword entries and reported 160 control codes it does not
+    /// accept. Two indices here select the same case, which is the thing a one-table reading
+    /// cannot produce.
+    ///
+    /// It also pins the `lea eax,[r13-6DC004h]` rebase -- a `sub` that leaves the flags alone,
+    /// which is what a compiler emits right before a bounds check.
+    #[test]
+    fn a_two_table_switch_is_read_through_its_byte_map() {
+        const MAP: i64 = 0x5b90;
+        const TABLE: i64 = 0x5b80;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "lea",
+                vec![
+                    reg("eax"),
+                    Operand::Memory(MemoryOperand {
+                        size: None,
+                        segment: None,
+                        base: Some("r13".to_string()),
+                        index: None,
+                        scale: 1,
+                        displacement: -0x6dc004,
+                        address: None,
+                    }),
+                ],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xf,
+                "cmp",
+                vec![reg("eax"), imm(4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x12,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "lea",
+                vec![reg("rdx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1f,
+                "movzx",
+                vec![
+                    reg("eax"),
+                    Operand::Memory(MemoryOperand {
+                        size: Some(1),
+                        segment: None,
+                        base: Some("rdx".to_string()),
+                        index: Some("rax".to_string()),
+                        scale: 1,
+                        displacement: MAP,
+                        address: None,
+                    }),
+                ],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x27,
+                "mov",
+                vec![reg("ecx"), indexed(Some("rdx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2e,
+                "add",
+                vec![reg("rcx"), reg("rdx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x31, "jmp", vec![reg("rcx")], Flow::Jmp(None)),
+        ]);
+        let map_at = IMAGE_BASE.wrapping_add(MAP as u64);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| match (at, len) {
+            // Five indices, three cases: 0, 1, 0, 2, 1.
+            (a, 5) if a == map_at => Some(vec![0u8, 1, 0, 2, 1]),
+            (a, 12) if a == table_at => Some(
+                [0x1000u32, 0x2000, 0x3000]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect(),
+            ),
+            _ => None,
+        };
+
+        let found = map(DISPATCH, &block, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc004, IMAGE_BASE + 0x1000),
+                (0x6dc005, IMAGE_BASE + 0x2000),
+                (0x6dc006, IMAGE_BASE + 0x1000),
+                (0x6dc007, IMAGE_BASE + 0x3000),
+                (0x6dc008, IMAGE_BASE + 0x2000),
+            ],
+            "two indices select one case, which one table cannot do: {:?}",
+            found.cases
+        );
+        assert_eq!(found.tables.len(), 1, "{:?}", found.tables);
+        assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+    }
+
+    /// One entry outside the image refuses the **whole** table.
+    ///
+    /// The patterns are recognised from a handful of instructions, so a shape that matches by
+    /// accident computes an address and reads whatever is there -- string data, a relocation, the
+    /// next function -- and every dword of it becomes a control code the driver is reported as
+    /// accepting. An entry that is not code in this image says the bytes are not a jump table, and
+    /// the answer is then the unresolved jump rather than a partly-filtered table: half a
+    /// misidentified table is not half an answer.
+    #[test]
+    fn a_table_entry_outside_the_image_refuses_the_table() {
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "cmp",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "ja", Vec::new(), Flow::Branch(Some(0xfa11))),
+            insn(
+                DISPATCH + 0x14,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1b,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x22,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x25, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at && len == 12).then(|| {
+                // The third entry lands past the end of the image.
+                [0x1000u32, 0x2000, (IMAGE_SIZE + 0x1000) as u32]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, read, in_image, never);
+
+        assert!(
+            found.cases.is_empty(),
+            "not two of three: {:?}",
+            found.cases
+        );
+        assert!(found.tables.is_empty(), "{:?}", found.tables);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x25]);
+    }
+
+    /// A slot that goes to the switch's **default** is not a case.
+    ///
+    /// A dense table covers every index between its bounds, and a compiler fills the ones it has
+    /// no case for with the block the bounds check jumps to -- `mountmgr`'s two 81-entry tables
+    /// hold 21 codes and 60 rejections each. Reporting those makes an answer look four times
+    /// richer than it is and be wrong about three quarters of it: a code the driver rejects,
+    /// reported as one it accepts, is exactly what a reader would go and test.
+    ///
+    /// The default is read off the **bounds check's own branch target**, not inferred from entries
+    /// repeating, so a switch whose cases genuinely share a handler keeps both.
+    #[test]
+    fn a_slot_that_goes_to_the_default_is_not_a_case() {
+        const TABLE: i64 = 0x9000;
+        const DEFAULT: u64 = IMAGE_BASE + 0x500;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x21,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2b, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at && len == 16).then(|| {
+                // Four slots; the second and third are the default the `ja` jumps to, and the
+                // first and last are cases. Two of them, so "every slot but one" cannot pass.
+                [0x1000u32, 0x500, 0x500, 0x2000]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x222000, IMAGE_BASE + 0x1000),
+                (0x222003, IMAGE_BASE + 0x2000),
+            ],
+            "the two default slots are rejections, not codes: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.tables,
+            vec![Table {
+                at: DISPATCH + 0x2b,
+                table: table_at,
+                entries: 4,
+                followed: 2,
+            }],
+            "the table is four entries long and two of them are cases"
+        );
+    }
+
     /// An indirect jump with no bounds check is **recorded**, not dropped.
     ///
     /// Which is the whole difference between a short answer and a wrong one: a driver whose switch
@@ -1371,7 +1894,7 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
         assert_eq!(
@@ -1417,7 +1940,7 @@ mod tests {
             insn(DISPATCH + 0x22, "jmp", vec![reg("rax")], Flow::Jmp(None)),
         ]);
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert_eq!(found.unresolved, vec![DISPATCH + 0x22]);
@@ -1480,7 +2003,7 @@ mod tests {
             Some(vec![0u8; len])
         };
 
-        let found = map(DISPATCH, &block, read, never);
+        let found = map(DISPATCH, &block, read, in_image, never);
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert!(found.tables.is_empty(), "{:?}", found.tables);
@@ -1512,7 +2035,7 @@ mod tests {
             insn(DISPATCH + 0x10, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
         assert_eq!(found.cases[0].code, 0x222003);
@@ -1582,7 +2105,7 @@ mod tests {
             insn(DISPATCH + 0x6d, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         let sizes: Vec<_> = found
             .cases
@@ -1664,7 +2187,7 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert_eq!(
             found
@@ -1699,7 +2222,7 @@ mod tests {
             at += 12;
         }
 
-        let found = map(DISPATCH, &block, unreadable, never);
+        let found = map(DISPATCH, &block, unreadable, in_image, never);
 
         assert_eq!(found.cases.len(), MAX_CASES, "the list stops");
         assert_eq!(
@@ -1732,7 +2255,7 @@ mod tests {
             (polls > 1).then_some(Halt::Deadline)
         };
 
-        let found = map(DISPATCH, &block, unreadable, halt);
+        let found = map(DISPATCH, &block, unreadable, in_image, halt);
 
         assert_eq!(found.halted, Some(Halt::Deadline));
         assert!(
