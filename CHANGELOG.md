@@ -15,6 +15,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   binary answers as well as one with symbols, and a call site is matched by the **slot** it goes
   through rather than by a name.
 
+  Whether an instruction is privileged is the **decoder's** answer, carried beside the flow by
+  `dbgscope` and generated from the instruction set, so `cli`, `clts`, `lmsw` and the
+  virtualisation families are found without anyone maintaining a list -- a list is wrong by
+  construction, and a driver holding only the instructions nobody remembered was reported as
+  holding none. The `kind` beside each finding names the family and nothing more; one no family
+  names is `other`, with its mnemonic.
+
   Evidence rather than a verdict, and the result says so: an import is not a call, an absent import
   excludes nothing since a driver can resolve an export at run time, and a call site is not a
   reachable one. What counts as sensitive is a curated judgement, so the result carries the version

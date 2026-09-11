@@ -2396,7 +2396,8 @@ pub struct ImportedSink {
 pub struct PrivilegedInstruction {
     pub at: CodeLocation,
     /// `model_specific_register`, `port_io`, `control_register`, `descriptor_table`,
-    /// `machine_state`.
+    /// `machine_state`, `interrupt_flag`, `virtualization`, or `other` for one no family names —
+    /// whether an instruction is here at all is the decoder's answer, and the family only names it.
     pub kind: String,
     /// The mnemonic, for a reader who wants to know which of the family it was.
     pub mnemonic: String,
