@@ -254,12 +254,12 @@
     },
     {
       "annotations": 89,
-      "description": 683,
+      "description": 755,
       "inputSchema": 563,
-      "modelVisible": 1296,
+      "modelVisible": 1368,
       "name": "ioctl_map",
       "outputSchema": 3960,
-      "wire": 5376
+      "wire": 5448
     },
     {
       "annotations": 124,
@@ -534,14 +534,14 @@
   ],
   "totals": {
     "annotations": 6241,
-    "description": 32934,
+    "description": 33006,
     "inputSchema": 51052,
     "instructions": 1983,
-    "modelVisible": 87083,
+    "modelVisible": 87155,
     "outputSchema": 136192,
-    "payload": 231175,
+    "payload": 231247,
     "tools": 59,
-    "wire": 231105,
+    "wire": 231177,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

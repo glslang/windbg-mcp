@@ -27,7 +27,7 @@
 //!   batch          1   10,021  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
-//!   ioctl          8    9,071  driver objects, IRP stacks, reachability, hazards and IOCTL maps
+//!   ioctl          8    9,143  driver objects, IRP stacks, reachability, hazards and IOCTL maps
 //! ```
 //!
 //! Those bytes are a measurement of **2026-09-07** and move with any edit to a description — the

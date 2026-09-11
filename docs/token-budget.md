@@ -346,11 +346,11 @@ None of these is a bug. They are recorded because they were invisible, and
    | `batch` | 1 | 10,021 | 11.5% |
    | `crash` | 3 | 7,427 | 8.5% |
    | `ttd` | 9 | 6,829 | 7.8% |
-   | `ioctl` | 8 | 9,071 | 10.4% |
+   | `ioctl` | 8 | 9,143 | 10.5% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 59 | 87,083 |
+   | *(absent)* | 59 | 87,155 |
    | `session,inspect,exec,crash` | 31 | 43,784 |
    | `session,inspect,crash` | 23 | 32,322 |
    | `crash` | 13 | 19,078 |

@@ -113,10 +113,12 @@ table), load the `.sys` in Binary Ninja:
    `InputBufferLength` (`+0x10`), `OutputBufferLength` (`+0x08`), `Type3InputBuffer`/`UserBuffer`
    (`+0x20`). These confirm the `poi(@rdx+0xb8)+…` chain `ioctl_trace` uses — no runtime
    guesswork.
-4. Emit a **JSON IOCTL map** for the dynamic step to join against. `ioctl_map` answers in this
-   shape natively — `ioctl_map { "dispatch": "<driver>!<DispatchRoutine>" }`, with `driver_object`
+4. Emit a **JSON IOCTL map** for the dynamic step to join against. `ioctl_map` answers these
+   fields natively — `ioctl_map { "dispatch": "<driver>!<DispatchRoutine>" }`, with `driver_object`
    naming that routine — so a disassembler-side recovery and a debugger-side one are the same
-   record about the same driver. Schema (one object per case site, preserving repeated codes):
+   record about the same driver. Its own result is the **map**: a `status`, the dispatch routine's
+   coordinate, and a `cases[]` of objects in the shape below (one per case site, preserving
+   repeated codes), plus `tables[]`, `unresolved[]` and the flags that say how complete it is.
 
    ```json
    {

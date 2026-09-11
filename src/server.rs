@@ -4481,9 +4481,10 @@ impl WindbgServer {
     /// its own code and decoded: device type, function, method and required access,
     /// with the site that recognises each code and the routine it reaches. Follows
     /// compare chains, the `sub`-and-compare form, and a switch's jump table when the
-    /// bounds check and the table's base were both recovered. An indirect transfer it
-    /// cannot resolve is listed rather than dropped, so a map that is a lower bound
-    /// says so; sizes are proven-exact or absent.
+    /// bounds check and the table's base were both recovered. An indirect **jump**
+    /// it cannot resolve is listed rather than dropped, so a map that is a lower
+    /// bound says so; a call through a pointer is not a dispatch decision and is not
+    /// listed. Sizes are proven-exact or absent.
     #[rmcp::tool(
         annotations(
             title = "Map a dispatch routine's IOCTL codes",
