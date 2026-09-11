@@ -231,10 +231,18 @@ pub struct Sink {
     pub kind: SinkKind,
     /// The IAT slot a call to it goes through — the coordinate a call site is matched by.
     pub slot: u64,
-    /// Every call site found in the scanned code, in address order. **Empty is not "never
-    /// called"**: an indirect call through a stored pointer, or a call in code this scan did not
-    /// reach, leaves nothing here.
+    /// The call sites found, in address order, **up to [`MAX_CALL_SITES_PER_SINK`]**. A sample
+    /// rather than the list when [`Self::call_site_count`] is larger.
+    ///
+    /// **Empty is not "never called"**: an indirect call through a stored pointer, or a call in
+    /// code this scan did not reach, leaves nothing here.
     pub call_sites: Vec<u64>,
+    /// How many call sites the scan found, which is exact however many are listed above.
+    ///
+    /// The count is the fact and the list is a sample, which is the split `modules` makes between
+    /// `matched` and its rows. Capping the list without carrying the count would report a driver
+    /// that calls an allocator six hundred times as one that calls it two hundred and fifty-six.
+    pub call_site_count: usize,
 }
 
 /// One privileged instruction, and what it reaches.
@@ -260,7 +268,10 @@ pub struct Scanned {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Scan {
     pub sinks: Vec<Sink>,
+    /// The privileged instructions found, in address order, up to [`MAX_PRIVILEGED`].
     pub privileged: Vec<Privileged>,
+    /// How many were found, which is exact however many are listed above.
+    pub privileged_count: usize,
     pub scanned: Vec<Scanned>,
     /// Executable ranges that were **not** decoded, and therefore say nothing: bytes that would
     /// not read, and any part of a section whose declared span ran past the image.
@@ -280,6 +291,19 @@ pub struct Scan {
     /// True when the byte cap stopped it rather than the code running out.
     pub cap_hit: bool,
 }
+
+/// The most call sites listed for one sink, and the most privileged instructions listed at all.
+///
+/// **The byte cap bounds the work; these bound the answer, and the two are different budgets.**
+/// Four megabytes of one-byte `hlt` is within the byte cap and would be four million findings —
+/// each one attributed through an engine call and serialized into the reply, which is a worker
+/// that stalls or dies while analysing an untrusted driver. Both are far past what a real driver
+/// produces (`mountmgr`: eighty-four call sites in total, no privileged instructions), so what
+/// they prevent is the absurd rather than the large. The exact counts travel beside the lists, so
+/// a capped answer says how much it is a sample of.
+pub const MAX_CALL_SITES_PER_SINK: usize = 256;
+/// See [`MAX_CALL_SITES_PER_SINK`].
+pub const MAX_PRIVILEGED: usize = 1024;
 
 /// The most code one scan will decode, in bytes.
 ///
@@ -326,6 +350,7 @@ pub fn scan(
                         kind,
                         slot: import.slot,
                         call_sites: Vec::new(),
+                        call_site_count: 0,
                     },
                 );
             }
@@ -334,6 +359,7 @@ pub fn scan(
     }
 
     let mut privileged = Vec::new();
+    let mut privileged_count = 0usize;
     let mut scanned = Vec::new();
     let mut unreadable: Vec<Scanned> = Vec::new();
     let mut budget = MAX_SCAN_BYTES;
@@ -350,6 +376,16 @@ pub fn scan(
         // worth scanning, and what was cut has to be visible for the same reason every other
         // shortfall here does.
         let Ok(start) = image.checked_va(section.rva, 0) else {
+            // A section that begins **outside** the image is recorded, not skipped. Skipped, its
+            // whole declared range vanished from both lists and the report read as a complete
+            // clean scan of an image whose headers do not hold together. There is no address to
+            // record it at -- that is the point of it -- so it is reported at the image's end,
+            // which is the last address this scan can speak for.
+            unreadable.push(Scanned {
+                section: section.name.clone(),
+                start: image.base.saturating_add(u64::from(image.size_of_image)),
+                bytes: u64::from(section.virtual_size),
+            });
             continue;
         };
         let declared = u64::from(section.virtual_size);
@@ -418,14 +454,22 @@ pub fn scan(
                 if let Some(import) = by_slot.get(&called_slot(instruction).unwrap_or(0))
                     && let Some(sink) = sinks.get_mut(&import.slot)
                 {
-                    sink.call_sites.push(instruction.address);
+                    // Counted always, listed up to the cap: the count is the fact and the list is
+                    // a sample of it.
+                    sink.call_site_count += 1;
+                    if sink.call_sites.len() < MAX_CALL_SITES_PER_SINK {
+                        sink.call_sites.push(instruction.address);
+                    }
                 }
                 if let Some(kind) = privilege_kind(instruction) {
-                    privileged.push(Privileged {
-                        address: instruction.address,
-                        kind,
-                        mnemonic: instruction.mnemonic.clone(),
-                    });
+                    privileged_count += 1;
+                    if privileged.len() < MAX_PRIVILEGED {
+                        privileged.push(Privileged {
+                            address: instruction.address,
+                            kind,
+                            mnemonic: instruction.mnemonic.clone(),
+                        });
+                    }
                 }
             }
             // Resume after the last instruction that decoded whole, not at a fixed stride: a
@@ -452,6 +496,7 @@ pub fn scan(
     Scan {
         sinks: sinks.into_values().collect(),
         privileged,
+        privileged_count,
         scanned,
         unreadable,
         other_imports,
@@ -519,6 +564,7 @@ pub fn structured_report(
                 kind: sink.kind.name().to_string(),
                 slot: structured::addr(sink.slot),
                 call_sites: sink.call_sites.iter().map(|at| locate(*at)).collect(),
+                call_site_count: sink.call_site_count,
             })
             .collect(),
         privileged: scan
@@ -530,6 +576,7 @@ pub fn structured_report(
                 mnemonic: found.mnemonic.clone(),
             })
             .collect(),
+        privileged_count: scan.privileged_count,
         scanned: scan.scanned.iter().map(scanned_range).collect(),
         unreadable: scan.unreadable.iter().map(scanned_range).collect(),
         other_imports: scan.other_imports,
@@ -595,11 +642,17 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     } else {
         out.push_str(&format!("  Sensitive imports ({}):\n", report.sinks.len()));
         for sink in &report.sinks {
+            // The **count**, with the listed sample noted when it is one. Printing the list's
+            // length would report a driver that calls an allocator six hundred times as one that
+            // calls it two hundred and fifty-six.
+            let listed = if sink.call_site_count > sink.call_sites.len() {
+                format!(" (first {} listed)", sink.call_sites.len())
+            } else {
+                String::new()
+            };
             out.push_str(&format!(
-                "    {:<32} {:<20} {} call site(s)\n",
-                sink.name,
-                sink.kind,
-                sink.call_sites.len()
+                "    {:<32} {:<20} {} call site(s){listed}\n",
+                sink.name, sink.kind, sink.call_site_count
             ));
         }
     }
@@ -607,9 +660,14 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     if report.privileged.is_empty() {
         out.push_str("  Privileged instructions: none\n");
     } else {
+        let listed = if report.privileged_count > report.privileged.len() {
+            format!(", first {} listed", report.privileged.len())
+        } else {
+            String::new()
+        };
         out.push_str(&format!(
-            "  Privileged instructions ({}):\n",
-            report.privileged.len()
+            "  Privileged instructions ({}{listed}):\n",
+            report.privileged_count
         ));
         for found in &report.privileged {
             let rva = found.at.rva.as_deref().unwrap_or("?");
@@ -1076,6 +1134,89 @@ mod tests {
             "the part cut off is recorded rather than silently dropped: {:?}",
             found.unreadable
         );
+    }
+
+    /// The findings are capped, and the **counts stay exact**.
+    ///
+    /// The byte cap bounds the work and not the answer, which are different budgets: four
+    /// megabytes of one-byte `hlt` is inside it and would be four million findings, each attributed
+    /// through an engine call and serialized into the reply. What that costs is a worker that
+    /// stalls or dies while analysing an untrusted driver — so the lists are bounded and the counts
+    /// are not, because a capped list reported as a count would turn a driver that calls an
+    /// allocator six hundred times into one that calls it two hundred and fifty-six.
+    #[test]
+    fn the_findings_are_capped_and_the_counts_stay_exact() {
+        let mut image = image();
+        image.size_of_image = 0x40000;
+        image.sections[0].virtual_size = 0x30000;
+        let imports = [import("memcpy", BASE + 0x3008)];
+
+        // One window's worth of alternating call-and-`hlt`, repeated: far more of each than the
+        // caps allow, and the fixture consumes whole windows so the scan advances.
+        let found = scan(
+            &image,
+            &imports,
+            |at, want| {
+                let mut block = Vec::new();
+                let mut address = at;
+                while address + 1 < at + want as u64 {
+                    block.push(call_slot(address, BASE + 0x3008));
+                    block.push(insn(address + 1, "f4", "hlt", Flow::Trap, Vec::new()));
+                    address += 2;
+                }
+                Some(block)
+            },
+            never,
+        );
+
+        let sink = &found.sinks[0];
+        assert_eq!(
+            sink.call_sites.len(),
+            MAX_CALL_SITES_PER_SINK,
+            "the list stops at the cap"
+        );
+        assert!(
+            sink.call_site_count > MAX_CALL_SITES_PER_SINK,
+            "and the count does not: {}",
+            sink.call_site_count
+        );
+        assert_eq!(found.privileged.len(), MAX_PRIVILEGED, "the list stops");
+        assert!(
+            found.privileged_count > MAX_PRIVILEGED,
+            "and the count does not: {}",
+            found.privileged_count
+        );
+        assert_eq!(
+            sink.call_site_count, found.privileged_count,
+            "the fixture emits one of each per pair, so the two counts agree — which is what says              both are counting rather than both being capped"
+        );
+    }
+
+    /// A section beginning **outside** the image is recorded, not skipped.
+    ///
+    /// Skipped, its whole declared range vanished from both lists and the report read as a
+    /// complete clean scan of an image whose headers do not hold together — the same silence the
+    /// unreadable windows above were leaving, reached through the other half of the bounds check.
+    #[test]
+    fn a_section_beginning_outside_the_image_is_recorded() {
+        let mut image = image();
+        image.sections[0].rva = 0x9000;
+
+        let found = scan(
+            &image,
+            &[],
+            |_, _| panic!("nothing outside the image is read"),
+            never,
+        );
+        assert!(found.scanned.is_empty(), "{:?}", found.scanned);
+        assert_eq!(
+            found.unreadable.len(),
+            1,
+            "the section is unavailable, and says so: {:?}",
+            found.unreadable
+        );
+        assert_eq!(found.unreadable[0].section, ".text");
+        assert_eq!(found.unreadable[0].bytes, 0x100);
     }
 
     /// A halt stops the scan and is reported, rather than leaving a partial answer that reads like

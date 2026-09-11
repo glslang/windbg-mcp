@@ -6533,15 +6533,33 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     // sections. `read_memory` is bounded by its own size rather than by the clock; these are
     // header-sized reads, not a walk.
     let read = |at: u64, len: usize| e.read_memory(at, len).ok();
-    let image = pe::read_image(base, read).map_err(|why| pe_failure(module, &why))?;
+    let image = pe::read_image(base, read).map_err(|why| pe_failure(module, &why, None))?;
     // Polled inside the import walk, which refuses rather than truncates but can still be a few
     // thousand entries on a driver that imports heavily. A stop there comes back as
-    // `PeError::Interrupted`, which `pe_failure` categorises -- there is no half-read import table
-    // to report, since a short one would understate what the driver holds.
+    // `PeError::Interrupted` — there is no half-read import table to report, since a short one
+    // would understate what the driver holds.
+    //
+    // **Which** stop it was is recorded here, because the reader cannot tell: that error carries
+    // one variant and the two have different categories and opposite advice — an `interrupted`
+    // says somebody asked, a `timeout` says raise the clock. A cell for the same reason the walk's
+    // halt uses one: the closure is handed away and nothing else can see what it decided.
+    //
+    // The *mapping* is covered by `a_pe_walk_the_clock_stopped_is_not_reported_as_an_interrupt`;
+    // this wiring between the closure and it is not, needing an engine and an import table large
+    // enough to be stopped part-way through. Said rather than left to look tested.
+    let stopped_by: std::cell::Cell<Option<walk::Halt>> = std::cell::Cell::new(None);
     let table = pe::read_imports(&image, read, || {
-        matches!(e.interrupted(), Ok(true)) || Instant::now() >= deadline
+        let halt = if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        };
+        stopped_by.set(halt);
+        halt.is_some()
     })
-    .map_err(|why| pe_failure(module, &why))?;
+    .map_err(|why| pe_failure(module, &why, stopped_by.get()))?;
 
     let mut scan = hazards::scan(
         &image,
@@ -6570,13 +6588,19 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
 /// The two kinds are kept apart because their remedies are: bytes that would not read are an image
 /// the session cannot reach — on a dump, the ordinary answer for anything the capture left out —
 /// while a structure that does not hold together is an image that is not what it claims to be.
-fn pe_failure(module: &str, why: &pe::PeError) -> Failed {
+fn pe_failure(module: &str, why: &pe::PeError, stopped_by: Option<walk::Halt>) -> Failed {
     let category = match why {
         pe::PeError::Unreadable { .. } => structured::ErrorCategory::Debugger,
         pe::PeError::NotAnImage { .. } | pe::PeError::Malformed { .. } => {
             structured::ErrorCategory::Debugger
         }
-        pe::PeError::Interrupted => structured::ErrorCategory::Interrupted,
+        // `PeError` carries one variant for both stops, so which it was comes from the caller that
+        // polled. A caller told `interrupted` about their own call's clock is told somebody asked,
+        // and goes looking for who.
+        pe::PeError::Interrupted => match stopped_by {
+            Some(walk::Halt::Deadline) => structured::ErrorCategory::Timeout,
+            _ => structured::ErrorCategory::Interrupted,
+        },
     };
     let hint = match why {
         pe::PeError::Unreadable { .. } => {
@@ -7178,6 +7202,44 @@ mod tests {
             attributor.images().len(),
             2,
             "and each is reported once, in the order first reached"
+        );
+    }
+
+    /// A PE walk stopped by the clock is a timeout, and one somebody stopped is an interrupt.
+    ///
+    /// `PeError` carries **one** variant for both, because the module that raises it is handed a
+    /// bare `bool` and cannot know which — so the caller that polled has to say. Without that, a
+    /// scan whose import walk simply ran out of time told its caller somebody had interrupted it,
+    /// and a caller branching on the category goes looking for who instead of raising a clock.
+    #[test]
+    fn a_pe_walk_the_clock_stopped_is_not_reported_as_an_interrupt() {
+        let stopped = pe::PeError::Interrupted;
+        for (halt, expected) in [
+            (
+                Some(walk::Halt::Deadline),
+                structured::ErrorCategory::Timeout,
+            ),
+            (
+                Some(walk::Halt::Interrupted),
+                structured::ErrorCategory::Interrupted,
+            ),
+        ] {
+            let failure = pe_failure("drv", &stopped, halt);
+            assert_eq!(failure.category, Some(expected), "{halt:?}: {failure:?}");
+        }
+
+        // And the other kinds are about the image rather than about a stop, whatever was polled.
+        let unreadable = pe::PeError::Unreadable { at: 0x1000, len: 8 };
+        let failure = pe_failure("drv", &unreadable, Some(walk::Halt::Deadline));
+        assert_eq!(
+            failure.category,
+            Some(structured::ErrorCategory::Debugger),
+            "{failure:?}"
+        );
+        assert!(
+            failure.message.contains("image path"),
+            "bytes that would not read name the remedy: {}",
+            failure.message
         );
     }
 
