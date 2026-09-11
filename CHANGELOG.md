@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`ioctl_map` — which control codes a dispatch routine accepts.** Recovered from the driver's own code and decoded: device type, function code, method and required access, with the site that recognises each code and the routine it reaches. It follows compare chains, the `sub`-and-compare form a rebased switch compiles to, and a jump table when the bounds check and the table's base were both recovered.
+- **`ioctl_map` — which control codes a dispatch routine accepts.** Recovered from the driver's own code and decoded: device type, function code, method and required access, with the site that recognises each code and the routine it reaches. It follows compare chains, the `sub`-and-compare form a rebased switch compiles to, and a jump table when the bounds check and the table's base were both recovered and the switch is indexed by the code itself.
 
   **A value is followed only while it is whole.** A control code is a `ULONG`, so a two-byte read or copy of one carries part of it and is not reported as a code -- the register's width is the decoder's answer, as is whether a table's entries were sign-extended, which decides whether a case sits before its base or four gigabytes past the image.
 
