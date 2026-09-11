@@ -863,6 +863,9 @@ mod tests {
         RegisterOperand {
             name: name.to_string(),
             full: full.to_string(),
+            // The scan reads operands for what they *are* -- a control register, a port -- and
+            // never for how much of a value they carry, so any width answers here.
+            width: 8,
         }
     }
 

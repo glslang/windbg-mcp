@@ -11,7 +11,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`ioctl_map` — which control codes a dispatch routine accepts.** Recovered from the driver's own code and decoded: device type, function code, method and required access, with the site that recognises each code and the routine it reaches. It follows compare chains, the `sub`-and-compare form a rebased switch compiles to, and a jump table when the bounds check and the table's base were both recovered.
 
-  **The recovery is a walk over the routine's blocks and edges**, not down its listing. `uf` prints basic blocks in sequence, so reading them in order carries register facts across seams control flow never crosses -- a shared epilogue's `pop r13`, a block entered from a branch elsewhere. What a block knows is what every path into it agrees on, a bounds check holds on the path it admits, and a case block is read with the facts of the path that reaches it.
+  **A value is followed only while it is whole.** A control code is a `ULONG`, so a two-byte read or copy of one carries part of it and is not reported as a code -- the register's width is the decoder's answer, as is whether a table's entries were sign-extended, which decides whether a case sits before its base or four gigabytes past the image.
+
+    **The recovery is a walk over the routine's blocks and edges**, not down its listing. `uf` prints basic blocks in sequence, so reading them in order carries register facts across seams control flow never crosses -- a shared epilogue's `pop r13`, a block entered from a branch elsewhere. What a block knows is what every path into it agrees on, a bounds check holds on the path it admits, and a case block is read with the facts of the path that reaches it.
 
     **A dense switch is two tables, and reading it as one invents codes.** MSVC emits a byte per
   index saying which case it is and a dword per case holding its RVA, reusing one register for
