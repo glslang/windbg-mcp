@@ -6721,7 +6721,13 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
         within_module(module.base, module.size, at, len).then(|| e.read_memory(at, len).ok())?
     };
 
-    let found = ioctl::map(entry, &block, read, || {
+    // Whether a resolved jump-table entry is code in this driver at all, which is what a table
+    // recognised by accident fails. An image the session cannot place the routine in answers
+    // `false` for everything, so no table is followed there rather than every one being trusted.
+    let in_image = |address: u64| {
+        holding.is_some_and(|module| address >= module.base && address < module.end())
+    };
+    let found = ioctl::map(entry, &block, read, in_image, || {
         if let Some(why) = halted.get() {
             return Some(why);
         }

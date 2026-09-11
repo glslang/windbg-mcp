@@ -11,6 +11,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`ioctl_map` — which control codes a dispatch routine accepts.** Recovered from the driver's own code and decoded: device type, function code, method and required access, with the site that recognises each code and the routine it reaches. It follows compare chains, the `sub`-and-compare form a rebased switch compiles to, and a jump table when the bounds check and the table's base were both recovered.
 
+  **A dense switch is two tables, and reading it as one invents codes.** MSVC emits a byte per
+  index saying which case it is and a dword per case holding its RVA, reusing one register for
+  both — so a table's entries are reached through the byte map, and a slot that goes to the
+  switch's default is not a code the driver accepts. On `mountmgr` that is the difference between
+  43 case records and 179, three quarters of which would have been wrong. Every resolved entry has
+  to be code inside the driver's own image, or the table is refused as not being one.
+
   **What it could not follow is in the answer.** Every indirect transfer it did not resolve is listed, so a map that is a lower bound says so rather than reading as a complete set; a table is never read at a guessed length; and `code_proved` says whether the control code was traced from the IRP or taken from a bare `+0x18` displacement, which is what an empty case list turns on. Sizes are proven-exact or absent, with floors kept separately as evidence. The case fields are the shared IOCTL-case shape a Binary Ninja or Ghidra companion answers in, so the same driver recovered on either side is the same record. See [`docs/structured-results.md`](docs/structured-results.md) and [`docs/limitations.md`](docs/limitations.md).
 
 - **`driver_hazards` — what a driver's image says it can do.** The sensitive APIs it imports with
