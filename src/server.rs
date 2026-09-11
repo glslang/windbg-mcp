@@ -1378,6 +1378,17 @@ pub struct DriverObjectArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct DriverHazardsArgs {
+    /// The driver to scan, as `modules` lists it, e.g. "mydriver". The image must be readable in
+    /// this session: on a dump that means the engine can obtain the binary.
+    pub module: String,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DeviceObjectArgs {
     /// Device object: a name (e.g. "\\Device\\MyDevice") or an address (0x-hex).
     pub device: String,
@@ -4410,6 +4421,45 @@ impl WindbgServer {
         // holding several cannot place. It answered with plain text before, where there was no
         // field for it to go missing from; the typed result has one, and `set_breakpoint` — the
         // same op, the same shape — has always filled it in.
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// What a driver's image says it can do: the sensitive APIs it imports with the
+    /// call sites that reach them, and the privileged instructions in its code
+    /// (`rdmsr`, `out`, `mov cr3`). Imports are named from the driver's own import
+    /// table, so a stripped third-party binary answers as well as one with symbols.
+    /// Evidence rather than a verdict: an import is not a call, an absent import
+    /// excludes nothing since a driver can resolve an export at run time, and a call
+    /// site is not a reachable one. The result carries the version of the curated
+    /// list it was scanned with.
+    #[rmcp::tool(
+        annotations(
+            title = "Scan a driver for sensitive APIs and privileged instructions",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::DriverHazards>>()
+    )]
+    async fn driver_hazards(
+        &self,
+        Parameters(args): Parameters<DriverHazardsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // `module` reaches `lm m <module>`, so it is screened for the separators that would run a
+        // second command — the same door `reachable_from_dispatch`'s operands go through.
+        if let Err(e) = reject_command_breakers("module", &args.module, Quotes::Rejected) {
+            return typed_error(ErrorCategory::InvalidArgument, e, args.session_id.clone());
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::DriverHazards {
+                    module: args.module,
+                    // Filled in by the supervisor's pump when this job reaches the front of its
+                    // session's queue, exactly as the walk's is.
+                    patience_ms: 0,
+                },
+            )
+            .await;
         engine_result_for(args.session_id.as_deref(), out)
     }
 

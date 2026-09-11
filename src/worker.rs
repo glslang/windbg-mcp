@@ -61,6 +61,8 @@ use crate::driver::{
     parse_windbg_addr, path_recipe, reachability, structured_report,
 };
 use crate::fault;
+use crate::hazards;
+use crate::pe;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Interrupted, MAX_MODULE_ROWS,
     Output, PoolOp, ReachabilityOp, SymbolPathSetting, TargetOrigin, WorkerMessage, WorkerRequest,
@@ -1734,6 +1736,30 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         } => {
             let address = resolve_coordinate(e, coordinate.as_deref(), address, 1)?;
             run_to_address(e, &address, timeout_ms)
+        }
+        EngineOp::DriverHazards {
+            module,
+            patience_ms,
+        } => {
+            // The same budget arithmetic as the reachability walk's, and the same reason it is not
+            // a refusal when there is none: a scan that stops early names what it found and says
+            // it stopped, where a walk with no time reads nothing and reports an empty table.
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, queued) {
+                Some(budget) => driver_hazards(e, &module, Instant::now() + budget),
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This driver scan was not run: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to read an image and report \
+                         back. Nothing was read. It waited {}s behind other work on this session; \
+                         issue it when the session is idle, or raise the server's call timeout \
+                         (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                    ),
+                )),
+            }
         }
         EngineOp::Reachability(args) => {
             // Whatever is left of the caller's patience once the queue has had its share. Unlike
@@ -6450,6 +6476,119 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
             output: res.output,
         },
     ))
+}
+
+/// Scans a driver's image for the sensitive APIs it holds and the privileged instructions it
+/// contains.
+///
+/// Everything that reads the target is a closure handed to [`hazards::scan`]; the analysis itself
+/// has never seen an engine. What this function owns is the three things only the worker can do:
+/// rebase the module, read its headers, and decode its code — each of them bounded by what is left
+/// of the caller's clock, for the reason `reachable` is: the preliminaries run before the scan, so
+/// a deadline first consulted inside it is one the caller can outlive.
+fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Output, Failed> {
+    // Refused outright on an instruction set whose encodings this build does not decode, exactly
+    // as the reachability walk is and for a sharper reason: every instruction would come back
+    // `Flow::Unknown` with no operands, so a scan would report *no* privileged instructions and no
+    // call sites — an answer shaped like a clean driver rather than like a question not asked.
+    let set = e.instruction_set();
+    if !set.operands_are_read() {
+        let machine = match set {
+            dbgscope::dbgeng::InstructionSet::Other(machine) => format!("{machine:#06x}"),
+            other => format!("{other:?}"),
+        };
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this build decodes x86 and x64 instructions, and this target's are machine \
+                 {machine} — so a scan of `{module}` could not read a call site or a privileged \
+                 instruction, and would report a driver with neither rather than a question it \
+                 could not ask. The import table alone is architecture-neutral; `modules` and \
+                 `read_memory` work here."
+            ),
+        ));
+    }
+
+    let lm = e
+        .execute_command_bounded(
+            &format!("lm m {module}"),
+            remaining(deadline, "the module's base was read")?,
+        )
+        .map_err(|why| Failed::from(es(why)))
+        .and_then(|run| {
+            finished(run)
+                .map_err(|why| cut_short_failure(why, &format!("reading `{module}`'s base")))
+        })?
+        .unwrap_or_default();
+    let base = parse_lm_base(&lm).ok_or_else(|| {
+        Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!("module `{module}` not found (`lm m {module}` returned):\n{lm}"),
+        )
+    })?;
+
+    // The headers, then the imports. Both read through one closure, and a read that does not
+    // answer is `PeError::Unreadable` naming what could not be read rather than a zero parsed as a
+    // structure — which on a dump is the ordinary case for anything outside the read-only
+    // sections. `read_memory` is bounded by its own size rather than by the clock; these are
+    // header-sized reads, not a walk.
+    let read = |at: u64, len: usize| e.read_memory(at, len).ok();
+    let image = pe::read_image(base, read).map_err(|why| pe_failure(module, &why))?;
+    // Polled inside the import walk, which refuses rather than truncates but can still be a few
+    // thousand entries on a driver that imports heavily. A stop there comes back as
+    // `PeError::Interrupted`, which `pe_failure` categorises -- there is no half-read import table
+    // to report, since a short one would understate what the driver holds.
+    let table = pe::read_imports(&image, read, || {
+        matches!(e.interrupted(), Ok(true)) || Instant::now() >= deadline
+    })
+    .map_err(|why| pe_failure(module, &why))?;
+
+    let mut scan = hazards::scan(
+        &image,
+        &table.imports,
+        |at, len| e.decode_range(at, len).ok(),
+        || {
+            if matches!(e.interrupted(), Ok(true)) {
+                Some(walk::Halt::Interrupted)
+            } else if Instant::now() >= deadline {
+                Some(walk::Halt::Deadline)
+            } else {
+                None
+            }
+        },
+    );
+    scan.unnamed_libraries = table.unnamed_libraries;
+
+    let mut attributor = Attributor::default();
+    let report =
+        hazards::structured_report(module, base, &scan, |address| attributor.locate(e, address));
+    Ok(Output::typed(hazards::render(&report), report))
+}
+
+/// A PE read that did not work out, as the failure its caller branches on.
+///
+/// The two kinds are kept apart because their remedies are: bytes that would not read are an image
+/// the session cannot reach — on a dump, the ordinary answer for anything the capture left out —
+/// while a structure that does not hold together is an image that is not what it claims to be.
+fn pe_failure(module: &str, why: &pe::PeError) -> Failed {
+    let category = match why {
+        pe::PeError::Unreadable { .. } => structured::ErrorCategory::Debugger,
+        pe::PeError::NotAnImage { .. } | pe::PeError::Malformed { .. } => {
+            structured::ErrorCategory::Debugger
+        }
+        pe::PeError::Interrupted => structured::ErrorCategory::Interrupted,
+    };
+    let hint = match why {
+        pe::PeError::Unreadable { .. } => {
+            " On a dump the image is what supplies these bytes: use a symbol path that serves \
+             image binaries, or set an executable image path and `.reload /f`."
+        }
+        _ => "",
+    };
+    Failed::categorised(
+        category,
+        format!("`{module}`'s PE structures could not be read: {why}.{hint}"),
+    )
 }
 
 /// What is left of the walk's clock, or the failure to report when nothing is.

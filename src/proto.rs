@@ -293,6 +293,19 @@ pub enum EngineOp {
         timeout_ms: u32,
     },
     Reachability(ReachabilityOp),
+    /// What a driver's image says it can do: which sensitive APIs it imports and where each is
+    /// called, and which privileged instructions its code contains.
+    ///
+    /// One indivisible job for the same reason [`Self::Reachability`] is: it decodes a driver's
+    /// whole executable image, which is a run of engine calls rather than one, and letting another
+    /// call for this session interleave would put two readers on one engine thread.
+    DriverHazards {
+        /// The module to scan, as `lm m <module>` matches it.
+        module: String,
+        /// Whatever is left of the caller's own clock when this reaches the front of the queue,
+        /// filled in by the supervisor's pump.
+        patience_ms: u32,
+    },
     /// A pool query. Like [`Self::Reachability`] this is one indivisible job: a query may have
     /// to walk every pool page, and letting another call for the same session interleave would
     /// let the walk describe a target that moved underneath it.
@@ -452,6 +465,7 @@ impl EngineOp {
             | Self::CrashTriage { patience_ms, .. }
             | Self::Walk(WalkOp { patience_ms, .. })
             | Self::Reachability(ReachabilityOp { patience_ms, .. })
+            | Self::DriverHazards { patience_ms, .. }
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
             _ => None,
         }

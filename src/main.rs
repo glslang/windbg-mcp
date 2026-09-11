@@ -18,6 +18,7 @@ mod client;
 mod driver;
 mod engine;
 mod fault;
+mod hazards;
 mod kdconn;
 mod listen;
 mod logbridge;

@@ -118,6 +118,15 @@
       "wire": 3103
     },
     {
+      "annotations": 113,
+      "description": 563,
+      "inputSchema": 541,
+      "modelVisible": 1159,
+      "name": "driver_hazards",
+      "outputSchema": 2645,
+      "wire": 3948
+    },
+    {
       "annotations": 74,
       "description": 211,
       "inputSchema": 444,
@@ -515,15 +524,15 @@
     }
   ],
   "totals": {
-    "annotations": 6039,
-    "description": 31566,
-    "inputSchema": 49948,
+    "annotations": 6152,
+    "description": 32129,
+    "inputSchema": 50489,
     "instructions": 1983,
-    "modelVisible": 84506,
-    "outputSchema": 129236,
-    "payload": 221376,
-    "tools": 57,
-    "wire": 221308,
+    "modelVisible": 85665,
+    "outputSchema": 131881,
+    "payload": 225325,
+    "tools": 58,
+    "wire": 225256,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
