@@ -1743,7 +1743,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // the same shape as hitting a bound, and already a thing a caller must read.
             let patience = Duration::from_millis(u64::from(args.patience_ms));
             match walk_budget(patience, queued) {
-                Some(budget) => reachable(e, args, Instant::now() + budget).map_err(Failed::from),
+                Some(budget) => reachable(e, args, Instant::now() + budget),
                 // Refused rather than attempted with nothing. An already-expired deadline halts
                 // before the seed is disassembled, which leaves `from_entry` unset — and that is
                 // reported as "could not disassemble `from`", sending the caller to check a symbol
@@ -3625,7 +3625,16 @@ const STACK_SCAN_SPAN: u64 = 0x10000;
 /// the cache can only ever save a call, never change an answer.
 #[derive(Default)]
 struct Attributor {
-    held: Option<(dbgscope::dbgeng::Module, structured::ImageIdentity)>,
+    /// Every module resolved so far, kept by the range it covers.
+    ///
+    /// **A list rather than one slot**, which the first version got wrong. One slot is right for a
+    /// disassembly — a contiguous range walks forward through one image — and wrong for this
+    /// caller, because the order a reachability answer visits addresses in is the order of its
+    /// *fields*: the seed, then the target, then each hop's site and callee, then every recipe
+    /// segment and step. A driver-to-`nt` path therefore alternates, and one slot evicts on every
+    /// alternation, paying `module_at` **and** `module_pdb` again for an answer it already had.
+    /// Two or three entries is what a real walk holds, so a scan is arithmetic either way.
+    resolved: Vec<(dbgscope::dbgeng::Module, structured::ImageIdentity)>,
     /// Every image a location has named, in the order first reached — the other half of the
     /// coordinate, kept here rather than repeated on each address.
     seen: Vec<structured::ImageRef>,
@@ -3639,29 +3648,52 @@ impl Attributor {
     /// a finding about the target — a pool allocation, an unloaded driver, a corrupted address —
     /// and `attribution_failed` says the lookup itself did not answer, which is not.
     fn locate(&mut self, e: &DebugEngine, address: u64) -> structured::CodeLocation {
-        let inside = |(module, _): &(dbgscope::dbgeng::Module, structured::ImageIdentity)| {
+        self.locate_with(address, |address| {
+            let module = e.module_at(address).map_err(|why| {
+                tracing::debug!("worker: could not attribute {address:#x}: {why}");
+            })?;
+            Ok(module.map(|module| {
+                let identity = Self::identity(e, &module);
+                (module, identity)
+            }))
+        })
+    }
+
+    /// [`Self::locate`] with the engine behind a closure, which is what makes the cache testable.
+    ///
+    /// The property worth pinning is not "an address inside a known range is attributed" — that is
+    /// visible in the result — but "the engine is **not asked again** for it", which is not. A
+    /// counting closure is the only way to see the difference, and it is the difference the whole
+    /// structure exists for. `FnOnce` because a miss resolves once and a hit resolves not at all.
+    fn locate_with(
+        &mut self,
+        address: u64,
+        resolve: impl FnOnce(
+            u64,
+        ) -> Result<
+            Option<(dbgscope::dbgeng::Module, structured::ImageIdentity)>,
+            (),
+        >,
+    ) -> structured::CodeLocation {
+        let inside = |(module, _): &&(dbgscope::dbgeng::Module, structured::ImageIdentity)| {
             address >= module.base && address < module.end()
         };
         let mut attribution_failed = false;
-        if !self.held.as_ref().is_some_and(inside) {
-            self.held = match e.module_at(address) {
-                Ok(Some(module)) => {
-                    let identity = self.identity(e, &module);
-                    Some((module, identity))
-                }
-                Ok(None) => None,
-                Err(why) => {
-                    tracing::debug!("worker: could not attribute {address:#x}: {why}");
-                    attribution_failed = true;
-                    None
-                }
-            };
+        if !self.resolved.iter().any(|entry| inside(&entry)) {
+            match resolve(address) {
+                Ok(Some(entry)) => self.resolved.push(entry),
+                // An address in no image is not cached: there is no range to key it by, and the
+                // answer is cheap to re-ask for the handful of them a walk produces.
+                Ok(None) => {}
+                Err(()) => attribution_failed = true,
+            }
         }
         // An unloaded module has no name to qualify anything with, exactly as in a stack walk, so
         // it carries no coordinate either — `module` is what a coordinate is joined by.
         let named = self
-            .held
-            .as_ref()
+            .resolved
+            .iter()
+            .find(inside)
             .filter(|(module, _)| !module.name.is_empty());
         // Recorded once per image rather than on every address. See `structured::ImageRef`: a
         // real driver's path and its recipe name the same two or three images across dozens of
@@ -3703,11 +3735,7 @@ impl Attributor {
     /// [`with_pdb_identity`]'s rule and for its reason: a call per module is cheap, and a call that
     /// will answer nothing is not worth making. A failure costs this one field — a coordinate must
     /// not be lost over the provenance of the symbols beside it.
-    fn identity(
-        &self,
-        e: &DebugEngine,
-        module: &dbgscope::dbgeng::Module,
-    ) -> structured::ImageIdentity {
+    fn identity(e: &DebugEngine, module: &dbgscope::dbgeng::Module) -> structured::ImageIdentity {
         use dbgscope::dbgeng::SymbolKind;
         let pdb = matches!(module.symbols, SymbolKind::Pdb | SymbolKind::Dia)
             .then(|| match e.module_pdb(module.base) {
@@ -6392,7 +6420,7 @@ fn halt_for(cut_short: Interruption) -> walk::Halt {
     }
 }
 
-fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, String> {
+fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
     // Refused outright on an instruction set whose flow this build does not decode — ARM64
     // today, which this server otherwise supports (`src/target.rs`). Every instruction there
     // decodes to `Flow::Unknown`, and the walk stops at those, so the answer would be a NOT
@@ -6410,12 +6438,19 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
             dbgscope::dbgeng::InstructionSet::Other(machine) => format!("{machine:#06x}"),
             other => format!("{other:?}"),
         };
-        return Err(format!(
-            "this build decodes x86 and x64 instructions, and this target's are machine \
-             {machine} — so a reachability walk over it cannot follow control flow, and any \
-             verdict would be about what could not be read rather than about the target. \
-             Analysis that needs no flow is unaffected: modules, memory, stacks and `disassemble` \
-             all work here."
+        // `Debugger` rather than `InvalidArgument`, which is the tempting one because the call is
+        // refused before the walk starts. No change to an *argument* helps: the refusal is about
+        // the target this session holds, and that is what `Debugger` names — actionable by
+        // changing what is asked, not how it is spelt.
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this build decodes x86 and x64 instructions, and this target's are machine \
+                 {machine} — so a reachability walk over it cannot follow control flow, and any \
+                 verdict would be about what could not be read rather than about the target. \
+                 Analysis that needs no flow is unaffected: modules, memory, stacks and \
+                 `disassemble` all work here."
+            ),
         ));
     }
 
@@ -6426,20 +6461,51 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // Reject conflicting target forms rather than silently ignoring one — analysing the
         // wrong target would give a misleading verdict.
         (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
-            return Err("provide `address` OR `module`+`rva`, not both".to_string());
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                "provide `address` OR `module`+`rva`, not both",
+            ));
         }
         (Some(a), None, None) => {
-            resolve(e, a).ok_or_else(|| format!("could not resolve target address `{a}`"))?
+            // `Debugger`, not `InvalidArgument`: this reached the debugger's expression evaluator
+            // and it could not answer, which is that category's own example.
+            resolve(e, a).ok_or_else(|| {
+                Failed::categorised(
+                    structured::ErrorCategory::Debugger,
+                    format!("could not resolve target address `{a}`"),
+                )
+            })?
         }
         (None, Some(m), Some(r)) => {
-            let rva = resolve(e, r).ok_or_else(|| format!("could not resolve rva `{r}`"))?;
-            let lm = e.execute_command(&format!("lm m {m}")).map_err(es)?;
-            let base = parse_lm_base(&lm)
-                .ok_or_else(|| format!("module `{m}` not found (`lm m {m}` returned):\n{lm}"))?;
-            base.checked_add(rva)
-                .ok_or_else(|| "module base + rva overflowed u64".to_string())?
+            let rva = resolve(e, r).ok_or_else(|| {
+                Failed::categorised(
+                    structured::ErrorCategory::Debugger,
+                    format!("could not resolve rva `{r}`"),
+                )
+            })?;
+            let lm = e
+                .execute_command(&format!("lm m {m}"))
+                .map_err(|why| Failed::from(es(why)))?;
+            let base = parse_lm_base(&lm).ok_or_else(|| {
+                Failed::categorised(
+                    structured::ErrorCategory::Debugger,
+                    format!("module `{m}` not found (`lm m {m}` returned):\n{lm}"),
+                )
+            })?;
+            // Arithmetic over the caller's own two numbers, so this one *is* the argument.
+            base.checked_add(rva).ok_or_else(|| {
+                Failed::categorised(
+                    structured::ErrorCategory::InvalidArgument,
+                    "module base + rva overflowed u64",
+                )
+            })?
         }
-        _ => return Err("provide `address`, or both `module` and `rva`".to_string()),
+        _ => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                "provide `address`, or both `module` and `rva`",
+            ));
+        }
     };
 
     // Resolve `from` to a numeric VA so a mid-function start (a handler scoped past a switch)
@@ -6597,22 +6663,35 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // A halt outranks the symbol. The seed's own disassembly can be cut short by the deadline
         // or an interrupt, which leaves `from_entry` unset exactly as a bad symbol does — and
         // sending someone to check a `from` that was fine is the wrong end of the problem.
+        // And the category follows the reason, for the same argument: a caller branching on it
+        // recovers differently from each. `Timeout` says the call's own clock ran out — which is
+        // this one rather than `NotRun`, because the walk *started* and read what it could;
+        // `Interrupted` says somebody asked; and only the third is about the symbol.
         return Err(match rpt.halted {
-            Some(walk::Halt::Deadline) => format!(
-                "the walk from `{}` ran out of time before its first function could be \
-                 disassembled. Nothing was explored. Raise the server's call timeout \
-                 (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue this when the session is idle.",
-                args.from
+            Some(walk::Halt::Deadline) => Failed::categorised(
+                structured::ErrorCategory::Timeout,
+                format!(
+                    "the walk from `{}` ran out of time before its first function could be \
+                     disassembled. Nothing was explored. Raise the server's call timeout \
+                     (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue this when the session is idle.",
+                    args.from
+                ),
             ),
-            Some(walk::Halt::Interrupted) => format!(
-                "the walk from `{}` was interrupted before its first function could be \
-                 disassembled. Nothing was explored.",
-                args.from
+            Some(walk::Halt::Interrupted) => Failed::categorised(
+                structured::ErrorCategory::Interrupted,
+                format!(
+                    "the walk from `{}` was interrupted before its first function could be \
+                     disassembled. Nothing was explored.",
+                    args.from
+                ),
             ),
-            None => format!(
-                "could not disassemble `from` ({}): `uf` returned no function. Check the \
-                 symbol/address and that the module is loaded.",
-                args.from
+            None => Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!(
+                    "could not disassemble `from` ({}): `uf` returned no function. Check the \
+                     symbol/address and that the module is loaded.",
+                    args.from
+                ),
             ),
         });
     }
@@ -6678,6 +6757,72 @@ mod tests {
         assert_eq!(
             walk_budget_ms(now + Duration::from_secs(30), now),
             Some(30_000)
+        );
+    }
+
+    /// The attributor asks the engine **once per module**, whatever order the addresses arrive in.
+    ///
+    /// It held one module at first, which is right for a disassembly — a contiguous range walks
+    /// forward through one image — and wrong for the caller it was written for. A reachability
+    /// answer visits addresses in the order of its *fields*: the seed, the target, each hop's site
+    /// and callee, then every recipe segment and step. A driver-to-`nt` path alternates, and one
+    /// slot evicts on every alternation, paying `module_at` **and** `module_pdb` again for an
+    /// answer already in hand.
+    ///
+    /// The count is the assertion, not the coordinates: an attribution that is correct and asks
+    /// twice looks identical in the result, which is why this drives the engine through a closure
+    /// it can count.
+    #[test]
+    fn the_attributor_asks_once_per_module_however_the_addresses_alternate() {
+        fn module(name: &str, base: u64, size: u32) -> dbgscope::dbgeng::Module {
+            dbgscope::dbgeng::Module {
+                base,
+                size,
+                name: name.to_string(),
+                image_name: format!("{name}.sys"),
+                loaded_image_name: String::new(),
+                timestamp: 1,
+                checksum: 0,
+                symbols: dbgscope::dbgeng::SymbolKind::Deferred,
+                user_mode: false,
+                unloaded: false,
+            }
+        }
+        let images = [module("drv", 0x1000, 0x1000), module("nt", 0x8000, 0x4000)];
+
+        let mut asked: Vec<u64> = Vec::new();
+        let mut attributor = Attributor::default();
+        // The order a real answer produces: seed, target, hop site, hop callee, then a recipe
+        // walking back through the first image.
+        for address in [0x1100, 0x8200, 0x1180, 0x8200, 0x1100, 0x1200, 0x1240] {
+            let location = attributor.locate_with(address, |address| {
+                asked.push(address);
+                Ok(images
+                    .iter()
+                    .find(|m| address >= m.base && address < m.base + u64::from(m.size))
+                    .map(|m| {
+                        (
+                            m.clone(),
+                            structured::ImageIdentity {
+                                timestamp: m.timestamp,
+                                size: u64::from(m.size),
+                                pdb: None,
+                            },
+                        )
+                    }))
+            });
+            assert!(location.module.is_some(), "{address:#x}: {location:?}");
+        }
+
+        assert_eq!(
+            asked.len(),
+            2,
+            "two images, two lookups — one slot would have made this seven: {asked:x?}"
+        );
+        assert_eq!(
+            attributor.images().len(),
+            2,
+            "and each is reported once, in the order first reached"
         );
     }
 
