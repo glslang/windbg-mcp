@@ -630,7 +630,14 @@ fn simulate(
         // with nothing saying so: no unresolved transfer, no blind instruction, no stop. Which
         // instructions write flags is the decoder's answer rather than a list of arithmetic
         // mnemonics, so this is the whole rule.
-        if instruction.writes_flags {
+        //
+        // **A call is the exception**, and the decoder cannot say otherwise: a callee is free to
+        // leave the flags as it likes, so a branch after one is not reading the compare before
+        // it. Attributing it to that compare fabricates a case out of two unrelated
+        // instructions.
+        if matches!(instruction.flow, Flow::Call(_)) {
+            compared = None;
+        } else if instruction.writes_flags {
             compared = next;
         }
     }
@@ -830,10 +837,18 @@ fn update(
     if instruction.effect == Effect::Compare {
         return compare(facts, instruction, layout, traced);
     }
-    // A call returns over the volatile registers, so a belief about one does not survive it.
+    // A call returns over the volatile registers, so a belief about one does not survive it --
+    // including a bound whose index is one of them.
     if matches!(instruction.flow, Flow::Call(_)) {
         for volatile in VOLATILE {
             facts.registers.remove(volatile);
+        }
+        if facts
+            .bound
+            .as_ref()
+            .is_some_and(|bound| VOLATILE.contains(&bound.register.as_str()))
+        {
+            facts.bound = None;
         }
     }
     // Neither of these writes a register, and `test` is the other thing that writes only flags.
@@ -847,6 +862,12 @@ fn update(
         return None;
     };
     let held = facts.registers.get(&destination).cloned();
+    // The bound goes with the register it was about, unless this is the load that carries it.
+    if facts.bound.as_ref().is_some_and(|bound| {
+        bound.register == destination && !keeps_a_bound(instruction, &bound.register)
+    }) {
+        facts.bound = None;
+    }
 
     match instruction.effect {
         Effect::Move | Effect::LoadAddress => {
@@ -956,6 +977,38 @@ fn update(
         _ => set(facts, &destination, None),
     }
     None
+}
+
+/// Whether an instruction leaves a bounds check still describing the register it covered.
+///
+/// **A bound is about a register's *value*, and a write to that register ends it.** `cmp eax,2` /
+/// `ja default` followed by `xor eax,eax` says nothing about what a table indexed by `eax` then
+/// selects, and reading it as a bound reports every entry of that table as a code the driver
+/// accepts when execution can reach only one.
+///
+/// The writes that are exempt are the table pattern's own, and only while they **read** the
+/// bounded register: a dense switch loads a byte map or a dword table *through* the index and
+/// leaves its result in the same register, which carries the bound forward rather than ending it.
+/// Anything else -- an arithmetic adjustment, a copy from elsewhere, a zeroing, a load indexed by
+/// something else -- takes it away.
+fn keeps_a_bound(instruction: &Instruction, register: &str) -> bool {
+    match instruction.operands.get(1) {
+        // A byte per index or a dword per case, read **through** the bounded register: the two
+        // tables a switch is made of, each leaving its result where the index was.
+        Some(Operand::Memory(memory)) if instruction.effect == Effect::Move => {
+            let through = memory
+                .index
+                .as_ref()
+                .is_some_and(|index| index.full == register);
+            through && ((memory.scale == 1 && memory.size.unwrap_or(1) == 1) || memory.scale == 4)
+        }
+        // `add rcx,rdx` folding the image base into an entry, which is the step between the load
+        // and the jump. What the bound describes -- the limit, the offset, the shift and the
+        // default -- is a fact about the index *before* these, and `follow_table` re-derives the
+        // chain from the jump backwards; this is only about which writes end it.
+        Some(Operand::Register(_)) if instruction.effect == Effect::Add => true,
+        _ => false,
+    }
 }
 
 /// What a `mov`-shaped instruction's source is worth.
@@ -1463,9 +1516,9 @@ fn sizes_in(
         }
         // Everything else updates the facts, which is what retires a base the block overwrites.
         // The pending compare survives anything that writes no flags, for the reason the block
-        // walk's does: a compiler puts the case's setup between a compare and its branch.
+        // walk's does -- and not a call, for the reason it does not there either.
         update(&mut facts, instruction, layout, &mut traced);
-        if instruction.writes_flags {
+        if instruction.writes_flags || matches!(instruction.flow, Flow::Call(_)) {
             pending = None;
         }
     }
@@ -1775,6 +1828,45 @@ mod tests {
 
     fn reg(name: &str) -> Operand {
         Operand::Register(named(name))
+    }
+
+    /// A register as the decoder names it **on a 32-bit target**, where a 32-bit spelling is the
+    /// whole register: there is no `rax` there, so the full-width name is the name.
+    fn named32(name: &str) -> RegisterOperand {
+        RegisterOperand {
+            name: name.to_string(),
+            full: name.to_string(),
+        }
+    }
+
+    fn reg32(name: &str) -> Operand {
+        Operand::Register(named32(name))
+    }
+
+    /// `[base+displacement]` on a 32-bit target.
+    fn mem32(base: &str, displacement: i64) -> Operand {
+        Operand::Memory(MemoryOperand {
+            size: Some(4),
+            segment: None,
+            base: Some(named32(base)),
+            index: None,
+            scale: 1,
+            displacement,
+            address: None,
+        })
+    }
+
+    /// `[index*4+displacement]` on a 32-bit target -- the form a switch jumps straight through.
+    fn indexed32(index: &str, displacement: i64) -> Operand {
+        Operand::Memory(MemoryOperand {
+            size: Some(4),
+            segment: None,
+            base: None,
+            index: Some(named32(index)),
+            scale: 4,
+            displacement,
+            address: None,
+        })
     }
 
     fn imm(value: u64) -> Operand {
@@ -2537,31 +2629,31 @@ mod tests {
             insn(
                 DISPATCH,
                 "mov",
-                vec![reg("esi"), mem("ebp", 0x0c)],
+                vec![reg32("esi"), mem32("ebp", 0x0c)],
                 Flow::Fallthrough,
             ),
             insn(
                 DISPATCH + 3,
                 "mov",
-                vec![reg("edi"), mem("esi", 0x60)],
+                vec![reg32("edi"), mem32("esi", 0x60)],
                 Flow::Fallthrough,
             ),
             insn(
                 DISPATCH + 6,
                 "mov",
-                vec![reg("eax"), mem("edi", 0x0c)],
+                vec![reg32("eax"), mem32("edi", 0x0c)],
                 Flow::Fallthrough,
             ),
             insn(
                 DISPATCH + 9,
                 "sub",
-                vec![reg("eax"), imm(0x222000)],
+                vec![reg32("eax"), imm(0x222000)],
                 Flow::Fallthrough,
             ),
             insn(
                 DISPATCH + 0xf,
                 "cmp",
-                vec![reg("eax"), imm(2)],
+                vec![reg32("eax"), imm(2)],
                 Flow::Fallthrough,
             ),
             insn(
@@ -2573,7 +2665,7 @@ mod tests {
             insn(
                 DISPATCH + 0x18,
                 "jmp",
-                vec![indexed(None, "eax", TABLE, None)],
+                vec![indexed32("eax", TABLE)],
                 Flow::Jmp(None),
             ),
         ];
@@ -3313,6 +3405,186 @@ mod tests {
         );
     }
 
+    /// A bound is about a register's **value**, so a write that is not part of the table pattern
+    /// ends it.
+    ///
+    /// `cmp eax,2` / `ja default` followed by `xor eax,eax` says nothing about what a table
+    /// indexed by `eax` then selects: execution can reach only entry zero, and reading the bound
+    /// as still standing reports all three as codes the driver accepts. The fixture's reader would
+    /// serve the table happily, so what is asserted is that nothing was read rather than that the
+    /// answer came out empty.
+    #[test]
+    fn a_write_that_is_not_the_table_pattern_ends_the_bound() {
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            // Nothing to do with the index any more.
+            insn(
+                DISPATCH + 0x1a,
+                "xor",
+                vec![reg("eax"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x23,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2a,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2d, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let served = std::cell::Cell::new(0usize);
+        let read = |_: u64, len: usize| {
+            served.set(served.get() + 1);
+            Some(vec![0u8; len])
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x2d]);
+        assert_eq!(served.get(), 0, "nothing was read");
+    }
+
+    /// A **call** ends a pending compare, whatever the decoder says about flags.
+    ///
+    /// A callee is free to leave the flags as it likes, so the branch after one is not reading the
+    /// compare before it. Attributing it to that compare builds a case out of two unrelated
+    /// instructions -- and `call` writes no flags of its own, so the rule that lets a `mov` through
+    /// would let this through too.
+    #[test]
+    fn a_call_ends_a_pending_compare() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "call",
+                vec![Operand::Target(0x5000)],
+                Flow::Call(Some(0x5000)),
+            ),
+            insn(DISPATCH + 0x13, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x19, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert!(
+            found.cases.is_empty(),
+            "the branch is not reading the compare before the call: {:?}",
+            found.cases
+        );
+    }
+
+    /// On a 32-bit target the return register is `eax`, and a refusal that returns one is read as
+    /// a refusal.
+    ///
+    /// The full-width register a decoder names depends on the target -- `eax` is part of `rax` on
+    /// x64 and is itself the whole register on x86 -- so a rejection written in `eax` is invisible
+    /// to a layout carrying the other name. With a direct call in the same block it is worse than
+    /// invisible: the block reads as handled and the call is published as the handler.
+    #[test]
+    fn a_32_bit_refusal_returns_in_the_register_that_target_returns_in() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg32("esi"), mem32("ebp", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 3,
+                "mov",
+                vec![reg32("edi"), mem32("esi", 0x60)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 6,
+                "mov",
+                vec![reg32("ebx"), mem32("edi", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 9,
+                "cmp",
+                vec![reg32("ebx"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xf,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x20)),
+            ),
+            insn(DISPATCH + 0x15, "ret", Vec::new(), Flow::Return),
+            // The refusal: a status in the return register, a completion call, and out.
+            insn(
+                DISPATCH + 0x20,
+                "mov",
+                vec![reg32("eax"), imm(0xc000_0010)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x25,
+                "call",
+                vec![Operand::Target(0x7000)],
+                Flow::Call(Some(0x7000)),
+            ),
+            insn(DISPATCH + 0x2a, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(DISPATCH, &block, Layout::X86, unreadable, in_image, never);
+
+        assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+        assert_eq!(
+            (found.cases[0].accepted, found.cases[0].handler),
+            (Some(false), None),
+            "the completion routine is not this code's handler: {:?}",
+            found.cases[0]
+        );
+    }
+
     /// An indirect jump with no bounds check is **recorded**, not dropped.
     ///
     /// Which is the whole difference between a short answer and a wrong one: a driver whose switch
@@ -3706,25 +3978,25 @@ mod tests {
             insn(
                 DISPATCH,
                 "mov",
-                vec![reg("esi"), mem("ebp", 0x0c)],
+                vec![reg32("esi"), mem32("ebp", 0x0c)],
                 Flow::Fallthrough,
             ),
             insn(
                 DISPATCH + 3,
                 "mov",
-                vec![reg("edi"), mem("esi", 0x60)],
+                vec![reg32("edi"), mem32("esi", 0x60)],
                 Flow::Fallthrough,
             ),
             insn(
                 DISPATCH + 6,
                 "mov",
-                vec![reg("ebx"), mem("edi", 0x0c)],
+                vec![reg32("ebx"), mem32("edi", 0x0c)],
                 Flow::Fallthrough,
             ),
             insn(
                 DISPATCH + 9,
                 "cmp",
-                vec![reg("ebx"), imm(0x222003)],
+                vec![reg32("ebx"), imm(0x222003)],
                 Flow::Fallthrough,
             ),
             insn(DISPATCH + 0xf, "je", Vec::new(), Flow::Branch(Some(0x900))),
