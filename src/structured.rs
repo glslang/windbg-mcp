@@ -2373,12 +2373,16 @@ pub struct ImportedSink {
     /// The import address table slot a call goes through — the coordinate a call site is matched
     /// by, and the reason this works on a driver with no symbols at all.
     pub slot: String,
-    /// Where the scanned code transfers control through that slot, as `module`+`rva` locations.
+    /// Where the scanned code transfers control through that slot, as `module`+`rva` locations —
+    /// a **sample** rather than the whole list when [`Self::call_site_count`] is larger.
     ///
     /// **Empty is not "never called".** A call through a pointer the driver stored earlier leaves
     /// nothing here, and neither does a call in code this scan did not reach — see
     /// [`DriverHazards::scanned`] for what it did.
     pub call_sites: Vec<CodeLocation>,
+    /// How many call sites the scan found, exact however many are listed above. The count is the
+    /// fact and the list is bounded, the same split `modules` makes between `matched` and rows.
+    pub call_site_count: usize,
 }
 
 /// One privileged instruction, and what it reaches.
@@ -2424,8 +2428,10 @@ pub struct DriverHazards {
     pub sink_list_version: String,
     /// The sensitive imports the driver holds, in slot order.
     pub sinks: Vec<ImportedSink>,
-    /// The privileged instructions found, in address order.
+    /// The privileged instructions found, in address order, and bounded like the call sites above.
     pub privileged: Vec<PrivilegedInstruction>,
+    /// How many were found, exact however many are listed.
+    pub privileged_count: usize,
     /// What was decoded, one entry per **contiguous** run. A section with a hole in it appears
     /// twice, which is what lets a reader see where the hole was.
     pub scanned: Vec<ScannedRange>,
