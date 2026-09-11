@@ -2276,8 +2276,22 @@ pub struct RecipeSegment {
     pub start: CodeLocation,
     /// Where this segment routes to — the call or jump site to the next hop, or the target.
     pub goal: CodeLocation,
-    /// The branches to satisfy, in path order. Empty means straight-line, not unknown.
+    /// The branches to satisfy, in path order. Empty means straight-line — **unless
+    /// [`Self::gates_unknown`] is set**, which is the case where it means nothing at all.
     pub steps: Vec<BranchStep>,
+    /// True when this segment's branches could not be recovered, so [`Self::steps`] is an unknown
+    /// list rather than a short one.
+    ///
+    /// Two things produce it and neither is a halt: a re-disassembly of this function that failed
+    /// for an ordinary reason, and a route through it the search could not reconstruct. The
+    /// segment is still reported, because control does pass through this function on the way to
+    /// the target — what is missing is the conditions, and satisfying every condition the recipe
+    /// *does* list will not be enough. A caller generating input from a recipe must treat this as
+    /// disqualifying for that segment rather than as an absence of gates.
+    ///
+    /// Absent from the JSON when false, which is every segment of an ordinary recipe.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gates_unknown: bool,
 }
 
 /// What a reachability walk found, as values.
