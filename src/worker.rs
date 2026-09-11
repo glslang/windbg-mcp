@@ -6329,6 +6329,37 @@ fn resolve(e: &DebugEngine, expr: &str) -> Option<u64> {
         .or_else(|| parse_u64(expr).ok())
 }
 
+/// [`resolve`], bounded by what is left of a caller's clock.
+///
+/// **`?` is where a symbol gets fetched**, and a cold symbol server is minutes with the session's
+/// one thread inside the engine. A caller that has promised a deadline cannot keep it around an
+/// unbounded call, and a poll after the call is a poll that runs when the damage is done — the
+/// same argument that bounded the walk's `uf`, one call earlier in the same job.
+///
+/// A run that was **cut short parses nothing**: the output up to a Ctrl+Break is a prefix, and a
+/// prefix of an evaluator's answer is a number that is not the one asked for. The local fallbacks
+/// below it still apply, since they read the caller's own text and need no engine at all.
+fn resolve_within(e: &DebugEngine, expr: &str, budget: u32) -> Option<u64> {
+    e.execute_command_bounded(&format!("? {expr}"), budget)
+        .ok()
+        .and_then(evaluated)
+        .as_deref()
+        .and_then(parse_eval)
+        .or_else(|| parse_windbg_addr(expr))
+        .or_else(|| parse_u64(expr).ok())
+}
+
+/// The output of an evaluation that **finished**, or nothing.
+///
+/// A named function rather than a `filter` at the call site, because what it refuses is a value
+/// rather than an error: the text a Ctrl+Break leaves behind is a *prefix* of the evaluator's
+/// answer, and a prefix of a number parses perfectly well into a different number. That is a wrong
+/// address to walk from, reported as an address the caller asked for, and nothing downstream can
+/// tell. Discarding it costs the local fallbacks nothing — they read the caller's own text.
+fn evaluated(run: CommandRun) -> Option<String> {
+    run.cut_short.is_none().then_some(run.output)
+}
+
 fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, Failed> {
     let target = address
         .strip_prefix("0x")
@@ -6385,6 +6416,26 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
             output: res.output,
         },
     ))
+}
+
+/// What is left of the walk's clock, or the failure to report when nothing is.
+///
+/// The preliminaries — resolving `address`, resolving `from`, reading a module's base — run
+/// *before* the walk, so a deadline consulted only inside the walk is one the caller can outlive
+/// while the worker is still in the engine. `what` names the step that was about to run, because
+/// "ran out of time" before anything was read and after half a graph was explored send a caller to
+/// different places.
+fn remaining(deadline: Instant, what: &str) -> Result<u32, Failed> {
+    walk_budget_ms(deadline, Instant::now()).ok_or_else(|| {
+        Failed::categorised(
+            structured::ErrorCategory::Timeout,
+            format!(
+                "this reachability walk ran out of time before {what}. Nothing was explored. \
+                 Raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue it \
+                 when the session is idle."
+            ),
+        )
+    })
 }
 
 /// Why a bounded command stopped, as the walk reports it.
@@ -6469,7 +6520,12 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         (Some(a), None, None) => {
             // `Debugger`, not `InvalidArgument`: this reached the debugger's expression evaluator
             // and it could not answer, which is that category's own example.
-            resolve(e, a).ok_or_else(|| {
+            resolve_within(
+                e,
+                a,
+                remaining(deadline, "the target address was resolved")?,
+            )
+            .ok_or_else(|| {
                 Failed::categorised(
                     structured::ErrorCategory::Debugger,
                     format!("could not resolve target address `{a}`"),
@@ -6477,15 +6533,20 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
             })?
         }
         (None, Some(m), Some(r)) => {
-            let rva = resolve(e, r).ok_or_else(|| {
-                Failed::categorised(
-                    structured::ErrorCategory::Debugger,
-                    format!("could not resolve rva `{r}`"),
-                )
-            })?;
+            let rva = resolve_within(e, r, remaining(deadline, "the rva was resolved")?)
+                .ok_or_else(|| {
+                    Failed::categorised(
+                        structured::ErrorCategory::Debugger,
+                        format!("could not resolve rva `{r}`"),
+                    )
+                })?;
             let lm = e
-                .execute_command(&format!("lm m {m}"))
-                .map_err(|why| Failed::from(es(why)))?;
+                .execute_command_bounded(
+                    &format!("lm m {m}"),
+                    remaining(deadline, "the module's base was read")?,
+                )
+                .map_err(|why| Failed::from(es(why)))?
+                .output;
             let base = parse_lm_base(&lm).ok_or_else(|| {
                 Failed::categorised(
                     structured::ErrorCategory::Debugger,
@@ -6510,7 +6571,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
     // Resolve `from` to a numeric VA so a mid-function start (a handler scoped past a switch)
     // is honored; `None` (unresolvable) starts at the entry.
-    let seed_start = resolve(e, &args.from);
+    let seed_start = resolve_within(e, &args.from, remaining(deadline, "`from` was resolved")?);
 
     // A real `uf` lists backtick addresses or at least a "module!Func:" label; error text
     // ("Couldn't resolve...", "no code") lacks both and prunes the branch. Held in a `&mut`
@@ -6758,6 +6819,94 @@ mod tests {
             walk_budget_ms(now + Duration::from_secs(30), now),
             Some(30_000)
         );
+    }
+
+    /// The reachability op reaches **no** unbounded command, including through a helper.
+    ///
+    /// `every_unbounded_execute_in_this_worker_is_accounted_for` cannot see this: it counts
+    /// `Execute` call sites by the function they are written in, so an unbounded command inside
+    /// `resolve` is charged to `resolve` however many ops call it. Backing one of this op's
+    /// preliminaries out to the unbounded helper therefore leaves that test green — measured, not
+    /// assumed — which makes the op's own claim to be time-bounded unenforced at exactly the seam
+    /// a review found it broken on.
+    ///
+    /// Narrow on purpose. `resolve` is still the right call for `run_to_address` and
+    /// `disassemble`, whose ops carry no deadline to spend (`FOLLOWUPS.md` item 56); what is
+    /// asserted here is that the op which *does* carry one spends it.
+    #[test]
+    fn the_reachability_op_resolves_nothing_unbounded() {
+        let code = include_str!("worker.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this module has a test half")
+            .0;
+        let body = code
+            .split_once("\nfn reachable(")
+            .expect("this module has a `reachable`")
+            .1;
+        let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
+        // `resolve_within(e,` does not contain this, which is the whole point of the two names.
+        assert!(
+            !body.contains("resolve(e,"),
+            "`reachable` carries a deadline and must spend it on every command it causes, \
+             including the ones inside a helper: `resolve` runs an unbounded `? <expr>`, and a \
+             symbol fetch there blocks the session's one thread with no poll able to run. Use \
+             `resolve_within` with what `remaining` reports."
+        );
+    }
+
+    /// The preliminaries carry the deadline too, and a run they cut short yields no value.
+    ///
+    /// Resolving `address`, resolving `from` and reading a module's base all run **before** the
+    /// walk, so a deadline first consulted inside the walk is one a caller can outlive while the
+    /// worker sits in the engine — which is the failure the job-level deadline exists to prevent,
+    /// reached through the calls that come before it. And a `?` the watchdog broke leaves a
+    /// *prefix* of the evaluator's answer, which parses into a different number: a wrong address
+    /// to walk from, reported as the one that was asked for.
+    #[test]
+    fn a_preliminary_that_ran_out_of_time_yields_an_error_rather_than_a_number() {
+        let now = Instant::now();
+        let out = remaining(
+            now - Duration::from_secs(1),
+            "the target address was resolved",
+        )
+        .expect_err("a deadline already past leaves nothing to spend");
+        assert_eq!(
+            out.category,
+            Some(structured::ErrorCategory::Timeout),
+            "{out:?}"
+        );
+        assert!(
+            out.message.contains("the target address was resolved"),
+            "the step it was about to take is what separates this from a walk that half ran: {}",
+            out.message
+        );
+        assert!(
+            remaining(now + Duration::from_secs(30), "anything").is_ok(),
+            "a live deadline is a budget"
+        );
+
+        // And the value half: a finished run is read, a broken one is not.
+        let finished = CommandRun {
+            output: "Evaluate expression: 4096 = 00000000`00001000".to_string(),
+            cut_short: None,
+            target_gone: false,
+        };
+        assert!(evaluated(finished).is_some());
+        for why in [
+            Interruption::OnRequest,
+            Interruption::Deadline { after_ms: 10 },
+        ] {
+            let broken = CommandRun {
+                output: "Evaluate expression: 40".to_string(),
+                cut_short: Some(why),
+                target_gone: false,
+            };
+            assert_eq!(
+                evaluated(broken),
+                None,
+                "{why:?}: a prefix of an answer is not a shorter answer"
+            );
+        }
     }
 
     /// The attributor asks the engine **once per module**, whatever order the addresses arrive in.
@@ -7169,12 +7318,16 @@ mod tests {
     ///   deferral rather than a reason. It is a shared helper with three callers on three
     ///   different clocks (`disassemble`, `run_to_address`, `reachable`), two of which have no
     ///   patience to thread through it at all. `FOLLOWUPS.md` item 56.
-    /// - **`reachable`** — `lm m <module>`, once, to rebase a `module`+`rva` target. A fixed
-    ///   command over the module table, run before the walk starts. Its `uf` sibling used to be
-    ///   here too, on the argument that no individual `uf` is the problem: that was wrong in the
-    ///   way a per-call bound exists to catch, since a `uf` blocked on a deferred symbol load
-    ///   blocks the one thread this session has, and no poll between calls can run while it does.
-    ///   It is `execute_command_bounded` on the remainder of the caller's clock now.
+    ///
+    /// **`reachable` is no longer here, and it held two entries on the way out.** Both left for
+    /// the same reason, a round apart. Its `uf` was defended as "no individual `uf` is the
+    /// problem, the aggregate is", which is wrong in exactly the way a per-call bound exists to
+    /// catch: one blocked on a deferred symbol load blocks the single thread this session has, and
+    /// no poll between calls can run while it does. Its `lm m <module>` was defended as a fixed
+    /// command over the module table — true, and it still runs *before* the walk, which is where a
+    /// job-level deadline has not been consulted yet, so a caller could outlive the whole thing
+    /// before the first poll. Both take `execute_command_bounded` on the remainder of the clock
+    /// now, as does the `? <expr>` this op resolves its arguments with ([`resolve_within`]).
     ///
     /// Read from the source for `record::tests::this_module_never_writes_to_stdout`'s reason: the
     /// property is about what is *written*, and no runtime test can prove the absence of a call
@@ -7241,7 +7394,6 @@ mod tests {
                 ("execute", 7),
                 ("kernel_report", 2),
                 ("pump_a_resume", 1),
-                ("reachable", 1),
                 ("resolve", 1),
             ],
             "an `Execute` with no watchdog is in a place this rule has not accounted for. Every              command a tool's op runs is bounded on the caller's clock (DECISIONS.md, 2026-08-02,              revised 2026-08-31); the sites above are the enumerated exceptions and the doc              comment says why each is one. Bound it, or add it here with its reason — including              when the count of an already-listed function goes up, which is a new unbounded              command inside a function that has some for other reasons."

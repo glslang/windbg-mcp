@@ -763,19 +763,26 @@ its op is its own; this one is not, for the reason below.
   `EngineOp::Disassemble` carries no `patience_ms` at all and would have to grow one — the first
   typed op to carry a deadline for a command *inside* it, which `SetBreakpoint` has now made a
   shape rather than a novelty. So the fix is three decisions, not one.
-- **The `reachable` third of this is unblocked**, and the paragraph above used to say two wrong
-  things about it. `reachable` does **not** call `resolve` up to `max_functions` times: it calls it
-  at most **twice**, once for the target coordinate (`address`, or the `rva` half of
-  `module`+`rva` — the two forms are mutually exclusive) and once for `from`, both before the walk
-  starts. The `max_functions` figure belongs to the `uf`, which is a different command. And "a per-call bound
-  is the wrong instrument for the same reason item 13 gives" was wrong outright, as
-  [#296](https://github.com/glslang/windbg-mcp/pull/296) measured: a `uf` blocked on a deferred
-  symbol load blocks the one thread the session has, so no poll between calls can run, and the
-  job-level deadline held only once each command carried it too. That `uf` is
-  `execute_command_bounded` on the remainder of the caller's clock now, and the same deadline is in
-  scope for those two `resolve` calls whenever somebody threads a budget through the helper.
-- **What would close it:** a `patience_ms` on `EngineOp::Disassemble`, and `resolve` taking a
-  budget and running `execute_command_bounded`. Done together, `resolve` leaves the allowlist in
+- **The `reachable` third is done** ([#299](https://github.com/glslang/windbg-mcp/pull/299)), and
+  the paragraph above used to say two wrong things about it. `reachable` does **not** call
+  `resolve` up to `max_functions` times: at most **twice**, once for the target coordinate
+  (`address`, or the `rva` half of `module`+`rva` — the two forms are mutually exclusive) and once
+  for `from`, both before the walk starts. The `max_functions` figure belongs to the `uf`, which is
+  a different command. And "a per-call bound is the wrong instrument for the same reason item 13
+  gives" was wrong outright, as [#296](https://github.com/glslang/windbg-mcp/pull/296) measured: a
+  `uf` blocked on a deferred symbol load blocks the one thread the session has, so no poll between
+  calls can run. That op now spends its deadline on every command it causes — the `uf`, the
+  `lm m <module>` that rebases a `module`+`rva` target, and the `? <expr>` behind both address
+  arguments, through a `resolve_within` that takes a budget.
+- **And the allowlist could not have caught that**, which is worth knowing before trusting it for
+  the other two thirds. It counts `Execute` call sites by the function they are *written* in, so
+  an unbounded command inside `resolve` is charged to `resolve` however many ops reach it: backing
+  one of `reachable`'s preliminaries out to the unbounded helper leaves that test green. Measured,
+  not assumed. `worker::tests::the_reachability_op_resolves_nothing_unbounded` asserts the one op
+  that carries a deadline reaches no unbounded helper; the general version of that check does not
+  exist.
+- **What would close it:** a `patience_ms` on `EngineOp::Disassemble`, and `run_to_address` passing
+  down the `timeout_ms` it already has. Done together, `resolve` leaves the allowlist in
   `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for`, which is where
   the deferral is recorded in code.
 - **Note the hazard is not fully closable by a watchdog anyway.** `backtrace` resolves a symbol per
