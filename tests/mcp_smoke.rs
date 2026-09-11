@@ -7955,6 +7955,21 @@ fn a_reachability_answer_carries_coordinates_and_its_own_rendering() {
     let open = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&open, "tools/call open_dump");
 
+    // First, a refusal the worker raises: two target forms at once. It needs a session and no
+    // symbols, so it runs here whatever this host resolves -- and the category is the point. Every
+    // failure out of this walk used to arrive as `debugger`, which sends a caller to look at the
+    // target over an argument of their own they can simply fix.
+    let both = server.call_tool(
+        "reachable_from_dispatch",
+        json!({ "from": "nt!KeBugCheckEx", "address": "0x1000", "module": "nt", "rva": "0x10" }),
+        TARGET_STEP,
+    );
+    assert!(is_tool_error(&both), "{both}");
+    assert_eq!(
+        both["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "a caller's own two-forms-at-once is theirs to fix, not the debugger's: {both}"
+    );
+
     let response = server.call_tool(
         "reachable_from_dispatch",
         json!({ "from": "nt!KeBugCheckEx", "address": "nt!KeBugCheckEx" }),
@@ -7962,7 +7977,11 @@ fn a_reachability_answer_carries_coordinates_and_its_own_rendering() {
     );
     assert_no_error(&response, "tools/call reachable_from_dispatch");
     let result = &response["result"];
-    if is_tool_error(result) {
+    // `is_tool_error` takes the whole **response** -- it reads `result.isError` itself. Passing
+    // the result here reads `result.result.isError`, which is always null, so this branch never
+    // fired and the stand-down below was unreachable: on a host with no symbols this test failed
+    // instead of skipping. Caught by the assertion above it, which had the same mistake.
+    if is_tool_error(&response) {
         let text = text_of(result);
         // The one environmental failure: no PDB for `nt`, so there is no symbol to walk from.
         // Every other error is this server's and fails the tier.
