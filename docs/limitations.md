@@ -46,6 +46,17 @@
   fully explored, and names the remedy. Such an instruction is a **barrier** and is never stepped
   over — skipping it would join the instruction before it to whatever follows and invent an edge,
   which is the one thing a sound `REACHABLE` verdict must never rest on.
+- `driver_hazards` is **evidence, not a verdict**, and each of its three limits is a way to reach a
+  wrong conclusion from a right answer. An **import is not a call**: the tool reports the call sites
+  it found in the code it scanned, and a call through a pointer stored earlier leaves none. An
+  **absent import excludes nothing**, because a driver can resolve an export at run time through
+  `MmGetSystemRoutineAddress` and leave no import-table entry at all. And a **call site is not a
+  reachable one** -- whether the dispatch routine gets there is a separate question, with its own
+  tool. There is no decompiler here, so "this driver copies a user buffer without probing it" is not
+  a question it answers; what it answers is that the driver imports both, and where each is called.
+  What counts as sensitive is a curated judgement rather than a fact about Windows, which is why the
+  result carries the version of the list it was scanned with. It is x86/x64 only and refuses
+  anything else by name, for the reason the reachability walk does.
 - On a **dump**, whether a driver's code reads at all depends on whether the engine can obtain its
   image, and the dump's type does not predict it — probe rather than assume. Measured on the
   x64 kernel minidump under `docs/samples/`, with no executable image path set: every code RVA

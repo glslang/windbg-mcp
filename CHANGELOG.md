@@ -9,6 +9,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`driver_hazards` — what a driver's image says it can do.** The sensitive APIs it imports with
+  the call sites that reach them, and the privileged instructions in its code (`rdmsr`, `out`,
+  `mov cr3`). Imports are named from the driver's own import table, so a stripped third-party
+  binary answers as well as one with symbols, and a call site is matched by the **slot** it goes
+  through rather than by a name.
+
+  Evidence rather than a verdict, and the result says so: an import is not a call, an absent import
+  excludes nothing since a driver can resolve an export at run time, and a call site is not a
+  reachable one. What counts as sensitive is a curated judgement, so the result carries the version
+  of the list it was scanned with.
+
 - **`reachable_from_dispatch` answers with values as well as prose**, with a matching
   `outputSchema` — the text is unchanged and both halves are built from the same walk, so they
   cannot disagree. The verdict, the call path as `{site, kind, callee}` hops, and the branch recipe
