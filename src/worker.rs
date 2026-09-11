@@ -6542,6 +6542,10 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // Resolve the target VA: an absolute address, or module+RVA rebased against the module's
     // live base from `lm m <module>`. Both sides go through `resolve`, so a value pasted from
     // WinDbg — a `hi`lo` backtick address or a digit-only 32-bit address — reads consistently.
+    // The shapes below are settled by the supervisor before this op is queued, which is what
+    // keeps a malformed pair from arriving here as an architecture refusal. They are matched again
+    // rather than assumed: this is the one place the target VA is computed, and a match that
+    // cannot fail is a match whose arms nobody has to reason about.
     let target = match (&args.address, &args.module, &args.rva) {
         // Reject conflicting target forms rather than silently ignoring one — analysing the
         // wrong target would give a misleading verdict.
