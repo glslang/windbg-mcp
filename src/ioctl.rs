@@ -16,9 +16,11 @@
 //!   would report the neighbouring codes wrongly rather than not at all.
 //! - **A jump table.** A dense run of codes becomes a bounds check, an indexed load and an
 //!   indirect jump, and the table is in the image. It is followed **only** when the base, the
-//!   scale and a bounded entry count were all recovered; anything else is recorded as an
-//!   unresolved transfer, because a table read at a guessed address is a list of plausible
-//!   addresses rather than an answer.
+//!   scale and a bounded entry count were all recovered, and only when the index is the code
+//!   itself rather than the code **shifted**; anything else is recorded as an unresolved
+//!   transfer, because a table read at a guessed address is a list of plausible addresses rather
+//!   than an answer, and a shifted index is several codes reaching one slot with nothing here
+//!   saying which of them the driver takes.
 //!
 //! # What decides the control code
 //!
@@ -239,6 +241,9 @@ pub(crate) struct Layout {
     /// Where a dispatch routine's return value goes, which is what makes a status a **refusal**
     /// rather than a constant somebody loaded.
     return_register: &'static str,
+    /// How wide a pointer is on this target, which is what a load of the IRP's stack location has
+    /// to be to have loaded one.
+    pointer: u32,
     /// The register a dispatch routine's `Irp` argument arrives in, when the calling convention
     /// puts it in one.
     ///
@@ -255,6 +260,7 @@ impl Layout {
         input_length: 0x10,
         output_length: 0x08,
         return_register: "rax",
+        pointer: 8,
         irp_register: Some("rdx"),
     };
     pub(crate) const X86: Self = Self {
@@ -263,6 +269,7 @@ impl Layout {
         input_length: 0x08,
         output_length: 0x04,
         return_register: "eax",
+        pointer: 4,
         irp_register: None,
     };
 }
@@ -818,7 +825,8 @@ struct Compared {
 struct Bound {
     /// The register checked, by its full-width name.
     register: String,
-    /// What it held: `(code - offset) >> shift`.
+    /// What it held: `(code - offset) >> shift`. A non-zero shift is what [`follow_table`]
+    /// refuses on: the bits it discarded are what would say which code reached a slot.
     offset: i64,
     shift: u32,
     /// The largest index the check admits.
@@ -1048,9 +1056,16 @@ fn source_value(
             let held = base.as_ref().and_then(|base| facts.registers.get(base));
             // **A partial read of a `ULONG` is not the field.** Reported as one it invents the
             // bits nobody read -- a device type out of two bytes of a control code.
-            let dword = memory.size == Some(4);
+            let dword = memory.size == Some(FIELD_WIDTH);
             match (held, memory.displacement) {
-                (Some(Value::Irp), d) if d == layout.current_stack_location => {
+                // And a **pointer** has a width of its own: `movzx eax,byte ptr [rdx+0b8h]` reads
+                // one byte of the stack location's address, so whatever is in `eax` afterwards is
+                // not that pointer -- and a `+0x18` off it would be reported as a control code
+                // traced from the IRP.
+                (Some(Value::Irp), d)
+                    if d == layout.current_stack_location
+                        && memory.size == Some(layout.pointer) =>
+                {
                     Some(Value::StackLocation)
                 }
                 (Some(Value::StackLocation), d) if d == layout.control_code && dword => {
@@ -1245,6 +1260,16 @@ fn follow_table(
     if index != bound.register {
         return None;
     }
+    // **A shifted index does not say which code reached a slot.** `shr eax,2` throws away two
+    // bits, so slot zero is reached by four codes and not one -- and whether the driver accepts
+    // all four turns on a check this walk does not follow (`test al,3` / `jne default`). Naming
+    // one of them reports three codes as absent that may be accepted, and naming all four reports
+    // three as accepted that may be refused. Neither is worth saying, so the jump goes back
+    // unresolved and the map says a switch here was not followed. Lifting this means proving the
+    // discarded bits, not picking one of the two wrong answers.
+    if bound.shift != 0 {
+        return None;
+    }
     let entries = usize::try_from(bound.limit.checked_add(1)?).ok()?;
     if entries == 0 || entries > MAX_TABLE_ENTRIES {
         return None;
@@ -1338,7 +1363,7 @@ fn follow_table(
         if !in_image(target) {
             return None;
         }
-        let code = ((position as u64) << bound.shift).wrapping_add(bound.offset as u64);
+        let code = (position as u64).wrapping_add(bound.offset as u64);
         found.push((code, target));
     }
     Some(Resolved {
@@ -1510,11 +1535,16 @@ fn sizes_in(
                 }
                 // Or a register the walk watched it loaded into: `mov ecx,[sp+10h]` /
                 // `cmp ecx,20h` is the same check with the field in hand, and it is what a
-                // compiler emits when the length is tested more than once.
-                Some(Operand::Register(register)) => match facts.registers.get(&register.full) {
-                    Some(value @ (Value::InputLength | Value::OutputLength)) => Some(*value),
-                    _ => None,
-                },
+                // compiler emits when the length is tested more than once. At the field's own
+                // width, for the reason a control code is: `cmp cx,20h` accepts every length whose
+                // low sixteen bits are 32, and publishing that as an exact size of 32 is a
+                // requirement the driver does not have.
+                Some(Operand::Register(register)) if register.width >= FIELD_WIDTH => {
+                    match facts.registers.get(&register.full) {
+                        Some(value @ (Value::InputLength | Value::OutputLength)) => Some(*value),
+                        _ => None,
+                    }
+                }
                 _ => None,
             };
             if let Some(length) = length
@@ -1939,6 +1969,14 @@ mod tests {
         sized(base, displacement, Some(4))
     }
 
+    /// `[base+displacement]` read at a **pointer's** width, which is what a load of the IRP's
+    /// stack location is: `mov rax,[rdx+0b8h]` moves eight bytes on this target. Spelled apart
+    /// from `mem` because the two widths are the distinction several tests here are about, and a
+    /// fixture that gave every load four bytes would make the pointer check unreachable.
+    fn pointer(base: &str, displacement: i64) -> Operand {
+        sized(base, displacement, Some(8))
+    }
+
     /// The same at a width a caller picks, for the tests about what a partial read is worth.
     fn sized(base: &str, displacement: i64, size: Option<u32>) -> Operand {
         Operand::Memory(MemoryOperand {
@@ -1990,7 +2028,7 @@ mod tests {
             insn(
                 at,
                 "mov",
-                vec![reg("rax"), mem("rdx", 0xb8)],
+                vec![reg("rax"), pointer("rdx", 0xb8)],
                 Flow::Fallthrough,
             ),
             insn(
@@ -2219,65 +2257,84 @@ mod tests {
         );
     }
 
-    /// A bounded jump table becomes one case per entry, read out of the image.
+    /// A bounded jump table becomes one case per entry, read out of the image -- and a **shifted**
+    /// index is refused rather than guessed at.
+    ///
+    /// `shr eax,2` throws two bits away, so each slot of the table after it is reached by four
+    /// codes rather than one, and which of them the driver accepts turns on a check this walk does
+    /// not follow (`test al,3` / `jne default`). Naming one code per slot reports three as absent
+    /// that may be accepted; naming all four reports three as accepted that may be refused. So the
+    /// jump goes back unresolved, and the map says a switch here was not followed. The two halves
+    /// of the fixture differ only by that one instruction, which is what makes this about the
+    /// shift -- and the refusal happens before the table is read, which the reader's count is what
+    /// says.
     #[test]
     fn a_bounded_jump_table_becomes_a_case_per_entry() {
         const IMAGE: u64 = 0xfffff803_3e250000;
         const TABLE: i64 = 0x9000;
-        let mut block = prologue(DISPATCH);
-        block.extend([
-            insn(
-                DISPATCH + 8,
-                "mov",
-                vec![reg("eax"), reg("r13d")],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0xb,
-                "sub",
-                vec![reg("eax"), imm(0x6dc004)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x11,
-                "shr",
-                vec![reg("eax"), imm(2)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x14,
-                "cmp",
-                vec![reg("eax"), imm(2)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x17,
-                "ja",
-                Vec::new(),
-                Flow::Branch(Some(0xfa11)),
-            ),
-            insn(
-                DISPATCH + 0x1d,
-                "lea",
-                vec![reg("rcx"), at_address(IMAGE)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x24,
-                "mov",
-                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x2b,
-                "add",
-                vec![reg("rax"), reg("rcx")],
-                Flow::Fallthrough,
-            ),
-            insn(DISPATCH + 0x2e, "jmp", vec![reg("rax")], Flow::Jmp(None)),
-        ]);
+        let block = |shifted: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if shifted {
+                block.push(insn(
+                    DISPATCH + 0x11,
+                    "shr",
+                    vec![reg("eax"), imm(2)],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0x14,
+                    "cmp",
+                    vec![reg("eax"), imm(2)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x17,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1d,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x24,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x2b,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x2e, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            ]);
+            block
+        };
         let table_at = IMAGE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
         let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
             (at == table_at && len == 12).then(|| {
                 [0x1000u32, 0x1100, 0x1200]
                     .iter()
@@ -2286,7 +2343,7 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(DISPATCH, &block(false), Layout::X64, &read, in_image, never);
 
         assert_eq!(
             found
@@ -2296,10 +2353,10 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![
                 (0x6dc004, IMAGE + 0x1000, Recovery::JumpTable),
-                (0x6dc008, IMAGE + 0x1100, Recovery::JumpTable),
-                (0x6dc00c, IMAGE + 0x1200, Recovery::JumpTable),
+                (0x6dc005, IMAGE + 0x1100, Recovery::JumpTable),
+                (0x6dc006, IMAGE + 0x1200, Recovery::JumpTable),
             ],
-            "the shift is the stride between codes: {:?}",
+            "one code per slot, counting from what was subtracted: {:?}",
             found.cases
         );
         assert_eq!(
@@ -2312,6 +2369,18 @@ mod tests {
             }]
         );
         assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+
+        served.set(0);
+        let shifted = map(DISPATCH, &block(true), Layout::X64, &read, in_image, never);
+
+        assert!(
+            shifted.cases.is_empty(),
+            "four codes reach each slot and this walk cannot say which: {:?}",
+            shifted.cases
+        );
+        assert!(shifted.tables.is_empty(), "{:?}", shifted.tables);
+        assert_eq!(shifted.unresolved, vec![DISPATCH + 0x2e]);
+        assert_eq!(served.get(), 0, "the table was not read at all");
     }
 
     /// MSVC's dense switch has **two** tables, and reading it as one is how a map invents codes.
@@ -2895,7 +2964,7 @@ mod tests {
                 insn(
                     DISPATCH,
                     "mov",
-                    vec![reg("rax"), mem("rdx", 0xb8)],
+                    vec![reg("rax"), pointer("rdx", 0xb8)],
                     Flow::Fallthrough,
                 ),
                 insn(
@@ -2953,6 +3022,81 @@ mod tests {
             whole.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
             vec![0x2003],
             "and four bytes are: {:?}",
+            whole.cases
+        );
+        assert!(whole.code_proved);
+    }
+
+    /// A **partial** read of the IRP's stack location does not carry it.
+    ///
+    /// `movzx eax,byte ptr [rdx+0b8h]` reads one byte of a pointer, so what is in `eax` afterwards
+    /// is not the stack location -- and a `+0x18` off it is not the control code reached through
+    /// it. The case is still recovered, from the bare displacement the module doc describes, and
+    /// that is the whole difference: it says `proved: false`, which is where the doubt is carried.
+    /// Believed as a traced chain instead, a code nobody proved is published as one that was.
+    #[test]
+    fn a_partial_read_of_the_stack_location_is_not_the_stack_location() {
+        let block = |width: u32| {
+            vec![
+                insn(
+                    DISPATCH,
+                    "mov",
+                    vec![reg("rax"), sized("rdx", 0xb8, Some(width))],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 4,
+                    "mov",
+                    vec![reg("r13d"), mem("rax", 0x18)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            ]
+        };
+
+        let partial = map(
+            DISPATCH,
+            &block(1),
+            Layout::X64,
+            unreadable,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            partial
+                .cases
+                .iter()
+                .map(|case| (case.code, case.proved))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, false)],
+            "one byte of a pointer is not the pointer: {:?}",
+            partial.cases
+        );
+        assert!(!partial.code_proved);
+
+        let whole = map(
+            DISPATCH,
+            &block(8),
+            Layout::X64,
+            unreadable,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            whole
+                .cases
+                .iter()
+                .map(|case| (case.code, case.proved))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, true)],
+            "and the whole pointer is: {:?}",
             whole.cases
         );
         assert!(whole.code_proved);
@@ -3397,65 +3541,82 @@ mod tests {
         );
     }
 
-    /// A length check may be made against the field once it is **in a register**.
+    /// A length check may be made against the field once it is **in a register** -- at the
+    /// field's own width.
     ///
     /// `mov ecx,[sp+10h]` / `cmp ecx,20h` is the same check as comparing the field where it lives,
     /// and it is what a compiler emits when the length is tested more than once. Reading only the
     /// memory form drops it, and a case that does require an exact size then reports none.
+    ///
+    /// `cmp cx,20h` is not that check: it accepts every length whose low sixteen bits are 32 --
+    /// 0x10020 among them -- so publishing an exact size of 32 states a requirement the driver
+    /// does not have, and a caller sizing a buffer from it is refused by the driver it was
+    /// obeying. The two halves differ only in the spelling of the register, which is what makes
+    /// this about the width.
     #[test]
     fn a_length_check_may_be_made_against_the_loaded_field() {
-        let mut block = prologue(DISPATCH);
-        block.extend([
-            insn(
-                DISPATCH + 8,
-                "cmp",
-                vec![reg("r13d"), imm(0x222003)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0xe,
-                "je",
-                Vec::new(),
-                Flow::Branch(Some(DISPATCH + 0x40)),
-            ),
-            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
-            // The field into a register, then the compare against it.
-            insn(
-                DISPATCH + 0x40,
-                "mov",
-                vec![reg("ecx"), mem("rax", 0x10)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x43,
-                "cmp",
-                vec![reg("ecx"), imm(0x20)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x46,
-                "jne",
-                Vec::new(),
-                Flow::Branch(Some(DISPATCH + 0x60)),
-            ),
-            insn(
-                DISPATCH + 0x4c,
-                "call",
-                vec![Operand::Target(0x5000)],
-                Flow::Call(Some(0x5000)),
-            ),
-            insn(DISPATCH + 0x51, "ret", Vec::new(), Flow::Return),
-            // The refusal the check's other edge reaches.
-            insn(
-                DISPATCH + 0x60,
-                "mov",
-                vec![reg("eax"), imm(0xc000_0023)],
-                Flow::Fallthrough,
-            ),
-            insn(DISPATCH + 0x65, "ret", Vec::new(), Flow::Return),
-        ]);
+        let block = |compared: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+                // The field into a register, then the compare against it.
+                insn(
+                    DISPATCH + 0x40,
+                    "mov",
+                    vec![reg("ecx"), mem("rax", 0x10)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x43,
+                    "cmp",
+                    vec![reg(compared), imm(0x20)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x46,
+                    "jne",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x60)),
+                ),
+                insn(
+                    DISPATCH + 0x4c,
+                    "call",
+                    vec![Operand::Target(0x5000)],
+                    Flow::Call(Some(0x5000)),
+                ),
+                insn(DISPATCH + 0x51, "ret", Vec::new(), Flow::Return),
+                // The refusal the check's other edge reaches.
+                insn(
+                    DISPATCH + 0x60,
+                    "mov",
+                    vec![reg("eax"), imm(0xc000_0023)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x65, "ret", Vec::new(), Flow::Return),
+            ]);
+            block
+        };
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block("ecx"),
+            Layout::X64,
+            unreadable,
+            in_image,
+            never,
+        );
 
         assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
         assert_eq!(
@@ -3463,6 +3624,22 @@ mod tests {
             Some((0x20, true)),
             "{:?}",
             found.cases[0]
+        );
+
+        let narrow = map(
+            DISPATCH,
+            &block("cx"),
+            Layout::X64,
+            unreadable,
+            in_image,
+            never,
+        );
+
+        assert_eq!(narrow.cases.len(), 1, "{:?}", narrow.cases);
+        assert_eq!(
+            narrow.cases[0].in_size, None,
+            "two bytes of a ULONG are not the length: {:?}",
+            narrow.cases[0]
         );
     }
 
@@ -4399,7 +4576,7 @@ mod tests {
             insn(
                 DISPATCH + 0x10,
                 "mov",
-                vec![reg("rax"), mem("rdx", 0xb8)],
+                vec![reg("rax"), pointer("rdx", 0xb8)],
                 Flow::Fallthrough,
             ),
             insn(
