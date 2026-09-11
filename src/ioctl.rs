@@ -31,6 +31,17 @@
 //! says which of the two produced the answer. The distinction matters because `+0x18` off an
 //! arbitrary register is an extremely ordinary thing for code to do.
 //!
+//! # How this is derived, and what that costs
+//!
+//! A **linear pass** over the listing: register facts carried instruction to instruction, restored
+//! at a region boundary, with a window looked backwards from an indirect jump and forwards from a
+//! case's landing site. It answers `mountmgr` exactly as a hand decode did — and every guard below
+//! about a fact not carrying across a boundary is there because a review round found the pass
+//! carrying one. A block-structured walk answers those structurally rather than one guard at a
+//! time, which is
+//! [#306](https://github.com/glslang/windbg-mcp/issues/306); this module's entry point is what that
+//! would keep, and these tests are what would check it.
+//!
 //! # Engine-free
 //!
 //! Like [`crate::pe`], [`crate::hazards`] and [`crate::driver`], every entry point takes closures
