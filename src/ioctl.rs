@@ -648,11 +648,22 @@ pub(crate) fn map(
             case.handler = handler_in(window);
             // Rejected if the landing block fails, handled if it reaches a routine, and unknown
             // otherwise -- which is an ordinary outcome and is why this is not a `bool`.
-            case.accepted = match (failure_block(window), case.handler) {
-                (true, _) => Some(false),
-                (false, Some(_)) => Some(true),
-                (false, None) => None,
+            // **A call is not an acceptance**, which is the trap this three-way answer exists
+            // for: the ordinary rejection calls a completion routine too, and reading that as the
+            // handler publishes the completion routine as this code's. So `true` needs a routine
+            // reached *and* no error status anywhere in the block -- the absence of a visible
+            // rejection rather than proof of handling, which is what its documentation says.
+            case.accepted = match (failure_block(window), case.handler, error_status(window)) {
+                (true, _, _) => Some(false),
+                (false, Some(_), false) => Some(true),
+                _ => None,
             };
+            // And a rejection has no handler to report: what it reaches is the completion routine
+            // that refuses the request, and naming that as this code's handler is a name a reader
+            // would go and look up.
+            if case.accepted == Some(false) {
+                case.handler = None;
+            }
             let (input, output) = sizes_in(window, layout, &stack_registers, &fails);
             case.in_size = input;
             case.out_size = output;
@@ -1027,42 +1038,87 @@ fn follow_table(
     // So the chain is walked backwards from the jump's own register: `jmp rcx` <- `add rcx,rdx`
     // (an accumulation, so the chain continues through `rcx`) <- `mov ecx,[rdx+rax*4+5B80h]`,
     // which is the load. Anything else writing the register on the way ends it.
-    let mut wanted = match jump.operands.first() {
-        Some(Operand::Register(register)) => family(register)?,
-        // A `jmp qword ptr [...]` reads its destination from memory rather than from a register:
-        // an import thunk or a vtable call, not a compiler's switch.
+    // **The 32-bit form jumps through the table itself**: `jmp dword ptr [table+eax*4]`, with no
+    // register in between and the entry an absolute address rather than an offset from the image.
+    // Refusing every memory-operand jump left dense switches on exactly the targets `Layout::X86`
+    // exists to serve permanently unresolved.
+    let (dword_load, dword_memory) = match jump.operands.first() {
+        Some(Operand::Memory(memory)) if memory.scale == 4 && memory.index.is_some() => {
+            (jump, memory)
+        }
+        Some(Operand::Register(register)) => {
+            let mut wanted = family(register)?;
+            let mut found = None;
+            for instruction in window.iter().rev() {
+                // **Only an instruction that *defines* the register continues the chain.** A
+                // `cmp rcx,[base+rax*4+table]` has the register as its first operand and writes
+                // nothing but the flags, and reading that as the load turns an unrelated array
+                // into a table whenever its dwords resolve inside the image -- while also taking
+                // the real jump off the unresolved list, so nothing says the switch was missed.
+                if matches!(instruction.mnemonic.as_str(), "cmp" | "test" | "push") {
+                    continue;
+                }
+                let Some(written) = instruction.operands.first().and_then(register_of) else {
+                    continue;
+                };
+                if written != wanted {
+                    continue;
+                }
+                match instruction.operands.get(1) {
+                    // The indexed load this whole function is about, and only from an instruction
+                    // whose job is to load.
+                    Some(Operand::Memory(memory))
+                        if memory.scale == 4
+                            && memory.index.is_some()
+                            && matches!(
+                                instruction.mnemonic.as_str(),
+                                "mov" | "movzx" | "movsx" | "movsxd"
+                            ) =>
+                    {
+                        found = Some((instruction, memory));
+                        break;
+                    }
+                    // `add rcx,rdx` folds the image base into the entry: the value being followed
+                    // is still the one in `rcx`, so the chain continues through the same register.
+                    Some(Operand::Register(_)) if instruction.mnemonic == "add" => continue,
+                    // A copy: follow the register it came from.
+                    Some(Operand::Register(source)) if instruction.mnemonic == "mov" => {
+                        wanted = family(source)?;
+                    }
+                    // Anything else -- an immediate, a different memory shape, an instruction this
+                    // does not model -- ends the chain, and with it the claim that this is a table.
+                    _ => return None,
+                }
+            }
+            found?
+        }
         _ => return None,
     };
-    let mut dword = None;
-    for instruction in window.iter().rev() {
-        let Some(written) = instruction.operands.first().and_then(register_of) else {
-            continue;
-        };
-        if written != wanted {
-            continue;
-        }
-        match instruction.operands.get(1) {
-            // The indexed load this whole function is about.
-            Some(Operand::Memory(memory)) if memory.scale == 4 && memory.index.is_some() => {
-                dword = Some((instruction, memory));
-                break;
-            }
-            // `add rcx,rdx` folds the image base into the entry: the value being followed is
-            // still the one in `rcx`, so the chain continues through the same register.
-            Some(Operand::Register(_)) if instruction.mnemonic == "add" => continue,
-            // A copy: follow the register it came from.
-            Some(Operand::Register(source)) if instruction.mnemonic == "mov" => {
-                wanted = family(source)?;
-            }
-            // Anything else -- an immediate, a different memory shape, an instruction this does
-            // not model -- ends the chain, and with it the claim that this jump is a table.
-            _ => return None,
-        }
-    }
-    let (dword_load, dword_memory) = dword?;
     let table_index = dword_memory.index.as_deref().and_then(family)?;
-    let base = table_base(dword_memory, state)?;
-    let table = base.checked_add_signed(dword_memory.displacement)?;
+    // **What an entry means depends on which form this is.** A 64-bit switch holds offsets from
+    // the image base the compiler loaded into a register, which is why the same register appears
+    // in the load and in the `add` after it. A 32-bit one jumps straight through the table and its
+    // entries are whole addresses, so adding anything to them lands nowhere.
+    let absolute = dword_load.address == jump.address;
+    let (table, entry_base) = match absolute {
+        true => {
+            let start = match dword_memory.base.as_deref().and_then(family) {
+                Some(base) => match state.get(base).copied() {
+                    Some(Value::Address(address)) => address,
+                    _ => return None,
+                },
+                None => 0,
+            };
+            (start.checked_add_signed(dword_memory.displacement)?, None)
+        }
+        false => {
+            let base = table_base(dword_memory, state)?;
+            (
+                base.checked_add_signed(dword_memory.displacement)?,
+                Some(base),
+            )
+        }
+    };
 
     // **Which register the bounds check covered decides the shape, and getting this wrong is how a
     // table reads as eighty-one entries of whatever follows it.** MSVC's dense switch has *two*
@@ -1107,9 +1163,12 @@ fn follow_table(
             // the name is all that matches. The byte map above is one such writer; this rules out
             // the rest. Bounded by the compare's own address rather than by a count of
             // instructions, because the window is a slice and the check may be anywhere in it.
+            // The 32-bit form's "load" is the jump itself, which is past the window rather than
+            // in it: everything here precedes it either way.
             let position = window
                 .iter()
-                .position(|instruction| instruction.address == dword_load.address)?;
+                .position(|instruction| instruction.address == dword_load.address)
+                .unwrap_or(window.len());
             let overwritten = window[..position].iter().any(|instruction| {
                 instruction.address > bound.at
                     && instruction.operands.first().and_then(register_of) == Some(table_index)
@@ -1144,8 +1203,11 @@ fn follow_table(
 
     let mut found = Vec::new();
     for (index, case) in cases.iter().enumerate() {
-        let rva = rvas.get(*case)?;
-        let target = base.wrapping_add(u64::from(u32::from_le_bytes(*rva)));
+        let entry = u32::from_le_bytes(*rvas.get(*case)?);
+        let target = match entry_base {
+            Some(base) => base.wrapping_add(u64::from(entry)),
+            None => u64::from(entry),
+        };
         // **A slot that goes to the default is not a case.** A dense table covers every index
         // between its bounds, and a compiler fills the ones it has no case for with the same block
         // the bounds check jumps to -- so `mountmgr`'s two 81-entry tables hold 21 codes and 60
@@ -1195,39 +1257,64 @@ fn table_base(
     }
 }
 
-/// Whether a block is a **failure path**: it sets an NTSTATUS error and returns.
+/// Whether an NTSTATUS **error** value is set anywhere in a block before it leaves.
 ///
-/// This is the one piece of evidence that says which side of a branch the driver treats as
-/// success, and without it neither a case nor a size means what it reads like. `cmp code,N` /
+/// The severity field is the signal, not a list of codes: the top two bits set is the definition of
+/// an error status, so `STATUS_INVALID_DEVICE_REQUEST`, `STATUS_INVALID_PARAMETER` and
+/// `STATUS_BUFFER_TOO_SMALL` all answer without being named. Where it goes does not matter -- a
+/// register on the way to a `ret`, or a store into the IRP before a completion call -- because
+/// what is being asked is whether this block is refusing the request.
+fn error_status(window: &[Instruction]) -> bool {
+    for instruction in window {
+        if instruction.mnemonic == "mov"
+            && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
+            && let Ok(value) = u32::try_from(value)
+            && value >> 30 == 0b11
+        {
+            return true;
+        }
+        // A branch means the block has not finished deciding, and a return means it has.
+        if matches!(
+            instruction.flow,
+            Flow::Branch(_) | Flow::Jmp(_) | Flow::Return | Flow::Unreadable | Flow::Unknown
+        ) {
+            return false;
+        }
+    }
+    false
+}
+
+/// Whether a block is a **failure path**: it sets an NTSTATUS error and returns, with or without
+/// completing the IRP on the way out.
+///
+/// This is the one piece of evidence that says which side of a branch the driver treats as success,
+/// and without it neither a case nor a size means what it reads like. `cmp code,N` /
 /// `je invalid_request` and `cmp code,N` / `je handler` are the same instructions with opposite
 /// meanings; so are `cmp length,20h` / `jne fail` and `cmp length,20h` / `jne handler`.
 ///
-/// **An NTSTATUS with the error severity is the signal**, because that is what the failure path is
-/// for: `mov eax,0C000000Dh` (`STATUS_INVALID_PARAMETER`), `0C0000010h`
-/// (`STATUS_INVALID_DEVICE_REQUEST`), `0C0000023h` (`STATUS_BUFFER_TOO_SMALL`) — the top two bits
-/// set is the definition of the severity field, so this is a property of the value rather than a
-/// list of codes. The block has to *return* it too: a driver that loads a status and carries on is
-/// not failing there.
+/// **The call is part of the shape rather than the end of it.** The ordinary rejection stores the
+/// status into the IRP and calls a completion routine before returning, so a scan that stopped at
+/// the first call would see a block that calls something and report the completion routine as this
+/// code's handler.
 ///
-/// It says nothing when it says nothing. A failure path that jumps to a shared tail, or completes
-/// the IRP through a helper, answers `false` here, and every caller treats that as "could not
-/// tell" rather than as "this is the success path".
+/// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
+/// here, and every caller treats that as "could not tell" rather than as "this is the success
+/// path".
 fn failure_block(window: &[Instruction]) -> bool {
     let mut status = false;
     for instruction in window {
         if instruction.mnemonic == "mov"
             && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
             && let Ok(value) = u32::try_from(value)
-            // The severity field: `11` is an error. `STATUS_SUCCESS` and the informational and
-            // warning ranges are not failures, and neither is an ordinary small constant.
             && value >> 30 == 0b11
         {
             status = true;
         }
         match instruction.flow {
             Flow::Return => return status,
-            // A call or a branch before the return: whatever this block is doing, it is not the
-            // two-instruction failure tail this recognises.
+            // A completion call after the status is part of the rejection; one before it is a
+            // block doing something else.
+            Flow::Call(_) if status => {}
             Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return false,
             Flow::Unreadable | Flow::Unknown => return false,
             Flow::Fallthrough | Flow::Trap => {}
@@ -2278,6 +2365,212 @@ mod tests {
         assert!(found.tables.is_empty(), "{:?}", found.tables);
         assert_eq!(found.unresolved, vec![DISPATCH + 0x2d]);
         assert_eq!(served.get(), 0, "nothing was read");
+    }
+
+    /// A 32-bit switch jumps **through** its table, and its entries are whole addresses.
+    ///
+    /// `jmp dword ptr [eax*4+410000h]` has no register in between and no image base to add, so a
+    /// resolver that only knew the 64-bit form left every dense switch on exactly the targets
+    /// `Layout::X86` exists to serve unresolved, while reporting the compare chain around it as if
+    /// that were the whole answer.
+    #[test]
+    fn a_32_bit_switch_jumps_through_its_table() {
+        const TABLE: i64 = 0x0041_0000;
+        const CODE_BASE: u64 = 0x0040_0000;
+        let in_image32 = |address: u64| (CODE_BASE..CODE_BASE + 0x2_0000).contains(&address);
+        let block = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg("esi"), mem("ebp", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 3,
+                "mov",
+                vec![reg("edi"), mem("esi", 0x60)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 6,
+                "mov",
+                vec![reg("eax"), mem("edi", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 9,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xf,
+                "cmp",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x12,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "jmp",
+                vec![indexed(None, "eax", TABLE, None)],
+                Flow::Jmp(None),
+            ),
+        ];
+        let read = |at: u64, len: usize| {
+            (at == TABLE as u64 && len == 12).then(|| {
+                [
+                    (CODE_BASE + 0x1000) as u32,
+                    (CODE_BASE + 0x1100) as u32,
+                    (CODE_BASE + 0x1200) as u32,
+                ]
+                .iter()
+                .flat_map(|address| address.to_le_bytes())
+                .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::X86, read, in_image32, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x222000, CODE_BASE + 0x1000),
+                (0x222001, CODE_BASE + 0x1100),
+                (0x222002, CODE_BASE + 0x1200),
+            ],
+            "the entries are addresses, not offsets from anything: {:?}",
+            found.cases
+        );
+        assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+    }
+
+    /// An instruction that reads the jump's register is not the load that **defines** it.
+    ///
+    /// `cmp rcx,[rdx+rax*4+9000h]` has `rcx` as its first operand and writes nothing but the
+    /// flags. Treating it as the table load turns an unrelated array into a switch table whenever
+    /// its dwords resolve inside the image — and takes the real jump off the unresolved list, so
+    /// nothing says the switch was missed. The reader is counted, because what is asserted is that
+    /// nothing was read at an address arrived at this way.
+    ///
+    /// Two checks refuse this independently — the skip for instructions that write only flags, and
+    /// the load arm requiring an instruction whose job is to load — so this pins the property and
+    /// neither line. Removing both is what makes it fail.
+    #[test]
+    fn an_instruction_that_only_reads_the_register_is_not_the_load() {
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rdx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            // Reads `rcx` and the array; defines neither.
+            insn(
+                DISPATCH + 0x21,
+                "cmp",
+                vec![reg("rcx"), indexed(Some("rdx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x28, "jmp", vec![reg("rcx")], Flow::Jmp(None)),
+        ]);
+        let served = std::cell::Cell::new(0usize);
+        let read = |_: u64, len: usize| {
+            served.set(served.get() + 1);
+            Some(vec![0u8; len])
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x28]);
+        assert_eq!(served.get(), 0, "nothing was read");
+    }
+
+    /// A block that completes the IRP with an error status is a **rejection**, call and all.
+    ///
+    /// This is the ordinary shape of one: the status goes into the IRP, a completion routine is
+    /// called, and the routine returns. A scan that stopped at the first call would see a block
+    /// that calls something, report `accepted: true`, and publish the completion routine as this
+    /// code's handler — which is a reader sent to test a code the driver refuses and a name that
+    /// is not the handler's.
+    #[test]
+    fn a_block_that_completes_with_an_error_status_is_a_rejection() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            // `mov dword ptr [rbx+30h],0C0000010h` -- the status into the IRP.
+            insn(
+                DISPATCH + 0x40,
+                "mov",
+                vec![mem("rbx", 0x30), imm(0xc000_0010)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x47,
+                "call",
+                vec![Operand::Target(0x7000)],
+                Flow::Call(Some(0x7000)),
+            ),
+            insn(DISPATCH + 0x4c, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+        assert_eq!(found.cases[0].accepted, Some(false), "{:?}", found.cases[0]);
+        assert_eq!(
+            found.cases[0].handler, None,
+            "the completion routine is not this code's handler: {:?}",
+            found.cases[0]
+        );
     }
 
     /// An indirect jump with no bounds check is **recorded**, not dropped.
