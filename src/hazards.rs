@@ -509,8 +509,19 @@ pub fn scan(
                 budget = budget.saturating_sub(want);
                 continue;
             };
+            // **An empty answer is not an answer**, and neither is one that advances nothing.
+            // The decoder can succeed and return nothing — bytes that are there and decode to no
+            // instruction — and a zero-length instruction would loop for ever, so both end the
+            // section. What each has to do first is say what it is leaving: without that, a window
+            // that decoded to nothing ends a section silently and the rest of it is missing from
+            // both lists, which is the same silence an unreadable window used to keep.
             if block.is_empty() {
                 close(&mut run, &mut scanned);
+                unreadable.push(Scanned {
+                    section: section.name.clone(),
+                    start: at,
+                    bytes: end.saturating_sub(at),
+                });
                 break;
             }
             for instruction in &block {
@@ -547,6 +558,11 @@ pub fn scan(
             let consumed = next.saturating_sub(at);
             if consumed == 0 {
                 close(&mut run, &mut scanned);
+                unreadable.push(Scanned {
+                    section: section.name.clone(),
+                    start: at,
+                    bytes: end.saturating_sub(at),
+                });
                 break;
             }
             let taken = consumed.min(want);
@@ -1101,6 +1117,38 @@ mod tests {
             "the second starts after the three-byte instruction, not at a stride: {asked:x?}"
         );
         assert_eq!(found.scanned[0].bytes, 4, "{:?}", found.scanned);
+    }
+
+    /// A decode that answers **nothing** ends the section and says what it is leaving.
+    ///
+    /// The engine can succeed and return no instructions — bytes that are there and decode to
+    /// none — and a zero-length instruction would loop for ever, so both end the section. Ending
+    /// it silently was the defect: the rest of the section was missing from `scanned` and from
+    /// `unreadable` alike, so a report could say "Privileged instructions: none" with most of a
+    /// driver never looked at and nothing anywhere saying so.
+    #[test]
+    fn a_decode_that_answers_nothing_records_what_it_leaves() {
+        let image = image();
+
+        // An empty but successful decode.
+        let empty = scan(&image, &[], |_, _| Some(Vec::new()), never);
+        assert!(empty.scanned.is_empty(), "{:?}", empty.scanned);
+        assert_eq!(empty.unreadable.len(), 1, "{:?}", empty.unreadable);
+        assert_eq!(empty.unreadable[0].start, BASE + 0x1000);
+        assert_eq!(
+            empty.unreadable[0].bytes, 0x100,
+            "the whole section is left"
+        );
+
+        // And an instruction that advances nothing, which cannot be walked past.
+        let stuck = scan(
+            &image,
+            &[],
+            |at, _| Some(vec![insn(at, "", "nop", Flow::Fallthrough, Vec::new())]),
+            never,
+        );
+        assert_eq!(stuck.unreadable.len(), 1, "{:?}", stuck.unreadable);
+        assert_eq!(stuck.unreadable[0].bytes, 0x100);
     }
 
     /// A window that will not read is skipped, **and recorded**; the scan goes on.
