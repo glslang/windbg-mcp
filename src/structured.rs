@@ -2428,6 +2428,16 @@ pub struct IoctlCase {
     /// a traced one, and a flag on the routine would let the first borrow the second's
     /// credibility. [`IoctlMap::code_proved`] is every case together.
     pub proved: bool,
+    /// Whether the block this code reaches **handles** it, as far as the code says.
+    ///
+    /// A compare and a branch say where control goes when a code matches; they do not say the
+    /// driver accepts it. `cmp code,N` / `je invalid_request` is the same shape as `je handler`,
+    /// and a list reporting both as accepted sends a reader to test a code the driver refuses.
+    /// `false` for a block that sets an NTSTATUS error and returns, `true` for one that reaches a
+    /// routine, and **absent** where neither is visible, which is an ordinary outcome and the
+    /// reason this is not a boolean.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub accepted: Option<bool>,
     /// Where the code is recognised — the compare, or the indirect jump whose table holds it.
     pub at: CodeLocation,
     /// The length checks found in the case block, including the ones that are not sizes.

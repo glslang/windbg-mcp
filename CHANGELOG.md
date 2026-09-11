@@ -18,6 +18,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   43 case records and 179, three quarters of which would have been wrong. Every resolved entry has
   to be code inside the driver's own image, or the table is refused as not being one.
 
+  **An edge is not a verdict.** A compare and a branch say where control goes when a code matches, not that the driver accepts it, so each case carries what the landing block shows: an NTSTATUS error returned is a rejection, a routine reached is a handler, and neither is left open. An exact size needs the same evidence on the other edge.
+
   **Provenance belongs to the value, not to the routine.** Each case says whether the value it tested was traced from the IRP or read off a bare displacement, because a dispatch routine that compares some other structure's `+0x18` field before reading the real control code has one of each -- and the guessed case is the one a reader needs warning about. The offsets follow the target's bitness rather than being x64 constants.
 
   **What it could not follow is in the answer.** Every indirect transfer it did not resolve is listed, so a map that is a lower bound says so rather than reading as a complete set; a table is never read at a guessed length; and `code_proved` says whether the control code was traced from the IRP or taken from a bare `+0x18` displacement, which is what an empty case list turns on. Sizes are proven-exact or absent, with floors kept separately as evidence. The case fields are the shared IOCTL-case shape a Binary Ninja or Ghidra companion answers in, so the same driver recovered on either side is the same record. See [`docs/structured-results.md`](docs/structured-results.md) and [`docs/limitations.md`](docs/limitations.md).

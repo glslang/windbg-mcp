@@ -258,8 +258,8 @@
       "inputSchema": 563,
       "modelVisible": 1296,
       "name": "ioctl_map",
-      "outputSchema": 3921,
-      "wire": 5337
+      "outputSchema": 3960,
+      "wire": 5376
     },
     {
       "annotations": 124,
@@ -538,10 +538,10 @@
     "inputSchema": 51052,
     "instructions": 1983,
     "modelVisible": 87083,
-    "outputSchema": 136153,
-    "payload": 231136,
+    "outputSchema": 136192,
+    "payload": 231175,
     "tools": 59,
-    "wire": 231066,
+    "wire": 231105,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

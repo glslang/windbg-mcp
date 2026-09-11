@@ -108,6 +108,14 @@ pub(crate) struct Case {
     /// Whether the value this case tested was traced from the IRP rather than read off a bare
     /// `+0x18` displacement. Per case, because one routine can have both.
     pub(crate) proved: bool,
+    /// Whether the block this code reaches **handles** it, as far as the code says.
+    ///
+    /// A compare and a branch say where control goes when a code matches; they do not say that
+    /// the driver accepts it. `cmp code,N` / `je invalid_request` is the same shape as `je
+    /// handler`, and reporting the first as an accepted code sends a reader to test a code the
+    /// driver rejects. So this is `Some(false)` for a block that sets an NTSTATUS error and
+    /// returns, `Some(true)` for one that reaches a routine, and `None` where neither is visible.
+    pub(crate) accepted: Option<bool>,
     /// The input length the case requires, when the case block proves one.
     pub(crate) in_size: Option<SizeCheck>,
     /// The output length the case requires, when the case block proves one.
@@ -547,6 +555,7 @@ pub(crate) fn map(
             bounds.retain(|bound| bound.at_index >= start);
             match follow_table(
                 &block[start..i],
+                instruction,
                 instruction.address,
                 &bounds,
                 &state,
@@ -624,11 +633,27 @@ pub(crate) fn map(
         .filter(|(_, value)| matches!(value, Value::StackLocation))
         .map(|(register, _)| *register)
         .collect();
+    // Whether the block at an address sets an NTSTATUS error and returns, which is the only thing
+    // in this routine that says which side of a branch the driver treats as success.
+    let fails = |at: u64| {
+        index.get(&at).is_some_and(|&at| {
+            let end = (at + WINDOW).min(block.len());
+            failure_block(&block[at..end])
+        })
+    };
     for case in &mut cases {
         if let Some(&at) = index.get(&case.lands) {
             let end = (at + WINDOW).min(block.len());
-            case.handler = handler_in(&block[at..end]);
-            let (input, output) = sizes_in(&block[at..end], layout, &stack_registers);
+            let window = &block[at..end];
+            case.handler = handler_in(window);
+            // Rejected if the landing block fails, handled if it reaches a routine, and unknown
+            // otherwise -- which is an ordinary outcome and is why this is not a `bool`.
+            case.accepted = match (failure_block(window), case.handler) {
+                (true, _) => Some(false),
+                (false, Some(_)) => Some(true),
+                (false, None) => None,
+            };
+            let (input, output) = sizes_in(window, layout, &stack_registers, &fails);
             case.in_size = input;
             case.out_size = output;
         }
@@ -681,6 +706,7 @@ fn push_case(
         site,
         lands,
         proved,
+        accepted: None,
         handler: None,
         in_size: None,
         out_size: None,
@@ -984,24 +1010,54 @@ struct Resolved {
 /// not a table this can resolve — which the caller records as unresolved rather than dropping.
 fn follow_table(
     window: &[Instruction],
+    jump: &Instruction,
     at: u64,
     bounds: &[Bound],
     state: &HashMap<&'static str, Value>,
     read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
     in_image: &impl Fn(u64) -> bool,
 ) -> Option<Resolved> {
-    // The last indexed load before the jump: `mov ecx, dword ptr [rdx+rax*4+5B80h]`, whose base is
-    // an address this pass watched a `lea` put there. Everything else hangs off it.
+    // **The load has to feed *this* jump**, which is a question about dataflow and not about
+    // proximity. Taking the last scale-4 indexed load in the window instead reads an unrelated
+    // array indexed by the same bounded register -- ordinary code, a few instructions before a
+    // jump through some other register -- as the switch table, and every dword of that array that
+    // happens to resolve inside the image becomes a control code. Worse, the real jump is then not
+    // listed as unresolved, so nothing says the switch was missed.
+    //
+    // So the chain is walked backwards from the jump's own register: `jmp rcx` <- `add rcx,rdx`
+    // (an accumulation, so the chain continues through `rcx`) <- `mov ecx,[rdx+rax*4+5B80h]`,
+    // which is the load. Anything else writing the register on the way ends it.
+    let mut wanted = match jump.operands.first() {
+        Some(Operand::Register(register)) => family(register)?,
+        // A `jmp qword ptr [...]` reads its destination from memory rather than from a register:
+        // an import thunk or a vtable call, not a compiler's switch.
+        _ => return None,
+    };
     let mut dword = None;
     for instruction in window.iter().rev() {
-        let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
+        let Some(written) = instruction.operands.first().and_then(register_of) else {
             continue;
         };
-        if memory.scale != 4 || memory.index.is_none() {
+        if written != wanted {
             continue;
         }
-        dword = Some((instruction, memory));
-        break;
+        match instruction.operands.get(1) {
+            // The indexed load this whole function is about.
+            Some(Operand::Memory(memory)) if memory.scale == 4 && memory.index.is_some() => {
+                dword = Some((instruction, memory));
+                break;
+            }
+            // `add rcx,rdx` folds the image base into the entry: the value being followed is
+            // still the one in `rcx`, so the chain continues through the same register.
+            Some(Operand::Register(_)) if instruction.mnemonic == "add" => continue,
+            // A copy: follow the register it came from.
+            Some(Operand::Register(source)) if instruction.mnemonic == "mov" => {
+                wanted = family(source)?;
+            }
+            // Anything else -- an immediate, a different memory shape, an instruction this does
+            // not model -- ends the chain, and with it the claim that this jump is a table.
+            _ => return None,
+        }
     }
     let (dword_load, dword_memory) = dword?;
     let table_index = dword_memory.index.as_deref().and_then(family)?;
@@ -1139,6 +1195,47 @@ fn table_base(
     }
 }
 
+/// Whether a block is a **failure path**: it sets an NTSTATUS error and returns.
+///
+/// This is the one piece of evidence that says which side of a branch the driver treats as
+/// success, and without it neither a case nor a size means what it reads like. `cmp code,N` /
+/// `je invalid_request` and `cmp code,N` / `je handler` are the same instructions with opposite
+/// meanings; so are `cmp length,20h` / `jne fail` and `cmp length,20h` / `jne handler`.
+///
+/// **An NTSTATUS with the error severity is the signal**, because that is what the failure path is
+/// for: `mov eax,0C000000Dh` (`STATUS_INVALID_PARAMETER`), `0C0000010h`
+/// (`STATUS_INVALID_DEVICE_REQUEST`), `0C0000023h` (`STATUS_BUFFER_TOO_SMALL`) — the top two bits
+/// set is the definition of the severity field, so this is a property of the value rather than a
+/// list of codes. The block has to *return* it too: a driver that loads a status and carries on is
+/// not failing there.
+///
+/// It says nothing when it says nothing. A failure path that jumps to a shared tail, or completes
+/// the IRP through a helper, answers `false` here, and every caller treats that as "could not
+/// tell" rather than as "this is the success path".
+fn failure_block(window: &[Instruction]) -> bool {
+    let mut status = false;
+    for instruction in window {
+        if instruction.mnemonic == "mov"
+            && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
+            && let Ok(value) = u32::try_from(value)
+            // The severity field: `11` is an error. `STATUS_SUCCESS` and the informational and
+            // warning ranges are not failures, and neither is an ordinary small constant.
+            && value >> 30 == 0b11
+        {
+            status = true;
+        }
+        match instruction.flow {
+            Flow::Return => return status,
+            // A call or a branch before the return: whatever this block is doing, it is not the
+            // two-instruction failure tail this recognises.
+            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return false,
+            Flow::Unreadable | Flow::Unknown => return false,
+            Flow::Fallthrough | Flow::Trap => {}
+        }
+    }
+    false
+}
+
 /// The routine a case block reaches directly, when it reaches one.
 fn handler_in(window: &[Instruction]) -> Option<u64> {
     for instruction in window {
@@ -1174,6 +1271,7 @@ fn sizes_in(
     window: &[Instruction],
     layout: Layout,
     stack_registers: &[&'static str],
+    fails: &impl Fn(u64) -> bool,
 ) -> (Option<SizeCheck>, Option<SizeCheck>) {
     let mut input = None;
     let mut output = None;
@@ -1198,9 +1296,17 @@ fn sizes_in(
             }
             continue;
         }
-        if let Flow::Branch(_) = instruction.flow {
+        if let Flow::Branch(target) = instruction.flow {
             if let Some((displacement, value, at)) = pending.take() {
-                let exact = matches!(instruction.mnemonic.as_str(), "jne" | "jnz");
+                // **Exact needs both halves.** The mnemonic says equality continues by falling
+                // through; it does not say the fall-through is the path that handles the code.
+                // `cmp length,20h` / `jne handler` is the same instruction pair with the success
+                // on the other edge, and reporting 0x20 there is a requirement the driver does not
+                // have. So the branch has to be the one that *leaves*: its target sets an NTSTATUS
+                // error and returns. Without that evidence the check is still reported, as
+                // evidence rather than as a size.
+                let exact = matches!(instruction.mnemonic.as_str(), "jne" | "jnz")
+                    && target.is_some_and(fails);
                 let check = SizeCheck { value, at, exact };
                 match displacement {
                     d if d == layout.input_length => input = input.or(Some(check)),
@@ -1294,6 +1400,7 @@ pub(crate) fn structured_report(
                         .map(|check| check.value),
                     recovered: case.recovered.name().to_string(),
                     proved: case.proved,
+                    accepted: case.accepted,
                     at: locate(case.site),
                     evidence,
                 }
@@ -1348,7 +1455,7 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
         out.push_str(&format!("  {} code(s){listed}:\n", report.case_count));
         for case in &report.cases {
             out.push_str(&format!(
-                "    {}  device 0x{:04x} function 0x{:03x} {} {}  -> {}\n",
+                "    {}  device 0x{:04x} function 0x{:03x} {} {}  -> {}{}\n",
                 case.code,
                 case.device_type,
                 case.function,
@@ -1358,6 +1465,14 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
                     .clone()
                     .or_else(|| case.case_rva.clone())
                     .unwrap_or_else(|| where_(&case.at)),
+                // Said where the code says it, and silent where it does not: a block that returns
+                // an error status is a code the driver refuses, and one that reaches a routine is
+                // a code it handles. Neither is what the compare and the branch alone say.
+                match case.accepted {
+                    Some(false) => "  [rejected]",
+                    Some(true) => "",
+                    None => "  [?]",
+                },
             ));
             for check in &case.evidence {
                 out.push_str(&format!(
@@ -2091,6 +2206,80 @@ mod tests {
         );
     }
 
+    /// The table load has to **feed the jump**, which is dataflow and not proximity.
+    ///
+    /// Here the bounded index is used for an ordinary array read a few instructions before a jump
+    /// through a register loaded from somewhere else entirely. Taking the nearest scale-4 indexed
+    /// load reads that array as the switch table: every dword of it that happens to resolve inside
+    /// the image becomes a control code, and the real jump stops being listed as unresolved, so
+    /// nothing says the switch was missed. The reader is counted for the same reason the
+    /// no-bounds-check test counts it -- what is asserted is that nothing was read at a guessed
+    /// address, not merely that the answer came out empty.
+    #[test]
+    fn a_load_that_does_not_feed_the_jump_is_not_the_table() {
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            // An array indexed by the bounded register, into a register the jump never reads.
+            insn(
+                DISPATCH + 0x21,
+                "mov",
+                vec![reg("edx"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            // And the jump's own register, from the stack.
+            insn(
+                DISPATCH + 0x28,
+                "mov",
+                vec![reg("rbx"), mem("rsp", 0x30)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2d, "jmp", vec![reg("rbx")], Flow::Jmp(None)),
+        ]);
+        let served = std::cell::Cell::new(0usize);
+        let read = |_: u64, len: usize| {
+            served.set(served.get() + 1);
+            Some(vec![0u8; len])
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert!(found.tables.is_empty(), "{:?}", found.tables);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x2d]);
+        assert_eq!(served.get(), 0, "nothing was read");
+    }
+
     /// An indirect jump with no bounds check is **recorded**, not dropped.
     ///
     /// Which is the whole difference between a short answer and a wrong one: a driver whose switch
@@ -2265,9 +2454,149 @@ mod tests {
         );
     }
 
-    /// An exact length is told apart from a floor, because only one of them is a size.
+    /// An **exact** size needs two things: equality must be what the case continues on, and the
+    /// other edge must be the one that fails.
+    ///
+    /// Three cases, each of which a weaker rule reports wrongly. The first branches away on
+    /// inequality to a block that sets `STATUS_INVALID_PARAMETER` and returns, so 0x20 is
+    /// required. The second makes the same compare and branches to a **handler**: the driver
+    /// accepts the unequal length and reporting 0x20 as its size is a requirement it does not
+    /// have. The third is a floor, which says nothing about the size of a buffer at all.
+    ///
+    /// All three are reported as evidence; only the first is a size.
     #[test]
-    fn an_exact_length_check_is_told_apart_from_a_floor() {
+    fn an_exact_size_needs_the_failing_edge_as_well_as_the_condition() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("r13d"), imm(0x222007)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x60)),
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "cmp",
+                vec![reg("r13d"), imm(0x22200b)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x26,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x90)),
+            ),
+            insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
+            // Exactly 0x20 input bytes, or the path leaves for the failure tail.
+            insn(
+                DISPATCH + 0x40,
+                "cmp",
+                vec![mem("rax", 0x10), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x47,
+                "jne",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0xb0)),
+            ),
+            insn(
+                DISPATCH + 0x4d,
+                "call",
+                vec![Operand::Target(0x5000)],
+                Flow::Call(Some(0x5000)),
+            ),
+            insn(DISPATCH + 0x52, "ret", Vec::new(), Flow::Return),
+            // The same compare, branching to a handler: the unequal length is what is handled.
+            insn(
+                DISPATCH + 0x60,
+                "cmp",
+                vec![mem("rax", 0x10), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x67,
+                "jne",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0xd0)),
+            ),
+            insn(DISPATCH + 0x6d, "ret", Vec::new(), Flow::Return),
+            // A floor.
+            insn(
+                DISPATCH + 0x90,
+                "cmp",
+                vec![mem("rax", 0x10), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x97,
+                "jb",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0xb0)),
+            ),
+            insn(DISPATCH + 0x9d, "ret", Vec::new(), Flow::Return),
+            // The failure tail: `STATUS_INVALID_PARAMETER`, then a return.
+            insn(
+                DISPATCH + 0xb0,
+                "mov",
+                vec![reg("eax"), imm(0xc000_000d)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xb5, "ret", Vec::new(), Flow::Return),
+            // And a handler, which is not a failure however it is reached.
+            insn(
+                DISPATCH + 0xd0,
+                "call",
+                vec![Operand::Target(0x6000)],
+                Flow::Call(Some(0x6000)),
+            ),
+            insn(DISPATCH + 0xd5, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.in_size.map(|size| (size.value, size.exact))))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x222003, Some((0x20, true))),
+                (0x222007, Some((0x20, false))),
+                (0x22200b, Some((0x20, false))),
+            ],
+            "only the check whose other edge fails is a size: {:?}",
+            found.cases
+        );
+    }
+
+    /// A case whose block sets an NTSTATUS error and returns is one the driver **rejects**.
+    ///
+    /// `cmp code,N` / `je invalid_request` and `je handler` are the same instructions, so a case
+    /// list that reports both as accepted sends a reader to test a code the driver refuses. The
+    /// evidence is the block itself: an error status returned, against a block that reaches a
+    /// routine.
+    #[test]
+    fn a_case_that_returns_an_error_status_is_reported_as_rejected() {
         let mut block = prologue(DISPATCH);
         block.extend([
             insn(
@@ -2295,49 +2624,33 @@ mod tests {
                 Flow::Branch(Some(DISPATCH + 0x60)),
             ),
             insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
-            // The first case: exactly 0x20 input bytes or the path leaves.
+            // Rejected: `STATUS_INVALID_DEVICE_REQUEST`, then a return.
             insn(
                 DISPATCH + 0x40,
-                "cmp",
-                vec![mem("rax", 0x10), imm(0x20)],
+                "mov",
+                vec![reg("eax"), imm(0xc000_0010)],
                 Flow::Fallthrough,
             ),
-            insn(
-                DISPATCH + 0x47,
-                "jne",
-                Vec::new(),
-                Flow::Branch(Some(0xfa11)),
-            ),
-            insn(DISPATCH + 0x4d, "ret", Vec::new(), Flow::Return),
-            // The second: 0x20 is a floor, which says nothing about the buffer's size.
+            insn(DISPATCH + 0x45, "ret", Vec::new(), Flow::Return),
+            // Handled.
             insn(
                 DISPATCH + 0x60,
-                "cmp",
-                vec![mem("rax", 0x10), imm(0x20)],
-                Flow::Fallthrough,
+                "call",
+                vec![Operand::Target(0x5000)],
+                Flow::Call(Some(0x5000)),
             ),
-            insn(
-                DISPATCH + 0x67,
-                "jb",
-                Vec::new(),
-                Flow::Branch(Some(0xfa11)),
-            ),
-            insn(DISPATCH + 0x6d, "ret", Vec::new(), Flow::Return),
+            insn(DISPATCH + 0x65, "ret", Vec::new(), Flow::Return),
         ]);
 
         let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
 
-        let sizes: Vec<_> = found
-            .cases
-            .iter()
-            .map(|case| (case.code, case.in_size.map(|size| (size.value, size.exact))))
-            .collect();
         assert_eq!(
-            sizes,
-            vec![
-                (0x222003, Some((0x20, true))),
-                (0x222007, Some((0x20, false))),
-            ],
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.accepted))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, Some(false)), (0x222007, Some(true))],
             "{:?}",
             found.cases
         );
