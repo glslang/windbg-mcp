@@ -57,6 +57,16 @@ driver with no PDB, you'd rebase an RVA to `lm m <driver>`.)
 ## 3. Static enumeration — recover the switch
 
 ```jsonc
+ioctl_map { "dispatch": "mountmgr!MountMgrDeviceControl" }
+```
+
+Each case comes back decoded, with the compare that recognises it and the block it routes to, and
+anything the recovery could not follow is listed rather than left out — a map with entries in
+`unresolved` is a lower bound on what the driver accepts. The rest of this section is how that
+answer is derived, and is worth reading once: it is what the tool is doing, and what to fall back
+on when a driver's switch defeats it.
+
+```jsonc
 execute { "command": "uf mountmgr!MountMgrDeviceControl" }
 ```
 

@@ -103,6 +103,13 @@ Index **`0x0e`** (`IRP_MJ_DEVICE_CONTROL`) at `DriverObject+0xe0` is the IOCTL d
 ## 5. Static enumeration — recover the switch
 
 ```jsonc
+ioctl_map { "dispatch": "HEVD!IrpDeviceIoCtlHandler" }
+```
+
+The 28 codes, each decoded, with the compare that recognises it. Below is the same recovery by
+hand — the method the tool implements, and the fallback when a driver's switch defeats it.
+
+```jsonc
 execute { "command": "uf HEVD!IrpDeviceIoCtlHandler" }
 ```
 

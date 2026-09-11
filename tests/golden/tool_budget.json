@@ -128,12 +128,12 @@
     },
     {
       "annotations": 74,
-      "description": 211,
+      "description": 282,
       "inputSchema": 444,
-      "modelVisible": 709,
+      "modelVisible": 780,
       "name": "driver_object",
       "outputSchema": 0,
-      "wire": 798
+      "wire": 869
     },
     {
       "annotations": 130,
@@ -251,6 +251,15 @@
       "name": "interrupt",
       "outputSchema": 0,
       "wire": 2824
+    },
+    {
+      "annotations": 89,
+      "description": 683,
+      "inputSchema": 563,
+      "modelVisible": 1296,
+      "name": "ioctl_map",
+      "outputSchema": 3829,
+      "wire": 5245
     },
     {
       "annotations": 124,
@@ -524,15 +533,15 @@
     }
   ],
   "totals": {
-    "annotations": 6152,
-    "description": 32180,
-    "inputSchema": 50489,
+    "annotations": 6241,
+    "description": 32934,
+    "inputSchema": 51052,
     "instructions": 1983,
-    "modelVisible": 85716,
-    "outputSchema": 132232,
-    "payload": 225727,
-    "tools": 58,
-    "wire": 225658,
+    "modelVisible": 87083,
+    "outputSchema": 136061,
+    "payload": 231044,
+    "tools": 59,
+    "wire": 230974,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

@@ -1908,7 +1908,17 @@ const MODEL_VISIBLE_CEILING: usize = 88_000;
 /// The three remaining driver tools will each want their own schema, and this is deliberately
 /// **not** sized for them: a ceiling raised for work not yet done absorbs the next regression in
 /// silence. Each one raises it again, with its own arithmetic.
-const WIRE_CEILING: usize = 230_000;
+///
+/// **230,000 -> 236,000 for `ioctl_map`** (2026-09-11), which is the second of those three doing
+/// exactly that. The payload went 225,727 -> 231,044, a difference of 5,318: `ioctl_map` is
+/// 5,245 B of wire, its `TOOL_NOTES` cross-reference adds 71 B to `driver_object`, and the
+/// remaining byte is the array's own comma. Nothing else moved. It shares `CodeLocation`, `ImageRef` and `WalkHalt`
+/// with `Reachability` and `DriverHazards`, and the question this ceiling exists to force is
+/// whether that sharing multiplied -- it did not, for the reason the last raise recorded: a shared
+/// type is inlined once per tool's own `$defs` closure, so a third consumer is a third copy rather
+/// than a product. It is the larger of the two driver schemas because a case carries a decoded
+/// code, two coordinates and its evidence. The new figure leaves 5,194 B, which is 2.2%.
+const WIRE_CEILING: usize = 236_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -2811,6 +2821,13 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ),
         // Well-formed, so it takes the session refusal rather than its own argument one.
         ("driver_hazards", json!({ "module": "mydriver" }), "error"),
+        // Likewise: the command-breaker screen on `dispatch` answers before a session is
+        // looked for, and this row is here for the session refusal after it.
+        (
+            "ioctl_map",
+            json!({ "dispatch": "mydriver!DispatchDeviceControl" }),
+            "error",
+        ),
         // A well-formed request, so it takes the *session* refusal path like every row above it
         // rather than the argument one — which this tool also has, and which is checked in
         // `a_malformed_walk_is_refused_before_a_session_is_needed`.
@@ -3693,7 +3710,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 58 tools (session, crash)"),
+        log.contains("serving 13 of 59 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3725,7 +3742,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 58 tools (session, inspect) — except bench serves 13 of 58 tools \
+            "serving 20 of 59 tools (session, inspect) — except bench serves 13 of 59 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),

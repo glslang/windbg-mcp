@@ -19,6 +19,7 @@ mod driver;
 mod engine;
 mod fault;
 mod hazards;
+mod ioctl;
 mod kdconn;
 mod listen;
 mod logbridge;

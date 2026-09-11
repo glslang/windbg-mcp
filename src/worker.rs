@@ -62,6 +62,7 @@ use crate::driver::{
 };
 use crate::fault;
 use crate::hazards;
+use crate::ioctl;
 use crate::pe;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Interrupted, MAX_MODULE_ROWS,
@@ -1736,6 +1737,26 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         } => {
             let address = resolve_coordinate(e, coordinate.as_deref(), address, 1)?;
             run_to_address(e, &address, timeout_ms)
+        }
+        EngineOp::IoctlMap {
+            dispatch,
+            patience_ms,
+        } => {
+            // The same arithmetic as the hazard scan's, and the same reason it refuses rather
+            // than starting: a map with no clock disassembles nothing and reports a dispatch
+            // routine that accepts no codes, which is an answer rather than an absence.
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, queued) {
+                Some(budget) => ioctl_map(e, &dispatch, Instant::now() + budget),
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This IOCTL map was not run: it reached the engine with {}s of its                          caller's timeout left, which is not enough to disassemble a dispatch                          routine and report back. Nothing was read. It waited {}s behind other                          work on this session; issue it when the session is idle, or raise the                          server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                    ),
+                )),
+            }
         }
         EngineOp::DriverHazards {
             module,
@@ -6624,6 +6645,101 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     Ok(Output::typed(hazards::render(&report), report))
 }
 
+/// Recovers the control codes a dispatch routine accepts.
+///
+/// What only the worker can do is here and nothing else is: disassemble the routine, find the
+/// image behind it, and read that image's own bytes for a jump table. [`ioctl::map`] takes those
+/// three as closures and has never seen an engine.
+fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Output, Failed> {
+    // Refused on an instruction set this build does not decode, exactly as the walk and the hazard
+    // scan are. Every instruction would come back with no operands, so every compare would be
+    // invisible and the answer would be a driver that accepts no control codes -- which is what a
+    // driver with no IOCTL dispatch looks like.
+    let set = e.instruction_set();
+    if !set.operands_are_read() {
+        let machine = match set {
+            dbgscope::dbgeng::InstructionSet::Other(machine) => format!("{machine:#06x}"),
+            other => format!("{other:?}"),
+        };
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this build decodes x86 and x64 instructions, and this target's are machine \
+                 {machine} -- so the compares that recognise a control code cannot be read, and a \
+                 map of `{dispatch}` would report a routine that accepts none. `driver_object` \
+                 and `decode_ioctl` work here."
+            ),
+        ));
+    }
+
+    // The listing, through the same path the reachability walk uses: `uf` for the extent, typed
+    // decodes for everything else, a barrier wherever an address would not decode.
+    let halted: std::cell::Cell<Option<walk::Halt>> = std::cell::Cell::new(None);
+    let _ = remaining(deadline, "the dispatch routine was disassembled")?;
+    let block = function_listing(e, dispatch, deadline, &halted).ok_or_else(|| match halted.get() {
+        Some(walk::Halt::Deadline) => Failed::categorised(
+            structured::ErrorCategory::Timeout,
+            format!(
+                "`{dispatch}` ran out of time before it could be disassembled. Nothing was read. \
+                 Raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue this \
+                 when the session is idle."
+            ),
+        ),
+        Some(walk::Halt::Interrupted) => Failed::categorised(
+            structured::ErrorCategory::Interrupted,
+            format!("`{dispatch}` was interrupted before it could be disassembled."),
+        ),
+        None => Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "could not disassemble `{dispatch}`: `uf` returned no function. Check the \
+                 symbol or address, and that the module is loaded. `driver_object` names the \
+                 dispatch routine: the MajorFunction table's index 0x0e."
+            ),
+        ),
+    })?;
+    let entry = block
+        .first()
+        .map(|instruction| instruction.address)
+        .ok_or_else(|| {
+            Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!("`{dispatch}` disassembled to no instructions."),
+            )
+        })?;
+
+    // The image behind the routine, for the jump tables. A table is in the driver's own read-only
+    // data, so the read is bounded to that module for the reason `driver_hazards`'s is: the
+    // address a table is read at comes from the image's own instructions, and an image that is
+    // not what it claims must not be able to send a read outside itself.
+    let loaded = e.modules().map_err(failed)?;
+    let holding = loaded
+        .iter()
+        .find(|module| entry >= module.base && entry < module.end());
+    let read = |at: u64, len: usize| {
+        let module = holding?;
+        within_module(module.base, module.size, at, len).then(|| e.read_memory(at, len).ok())?
+    };
+
+    let found = ioctl::map(entry, &block, read, || {
+        if let Some(why) = halted.get() {
+            return Some(why);
+        }
+        if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        }
+    });
+
+    let mut attributor = Attributor::default();
+    let mut report = ioctl::structured_report(&found, |address| attributor.locate(e, address));
+    report.images = attributor.images();
+    Ok(Output::typed(ioctl::render(&report), report))
+}
+
 /// Whether a read falls inside the module the loader mapped.
 ///
 /// `size` of zero means the engine reported none, in which case there is nothing to bound against
@@ -6738,6 +6854,123 @@ fn halt_for(cut_short: Interruption) -> walk::Halt {
         Interruption::OnRequest => walk::Halt::Interrupted,
         Interruption::Deadline { .. } => walk::Halt::Deadline,
     }
+}
+
+/// One function's instructions, as the walk and the IOCTL map both need them: the addresses `uf`
+/// lists, decoded, in listing order, with a barrier wherever one would not decode.
+///
+/// Shared rather than copied, because every sentence of it is a property two callers depend on
+/// equally -- the extent comes from `uf` because nothing else knows where a function ends, the
+/// decodes are grouped into runs, anything the grouping missed is asked for on its own, and a
+/// stop is recorded in `halted` rather than returned as a short listing. A second copy would
+/// drift from this one in exactly those four places.
+fn function_listing(
+    e: &DebugEngine,
+    arg: &str,
+    deadline: Instant,
+    halted: &std::cell::Cell<Option<walk::Halt>>,
+) -> Option<Vec<Instruction>> {
+    let expired = |e: &DebugEngine| -> Option<walk::Halt> {
+        if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        }
+    };
+    // **The command carries the deadline, rather than being polled around.** A poll can only
+    // run between engine calls, and a `uf` blocked on a deferred symbol load blocks the one
+    // thread this session has — so a walk bounded only by its own polls outlives the call
+    // timeout, answers nobody, and pins the session for as long as the engine takes. Bounded,
+    // the watchdog Ctrl+Breaks it exactly as a human would and the walk reports a halt.
+    let Some(budget) = walk_budget_ms(deadline, Instant::now()) else {
+        halted.set(Some(expired(e).unwrap_or(walk::Halt::Deadline)));
+        return None;
+    };
+    let run = match e.execute_command_bounded(&format!("uf {arg}"), budget) {
+        Ok(run) => run,
+        Err(_) => return None,
+    };
+    // A break is not a listing, whoever raised it. Recorded rather than returned as a short
+    // one: the output up to a Ctrl+Break is a *prefix* of the function, and a prefix walked as
+    // though it were the whole reads as a function that simply ends there.
+    if let Some(why) = run.cut_short {
+        halted.set(Some(halt_for(why)));
+        return None;
+    }
+    // A real `uf` lists backtick addresses or at least a `module!Func:` label; error text
+    // ("Couldn't resolve...", "no code") has neither, and prunes the branch.
+    let text = run.output;
+    if !text.contains('`') && !text.contains(':') {
+        return None;
+    }
+    let listing: Vec<u64> = text
+        .lines()
+        .filter_map(|line| line.split_whitespace().next().and_then(parse_windbg_addr))
+        .collect();
+    if listing.is_empty() {
+        return None;
+    }
+    // Fetched in **runs** rather than one instruction at a time: consecutive listing lines
+    // are contiguous inside a region, so a function is a handful of calls rather than one
+    // per instruction. A gap wider than the longest x86 instruction starts a new run, which
+    // is also what separates one region from the next.
+    // Polled between runs and between retries, not only once before the `uf`. One function
+    // can be many regions, and a listing whose grouped decodes miss many addresses adds a
+    // retry each — an unbounded number of engine calls between two of the walk's own polls,
+    // which is the bound this was supposed to add rather than move.
+    // **What it finds is recorded, not merely acted on.** Returning `None` alone reads to the
+    // walk as an ordinary disassembly failure, which prunes the branch silently: on the seed
+    // that becomes "could not disassemble `from`" against a symbol that was fine, and on the
+    // last queued function it becomes a clean NOT REACHABLE claiming the graph was fully
+    // explored. The reason goes in a cell the walk's own `halt` closure reads.
+    // **The typed decodes below carry no bound of their own, and dbgscope has none to give
+    // them.** `disassemble` renders each line, so it resolves symbols, so a module with
+    // deferred ones can send it to a symbol server mid-loop — and a poll between calls cannot
+    // run while one is inside the engine. The `uf` above is bounded because a *command* can
+    // be; a typed call needs `disassemble_bounded`, which is
+    // [dbgscope#149](https://github.com/glslang/dbgscope/issues/149) and the sibling of #95's
+    // question about `read_memory`. Until then the bound here is the number of calls rather
+    // than the time they take, which is the honest description of it.
+    let mut decoded: HashMap<u64, Instruction> = HashMap::new();
+    for (start, count) in listing_runs(&listing) {
+        if let Some(why) = expired(e) {
+            // Pruned rather than returned half-decoded: a function missing instructions is a
+            // function missing edges. The reason is recorded first, so the walk reports a
+            // halt rather than a graph it never finished.
+            halted.set(Some(why));
+            return None;
+        }
+        decoded.extend(
+            e.disassemble(start, count)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|instruction| (instruction.address, instruction)),
+        );
+    }
+    // **Grouping is an optimisation, and this is what keeps it from being an assumption.**
+    // A run decodes forward from its first address, so any listed address the run did not
+    // land on — a grouping that merged two regions, an entry that is not an instruction
+    // boundary from that start — would otherwise be dropped from the function silently, and
+    // an edge or a target in the dropped part reads as NOT REACHABLE. Anything missing is
+    // asked for on its own, which is the answer the ungrouped version would have given.
+    for &address in &listing {
+        if let Some(why) = expired(e) {
+            halted.set(Some(why));
+            return None;
+        }
+        if !decoded.contains_key(&address)
+            && let Ok(mut one) = e.disassemble(address, 1)
+            && let Some(instruction) = one.pop()
+        {
+            decoded.insert(instruction.address, instruction);
+        }
+    }
+    // Emitted in the **listing's** order and with a barrier wherever an address would not
+    // decode, both for reasons `in_listing_order` states: the order is what the walk reads a
+    // fall-through from, and a hole left in it invents an edge across whatever was missing.
+    Some(in_listing_order(&listing, &mut decoded))
 }
 
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
@@ -6873,110 +7106,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // handed to `reachability` separately and neither can see the other.
     let halted: std::cell::Cell<Option<walk::Halt>> = std::cell::Cell::new(None);
 
-    let expired = |e: &DebugEngine| -> Option<walk::Halt> {
-        if matches!(e.interrupted(), Ok(true)) {
-            Some(walk::Halt::Interrupted)
-        } else if Instant::now() >= deadline {
-            Some(walk::Halt::Deadline)
-        } else {
-            None
-        }
-    };
-
-    let mut uf = |arg: &str| -> Option<Vec<Instruction>> {
-        // **The command carries the deadline, rather than being polled around.** A poll can only
-        // run between engine calls, and a `uf` blocked on a deferred symbol load blocks the one
-        // thread this session has — so a walk bounded only by its own polls outlives the call
-        // timeout, answers nobody, and pins the session for as long as the engine takes. Bounded,
-        // the watchdog Ctrl+Breaks it exactly as a human would and the walk reports a halt.
-        let Some(budget) = walk_budget_ms(deadline, Instant::now()) else {
-            halted.set(Some(expired(e).unwrap_or(walk::Halt::Deadline)));
-            return None;
-        };
-        let run = match e.execute_command_bounded(&format!("uf {arg}"), budget) {
-            Ok(run) => run,
-            Err(_) => return None,
-        };
-        // A break is not a listing, whoever raised it. Recorded rather than returned as a short
-        // one: the output up to a Ctrl+Break is a *prefix* of the function, and a prefix walked as
-        // though it were the whole reads as a function that simply ends there.
-        if let Some(why) = run.cut_short {
-            halted.set(Some(halt_for(why)));
-            return None;
-        }
-        // A real `uf` lists backtick addresses or at least a `module!Func:` label; error text
-        // ("Couldn't resolve...", "no code") has neither, and prunes the branch.
-        let text = run.output;
-        if !text.contains('`') && !text.contains(':') {
-            return None;
-        }
-        let listing: Vec<u64> = text
-            .lines()
-            .filter_map(|line| line.split_whitespace().next().and_then(parse_windbg_addr))
-            .collect();
-        if listing.is_empty() {
-            return None;
-        }
-        // Fetched in **runs** rather than one instruction at a time: consecutive listing lines
-        // are contiguous inside a region, so a function is a handful of calls rather than one
-        // per instruction. A gap wider than the longest x86 instruction starts a new run, which
-        // is also what separates one region from the next.
-        // Polled between runs and between retries, not only once before the `uf`. One function
-        // can be many regions, and a listing whose grouped decodes miss many addresses adds a
-        // retry each — an unbounded number of engine calls between two of the walk's own polls,
-        // which is the bound this was supposed to add rather than move.
-        // **What it finds is recorded, not merely acted on.** Returning `None` alone reads to the
-        // walk as an ordinary disassembly failure, which prunes the branch silently: on the seed
-        // that becomes "could not disassemble `from`" against a symbol that was fine, and on the
-        // last queued function it becomes a clean NOT REACHABLE claiming the graph was fully
-        // explored. The reason goes in a cell the walk's own `halt` closure reads.
-        // **The typed decodes below carry no bound of their own, and dbgscope has none to give
-        // them.** `disassemble` renders each line, so it resolves symbols, so a module with
-        // deferred ones can send it to a symbol server mid-loop — and a poll between calls cannot
-        // run while one is inside the engine. The `uf` above is bounded because a *command* can
-        // be; a typed call needs `disassemble_bounded`, which is
-        // [dbgscope#149](https://github.com/glslang/dbgscope/issues/149) and the sibling of #95's
-        // question about `read_memory`. Until then the bound here is the number of calls rather
-        // than the time they take, which is the honest description of it.
-        let mut decoded: HashMap<u64, Instruction> = HashMap::new();
-        for (start, count) in listing_runs(&listing) {
-            if let Some(why) = expired(e) {
-                // Pruned rather than returned half-decoded: a function missing instructions is a
-                // function missing edges. The reason is recorded first, so the walk reports a
-                // halt rather than a graph it never finished.
-                halted.set(Some(why));
-                return None;
-            }
-            decoded.extend(
-                e.disassemble(start, count)
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|instruction| (instruction.address, instruction)),
-            );
-        }
-        // **Grouping is an optimisation, and this is what keeps it from being an assumption.**
-        // A run decodes forward from its first address, so any listed address the run did not
-        // land on — a grouping that merged two regions, an entry that is not an instruction
-        // boundary from that start — would otherwise be dropped from the function silently, and
-        // an edge or a target in the dropped part reads as NOT REACHABLE. Anything missing is
-        // asked for on its own, which is the answer the ungrouped version would have given.
-        for &address in &listing {
-            if let Some(why) = expired(e) {
-                halted.set(Some(why));
-                return None;
-            }
-            if !decoded.contains_key(&address)
-                && let Ok(mut one) = e.disassemble(address, 1)
-                && let Some(instruction) = one.pop()
-            {
-                decoded.insert(instruction.address, instruction);
-            }
-        }
-        // Emitted in the **listing's** order and with a barrier wherever an address would not
-        // decode, both for reasons `in_listing_order` states: the order is what the walk reads a
-        // fall-through from, and a hole left in it invents an edge across whatever was missing.
-        Some(in_listing_order(&listing, &mut decoded))
-    };
+    let mut uf = |arg: &str| function_listing(e, arg, deadline, &halted);
 
     // The interrupt is asked about first, for the reason `walk_memory`'s closure records: both
     // can be true in one poll, and reporting a deadline for a break the caller just asked for
