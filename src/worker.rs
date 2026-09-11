@@ -6522,8 +6522,8 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     let mut matched = loaded
         .iter()
         .filter(|candidate| candidate.name.eq_ignore_ascii_case(module));
-    let base = match (matched.next(), matched.next()) {
-        (Some(one), None) => one.base,
+    let (base, loaded_size) = match (matched.next(), matched.next()) {
+        (Some(one), None) => (one.base, one.size),
         (None, _) => {
             return Err(Failed::categorised(
                 structured::ErrorCategory::Debugger,
@@ -6551,7 +6551,19 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     // sections. `read_memory` is bounded by its own size rather than by the clock; these are
     // header-sized reads, not a walk.
     let read = |at: u64, len: usize| e.read_memory(at, len).ok();
-    let image = pe::read_image(base, read).map_err(|why| pe_failure(module, &why, None))?;
+    let mut image = pe::read_image(base, read).map_err(|why| pe_failure(module, &why, None))?;
+    // **The loader's extent wins.** `SizeOfImage` is read out of the image's own header, which on
+    // an untrusted driver is memory that driver may have written: advertise a larger one and every
+    // bound in `src/pe.rs` — which are all `checked_va` against this number — would accept
+    // addresses past the module and attribute the next one's code to this. The engine's size is
+    // what the loader recorded when it mapped the image, and is the one this cannot edit.
+    //
+    // Clamped rather than refused, and measured before choosing: across sixty modules of the
+    // sample dump the two agree exactly, so a refusal would not misfire either — but a scan
+    // bounded by the loader's own view still answers, where a refusal gives nothing about a driver
+    // that is interesting precisely because its header disagrees. Anything the header claimed
+    // beyond it comes back through the section-overrun path as a range that was not scanned.
+    image.size_of_image = smaller_extent(image.size_of_image, loaded_size);
     // Polled inside the import walk, which refuses rather than truncates but can still be a few
     // thousand entries on a driver that imports heavily. A stop there comes back as
     // `PeError::Interrupted` — there is no half-read import table to report, since a short one
@@ -6599,6 +6611,19 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     let report =
         hazards::structured_report(module, base, &scan, |address| attributor.locate(e, address));
     Ok(Output::typed(hazards::render(&report), report))
+}
+
+/// The extent to trust for an image: the smaller of what its header claims and what the loader
+/// recorded.
+///
+/// A named function rather than a `min` at the call site, because which way round it goes is the
+/// whole of it and an inverted one reads identically. The loader's figure is zero only if the
+/// engine reported no size at all, in which case the header is all there is.
+fn smaller_extent(header: u32, loaded: u32) -> u32 {
+    if loaded == 0 {
+        return header;
+    }
+    header.min(loaded)
 }
 
 /// A PE read that did not work out, as the failure its caller branches on.
@@ -7083,6 +7108,50 @@ mod tests {
              including the ones inside a helper: `resolve` runs an unbounded `? <expr>`, and a \
              symbol fetch there blocks the session's one thread with no poll able to run. Use \
              `resolve_within` with what `remaining` reports."
+        );
+    }
+
+    /// An image's extent is the **smaller** of what its header claims and what the loader
+    /// recorded.
+    ///
+    /// `SizeOfImage` is read out of the image's own header, which on an untrusted driver is memory
+    /// that driver may have written — and every bound in `src/pe.rs` is a `checked_va` against that
+    /// number, so a larger one buys addresses past the module and the next image's code reported as
+    /// this one's. Which way round the `min` goes is the whole of the fix, and an inverted one
+    /// reads identically, which is why it is a named function with a test rather than a call site.
+    #[test]
+    fn an_images_extent_is_the_smaller_of_the_two() {
+        assert_eq!(smaller_extent(0x20000, 0x10000), 0x10000, "the loader wins");
+        assert_eq!(
+            smaller_extent(0x10000, 0x20000),
+            0x10000,
+            "and so does the header when it is the smaller"
+        );
+        assert_eq!(smaller_extent(0x10000, 0x10000), 0x10000);
+        // Measured on the sample dump: sixty modules, and the two agree on every one of them, so
+        // this is a guard against a tampered header rather than an everyday adjustment.
+        assert_eq!(
+            smaller_extent(0x10000, 0),
+            0x10000,
+            "an engine that reported no size leaves the header as all there is"
+        );
+
+        // And that it is **applied**, which the arithmetic above cannot say: the clamp lives in a
+        // function that needs an engine, so what is checked here is that the call is still there.
+        // Without it the three assertions above pass over a scan that trusts the header.
+        let code = include_str!("worker.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this module has a test half")
+            .0;
+        let body = code
+            .split_once("\nfn driver_hazards(")
+            .expect("this module has a `driver_hazards`")
+            .1;
+        let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
+        assert!(
+            body.contains("image.size_of_image = smaller_extent("),
+            "`driver_hazards` no longer clamps the image's extent to the loader's, so every bound \
+             in `src/pe.rs` is against a number the image itself supplies."
         );
     }
 
