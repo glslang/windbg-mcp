@@ -33,7 +33,10 @@
   short the same way is labelled `INCOMPLETE`, because a prefix of a recipe is not a weaker
   version of one — satisfying it does not put control on the target. Each disassembly the walk
   runs carries that remaining time as its own bound, so one blocked on a deferred symbol load
-  aborts rather than outliving the call that asked for it and pinning the session behind it. The
+  aborts rather than outliving the call that asked for it and pinning the session behind it. So do
+  the commands that run *before* the walk: evaluating the address expressions and reading a
+  module's base are where a cold symbol server is reached, and a deadline first consulted inside
+  the walk is one the caller can outlive before it starts. The
   typed instruction decodes underneath it are bounded by their *number* rather than by their time,
   because the debugger bindings have no bounded form of that call yet
   ([dbgscope#149](https://github.com/glslang/dbgscope/issues/149)).
