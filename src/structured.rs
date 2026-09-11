@@ -2483,8 +2483,12 @@ pub struct IoctlMap {
     /// The jump tables that were followed.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<JumpTable>,
-    /// Indirect transfers that were **not** followed: a switch whose table could not be resolved,
-    /// a call through a pointer.
+    /// Indirect **jumps** that were not followed: a switch whose table could not be resolved.
+    ///
+    /// A call through a pointer is not here, and deliberately: a driver reaches its imports that
+    /// way, so every dispatch routine is full of them and none of them decides on a control code.
+    /// What this lists is the places control could have gone somewhere this walk could not
+    /// follow.
     ///
     /// This is what stops a short list reading as a complete one. Every entry is a place a code
     /// could be recognised and was not, so a map with entries here is a lower bound on what the

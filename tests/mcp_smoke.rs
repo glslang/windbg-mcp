@@ -1910,11 +1910,12 @@ const MODEL_VISIBLE_CEILING: usize = 88_000;
 /// silence. Each one raises it again, with its own arithmetic.
 ///
 /// **230,000 -> 236,000 for `ioctl_map`** (2026-09-11), which is the second of those three doing
-/// exactly that. The payload went 225,727 -> 231,175, a difference of 5,448: `ioctl_map` is
-/// 5,376 B of wire, its `TOOL_NOTES` cross-reference adds 71 B to `driver_object`, and the
+/// exactly that. The payload went 225,727 -> 231,247, a difference of 5,520: `ioctl_map` is
+/// 5,448 B of wire, its `TOOL_NOTES` cross-reference adds 71 B to `driver_object`, and the
 /// remaining byte is the array's own comma. Nothing else moved. (The tool was 5,245 B when this
-/// paragraph was first written and review added 131 B of `outputSchema` in three fields on a case,
-/// which is the ordinary way this figure moves.) It shares `CodeLocation`, `ImageRef` and `WalkHalt`
+/// paragraph was first written; review added 131 B of `outputSchema` in three fields on a case and
+/// 72 B of description narrowing a completeness claim, which is the ordinary way this figure
+/// moves.) It shares `CodeLocation`, `ImageRef` and `WalkHalt`
 /// with `Reachability` and `DriverHazards`, and the question this ceiling exists to force is
 /// whether that sharing multiplied -- it did not, for the reason the last raise recorded: a shared
 /// type is inlined once per tool's own `$defs` closure, so a third consumer is a third copy rather

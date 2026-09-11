@@ -1751,7 +1751,11 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
                     format!(
-                        "This IOCTL map was not run: it reached the engine with {}s of its                          caller's timeout left, which is not enough to disassemble a dispatch                          routine and report back. Nothing was read. It waited {}s behind other                          work on this session; issue it when the session is idle, or raise the                          server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        "This IOCTL map was not run: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to disassemble a dispatch \
+                         routine and report back. Nothing was read. It waited {}s behind other \
+                         work on this session; issue it when the session is idle, or raise the \
+                         server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
                         patience.saturating_sub(queued).as_secs(),
                         queued.as_secs(),
                     ),
@@ -6640,18 +6644,19 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     scan.unnamed_libraries = table.unnamed_libraries;
 
     let mut attributor = Attributor::default();
-    let expired = std::cell::Cell::new(false);
+    let stopped = std::cell::Cell::new(None);
+    let stop = || attribution_stop(e, deadline);
     let mut report = hazards::structured_report(module, base, &scan, |address| {
-        locate_within(address, deadline, &expired, |address| {
+        locate_within(address, &stopped, stop, |address| {
             attributor.locate(e, address)
         })
     });
-    // A scan whose attribution ran out of clock stopped, whatever the decode did: the answer is
-    // short of coordinates and says so here rather than leaving a reader to wonder why call sites
-    // in a loaded driver name no module.
-    if expired.get() {
-        report.stopped = Some(structured::WalkHalt::Deadline);
-    }
+    // A scan whose attribution stopped says so, whatever the decode did: the answer is short of
+    // coordinates and this is where a reader is told why rather than left wondering how call sites
+    // in a loaded driver name no module. **`or` rather than an assignment**: the scan may have
+    // stopped for a reason of its own -- an interrupt, where this is a deadline -- and the first
+    // stop is the one that happened.
+    report.stopped = report.stopped.or_else(|| stopped.get());
     Ok(Output::typed(hazards::render(&report), report))
 }
 
@@ -6758,17 +6763,32 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
     });
 
     let mut attributor = Attributor::default();
-    let expired = std::cell::Cell::new(false);
+    let stopped = std::cell::Cell::new(None);
+    let stop = || attribution_stop(e, deadline);
     let mut report = ioctl::structured_report(&found, |address| {
-        locate_within(address, deadline, &expired, |address| {
+        locate_within(address, &stopped, stop, |address| {
             attributor.locate(e, address)
         })
     });
     report.images = attributor.images();
-    if expired.get() {
-        report.stopped = Some(structured::WalkHalt::Deadline);
-    }
+    // The walk's own stop wins, for the reason the scan's does above.
+    report.stopped = report.stopped.or_else(|| stopped.get());
     Ok(Output::typed(ioctl::render(&report), report))
+}
+
+/// Why attribution should stop, or `None` to carry on.
+///
+/// The interrupt is asked about first, for the reason every other poll in this file gives: both can
+/// be true in one moment, and reporting a deadline for a break somebody just asked for sends them
+/// to the timeout setting instead of to their own request.
+fn attribution_stop(e: &DebugEngine, deadline: Instant) -> Option<structured::WalkHalt> {
+    if matches!(e.interrupted(), Ok(true)) {
+        Some(structured::WalkHalt::Interrupted)
+    } else if Instant::now() >= deadline {
+        Some(structured::WalkHalt::Deadline)
+    } else {
+        None
+    }
 }
 
 /// Attribution that stops asking the engine once the caller's clock has run out.
@@ -6784,12 +6804,18 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
 /// out says why rather than looking like a target whose addresses are in no image.
 fn locate_within(
     address: u64,
-    deadline: Instant,
-    expired: &std::cell::Cell<bool>,
+    stopped: &std::cell::Cell<Option<structured::WalkHalt>>,
+    stop: impl Fn() -> Option<structured::WalkHalt>,
     locate: impl FnOnce(u64) -> structured::CodeLocation,
 ) -> structured::CodeLocation {
-    if Instant::now() >= deadline {
-        expired.set(true);
+    // **Both stops, and the first one keeps its reason.** A caller's clock and a caller's break
+    // are different answers with different remedies, and attribution is a run of serialised engine
+    // calls that either of them should end — polling only the deadline leaves a Ctrl+Break waiting
+    // out the rest of the budget one `module_at` at a time.
+    let already = stopped.get();
+    let why = already.or_else(&stop);
+    if let Some(why) = why {
+        stopped.set(Some(why));
         return structured::CodeLocation {
             address: structured::addr(address),
             module: None,
@@ -6863,19 +6889,23 @@ fn pe_failure(module: &str, why: &pe::PeError, stopped_by: Option<walk::Halt>) -
     )
 }
 
-/// What is left of the walk's clock, or the failure to report when nothing is.
+/// What is left of a call's clock, or the failure to report when nothing is.
 ///
-/// The preliminaries — resolving `address`, resolving `from`, reading a module's base — run
-/// *before* the walk, so a deadline consulted only inside the walk is one the caller can outlive
+/// The preliminaries — resolving `address`, resolving `from`, disassembling a dispatch routine —
+/// run *before* the analysis, so a deadline consulted only inside it is one the caller can outlive
 /// while the worker is still in the engine. `what` names the step that was about to run, because
 /// "ran out of time" before anything was read and after half a graph was explored send a caller to
 /// different places.
+///
+/// **Its wording is shared by more than the walk**, which is why it says "this call" rather than
+/// naming one: the IOCTL map calls it before its own first disassembly, and a message telling that
+/// caller their reachability walk stopped is about a tool they did not call.
 fn remaining(deadline: Instant, what: &str) -> Result<u32, Failed> {
     walk_budget_ms(deadline, Instant::now()).ok_or_else(|| {
         Failed::categorised(
             structured::ErrorCategory::Timeout,
             format!(
-                "this reachability walk ran out of time before {what}. Nothing was explored. \
+                "this call ran out of time before {what}. Nothing was read. \
                  Raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue it \
                  when the session is idle."
             ),
@@ -7395,7 +7425,7 @@ fn ",
         );
     }
 
-    /// Past the deadline, an address is **not** taken to the engine.
+    /// Once the walk is stopped, an address is **not** taken to the engine.
     ///
     /// Attribution is a `module_at` call each, and an address in no loaded module is deliberately
     /// not cached, so a bounded answer that still carries thousands of them — an IOCTL map's
@@ -7404,11 +7434,12 @@ fn ",
     /// is a counting closure: the returned coordinate looks the same either way, and the property
     /// is that nothing was asked.
     ///
-    /// The flag is what the caller reports as a stop, so the two are asserted together: an answer
+    /// What stopped it is what the caller reports, so the two are asserted together: an answer
     /// whose coordinates thinned out has to say why, or it reads as a target whose addresses are
-    /// in no image at all.
+    /// in no image at all. And the **first** stop is the one kept, because an interrupt and a
+    /// deadline send a caller to different places.
     #[test]
-    fn attribution_stops_asking_the_engine_when_the_clock_has_run_out() {
+    fn attribution_stops_asking_the_engine_when_the_walk_is_stopped() {
         let asked = std::cell::Cell::new(0usize);
         let resolve = |address: u64| {
             asked.set(asked.get() + 1);
@@ -7420,30 +7451,48 @@ fn ",
             }
         };
 
-        let expired = std::cell::Cell::new(false);
-        let live = locate_within(
-            0xffff_f800_0000_1000,
-            Instant::now() + Duration::from_secs(60),
-            &expired,
-            resolve,
+        let stopped = std::cell::Cell::new(None);
+        let live = locate_within(0xffff_f800_0000_1000, &stopped, || None, resolve);
+        assert_eq!(
+            asked.get(),
+            1,
+            "with nothing stopping it, the engine answers"
         );
-        assert_eq!(asked.get(), 1, "inside the clock, the engine answers");
         assert_eq!(live.module.as_deref(), Some("driver"));
-        assert!(!expired.get());
+        assert_eq!(stopped.get(), None);
 
-        let past = locate_within(
+        // An interrupt and a deadline are different answers with different remedies, so the one
+        // that happened is the one reported -- and after either, nothing else is asked.
+        let broken = locate_within(
             0xffff_f800_0000_2000,
-            Instant::now() - Duration::from_secs(1),
-            &expired,
+            &stopped,
+            || Some(structured::WalkHalt::Interrupted),
             resolve,
         );
-        assert_eq!(asked.get(), 1, "and past it, nothing is asked");
-        assert_eq!(past.module, None);
+        assert_eq!(asked.get(), 1, "and stopped, nothing is asked");
+        assert_eq!(broken.module, None);
         assert!(
-            past.attribution_failed,
-            "which is a lookup that did not answer, not an address in no image: {past:?}"
+            broken.attribution_failed,
+            "which is a lookup that did not answer, not an address in no image: {broken:?}"
         );
-        assert!(expired.get(), "and the caller is told to report a stop");
+        assert_eq!(stopped.get(), Some(structured::WalkHalt::Interrupted));
+
+        // A later deadline does not rewrite what stopped it: the first stop is the one that
+        // happened, and a caller branching on `interrupted` against `timeout` recovers differently
+        // from each.
+        let after = locate_within(
+            0xffff_f800_0000_3000,
+            &stopped,
+            || Some(structured::WalkHalt::Deadline),
+            resolve,
+        );
+        assert_eq!(asked.get(), 1);
+        assert!(after.attribution_failed);
+        assert_eq!(
+            stopped.get(),
+            Some(structured::WalkHalt::Interrupted),
+            "the break is what stopped this, and a clock reading later does not replace it"
+        );
     }
 
     /// An image's extent is the **smaller** of what its header claims and what the loader

@@ -236,6 +236,9 @@ pub(crate) struct Layout {
     control_code: i64,
     input_length: i64,
     output_length: i64,
+    /// Where a dispatch routine's return value goes, which is what makes a status a **refusal**
+    /// rather than a constant somebody loaded.
+    return_register: &'static str,
     /// The register a dispatch routine's `Irp` argument arrives in, when the calling convention
     /// puts it in one.
     ///
@@ -251,6 +254,7 @@ impl Layout {
         control_code: 0x18,
         input_length: 0x10,
         output_length: 0x08,
+        return_register: "rax",
         irp_register: Some("rdx"),
     };
     pub(crate) const X86: Self = Self {
@@ -258,6 +262,7 @@ impl Layout {
         control_code: 0x0c,
         input_length: 0x08,
         output_length: 0x04,
+        return_register: "eax",
         irp_register: None,
     };
 }
@@ -472,8 +477,8 @@ pub(crate) fn map(
         let facts = entry[at].clone().unwrap_or_default();
         let instructions = &block[graph.blocks[at].start..graph.blocks[at].end];
         case.handler = handler_in(instructions);
-        let refuses = refuses_in(at, &graph, block);
-        case.accepted = match (refuses, case.handler, error_status(instructions)) {
+        let refuses = refuses_in(at, &graph, block, layout);
+        case.accepted = match (refuses, case.handler, error_status(instructions, layout)) {
             (true, _, _) => Some(false),
             (false, Some(_), false) => Some(true),
             _ => None,
@@ -487,7 +492,7 @@ pub(crate) fn map(
             index_of
                 .get(&address)
                 .and_then(|&at| graph.holding(at))
-                .is_some_and(|at| refuses_in(at, &graph, block))
+                .is_some_and(|at| refuses_in(at, &graph, block, layout))
         });
         case.in_size = input;
         case.out_size = output;
@@ -618,7 +623,16 @@ fn simulate(
         if position == terminator {
             break;
         }
-        compared = update(&mut facts, instruction, layout, &mut traced);
+        let next = update(&mut facts, instruction, layout, &mut traced);
+        // **A compare survives anything that does not write the flags.** A compiler puts the
+        // setup for the case block between the compare and its branch -- `cmp r13d,N` /
+        // `mov rbx,rcx` / `je handler` -- and dropping the pending compare there loses the case
+        // with nothing saying so: no unresolved transfer, no blind instruction, no stop. Which
+        // instructions write flags is the decoder's answer rather than a list of arithmetic
+        // mnemonics, so this is the whole rule.
+        if instruction.writes_flags {
+            compared = next;
+        }
     }
 
     let last = instructions.last();
@@ -1262,23 +1276,71 @@ fn follow_table(
     })
 }
 
-/// Whether an NTSTATUS **error** value is set anywhere in a block before it leaves.
+/// Whether a block sets an NTSTATUS **error** somewhere that returns it.
 ///
 /// The severity field is the signal rather than a list of codes: the top two bits set is the
 /// definition of an error status, so `STATUS_INVALID_DEVICE_REQUEST`, `STATUS_INVALID_PARAMETER`
-/// and `STATUS_BUFFER_TOO_SMALL` all answer without being named. Where it goes does not matter — a
-/// register on the way to a `ret`, or a store into the IRP before a completion call — because what
-/// is being asked is whether this block is refusing the request.
-fn error_status(instructions: &[Instruction]) -> bool {
-    instructions.iter().any(|instruction| {
-        instruction.effect == Effect::Move
-            && instruction
-                .operands
-                .get(1)
-                .and_then(immediate_of)
-                .and_then(|value| u32::try_from(value).ok())
-                .is_some_and(|value| value >> 30 == 0b11)
-    })
+/// and `STATUS_BUFFER_TOO_SMALL` all answer without being named.
+///
+/// **Where it goes is the other half, and taking the value alone is how a log line becomes a
+/// rejection.** `mov ecx,0C000000Dh` before a tracing call is an *argument*; the same constant in
+/// the return register, or stored into the IRP's status field, is the routine refusing the
+/// request. So only those two destinations count, and a later write of the return register with
+/// anything else takes the finding back -- a block that loads a status and then returns something
+/// derived from a call is not refusing here.
+fn error_status(instructions: &[Instruction], layout: Layout) -> bool {
+    let mut status = false;
+    for instruction in instructions {
+        if instruction.effect != Effect::Move {
+            continue;
+        }
+        let returned = match instruction.operands.first() {
+            // The return register, by the full-width name the decoder gives it.
+            Some(Operand::Register(register)) => register.full == layout.return_register,
+            // A store: the IRP's status field is the other place a refusal writes one, and its
+            // displacement is a question about a structure this does not otherwise read.
+            Some(Operand::Memory(_)) => true,
+            _ => false,
+        };
+        if !returned {
+            continue;
+        }
+        status = match instruction.operands.get(1).and_then(immediate_of) {
+            Some(value) => u32::try_from(value).is_ok_and(|value| value >> 30 == 0b11),
+            // The destination was written with something that is not a literal status: whatever
+            // this block returns is no longer the refusal that was loaded.
+            None => false,
+        };
+    }
+    status
+}
+
+/// Whether a block **refuses** the request: it sets an NTSTATUS error where the routine returns
+/// it, and returns.
+///
+/// **The completion call is part of the shape rather than the end of it.** The ordinary rejection
+/// stores the status into the IRP and calls a completion routine before returning, so a scan that
+/// stopped at the first call would see a block that calls something and report the completion
+/// routine as this code's handler.
+///
+/// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
+/// here, and [`refuses_in`] is what follows that jump.
+fn failure_block(instructions: &[Instruction], layout: Layout) -> bool {
+    for (position, instruction) in instructions.iter().enumerate() {
+        // What the block has established **so far**, which is what says whether the call it is
+        // about to make is a completion on the way out or a block doing something else.
+        let status = error_status(&instructions[..=position], layout);
+        match instruction.flow {
+            Flow::Return => return status,
+            // A completion call after the status is part of the rejection; one before it is a
+            // block doing something else.
+            Flow::Call(_) if status => {}
+            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return false,
+            Flow::Unreadable | Flow::Unknown => return false,
+            Flow::Fallthrough | Flow::Trap => {}
+        }
+    }
+    false
 }
 
 /// Whether the block at `index` **refuses** the request, following the tail jumps a shared
@@ -1286,14 +1348,14 @@ fn error_status(instructions: &[Instruction]) -> bool {
 ///
 /// A case block that is one `jmp shared_error_tail` is the ordinary way to share an
 /// invalid-request epilogue, and reading it as a handler presents the error tail as this code's
-/// routine. The graph already has that edge, so following it is a lookup rather than a guess —
+/// routine. The graph already has that edge, so following it is a lookup rather than a guess --
 /// bounded to a few hops, since a chain longer than that is not an epilogue.
-fn refuses_in(index: usize, graph: &cfg::Graph, listing: &[Instruction]) -> bool {
+fn refuses_in(index: usize, graph: &cfg::Graph, listing: &[Instruction], layout: Layout) -> bool {
     let mut at = index;
     for _ in 0..3 {
         let block = &graph.blocks[at];
         let instructions = &listing[block.start..block.end];
-        if failure_block(instructions) {
+        if failure_block(instructions, layout) {
             return true;
         }
         // Only an unconditional tail jump is followed: a block that decides something is deciding
@@ -1304,36 +1366,6 @@ fn refuses_in(index: usize, graph: &cfg::Graph, listing: &[Instruction]) -> bool
         match (tail, block.successors.as_slice()) {
             (true, [next]) => at = *next,
             _ => return false,
-        }
-    }
-    false
-}
-
-/// Whether a block sets an NTSTATUS error and returns, with or without completing the IRP on the
-/// way out.
-///
-/// **The call is part of the shape rather than the end of it.** The ordinary rejection stores the
-/// status into the IRP and calls a completion routine before returning, so a scan that stopped at
-/// the first call would see a block that calls something and report the completion routine as this
-/// code's handler.
-fn failure_block(instructions: &[Instruction]) -> bool {
-    let mut status = false;
-    for instruction in instructions {
-        if instruction.effect == Effect::Move
-            && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
-            && let Ok(value) = u32::try_from(value)
-            && value >> 30 == 0b11
-        {
-            status = true;
-        }
-        match instruction.flow {
-            Flow::Return => return status,
-            // A completion call after the status is part of the rejection; one before it is a
-            // block doing something else.
-            Flow::Call(_) if status => {}
-            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return false,
-            Flow::Unreadable | Flow::Unknown => return false,
-            Flow::Fallthrough | Flow::Trap => {}
         }
     }
     false
@@ -1355,20 +1387,22 @@ fn handler_in(instructions: &[Instruction]) -> Option<u64> {
 
 /// The buffer-length checks a case block makes against a literal.
 ///
-/// Three things have to hold before a compare here is a statement about a buffer, and each is a way
+/// Four things have to hold before a compare here is a statement about a buffer, and each is a way
 /// an answer would otherwise be invented.
 ///
-/// **The base must hold the IO_STACK_LOCATION**, on the path that reaches this block — a
-/// displacement is not a type, `cmp [rsp+10h],20h` is a stack slot, and a case that overwrites the
-/// register first is comparing something else. The facts say which register holds what here, and
-/// they are updated through the block, so a write retires it without a list.
+/// **The value must be a length.** Either the field read where it lives — a `ULONG` at the stack
+/// location's displacement, off a register this path put it in — or a register the walk watched it
+/// loaded into, which is what a compiler emits when it tests the same length twice.
 ///
 /// **The field is a `ULONG`**, so a narrower compare constrains part of one and is not its size.
 ///
-/// **Exact means the path continues on equality *and* the other edge fails.** `jne` says equality
-/// falls through; only the branch target being a refusal says the fall-through is the accepted
-/// path. `cmp length,20h` / `jne handler` has the success on the other edge, and `cmp length,0` /
-/// `je failure` rejects zero rather than requiring it.
+/// **The block is the case's own.** A block is where a case's instructions end, so nothing here
+/// can inherit the next case's compare.
+///
+/// **Exact means the path continues on equality *and* the other edge refuses.** `jne` says
+/// equality falls through; only the branch target being a refusal says the fall-through is the
+/// accepted path. `cmp length,20h` / `jne handler` has the success on the other edge, and
+/// `cmp length,0` / `je failure` rejects zero rather than requiring it.
 fn sizes_in(
     instructions: &[Instruction],
     entry: &Facts,
@@ -1379,38 +1413,59 @@ fn sizes_in(
     let mut traced = false;
     let mut input = None;
     let mut output = None;
-    let mut pending: Option<(i64, u32, u64)> = None;
+    let mut pending: Option<(Value, u32, u64)> = None;
     for instruction in instructions {
         if instruction.effect == Effect::Compare {
             pending = None;
-            if let Some(Operand::Memory(memory)) = instruction.operands.first()
-                && memory.size == Some(4)
-                && let Some(base) = memory.base.as_ref()
-                && facts.registers.get(&base.full) == Some(&Value::StackLocation)
+            let length = match instruction.operands.first() {
+                // The field where it lives.
+                Some(Operand::Memory(memory))
+                    if memory.size == Some(4)
+                        && memory.base.as_ref().is_some_and(|base| {
+                            facts.registers.get(&base.full) == Some(&Value::StackLocation)
+                        }) =>
+                {
+                    match memory.displacement {
+                        d if d == layout.input_length => Some(Value::InputLength),
+                        d if d == layout.output_length => Some(Value::OutputLength),
+                        _ => None,
+                    }
+                }
+                // Or a register the walk watched it loaded into: `mov ecx,[sp+10h]` /
+                // `cmp ecx,20h` is the same check with the field in hand, and it is what a
+                // compiler emits when the length is tested more than once.
+                Some(Operand::Register(register)) => match facts.registers.get(&register.full) {
+                    Some(value @ (Value::InputLength | Value::OutputLength)) => Some(*value),
+                    _ => None,
+                },
+                _ => None,
+            };
+            if let Some(length) = length
                 && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
                 && let Ok(value) = u32::try_from(value)
             {
-                pending = Some((memory.displacement, value, instruction.address));
+                pending = Some((length, value, instruction.address));
             }
             continue;
         }
         if let Flow::Branch(target) = instruction.flow {
-            if let Some((displacement, value, at)) = pending.take() {
+            if let Some((length, value, at)) = pending.take() {
                 let exact = instruction.condition == Some(Condition::NotEqual)
                     && target.is_some_and(refuses);
                 let check = SizeCheck { value, at, exact };
-                match displacement {
-                    d if d == layout.input_length => input = input.or(Some(check)),
-                    d if d == layout.output_length => output = output.or(Some(check)),
+                match length {
+                    Value::InputLength => input = input.or(Some(check)),
+                    Value::OutputLength => output = output.or(Some(check)),
                     _ => {}
                 }
             }
             continue;
         }
-        // Everything else updates the facts, which is what retires a base the block overwrites --
-        // and a compare's pairing with its branch, which anything in between invalidates.
+        // Everything else updates the facts, which is what retires a base the block overwrites.
+        // The pending compare survives anything that writes no flags, for the reason the block
+        // walk's does: a compiler puts the case's setup between a compare and its branch.
         update(&mut facts, instruction, layout, &mut traced);
-        if !instruction.operands.is_empty() {
+        if instruction.writes_flags {
             pending = None;
         }
     }
@@ -3078,6 +3133,184 @@ mod tests {
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert_eq!(found.unresolved, vec![DISPATCH + 0x41]);
         assert_eq!(served.get(), 0, "nothing was read on the rejected path");
+    }
+
+    /// A compare survives anything that writes no flags.
+    ///
+    /// A compiler puts the case block's setup between the compare and its branch — `cmp r13d,N` /
+    /// `mov rbx,rcx` / `je handler` — and the branch still reads the compare's flags. Dropping the
+    /// pending compare there loses the case with nothing saying so: no unresolved transfer, no
+    /// blind instruction, no stop, just a map one code shorter than the driver.
+    ///
+    /// Which instructions write flags is the **decoder's** answer, so the second half of the
+    /// fixture puts an `add` in the same place: that one does replace the compare, and the case
+    /// goes with it.
+    #[test]
+    fn a_compare_survives_an_instruction_that_writes_no_flags() {
+        let between = |mnemonic: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    mnemonic,
+                    vec![reg("rbx"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert_eq!(
+            between("mov")
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x222003],
+            "a copy leaves the flags alone: {:?}",
+            between("mov").cases
+        );
+        assert!(
+            between("add").cases.is_empty(),
+            "and an `add` is what the branch would then be reading: {:?}",
+            between("add").cases
+        );
+    }
+
+    /// An error status in an **argument** is not a refusal.
+    ///
+    /// `mov ecx,0C000000Dh` before a logging call is a constant on its way into a callee; the same
+    /// value in the return register is the routine refusing the request. Taking the value alone
+    /// marks the case rejected and takes its handler away, so a code the driver serves is reported
+    /// as one it refuses and the routine that serves it is not named.
+    #[test]
+    fn an_error_status_in_an_argument_is_not_a_refusal() {
+        let case_block = |destination: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x40,
+                    "mov",
+                    vec![reg(destination), imm(0xc000_000d)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x45,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(DISPATCH + 0x4a, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        let argument = case_block("ecx");
+        assert_eq!(argument.cases.len(), 1, "{:?}", argument.cases);
+        assert_eq!(
+            (argument.cases[0].accepted, argument.cases[0].handler),
+            (Some(true), Some(0x7000)),
+            "a constant on its way into a callee: {:?}",
+            argument.cases[0]
+        );
+
+        let returned = case_block("eax");
+        assert_eq!(
+            (returned.cases[0].accepted, returned.cases[0].handler),
+            (Some(false), None),
+            "and the same value where the routine returns from: {:?}",
+            returned.cases[0]
+        );
+    }
+
+    /// A length check may be made against the field once it is **in a register**.
+    ///
+    /// `mov ecx,[sp+10h]` / `cmp ecx,20h` is the same check as comparing the field where it lives,
+    /// and it is what a compiler emits when the length is tested more than once. Reading only the
+    /// memory form drops it, and a case that does require an exact size then reports none.
+    #[test]
+    fn a_length_check_may_be_made_against_the_loaded_field() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            // The field into a register, then the compare against it.
+            insn(
+                DISPATCH + 0x40,
+                "mov",
+                vec![reg("ecx"), mem("rax", 0x10)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x43,
+                "cmp",
+                vec![reg("ecx"), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x46,
+                "jne",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x60)),
+            ),
+            insn(
+                DISPATCH + 0x4c,
+                "call",
+                vec![Operand::Target(0x5000)],
+                Flow::Call(Some(0x5000)),
+            ),
+            insn(DISPATCH + 0x51, "ret", Vec::new(), Flow::Return),
+            // The refusal the check's other edge reaches.
+            insn(
+                DISPATCH + 0x60,
+                "mov",
+                vec![reg("eax"), imm(0xc000_0023)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x65, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+        assert_eq!(
+            found.cases[0].in_size.map(|size| (size.value, size.exact)),
+            Some((0x20, true)),
+            "{:?}",
+            found.cases[0]
+        );
     }
 
     /// An indirect jump with no bounds check is **recorded**, not dropped.
