@@ -44,12 +44,6 @@
 //! parser: `goblin`, `object` and `pelite` all want a contiguous slice, and a loaded image in a
 //! dump has holes in it.
 
-// Nothing outside the tests reads this module yet — the driver tools that will are the next
-// commits — and twenty `dead_code` warnings would bury a real one in the meantime. **Delete this
-// the moment `driver_hazards` consumes it**; if it is still here when the tool surface has that
-// tool, the suppression has outlived its reason.
-#![allow(dead_code)]
-
 use std::collections::BTreeMap;
 
 /// What went wrong, in terms a caller can render as an outcome rather than a message.
@@ -113,17 +107,6 @@ impl Section {
     pub fn executable(&self) -> bool {
         self.characteristics & 0x2000_0000 != 0
     }
-
-    /// `IMAGE_SCN_MEM_WRITE` — which is what makes a section's runtime contents unavailable from
-    /// the image file, and therefore unavailable on a dump that did not capture them.
-    pub fn writable(&self) -> bool {
-        self.characteristics & 0x8000_0000 != 0
-    }
-
-    /// Whether an RVA falls inside this section.
-    pub fn contains(&self, rva: u32) -> bool {
-        rva >= self.rva && rva < self.rva.saturating_add(self.virtual_size)
-    }
 }
 
 /// The image's headers, as much as naming imports and bounding a code scan needs.
@@ -143,11 +126,6 @@ pub struct Image {
 }
 
 impl Image {
-    /// The section holding an RVA.
-    pub fn section_at(&self, rva: u32) -> Option<&Section> {
-        self.sections.iter().find(|section| section.contains(rva))
-    }
-
     /// The executable sections, which is what a linear code scan is bounded by.
     pub fn code_sections(&self) -> impl Iterator<Item = &Section> {
         self.sections.iter().filter(|section| section.executable())
@@ -177,12 +155,6 @@ impl Image {
             .ok_or(PeError::Malformed {
                 reason: "an image address overflowed",
             })
-    }
-
-    /// An RVA as a virtual address, unchecked. Prefer [`Self::checked_va`]; this is for a caller
-    /// that has already bounded the RVA itself.
-    pub fn va(&self, rva: u32) -> u64 {
-        self.base + u64::from(rva)
     }
 }
 
@@ -730,18 +702,10 @@ mod tests {
         let code = image.code_sections().collect::<Vec<_>>();
         assert_eq!(code.len(), 1);
         assert_eq!(code[0].name, ".text");
-        assert!(!code[0].writable());
         assert!(
-            image.sections[2].writable(),
-            "the .data section is writable"
+            !code.iter().any(|s| s.name == ".data"),
+            "a writable section is not code and is never decoded: {code:?}"
         );
-
-        assert_eq!(
-            image.section_at(0x2100).map(|s| s.name.as_str()),
-            Some(".rdata")
-        );
-        assert_eq!(image.section_at(0x9999), None);
-        assert_eq!(image.va(0x1000), BASE + 0x1000);
     }
 
     /// A driver with no import directory imports nothing, and that is not an error — but it is

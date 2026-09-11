@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 57,
+  "toolCount": 58,
   "tools": [
     {
       "hints": {
@@ -430,6 +430,43 @@
       ],
       "required": [],
       "title": "Disassemble"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "driver_hazards",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/DriverHazards",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "module: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "module"
+      ],
+      "title": "Scan a driver for sensitive APIs and privileged instructions"
     },
     {
       "hints": {

@@ -2360,6 +2360,91 @@ pub struct Reachability {
     pub recipe_stopped: Option<WalkHalt>,
 }
 
+/// One sensitive API a driver imports, and where its code reaches it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ImportedSink {
+    /// The library as the image spells it — `ntoskrnl.exe`.
+    pub library: String,
+    pub name: String,
+    /// Why it is on the list: `buffer_copy`, `allocation`, `physical_memory` and the rest. The
+    /// category is the half a reader acts on, and the half that makes two drivers comparable
+    /// without knowing either API.
+    pub kind: String,
+    /// The import address table slot a call goes through — the coordinate a call site is matched
+    /// by, and the reason this works on a driver with no symbols at all.
+    pub slot: String,
+    /// Where the scanned code transfers control through that slot, as `module`+`rva` locations.
+    ///
+    /// **Empty is not "never called".** A call through a pointer the driver stored earlier leaves
+    /// nothing here, and neither does a call in code this scan did not reach — see
+    /// [`DriverHazards::scanned`] for what it did.
+    pub call_sites: Vec<CodeLocation>,
+}
+
+/// One privileged instruction, and what it reaches.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct PrivilegedInstruction {
+    pub at: CodeLocation,
+    /// `model_specific_register`, `port_io`, `control_register`, `descriptor_table`,
+    /// `machine_state`.
+    pub kind: String,
+    /// The mnemonic, for a reader who wants to know which of the family it was.
+    pub mnemonic: String,
+}
+
+/// One executable range a scan covered.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ScannedRange {
+    pub section: String,
+    pub start: String,
+    /// Bytes decoded. Less than the section's virtual size means the scan stopped inside it, and
+    /// [`DriverHazards::stopped`] or [`DriverHazards::cap_hit`] says which.
+    pub bytes: u64,
+}
+
+/// What a driver's image says it can do.
+///
+/// Read off the image rather than off its behaviour, and **evidence rather than a verdict**. Three
+/// things a caller has to hold on to, each of which is a way to reach a wrong conclusion from a
+/// right answer:
+///
+/// - **An import is not a call**, and a call site is not a reachable one. Ask
+///   `reachable_from_dispatch` whether a particular one can be reached from the dispatch routine.
+/// - **An absent import excludes nothing.** A driver can resolve an export at run time and leave
+///   no import-table entry, so this is evidence of what a driver *holds*, never of what it cannot
+///   do.
+/// - **The list is a judgement**, which is why [`Self::sink_list_version`] is here: a result
+///   quoted later can be checked against the list that produced it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DriverHazards {
+    /// The module scanned, and where it was loaded.
+    pub module: String,
+    pub base: String,
+    /// The version of the curated sink list this scan used.
+    pub sink_list_version: String,
+    /// The sensitive imports the driver holds, in slot order.
+    pub sinks: Vec<ImportedSink>,
+    /// The privileged instructions found, in address order.
+    pub privileged: Vec<PrivilegedInstruction>,
+    /// What was decoded. A section missing from here was not scanned at all — unreadable, or past
+    /// the byte cap — and anything it contains is absent from the two lists above for that reason
+    /// rather than because the driver does not contain it.
+    pub scanned: Vec<ScannedRange>,
+    /// Imports that are **not** on the list, counted rather than listed. The number is what says
+    /// whether a short `sinks` means a small driver or a narrow list.
+    pub other_imports: usize,
+    /// Libraries whose imports could not be named at all: bound imports, whose names live only in
+    /// the table this deliberately never reads.
+    pub unnamed_libraries: Vec<String>,
+    /// Why the scan stopped early, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WalkHalt>,
+    /// True when the scan's own byte cap stopped it rather than the code running out. A partial
+    /// answer either way, and this says the remedy is a narrower question rather than more time.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub cap_hit: bool,
+}
+
 /// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.
 ///
 /// Every field is `!analyze`'s own, extracted from its summary block. They are here because they

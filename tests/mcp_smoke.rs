@@ -1896,7 +1896,19 @@ const MODEL_VISIBLE_CEILING: usize = 88_000;
 /// type moves it.
 /// Bridge coordinate inputs and two structured outputs add 7,338 B after rebase.
 /// See docs/token-budget.md; output schemas still carry constraints only.
-const WIRE_CEILING: usize = 225_000;
+///
+/// **225,000 -> 230,000 for `driver_hazards`** (2026-09-11), and the arithmetic is the check that
+/// it is headroom rather than a leak: the payload went 221,376 -> 225,325, and the new tool is
+/// 3,949 B of wire, which is exactly the difference. Nothing else moved. Most of it is its
+/// `outputSchema`, which no model reads -- and the question this ceiling exists to force was asked
+/// before raising it: the schema shares `CodeLocation` with `Reachability`, and a shared type
+/// appears once per tool's own `$defs` closure by construction, so it is a second copy rather than
+/// a multiplication. The new figure leaves 4,675 B, which is 2.1%.
+///
+/// The three remaining driver tools will each want their own schema, and this is deliberately
+/// **not** sized for them: a ceiling raised for work not yet done absorbs the next regression in
+/// silence. Each one raises it again, with its own arithmetic.
+const WIRE_CEILING: usize = 230_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -2797,6 +2809,8 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             json!({ "from": "nt!IopXxxControlFile", "address": "nt!KeBugCheckEx" }),
             "error",
         ),
+        // Well-formed, so it takes the session refusal rather than its own argument one.
+        ("driver_hazards", json!({ "module": "mydriver" }), "error"),
         // A well-formed request, so it takes the *session* refusal path like every row above it
         // rather than the argument one — which this tool also has, and which is checked in
         // `a_malformed_walk_is_refused_before_a_session_is_needed`.
@@ -3679,7 +3693,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 57 tools (session, crash)"),
+        log.contains("serving 13 of 58 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3711,7 +3725,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 57 tools (session, inspect) — except bench serves 13 of 57 tools \
+            "serving 20 of 58 tools (session, inspect) — except bench serves 13 of 58 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
