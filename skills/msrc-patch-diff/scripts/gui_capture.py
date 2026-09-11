@@ -82,7 +82,22 @@ def finalize_capture(report, output, workspace, comparison_id, request_quit=None
         attempt("quit_request", request_quit)
 
 
-def run(reference, target, bindiff, output, quit_on_finish):
+def prepare_target(workspace, binaries, target, rva):
+    if type(rva) is not int or rva < 0:
+        raise ValueError("prepare_target_rva must be a nonnegative integer")
+    for item in binaries:
+        _, view, _, _ = workspace.acquire(item["binary_id"])
+        if Path(view.file.original_filename).resolve() != target:
+            continue
+        coordinate = workspace.coordinate(view, view.start + rva)
+        navigation = workspace.navigate(item["binary_id"], coordinate)
+        # Displaying a function can request lazy analysis. Finish it before the baseline.
+        view.update_analysis_and_wait()
+        return {"stage": "before_baseline", "navigation": navigation}
+    raise ValueError("target view unavailable for preparation")
+
+
+def run(reference, target, bindiff, output, quit_on_finish, prepare_target_rva=None):
     import binaryninja as bn
     from binaryninjaui import UIContext
     from binja_windbg_mcp.adapter import Workspace, main_thread
@@ -110,6 +125,10 @@ def run(reference, target, bindiff, output, quit_on_finish):
         for item in binaries:
             _, view, _, _ = workspace.acquire(item["binary_id"])
             view.update_analysis_and_wait()
+        if prepare_target_rva is not None:
+            report["preparation"] = prepare_target(
+                workspace, binaries, target, prepare_target_rva
+            )
         before = workspace.list_binaries()["binaries"]
         ids = {}
         for item in before:
@@ -192,7 +211,7 @@ def run(reference, target, bindiff, output, quit_on_finish):
         )
 
 
-def start(reference, target, bindiff, output, quit_on_finish=False):
+def start(reference, target, bindiff, output, quit_on_finish=False, prepare_target_rva=None):
     """Analyze two downloaded PE files; leave views open unless this disposable GUI should quit."""
     from binaryninjaui import FileContext
     from PySide6.QtCore import QTimer
@@ -210,7 +229,7 @@ def start(reference, target, bindiff, output, quit_on_finish=False):
         100,
         lambda: threading.Thread(
             target=run,
-            args=(reference, target, bindiff, output, quit_on_finish),
+            args=(reference, target, bindiff, output, quit_on_finish, prepare_target_rva),
             daemon=True,
         ).start(),
     )

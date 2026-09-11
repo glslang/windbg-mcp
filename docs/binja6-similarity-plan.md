@@ -175,6 +175,22 @@ Its ARM64 follow-up recorded a partial secure-kernel comparison and a complete
 target, but failed strict generation stability; these captures do not close full
 ARM64 acceptance.
 
+The 2026-09-10 follow-up resolved generation stability by preparing the selected
+target UI location and finishing lazy analysis before the capture baseline.
+Both reruns preserved strict generations and analysis; vertdll passed full
+acceptance. Securekernel remains partial because eight function starts per side
+lack exported flow-graph entries, accounting for all eight unresolved BinDiff rows.
+Full coverage would require further exporter investigation; the guards remain
+unchanged. The captures and exact omissions are in the
+[follow-up acceptance record](cve-patch-diff-acceptance.md#arm64-generation-follow-up--2026-09-10).
+
+The [2026-09-10 lifecycle follow-up](similarity-lifecycle-acceptance.md) recorded
+successful cancellation during export and matching, active comparison closure,
+and comment-edit invalidation after a missing metadata notification was fixed.
+Rebase and tab-close acceptance remain incomplete. Normal quit failed with
+repeatable native widget-destruction aborts; further GUI runs stopped pending
+isolation of that crash. Listener restart and guarded WinDbg handoff remain unrun.
+
 ## Assumptions and defaults
 
 V1 targets Apple Silicon macOS, BN6/Python 3.13, two open PE views, and agent-readable
