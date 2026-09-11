@@ -4,16 +4,61 @@ import copy
 import hashlib
 import json
 import struct
+import sys
 import tempfile
 import unittest
 from pathlib import Path
-from unittest.mock import Mock
+from unittest.mock import Mock, patch
 
 import evidence
 import gui_capture
 
 
 class EvidenceTests(unittest.TestCase):
+    def test_modal_dialog_blocks_capture_before_creating_output_or_opening_files(self):
+        ui, widgets, adapter, qt = Mock(), Mock(), Mock(), Mock()
+        adapter.main_thread.side_effect = lambda action: action()
+        widgets.QApplication.instance.return_value.activeModalWidget.return_value = Mock()
+        with patch.dict(sys.modules, {
+            "binaryninjaui": ui,
+            "PySide6.QtWidgets": widgets,
+            "PySide6.QtCore": qt,
+            "binja_windbg_mcp.adapter": adapter,
+        }), tempfile.TemporaryDirectory() as folder:
+            output = Path(folder) / "capture"
+            with self.assertRaisesRegex(RuntimeError, "modal dialogs"):
+                gui_capture.start("missing-reference", "missing-target", "missing-bindiff", output)
+            self.assertFalse(output.exists())
+            ui.UIContext.allContexts.assert_not_called()
+            qt.QTimer.singleShot.assert_not_called()
+
+    def test_quit_refuses_modal_dialog_and_dispatches_application_action_when_ready(self):
+        ui, widgets, context = Mock(), Mock(), Mock()
+        ui.UIContext.allContexts.return_value = [context]
+        application = widgets.QApplication.instance.return_value
+        with patch.dict(sys.modules, {"binaryninjaui": ui, "PySide6.QtWidgets": widgets}):
+            with self.assertRaisesRegex(RuntimeError, "modal dialogs"):
+                gui_capture.request_gui_quit()
+            context.getCurrentActionHandler.assert_not_called()
+            application.activeModalWidget.return_value = None
+            gui_capture.request_gui_quit()
+            context.getCurrentActionHandler.return_value.executeAction.assert_called_once_with("Quit")
+
+    def test_quit_refuses_multiple_contexts_and_unavailable_action(self):
+        ui, widgets, context = Mock(), Mock(), Mock()
+        widgets.QApplication.instance.return_value.activeModalWidget.return_value = None
+        with patch.dict(sys.modules, {"binaryninjaui": ui, "PySide6.QtWidgets": widgets}):
+            for contexts in ([], [context, Mock()]):
+                ui.UIContext.allContexts.return_value = contexts
+                with self.assertRaisesRegex(RuntimeError, "one disposable GUI"):
+                    gui_capture.request_gui_quit()
+            ui.UIContext.allContexts.return_value = [context]
+            handler = context.getCurrentActionHandler.return_value
+            handler.isValidAction.return_value = False
+            with self.assertRaisesRegex(RuntimeError, "Quit action is unavailable"):
+                gui_capture.request_gui_quit()
+            handler.executeAction.assert_not_called()
+
     def test_target_preparation_navigates_then_finishes_analysis(self):
         target = Path("target.dll").resolve()
         reference_view, target_view = Mock(), Mock()
@@ -55,7 +100,7 @@ class EvidenceTests(unittest.TestCase):
                 report = {"ok": False, "error": "original analysis failure"}
                 calls = []
 
-                def action(stage):
+                def action(stage, output=output, report=report, calls=calls, failures=failures):
                     saved = json.loads((output / "capture.json").read_text())
                     self.assertEqual(saved["error"], report["error"])
                     calls.append(stage)

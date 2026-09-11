@@ -79,6 +79,14 @@ can run in an empty, disposable BN6 Personal GUI. For an isolated process use
 `--new-instance`, `BN_USER_DIRECTORY` and `BN_QSETTINGS_POSTFIX` as described in
 [BN troubleshooting](https://docs.binary.ninja/guide/troubleshooting.html). Merely
 changing the user directory can forward the launch to an existing instance.
+Complete the first-run wizard before starting a capture. For an automated disposable
+profile, write `{"ui.allowWelcome": false}` to its `settings.json` before launch.
+BN 6.0.10601 on macOS can abort when the application Quit action closes the main
+window while `FirstSetupDialog` is still active, even without the companion loaded.
+The helper refuses to start or request quit through an active modal dialog.
+Run one disposable instance at a time and record its exit status before starting
+the next; an exit code of zero, without forced termination, is required for clean
+shutdown evidence. Keep this setting scoped to the disposable profile.
 Put the companion checkout and
 this skill's `scripts` directory on that GUI's Python path, with the companion's
 dependencies installed, then run from its Python console:
@@ -98,8 +106,10 @@ The helper opens only these two files, creates its own companion workspace, reco
 all match/unmatched pages and up to ten diffs, navigates to a target match, compares
 before/after hashes of analysis state and bytes, and writes `capture.json`.
 It closes its comparison and workspace. It leaves the views open by default;
-`quit_on_finish=True` requests exit of that disposable GUI; confirm it actually
-exits before recording quit acceptance. This is a direct companion API
+`quit_on_finish=True` requests exit through the application's Quit action; confirm
+it actually exits before recording quit acceptance. Quit refusal is retained under
+`cleanup_errors`; a successful request alone does not establish clean exit.
+This is a direct companion API
 capture, not an MCP transport or live WinDbg test.
 
 If a previous capture shows generation changes caused by displaying the target
