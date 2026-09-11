@@ -305,6 +305,10 @@ impl Facts {
     }
 }
 
+/// The width of every field this module reads: `IoControlCode` and the two lengths are `ULONG`s,
+/// so a value narrower than this is part of one rather than one.
+const FIELD_WIDTH: u32 = 4;
+
 /// How many times the block walk may sweep the function before the facts stop moving.
 ///
 /// A forward analysis in reverse post-order converges in about one sweep per loop nesting level,
@@ -995,7 +999,9 @@ fn keeps_a_bound(instruction: &Instruction, register: &str) -> bool {
     match instruction.operands.get(1) {
         // A byte per index or a dword per case, read **through** the bounded register: the two
         // tables a switch is made of, each leaving its result where the index was.
-        Some(Operand::Memory(memory)) if instruction.effect == Effect::Move => {
+        Some(Operand::Memory(memory))
+            if matches!(instruction.effect, Effect::Move | Effect::MoveSigned) =>
+        {
             let through = memory
                 .index
                 .as_ref()
@@ -1021,14 +1027,13 @@ fn source_value(
     match instruction.operands.get(1)? {
         // A copy carries the value only if it carries **all** of it: `movzx ecx,ax` is two bytes
         // of a `ULONG`, and a compare against that is a statement about part of a field.
+        // **A copy carries the value only if it carries all of it.** `movzx ecx,ax` and a plain
+        // `mov cx,ax` both leave two bytes of a `ULONG` behind, and a compare against that is a
+        // statement about part of a field reported as one about the field -- a control code whose
+        // device type nobody read. The question is the source register's **width**, which the
+        // decoder answers because it decoded the register.
         Operand::Register(register) => match instruction.effect {
-            // **A copy carries the value only if it carries all of it.** `movzx ecx,ax` is two
-            // bytes of a `ULONG`, and a compare against that is a statement about part of a field
-            // reported as one about the field. The exact question is the source register's
-            // *width*, which is glslang/dbgscope#154; until that lands this excludes the widening
-            // loads by name, which catches `movzx` and `movsx` and leaves a narrow plain `mov`
-            // between two registers as the hole that field closes.
-            Effect::Move if instruction.mnemonic == "mov" => {
+            Effect::Move | Effect::MoveSigned if register.width >= FIELD_WIDTH => {
                 facts.registers.get(&register.full).cloned()
             }
             _ => None,
@@ -1115,7 +1120,17 @@ fn compare(
         return None;
     }
 
-    let register = register_full(left)?;
+    // **A narrow compare tests part of the value, and that is not the value.** `cmp r13w,2003h`
+    // constrains sixteen bits of a `ULONG` and matches every code sharing them, so reporting it as
+    // one exact control code invents the bits it never read -- and as a bounds check it would size
+    // a table from a number the index may exceed.
+    let Operand::Register(operand) = left else {
+        return None;
+    };
+    if operand.width < FIELD_WIDTH {
+        return None;
+    }
+    let register = operand.full.clone();
     match facts.registers.get(&register)? {
         Value::Code {
             offset,
@@ -1175,7 +1190,7 @@ fn follow_table(
 
     // **The 32-bit form jumps through the table itself**: `jmp dword ptr [table+eax*4]`, with no
     // register in between and the entry a whole address rather than an offset from the image.
-    let ((_load, memory), added) = match jump.operands.first() {
+    let ((load, memory), added) = match jump.operands.first() {
         Some(Operand::Memory(memory)) if memory.scale == 4 && memory.index.is_some() => {
             ((jump, memory), None)
         }
@@ -1203,7 +1218,7 @@ fn follow_table(
                     Some(Operand::Memory(memory))
                         if memory.scale == 4
                             && memory.index.is_some()
-                            && instruction.effect == Effect::Move =>
+                            && matches!(instruction.effect, Effect::Move | Effect::MoveSigned) =>
                     {
                         found = Some((instruction, memory));
                         break;
@@ -1299,6 +1314,15 @@ fn follow_table(
     for (position, case) in cases.iter().enumerate() {
         let entry = u32::from_le_bytes(*rvas.get(*case)?);
         let target = match entry_base {
+            // **A sign-extending load makes the entry a signed displacement.** `movsxd rax,dword
+            // ptr [table+index*4]` is how a compiler writes a table whose cases sit *before* the
+            // base it is measured from, and zero-extending one of those adds four gigabytes --
+            // which lands outside the image, so the whole table is refused and its cases are
+            // silently lost. Which of the two it is comes from the decoder's own classification
+            // of the load rather than from its spelling.
+            Some(base) if load.effect == Effect::MoveSigned => {
+                base.wrapping_add_signed(i64::from(entry as i32))
+            }
             Some(base) => base.wrapping_add(u64::from(entry)),
             None => u64::from(entry),
         };
@@ -1744,7 +1768,8 @@ mod tests {
     /// with itself.
     fn insn(address: u64, mnemonic: &str, operands: Vec<Operand>, flow: Flow) -> Instruction {
         let effect = match mnemonic {
-            "mov" | "movzx" | "movsx" | "movsxd" => Effect::Move,
+            "mov" | "movzx" => Effect::Move,
+            "movsx" | "movsxd" => Effect::MoveSigned,
             "lea" => Effect::LoadAddress,
             "cmp" => Effect::Compare,
             "test" => Effect::Test,
@@ -1806,23 +1831,57 @@ mod tests {
     /// answer, and it is per bitness, so a fixture that computed it would be sharing whatever the
     /// code under test uses to decide.
     fn named(name: &str) -> RegisterOperand {
+        // The width belongs to the spelling, and it is the field a test about a partial read is
+        // about: `ax` is two bytes of the same register `eax` gives four of.
+        // A numbered register's suffix says its width, and the legacy names say theirs by being
+        // themselves. Spelled out because on a target it is the decoder's answer -- and because a
+        // test about a **partial** read is about nothing at all if the narrow spelling is not in
+        // the family map: the lookup misses, no fact is found, and the assertion passes for a
+        // reason that has nothing to do with the width.
+        let numbered = name.strip_prefix('r').and_then(|rest| {
+            let (digits, suffix) = rest.split_at(rest.len().saturating_sub(1));
+            match (
+                digits.chars().all(|c| c.is_ascii_digit()) && !digits.is_empty(),
+                suffix,
+            ) {
+                (true, "d") => Some((format!("r{digits}"), 4)),
+                (true, "w") => Some((format!("r{digits}"), 2)),
+                (true, "b") => Some((format!("r{digits}"), 1)),
+                _ => match rest.chars().all(|c| c.is_ascii_digit()) && !rest.is_empty() {
+                    true => Some((name.to_string(), 8)),
+                    false => None,
+                },
+            }
+        });
+        if let Some((full, width)) = numbered {
+            return RegisterOperand {
+                name: name.to_string(),
+                full,
+                width,
+            };
+        }
+        let width = match name {
+            "al" | "ah" | "bl" | "cl" | "dl" | "sil" | "dil" => 1,
+            "ax" | "bx" | "cx" | "dx" | "si" | "di" => 2,
+            name if name.starts_with('e') => 4,
+            _ => 8,
+        };
         let full = match name {
             "rax" | "eax" | "ax" | "al" | "ah" => "rax",
             "rbx" | "ebx" | "bx" | "bl" => "rbx",
             "rcx" | "ecx" | "cx" | "cl" => "rcx",
             "rdx" | "edx" | "dx" | "dl" => "rdx",
-            "rsi" | "esi" | "si" => "rsi",
-            "rdi" | "edi" | "di" => "rdi",
+            "rsi" | "esi" | "si" | "sil" => "rsi",
+            "rdi" | "edi" | "di" | "dil" => "rdi",
             "rbp" | "ebp" => "rbp",
             "rsp" | "esp" => "rsp",
-            "r12" | "r12d" => "r12",
-            "r13" | "r13d" => "r13",
             "rip" | "eip" => "rip",
             other => other,
         };
         RegisterOperand {
             name: name.to_string(),
             full: full.to_string(),
+            width,
         }
     }
 
@@ -1836,6 +1895,8 @@ mod tests {
         RegisterOperand {
             name: name.to_string(),
             full: name.to_string(),
+            // Every 32-bit spelling these fixtures use is the whole register on that target.
+            width: 4,
         }
     }
 
@@ -3583,6 +3644,177 @@ mod tests {
             "the completion routine is not this code's handler: {:?}",
             found.cases[0]
         );
+    }
+
+    /// A **narrow** compare tests part of the control code, and part of it is not it.
+    ///
+    /// `cmp r13w,2003h` constrains sixteen bits of a `ULONG` and matches every code that shares
+    /// them, so reporting it as one exact code invents the bits nobody read — a device type out of
+    /// thin air. The same fixture at the register's full width is the control code, which is what
+    /// makes this about the width rather than about the compare.
+    ///
+    /// The copy is the other half of the same question: `movzx ecx,ax` carries two bytes of the
+    /// value, and a compare against `ecx` afterwards is a statement about those two.
+    #[test]
+    fn a_narrow_compare_or_copy_does_not_carry_the_control_code() {
+        let compared = |spelling: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg(spelling), imm(0x2003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert!(
+            compared("r13w").cases.is_empty(),
+            "two bytes of a ULONG are not a control code: {:?}",
+            compared("r13w").cases
+        );
+        assert_eq!(
+            compared("r13d")
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x2003],
+            "and four bytes are: {:?}",
+            compared("r13d").cases
+        );
+
+        let copied = |mnemonic: &str, source: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                // The code into `rax` first, so the narrow read below is a read of *it* rather
+                // than of a register holding nothing.
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    mnemonic,
+                    vec![reg("ecx"), reg(source)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    "cmp",
+                    vec![reg("ecx"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x14, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert!(
+            copied("movzx", "ax").cases.is_empty(),
+            "a copy of two bytes carries two bytes: {:?}",
+            copied("movzx", "ax").cases
+        );
+        assert_eq!(
+            copied("mov", "eax")
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x222003],
+            "and a copy of the whole value carries it: {:?}",
+            copied("mov", "eax").cases
+        );
+    }
+
+    /// A **sign-extending** load makes a table entry a signed displacement.
+    ///
+    /// `movsxd rax,dword ptr [table+index*4]` is how a compiler writes a table whose cases sit
+    /// *before* the base they are measured from. Zero-extending one of those adds about four
+    /// gigabytes, which lands outside the image — so the table is refused as not being one and
+    /// every case in it is lost, with the jump reported unresolved. The fixture's first entry is
+    /// negative for exactly that reason.
+    #[test]
+    fn a_sign_extending_load_reads_its_entries_as_signed() {
+        const TABLE: i64 = 0x9000;
+        const BASE: u64 = IMAGE_BASE + 0x8000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rcx"), at_address(BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x21,
+                "movsxd",
+                vec![reg("rax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2b, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let table_at = BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at && len == 8).then(|| {
+                // One case before the base and one after it.
+                [(-0x1000i32) as u32, 0x1000u32]
+                    .iter()
+                    .flat_map(|entry| entry.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x222000, BASE - 0x1000), (0x222001, BASE + 0x1000)],
+            "the negative entry is a displacement backwards: {:?}",
+            found.cases
+        );
+        assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
     }
 
     /// An indirect jump with no bounds check is **recorded**, not dropped.
