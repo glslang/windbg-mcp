@@ -2370,9 +2370,15 @@ pub struct ImportedSink {
     /// category is the half a reader acts on, and the half that makes two drivers comparable
     /// without knowing either API.
     pub kind: String,
-    /// The import address table slot a call goes through — the coordinate a call site is matched
+    /// The import address table slots calls go through — the coordinates a call site is matched
     /// by, and the reason this works on a driver with no symbols at all.
-    pub slot: String,
+    ///
+    /// **Almost always one.** A linker emits an import once per library, so more than one here
+    /// means the import table repeats a name, which a crafted image can do and a real one does
+    /// not. Bounded, with [`Self::slot_count`] exact beside it.
+    pub slots: Vec<String>,
+    /// How many slots carry this name in this library, exact however many are listed.
+    pub slot_count: usize,
     /// Where the scanned code transfers control through that slot, as `module`+`rva` locations —
     /// a **sample** rather than the whole list when [`Self::call_site_count`] is larger.
     ///

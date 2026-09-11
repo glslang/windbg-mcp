@@ -229,8 +229,15 @@ pub struct Sink {
     pub library: String,
     pub name: String,
     pub kind: SinkKind,
-    /// The IAT slot a call to it goes through — the coordinate a call site is matched by.
-    pub slot: u64,
+    /// The IAT slots calls to it go through — the coordinates a call site is matched by.
+    ///
+    /// **A list, and almost always of one.** A linker emits an import once per library, so a real
+    /// image has exactly one slot here; more than one means the import table repeats a name, which
+    /// a crafted image can do and a real one does not. Bounded like everything else the answer
+    /// carries, with [`Self::slot_count`] exact beside it.
+    pub slots: Vec<u64>,
+    /// How many slots carry this name in this library, exact however many are listed.
+    pub slot_count: usize,
     /// The call sites found, in address order, **up to [`MAX_CALL_SITES_PER_SINK`]**. A sample
     /// rather than the list when [`Self::call_site_count`] is larger.
     ///
@@ -292,6 +299,17 @@ pub struct Scan {
     pub cap_hit: bool,
 }
 
+/// **Every list this answer carries is bounded, and every count beside it is exact.**
+///
+/// Stated once because it was arrived at three times: a byte cap that bounds the *work* bounds
+/// nothing about the *answer*, and each list found its own way to be enormous — four million
+/// privileged instructions inside the byte cap, six hundred call sites through one slot, half a
+/// million sink records from an import table that repeats a name. The rule that ends the class is
+/// that a list is capped and a count is not, so a bounded answer always says how much of one it is.
+///
+/// The sinks themselves need no number: keyed by library and name they are bounded by the curated
+/// list, which is the difference between a limit and an arbitrary one.
+///
 /// The most call sites listed for one sink, and the most privileged instructions listed at all.
 ///
 /// **The byte cap bounds the work; these bound the answer, and the two are different budgets.**
@@ -304,6 +322,11 @@ pub struct Scan {
 pub const MAX_CALL_SITES_PER_SINK: usize = 256;
 /// See [`MAX_CALL_SITES_PER_SINK`].
 pub const MAX_PRIVILEGED: usize = 1024;
+/// See [`MAX_CALL_SITES_PER_SINK`]. One in every real image; more means a repeated name.
+pub const MAX_SLOTS_PER_SINK: usize = 16;
+/// See [`MAX_CALL_SITES_PER_SINK`]. Both lists are bounded by the byte cap and the section count
+/// already; this keeps a pathological section table from turning that into thousands of rows.
+pub const MAX_RANGES: usize = 256;
 
 /// The most code one scan will decode, in bytes.
 ///
@@ -337,22 +360,31 @@ pub fn scan(
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> Scan {
     let by_slot = pe::imports_by_slot(imports);
-    let mut sinks: BTreeMap<u64, Sink> = BTreeMap::new();
+    // **Keyed by library and name, not by slot**, which is what bounds this list by construction:
+    // a crafted table repeating one sensitive name across half a million slots is one sink with a
+    // slot count, where keying by slot made it half a million records to allocate, attribute and
+    // serialize. A real image has one slot per name per library, so the two keyings agree on
+    // everything anyone actually scans.
+    let mut sinks: BTreeMap<(String, String), Sink> = BTreeMap::new();
     let mut other_imports = 0usize;
     for import in imports {
         match (&import.name, sink_kind(&import.name.to_string())) {
             (pe::ImportName::Named(name), Some(kind)) => {
-                sinks.insert(
-                    import.slot,
-                    Sink {
+                let sink = sinks
+                    .entry((import.library.clone(), name.clone()))
+                    .or_insert_with(|| Sink {
                         library: import.library.clone(),
                         name: name.clone(),
                         kind,
-                        slot: import.slot,
+                        slots: Vec::new(),
+                        slot_count: 0,
                         call_sites: Vec::new(),
                         call_site_count: 0,
-                    },
-                );
+                    });
+                sink.slot_count += 1;
+                if sink.slots.len() < MAX_SLOTS_PER_SINK {
+                    sink.slots.push(import.slot);
+                }
             }
             _ => other_imports += 1,
         }
@@ -430,6 +462,15 @@ pub fn scan(
                 close(&mut run, &mut scanned);
                 break 'sections;
             }
+            // The two range lists are bounded like everything else the answer carries. A section
+            // table that is plausible produces a handful of entries; one that is not can produce a
+            // row per window per section, and a bounded answer is still an answer where thousands
+            // of rows is a reply nobody reads.
+            if scanned.len() + unreadable.len() >= MAX_RANGES {
+                cap_hit = true;
+                close(&mut run, &mut scanned);
+                break 'sections;
+            }
             let want = WINDOW.min(end - at).min(budget);
             let Some(block) = decode(at, want as usize) else {
                 // A window that would not read is skipped rather than ending the scan — a driver
@@ -452,7 +493,8 @@ pub fn scan(
             }
             for instruction in &block {
                 if let Some(import) = by_slot.get(&called_slot(instruction).unwrap_or(0))
-                    && let Some(sink) = sinks.get_mut(&import.slot)
+                    && let Some(sink) =
+                        sinks.get_mut(&(import.library.clone(), import.name.to_string()))
                 {
                     // Counted always, listed up to the cap: the count is the fact and the list is
                     // a sample of it.
@@ -562,7 +604,8 @@ pub fn structured_report(
                 library: sink.library.clone(),
                 name: sink.name.clone(),
                 kind: sink.kind.name().to_string(),
-                slot: structured::addr(sink.slot),
+                slots: sink.slots.iter().map(|at| structured::addr(*at)).collect(),
+                slot_count: sink.slot_count,
                 call_sites: sink.call_sites.iter().map(|at| locate(*at)).collect(),
                 call_site_count: sink.call_site_count,
             })
@@ -1190,6 +1233,51 @@ mod tests {
             sink.call_site_count, found.privileged_count,
             "the fixture emits one of each per pair, so the two counts agree — which is what says              both are counting rather than both being capped"
         );
+    }
+
+    /// An import table that repeats a name is **one** sink, not one per slot.
+    ///
+    /// This is what bounds the sink list by construction rather than by a number. Keyed by slot, a
+    /// crafted table naming `memcpy` in every one of its thousands of entries became thousands of
+    /// records to allocate, attribute and serialize — the third way this answer found to be
+    /// enormous inside a byte cap that bounds only the work. Keyed by library and name it is one
+    /// record with a slot count, and a real image, which imports a name once per library, is
+    /// unaffected either way.
+    #[test]
+    fn an_import_table_that_repeats_a_name_is_one_sink() {
+        let image = image();
+        let imports: Vec<pe::Import> = (0..MAX_SLOTS_PER_SINK * 4)
+            .map(|index| import("memcpy", BASE + 0x3000 + (index as u64 * 8)))
+            .collect();
+
+        let found = scan(&image, &imports, |_, _| None, never);
+        assert_eq!(
+            found.sinks.len(),
+            1,
+            "one name, one sink: {:?}",
+            found.sinks
+        );
+        let sink = &found.sinks[0];
+        assert_eq!(sink.slot_count, imports.len(), "the count is exact");
+        assert_eq!(
+            sink.slots.len(),
+            MAX_SLOTS_PER_SINK,
+            "and the list is bounded"
+        );
+        assert_eq!(
+            found.other_imports, 0,
+            "every one of them is the same sink, not an unlisted import"
+        );
+
+        // The same name from a *different* library is a different import and stays separate.
+        let mut two = imports.clone();
+        two.push(pe::Import {
+            library: "hal.dll".to_string(),
+            name: pe::ImportName::Named("memcpy".to_string()),
+            slot: BASE + 0x3900,
+        });
+        let found = scan(&image, &two, |_, _| None, never);
+        assert_eq!(found.sinks.len(), 2, "{:?}", found.sinks);
     }
 
     /// A section beginning **outside** the image is recorded, not skipped.
