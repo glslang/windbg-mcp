@@ -13,6 +13,14 @@
 //! *under* the device. What this says is what the object grants; who arrives holding what is a
 //! different question and needs a token.
 //!
+//! # Where a descriptor can be read from
+//!
+//! **Not from the checked-in kernel minidump**, measured 2026-09-11: `!devobj
+//! \Device\MountPointManager` there answers `Unable to get value of ObpRootDirectoryObject`
+//! and then `not found`, because a minidump carries no object namespace to walk. So the oracle for
+//! this is the live-kernel tier -- the four ACEs `docs/driver-ioctl-walkthrough.md` published --
+//! and what a dump can still serve is a descriptor whose address a caller already has.
+//!
 //! # Engine-free
 //!
 //! Like [`crate::pe`], [`crate::ioctl`], [`crate::hazards`] and [`crate::driver`], the entry point
