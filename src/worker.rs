@@ -6680,7 +6680,7 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
             structured::ErrorCategory::Debugger,
             format!(
                 "this build decodes x86 and x64 instructions, and this target's are machine \
-                 {machine} -- so the compares that recognise a control code cannot be read, and a \
+                 {machine} — so the compares that recognise a control code cannot be read, and a \
                  map of `{dispatch}` would report a routine that accepts none. `driver_object` \
                  and `decode_ioctl` work here."
             ),
