@@ -20,7 +20,9 @@
 //!   itself rather than the code **shifted**; anything else is recorded as an unresolved
 //!   transfer, because a table read at a guessed address is a list of plausible addresses rather
 //!   than an answer, and a shifted index is several codes reaching one slot with nothing here
-//!   saying which of them the driver takes.
+//!   saying which of them the driver takes. A case recovered this way carries no **sizes**: the
+//!   edge it arrived on is not in the graph, so nothing is believed about the registers a length
+//!   check would be read through.
 //!
 //! # What decides the control code
 //!
@@ -485,7 +487,22 @@ pub(crate) fn map(
         let Some(at) = index_of.get(&case.lands).and_then(|&at| graph.holding(at)) else {
             continue;
         };
-        let facts = entry[at].clone().unwrap_or_default();
+        // **A jump-table case arrives along an edge this graph does not have.** Its blocks and
+        // edges are what the *encoding* says, and an indirect `jmp` says nothing about where it
+        // goes -- the table said that, and the table was read after the facts had stopped moving.
+        // So what is on the way into a landing block is what its **direct** predecessors left,
+        // which for a case the table selected is somebody else's path: `mountmgr` has a landing
+        // reached by five table entries *and* by a `cmp`, and that compare's path would lend its
+        // registers to all five -- a length checked through one of them published as the required
+        // size of codes whose path clobbered it. Read with nothing believed instead, which is what
+        // this pass already does for a block no edge reaches at all. It costs a table case its
+        // sizes; getting them back means feeding the resolved edges into the sweeps and settling
+        // the facts again, which is a different change from this one and would move what every
+        // block downstream of such a landing believes.
+        let facts = match case.recovered {
+            Recovery::JumpTable => Facts::default(),
+            Recovery::Compare => entry[at].clone().unwrap_or_default(),
+        };
         let instructions = &block[graph.blocks[at].start..graph.blocks[at].end];
         case.handler = handler_in(instructions);
         let refuses = refuses_in(at, &graph, block, layout);
@@ -3640,6 +3657,142 @@ mod tests {
             narrow.cases[0].in_size, None,
             "two bytes of a ULONG are not the length: {:?}",
             narrow.cases[0]
+        );
+    }
+
+    /// A landing block shared by a compare and a table lends its facts to the compare **only**.
+    ///
+    /// `mountmgr` has one: a block five table entries and one `cmp` all reach. The graph has the
+    /// compare's edge and not the table's -- an indirect `jmp` says nothing about where it goes,
+    /// and the table that does say was read after the facts had stopped moving -- so what is on
+    /// the way into that block is the compare path's registers. Here that path still holds the IO
+    /// stack location in `rax` while the switch path overwrites `rax` with the jump target, so a
+    /// `cmp [rax+10h],20h` in the shared block is a length check on one path and an unknown
+    /// register's field on the other. Read for both, it publishes an exact input size for codes
+    /// whose own path proves nothing about it -- and a caller sizing a buffer from it is refused
+    /// by the driver it was obeying.
+    #[test]
+    fn a_table_case_does_not_inherit_the_facts_of_a_compare_that_shares_its_landing() {
+        const TABLE: i64 = 0x9000;
+        const SHARED: u64 = DISPATCH + 0x80;
+        const OTHER: u64 = DISPATCH + 0xa0;
+        const REFUSE: u64 = DISPATCH + 0xc0;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(SHARED))),
+            // The switch, which takes `rax` for the jump target and so knows nothing about the
+            // stack location by the time it arrives.
+            insn(
+                DISPATCH + 0x14,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x17,
+                "sub",
+                vec![reg("eax"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1d,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x26,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2d,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x34,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x37, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            // The shared landing: the compare's case and the table's first entry both arrive.
+            insn(
+                SHARED,
+                "cmp",
+                vec![mem("rax", 0x10), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(SHARED + 6, "jne", Vec::new(), Flow::Branch(Some(REFUSE))),
+            insn(
+                SHARED + 0xc,
+                "call",
+                vec![Operand::Target(0x5000)],
+                Flow::Call(Some(0x5000)),
+            ),
+            insn(SHARED + 0x11, "ret", Vec::new(), Flow::Return),
+            // The table's second entry, so the table is a table rather than one slot.
+            insn(
+                OTHER,
+                "call",
+                vec![Operand::Target(0x6000)],
+                Flow::Call(Some(0x6000)),
+            ),
+            insn(OTHER + 5, "ret", Vec::new(), Flow::Return),
+            // What the length check's other edge reaches, which is what makes it exact.
+            insn(
+                REFUSE,
+                "mov",
+                vec![reg("eax"), imm(0xc000_0023)],
+                Flow::Fallthrough,
+            ),
+            insn(REFUSE + 5, "ret", Vec::new(), Flow::Return),
+        ]);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at && len == 8).then(|| {
+                [SHARED - IMAGE_BASE, OTHER - IMAGE_BASE]
+                    .iter()
+                    .flat_map(|rva| (*rva as u32).to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (
+                    case.code,
+                    case.recovered,
+                    case.lands,
+                    case.in_size.map(|size| (size.value, size.exact))
+                ))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x222003, Recovery::Compare, SHARED, Some((0x20, true))),
+                (0x6dc004, Recovery::JumpTable, SHARED, None),
+                (0x6dc005, Recovery::JumpTable, OTHER, None),
+            ],
+            "the compare proved the length and the table entry beside it proved nothing: {:?}",
+            found.cases
         );
     }
 
