@@ -898,11 +898,18 @@ fn source_value(
             }
             let base = memory.base.as_deref().and_then(family);
             let held = base.and_then(|base| state.get(base).copied());
+            // **A partial read of the control code is not the control code.** `movzx eax,word ptr
+            // [rdx+18h]` inspects the function and method bits and nothing above them, so a
+            // compare after it is a statement about part of the value; reported as a whole code it
+            // invents a device type out of the two bytes nobody read. A `ULONG` field is read four
+            // bytes at a time, and anything else at that displacement is refused rather than
+            // widened. The same for the two lengths, which are `ULONG`s too.
+            let dword = memory.size == Some(4);
             match (held, memory.displacement) {
                 (Some(Value::Irp), d) if d == layout.current_stack_location => {
                     Some(Value::StackLocation)
                 }
-                (Some(Value::StackLocation), d) if d == layout.control_code => {
+                (Some(Value::StackLocation), d) if d == layout.control_code && dword => {
                     *traced = true;
                     Some(Value::Code {
                         offset: 0,
@@ -910,21 +917,23 @@ fn source_value(
                         proved: true,
                     })
                 }
-                (Some(Value::StackLocation), d) if d == layout.input_length => {
+                (Some(Value::StackLocation), d) if d == layout.input_length && dword => {
                     Some(Value::InputLength)
                 }
-                (Some(Value::StackLocation), d) if d == layout.output_length => {
+                (Some(Value::StackLocation), d) if d == layout.output_length && dword => {
                     Some(Value::OutputLength)
                 }
                 // The fallback the module doc describes: a `+0x18` off a register whose chain was
                 // not followed. Believed, because a listing that starts mid-function or a driver
                 // that fetches the stack location in a helper would otherwise answer nothing --
                 // and `code_proved` stays false, which is where that doubt is carried.
-                (None, d) if d == layout.control_code && base.is_some() => Some(Value::Code {
-                    offset: 0,
-                    shift: 0,
-                    proved: false,
-                }),
+                (None, d) if d == layout.control_code && dword && base.is_some() => {
+                    Some(Value::Code {
+                        offset: 0,
+                        shift: 0,
+                        proved: false,
+                    })
+                }
                 _ => None,
             }
         }
@@ -1042,13 +1051,14 @@ fn follow_table(
     // register in between and the entry an absolute address rather than an offset from the image.
     // Refusing every memory-operand jump left dense switches on exactly the targets `Layout::X86`
     // exists to serve permanently unresolved.
-    let (dword_load, dword_memory) = match jump.operands.first() {
+    let ((dword_load, dword_memory), added) = match jump.operands.first() {
         Some(Operand::Memory(memory)) if memory.scale == 4 && memory.index.is_some() => {
-            (jump, memory)
+            ((jump, memory), None)
         }
         Some(Operand::Register(register)) => {
             let mut wanted = family(register)?;
             let mut found = None;
+            let mut added: Option<&'static str> = None;
             for instruction in window.iter().rev() {
                 // **Only an instruction that *defines* the register continues the chain.** A
                 // `cmp rcx,[base+rax*4+table]` has the register as its first operand and writes
@@ -1080,7 +1090,12 @@ fn follow_table(
                     }
                     // `add rcx,rdx` folds the image base into the entry: the value being followed
                     // is still the one in `rcx`, so the chain continues through the same register.
-                    Some(Operand::Register(_)) if instruction.mnemonic == "add" => continue,
+                    // **Which register was added is recorded**, because that — and not the memory
+                    // operand's base — is what execution adds to every entry.
+                    Some(Operand::Register(source)) if instruction.mnemonic == "add" => {
+                        added = Some(family(source)?);
+                        continue;
+                    }
                     // A copy: follow the register it came from.
                     Some(Operand::Register(source)) if instruction.mnemonic == "mov" => {
                         wanted = family(source)?;
@@ -1090,7 +1105,7 @@ fn follow_table(
                     _ => return None,
                 }
             }
-            found?
+            (found?, added)
         }
         _ => return None,
     };
@@ -1099,25 +1114,27 @@ fn follow_table(
     // the image base the compiler loaded into a register, which is why the same register appears
     // in the load and in the `add` after it. A 32-bit one jumps straight through the table and its
     // entries are whole addresses, so adding anything to them lands nowhere.
-    let absolute = dword_load.address == jump.address;
-    let (table, entry_base) = match absolute {
-        true => {
-            let start = match dword_memory.base.as_deref().and_then(family) {
-                Some(base) => match state.get(base).copied() {
-                    Some(Value::Address(address)) => address,
-                    _ => return None,
-                },
-                None => 0,
-            };
-            (start.checked_add_signed(dword_memory.displacement)?, None)
-        }
-        false => {
-            let base = table_base(dword_memory, state)?;
-            (
-                base.checked_add_signed(dword_memory.displacement)?,
-                Some(base),
-            )
-        }
+    let table = match dword_memory.base.as_deref().and_then(family) {
+        Some(base) => match state.get(base).copied() {
+            Some(Value::Address(address)) => address,
+            _ => return None,
+        },
+        // An absolute table with no base register at all — the 32-bit shape.
+        None => 0,
+    }
+    .checked_add_signed(dword_memory.displacement)?;
+    // **What an entry means is decided by what the code adds to it.** A 64-bit switch folds the
+    // image base in with an `add`, so its entries are offsets from *that register's* value; a
+    // 32-bit one adds nothing and its entries are whole addresses. Taking the memory operand's
+    // base instead agrees with a compiler's own switch, where they are the same register, and
+    // disagrees silently with anything else — producing addresses that can still land inside the
+    // image and so pass every check after this one.
+    let entry_base = match added {
+        Some(register) => match state.get(register).copied() {
+            Some(Value::Address(address)) => Some(address),
+            _ => return None,
+        },
+        None => None,
     };
 
     // **Which register the bounds check covered decides the shape, and getting this wrong is how a
@@ -1363,6 +1380,14 @@ fn sizes_in(
     let mut input = None;
     let mut output = None;
     let mut pending: Option<(i64, u32, u64)> = None;
+    // **The snapshot is where the case starts, not what it keeps.** The registers holding the IO
+    // stack location are read at the top of the dispatch chain, and a case block is free to
+    // overwrite one before it compares anything -- `mov rax,<some other pointer>` then
+    // `cmp [rax+10h],20h` is a field of some other structure, and a `jne` to a failure block would
+    // promote it to an exact input length. So a register stops counting the moment this block
+    // writes to it. A block that re-derives the pointer into the same register loses it too, which
+    // is the conservative direction: a length check not reported against one invented.
+    let mut live: Vec<&'static str> = stack_registers.to_vec();
     for instruction in window {
         // The case's own region ends here, and what follows belongs to the next one.
         if matches!(
@@ -1371,11 +1396,17 @@ fn sizes_in(
         ) {
             break;
         }
+        // Anything that writes a register retires it, and a compare writes none.
+        if !matches!(instruction.mnemonic.as_str(), "cmp" | "test" | "push")
+            && let Some(written) = instruction.operands.first().and_then(register_of)
+        {
+            live.retain(|register| *register != written);
+        }
         if instruction.mnemonic == "cmp" {
             pending = None;
             if let Some(Operand::Memory(memory)) = instruction.operands.first()
                 && let Some(base) = memory.base.as_deref().and_then(family)
-                && stack_registers.contains(&base)
+                && live.contains(&base)
                 && let Some(value) = instruction.operands.get(1).and_then(immediate_of)
                 && let Ok(value) = u32::try_from(value)
             {
@@ -2570,6 +2601,267 @@ mod tests {
             found.cases[0].handler, None,
             "the completion routine is not this code's handler: {:?}",
             found.cases[0]
+        );
+    }
+
+    /// A **partial** read of the control code is not the control code.
+    ///
+    /// `movzx eax,word ptr [rax+18h]` inspects the function and method bits and nothing above
+    /// them, so a compare after it is a statement about part of the value. Reported as a whole
+    /// code it invents a device type out of two bytes nobody read — `0x2003` becomes device
+    /// `0x0000`, which is a code no driver has. The same fixture at four bytes wide is the control code:
+    /// the only difference between the two is the width, which is what makes this about the width.
+    #[test]
+    fn a_partial_read_of_the_control_code_is_not_a_case() {
+        let block = |width: u32| {
+            vec![
+                insn(
+                    DISPATCH,
+                    "mov",
+                    vec![reg("rax"), mem("rdx", 0xb8)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 4,
+                    "movzx",
+                    vec![
+                        reg("eax"),
+                        Operand::Memory(MemoryOperand {
+                            size: Some(width),
+                            segment: None,
+                            base: Some("rax".to_string()),
+                            index: None,
+                            scale: 1,
+                            displacement: 0x18,
+                            address: None,
+                        }),
+                    ],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("eax"), imm(0x2003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            ]
+        };
+
+        let partial = map(
+            DISPATCH,
+            &block(2),
+            Layout::X64,
+            unreadable,
+            in_image,
+            never,
+        );
+        assert!(
+            partial.cases.is_empty(),
+            "two bytes of a ULONG are not a control code: {:?}",
+            partial.cases
+        );
+        assert!(!partial.code_proved);
+
+        let whole = map(
+            DISPATCH,
+            &block(4),
+            Layout::X64,
+            unreadable,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            whole.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
+            vec![0x2003],
+            "and four bytes are: {:?}",
+            whole.cases
+        );
+        assert!(whole.code_proved);
+    }
+
+    /// A table's entries are offsets from the register the code **adds**, not from the one the
+    /// load happened to index against.
+    ///
+    /// They are the same register in a compiler's own switch, so a resolver reading the memory
+    /// operand's base agrees with every real one and disagrees silently with anything else. The
+    /// fixture separates them: the load indexes against `rdx` and the `add` folds in `rcx`, which
+    /// holds a different image address. Read against `rdx` the entries resolve to addresses that
+    /// are still inside the image, so nothing downstream catches it -- the answer is simply wrong
+    /// about where every case goes.
+    #[test]
+    fn a_table_entry_is_an_offset_from_the_register_that_is_added() {
+        const TABLE: i64 = 0x9000;
+        const OTHER: u64 = IMAGE_BASE + 0x4000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rdx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x21,
+                "lea",
+                vec![reg("rcx"), at_address(OTHER)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "mov",
+                vec![reg("eax"), indexed(Some("rdx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2f,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x32, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at && len == 8).then(|| {
+                [0x1000u32, 0x2000]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x222000, OTHER + 0x1000), (0x222001, OTHER + 0x2000)],
+            "against `rcx`, which is what the `add` uses: {:?}",
+            found.cases
+        );
+    }
+
+    /// A stack-location register stops counting once the case block writes to it.
+    ///
+    /// The set is read at the top of the dispatch chain, and a case is free to put something else
+    /// in `rax` before comparing `[rax+10h]` -- a field of another structure entirely, which a
+    /// `jne` to a failure block would otherwise promote to an exact input length. The second case
+    /// in the fixture does not overwrite it, so the assertion is about the write and not about
+    /// the fixture.
+    #[test]
+    fn a_clobbered_base_is_no_longer_the_stack_location() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("r13d"), imm(0x222007)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x60)),
+            ),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+            // `rax` held the stack location at the top of the routine; this case puts something
+            // else in it first.
+            insn(
+                DISPATCH + 0x40,
+                "mov",
+                vec![reg("rax"), mem("rbx", 0x8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x44,
+                "cmp",
+                vec![mem("rax", 0x10), imm(0x20)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x4b,
+                "jne",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x80)),
+            ),
+            insn(DISPATCH + 0x51, "ret", Vec::new(), Flow::Return),
+            // And one that compares the same field without touching the register.
+            insn(
+                DISPATCH + 0x60,
+                "cmp",
+                vec![mem("rax", 0x10), imm(0x40)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x67,
+                "jne",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x80)),
+            ),
+            insn(DISPATCH + 0x6d, "ret", Vec::new(), Flow::Return),
+            // The failure tail both branch to.
+            insn(
+                DISPATCH + 0x80,
+                "mov",
+                vec![reg("eax"), imm(0xc000_000d)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x85, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.in_size.map(|size| size.value)))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, None), (0x222007, Some(0x40))],
+            "the overwritten base is not the stack location any more: {:?}",
+            found.cases
         );
     }
 
