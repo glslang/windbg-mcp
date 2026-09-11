@@ -93,6 +93,16 @@ when the compare's memory base is the current stack-location pointer, and comple
 (multi-instruction conditions, computed offsets, table lookups) aren't decoded. This is the documented
 boundary where item 6 would take over.
 
+**Half of it is closed, and the half that is left is the recipe's.** `ioctl_map` (`src/ioctl.rs`)
+does not infer from the displacement: it follows the chain from the dispatch routine's IRP argument
+through `+0xb8` into the stack location, reports per case whether the value it tested came that way
+or from a bare displacement, and accepts a length check only when its base is a register the walk
+watched the stack location reach. What still reads a displacement alone is
+`crate::driver::field_from_operands`, which fills `BranchPredicate.field` in a reachability recipe
+— so a recipe step naming `IoControlCode` is still a hint about a compare rather than a fact about a
+structure, and `docs/structured-results.md` says so. Closing that half means giving the recipe pass
+the same tracking, which is the same shape of work one function over.
+
 ## 6. [windbg-mcp] Concolic/symbolic buffer synthesis (DECISIONS.md D2 — scoped out)
 
 Auto-emit a concrete `(code, buffer, lengths)` by SMT-solving the on-path branch predicates, rather
