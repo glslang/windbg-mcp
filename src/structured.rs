@@ -2420,6 +2420,14 @@ pub struct IoctlCase {
     /// How this case was recovered: `compare` for a compare against the control code, `jump_table`
     /// for an entry in a resolved switch table.
     pub recovered: String,
+    /// Whether the value this case tested was traced from the IRP (`[[Irp+0xb8]+0x18]`) rather
+    /// than read off a bare `+0x18` displacement.
+    ///
+    /// **Per case, because one routine can hold both.** A dispatch routine that compares some
+    /// other structure's `+0x18` field before reading the real control code has a guessed case and
+    /// a traced one, and a flag on the routine would let the first borrow the second's
+    /// credibility. [`IoctlMap::code_proved`] is every case together.
+    pub proved: bool,
     /// Where the code is recognised — the compare, or the indirect jump whose table holds it.
     pub at: CodeLocation,
     /// The length checks found in the case block, including the ones that are not sizes.
@@ -2479,6 +2487,18 @@ pub struct IoctlMap {
     /// True when a bound ended a list early — the cases, or one table's entries.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cap_hit: bool,
+    /// How many instructions in the routine could **not** be read or decoded.
+    ///
+    /// Each is a place a compare or a dispatch jump may be, so any of these makes the map
+    /// incomplete in a way no other field says: nothing stopped, no bound was hit, nothing was
+    /// left unresolved, and there was simply nothing there to read. The remedy is an image the
+    /// session can reach rather than a longer clock.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub blind: usize,
+}
+
+fn usize_is_zero(value: &usize) -> bool {
+    *value == 0
 }
 
 /// One sensitive API a driver imports, and where its code reaches it.

@@ -6727,7 +6727,14 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
     let in_image = |address: u64| {
         holding.is_some_and(|module| address >= module.base && address < module.end())
     };
-    let found = ioctl::map(entry, &block, read, in_image, || {
+    // **The structure offsets follow the target, and the check above is what makes this pair
+    // exhaustive**: an instruction set whose operands are not read was refused before this point,
+    // so the only two left are the two that have a layout.
+    let layout = match set {
+        dbgscope::dbgeng::InstructionSet::X86 => ioctl::Layout::X86,
+        _ => ioctl::Layout::X64,
+    };
+    let found = ioctl::map(entry, &block, layout, read, in_image, || {
         if let Some(why) = halted.get() {
             return Some(why);
         }
