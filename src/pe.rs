@@ -401,6 +401,11 @@ pub fn read_imports(
     }
     let descriptors = at(directory, size as usize)?;
     let mut table = ImportTable::default();
+    // **A slot belongs to one import.** It holds one function pointer, so two names claiming it is
+    // a structure that does not hold together — and continuing would make every call through it an
+    // arbitrary choice between the two, reported as a fact. Refused here rather than resolved
+    // downstream, because a consumer indexing by slot can only silently keep the last one.
+    let mut claimed: std::collections::HashSet<u64> = std::collections::HashSet::new();
     let mut terminated = false;
     for index in 0..(descriptors.len() / 20) {
         if halt() {
@@ -467,6 +472,11 @@ pub fn read_imports(
             };
             // Checked as the table grows rather than after it, which is the whole point: a limit
             // enforced on a finished list is a limit enforced after the memory was spent.
+            if !claimed.insert(slot) {
+                return Err(PeError::Malformed {
+                    reason: "two imports claim the same import address table slot",
+                });
+            }
             if table.imports.len() >= MAX_IMPORTS_TOTAL {
                 return Err(PeError::Malformed {
                     reason: "the image imports more functions in total than a plausible one does",
@@ -732,6 +742,34 @@ mod tests {
         assert_eq!(
             read_imports(&image, |at, len| fake.read(at, len), || false).unwrap(),
             ImportTable::default()
+        );
+    }
+
+    /// A slot belongs to **one** import, and two claiming it is refused.
+    ///
+    /// A slot holds one function pointer, so two names claiming it is a structure that does not
+    /// hold together — and an index keyed by slot can only silently keep the last one, which makes
+    /// every call through that address an arbitrary choice between the two, reported as a fact.
+    /// The other name then reports no call sites at all, which reads as an import the driver never
+    /// uses.
+    #[test]
+    fn two_imports_claiming_one_slot_are_refused() {
+        let mut fake = driver_image();
+        // A second library whose `FirstThunk` is the first one's, so their slots collide.
+        put(&mut fake.bytes, 0x2014, &0x2060u32.to_le_bytes()); // OriginalFirstThunk
+        put(&mut fake.bytes, 0x2014 + 12, &0x2100u32.to_le_bytes()); // Name
+        put(&mut fake.bytes, 0x2014 + 16, &0x3000u32.to_le_bytes()); // FirstThunk: the same
+        put(&mut fake.bytes, 0x2028, &[0u8; 20]); // terminator moves along
+        put(&mut fake.bytes, 0x174, &60u32.to_le_bytes()); // three descriptor slots
+        // Its lookup table names one import and ends.
+        put(&mut fake.bytes, 0x2060, &0x2120u64.to_le_bytes());
+        put(&mut fake.bytes, 0x2068, &0u64.to_le_bytes());
+
+        let image = read_image(BASE, |at, len| fake.read(at, len)).unwrap();
+        let read = read_imports(&image, |at, len| fake.read(at, len), || false);
+        assert!(
+            matches!(read, Err(PeError::Malformed { .. })),
+            "a slot claimed twice is refused rather than resolved to whichever came last: {read:?}"
         );
     }
 
