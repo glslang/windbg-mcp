@@ -6640,8 +6640,18 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     scan.unnamed_libraries = table.unnamed_libraries;
 
     let mut attributor = Attributor::default();
-    let report =
-        hazards::structured_report(module, base, &scan, |address| attributor.locate(e, address));
+    let expired = std::cell::Cell::new(false);
+    let mut report = hazards::structured_report(module, base, &scan, |address| {
+        locate_within(address, deadline, &expired, |address| {
+            attributor.locate(e, address)
+        })
+    });
+    // A scan whose attribution ran out of clock stopped, whatever the decode did: the answer is
+    // short of coordinates and says so here rather than leaving a reader to wonder why call sites
+    // in a loaded driver name no module.
+    if expired.get() {
+        report.stopped = Some(structured::WalkHalt::Deadline);
+    }
     Ok(Output::typed(hazards::render(&report), report))
 }
 
@@ -6748,9 +6758,46 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
     });
 
     let mut attributor = Attributor::default();
-    let mut report = ioctl::structured_report(&found, |address| attributor.locate(e, address));
+    let expired = std::cell::Cell::new(false);
+    let mut report = ioctl::structured_report(&found, |address| {
+        locate_within(address, deadline, &expired, |address| {
+            attributor.locate(e, address)
+        })
+    });
     report.images = attributor.images();
+    if expired.get() {
+        report.stopped = Some(structured::WalkHalt::Deadline);
+    }
     Ok(Output::typed(ioctl::render(&report), report))
+}
+
+/// Attribution that stops asking the engine once the caller's clock has run out.
+///
+/// Turning an address into a coordinate is a `module_at` call, and an address in **no** loaded
+/// module is deliberately not cached -- the cache holds ranges that resolved. So a bounded answer
+/// that still carries thousands of addresses (an IOCTL map's landing sites, a scan's call sites)
+/// can keep issuing serialized engine calls long after its caller has timed out, holding the
+/// session against every job behind it. Past the deadline an address is reported as one the lookup
+/// did not answer for, which is what `attribution_failed` means and is true: nothing asked.
+///
+/// The flag it sets is what the caller reports as a stop, so an answer whose coordinates thinned
+/// out says why rather than looking like a target whose addresses are in no image.
+fn locate_within(
+    address: u64,
+    deadline: Instant,
+    expired: &std::cell::Cell<bool>,
+    locate: impl FnOnce(u64) -> structured::CodeLocation,
+) -> structured::CodeLocation {
+    if Instant::now() >= deadline {
+        expired.set(true);
+        return structured::CodeLocation {
+            address: structured::addr(address),
+            module: None,
+            rva: None,
+            attribution_failed: true,
+        };
+    }
+    locate(address)
 }
 
 /// Whether a read falls inside the module the loader mapped.
@@ -7346,6 +7393,57 @@ fn ",
             body.contains("within_module(base, loaded_size, at, len)"),
             "`driver_hazards` reads the image unbounded again, so a header field can send the              parser into whatever is mapped after the module."
         );
+    }
+
+    /// Past the deadline, an address is **not** taken to the engine.
+    ///
+    /// Attribution is a `module_at` call each, and an address in no loaded module is deliberately
+    /// not cached, so a bounded answer that still carries thousands of them — an IOCTL map's
+    /// landing sites, a scan's call sites — keeps issuing serialized engine calls long after its
+    /// caller has gone, holding the session against every job behind it. What makes that visible
+    /// is a counting closure: the returned coordinate looks the same either way, and the property
+    /// is that nothing was asked.
+    ///
+    /// The flag is what the caller reports as a stop, so the two are asserted together: an answer
+    /// whose coordinates thinned out has to say why, or it reads as a target whose addresses are
+    /// in no image at all.
+    #[test]
+    fn attribution_stops_asking_the_engine_when_the_clock_has_run_out() {
+        let asked = std::cell::Cell::new(0usize);
+        let resolve = |address: u64| {
+            asked.set(asked.get() + 1);
+            structured::CodeLocation {
+                address: structured::addr(address),
+                module: Some("driver".to_string()),
+                rva: Some("0x1000".to_string()),
+                attribution_failed: false,
+            }
+        };
+
+        let expired = std::cell::Cell::new(false);
+        let live = locate_within(
+            0xffff_f800_0000_1000,
+            Instant::now() + Duration::from_secs(60),
+            &expired,
+            resolve,
+        );
+        assert_eq!(asked.get(), 1, "inside the clock, the engine answers");
+        assert_eq!(live.module.as_deref(), Some("driver"));
+        assert!(!expired.get());
+
+        let past = locate_within(
+            0xffff_f800_0000_2000,
+            Instant::now() - Duration::from_secs(1),
+            &expired,
+            resolve,
+        );
+        assert_eq!(asked.get(), 1, "and past it, nothing is asked");
+        assert_eq!(past.module, None);
+        assert!(
+            past.attribution_failed,
+            "which is a lookup that did not answer, not an address in no image: {past:?}"
+        );
+        assert!(expired.get(), "and the caller is told to report a stop");
     }
 
     /// An image's extent is the **smaller** of what its header claims and what the loader
