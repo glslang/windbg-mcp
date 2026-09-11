@@ -8009,12 +8009,22 @@ fn a_reachability_answer_carries_coordinates_and_its_own_rendering() {
     // instead of skipping. Caught by the assertion above it, which had the same mistake.
     if is_tool_error(&response) {
         let text = text_of(result);
-        // The one environmental failure: no PDB for `nt`, so there is no symbol to walk from.
-        // Every other error is this server's and fails the tier.
+        // **Branched on the category, not the wording** — the rule this server asks its own
+        // callers to follow, and this test is one of them. It matched two phrases until the
+        // resolver grew a deadline, at which point a slow symbol server produced a third, and the
+        // tier panicked where it was written to stand down: on exactly the host it exists for.
+        // Two categories are the host's. `debugger` is no PDB for `nt`; `timeout` is a symbol
+        // server too slow to answer inside the call. Anything else is this server's and fails the
+        // tier — an `interrupted` here would mean something stopped a call nobody interrupted.
+        //
+        // The `debugger` arm is measured: point `from` at a symbol that cannot resolve and this
+        // stands down. The `timeout` arm is **not**, because a symbol server slow enough to be cut
+        // short is not something a bench with a warm cache can arrange; it is here because the
+        // resolver can now produce it, not because it has been seen.
+        let category = &result["structuredContent"]["error"]["category"];
         assert!(
-            text.contains("could not resolve") || text.contains("could not disassemble"),
-            "reachability failed for a reason that is not the host's:
-{text}"
+            category == "debugger" || category == "timeout",
+            "reachability failed for a reason that is not the host's ({category}):\n{text}"
         );
         skip(&format!("nt resolved no symbol on this host: {text}"));
         return;
