@@ -2432,7 +2432,11 @@ pub struct DriverHazards {
     pub base: String,
     /// The version of the curated sink list this scan used.
     pub sink_list_version: String,
-    /// The sensitive imports the driver holds, in slot order.
+    /// The sensitive imports the driver holds, in **library and name order**.
+    ///
+    /// It was slot order while a sink was one slot. Grouping repeated imports made the key the
+    /// library and the name, which changed what the order is — a stable one either way, and this
+    /// says which, because an order stated and not kept is worse than one nobody promised.
     pub sinks: Vec<ImportedSink>,
     /// The privileged instructions found, in address order, and bounded like the call sites above.
     pub privileged: Vec<PrivilegedInstruction>,

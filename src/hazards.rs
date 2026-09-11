@@ -310,6 +310,12 @@ pub struct Scan {
 /// The sinks themselves need no number: keyed by library and name they are bounded by the curated
 /// list, which is the difference between a limit and an arbitrary one.
 ///
+/// **A per-group cap is not a bound**, which is the correction this rule needed after it was first
+/// written. The call sites were capped per sink, and sixty-four libraries times forty-seven names
+/// is three thousand sinks — so the product of two limits was three quarters of a million
+/// locations, every one of them attributed and serialized. Where a list is per-group the groups
+/// share a total, and the per-group cap is then only there to stop one group taking all of it.
+///
 /// The most call sites listed for one sink, and the most privileged instructions listed at all.
 ///
 /// **The byte cap bounds the work; these bound the answer, and the two are different budgets.**
@@ -320,6 +326,9 @@ pub struct Scan {
 /// they prevent is the absurd rather than the large. The exact counts travel beside the lists, so
 /// a capped answer says how much it is a sample of.
 pub const MAX_CALL_SITES_PER_SINK: usize = 256;
+/// The total across every sink. See [`MAX_CALL_SITES_PER_SINK`]: the per-sink cap keeps one name
+/// from taking the whole budget, and this is what actually bounds the answer.
+pub const MAX_CALL_SITES_TOTAL: usize = 4096;
 /// See [`MAX_CALL_SITES_PER_SINK`].
 pub const MAX_PRIVILEGED: usize = 1024;
 /// See [`MAX_CALL_SITES_PER_SINK`]. One in every real image; more means a repeated name.
@@ -392,6 +401,7 @@ pub fn scan(
 
     let mut privileged = Vec::new();
     let mut privileged_count = 0usize;
+    let mut listed_call_sites = 0usize;
     let mut scanned = Vec::new();
     let mut unreadable: Vec<Scanned> = Vec::new();
     let mut budget = MAX_SCAN_BYTES;
@@ -511,8 +521,11 @@ pub fn scan(
                     // Counted always, listed up to the cap: the count is the fact and the list is
                     // a sample of it.
                     sink.call_site_count += 1;
-                    if sink.call_sites.len() < MAX_CALL_SITES_PER_SINK {
+                    if sink.call_sites.len() < MAX_CALL_SITES_PER_SINK
+                        && listed_call_sites < MAX_CALL_SITES_TOTAL
+                    {
                         sink.call_sites.push(instruction.address);
+                        listed_call_sites += 1;
                     }
                 }
                 if let Some(kind) = privilege_kind(instruction) {
@@ -1302,6 +1315,92 @@ mod tests {
         assert_eq!(
             overlapped, plain,
             "the overlap is skipped, not decoded again: {overlapped:x?}"
+        );
+    }
+
+    /// The call sites are bounded **in total**, not only per sink.
+    ///
+    /// A per-group cap is not a bound, which is what this one needed pointing out: sixty-four
+    /// libraries times forty-seven curated names is three thousand sinks, so two limits multiplied
+    /// out to three quarters of a million locations — every one attributed through an engine call
+    /// and serialized. The per-sink cap is still there to stop one name taking the whole budget;
+    /// the total is what bounds the answer.
+    #[test]
+    fn the_call_sites_are_bounded_across_every_sink_together() {
+        let mut image = image();
+        image.size_of_image = 0x40000;
+        image.sections[0].virtual_size = 0x30000;
+
+        // Enough distinct sinks that the per-sink cap alone would allow far more than the total:
+        // each gets its own slot, and the scan calls every one of them in turn.
+        let names = [
+            "memcpy",
+            "memmove",
+            "RtlCopyMemory",
+            "RtlMoveMemory",
+            "ProbeForRead",
+            "ProbeForWrite",
+            "ExAllocatePool2",
+            "ExAllocatePool3",
+            "MmMapIoSpace",
+            "MmMapIoSpaceEx",
+            "ZwCreateFile",
+            "ZwWriteFile",
+            "ZwOpenProcess",
+            "ZwOpenProcessToken",
+            "SeAccessCheck",
+            "SePrivilegeCheck",
+            "RtlULongAdd",
+            "RtlULongMult",
+            "MmGetPhysicalAddress",
+            "ObReferenceObjectByHandle",
+        ];
+        assert!(
+            names.len() * MAX_CALL_SITES_PER_SINK > MAX_CALL_SITES_TOTAL,
+            "the fixture must be able to cross the total without any one sink crossing its own cap"
+        );
+        let imports: Vec<pe::Import> = names
+            .iter()
+            .enumerate()
+            .map(|(index, name)| import(name, BASE + 0x3000 + (index as u64 * 8)))
+            .collect();
+
+        let found = scan(
+            &image,
+            &imports,
+            |at, want| {
+                let mut block = Vec::new();
+                let mut address = at;
+                let mut which = 0usize;
+                while address + 6 <= at + want as u64 {
+                    block.push(call_slot(
+                        address,
+                        BASE + 0x3000 + ((which % names.len()) as u64 * 8),
+                    ));
+                    address += 6;
+                    which += 1;
+                }
+                Some(block)
+            },
+            never,
+        );
+
+        let listed: usize = found.sinks.iter().map(|sink| sink.call_sites.len()).sum();
+        let counted: usize = found.sinks.iter().map(|sink| sink.call_site_count).sum();
+        assert_eq!(
+            listed, MAX_CALL_SITES_TOTAL,
+            "the answer is bounded across the sinks together"
+        );
+        assert!(
+            counted > MAX_CALL_SITES_TOTAL,
+            "and the counts are not: {counted}"
+        );
+        assert!(
+            found
+                .sinks
+                .iter()
+                .all(|sink| sink.call_sites.len() < MAX_CALL_SITES_PER_SINK),
+            "no single sink reached its own cap, so only the total can have stopped this"
         );
     }
 
