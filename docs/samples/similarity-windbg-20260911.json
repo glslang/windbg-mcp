@@ -1,0 +1,1216 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-11",
+  "purpose": "BN Personal similarity to guarded live WinDbg actions on an owned benign ARM64 fixture",
+  "environment": {
+    "bn": "6.0.10601 Personal",
+    "host": "Apple Silicon macOS 26.6.2 (25G83)",
+    "guest": "Windows ARM64",
+    "rustc": "1.96.1 aarch64-pc-windows-msvc",
+    "windbg_mcp_commit": "17f5d7300b92b9510822c805c972317cbc9b92e1",
+    "companion_base_commit": "0fded637340b4f5eb07d91e72d2b3ab18fb767a0",
+    "companion_local_changes": "close-file notification fix and regression test from lifecycle acceptance",
+    "transport": "authenticated loopback MCP through an owned SSH tunnel"
+  },
+  "source_sha256": {
+    "docs/samples/similarity-windbg-probe-20260911.py": "20c9cc0a54c7d6afb5b2894ceb6ac2e37859bab00fdd638dce15741e51b19fdf",
+    "docs/samples/similarity-windbg-fixture-20260911.rs": "8824cee3c8c159f168a7942398550b8d573a3d441ffdc7dd05d57be7157f088c"
+  },
+  "companion_sha256": {
+    "binja_windbg_mcp/adapter.py": "f46bd4f3bd1d30a1710146bc9e09fdc025611393c389062d70096b4df475a6d3",
+    "binja_windbg_mcp/pairing.py": "148012c703fb09f5aed78c37abde201cb0142c3ef1286651db8fff9e31aacb90",
+    "binja_windbg_mcp/server.py": "01ba27b4dceea638a4f9efcf9aa9f0419c2338aeed3aa3633e1677cbb9c9636c",
+    "binja_windbg_mcp/native/libbinja_binexport.dylib": "54a740c3dbf61f6dba861380a0454d63984a032445405f5daf5d9d5ab7ffd904"
+  },
+  "bindiff_sha256": "22a508a735f049b0aa71de8a0a4d5f58fc66698d0acc751d48a6e24043152ecc",
+  "fixtures": {
+    "reference": {
+      "sha256": "39540f3215b279d1b3a4c0536a0786189742da2f97b473e14fd23813be01ca39",
+      "size_bytes": 3072,
+      "probe_step_addend": 7
+    },
+    "target": {
+      "sha256": "4ec29723e87ff3a017dd0a02222645bf5829f3f8b927a737f272831c0f0aeb22",
+      "size_bytes": 3072,
+      "probe_step_addend": 11
+    }
+  },
+  "initial_probe": {
+    "ok": false,
+    "reason": "Probe expected identity_mismatch category; live API correctly returned debugger with coordinate PE identity mismatch. Corrected probe assertion only.",
+    "wrong_build_read_memory": {
+      "is_error": true,
+      "data": {
+        "error": {
+          "category": "debugger",
+          "message": "coordinate PE identity mismatch",
+          "session_id": "sess-18d45bea72f44a20-7"
+        },
+        "status": "error"
+      },
+      "text": []
+    },
+    "session_inventory_restored": true,
+    "gui_exit": {
+      "returncode": 0,
+      "forced": false
+    }
+  },
+  "capture": {
+    "ok": true,
+    "bn_version": "6.0.10601 Personal",
+    "calls": {
+      "sessions_before": {
+        "is_error": false,
+        "data": {
+          "max_sessions": 4,
+          "sessions": [],
+          "status": "ok",
+          "unknown_handle": false
+        },
+        "text": []
+      },
+      "similarity_start": {
+        "is_error": false,
+        "data": {
+          "comparison_id": "e3238e85a0a449f5b74640f12f66f7b5",
+          "state": "preparing",
+          "active": true,
+          "closing": false,
+          "progress": 0.0,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "preparing",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "782b305025f24994bbd180c2b7eab292",
+            "target": "e834a02779d34c17980f8feb9f040a91"
+          },
+          "snapshots": {},
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "text": []
+      },
+      "similarity_status": {
+        "is_error": false,
+        "data": {
+          "comparison_id": "e3238e85a0a449f5b74640f12f66f7b5",
+          "state": "completed",
+          "active": false,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "importing",
+          "omitted_functions": {
+            "reference": 0,
+            "target": 0
+          },
+          "binary_ids": {
+            "reference": "782b305025f24994bbd180c2b7eab292",
+            "target": "e834a02779d34c17980f8feb9f040a91"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "39540f3215b279d1b3a4c0536a0786189742da2f97b473e14fd23813be01ca39",
+              "hash_source": "original Raw view",
+              "image_name": "handoff_probe.exe",
+              "binary_id": "782b305025f24994bbd180c2b7eab292",
+              "path": "/private/tmp/bn-windbg-handoff-20260911/reference/handoff_probe.exe",
+              "display_name": "handoff_probe.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1789155882,
+                "size": 16384,
+                "pdb": {
+                  "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "782b305025f24994bbd180c2b7eab292",
+                5368709120,
+                5
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "4ec29723e87ff3a017dd0a02222645bf5829f3f8b927a737f272831c0f0aeb22",
+              "hash_source": "original Raw view",
+              "image_name": "handoff_probe.exe",
+              "binary_id": "e834a02779d34c17980f8feb9f040a91",
+              "path": "/private/tmp/bn-windbg-handoff-20260911/target/handoff_probe.exe",
+              "display_name": "handoff_probe.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1789155883,
+                "size": 16384,
+                "pdb": {
+                  "guid": "1E080823700E4350AB5739A242442337",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "e834a02779d34c17980f8feb9f040a91",
+                5368709120,
+                5
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 3,
+          "coverage_complete": true,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "text": []
+      },
+      "similarity_results": {
+        "is_error": false,
+        "data": {
+          "comparison_id": "e3238e85a0a449f5b74640f12f66f7b5",
+          "state": "completed",
+          "active": false,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "importing",
+          "omitted_functions": {
+            "reference": 0,
+            "target": 0
+          },
+          "binary_ids": {
+            "reference": "782b305025f24994bbd180c2b7eab292",
+            "target": "e834a02779d34c17980f8feb9f040a91"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "39540f3215b279d1b3a4c0536a0786189742da2f97b473e14fd23813be01ca39",
+              "hash_source": "original Raw view",
+              "image_name": "handoff_probe.exe",
+              "binary_id": "782b305025f24994bbd180c2b7eab292",
+              "path": "/private/tmp/bn-windbg-handoff-20260911/reference/handoff_probe.exe",
+              "display_name": "handoff_probe.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1789155882,
+                "size": 16384,
+                "pdb": {
+                  "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "782b305025f24994bbd180c2b7eab292",
+                5368709120,
+                5
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "4ec29723e87ff3a017dd0a02222645bf5829f3f8b927a737f272831c0f0aeb22",
+              "hash_source": "original Raw view",
+              "image_name": "handoff_probe.exe",
+              "binary_id": "e834a02779d34c17980f8feb9f040a91",
+              "path": "/private/tmp/bn-windbg-handoff-20260911/target/handoff_probe.exe",
+              "display_name": "handoff_probe.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1789155883,
+                "size": 16384,
+                "pdb": {
+                  "guid": "1E080823700E4350AB5739A242442337",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "e834a02779d34c17980f8feb9f040a91",
+                5368709120,
+                5
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 3,
+          "coverage_complete": true,
+          "unresolved_results": 0,
+          "error": null,
+          "side": "target",
+          "kind": "matches",
+          "items": [
+            {
+              "result_id": "match_1",
+              "provider": "Google BinDiff",
+              "similarity": 255,
+              "confidence": 253,
+              "raw_similarity": 1.0,
+              "raw_confidence": 0.9933071490757153,
+              "reference": {
+                "binary_id": "782b305025f24994bbd180c2b7eab292",
+                "generation": [
+                  "782b305025f24994bbd180c2b7eab292",
+                  5368709120,
+                  5
+                ],
+                "coordinate": {
+                  "module": "handoff_probe",
+                  "image_name": "handoff_probe.exe",
+                  "identity": {
+                    "timestamp": 1789155882,
+                    "size": 16384,
+                    "pdb": {
+                      "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+                      "age": 1
+                    }
+                  },
+                  "rva": "0x1000"
+                },
+                "address": "0x0000000140001000",
+                "name": "_start"
+              },
+              "target": {
+                "binary_id": "e834a02779d34c17980f8feb9f040a91",
+                "generation": [
+                  "e834a02779d34c17980f8feb9f040a91",
+                  5368709120,
+                  5
+                ],
+                "coordinate": {
+                  "module": "handoff_probe",
+                  "image_name": "handoff_probe.exe",
+                  "identity": {
+                    "timestamp": 1789155883,
+                    "size": 16384,
+                    "pdb": {
+                      "guid": "1E080823700E4350AB5739A242442337",
+                      "age": 1
+                    }
+                  },
+                  "rva": "0x1000"
+                },
+                "address": "0x0000000140001000",
+                "name": "_start"
+              },
+              "backend": "external"
+            },
+            {
+              "result_id": "match_2",
+              "provider": "Google BinDiff",
+              "similarity": 255,
+              "confidence": 248,
+              "raw_similarity": 1.0,
+              "raw_confidence": 0.9706877692486436,
+              "reference": {
+                "binary_id": "782b305025f24994bbd180c2b7eab292",
+                "generation": [
+                  "782b305025f24994bbd180c2b7eab292",
+                  5368709120,
+                  5
+                ],
+                "coordinate": {
+                  "module": "handoff_probe",
+                  "image_name": "handoff_probe.exe",
+                  "identity": {
+                    "timestamp": 1789155882,
+                    "size": 16384,
+                    "pdb": {
+                      "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+                      "age": 1
+                    }
+                  },
+                  "rva": "0x1028"
+                },
+                "address": "0x0000000140001028",
+                "name": "probe_finish"
+              },
+              "target": {
+                "binary_id": "e834a02779d34c17980f8feb9f040a91",
+                "generation": [
+                  "e834a02779d34c17980f8feb9f040a91",
+                  5368709120,
+                  5
+                ],
+                "coordinate": {
+                  "module": "handoff_probe",
+                  "image_name": "handoff_probe.exe",
+                  "identity": {
+                    "timestamp": 1789155883,
+                    "size": 16384,
+                    "pdb": {
+                      "guid": "1E080823700E4350AB5739A242442337",
+                      "age": 1
+                    }
+                  },
+                  "rva": "0x1028"
+                },
+                "address": "0x0000000140001028",
+                "name": "probe_finish"
+              },
+              "backend": "external"
+            },
+            {
+              "result_id": "match_3",
+              "provider": "Google BinDiff",
+              "similarity": 255,
+              "confidence": 252,
+              "raw_similarity": 1.0,
+              "raw_confidence": 0.9890130573694068,
+              "reference": {
+                "binary_id": "782b305025f24994bbd180c2b7eab292",
+                "generation": [
+                  "782b305025f24994bbd180c2b7eab292",
+                  5368709120,
+                  5
+                ],
+                "coordinate": {
+                  "module": "handoff_probe",
+                  "image_name": "handoff_probe.exe",
+                  "identity": {
+                    "timestamp": 1789155882,
+                    "size": 16384,
+                    "pdb": {
+                      "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+                      "age": 1
+                    }
+                  },
+                  "rva": "0x1034"
+                },
+                "address": "0x0000000140001034",
+                "name": "probe_step"
+              },
+              "target": {
+                "binary_id": "e834a02779d34c17980f8feb9f040a91",
+                "generation": [
+                  "e834a02779d34c17980f8feb9f040a91",
+                  5368709120,
+                  5
+                ],
+                "coordinate": {
+                  "module": "handoff_probe",
+                  "image_name": "handoff_probe.exe",
+                  "identity": {
+                    "timestamp": 1789155883,
+                    "size": 16384,
+                    "pdb": {
+                      "guid": "1E080823700E4350AB5739A242442337",
+                      "age": 1
+                    }
+                  },
+                  "rva": "0x1034"
+                },
+                "address": "0x0000000140001034",
+                "name": "probe_step"
+              },
+              "backend": "external"
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        "text": []
+      },
+      "similarity_diff": {
+        "is_error": false,
+        "data": {
+          "comparison_id": "e3238e85a0a449f5b74640f12f66f7b5",
+          "result": {
+            "result_id": "match_3",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 252,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9890130573694068,
+            "reference": {
+              "binary_id": "782b305025f24994bbd180c2b7eab292",
+              "generation": [
+                "782b305025f24994bbd180c2b7eab292",
+                5368709120,
+                5
+              ],
+              "coordinate": {
+                "module": "handoff_probe",
+                "image_name": "handoff_probe.exe",
+                "identity": {
+                  "timestamp": 1789155882,
+                  "size": 16384,
+                  "pdb": {
+                    "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+                    "age": 1
+                  }
+                },
+                "rva": "0x1034"
+              },
+              "address": "0x0000000140001034",
+              "name": "probe_step"
+            },
+            "target": {
+              "binary_id": "e834a02779d34c17980f8feb9f040a91",
+              "generation": [
+                "e834a02779d34c17980f8feb9f040a91",
+                5368709120,
+                5
+              ],
+              "coordinate": {
+                "module": "handoff_probe",
+                "image_name": "handoff_probe.exe",
+                "identity": {
+                  "timestamp": 1789155883,
+                  "size": 16384,
+                  "pdb": {
+                    "guid": "1E080823700E4350AB5739A242442337",
+                    "age": 1
+                  }
+                },
+                "rva": "0x1034"
+              },
+              "address": "0x0000000140001034",
+              "name": "probe_step"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x0000000140001034",
+                "rva": "0x1034",
+                "text": "add     w8, w0, w0, lsl #0x1",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x0000000140001034",
+                "rva": "0x1034",
+                "text": "add     w8, w0, w0, lsl #0x1",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x0000000140001038",
+                "rva": "0x1038",
+                "text": "add     w9, w0, #0x7",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x0000000140001038",
+                "rva": "0x1038",
+                "text": "add     w9, w0, #0xb",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014000103c",
+                "rva": "0x103c",
+                "text": "cmp     w0, #0xa",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014000103c",
+                "rva": "0x103c",
+                "text": "cmp     w0, #0xa",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x0000000140001040",
+                "rva": "0x1040",
+                "text": "csel    w0, w9, w8, hi",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x0000000140001040",
+                "rva": "0x1040",
+                "text": "csel    w0, w9, w8, hi",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x0000000140001044",
+                "rva": "0x1044",
+                "text": "ret     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x0000000140001044",
+                "rva": "0x1044",
+                "text": "ret     ",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 5,
+          "next_offset": null,
+          "truncated": false
+        },
+        "text": []
+      },
+      "launch": {
+        "is_error": false,
+        "data": {
+          "kind": "launch",
+          "report": "r\n x0=0000000000000000   x1=0000000000000000   x2=0000000000000000   x3=0000000000000000\n x4=0000000000000000   x5=0000000000000000   x6=0000000000000000   x7=0000000000000000\n x8=0000000000000000   x9=0000000000000000  x10=0000000000000000  x11=0000000000000000\nx12=0000000000000000  x13=0000000000000000  x14=0000000000000000  x15=0000000000000000\nx16=0000000000000000  x17=0000000000000000  x18=0000000000000000  x19=000000f1c8fbd000\nx20=00007ffe77e9b000  x21=00007ffe77e9b000  x22=0000000000000002  x23=00007ffe768d4c50\nx24=00007ffe77e3c000  x25=00007ffe77eb2380  x26=000000f1c90ff320  x27=00007ffe77e3b000\nx28=0000000000000000   fp=000000f1c90ff2f0   lr=00007ffe77c83348   sp=000000f1c90ff2f0\n pc=00007ffe77c83354  psr=40000040 -Z-- EL0\nntdll!LdrpDoDebuggerBreak+0x34:\n00007ffe`77c83354 d43e0000 brk         #0xF000\n\n4 module(s) loaded, `handoff_probe` at 0x00007ff6104e0000.\n  `modules` lists a page of that table and `modules { \"filter\": \"<name>\" }` answers for one.",
+          "session_id": "sess-18d45bf25c45b004-8",
+          "status": "ok",
+          "summary": {
+            "kernel_mode": false,
+            "modules_loaded": 4,
+            "primary_module": {
+              "checksum": 0,
+              "end": "0x00007ff6104e4000",
+              "image_name": "handoff_probe.exe",
+              "name": "handoff_probe",
+              "size": 16384,
+              "start": "0x00007ff6104e0000",
+              "symbols": "deferred",
+              "timestamp": 1789155883,
+              "user_mode": true
+            }
+          },
+          "target": "C:\\workspace\\bn-windbg-handoff-20260911\\target\\handoff_probe.exe"
+        },
+        "text": []
+      },
+      "modules": {
+        "is_error": false,
+        "data": {
+          "loaded": 4,
+          "matched": 4,
+          "modules": [
+            {
+              "checksum": 0,
+              "end": "0x00007ff6104e4000",
+              "image_name": "handoff_probe.exe",
+              "name": "handoff_probe",
+              "size": 16384,
+              "start": "0x00007ff6104e0000",
+              "symbols": "deferred",
+              "timestamp": 1789155883,
+              "user_mode": true
+            },
+            {
+              "checksum": 6411240,
+              "end": "0x00007ffe73a5a000",
+              "image_name": "C:\\WINDOWS\\System32\\KERNELBASE.dll",
+              "name": "KERNELBASE",
+              "size": 6332416,
+              "start": "0x00007ffe73450000",
+              "symbols": "deferred",
+              "timestamp": 2372941808,
+              "user_mode": true
+            },
+            {
+              "checksum": 1469193,
+              "end": "0x00007ffe76a20000",
+              "image_name": "C:\\WINDOWS\\System32\\KERNEL32.DLL",
+              "name": "KERNEL32",
+              "size": 1441792,
+              "start": "0x00007ffe768c0000",
+              "symbols": "deferred",
+              "timestamp": 35142611,
+              "user_mode": true
+            },
+            {
+              "checksum": 4310196,
+              "end": "0x00007ffe77f3d000",
+              "image_name": "ntdll.dll",
+              "loaded_image_name": "C:\\WINDOWS\\SYSTEM32\\ntdll.dll",
+              "name": "ntdll",
+              "pdb": {
+                "age": 1,
+                "guid": "C54D6A28D7C2DBB40F410DF09B974186",
+                "key": "C54D6A28D7C2DBB40F410DF09B9741861"
+              },
+              "size": 4313088,
+              "start": "0x00007ffe77b20000",
+              "symbols": "pdb",
+              "timestamp": 1891562960,
+              "user_mode": true
+            }
+          ],
+          "status": "ok",
+          "unloaded": [],
+          "unloaded_matched": 0
+        },
+        "text": []
+      },
+      "navigate_step": {
+        "is_error": false,
+        "data": {
+          "address": "0x0000000140001034",
+          "coordinate": {
+            "module": "handoff_probe",
+            "image_name": "handoff_probe.exe",
+            "identity": {
+              "timestamp": 1789155883,
+              "size": 16384,
+              "pdb": {
+                "guid": "1E080823700E4350AB5739A242442337",
+                "age": 1
+              }
+            },
+            "rva": "0x1034"
+          }
+        },
+        "text": []
+      },
+      "pair_windbg": {
+        "is_error": false,
+        "data": {
+          "paired": true,
+          "profile": "handoff",
+          "session_id": "sess-18d45bf25c45b004-8",
+          "binary_id": "e834a02779d34c17980f8feb9f040a91",
+          "state": "following",
+          "actions": {
+            "set_breakpoint": {
+              "enabled": true,
+              "reason": "requires guarded coordinate input and structured output"
+            },
+            "run_to_address": {
+              "enabled": true,
+              "reason": "requires guarded coordinate input and structured output"
+            },
+            "read_memory": {
+              "enabled": true,
+              "reason": "requires guarded coordinate input and structured output"
+            }
+          }
+        },
+        "text": []
+      },
+      "compare_runtime_bytes": {
+        "is_error": false,
+        "data": {
+          "status": "ok",
+          "coordinate": {
+            "module": "handoff_probe",
+            "image_name": "handoff_probe.exe",
+            "identity": {
+              "timestamp": 1789155883,
+              "size": 16384,
+              "pdb": {
+                "guid": "1E080823700E4350AB5739A242442337",
+                "age": 1
+              }
+            },
+            "rva": "0x1034"
+          },
+          "modified": false,
+          "source": "current BinaryView",
+          "requested_size": 16,
+          "static_data": "0804000b092c00111f2800712081881a",
+          "runtime_data": "0804000b092c00111f2800712081881a",
+          "static_read_size": 16,
+          "runtime_read_size": 16,
+          "incomplete": false,
+          "equal": true,
+          "differing_offsets": [],
+          "relocation_ranges": []
+        },
+        "text": []
+      },
+      "before_wrong_build": {
+        "is_error": false,
+        "data": {
+          "address": "0x00007ffe77c83354",
+          "coordinate": {
+            "identity": {
+              "pdb": {
+                "age": 1,
+                "guid": "C54D6A28D7C2DBB40F410DF09B974186"
+              },
+              "size": 4313088,
+              "timestamp": 1891562960
+            },
+            "image_name": "ntdll.dll",
+            "module": "ntdll",
+            "rva": "0x163354"
+          },
+          "location_state": "mapped",
+          "processor": null,
+          "status": "ok",
+          "thread": 5576
+        },
+        "text": []
+      },
+      "wrong_build_read_memory": {
+        "is_error": true,
+        "data": {
+          "error": {
+            "category": "debugger",
+            "message": "coordinate PE identity mismatch",
+            "session_id": "sess-18d45bf25c45b004-8"
+          },
+          "status": "error"
+        },
+        "text": []
+      },
+      "wrong_build_set_breakpoint": {
+        "is_error": true,
+        "data": {
+          "error": {
+            "category": "debugger",
+            "message": "coordinate PE identity mismatch",
+            "session_id": "sess-18d45bf25c45b004-8"
+          },
+          "status": "error"
+        },
+        "text": []
+      },
+      "wrong_build_run_to_address": {
+        "is_error": true,
+        "data": {
+          "error": {
+            "category": "debugger",
+            "message": "coordinate PE identity mismatch",
+            "session_id": "sess-18d45bf25c45b004-8"
+          },
+          "status": "error"
+        },
+        "text": []
+      },
+      "after_wrong_build": {
+        "is_error": false,
+        "data": {
+          "address": "0x00007ffe77c83354",
+          "coordinate": {
+            "identity": {
+              "pdb": {
+                "age": 1,
+                "guid": "C54D6A28D7C2DBB40F410DF09B974186"
+              },
+              "size": 4313088,
+              "timestamp": 1891562960
+            },
+            "image_name": "ntdll.dll",
+            "module": "ntdll",
+            "rva": "0x163354"
+          },
+          "location_state": "mapped",
+          "processor": null,
+          "status": "ok",
+          "thread": 5576
+        },
+        "text": []
+      },
+      "navigate_before_run_to": {
+        "is_error": false,
+        "data": {
+          "address": "0x0000000140001034",
+          "coordinate": {
+            "module": "handoff_probe",
+            "image_name": "handoff_probe.exe",
+            "identity": {
+              "timestamp": 1789155883,
+              "size": 16384,
+              "pdb": {
+                "guid": "1E080823700E4350AB5739A242442337",
+                "age": 1
+              }
+            },
+            "rva": "0x1034"
+          }
+        },
+        "text": []
+      },
+      "run_to_here": {
+        "is_error": false,
+        "data": {
+          "output": "g\nBreakpoint 0 hit\n*** WARNING: Unable to verify checksum for handoff_probe.exe\n",
+          "status": "ok",
+          "stopped_at": "0x00007ff6104e1034",
+          "target": "0x00007ff6104e1034",
+          "timeout_ms": 60000,
+          "verdict": "hit"
+        },
+        "text": []
+      },
+      "after_run_to": {
+        "is_error": false,
+        "data": {
+          "address": "0x00007ff6104e1034",
+          "coordinate": {
+            "identity": {
+              "pdb": {
+                "age": 1,
+                "guid": "1E080823700E4350AB5739A242442337"
+              },
+              "size": 16384,
+              "timestamp": 1789155883
+            },
+            "image_name": "handoff_probe.exe",
+            "module": "handoff_probe",
+            "rva": "0x1034"
+          },
+          "location_state": "mapped",
+          "processor": null,
+          "status": "ok",
+          "thread": 5576
+        },
+        "text": []
+      },
+      "navigate_finish": {
+        "is_error": false,
+        "data": {
+          "address": "0x0000000140001028",
+          "coordinate": {
+            "module": "handoff_probe",
+            "image_name": "handoff_probe.exe",
+            "identity": {
+              "timestamp": 1789155883,
+              "size": 16384,
+              "pdb": {
+                "guid": "1E080823700E4350AB5739A242442337",
+                "age": 1
+              }
+            },
+            "rva": "0x1028"
+          }
+        },
+        "text": []
+      },
+      "set_breakpoint_here": {
+        "is_error": false,
+        "data": {
+          "breakpoint": {
+            "address": "0x00007ff6104e1028",
+            "deferred": false,
+            "enabled": true,
+            "id": 0,
+            "kind": "code",
+            "one_shot": false,
+            "pass_count": 1,
+            "passes_remaining": 1
+          },
+          "breakpoints": [
+            {
+              "address": "0x00007ff6104e1028",
+              "deferred": false,
+              "enabled": true,
+              "id": 0,
+              "kind": "code",
+              "one_shot": false,
+              "pass_count": 1,
+              "passes_remaining": 1
+            }
+          ],
+          "cut_short": false,
+          "status": "ok"
+        },
+        "text": []
+      },
+      "go": {
+        "is_error": false,
+        "data": {
+          "command": "g",
+          "interrupted": false,
+          "output": "g\nBreakpoint 0 hit\n",
+          "status": "ok",
+          "stopped_at": "0x00007ff6104e1028",
+          "target_gone": false,
+          "thread": 5576,
+          "timed_out": false
+        },
+        "text": []
+      },
+      "after_breakpoint": {
+        "is_error": false,
+        "data": {
+          "address": "0x00007ff6104e1028",
+          "coordinate": {
+            "identity": {
+              "pdb": {
+                "age": 1,
+                "guid": "1E080823700E4350AB5739A242442337"
+              },
+              "size": 16384,
+              "timestamp": 1789155883
+            },
+            "image_name": "handoff_probe.exe",
+            "module": "handoff_probe",
+            "rva": "0x1028"
+          },
+          "location_state": "mapped",
+          "processor": null,
+          "status": "ok",
+          "thread": 5576
+        },
+        "text": []
+      },
+      "unpair_windbg": {
+        "is_error": false,
+        "data": {
+          "paired": false
+        },
+        "text": []
+      },
+      "similarity_close": {
+        "is_error": false,
+        "data": {
+          "comparison_id": "e3238e85a0a449f5b74640f12f66f7b5",
+          "state": "closed"
+        },
+        "text": []
+      },
+      "end_session": {
+        "is_error": false,
+        "data": {
+          "released": true,
+          "session_id": "sess-18d45bf25c45b004-8",
+          "status": "ok",
+          "target_left_running": false,
+          "worker_terminated": true
+        },
+        "text": []
+      },
+      "sessions_after": {
+        "is_error": false,
+        "data": {
+          "max_sessions": 4,
+          "sessions": [],
+          "status": "ok",
+          "unknown_handle": false
+        },
+        "text": []
+      }
+    },
+    "inputs": [
+      {
+        "file_sha256": "4ec29723e87ff3a017dd0a02222645bf5829f3f8b927a737f272831c0f0aeb22",
+        "hash_source": "original Raw view",
+        "image_name": "handoff_probe.exe",
+        "binary_id": "e834a02779d34c17980f8feb9f040a91",
+        "path": "/private/tmp/bn-windbg-handoff-20260911/target/handoff_probe.exe",
+        "display_name": "handoff_probe.exe",
+        "active": true,
+        "architecture": "aarch64",
+        "analysis_state": "IdleState",
+        "image_base": "0x0000000140000000",
+        "identity": {
+          "timestamp": 1789155883,
+          "size": 16384,
+          "pdb": {
+            "guid": "1E080823700E4350AB5739A242442337",
+            "age": 1
+          }
+        },
+        "generation": [
+          "e834a02779d34c17980f8feb9f040a91",
+          5368709120,
+          5
+        ],
+        "modified": false
+      },
+      {
+        "file_sha256": "39540f3215b279d1b3a4c0536a0786189742da2f97b473e14fd23813be01ca39",
+        "hash_source": "original Raw view",
+        "image_name": "handoff_probe.exe",
+        "binary_id": "782b305025f24994bbd180c2b7eab292",
+        "path": "/private/tmp/bn-windbg-handoff-20260911/reference/handoff_probe.exe",
+        "display_name": "handoff_probe.exe",
+        "active": false,
+        "architecture": "aarch64",
+        "analysis_state": "IdleState",
+        "image_base": "0x0000000140000000",
+        "identity": {
+          "timestamp": 1789155882,
+          "size": 16384,
+          "pdb": {
+            "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+            "age": 1
+          }
+        },
+        "generation": [
+          "782b305025f24994bbd180c2b7eab292",
+          5368709120,
+          5
+        ],
+        "modified": false
+      }
+    ],
+    "result_keys": [
+      "comparison_id",
+      "state",
+      "active",
+      "closing",
+      "progress",
+      "stop_reason",
+      "providers",
+      "backend",
+      "stage",
+      "omitted_functions",
+      "binary_ids",
+      "snapshots",
+      "match_count",
+      "coverage_complete",
+      "unresolved_results",
+      "error",
+      "side",
+      "kind",
+      "items",
+      "total",
+      "next_offset",
+      "truncated"
+    ],
+    "chosen_match": {
+      "result_id": "match_3",
+      "provider": "Google BinDiff",
+      "similarity": 255,
+      "confidence": 252,
+      "raw_similarity": 1.0,
+      "raw_confidence": 0.9890130573694068,
+      "reference": {
+        "binary_id": "782b305025f24994bbd180c2b7eab292",
+        "generation": [
+          "782b305025f24994bbd180c2b7eab292",
+          5368709120,
+          5
+        ],
+        "coordinate": {
+          "module": "handoff_probe",
+          "image_name": "handoff_probe.exe",
+          "identity": {
+            "timestamp": 1789155882,
+            "size": 16384,
+            "pdb": {
+              "guid": "D7BC3A19BABC4E9D89FA6AE761087F66",
+              "age": 1
+            }
+          },
+          "rva": "0x1034"
+        },
+        "address": "0x0000000140001034",
+        "name": "probe_step"
+      },
+      "target": {
+        "binary_id": "e834a02779d34c17980f8feb9f040a91",
+        "generation": [
+          "e834a02779d34c17980f8feb9f040a91",
+          5368709120,
+          5
+        ],
+        "coordinate": {
+          "module": "handoff_probe",
+          "image_name": "handoff_probe.exe",
+          "identity": {
+            "timestamp": 1789155883,
+            "size": 16384,
+            "pdb": {
+              "guid": "1E080823700E4350AB5739A242442337",
+              "age": 1
+            }
+          },
+          "rva": "0x1034"
+        },
+        "address": "0x0000000140001034",
+        "name": "probe_step"
+      },
+      "backend": "external"
+    },
+    "owned_session": "sess-18d45bf25c45b004-8",
+    "loaded_module": {
+      "checksum": 0,
+      "end": "0x00007ff6104e4000",
+      "image_name": "handoff_probe.exe",
+      "name": "handoff_probe",
+      "size": 16384,
+      "start": "0x00007ff6104e0000",
+      "symbols": "deferred",
+      "timestamp": 1789155883,
+      "user_mode": true
+    },
+    "runtime_comparison": {
+      "status": "ok",
+      "coordinate": {
+        "module": "handoff_probe",
+        "image_name": "handoff_probe.exe",
+        "identity": {
+          "timestamp": 1789155883,
+          "size": 16384,
+          "pdb": {
+            "guid": "1E080823700E4350AB5739A242442337",
+            "age": 1
+          }
+        },
+        "rva": "0x1034"
+      },
+      "modified": false,
+      "source": "current BinaryView",
+      "requested_size": 16,
+      "static_data": "0804000b092c00111f2800712081881a",
+      "runtime_data": "0804000b092c00111f2800712081881a",
+      "static_read_size": 16,
+      "runtime_read_size": 16,
+      "incomplete": false,
+      "equal": true,
+      "differing_offsets": [],
+      "relocation_ranges": []
+    },
+    "wrong_build_preserved_ip": true,
+    "run_to_reached_match": true,
+    "breakpoint_reached_match": true,
+    "session_inventory_restored": true,
+    "listener_thread_alive_after_shutdown": false,
+    "application_about_to_quit": true
+  },
+  "gui_exit": {
+    "returncode": 0,
+    "forced": false
+  },
+  "cleanup": {
+    "fixture_processes": [],
+    "listener": {
+      "Id": 2160,
+      "ProcessName": "windbg-mcp"
+    },
+    "owned_tunnel_pid": 30050,
+    "owned_tunnel_termination_requested": true,
+    "owned_tunnel_exited": true,
+    "remaining_binaryninja_processes": 0,
+    "remaining_bindiff_processes": 0
+  },
+  "limitations": [
+    "Generic benign fixture acceptance; does not establish a live securekernel/CVE handoff.",
+    "Initial module inventory had deferred symbols and no PDB metadata; timestamp and SizeOfImage checks were available. Later stopped coordinates include the target PDB identity.",
+    "Provider structural similarity remains 1.0 for the changed immediate; instruction-text diff records add #7 versus add #0xb.",
+    "PE build identities are timestamp/size/PDB metadata, not cryptographic authentication."
+  ]
+}

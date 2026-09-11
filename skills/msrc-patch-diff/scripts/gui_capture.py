@@ -8,6 +8,27 @@ import traceback
 from pathlib import Path
 
 
+def gui_context():
+    """Called on the UI thread before opening files or requesting application quit."""
+    from binaryninjaui import UIContext
+    from PySide6.QtWidgets import QApplication
+
+    application = QApplication.instance()
+    if application is None or application.activeModalWidget() is not None:
+        raise RuntimeError("finish or dismiss modal dialogs before GUI capture or quit")
+    contexts = list(UIContext.allContexts())
+    if len(contexts) != 1:
+        raise RuntimeError("expected one disposable GUI context")
+    return contexts[0]
+
+
+def request_gui_quit():
+    handler = gui_context().getCurrentActionHandler()
+    if not handler.isValidAction("Quit"):
+        raise RuntimeError("application Quit action is unavailable")
+    handler.executeAction("Quit")
+
+
 def state(workspace, binaries):
     result = {}
     for item in binaries:
@@ -99,10 +120,8 @@ def prepare_target(workspace, binaries, target, rva):
 
 def run(reference, target, bindiff, output, quit_on_finish, prepare_target_rva=None):
     import binaryninja as bn
-    from binaryninjaui import UIContext
     from binja_windbg_mcp.adapter import Workspace, main_thread
     from binja_windbg_mcp.core import Coordinate
-    from PySide6.QtCore import QCoreApplication
 
     workspace, comparison_id = None, None
     report = {"bn_version": bn.core_version(), "ok": False}
@@ -110,10 +129,7 @@ def run(reference, target, bindiff, output, quit_on_finish, prepare_target_rva=N
         for path in (reference, target):
 
             def open_file(path=path):
-                contexts = list(UIContext.allContexts())
-                if len(contexts) != 1:
-                    raise RuntimeError("expected one disposable GUI context")
-                return contexts[0].openFilename(str(path))
+                return gui_context().openFilename(str(path))
 
             if not main_thread(open_file):
                 raise RuntimeError("could not open input")
@@ -205,19 +221,22 @@ def run(reference, target, bindiff, output, quit_on_finish, prepare_target_rva=N
             output,
             workspace,
             comparison_id,
-            (lambda: bn.execute_on_main_thread(lambda: QCoreApplication.instance().quit()))
-            if quit_on_finish
-            else None,
+            (lambda: main_thread(request_gui_quit)) if quit_on_finish else None,
         )
 
 
 def start(reference, target, bindiff, output, quit_on_finish=False, prepare_target_rva=None):
     """Analyze two downloaded PE files; leave views open unless this disposable GUI should quit."""
     from binaryninjaui import FileContext
+    from binja_windbg_mcp.adapter import main_thread
     from PySide6.QtCore import QTimer
 
-    if FileContext.getOpenFileContexts():
-        raise ValueError("use an empty disposable BN6 GUI process")
+    def check_ready():
+        gui_context()
+        if FileContext.getOpenFileContexts():
+            raise ValueError("use an empty disposable BN6 GUI process")
+
+    main_thread(check_ready)
     reference, target, bindiff = (
         Path(p).resolve(strict=True) for p in (reference, target, bindiff)
     )

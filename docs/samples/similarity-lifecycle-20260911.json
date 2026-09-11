@@ -1,0 +1,1247 @@
+{
+  "recorded_date": "2026-09-11",
+  "bn_version": "6.0.10601 Personal",
+  "companion_base": "2eb95c5",
+  "probe_sha256": "69d17ded743a5e5a7f88e60116381aba52cfcdc9cbb62bc8fc23be074e769b8b",
+  "cases": {
+    "restart-v2": {
+      "capture_source_sha256": "3978ab38b2c8a455ecd612f19ea2dc6926de5a729dfdd21ed35db743280ba9fe",
+      "capture": {
+        "case": "restart",
+        "bn_version": "6.0.10601 Personal",
+        "ok": true,
+        "events": [],
+        "mcp_before": {
+          "capabilities": {
+            "available": true,
+            "providers": {
+              "Google BinDiff": true,
+              "WARP": false
+            },
+            "backends": {
+              "native": {
+                "available": false,
+                "requires": "Binary Ninja 6 Ultimate",
+                "providers": {
+                  "Google BinDiff": false,
+                  "WARP": false
+                },
+                "version": "6.0.10601 Personal",
+                "edition": "User"
+              },
+              "external": {
+                "available": true,
+                "providers": {
+                  "Google BinDiff": true,
+                  "WARP": false
+                },
+                "exporter": {
+                  "available": true,
+                  "abi": 1,
+                  "core_abi": 187
+                },
+                "executable": {
+                  "path": "bindiff",
+                  "version": "8",
+                  "available": true
+                },
+                "reason": ""
+              }
+            }
+          },
+          "accepting": true,
+          "comparisons": []
+        },
+        "inputs": [
+          {
+            "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "reference-binary",
+            "path": "reference/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": false,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 3350698326,
+              "size": 1245184,
+              "pdb": {
+                "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                "age": 1
+              }
+            },
+            "generation": [
+              "reference-binary",
+              5368709120,
+              14953
+            ],
+            "modified": false
+          },
+          {
+            "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "target-binary",
+            "path": "target/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": true,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 1188430604,
+              "size": 1290240,
+              "pdb": {
+                "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                "age": 1
+              }
+            },
+            "generation": [
+              "target-binary",
+              5368709120,
+              14936
+            ],
+            "modified": false
+          }
+        ],
+        "target_session": 14543027135623302110,
+        "sessions_before": [
+          9378873096661054316,
+          14543027135623302110
+        ],
+        "before_action": {
+          "comparison_id": "restart-v2-comparison",
+          "state": "running",
+          "active": true,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "matching",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "reference-binary",
+            "target": "target-binary"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "reference-binary",
+              "path": "reference/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "reference-binary",
+                5368709120,
+                14953
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "target-binary",
+              "path": "target/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "target-binary",
+                5368709120,
+                14936
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "active_resources_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": true,
+          "process_returncode": null,
+          "output_reader_alive": true
+        },
+        "selection_before": {
+          "session_id": 14543027135623302110,
+          "image_base": 5368709120,
+          "offset": 5369475072
+        },
+        "job_reason": "listener_stopped",
+        "job_phase": "listener_stopped",
+        "resources_after": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": true,
+          "process_returncode": -15,
+          "output_reader_alive": false
+        },
+        "stopped_state": "stopped",
+        "old_comparison_removed": true,
+        "stopped_port_refused": true,
+        "new_listener_thread": true,
+        "mcp_after_restart": {
+          "capabilities": {
+            "available": true,
+            "providers": {
+              "Google BinDiff": true,
+              "WARP": false
+            },
+            "backends": {
+              "native": {
+                "available": false,
+                "requires": "Binary Ninja 6 Ultimate",
+                "providers": {
+                  "Google BinDiff": false,
+                  "WARP": false
+                },
+                "version": "6.0.10601 Personal",
+                "edition": "User"
+              },
+              "external": {
+                "available": true,
+                "providers": {
+                  "Google BinDiff": true,
+                  "WARP": false
+                },
+                "exporter": {
+                  "available": true,
+                  "abi": 1,
+                  "core_abi": 187
+                },
+                "executable": {
+                  "path": "bindiff",
+                  "version": "8",
+                  "available": true
+                },
+                "reason": ""
+              }
+            }
+          },
+          "accepting": true,
+          "comparisons": []
+        },
+        "new_comparison": {
+          "comparison_id": "post-restart-comparison",
+          "state": "partial",
+          "active": false,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "importing",
+          "omitted_functions": {
+            "reference": 8,
+            "target": 8
+          },
+          "binary_ids": {
+            "reference": "reference-binary",
+            "target": "target-binary"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "reference-binary",
+              "path": "reference/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "reference-binary",
+                5368709120,
+                14953
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "target-binary",
+              "path": "target/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "target-binary",
+                5368709120,
+                14936
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 3109,
+          "coverage_complete": false,
+          "unresolved_results": 8,
+          "error": null
+        },
+        "new_comparison_cleanup": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": true,
+          "process_returncode": 0,
+          "output_reader_alive": false
+        },
+        "heartbeat_count": 116,
+        "listener_thread_alive_after_shutdown": false,
+        "application_about_to_quit": true
+      },
+      "gui_exit": {
+        "exited": true,
+        "forced": false,
+        "returncode": 0
+      },
+      "close_notification_fix_applied": false
+    },
+    "rebase-v1": {
+      "capture_source_sha256": "05062abe7969c3f40abb0bb0ee7bedbb6e2e78c7761a581c8cbbaa6a088121e7",
+      "capture": {
+        "case": "rebase",
+        "bn_version": "6.0.10601 Personal",
+        "ok": true,
+        "events": [
+          {
+            "event": "data_view_replaced",
+            "stage": "exporting",
+            "job_done": false,
+            "sessions": [
+              11126563051690330967,
+              11166921136629054376
+            ]
+          },
+          {
+            "event": "view_replaced",
+            "stage": "exporting",
+            "job_done": false,
+            "sessions": [
+              11126563051690330967,
+              11166921136629054376
+            ]
+          }
+        ],
+        "mcp_before": {
+          "capabilities": {
+            "available": true,
+            "providers": {
+              "Google BinDiff": true,
+              "WARP": false
+            },
+            "backends": {
+              "native": {
+                "available": false,
+                "requires": "Binary Ninja 6 Ultimate",
+                "providers": {
+                  "Google BinDiff": false,
+                  "WARP": false
+                },
+                "version": "6.0.10601 Personal",
+                "edition": "User"
+              },
+              "external": {
+                "available": true,
+                "providers": {
+                  "Google BinDiff": true,
+                  "WARP": false
+                },
+                "exporter": {
+                  "available": true,
+                  "abi": 1,
+                  "core_abi": 187
+                },
+                "executable": {
+                  "path": "bindiff",
+                  "version": "8",
+                  "available": true
+                },
+                "reason": ""
+              }
+            }
+          },
+          "accepting": true,
+          "comparisons": []
+        },
+        "inputs": [
+          {
+            "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "target-binary",
+            "path": "target/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": true,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 1188430604,
+              "size": 1290240,
+              "pdb": {
+                "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                "age": 1
+              }
+            },
+            "generation": [
+              "target-binary",
+              5368709120,
+              15058
+            ],
+            "modified": false
+          },
+          {
+            "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "reference-binary",
+            "path": "reference/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": false,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 3350698326,
+              "size": 1245184,
+              "pdb": {
+                "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                "age": 1
+              }
+            },
+            "generation": [
+              "reference-binary",
+              5368709120,
+              14984
+            ],
+            "modified": false
+          }
+        ],
+        "target_session": 11126563051690330967,
+        "sessions_before": [
+          11126563051690330967,
+          11166921136629054376
+        ],
+        "before_action": {
+          "comparison_id": "rebase-v1-comparison",
+          "state": "running",
+          "active": true,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "exporting",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "reference-binary",
+            "target": "target-binary"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "reference-binary",
+              "path": "reference/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "reference-binary",
+                5368709120,
+                14984
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "target-binary",
+              "path": "target/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "target-binary",
+                5368709120,
+                15058
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "active_resources_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "selection_before": {
+          "session_id": 11126563051690330967,
+          "image_base": 5368709120,
+          "offset": 5369475072
+        },
+        "rebase_returned": true,
+        "job_reason": "stale",
+        "job_phase": "stale",
+        "resources_after": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "results_after": {
+          "comparison_id": "rebase-v1-comparison",
+          "state": "stale",
+          "active": false,
+          "closing": false,
+          "progress": null,
+          "stop_reason": "stale",
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "exporting",
+          "omitted_functions": {
+            "reference": 8
+          },
+          "binary_ids": {
+            "reference": "reference-binary",
+            "target": "target-binary"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "reference-binary",
+              "path": "reference/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "reference-binary",
+                5368709120,
+                14984
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "target-binary",
+              "path": "target/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "target-binary",
+                5368709120,
+                15058
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": {
+            "code": "stale",
+            "message": "comparison stop requested"
+          },
+          "side": "target",
+          "kind": "matches",
+          "items": [],
+          "total": 0,
+          "next_offset": null,
+          "truncated": false
+        },
+        "selection_after_rebase": {
+          "session_id": 11126563051690330967,
+          "image_base": 5385486336,
+          "offset": 5386252288
+        },
+        "stale_navigation_refusal": "view generation changed",
+        "refused_navigation_preserved_selection": true,
+        "heartbeat_count": 10,
+        "listener_thread_alive_after_shutdown": false,
+        "application_about_to_quit": true
+      },
+      "gui_exit": {
+        "exited": true,
+        "forced": false,
+        "returncode": 0
+      },
+      "close_notification_fix_applied": false
+    },
+    "close_view-v1": {
+      "capture_source_sha256": "6d50719883a8de2ec613b31cab9ac50e1a93c854da235dcfac7f1479b5f3efe0",
+      "capture": {
+        "case": "close_view",
+        "bn_version": "6.0.10601 Personal",
+        "ok": false,
+        "events": [
+          {
+            "event": "after_close_file",
+            "stage": "exporting",
+            "job_done": false,
+            "sessions": [
+              4854112776867808419,
+              15331307733856887998
+            ]
+          }
+        ],
+        "mcp_before": {
+          "capabilities": {
+            "available": true,
+            "providers": {
+              "Google BinDiff": true,
+              "WARP": false
+            },
+            "backends": {
+              "native": {
+                "available": false,
+                "requires": "Binary Ninja 6 Ultimate",
+                "providers": {
+                  "Google BinDiff": false,
+                  "WARP": false
+                },
+                "version": "6.0.10601 Personal",
+                "edition": "User"
+              },
+              "external": {
+                "available": true,
+                "providers": {
+                  "Google BinDiff": true,
+                  "WARP": false
+                },
+                "exporter": {
+                  "available": true,
+                  "abi": 1,
+                  "core_abi": 187
+                },
+                "executable": {
+                  "path": "bindiff",
+                  "version": "8",
+                  "available": true
+                },
+                "reason": ""
+              }
+            }
+          },
+          "accepting": true,
+          "comparisons": []
+        },
+        "inputs": [
+          {
+            "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "reference-binary",
+            "path": "reference/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": false,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 3350698326,
+              "size": 1245184,
+              "pdb": {
+                "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                "age": 1
+              }
+            },
+            "generation": [
+              "reference-binary",
+              5368709120,
+              14978
+            ],
+            "modified": false
+          },
+          {
+            "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "target-binary",
+            "path": "target/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": true,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 1188430604,
+              "size": 1290240,
+              "pdb": {
+                "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                "age": 1
+              }
+            },
+            "generation": [
+              "target-binary",
+              5368709120,
+              14996
+            ],
+            "modified": false
+          }
+        ],
+        "target_session": 4854112776867808419,
+        "sessions_before": [
+          4854112776867808419,
+          15331307733856887998
+        ],
+        "before_action": {
+          "comparison_id": "close_view-v1-comparison",
+          "state": "running",
+          "active": true,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "exporting",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "reference-binary",
+            "target": "target-binary"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "reference-binary",
+              "path": "reference/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "reference-binary",
+                5368709120,
+                14978
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "target-binary",
+              "path": "target/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "target-binary",
+                5368709120,
+                14996
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "active_resources_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "selection_before": {
+          "session_id": 4854112776867808419,
+          "image_base": 5368709120,
+          "offset": 5369475072
+        },
+        "sessions_after_close": [
+          15331307733856887998
+        ],
+        "job_reason": null,
+        "job_phase": "partial",
+        "resources_after": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": true,
+          "process_returncode": 0,
+          "output_reader_alive": false
+        },
+        "error": "Traceback (most recent call last):\n  File \"similarity-lifecycle-probe-20260911.py\", line 186, in run\n    assert job.reason == 'stale', job.reason\n           ^^^^^^^^^^^^^^^^^^^^^\nAssertionError: None\n",
+        "listener_thread_alive_after_shutdown": false,
+        "application_about_to_quit": true
+      },
+      "gui_exit": {
+        "exited": true,
+        "forced": false,
+        "returncode": 0
+      },
+      "close_notification_fix_applied": false
+    },
+    "close_view-v2": {
+      "capture_source_sha256": "8479e9ecffcf000f016209687ce557120bae6acaa47551f721dae293c377082d",
+      "capture": {
+        "case": "close_view",
+        "bn_version": "6.0.10601 Personal",
+        "ok": true,
+        "events": [
+          {
+            "event": "after_close_file",
+            "stage": "exporting",
+            "job_done": false,
+            "sessions": [
+              9400224720943633327,
+              15634526259676319438
+            ]
+          }
+        ],
+        "mcp_before": {
+          "capabilities": {
+            "available": true,
+            "providers": {
+              "Google BinDiff": true,
+              "WARP": false
+            },
+            "backends": {
+              "native": {
+                "available": false,
+                "requires": "Binary Ninja 6 Ultimate",
+                "providers": {
+                  "Google BinDiff": false,
+                  "WARP": false
+                },
+                "version": "6.0.10601 Personal",
+                "edition": "User"
+              },
+              "external": {
+                "available": true,
+                "providers": {
+                  "Google BinDiff": true,
+                  "WARP": false
+                },
+                "exporter": {
+                  "available": true,
+                  "abi": 1,
+                  "core_abi": 187
+                },
+                "executable": {
+                  "path": "bindiff",
+                  "version": "8",
+                  "available": true
+                },
+                "reason": ""
+              }
+            }
+          },
+          "accepting": true,
+          "comparisons": []
+        },
+        "inputs": [
+          {
+            "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "reference-binary",
+            "path": "reference/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": false,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 3350698326,
+              "size": 1245184,
+              "pdb": {
+                "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                "age": 1
+              }
+            },
+            "generation": [
+              "reference-binary",
+              5368709120,
+              14665
+            ],
+            "modified": false
+          },
+          {
+            "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "target-binary",
+            "path": "target/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": true,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 1188430604,
+              "size": 1290240,
+              "pdb": {
+                "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                "age": 1
+              }
+            },
+            "generation": [
+              "target-binary",
+              5368709120,
+              14889
+            ],
+            "modified": false
+          }
+        ],
+        "target_session": 9400224720943633327,
+        "sessions_before": [
+          9400224720943633327,
+          15634526259676319438
+        ],
+        "before_action": {
+          "comparison_id": "close_view-v2-comparison",
+          "state": "running",
+          "active": true,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "exporting",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "reference-binary",
+            "target": "target-binary"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "reference-binary",
+              "path": "reference/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "reference-binary",
+                5368709120,
+                14665
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "target-binary",
+              "path": "target/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "target-binary",
+                5368709120,
+                14889
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "active_resources_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "selection_before": {
+          "session_id": 9400224720943633327,
+          "image_base": 5368709120,
+          "offset": 5369475072
+        },
+        "sessions_after_close": [
+          15634526259676319438
+        ],
+        "job_reason": "stale",
+        "job_phase": "stale",
+        "resources_after": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "results_after": {
+          "comparison_id": "close_view-v2-comparison",
+          "state": "stale",
+          "active": false,
+          "closing": false,
+          "progress": null,
+          "stop_reason": "stale",
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "exporting",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "reference-binary",
+            "target": "target-binary"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "reference-binary",
+              "path": "reference/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "reference-binary",
+                5368709120,
+                14665
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "target-binary",
+              "path": "target/securekernel.exe",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "target-binary",
+                5368709120,
+                14889
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": {
+            "code": "stale",
+            "message": "comparison stop requested"
+          },
+          "side": "target",
+          "kind": "matches",
+          "items": [],
+          "total": 0,
+          "next_offset": null,
+          "truncated": false
+        },
+        "stale_navigation_refusal": "select one unambiguous open PE binary_id",
+        "refused_navigation_preserved_selection": true,
+        "heartbeat_count": 6,
+        "listener_thread_alive_after_shutdown": false,
+        "application_about_to_quit": true
+      },
+      "gui_exit": {
+        "exited": true,
+        "forced": false,
+        "returncode": 0
+      },
+      "close_notification_fix_applied": true
+    }
+  },
+  "setup_failure": {
+    "case": "restart-v1",
+    "acceptance": "not_run",
+    "reason": "Previous temporary Python environment had missing files; Pydantic import failed before testing. Rebuilt temporary dependencies from pinned requirements.",
+    "gui_exit": {
+      "exited": true,
+      "forced": false,
+      "returncode": -15
+    },
+    "termination": "Parent sent SIGTERM to owned GUI; forced=false records only that the launcher did not send it."
+  },
+  "validation": {
+    "companion_tests_passed": 181,
+    "ruff": "passed",
+    "regression_failed_on_original_code": true,
+    "regression_test": "test_close_notification_invalidates_before_file_registry_removal"
+  },
+  "tested_fix_file_sha256": {
+    "binja_windbg_mcp/adapter.py": "f46bd4f3bd1d30a1710146bc9e09fdc025611393c389062d70096b4df475a6d3",
+    "tests/test_adapter.py": "1c2a3411f355376c4406506e28db060593f321ad87f56374b5b500a524be1077"
+  }
+}

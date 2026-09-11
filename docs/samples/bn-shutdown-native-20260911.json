@@ -1,0 +1,149 @@
+{
+  "recorded_date": "2026-09-11",
+  "bn_version": "6.0.10601 Personal",
+  "architecture": "arm64",
+  "cases": {
+    "qt-quit-wizard": {
+      "capture_source_sha256": "e76d5e3e777c1ab20f2ea87de11aee1961b5611aa1ad475842fc606de3116548",
+      "probe_source_sha256": "58907cb3b78009c49fccced533f112cc9040ef7235639294b5e4dda1ce2244f1",
+      "capture": {
+        "case": "qt-quit-wizard",
+        "bn_version": "6.0.10601 Personal",
+        "allow_welcome": true,
+        "modal": {
+          "class": "FirstSetupDialog",
+          "title": ""
+        },
+        "companion_modules": [],
+        "native_modal": {
+          "pointer": "0x16bc71db0",
+          "stack_bottom": "0x16b478000",
+          "stack_top": "0x16bc74000",
+          "on_main_thread_stack": true,
+          "parent_class": "MainWindow",
+          "parent_pointer": "0x8df2fc000"
+        },
+        "quit_valid": true,
+        "quit_requested": true,
+        "quit_method": "QCoreApplication.quit",
+        "alive_three_seconds_after_qt_quit": true,
+        "modal_after_qt_quit": "FirstSetupDialog",
+        "modal_before_recovery_quit": null,
+        "about_to_quit": true,
+        "visible_widget_types": [
+          "MainWindow",
+          "FirstSetupDialog"
+        ]
+      },
+      "launcher_exit_observation": {
+        "forced": false,
+        "returncode": 0,
+        "pid": 19051
+      }
+    },
+    "qt-quit-no-wizard": {
+      "capture_source_sha256": "a7de45ca0c13091af0c6958a429b8548e9871fd139314ff78e71af9c3eccd750",
+      "probe_source_sha256": "c74ba1b9ee7cd6e7d7bc2b1598b99912dc931d36e1d120d60a8aad5ab4fd51ec",
+      "capture": {
+        "case": "qt-quit-no-wizard",
+        "bn_version": "6.0.10601 Personal",
+        "allow_welcome": false,
+        "modal": null,
+        "companion_modules": [],
+        "quit_valid": true,
+        "quit_requested": true,
+        "quit_method": "QCoreApplication.quit",
+        "about_to_quit": true,
+        "visible_widget_types": [
+          "MainWindow"
+        ]
+      },
+      "launcher_exit_observation": {
+        "forced": false,
+        "returncode": 0,
+        "pid": 19061
+      }
+    },
+    "native-break": {
+      "capture_source_sha256": "c6b0b17ffcb071144b575537c6df92854f8e90a7c46ed13a05ab762248ea4e18",
+      "probe_source_sha256": "6c89f2f04d42c6db9606de6e203927ec18a9afc28045adcdbe85cc541fd67c63",
+      "capture": {
+        "case": "native-break",
+        "bn_version": "6.0.10601 Personal",
+        "allow_welcome": true,
+        "modal": {
+          "class": "FirstSetupDialog",
+          "title": ""
+        },
+        "companion_modules": [],
+        "native_modal": {
+          "pointer": "0x16b4d9db0",
+          "stack_bottom": "0x16ace0000",
+          "stack_top": "0x16b4dc000",
+          "on_main_thread_stack": true,
+          "parent_class": "MainWindow",
+          "parent_pointer": "0x8cb2fc000"
+        },
+        "quit_valid": true,
+        "quit_requested": true,
+        "ready_for_debugger": true,
+        "visible_widget_types": [
+          "FirstSetupDialog",
+          "MainWindow"
+        ]
+      },
+      "launcher_exit_observation": {
+        "forced": false,
+        "returncode": 0,
+        "pid": 19075
+      },
+      "debugger": {
+        "log_sha256": "9e058d6f1f14f3d717b8e4350e0fc45f271662aadc9eef51d10e0d8bca00edd9",
+        "breakpoint_image_offset": "0x146c0",
+        "instruction": "b operator delete(void*)",
+        "argument_x0": "0x000000016b4d9db0",
+        "argument_equals_observed_dialog_pointer": true,
+        "argument_on_main_thread_stack": true,
+        "frames": [
+          "frame #0: <load-address> binaryninja`___lldb_unnamed_symbol_1000146b0 + 16",
+          "* frame #0: <load-address> binaryninja`___lldb_unnamed_symbol_1000146b0 + 16",
+          "frame #1: <load-address> QtCore`QObjectPrivate::deleteChildren() + 156",
+          "frame #2: <load-address> QtWidgets`QWidget::~QWidget() + 1236",
+          "frame #3: <load-address> binaryninja`___lldb_unnamed_symbol_1000faac8 + 1040",
+          "frame #4: <load-address> binaryninja`___lldb_unnamed_symbol_1000fb098 + 12",
+          "frame #5: <load-address> QtCore`QObject::event(QEvent*) + 736",
+          "frame #6: <load-address> QtWidgets`QWidget::event(QEvent*) + 3400",
+          "frame #7: <load-address> QtWidgets`QMainWindow::event(QEvent*) + 680",
+          "frame #8: <load-address> QtWidgets`QApplicationPrivate::notify_helper(QObject*, QEvent*) + 336",
+          "frame #9: <load-address> QtWidgets`QApplication::notify(QObject*, QEvent*) + 468",
+          "frame #10: <load-address> QtCore`QCoreApplicationPrivate::sendPostedEvents(QObject*, int, QThreadData*) + 628",
+          "frame #11: <load-address> libqcocoa.dylib`QCocoaEventDispatcherPrivate::processPostedEvents() + 380",
+          "frame #12: <load-address> libqcocoa.dylib`QCocoaEventDispatcherPrivate::postedEventsSourceCallback(void*) + 516",
+          "frame #13: <load-address> CoreFoundation`__CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__ + 28",
+          "frame #14: <load-address> CoreFoundation`__CFRunLoopDoSource0 + 172",
+          "frame #15: <load-address> CoreFoundation`__CFRunLoopDoSources0 + 332",
+          "frame #16: <load-address> CoreFoundation`__CFRunLoopRun + 820",
+          "frame #17: <load-address> CoreFoundation`_CFRunLoopRunSpecificWithOptions + 532"
+        ],
+        "termination": "process kill; LLDB reported status 9 (killed)",
+        "clean_shutdown": false,
+        "launcher_limitation": "Launcher observed returncode 0 after LLDB killed/reaped the process. The debugger outcome is authoritative; this is not a clean-exit test."
+      }
+    }
+  },
+  "static_disassembly": {
+    "source_sha256": "65e551a35f7862e51d829bf24a707c4a10b216c5afeefff5b43d86e75e79797e",
+    "construction_image_offsets": {
+      "0xff488": "add x0, sp, #0x1e0",
+      "0xff490": "call wizard constructor",
+      "0xff494": "add x0, sp, #0x1e0",
+      "0xff498": "call QDialog::exec",
+      "0xff49c": "add x0, sp, #0x1e0",
+      "0xff4a0": "call wizard destructor"
+    },
+    "deleting_destructor_image_offset": "0x146b0",
+    "operator_delete_tail_image_offset": "0x146c0"
+  },
+  "binary_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+  "conclusion": "MainWindow destruction asks Qt to delete its stack-allocated FirstSetupDialog child. LLDB observed that exact stack pointer as operator delete argument. Direct Qt quit with the startup wizard active is ineffective; disabling the wizard makes the same quit call exit normally."
+}

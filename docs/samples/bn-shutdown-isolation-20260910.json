@@ -1,0 +1,606 @@
+{
+  "recorded_date": "2026-09-10",
+  "bn_version": "6.0.10601 Personal",
+  "companion_revision": "2eb95c5",
+  "cases": {
+    "baseline-empty": {
+      "capture_source_sha256": "0449445d3f76055ac7bf2cbcad35ed9de5ac451c141011c49dcdaaed0dc19d65",
+      "probe_source_sha256": "84da9f4d788f683a122dafc1d0ddf4237f2f749118f33711cdb514a1559ab3bd",
+      "capture": {
+        "case": "baseline-empty",
+        "bn_version": "6.0.10601 Personal",
+        "modal": {
+          "class": "FirstSetupDialog",
+          "title": ""
+        },
+        "companion_modules": [],
+        "quit_valid": true,
+        "quit_requested": true,
+        "visible_widget_types": [
+          "MainWindow",
+          "FirstSetupDialog"
+        ]
+      },
+      "gui_exit": {
+        "forced": false,
+        "returncode": -6,
+        "pid": 12129
+      }
+    },
+    "baseline-no-wizard": {
+      "capture_source_sha256": "c689a1aea06eb74e9fbb1c76d7eb0ae3f8fd4e9fb7032dc55ec2962882427e27",
+      "probe_source_sha256": "0e3b86e7a3a002a5c86f6518032662491233de354d98cf0401936f29a42ce75c",
+      "capture": {
+        "case": "baseline-no-wizard",
+        "bn_version": "6.0.10601 Personal",
+        "allow_welcome": false,
+        "modal": null,
+        "companion_modules": [],
+        "quit_valid": true,
+        "quit_requested": true,
+        "about_to_quit": true,
+        "visible_widget_types": [
+          "MainWindow"
+        ]
+      },
+      "gui_exit": {
+        "forced": false,
+        "returncode": 0,
+        "pid": 12158
+      }
+    },
+    "capture-helper-guard": {
+      "capture_source_sha256": "5e81e286f12adf3e9e4940f0c925a9c8e7ab1b7c29ac5b02f399f10bad88f916",
+      "probe_source_sha256": "ec8aec86fe7e66d0ba5234cb4b9d1402e848fca17a8c2e74db8165f9c421fe40",
+      "capture": {
+        "case": "capture-helper-guard",
+        "bn_version": "6.0.10601 Personal",
+        "allow_welcome": false,
+        "modal": null,
+        "companion_modules": [],
+        "quit_valid": true,
+        "quit_requested": true,
+        "modal_guard_refusal": "finish or dismiss modal dialogs before GUI capture or quit",
+        "about_to_quit": true,
+        "visible_widget_types": [
+          "MainWindow"
+        ]
+      },
+      "gui_exit": {
+        "forced": false,
+        "returncode": 0,
+        "pid": 12273
+      }
+    },
+    "quit-no-wizard": {
+      "capture_source_sha256": "aead1194f7dc2d5c51c955671eaec8d2ee1b28484bd8aad5e7e538314dbb301f",
+      "capture": {
+        "case": "quit",
+        "bn_version": "6.0.10601 Personal",
+        "ok": true,
+        "before_action": {
+          "state": "running",
+          "active": true,
+          "backend": "external",
+          "stage": "exporting"
+        },
+        "observed_stage": "exporting",
+        "active_process_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "heartbeat_before_action": 7,
+        "modal_at_quit": null,
+        "allow_welcome": false,
+        "quit_action_available": true,
+        "about_to_quit": true,
+        "after_shutdown": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "job_done": true,
+        "job_reason": "shutdown",
+        "listener_thread_alive": false,
+        "plugin_shutting_down": true,
+        "heartbeat_total": 8,
+        "input_hashes": [
+          {
+            "image_name": "securekernel.exe",
+            "architecture": "aarch64",
+            "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b"
+          },
+          {
+            "image_name": "securekernel.exe",
+            "architecture": "aarch64",
+            "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6"
+          }
+        ]
+      },
+      "gui_exit": {
+        "exited": true,
+        "forced": false,
+        "returncode": 0
+      }
+    },
+    "quit_matching-no-wizard": {
+      "capture_source_sha256": "847dc45ed97addd91480654f01c6d847ae36dedfd3ff82cc3a259abd2646159b",
+      "capture": {
+        "case": "quit_matching",
+        "bn_version": "6.0.10601 Personal",
+        "ok": true,
+        "before_action": {
+          "state": "running",
+          "active": true,
+          "backend": "external",
+          "stage": "exporting"
+        },
+        "observed_stage": "matching",
+        "active_process_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": true,
+          "process_returncode": null,
+          "output_reader_alive": true
+        },
+        "heartbeat_before_action": 46,
+        "modal_at_quit": null,
+        "allow_welcome": false,
+        "quit_action_available": true,
+        "about_to_quit": true,
+        "after_shutdown": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": true,
+          "process_returncode": -15,
+          "output_reader_alive": false
+        },
+        "job_done": true,
+        "job_reason": "shutdown",
+        "listener_thread_alive": false,
+        "plugin_shutting_down": true,
+        "heartbeat_total": 47,
+        "input_hashes": [
+          {
+            "image_name": "securekernel.exe",
+            "architecture": "aarch64",
+            "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b"
+          },
+          {
+            "image_name": "securekernel.exe",
+            "architecture": "aarch64",
+            "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6"
+          }
+        ]
+      },
+      "gui_exit": {
+        "exited": true,
+        "forced": false,
+        "returncode": 0
+      }
+    }
+  },
+  "crash_comparison": [
+    {
+      "source_file": "binaryninja-2026-09-10-212519.ips",
+      "source_sha256": "41e21e39bcee98c02bb052b62d899d646d3749cebea0f01aca5a2b9cda1cf138",
+      "pid": 11077,
+      "exception": {
+        "codes": "0x0000000000000000, 0x0000000000000000",
+        "rawCodes": [
+          0,
+          0
+        ],
+        "type": "EXC_CRASH",
+        "signal": "SIGABRT"
+      },
+      "frames": [
+        {
+          "image": "libsystem_kernel.dylib",
+          "offset": 38376,
+          "symbol": "__pthread_kill"
+        },
+        {
+          "image": "libsystem_pthread.dylib",
+          "offset": 26840,
+          "symbol": "pthread_kill"
+        },
+        {
+          "image": "libsystem_c.dylib",
+          "offset": 493944,
+          "symbol": "abort"
+        },
+        {
+          "image": "libsystem_malloc.dylib",
+          "offset": 55884,
+          "symbol": "malloc_vreport"
+        },
+        {
+          "image": "libsystem_malloc.dylib",
+          "offset": 70312,
+          "symbol": "malloc_report"
+        },
+        {
+          "image": "libsystem_malloc.dylib",
+          "offset": 91796,
+          "symbol": "___BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED"
+        },
+        {
+          "image": "QtCore",
+          "offset": 944424,
+          "symbol": "QObjectPrivate::deleteChildren()"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 297504,
+          "symbol": "QWidget::~QWidget()"
+        },
+        {
+          "image": "binaryninja",
+          "offset": 1027800,
+          "symbol": null
+        },
+        {
+          "image": "binaryninja",
+          "offset": 1028260,
+          "symbol": null
+        },
+        {
+          "image": "QtCore",
+          "offset": 948020,
+          "symbol": "QObject::event(QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 371712,
+          "symbol": "QWidget::event(QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 1539024,
+          "symbol": "QMainWindow::event(QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 51908,
+          "symbol": "QApplicationPrivate::notify_helper(QObject*, QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 56132,
+          "symbol": "QApplication::notify(QObject*, QEvent*)"
+        },
+        {
+          "image": "QtCore",
+          "offset": 639960,
+          "symbol": "QCoreApplicationPrivate::sendPostedEvents(QObject*, int, QThreadData*)"
+        },
+        {
+          "image": "libqcocoa.dylib",
+          "offset": 92764,
+          "symbol": "QCocoaEventDispatcherPrivate::processPostedEvents()"
+        },
+        {
+          "image": "libqcocoa.dylib",
+          "offset": 97556,
+          "symbol": "QCocoaEventDispatcherPrivate::postedEventsSourceCallback(void*)"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 515936,
+          "symbol": "__CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 515828,
+          "symbol": "__CFRunLoopDoSource0"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 515268,
+          "symbol": "__CFRunLoopDoSources0"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 510084,
+          "symbol": "__CFRunLoopRun"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 1372772,
+          "symbol": "_CFRunLoopRunSpecificWithOptions"
+        },
+        {
+          "image": "HIToolbox",
+          "offset": 775520,
+          "symbol": "RunCurrentEventLoopInMode"
+        },
+        {
+          "image": "HIToolbox",
+          "offset": 788668,
+          "symbol": "ReceiveNextEventCommon"
+        },
+        {
+          "image": "HIToolbox",
+          "offset": 2400588,
+          "symbol": "_BlockUntilNextEventMatchingListInMode"
+        },
+        {
+          "image": "AppKit",
+          "offset": 7230416,
+          "symbol": "_DPSBlockUntilNextEventMatchingListInMode"
+        },
+        {
+          "image": "AppKit",
+          "offset": 233604,
+          "symbol": "_DPSNextEvent"
+        },
+        {
+          "image": "AppKit",
+          "offset": 12380524,
+          "symbol": "-[NSApplication(NSEventRouting) _nextEventMatchingEventMask:untilDate:inMode:dequeue:]"
+        },
+        {
+          "image": "AppKit",
+          "offset": 12379768,
+          "symbol": "-[NSApplication(NSEventRouting) nextEventMatchingMask:untilDate:inMode:dequeue:]"
+        },
+        {
+          "image": "libqcocoa.dylib",
+          "offset": 87308,
+          "symbol": "QCocoaEventDispatcher::processEvents(QFlags<QEventLoop::ProcessEventsFlag>)"
+        },
+        {
+          "image": "QtCore",
+          "offset": 675220,
+          "symbol": "QEventLoop::exec(QFlags<QEventLoop::ProcessEventsFlag>)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 2319548,
+          "symbol": "QDialog::exec()"
+        },
+        {
+          "image": "binaryninja",
+          "offset": 1045660,
+          "symbol": null
+        },
+        {
+          "image": "binaryninja",
+          "offset": 987380,
+          "symbol": null
+        },
+        {
+          "image": "libbinaryninjaui.1.dylib",
+          "offset": 5489320,
+          "symbol": "main_bn_6_0_10601_Personal_87066bd6_"
+        },
+        {
+          "image": "dyld",
+          "offset": 132324,
+          "symbol": "start"
+        }
+      ]
+    },
+    {
+      "source_file": "binaryninja-2026-09-10-214415.ips",
+      "source_sha256": "9df52ecdf6e4bd3b85309ec4db67c6e0005f78d2fdddf28a2923fc0fd71f8f43",
+      "pid": 12129,
+      "exception": {
+        "codes": "0x0000000000000000, 0x0000000000000000",
+        "rawCodes": [
+          0,
+          0
+        ],
+        "type": "EXC_CRASH",
+        "signal": "SIGABRT"
+      },
+      "frames": [
+        {
+          "image": "libsystem_kernel.dylib",
+          "offset": 38376,
+          "symbol": "__pthread_kill"
+        },
+        {
+          "image": "libsystem_pthread.dylib",
+          "offset": 26840,
+          "symbol": "pthread_kill"
+        },
+        {
+          "image": "libsystem_c.dylib",
+          "offset": 493944,
+          "symbol": "abort"
+        },
+        {
+          "image": "libsystem_malloc.dylib",
+          "offset": 55884,
+          "symbol": "malloc_vreport"
+        },
+        {
+          "image": "libsystem_malloc.dylib",
+          "offset": 70312,
+          "symbol": "malloc_report"
+        },
+        {
+          "image": "libsystem_malloc.dylib",
+          "offset": 91796,
+          "symbol": "___BUG_IN_CLIENT_OF_LIBMALLOC_POINTER_BEING_FREED_WAS_NOT_ALLOCATED"
+        },
+        {
+          "image": "QtCore",
+          "offset": 944424,
+          "symbol": "QObjectPrivate::deleteChildren()"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 297504,
+          "symbol": "QWidget::~QWidget()"
+        },
+        {
+          "image": "binaryninja",
+          "offset": 1027800,
+          "symbol": null
+        },
+        {
+          "image": "binaryninja",
+          "offset": 1028260,
+          "symbol": null
+        },
+        {
+          "image": "QtCore",
+          "offset": 948020,
+          "symbol": "QObject::event(QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 371712,
+          "symbol": "QWidget::event(QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 1539024,
+          "symbol": "QMainWindow::event(QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 51908,
+          "symbol": "QApplicationPrivate::notify_helper(QObject*, QEvent*)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 56132,
+          "symbol": "QApplication::notify(QObject*, QEvent*)"
+        },
+        {
+          "image": "QtCore",
+          "offset": 639960,
+          "symbol": "QCoreApplicationPrivate::sendPostedEvents(QObject*, int, QThreadData*)"
+        },
+        {
+          "image": "libqcocoa.dylib",
+          "offset": 92764,
+          "symbol": "QCocoaEventDispatcherPrivate::processPostedEvents()"
+        },
+        {
+          "image": "libqcocoa.dylib",
+          "offset": 97556,
+          "symbol": "QCocoaEventDispatcherPrivate::postedEventsSourceCallback(void*)"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 515936,
+          "symbol": "__CFRUNLOOP_IS_CALLING_OUT_TO_A_SOURCE0_PERFORM_FUNCTION__"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 515828,
+          "symbol": "__CFRunLoopDoSource0"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 515268,
+          "symbol": "__CFRunLoopDoSources0"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 510084,
+          "symbol": "__CFRunLoopRun"
+        },
+        {
+          "image": "CoreFoundation",
+          "offset": 1372772,
+          "symbol": "_CFRunLoopRunSpecificWithOptions"
+        },
+        {
+          "image": "HIToolbox",
+          "offset": 775520,
+          "symbol": "RunCurrentEventLoopInMode"
+        },
+        {
+          "image": "HIToolbox",
+          "offset": 788668,
+          "symbol": "ReceiveNextEventCommon"
+        },
+        {
+          "image": "HIToolbox",
+          "offset": 2400588,
+          "symbol": "_BlockUntilNextEventMatchingListInMode"
+        },
+        {
+          "image": "AppKit",
+          "offset": 7230416,
+          "symbol": "_DPSBlockUntilNextEventMatchingListInMode"
+        },
+        {
+          "image": "AppKit",
+          "offset": 233604,
+          "symbol": "_DPSNextEvent"
+        },
+        {
+          "image": "AppKit",
+          "offset": 12380524,
+          "symbol": "-[NSApplication(NSEventRouting) _nextEventMatchingEventMask:untilDate:inMode:dequeue:]"
+        },
+        {
+          "image": "AppKit",
+          "offset": 12379768,
+          "symbol": "-[NSApplication(NSEventRouting) nextEventMatchingMask:untilDate:inMode:dequeue:]"
+        },
+        {
+          "image": "libqcocoa.dylib",
+          "offset": 87308,
+          "symbol": "QCocoaEventDispatcher::processEvents(QFlags<QEventLoop::ProcessEventsFlag>)"
+        },
+        {
+          "image": "QtCore",
+          "offset": 675220,
+          "symbol": "QEventLoop::exec(QFlags<QEventLoop::ProcessEventsFlag>)"
+        },
+        {
+          "image": "QtWidgets",
+          "offset": 2319548,
+          "symbol": "QDialog::exec()"
+        },
+        {
+          "image": "binaryninja",
+          "offset": 1045660,
+          "symbol": null
+        },
+        {
+          "image": "binaryninja",
+          "offset": 987380,
+          "symbol": null
+        },
+        {
+          "image": "libbinaryninjaui.1.dylib",
+          "offset": 5489320,
+          "symbol": "main_bn_6_0_10601_Personal_87066bd6_"
+        },
+        {
+          "image": "dyld",
+          "offset": 132324,
+          "symbol": "start"
+        }
+      ]
+    }
+  ],
+  "matching_crash_prefix_frames": 37,
+  "windows_tests": {
+    "opt_in_debugger_tiers": false,
+    "revision": "8eafc8fb8b57ae5824d4b7a6c53e7687d0ac9a52",
+    "exit_code": 0,
+    "toolchain": "rustc 1.96.1 (31fca3adb 2026-06-26)\nbinary: rustc\ncommit-hash: 31fca3adb283cc9dfd56b49cdee9a96eb9c96ffd\ncommit-date: 2026-06-26\nhost: aarch64-pc-windows-msvc\nrelease: 1.96.1\nLLVM version: 22.1.2",
+    "test_result_lines": [
+      "test result: ok. 724 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out; finished in 0.70s",
+      "test result: ok. 105 passed; 0 failed; 12 ignored; 0 measured; 0 filtered out; finished in 1.94s"
+    ],
+    "cargo_log_sha256": "2e9f4ec5c892ef7f33ba00d6737332c85cb50d4b9a229d7ea266b9bbc1910cf0",
+    "scope": "Ordinary cargo test --locked -- --nocapture. Opt-in debugger, kernel and TTD tiers disabled; gated tests can report ok after SKIPPED."
+  },
+  "conclusion": "Application Quit during FirstSetupDialog reproduces the earlier abort without the companion or input files. Disabling the wizard in the disposable profile permits clean baseline and active export/matching shutdown. This identifies the harness trigger, not the native invalid-free ownership defect."
+}

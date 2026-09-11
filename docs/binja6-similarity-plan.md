@@ -9,8 +9,9 @@ generations, identities and modification flags stayed unchanged.
 The helper built on Apple Silicon against BN6 ABI 187. Personal capture and
 reproduction instructions are in the companion's `docs/similarity.md`. Native
 Ultimate execution remains unvalidated and tentative: Ultimate is unavailable due
-to cost, and purchasing it is not a requirement for Personal delivery. The live
-similarity-to-WinDbg operation remains a separate acceptance check.
+to cost, and purchasing it is not a requirement for Personal delivery. The
+[2026-09-11 live handoff](similarity-windbg-acceptance.md) passed runtime-byte
+comparison, run-to, breakpoint, and wrong-build refusal on a disposable ARM64 fixture.
 
 ## Summary
 
@@ -187,9 +188,29 @@ unchanged. The captures and exact omissions are in the
 The [2026-09-10 lifecycle follow-up](similarity-lifecycle-acceptance.md) recorded
 successful cancellation during export and matching, active comparison closure,
 and comment-edit invalidation after a missing metadata notification was fixed.
-Rebase and tab-close acceptance remain incomplete. Normal quit failed with
-repeatable native widget-destruction aborts; further GUI runs stopped pending
-isolation of that crash. Listener restart and guarded WinDbg handoff remain unrun.
+The [shutdown investigation](bn-shutdown-investigation.md) reproduced the native abort
+without the companion: the disposable-profile harness invoked Quit while BN's
+first-run wizard was open. With the wizard disabled in the disposable profile,
+normal quit passed during both active export and external matching, including
+resource cleanup and exit code zero. Native debugging subsequently confirmed that
+main-window teardown tries to heap-delete the stack-allocated wizard; the direct
+Qt quit path also reproduced lingering instances during onboarding without the
+companion. The capture helper now refuses modal startup and quit.
+
+The [2026-09-11 final lifecycle captures](similarity-lifecycle-acceptance.md#final-lifecycle-follow-up--2026-09-11)
+passed listener restart, rebase, and actual target-view closure. Closure required
+invalidating the closing file immediately in `OnAfterCloseFile`, before BN removes
+it from the open-file registry. The new regression test and all 181 companion
+tests pass. Personal lifecycle acceptance is complete with that fix.
+
+The [2026-09-11 WinDbg handoff](similarity-windbg-acceptance.md) compared two benign
+ARM64 builds through the Personal GUI and external BinDiff, navigated to target
+matches, compared 16 runtime bytes, ran to one match, and hit a guarded breakpoint
+at another. All three debugger operations refused the reference build's identity.
+The owned debugger session and tunnel were closed, and BN exited normally.
+This closes the generic Personal handoff acceptance; it does not establish a live
+securekernel/CVE handoff. Full securekernel export coverage remains a separate
+follow-up. Ultimate stays tentative.
 
 ## Assumptions and defaults
 
