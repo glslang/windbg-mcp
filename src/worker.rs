@@ -6509,23 +6509,41 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
         ));
     }
 
-    let lm = e
-        .execute_command_bounded(
-            &format!("lm m {module}"),
-            remaining(deadline, "the module's base was read")?,
-        )
-        .map_err(|why| Failed::from(es(why)))
-        .and_then(|run| {
-            finished(run)
-                .map_err(|why| cut_short_failure(why, &format!("reading `{module}`'s base")))
-        })?
-        .unwrap_or_default();
-    let base = parse_lm_base(&lm).ok_or_else(|| {
-        Failed::categorised(
-            structured::ErrorCategory::Debugger,
-            format!("module `{module}` not found (`lm m {module}` returned):\n{lm}"),
-        )
-    })?;
+    // **Resolved through the module inventory, not through `lm m`.** That command takes a WinDbg
+    // pattern, so `foo*` matches several images and the first row's address wins — the scan then
+    // reads one arbitrary module and labels the report with the caller's pattern, which is a wrong
+    // answer wearing a right one's clothes. The typed list is matched exactly here, and **exactly
+    // one** match is required: a name matching several is a question with no single answer, and
+    // picking one is the thing to refuse rather than to do quietly.
+    //
+    // It also removes this path's last command, which is why the deadline no longer has to be
+    // spent before the image is read.
+    let loaded = e.modules().map_err(failed)?;
+    let mut matched = loaded
+        .iter()
+        .filter(|candidate| candidate.name.eq_ignore_ascii_case(module));
+    let base = match (matched.next(), matched.next()) {
+        (Some(one), None) => one.base,
+        (None, _) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!(
+                    "no loaded module is named `{module}`. Names here are the ones `modules` \
+                     lists — the `nt` in `nt!KeBugCheckEx` — and this matches one exactly rather \
+                     than as a pattern."
+                ),
+            ));
+        }
+        (Some(_), Some(_)) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                format!(
+                    "`{module}` matches more than one loaded module, and a scan is about one \
+                     image. Name it exactly; `modules` with a filter lists what is loaded."
+                ),
+            ));
+        }
+    };
 
     // The headers, then the imports. Both read through one closure, and a read that does not
     // answer is `PeError::Unreadable` naming what could not be read rather than a zero parsed as a

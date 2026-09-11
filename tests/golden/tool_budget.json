@@ -123,8 +123,8 @@
       "inputSchema": 541,
       "modelVisible": 1159,
       "name": "driver_hazards",
-      "outputSchema": 2896,
-      "wire": 4199
+      "outputSchema": 2996,
+      "wire": 4299
     },
     {
       "annotations": 74,
@@ -529,10 +529,10 @@
     "inputSchema": 50489,
     "instructions": 1983,
     "modelVisible": 85665,
-    "outputSchema": 132132,
-    "payload": 225576,
+    "outputSchema": 132232,
+    "payload": 225676,
     "tools": 58,
-    "wire": 225507,
+    "wire": 225607,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
