@@ -4452,6 +4452,28 @@ impl WindbgServer {
         // budget of none inspects nothing at all, leaves `from_entry` unset, and comes back as
         // "could not disassemble `from`", sending someone to check a symbol that was fine. The
         // two fields differ here for that reason and not by oversight.
+        // **The target's shape is settled here, before a session is chosen.** It is a fact about
+        // the request rather than about a target — the same rule `walk_memory`'s two-traversal
+        // refusal follows — so a caller finds out now instead of after queueing behind whatever
+        // that session is busy with. It also settles an ordering the worker could not: the walk
+        // refuses a target whose instruction set this build does not decode, and that check ran
+        // first, so a malformed pair on an ARM64 session came back as `debugger` and sent a caller
+        // to change their target rather than their call. The worker still matches these forms,
+        // as the one place the verdict is computed should.
+        let target_forms = match (&args.address, &args.module, &args.rva) {
+            (Some(_), Some(_), _) | (Some(_), _, Some(_)) => {
+                Some("provide `address` OR `module`+`rva`, not both")
+            }
+            (Some(_), None, None) | (None, Some(_), Some(_)) => None,
+            _ => Some("provide `address`, or both `module` and `rva`"),
+        };
+        if let Some(why) = target_forms {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                why.to_string(),
+                args.session_id.clone(),
+            );
+        }
         if args.max_functions == Some(0) {
             return typed_error(
                 ErrorCategory::InvalidArgument,

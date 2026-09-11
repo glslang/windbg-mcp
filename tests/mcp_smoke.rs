@@ -3266,6 +3266,32 @@ fn a_reachability_walk_with_no_budget_is_refused_before_a_session_is_needed() {
         "a caller branches on the category, not the wording: {none}"
     );
 
+    // Both malformed target shapes, refused with nothing open. These used to be settled in the
+    // worker, which put them *after* the refusal of a target whose instruction set this build
+    // does not decode -- so on an ARM64 session a caller who passed both forms was told their
+    // target was unsupported and went to change it rather than their call.
+    for (arguments, expected) in [
+        (
+            json!({ "from": "nt!Dispatch", "address": "0x1000", "module": "nt", "rva": "0x10" }),
+            "not both",
+        ),
+        (json!({ "from": "nt!Dispatch" }), "or both"),
+        (json!({ "from": "nt!Dispatch", "module": "nt" }), "or both"),
+    ] {
+        let shape = server.call_tool("reachable_from_dispatch", arguments.clone(), STEP);
+        assert!(is_tool_error(&shape), "{arguments}: {shape}");
+        let text = text_of(&shape["result"]);
+        assert!(text.contains(expected), "{arguments}: {text}");
+        assert!(
+            !text.contains("session"),
+            "this is refused before any session is needed: {text}"
+        );
+        assert_eq!(
+            shape["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+            "{arguments}: {shape}"
+        );
+    }
+
     // And a field carrying a command breaker, which is refused on the same path for a different
     // reason: `from` reaches the debugger's expression evaluator.
     let breaker = server.call_tool(
