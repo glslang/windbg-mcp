@@ -313,6 +313,16 @@ pub(crate) struct SegmentRecipe {
     goal: u64,
     /// On-path conditional branches, in path order (includes `Either` steps).
     steps: Vec<BranchStep>,
+    /// True when this segment's branches could **not** be recovered, so [`Self::steps`] is not a
+    /// short list but an unknown one.
+    ///
+    /// The distinction is the whole reason this field exists: an empty `steps` otherwise reads as
+    /// "straight-line to the goal", which is a positive claim that control reaches it
+    /// unconditionally. Two things produce an unknown segment and neither is a halt — a
+    /// re-disassembly that failed for an ordinary reason, and a route the search could not
+    /// reconstruct — so deriving completeness from the halt alone publishes a recipe whose gates
+    /// are missing as one that has none.
+    gates_unknown: bool,
 }
 
 /// Maps each instruction address to its mnemonic+operands text (address and raw-bytes
@@ -612,7 +622,29 @@ pub(crate) fn path_recipe(
             stopped = Some(why);
             break;
         }
-        let Some(block) = uf(&arg) else { continue };
+        let Some(block) = uf(&arg) else {
+            // Two reasons `uf` answers nothing, and they are different answers. A halt makes the
+            // recipe a **prefix**: what follows this segment is missing too, so it stops here and
+            // says so. An ordinary failure — a command that errored, a listing with no addresses
+            // in it — leaves the rest of the path describable, and what is unknown is this one
+            // function's gates. Skipping it silently was the defect: the segment vanished, and a
+            // recipe short by one function rendered as the complete set of conditions for
+            // reaching the target.
+            if let Some(why) = halt() {
+                stopped = Some(why);
+                break;
+            }
+            recipes.push(SegmentRecipe {
+                // The requested start rather than the resolved one: resolving it needs the block
+                // that would not disassemble. It is still where control enters this function on
+                // the path, which is what a reader wants it for.
+                start: want_start,
+                goal,
+                steps: Vec::new(),
+                gates_unknown: true,
+            });
+            continue;
+        };
         let idx: HashMap<u64, usize> = block
             .iter()
             .enumerate()
@@ -626,7 +658,11 @@ pub(crate) fn path_recipe(
             block.first().map_or(want_start, |i| i.address)
         };
         let textmap = instruction_text(&block);
-        let mut steps: Vec<BranchStep> = find_path(&block, &idx, start, goal)
+        // A route the search could not reconstruct is the same defect one level down: the branches
+        // on the way to the goal are unknown, and an empty list of them claims there are none.
+        let route = find_path(&block, &idx, start, goal);
+        let gates_unknown = route.is_none();
+        let mut steps: Vec<BranchStep> = route
             .unwrap_or_default()
             .into_iter()
             .map(|(site, took)| branch_step(&block, &idx, &textmap, site, took))
@@ -652,15 +688,22 @@ pub(crate) fn path_recipe(
                 predicate,
             });
         }
-        recipes.push(SegmentRecipe { start, goal, steps });
+        recipes.push(SegmentRecipe {
+            start,
+            goal,
+            steps,
+            gates_unknown,
+        });
     }
-    // Polled once more after the loop, for the reason the walk needs the same thing: the poll at
-    // the top of an iteration cannot see a halt that lands *inside* the disassembler on the last
-    // segment. There `uf` returns `None`, the arm continues, the loop ends — and a recipe missing
-    // its final segment would render as the whole of one.
-    if stopped.is_none() {
-        stopped = halt();
-    }
+    // **No poll after the loop**, and it used to have one. It was added because a halt landing
+    // inside the disassembler on the *last* segment left `stopped` empty, so a recipe missing its
+    // final segment rendered as the whole of one. The `uf` arm above answers that case directly
+    // now, and better: it can `break`, so the recipe really is a prefix when it says so.
+    //
+    // What is left for a poll here is the case where every segment *was* described and the clock
+    // then ran out — and reporting a halt there is the opposite error, labelling a complete recipe
+    // a prefix of itself. Nothing can vanish from this loop any more: a halt breaks it, and an
+    // ordinary failure leaves a segment saying its gates are unknown.
     (recipes, stopped)
 }
 
@@ -716,8 +759,18 @@ pub(crate) fn format_recipe(recipes: &[SegmentRecipe], stopped: Option<Halt>) ->
             fmt_addr(seg.start),
             fmt_addr(seg.goal)
         ));
+        if seg.gates_unknown {
+            out.push_str(
+                "    (conditions NOT recovered for this function — the gates on the way through\n\
+                 \x20    it are unknown, so what is listed below is not the whole of them)\n",
+            );
+        }
         if seg.steps.is_empty() {
-            out.push_str("    (no gating branches — straight-line to the goal)\n");
+            // Said only when the emptiness is a *finding*. With the gates unknown it is the
+            // absence of one, and the two read identically once rendered.
+            if !seg.gates_unknown {
+                out.push_str("    (no gating branches — straight-line to the goal)\n");
+            }
             continue;
         }
         for s in &seg.steps {
@@ -1085,6 +1138,7 @@ pub(crate) fn structured_report(
                 .map(|segment| structured::RecipeSegment {
                     start: locate(segment.start),
                     goal: locate(segment.goal),
+                    gates_unknown: segment.gates_unknown,
                     steps: segment
                         .steps
                         .iter()
@@ -1732,6 +1786,96 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         );
         assert_eq!(steps[0].site, 0x1008);
         assert_eq!(steps[0].required, Direction::Fallthrough);
+    }
+
+    /// A segment the recipe could not describe is **reported as undescribed**, not dropped.
+    ///
+    /// Two ways to get there and neither is a halt: the re-disassembly fails for an ordinary
+    /// reason — a command that errored, a listing with no addresses — or it succeeds and the
+    /// search cannot reconstruct a route through it. Both used to vanish. A dropped segment leaves
+    /// a recipe that is short by one function and says nothing about it, and a route that was not
+    /// reconstructed leaves an empty step list, which renders as "straight-line to the goal" — a
+    /// positive claim that control reaches it unconditionally. Either way a caller generating
+    /// input satisfies every condition listed and still does not reach the target.
+    #[test]
+    fn a_segment_the_recipe_cannot_describe_is_reported_rather_than_dropped() {
+        let m = functions(&[
+            (
+                "start",
+                uf_fn(
+                    0x1000,
+                    vec![
+                        insn(0x1004, Flow::Fallthrough, "cmp dword ptr [rdx+18h],222003h"),
+                        insn(0x1008, Flow::Branch(Some(0x1014)), "jne A+0x14"),
+                        insn(0x100c, Flow::Call(Some(0x2000)), "call A!B"),
+                        insn(0x1011, Flow::Return, "ret"),
+                        insn(0x1014, Flow::Return, "ret"),
+                    ],
+                ),
+            ),
+            (
+                "0x2000",
+                uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
+            ),
+        ]);
+        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        assert!(rpt.verdict_reachable);
+
+        // One: the callee will not disassemble the second time, and nothing halted.
+        let (recipes, stopped) = path_recipe(
+            "start",
+            None,
+            &rpt,
+            |a| (a != "0x2000").then(|| m.get(a).cloned()).flatten(),
+            never,
+        );
+        assert_eq!(stopped, None, "nothing halted; this is an ordinary failure");
+        assert_eq!(
+            recipes.len(),
+            2,
+            "the segment is still on the path and is still reported: {recipes:?}"
+        );
+        assert!(recipes[1].gates_unknown, "{:?}", recipes[1]);
+        let text = format_recipe(&recipes, stopped);
+        assert!(text.contains("NOT recovered"), "{text}");
+        assert!(
+            !text.contains("straight-line"),
+            "an unknown segment must not read as an unconditional one: {text}"
+        );
+        assert!(
+            structured_report(&rpt, Some((&recipes, stopped)), located)
+                .recipe
+                .unwrap()[1]
+                .gates_unknown,
+            "and the typed half says it too"
+        );
+
+        // Two: it disassembles, and the second listing does not contain the goal — so no route
+        // through it can be reconstructed. An empty step list here is an absence of information.
+        let short = uf_fn(0x2000, vec![insn(0x2008, Flow::Return, "ret")]);
+        let (recipes, stopped) = path_recipe(
+            "start",
+            None,
+            &rpt,
+            |a| {
+                if a == "0x2000" {
+                    return Some(short.clone());
+                }
+                m.get(a).cloned()
+            },
+            never,
+        );
+        assert_eq!(stopped, None);
+        assert_eq!(recipes.len(), 2, "{recipes:?}");
+        assert!(recipes[1].gates_unknown, "{:?}", recipes[1]);
+        assert!(recipes[1].steps.is_empty());
+        assert!(!format_recipe(&recipes, stopped).contains("straight-line"));
+
+        // And a recipe that *is* straight-line still says so, so the sentence above is about the
+        // unknown case rather than about every empty segment.
+        let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        assert!(!whole[1].gates_unknown);
+        assert!(format_recipe(&whole, none).contains("straight-line"));
     }
 
     /// A halt that lands *inside* the disassembler on the **final** segment still shortens the
