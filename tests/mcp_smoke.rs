@@ -9743,6 +9743,70 @@ fn an_ioctl_map_of_an_architecture_this_build_cannot_decode_is_refused() {
     );
 }
 
+/// **A dump has no object namespace to walk, and the refusal must be about the target rather than
+/// about the device name.**
+///
+/// A kernel minidump captures none of what the walk starts from: the root directory pointer, the
+/// type table and the header cookie all read `????????`, none of them being in the small set of
+/// pages a bug check writes. The failure available here is the quiet one -- a walk that treated an
+/// unreadable root as an empty directory would report every device as **not found**, which is a
+/// sentence about the caller's argument and says nothing about the dump.
+///
+/// So what is asserted is the **category**, and that is the whole point of the test rather than a
+/// weaker stand-in for checking the wording. `not found` and `is not an object path` are
+/// `invalid_argument`; everything the target failed to supply is `debugger`. A reader acting on
+/// the first goes and checks a device name that was perfectly correct.
+///
+/// **Not the message text, because which refusal comes back depends on the bench.** Measured here
+/// 2026-09-12: this tier's worker reads the sample with symbol path `srv*` and no cache, so `nt`
+/// loads with **no symbols** and the walk is refused before the globals are ever read -- it cannot
+/// locate `_OBJECT_DIRECTORY_ENTRY`. A bench whose symbols resolve gets past that and is refused
+/// at the unreadable globals instead. Both are right, both are `debugger`, and pinning either
+/// wording would make this test a statement about the machine it last ran on.
+#[test]
+fn a_device_query_against_a_dump_is_refused_about_the_target_not_the_name() {
+    let Some(sample) = native_sample_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let opened = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
+    assert_no_error(&opened, "open_dump");
+    let session_id = session_id_of(&opened["result"]);
+
+    let response = server.call_tool(
+        "device_security",
+        json!({ "session_id": session_id, "device": r"\Device\MountPointManager" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "device_security on a dump");
+    assert!(
+        is_tool_error(&response),
+        "a dump carries no namespace to walk, so this is a refusal rather than an answer: \
+         {response}"
+    );
+    let data = &response["result"]["structuredContent"];
+    assert_eq!(
+        data["status"], "error",
+        "the refusal carries structured content, as the schema promises: {response}"
+    );
+    assert_eq!(
+        data["error"]["category"], "debugger",
+        "and it is about the target rather than the argument -- `invalid_argument` here would \
+         send a reader to check a device name that was correct: {response}"
+    );
+    let message = data["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        !message.contains("is not in"),
+        "nor may it read as a device that is not there, whichever refusal it is: {response}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
 /// `debug_batch` end to end against a real engine: a batch that commits, and one that fails an
 /// assertion — with the same `always` block on both.
 ///
@@ -13827,6 +13891,129 @@ fn kernel_scratch(server: &mut Server, session: &str) -> Option<KernelScratch> {
         return None;
     }
     Some(scratch)
+}
+
+/// **`device_security` against a device whose gate is published**, which is what makes this an
+/// oracle rather than a demonstration.
+///
+/// `\Device\MountPointManager` is on every Windows kernel, and
+/// [`driver-ioctl-walkthrough.md`](../docs/driver-ioctl-walkthrough.md) recovered its four-ACE DACL
+/// by hand -- `dt nt!_SECURITY_DESCRIPTOR_RELATIVE`, `dt nt!_ACL` and `db`, parsed by eye -- before
+/// there was a tool. Every figure below is from that document rather than from this code, so a
+/// change to the descriptor reader that agrees with itself still fails here.
+///
+/// The assertion the rest exists for is the **last** one: Everyone's mask carries neither
+/// `FILE_READ_DATA` nor `FILE_WRITE_DATA`, which is the whole of why a standard user must open this
+/// device with `DesiredAccess = 0`. It is checked as the two booleans rather than by matching the
+/// hex, because those are what a caller joining this to an IOCTL map reads, and a mask quoted
+/// correctly into fields nobody computed would pass a test that looked only at the text.
+///
+/// Live-kernel only: this needs the object namespace, which a dump does not carry --
+/// `a_device_query_against_a_dump_says_the_dump_has_no_namespace` is the other half.
+#[test]
+#[ignore = "live kernel tier: needs WINDBG_MCP_SMOKE_KERNEL"]
+fn a_device_security_query_on_a_live_kernel_reproduces_the_published_gate() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    with_live_kernel_session(&mut server, &connection, |server, session| {
+        let response = server.call_tool(
+            "device_security",
+            json!({
+                "session_id": session,
+                "device": r"\Device\MountPointManager",
+            }),
+            TARGET_STEP,
+        );
+        assert_no_error(&response, "device_security");
+        assert!(
+            !is_tool_error(&response),
+            "the device is on every Windows kernel: {}",
+            text_of(&response["result"])
+        );
+        let data = &response["result"]["structuredContent"]["data"];
+
+        assert_eq!(
+            (
+                data["secure_open"].as_bool(),
+                data["characteristics"].as_str()
+            ),
+            (Some(true), Some("0x00000100")),
+            "FILE_DEVICE_SECURE_OPEN is the published characteristic: {data}"
+        );
+        assert_eq!(
+            data["type_confirmed"].as_bool(),
+            Some(true),
+            "and the namespace typed it as a device rather than assuming it: {data}"
+        );
+
+        let entries = data["security"]["dacl"]["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the DACL comes back as entries: {data}"));
+        let gate: Vec<(String, String, String)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry["kind"].as_str().unwrap_or_default().to_string(),
+                    entry["sid"].as_str().unwrap_or_default().to_string(),
+                    entry["mask"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        let published = [
+            ("allow", "S-1-1-0", "0x001200a0"),
+            ("allow", "S-1-5-12", "0x001200a0"),
+            ("allow", "S-1-5-18", "0x001f01ff"),
+            ("allow", "S-1-5-32-544", "0x001f01ff"),
+        ];
+        assert_eq!(
+            gate.len(),
+            published.len(),
+            "the walkthrough recovered four ACEs: {data}"
+        );
+        for (found, (kind, sid, mask)) in gate.iter().zip(published) {
+            assert_eq!(
+                (found.0.as_str(), found.1.as_str(), found.2.as_str()),
+                (kind, sid, mask),
+                "and in this order, since a DACL is walked in order and a deny after an allow may \
+                 never be reached: {data}"
+            );
+        }
+        let everyone = &entries[0];
+        assert_eq!(
+            everyone["account"].as_str(),
+            Some("Everyone"),
+            "the well-known SID reads as the account it is: {data}"
+        );
+        assert_eq!(
+            (everyone["reads"].as_bool(), everyone["writes"].as_bool()),
+            (Some(false), Some(false)),
+            "and 0x1200a0 grants neither FILE_READ_DATA nor FILE_WRITE_DATA, which is why a \
+             standard user must open this device with DesiredAccess = 0: {data}"
+        );
+
+        // The namespace half. A link is what makes the device reachable as `\\.\Name`, and the
+        // search verdict is what makes an empty list mean anything.
+        assert_eq!(
+            data["link_search"].as_str(),
+            Some("complete"),
+            "the directory was listed in full, so its links are all of them: {data}"
+        );
+        let links: Vec<&str> = data["links"]
+            .as_array()
+            .map(|links| {
+                links
+                    .iter()
+                    .filter_map(|link| link["path"].as_str())
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(
+            links.contains(&r"\GLOBAL??\MountPointManager"),
+            "and the published global link is among them: {data}"
+        );
+    });
 }
 
 /// Attaches, runs `body` against the session, and **releases the target whatever `body` did**.
