@@ -338,6 +338,17 @@ struct Facts {
     /// fall-through edge and not on the branch's, which is what makes a jump table's length a
     /// fact about the path that reaches it rather than about the listing near it.
     bound: Option<Bound>,
+    /// Where a refusal's status stands, which is a fact about the path like the rest of these.
+    ///
+    /// **It used to be computed inside whichever block was being read for a refusal**, which made
+    /// it the one thing here that did not cross an edge: a routine that stores the error into the
+    /// IRP *before* deciding -- `mov [rbx+30h],0C0000010h` / `cmp code,N` / `je complete` -- had
+    /// the store in one block and the completion in another, and the second was read as though the
+    /// first had not happened. Every way of carrying it across one edge at a time was another
+    /// round of this; carried as a fact, it crosses all of them and joins at merges the way a
+    /// register's value does -- kept only where every path into a block agrees, which is the same
+    /// conservatism, from the same place.
+    status: Status,
 }
 
 impl Facts {
@@ -357,6 +368,14 @@ impl Facts {
             changed |= self.bound.is_some();
             self.bound = None;
         }
+        // A status only where **every** path into the block has one, for the reason a register's
+        // value is: a refusal one path establishes is not one the block makes.
+        let status = Status {
+            returned: self.status.returned && other.status.returned,
+            irp: self.status.irp && other.status.irp,
+        };
+        changed |= status != self.status;
+        self.status = status;
         changed
     }
 }
@@ -1059,6 +1078,10 @@ fn update(
     layout: Layout,
     traced: &mut bool,
 ) -> Option<Compared> {
+    // Where the status stands after this instruction, asked **before** it is applied because a
+    // store reads its base as it stands. A compare writes neither a register nor a status, so this
+    // is above the early return for one and the answer is the same either way.
+    facts.status = status_after(facts.status, instruction, layout, facts);
     // A compare writes no register and is the only thing a branch reads.
     if instruction.effect == Effect::Compare {
         return compare(facts, instruction, layout, traced);
@@ -1808,12 +1831,10 @@ fn follow_table(
 fn error_status(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> bool {
     let mut facts = arrived.clone();
     let mut traced = false;
-    let mut status = Status::default();
     for instruction in instructions {
-        status = status_after(status, instruction, layout, &facts);
         update(&mut facts, instruction, layout, &mut traced);
     }
-    status.refusing()
+    facts.status.refusing()
 }
 
 /// What one instruction does to the status a block has established so far.
@@ -1911,11 +1932,10 @@ fn status_after(
 struct Ending {
     /// Whether that block returned, refusing.
     refuses: bool,
-    /// The status it established, for the block a tail jump carries it to.
-    status: Status,
-    /// And the registers it left, for the same reason: a case's own path can put the IRP somewhere
-    /// before jumping to a shared error block, and that block's *joined* facts are what every
-    /// predecessor agreed on -- which for a fact only this path carries is nothing.
+    /// The registers it left, for the block a tail jump carries them to: a case's own path can put
+    /// the IRP somewhere before jumping to a shared error block, and that block's *joined* facts
+    /// are what every predecessor agreed on -- which for a fact only this path carries is nothing.
+    /// The status rides in these, being one of them.
     facts: Facts,
 }
 
@@ -1950,12 +1970,7 @@ impl Status {
 ///
 /// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
 /// here, and [`refuses_in`] is what follows that jump.
-fn failure_block(
-    instructions: &[Instruction],
-    layout: Layout,
-    arrived: &Facts,
-    incoming: Status,
-) -> Ending {
+fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> Ending {
     // **Read where the store is, not where the block starts.** Whether a destination is
     // `Irp->IoStatus.Status` is a question about a register, and a block is free to reuse one: a
     // `rbx` that arrives holding the IRP and is reassigned to a diagnostic object before the store
@@ -1963,18 +1978,16 @@ fn failure_block(
     // driver accepts. Same rule, and same replay, as a jump table's base.
     let mut facts = arrived.clone();
     let mut traced = false;
-    let mut status = incoming;
     for instruction in instructions {
         // What the block has established **so far**, which is what says whether the call it is
-        // about to make is a completion on the way out or a block doing something else. Asked
-        // before the instruction is applied, because a store reads its base as it stands.
-        status = status_after(status, instruction, layout, &facts);
+        // about to make is a completion on the way out or a block doing something else. Kept by
+        // `update` with everything else, so what arrived on the edge is already in it.
         update(&mut facts, instruction, layout, &mut traced);
+        let status = facts.status;
         match instruction.flow {
             Flow::Return => {
                 return Ending {
                     refuses: status.refusing(),
-                    status,
                     facts,
                 };
             }
@@ -1989,7 +2002,6 @@ fn failure_block(
             Flow::Jmp(Some(_)) => {
                 return Ending {
                     refuses: false,
-                    status,
                     facts,
                 };
             }
@@ -2019,7 +2031,6 @@ fn refuses_in(
 ) -> bool {
     let mut at = index;
     let mut start = from;
-    let mut status = Status::default();
     // What the block before this one left, once there has been one. **Carried rather than looked
     // up**: a tail edge is one path into a shared block, and that block's entry facts are what
     // *every* path into it agreed on -- so a case that copies the IRP into a register before
@@ -2041,11 +2052,10 @@ fn refuses_in(
             (None, true) => Facts::default(),
             (None, false) => entry.get(at).cloned().flatten().unwrap_or_default(),
         };
-        let ending = failure_block(instructions, layout, &facts, status);
+        let ending = failure_block(instructions, layout, &facts);
         if ending.refuses {
             return true;
         }
-        status = ending.status;
         carried = Some(ending.facts);
         // Only an unconditional tail jump is followed: a block that decides something is deciding
         // it, and whatever it reaches is not simply this block's answer.
@@ -7560,6 +7570,104 @@ mod tests {
             through(true),
             (Some(false), None),
             "and so is the same constant carried there in a register"
+        );
+    }
+
+    /// A status established **before** the branch reaches the case that branch selects.
+    ///
+    /// A routine that stores the error into the IRP and then decides -- `mov [rbx+30h],0C0000010h`
+    /// / `cmp code,N` / `je complete` -- has the store in one block and the completion in another.
+    /// Reading the second alone sees a block that calls something and returns success, so the case
+    /// comes back accepted with the completion routine as its handler, while the IRP it completed
+    /// carries an error.
+    ///
+    /// The status is a fact about the path now, so it crosses that edge the way a register's value
+    /// does -- and **joins** the way one does, which is the third half of this: a path that reaches
+    /// the same compare without passing the store leaves the block knowing nothing about it.
+    #[test]
+    fn a_status_set_before_the_branch_reaches_the_case_it_selects() {
+        const JOIN: u64 = DISPATCH + 0x1a;
+        const COMPLETE: u64 = DISPATCH + 0x40;
+        let refusing = |stored: bool, skipping: bool| {
+            let mut block = prologue(DISPATCH);
+            block.push(insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("rbx"), reg("rdx")],
+                Flow::Fallthrough,
+            ));
+            if skipping {
+                // A way to the compare that never passes the store.
+                block.extend([
+                    insn(
+                        DISPATCH + 0xb,
+                        "test",
+                        vec![reg("ecx"), reg("ecx")],
+                        Flow::Fallthrough,
+                    ),
+                    insn(DISPATCH + 0xd, "je", Vec::new(), Flow::Branch(Some(JOIN))),
+                ]);
+            }
+            if stored {
+                block.push(insn(
+                    DISPATCH + 0x13,
+                    "mov",
+                    vec![mem("rbx", 0x30), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    JOIN,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x20,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(COMPLETE)),
+                ),
+                insn(DISPATCH + 0x26, "ret", Vec::new(), Flow::Return),
+                // The completion: a call, success in the return register, and out.
+                insn(
+                    COMPLETE,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(
+                    COMPLETE + 5,
+                    "xor",
+                    vec![reg("eax"), reg("eax")],
+                    Flow::Fallthrough,
+                ),
+                insn(COMPLETE + 7, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let case = found
+                .cases
+                .iter()
+                .find(|case| case.code == 0x222003)
+                .unwrap_or_else(|| panic!("the code is a case: {:?}", found.cases));
+            (case.accepted, case.handler)
+        };
+
+        assert_eq!(
+            refusing(true, false),
+            (Some(false), None),
+            "the IRP this completes carries the error the block before it stored"
+        );
+        assert_eq!(
+            refusing(false, false),
+            (Some(true), Some(0x7000)),
+            "and with nothing stored it is a case that reaches a routine"
+        );
+        assert_eq!(
+            refusing(true, true),
+            (Some(true), Some(0x7000)),
+            "a status one path sets is not one the block makes: the other way in never passed              the store, so what they agree on is nothing"
         );
     }
 
