@@ -83,7 +83,7 @@ GUI exited 0 without forced termination.
 The [follow-up manifest](samples/securekernel-export-followup-20260911.json) records
 the recovered pairs, source/helper/export hashes, fixed diagnostic, validation
 results, and separate process exits. Earlier partial captures remain unchanged.
-An independent [protobuf inspection](samples/securekernel-export-graph-inspection-20260911.py)
+An independent [protobuf inspection](samples/securekernel-export-graph-inspection-20260911-recorded.py.txt)
 followed each graph's entry block and instruction index in the retained BinExport
 files. All sixteen entries have the expected addresses, raw bytes `df2203d5`, and
 mnemonic `clrbhb`; there are 3,120 reference graphs and 3,143 target graphs.
@@ -92,7 +92,13 @@ process remained after the final diagnostic.
 `graph_inspection_raw_output_sha256` hashes the original `graph-inspection.json`
 [raw output](samples/securekernel-export-graph-inspection-20260911-raw.json) before
 export paths were reduced to basenames in the manifest;
-`graph_inspection_script.sha256` separately hashes the retained inspection script.
+`graph_inspection_script.sha256` separately hashes the archived executed script.
+The [reproduction inspector](samples/securekernel-export-graph-inspection-20260911.py)
+now rejects optimized Python (`-O`, `-OO`, or `PYTHONOPTIMIZE`) before validation;
+those modes remove its acceptance assertions. Offline CLI regressions with empty
+export graphs reproduced false-positive output in all four optimized-mode cases
+before the guard and now verify refusal without creating an output file. This
+corrects future execution; the recorded source, hashes, and observations are unchanged.
 
 The native helper build and its CTest regression passed, including rejection of
 wrong architectures, unaligned addresses, short input, null input, and a nearby
