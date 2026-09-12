@@ -2512,10 +2512,15 @@ pub struct IoctlMap {
     ///
     /// A block's facts start as whatever the first path into it left and are narrowed by every
     /// path after, so a budget that runs out leaves beliefs a later edge would have taken away.
-    /// Everything resting on one — every case, every table — is **discarded** rather than
-    /// reported, because a fabricated case is worse than a missing one: nothing about it says it
-    /// is fabricated. So this is the difference between a routine with no recognisable control
-    /// codes and a routine no answer was settled about, and `cases` is empty either way.
+    /// Everything resting on one is **discarded** rather than reported — every jump table, and
+    /// every code traced to the IRP — because a fabricated case is worse than a missing one:
+    /// nothing about it says it is fabricated.
+    ///
+    /// What is left is what a block says on its own, which is a compare against a bare `+0x18`
+    /// displacement: those are still listed, and every one of them is `proved: false`. So an empty
+    /// `cases` beside this means the routine compares nothing this could read at all, and a
+    /// non-empty one means these are the compares, unproved, with whatever a table would have
+    /// added missing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub unsettled: bool,
     /// How many instructions in the routine could **not** be read or decoded.
