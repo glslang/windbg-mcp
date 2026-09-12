@@ -2501,6 +2501,16 @@ pub struct IoctlMap {
     /// True when a bound ended a list early — the cases, or one table's entries.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cap_hit: bool,
+    /// True when the walk ran out of sweeps before what each block knows stopped changing.
+    ///
+    /// A block's facts start as whatever the first path into it left and are narrowed by every
+    /// path after, so a budget that runs out leaves beliefs a later edge would have taken away.
+    /// Everything resting on one — every case, every table — is **discarded** rather than
+    /// reported, because a fabricated case is worse than a missing one: nothing about it says it
+    /// is fabricated. So this is the difference between a routine with no recognisable control
+    /// codes and a routine no answer was settled about, and `cases` is empty either way.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub unsettled: bool,
     /// How many instructions in the routine could **not** be read or decoded.
     ///
     /// Each is a place a compare or a dispatch jump may be, so any of these makes the map
