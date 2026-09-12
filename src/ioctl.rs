@@ -1842,6 +1842,19 @@ fn status_after(
     }
 }
 
+/// What reading one block for a refusal produced.
+#[derive(Default)]
+struct Ending {
+    /// Whether that block returned, refusing.
+    refuses: bool,
+    /// The status it established, for the block a tail jump carries it to.
+    status: Status,
+    /// And the registers it left, for the same reason: a case's own path can put the IRP somewhere
+    /// before jumping to a shared error block, and that block's *joined* facts are what every
+    /// predecessor agreed on -- which for a fact only this path carries is nothing.
+    facts: Facts,
+}
+
 /// Where a dispatch routine's status stands, which is **two** places and not one.
 ///
 /// A refusal can put an error in either, and they are independent: a block that stores one into
@@ -1878,7 +1891,7 @@ fn failure_block(
     layout: Layout,
     arrived: &Facts,
     incoming: Status,
-) -> (bool, Status) {
+) -> Ending {
     // **Read where the store is, not where the block starts.** Whether a destination is
     // `Irp->IoStatus.Status` is a question about a register, and a block is free to reuse one: a
     // `rbx` that arrives holding the IRP and is reassigned to a diagnostic object before the store
@@ -1894,7 +1907,13 @@ fn failure_block(
         status = status_after(status, instruction, layout, &facts);
         update(&mut facts, instruction, layout, &mut traced);
         match instruction.flow {
-            Flow::Return => return (status.refusing(), status),
+            Flow::Return => {
+                return Ending {
+                    refuses: status.refusing(),
+                    status,
+                    facts,
+                };
+            }
             // A completion call after the status is part of the rejection; one before it is a
             // block doing something else.
             Flow::Call(_) if status.refusing() => {}
@@ -1903,13 +1922,19 @@ fn failure_block(
             // and starting the next one from nothing loses it -- the shared return block is then
             // reported as this case's handler. Whether that jump is followed at all is
             // [`refuses_in`]'s question; this says what goes with it.
-            Flow::Jmp(Some(_)) => return (false, status),
-            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return (false, Status::default()),
-            Flow::Unreadable | Flow::Unknown => return (false, Status::default()),
+            Flow::Jmp(Some(_)) => {
+                return Ending {
+                    refuses: false,
+                    status,
+                    facts,
+                };
+            }
+            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return Ending::default(),
+            Flow::Unreadable | Flow::Unknown => return Ending::default(),
             Flow::Fallthrough | Flow::Trap => {}
         }
     }
-    (false, Status::default())
+    Ending::default()
 }
 
 /// Whether the block at `index` **refuses** the request, following the tail jumps a shared
@@ -1931,6 +1956,13 @@ fn refuses_in(
     let mut at = index;
     let mut start = from;
     let mut status = Status::default();
+    // What the block before this one left, once there has been one. **Carried rather than looked
+    // up**: a tail edge is one path into a shared block, and that block's entry facts are what
+    // *every* path into it agreed on -- so a case that copies the IRP into a register before
+    // jumping to a shared error block has that provenance joined away by a predecessor which did
+    // not, and the store the error goes through stops being one to `Irp->IoStatus.Status`. The
+    // refusal is then missed and the tail is reported as this code's handler.
+    let mut carried: Option<Facts> = None;
     for hop in 0..3 {
         let block = &graph.blocks[at];
         // The first block is read from the landing, which a jump table's need not be the start
@@ -1940,15 +1972,17 @@ fn refuses_in(
         // there along an edge this graph does not have -- so it is read with nothing believed,
         // exactly as its sizes are. Every hop after that is a tail jump the graph *does* carry, so
         // those blocks are read with what reached them.
-        let facts = match blind && hop == 0 {
-            true => Facts::default(),
-            false => entry.get(at).cloned().flatten().unwrap_or_default(),
+        let facts = match (&carried, blind && hop == 0) {
+            (Some(carried), _) => carried.clone(),
+            (None, true) => Facts::default(),
+            (None, false) => entry.get(at).cloned().flatten().unwrap_or_default(),
         };
-        let (refuses, carried) = failure_block(instructions, layout, &facts, status);
-        if refuses {
+        let ending = failure_block(instructions, layout, &facts, status);
+        if ending.refuses {
             return true;
         }
-        status = carried;
+        status = ending.status;
+        carried = Some(ending.facts);
         // Only an unconditional tail jump is followed: a block that decides something is deciding
         // it, and whatever it reaches is not simply this block's answer.
         let tail = instructions
@@ -7017,6 +7051,80 @@ mod tests {
         assert!(
             !rendered.contains("every case and table was"),
             "and not that everything did, above a list of what did not: {rendered}"
+        );
+    }
+
+    /// The facts a rejection's own path carries go with it over the tail jump.
+    ///
+    /// A shared error block's *entry* facts are what every path into it agreed on, so a case that
+    /// copies the IRP into a register before jumping there has that provenance joined away by a
+    /// predecessor which did not -- and the store the error goes through stops being one to
+    /// `Irp->IoStatus.Status`. The refusal is missed, and the shared block is reported as this
+    /// code's handler.
+    ///
+    /// The fixture's second predecessor is what makes the join do anything: with one path in, the
+    /// entry facts *are* this path's and the test would pass without carrying them.
+    #[test]
+    fn a_rejections_own_facts_go_with_it_over_the_tail_jump() {
+        const CASE: u64 = DISPATCH + 0x40;
+        const OTHER: u64 = DISPATCH + 0x60;
+        const SHARED: u64 = DISPATCH + 0x80;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(CASE))),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("r13d"), imm(0x222007)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1a, "je", Vec::new(), Flow::Branch(Some(OTHER))),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+            // The case: the IRP into `rbx`, then out to the shared epilogue.
+            insn(CASE, "mov", vec![reg("rbx"), reg("rdx")], Flow::Fallthrough),
+            insn(CASE + 3, "jmp", Vec::new(), Flow::Jmp(Some(SHARED))),
+            // The other predecessor, which reaches the same block with `rbx` holding something
+            // else -- so the join keeps nothing about it.
+            insn(
+                OTHER,
+                "mov",
+                vec![reg("rbx"), reg("rsi")],
+                Flow::Fallthrough,
+            ),
+            insn(OTHER + 3, "jmp", Vec::new(), Flow::Jmp(Some(SHARED))),
+            // The shared epilogue: the status into the IRP, a completion call, and out.
+            insn(
+                SHARED,
+                "mov",
+                vec![mem("rbx", 0x30), imm(0xc000_0010)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                SHARED + 7,
+                "call",
+                vec![Operand::Target(0x7000)],
+                Flow::Call(Some(0x7000)),
+            ),
+            insn(SHARED + 0xc, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        let case = found
+            .cases
+            .iter()
+            .find(|case| case.code == 0x222003)
+            .unwrap_or_else(|| panic!("the first code is a case: {:?}", found.cases));
+        assert_eq!(
+            (case.accepted, case.handler),
+            (Some(false), None),
+            "this path put the IRP where the status goes, whatever the other one did: {case:?}"
         );
     }
 
