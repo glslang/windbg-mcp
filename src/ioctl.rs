@@ -127,6 +127,9 @@ pub(crate) struct SizeCheck {
 pub(crate) struct Case {
     pub(crate) code: u32,
     pub(crate) recovered: Recovery,
+    /// The status standing where this case was recognised, for a case the graph has no edge to.
+    /// Empty for a compare case, whose landing block's own facts carry it.
+    pub(crate) status: Status,
     /// The instruction that recognises this code: the compare, or the indirect jump whose table
     /// holds it.
     pub(crate) site: u64,
@@ -591,9 +594,9 @@ fn map_within(
     // The second half of that key is the jump-table rule above: whether a store is to the IRP's
     // status field is a question about a register, so a case read with nothing believed gets a
     // different answer from one read with the block's own.
-    let refusals: std::cell::RefCell<HashMap<(usize, bool), bool>> =
+    let refusals: std::cell::RefCell<HashMap<(usize, Option<Status>), bool>> =
         std::cell::RefCell::new(HashMap::new());
-    let refuses_at = |from: usize, blind: bool| {
+    let refuses_at = |from: usize, blind: Option<Status>| {
         let known = refusals.borrow().get(&(from, blind)).copied();
         if let Some(known) = known {
             return known;
@@ -647,12 +650,20 @@ fn map_within(
         // the facts again, which is a different change from this one and would move what every
         // block downstream of such a landing believes.
         let facts = match case.recovered {
-            Recovery::JumpTable => Facts::default(),
+            // Nothing believed about any **register**, for the reason above -- but the status is
+            // not a register, and where it stood at the jump is on the path to this landing.
+            Recovery::JumpTable => Facts {
+                status: case.status,
+                ..Facts::default()
+            },
             Recovery::Compare => entry[at].clone().unwrap_or_default(),
         };
         let instructions = &block[from..graph.blocks[at].end];
         case.handler = handler_in(instructions);
-        let blind = case.recovered == Recovery::JumpTable;
+        let blind = match case.recovered {
+            Recovery::JumpTable => Some(case.status),
+            Recovery::Compare => None,
+        };
         let refuses = refuses_at(from, blind);
         case.accepted = match (
             refuses,
@@ -671,7 +682,7 @@ fn map_within(
         let (input, output) = sizes_in(instructions, &facts, layout, &|address| {
             index_of
                 .get(&address)
-                .is_some_and(|&from| refuses_at(from, false))
+                .is_some_and(|&from| refuses_at(from, None))
         });
         case.in_size = input;
         case.out_size = output;
@@ -757,6 +768,7 @@ fn record(
             site,
             lands,
             proved,
+            Status::default(),
         );
     }
     if let Some(resolved) = run.table {
@@ -771,6 +783,7 @@ fn record(
                 resolved.table.at,
                 lands,
                 resolved.proved,
+                resolved.status,
             );
         }
         if tables.len() < MAX_TABLES {
@@ -990,6 +1003,7 @@ fn push_case(
     site: u64,
     lands: u64,
     proved: bool,
+    status: Status,
 ) {
     // A control code is a `ULONG`. A compare against a wider immediate is a compare against
     // something else, whatever register it used.
@@ -1012,6 +1026,7 @@ fn push_case(
     cases.push(Case {
         code,
         recovered,
+        status,
         site,
         lands,
         proved,
@@ -1087,8 +1102,15 @@ fn update(
         return compare(facts, instruction, layout, traced);
     }
     // A call returns over the volatile registers, so a belief about one does not survive it --
-    // including a bound whose index is one of them.
+    // including a bound whose index is one of them, and including a **status** sitting in the
+    // return register. That one used to be exempt, on the grounds that the ordinary rejection
+    // calls a completion routine on its way out; what the exemption actually bought was
+    // `mov eax,0C0000010h` / `call handler` / `ret` read as a refusal, when what that returns is
+    // whatever the handler did. A driver that means to return the status reloads it after the
+    // call, which is a thing this can see. `Irp->IoStatus.Status` is untouched by a call and is
+    // where the ordinary rejection puts its status anyway.
     if matches!(instruction.flow, Flow::Call(_)) {
+        facts.status.returned = false;
         for volatile in layout.volatile {
             facts.registers.remove(*volatile);
         }
@@ -1518,6 +1540,15 @@ struct Resolved {
     table: Table,
     cases: Vec<(u64, u64)>,
     proved: bool,
+    /// Where a refusal's status stood **at the jump**, which is on the path to every landing the
+    /// table selects.
+    ///
+    /// A case the table selected is read with nothing believed about any register, because the
+    /// edge it arrived on is not in the graph -- but the status is not a register, and it *is* on
+    /// that path. Dropped with the rest, a routine that stores an error into the IRP before
+    /// switching has every case it routes to read as accepted, with whatever they call reported as
+    /// the handler.
+    status: Status,
 }
 
 /// Follows an indirect jump's table, when every part of it was recovered from **this block**.
@@ -1805,6 +1836,7 @@ fn follow_table(
         found.push((code, target));
     }
     Some(Resolved {
+        status: facts_at(instructions.len()).status,
         table: Table {
             at: jump.address,
             table,
@@ -1945,8 +1977,8 @@ struct Ending {
 /// `Irp->IoStatus.Status`, completes the request and then returns success has refused the code, and
 /// folding the two into one flag has the `xor eax,eax` take the IRP's error away with it. The case
 /// then reads as accepted, with the completion routine reported as its handler.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-struct Status {
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash)]
+pub(crate) struct Status {
     /// An error literal in the return register, as it stands.
     returned: bool,
     /// An error literal in `Irp->IoStatus.Status`.
@@ -1991,9 +2023,13 @@ fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) 
                     facts,
                 };
             }
-            // A completion call after the status is part of the rejection; one before it is a
-            // block doing something else.
-            Flow::Call(_) if status.refusing() => {}
+            // **A call is walked through rather than stopped at.** It used to end the block
+            // unless a status was already established, which is a heuristic standing in for what
+            // the status itself now answers: the call clears the one in the return register and
+            // leaves the one in the IRP, so the `ret` below decides on what is actually there. It
+            // also finds the shape that heuristic missed -- a status **reloaded** after the call,
+            // which is how a driver returns one it completed with.
+            Flow::Call(_) => {}
             // **An unconditional tail jump carries the status it established.**
             // `mov eax,0C0000010h` / `jmp common_ret` is one rejection written across two blocks,
             // and starting the next one from nothing loses it -- the shared return block is then
@@ -2005,7 +2041,7 @@ fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) 
                     facts,
                 };
             }
-            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return Ending::default(),
+            Flow::Branch(_) | Flow::Jmp(_) => return Ending::default(),
             Flow::Unreadable | Flow::Unknown => return Ending::default(),
             Flow::Fallthrough | Flow::Trap => {}
         }
@@ -2027,7 +2063,7 @@ fn refuses_in(
     listing: &[Instruction],
     layout: Layout,
     entry: &[Option<Facts>],
-    blind: bool,
+    blind: Option<Status>,
 ) -> bool {
     let mut at = index;
     let mut start = from;
@@ -2047,10 +2083,14 @@ fn refuses_in(
         // there along an edge this graph does not have -- so it is read with nothing believed,
         // exactly as its sizes are. Every hop after that is a tail jump the graph *does* carry, so
         // those blocks are read with what reached them.
-        let facts = match (&carried, blind && hop == 0) {
+        let facts = match (&carried, blind.filter(|_| hop == 0)) {
             (Some(carried), _) => carried.clone(),
-            (None, true) => Facts::default(),
-            (None, false) => entry.get(at).cloned().flatten().unwrap_or_default(),
+            // Nothing believed about any register, and the status that stood at the jump.
+            (None, Some(status)) => Facts {
+                status,
+                ..Facts::default()
+            },
+            (None, None) => entry.get(at).cloned().flatten().unwrap_or_default(),
         };
         let ending = failure_block(instructions, layout, &facts);
         if ending.refuses {
@@ -4368,7 +4408,15 @@ mod tests {
                     vec![Operand::Target(0x7000)],
                     Flow::Call(Some(0x7000)),
                 ),
-                insn(DISPATCH + 0x4a, "ret", Vec::new(), Flow::Return),
+                // **Reloaded after the call**, which is what a driver that means to return the
+                // status does: the call it makes on its way out returns its own.
+                insn(
+                    DISPATCH + 0x4a,
+                    "mov",
+                    vec![reg(destination), imm(0xc000_000d)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x4f, "ret", Vec::new(), Flow::Return),
             ]);
             map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
         };
@@ -7678,6 +7726,233 @@ mod tests {
         );
     }
 
+    /// A status in the **return register** does not survive a call, and one in the IRP does.
+    ///
+    /// `mov eax,0C0000010h` / `call handler` / `ret` returns whatever the handler returned, so
+    /// reading it as a refusal reports a code the driver accepts as one it refuses, with the
+    /// routine it reaches taken away. The same status in `Irp->IoStatus.Status` is untouched by a
+    /// call, which is where the ordinary rejection puts it and why this distinction costs nothing
+    /// real -- and a driver that means to return one **reloads** it after the call, which is the
+    /// third half here.
+    ///
+    /// The status arrives from the block before in every variant, so this is also the rule that
+    /// makes carrying it across an edge safe.
+    #[test]
+    fn a_status_in_the_return_register_does_not_survive_a_call() {
+        #[derive(Clone, Copy)]
+        enum Put {
+            Returned,
+            Irp,
+            Reloaded,
+        }
+        let refusing = |put: Put| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("rbx"), reg("rdx")],
+                    Flow::Fallthrough,
+                ),
+                // The status, before the routine decides anything.
+                insn(
+                    DISPATCH + 0xb,
+                    "mov",
+                    vec![
+                        match put {
+                            Put::Irp => mem("rbx", 0x30),
+                            _ => reg("eax"),
+                        },
+                        imm(0xc000_0010),
+                    ],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x12,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x18,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x1e, "ret", Vec::new(), Flow::Return),
+                // The case: a call, and out.
+                insn(
+                    DISPATCH + 0x40,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+            ]);
+            if matches!(put, Put::Reloaded) {
+                block.push(insn(
+                    DISPATCH + 0x45,
+                    "mov",
+                    vec![reg("eax"), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.push(insn(DISPATCH + 0x4a, "ret", Vec::new(), Flow::Return));
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            (found.cases[0].accepted, found.cases[0].handler)
+        };
+
+        assert_eq!(
+            refusing(Put::Returned),
+            (Some(true), Some(0x7000)),
+            "the call returned its own status over the one loaded before it"
+        );
+        assert_eq!(
+            refusing(Put::Irp),
+            (Some(false), None),
+            "and a call writes no field of the IRP, so that one still stands"
+        );
+        assert_eq!(
+            refusing(Put::Reloaded),
+            (Some(false), None),
+            "as does one put back after the call, which is how a driver returns what it completed \
+             with"
+        );
+    }
+
+    /// A table case is read with nothing believed about any **register**, and with the status that
+    /// stood at its jump.
+    ///
+    /// The two are not the same kind of thing. A register's value is about the path the graph has
+    /// no edge for, so it is dropped; the status is about the path that *reaches* the jump, and
+    /// every landing the table selects is on it. Dropped with the registers, a routine that stores
+    /// an error into the IRP before switching has every code it routes to read as accepted, with
+    /// whatever they call reported as the handler.
+    #[test]
+    fn a_table_case_carries_the_status_that_stood_at_its_jump() {
+        const TABLE: i64 = 0x9000;
+        const FIRST: u64 = DISPATCH + 0x40;
+        const SECOND: u64 = DISPATCH + 0x50;
+        const DECIDES: u64 = DISPATCH + 0x60;
+        let refusing = |stored: bool| {
+            let mut block = prologue(DISPATCH);
+            block.push(insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("rbx"), reg("rdx")],
+                Flow::Fallthrough,
+            ));
+            if stored {
+                block.push(insn(
+                    DISPATCH + 0xb,
+                    "mov",
+                    vec![mem("rbx", 0x30), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0x12,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x15,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x1b,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x1e,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x24,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x2b,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x32,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x35, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+                // Two landings, each of which completes the request and returns.
+                insn(
+                    FIRST,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(FIRST + 5, "ret", Vec::new(), Flow::Return),
+                insn(
+                    SECOND,
+                    "call",
+                    vec![Operand::Target(0x7100)],
+                    Flow::Call(Some(0x7100)),
+                ),
+                // This one does **not** return: it leaves for a block that decides something, so
+                // the refusal walk answers nothing about it and what is left to read is the
+                // status the block itself has. That is the other place a table case's status is
+                // used, and it is a different answer -- undecided rather than refused.
+                insn(SECOND + 5, "jmp", Vec::new(), Flow::Jmp(Some(DECIDES))),
+                insn(DECIDES, "cmp", vec![reg("r13d"), imm(1)], Flow::Fallthrough),
+                insn(
+                    DECIDES + 6,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0xf00)),
+                ),
+                insn(DECIDES + 12, "ret", Vec::new(), Flow::Return),
+            ]);
+            let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+            let read = |at: u64, len: usize| {
+                (at == table_at).then(|| {
+                    [(FIRST - IMAGE_BASE) as u32, (SECOND - IMAGE_BASE) as u32]
+                        .iter()
+                        .flat_map(|rva| rva.to_le_bytes())
+                        .take(len)
+                        .collect()
+                })
+            };
+            let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+            assert_eq!(found.cases.len(), 2, "{:?}", found.cases);
+            found
+                .cases
+                .iter()
+                .map(|case| (case.accepted, case.handler))
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(
+            refusing(true),
+            vec![(Some(false), None), (None, Some(0x7100))],
+            "the code that returns completes an IRP carrying the error stored before the switch,              and the one that leaves for a block which decides something is undecided rather than              accepted -- both from the same status, read in the two places a case reads one"
+        );
+        assert_eq!(
+            refusing(false),
+            vec![(Some(true), Some(0x7000)), (Some(true), Some(0x7100))],
+            "and with nothing stored they are cases that reach routines"
+        );
+    }
+
     /// A bound is about a register's **value**, so a write that is not part of the table pattern
     /// ends it.
     ///
@@ -7831,18 +8106,20 @@ mod tests {
                 Flow::Branch(Some(DISPATCH + 0x20)),
             ),
             insn(DISPATCH + 0x15, "ret", Vec::new(), Flow::Return),
-            // The refusal: a status in the return register, a completion call, and out.
+            // The refusal: a completion call, the status into the return register, and out. The
+            // status goes in **after** the call, because the call returns its own -- which is the
+            // order a driver writes and the reason a status in that register does not survive one.
             insn(
                 DISPATCH + 0x20,
-                "mov",
-                vec![reg32("eax"), imm(0xc000_0010)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x25,
                 "call",
                 vec![Operand::Target(0x7000)],
                 Flow::Call(Some(0x7000)),
+            ),
+            insn(
+                DISPATCH + 0x25,
+                "mov",
+                vec![reg32("eax"), imm(0xc000_0010)],
+                Flow::Fallthrough,
             ),
             insn(DISPATCH + 0x2a, "ret", Vec::new(), Flow::Return),
         ];
