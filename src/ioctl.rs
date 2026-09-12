@@ -1265,11 +1265,13 @@ fn update(
 /// its slots as the codes the check admitted.
 fn keeps_a_bound(instruction: &Instruction, register: &str) -> bool {
     match instruction.operands.get(1) {
-        // A byte per index or a dword per case, read **through** the bounded register: the two
-        // tables a switch is made of, each leaving its result where the index was.
-        Some(Operand::Memory(memory))
-            if matches!(instruction.effect, Effect::Move | Effect::MoveSigned) =>
-        {
+        // A byte per index, read **through** the bounded register and **zero-extended**: the
+        // first of the two tables a switch is made of, leaving the case number where the index
+        // was. A case number is an index into the second table and cannot be negative, so MSVC
+        // emits `movzx` -- and a sign-extending load is not this stage. Accepting one kept a
+        // bound that [`follow_table`] then read as though the dword table were indexed by the
+        // original values, pairing every code with the wrong target.
+        Some(Operand::Memory(memory)) if instruction.effect == Effect::Move => {
             let through = memory
                 .index
                 .as_ref()
@@ -2270,9 +2272,11 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
     }
     if report.unsettled {
         out.push_str(
-            "  [!] what each block knows never stopped changing, so every case and table was \
-             discarded rather than reported: this is a routine no answer was settled about, not \
-             one with no control codes\n",
+            "  [!] what each block knows never stopped changing, so everything resting on a fact \
+             -- every jump table, and every code traced to the IRP -- was discarded rather than \
+             reported. Anything listed is what a block said on its own, off a bare displacement, \
+             and is unproved. This is a routine no answer was settled about rather than one with \
+             no control codes\n",
         );
     }
     if report.blind > 0 {
@@ -6820,6 +6824,200 @@ mod tests {
         );
         assert_eq!(indirect.unresolved, vec![DISPATCH + 0x32]);
         assert_eq!(served.get(), 0, "and the table was not read");
+    }
+
+    /// A byte map is **zero-extended**, and a sign-extending load is not that stage.
+    ///
+    /// A case number is an index into the second table and cannot be negative, so MSVC emits
+    /// `movzx`. Accepting a `movsx` kept the bound while [`follow_table`] declined to read the map
+    /// through it -- so the dword table was read as though it were indexed by the original values,
+    /// pairing every code with the target of a different case. The two halves differ in the
+    /// mnemonic and in nothing else.
+    #[test]
+    fn a_sign_extending_byte_map_is_not_the_map() {
+        const MAP: i64 = 0x5b90;
+        const TABLE: i64 = 0x5b80;
+        let extended = |mnemonic: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x21,
+                    mnemonic,
+                    vec![
+                        reg("eax"),
+                        Operand::Memory(MemoryOperand {
+                            size: Some(1),
+                            segment: None,
+                            base: Some(named("rcx")),
+                            index: Some(named("rax")),
+                            scale: 1,
+                            displacement: MAP,
+                            address: None,
+                        }),
+                    ],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x28,
+                    "mov",
+                    vec![reg("edx"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x2f,
+                    "add",
+                    vec![reg("rdx"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x32, "jmp", vec![reg("rdx")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let map_at = IMAGE_BASE.wrapping_add(MAP as u64);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            if at == map_at {
+                // Both indices are the *second* case, which is what reading the map is for.
+                return Some(vec![1u8, 1][..len.min(2)].to_vec());
+            }
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let zeroed = map(
+            DISPATCH,
+            &extended("movzx"),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            zeroed
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc004, IMAGE_BASE + 0x1100),
+                (0x6dc005, IMAGE_BASE + 0x1100)
+            ],
+            "both indices select the case the map names: {:?}",
+            zeroed.cases
+        );
+
+        let signed = map(
+            DISPATCH,
+            &extended("movsx"),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+
+        assert!(
+            signed.cases.is_empty(),
+            "a signed load is not the stage this reads, and the index is no longer the bounded \
+             one: {:?}",
+            signed.cases
+        );
+        assert_eq!(signed.unresolved, vec![DISPATCH + 0x32]);
+    }
+
+    /// The unsettled warning says what was discarded, and what was not.
+    ///
+    /// Clearing the facts takes away everything that rested on one -- every table, every code
+    /// traced to the IRP -- and leaves what a block says on its own: a compare against a bare
+    /// `+0x18` displacement, which is unproved and is still reported. A note claiming *every* case
+    /// was discarded, printed above a list of cases, is a result contradicting itself.
+    #[test]
+    fn the_unsettled_warning_does_not_contradict_the_list_under_it() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map_within(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            never,
+            0,
+        );
+
+        assert!(found.unsettled);
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.proved))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, false)],
+            "a bare displacement is something the block said on its own: {:?}",
+            found.cases
+        );
+
+        let rendered = render(&structured_report(&found, |address| {
+            crate::structured::CodeLocation {
+                address: format!("{address:#018x}"),
+                module: None,
+                rva: None,
+                attribution_failed: false,
+            }
+        }));
+
+        assert!(
+            rendered.contains("everything resting on a fact"),
+            "the note says what went: {rendered}"
+        );
+        assert!(
+            !rendered.contains("every case and table was"),
+            "and not that everything did, above a list of what did not: {rendered}"
+        );
     }
 
     /// A bound is about a register's **value**, so a write that is not part of the table pattern
