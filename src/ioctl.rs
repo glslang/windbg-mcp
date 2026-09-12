@@ -1041,6 +1041,33 @@ fn update(
     if matches!(instruction.effect, Effect::Test | Effect::Push) {
         return None;
     }
+    // **An instruction this pass does not model may write more than its first operand.**
+    // `xchg eax,r13d` writes both, and clearing only the first leaves a tracked control code in a
+    // register that now holds the old `eax` -- reported, when a later `cmp r13d,N` reads it, as a
+    // code the driver accepts. Nothing here knows which registers an unmodelled instruction
+    // writes, so every register it **names** stops being believed: the conservative reading, and
+    // the one that cannot invent a case.
+    //
+    // It does not reach an **implicit** destination -- `mul ecx` writes `eax` and `edx` and names
+    // neither -- and closing that means the decoder saying which registers an instruction writes,
+    // which is [glslang/dbgscope#155](https://github.com/glslang/dbgscope/issues/155). A mnemonic
+    // table here is the thing this module stopped keeping.
+    if instruction.effect == Effect::Other {
+        for operand in &instruction.operands {
+            let Operand::Register(register) = operand else {
+                continue;
+            };
+            set(facts, &register.full, None);
+            if facts
+                .bound
+                .as_ref()
+                .is_some_and(|bound| bound.register == register.full)
+            {
+                facts.bound = None;
+            }
+        }
+        return None;
+    }
     let operands = &instruction.operands;
     let Some(Operand::Register(written)) = operands.first() else {
         // Writes memory, or nothing this models. A store through a register does not change what
@@ -1231,9 +1258,11 @@ fn source_value(
         // device type nobody read. The question is the source register's **width**, which the
         // decoder answers because it decoded the register.
         Operand::Register(register) => match instruction.effect {
-            Effect::Move | Effect::MoveSigned if register.width >= FIELD_WIDTH => {
-                facts.registers.get(&register.full).cloned()
-            }
+            Effect::Move | Effect::MoveSigned => facts
+                .registers
+                .get(&register.full)
+                .filter(|value| register.width >= value.carried_by(layout))
+                .cloned(),
             _ => None,
         },
         Operand::Memory(memory) => {
@@ -1363,6 +1392,23 @@ fn compare(
             at: instruction.address,
         }),
         _ => None,
+    }
+}
+
+impl Value {
+    /// How wide a register has to be to still be holding this.
+    ///
+    /// **Not one answer, because these are not one kind of thing.** The fields are `ULONG`s, and
+    /// four bytes of one is the field. A **pointer** is the target's width: `mov ecx,edx` passes a
+    /// four-byte test and zero-extends the low half of a kernel address, so what is in `rcx`
+    /// afterwards is not the IRP -- and a `+0x18` off it would be published as a control code
+    /// traced from one, or a truncated table base would resolve a table at an address execution
+    /// never used.
+    fn carried_by(self, layout: Layout) -> u32 {
+        match self {
+            Value::Irp | Value::StackLocation | Value::Address(_) => layout.pointer,
+            Value::Code { .. } | Value::InputLength | Value::OutputLength => FIELD_WIDTH,
+        }
     }
 }
 
@@ -5248,6 +5294,122 @@ mod tests {
             found.cases
         );
         assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+    }
+
+    /// A **pointer** is carried only by a register wide enough to hold one.
+    ///
+    /// `mov ecx,edx` passes any four-byte test and zero-extends the low half of a kernel address,
+    /// so what is in `rcx` afterwards is not the IRP -- and a `+0xb8` off it is not the stack
+    /// location, nor a `+0x18` off *that* the control code. The case is still recovered from the
+    /// bare displacement, as it is for any chain this cannot follow, and says `proved: false`;
+    /// the same copy at the target's pointer width is the chain, which is what makes this about
+    /// the width.
+    ///
+    /// The `ULONG` rule stays at four bytes, because that is how wide those fields are. One
+    /// threshold for both is what let a truncated pointer through.
+    #[test]
+    fn a_pointer_is_carried_only_at_a_pointers_width() {
+        let copied = |spelling: (&str, &str)| {
+            let block = vec![
+                insn(
+                    DISPATCH,
+                    "mov",
+                    vec![reg(spelling.0), reg(spelling.1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 3,
+                    "mov",
+                    vec![reg("rax"), pointer("rcx", 0xb8)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 7,
+                    "mov",
+                    vec![reg("r13d"), mem("rax", 0x18)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+            ];
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            (
+                found
+                    .cases
+                    .iter()
+                    .map(|case| (case.code, case.proved))
+                    .collect::<Vec<_>>(),
+                found.code_proved,
+            )
+        };
+
+        assert_eq!(
+            copied(("ecx", "edx")),
+            (vec![(0x222003, false)], false),
+            "half a pointer is not the IRP, so nothing off it was traced from one"
+        );
+        assert_eq!(
+            copied(("rcx", "rdx")),
+            (vec![(0x222003, true)], true),
+            "and the whole of one is"
+        );
+    }
+
+    /// An instruction this pass does not model may write more than its first operand.
+    ///
+    /// `xchg eax,r13d` writes both. Clearing only the first leaves a tracked control code in a
+    /// register that now holds the old `eax`, and the `cmp r13d,N` after it is then reported as a
+    /// code the driver accepts. Nothing here knows which registers an unmodelled instruction
+    /// writes, so every register it **names** stops being believed.
+    ///
+    /// It does not reach an implicit destination -- `mul ecx` writes `eax` and `edx` and names
+    /// neither -- which needs the decoder to say what an instruction writes
+    /// (`glslang/dbgscope#155`), and is why this test is about the half that can be closed here.
+    #[test]
+    fn an_unmodelled_instruction_stops_every_register_it_names_being_believed() {
+        let exchanged = |swapped: bool| {
+            let mut block = prologue(DISPATCH);
+            if swapped {
+                block.push(insn(
+                    DISPATCH + 8,
+                    "xchg",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0xb,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert_eq!(
+            exchanged(false)
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x222003],
+            "the register still holds the code"
+        );
+        assert!(
+            exchanged(true).cases.is_empty(),
+            "and here it holds whatever was in `eax`: {:?}",
+            exchanged(true).cases
+        );
     }
 
     /// A bound is about a register's **value**, so a write that is not part of the table pattern

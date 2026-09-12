@@ -131,6 +131,24 @@ impl Image {
         self.sections.iter().filter(|section| section.executable())
     }
 
+    /// The virtual ranges this image's **executable** sections occupy.
+    ///
+    /// What an address recovered as code is checked against. The loader's extent is not that
+    /// question: `.rdata`, `.data` and the headers are all inside it, so a jump-table entry that
+    /// lands there is data being reported as a case. Each span goes through [`Self::checked_va`],
+    /// so a section whose declared size runs past `SizeOfImage` contributes nothing rather than a
+    /// range reaching into whatever is mapped after this image.
+    pub fn executable_ranges(&self) -> Vec<std::ops::Range<u64>> {
+        self.code_sections()
+            .filter_map(|section| {
+                let start = self
+                    .checked_va(section.rva, section.virtual_size as usize)
+                    .ok()?;
+                Some(start..start + u64::from(section.virtual_size))
+            })
+            .collect()
+    }
+
     /// An RVA as a virtual address in this image, **checked against the image's own bounds**.
     ///
     /// The one door. An RVA past `SizeOfImage` added to the base lands in whatever is mapped next
@@ -727,6 +745,18 @@ mod tests {
         assert!(
             !code.iter().any(|s| s.name == ".data"),
             "a writable section is not code and is never decoded: {code:?}"
+        );
+
+        // And as ranges, which is what an address recovered as code is checked against. The end
+        // is the start plus the section's size: `checked_va` answers with the **start** and
+        // validates the span, so reading its answer as the end makes every section empty -- which
+        // is how this first shipped, and it took `mountmgr`'s two switch tables with it.
+        let ranges = image.executable_ranges();
+        assert_eq!(ranges, vec![BASE + 0x1000..BASE + 0x2000]);
+        assert!(ranges.iter().any(|range| range.contains(&(BASE + 0x1500))));
+        assert!(
+            !ranges.iter().any(|range| range.contains(&(BASE + 0x2500))),
+            "`.rdata` is inside the module and is not code"
         );
     }
 
