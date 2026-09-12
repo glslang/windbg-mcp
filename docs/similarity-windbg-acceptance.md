@@ -59,8 +59,10 @@ checks. Both runs restored the session inventory and exited BN normally.
 
 - [Sanitized capture](samples/similarity-windbg-20260911.json) records the MCP
   results, fixture/helper/source hashes, initial assertion failure, and cleanup.
-- [Executed GUI probe](samples/similarity-windbg-probe-20260911.py) records the
-  exact diagnostic source. It uses disposable local paths and private profile
+- [Recorded GUI probe](samples/similarity-windbg-probe-20260911-recorded.py) preserves
+  the exact executed source and its original hash. The
+  [reproduction probe](samples/similarity-windbg-probe-20260911.py) includes the
+  subsequent cleanup correction below. It uses disposable local paths and private profile
   configuration; adapt those paths and supply your own loopback connection before
   running it. It launches and resumes only the named fixture, then ends its session.
 - [Target fixture source](samples/similarity-windbg-fixture-20260911.rs) is the
@@ -87,3 +89,21 @@ including live run-to and breakpoint checks. It does not execute securekernel or
 establish a live CVE-specific handoff. The eight unresolved securekernel rows were
 subsequently resolved in the separate [exporter follow-up](securekernel-export-followup.md);
 native Ultimate execution stays tentative.
+
+## Cleanup review follow-up — 2026-09-12
+
+The reproduction probe now attempts unpairing, comparison closure, owned-session
+termination, and inventory verification independently. Cleanup errors set `ok` to
+false and are recorded by stage without replacing the original capture failure.
+A failed inventory read or mismatch leaves `session_inventory_restored` false.
+
+The [offline regression](samples/test_similarity_windbg_probe.py) injects failures
+in each cleanup call, simultaneous failures, and an inventory mismatch; it also
+checks cleanup with no resource handles. The failure cases reproduced the original
+exception replacement before the fix. The 2026-09-11 live capture remains unchanged;
+its source reference now names the archived exact script. These failure injections
+are offline tests, not new live debugger acceptance runs.
+
+```console
+python3 -m unittest discover -s docs/samples -p test_similarity_windbg_probe.py
+```

@@ -9,30 +9,6 @@ from pathlib import Path
 ROOT = Path('/private/tmp/bn-windbg-handoff-20260911')
 
 
-async def cleanup_debugger(call, local, remote, comparison, session, initial, report):
-    """Attempt each release independently; leave an active capture exception intact."""
-    report['session_inventory_restored'] = False
-    actions = [(local, 'unpair_windbg', {})]
-    if comparison:
-        actions.append((local, 'similarity_close', {'comparison_id': comparison}))
-    if session:
-        actions.append((remote, 'end_session', {'session_id': session}))
-    actions.append((remote, 'session_status', {}))
-    for client, name, args in actions:
-        try:
-            if name == 'session_status':
-                final = await call(client, name, args, label='sessions_after')
-                if final['sessions'] != initial['sessions']:
-                    raise ValueError('session inventory was not restored')
-                report['session_inventory_restored'] = True
-            else:
-                await call(client, name, args)
-        except Exception:
-            report['ok'] = False
-            report.setdefault('cleanup_errors', []).append(
-                {'stage': name, 'error': traceback.format_exc()})
-
-
 def run():
     import binaryninja as bn
     from binaryninjaui import FileContext, UIContext
@@ -136,7 +112,14 @@ def run():
                             report['breakpoint_reached_match'] = True
                             report['ok'] = True
                         finally:
-                            await cleanup_debugger(call, local, remote, comparison, session, initial, report)
+                            await call(local,'unpair_windbg')
+                            if comparison:
+                                await call(local,'similarity_close',{'comparison_id':comparison})
+                            if session:
+                                await call(remote,'end_session',{'session_id':session})
+                            final = await call(remote,'session_status',label='sessions_after')
+                            assert final['sessions']==initial['sessions']
+                            report['session_inventory_restored'] = True
     try:
         main_thread(context)
         for side in ('reference','target'):
