@@ -209,8 +209,15 @@ matches, compared 16 runtime bytes, ran to one match, and hit a guarded breakpoi
 at another. All three debugger operations refused the reference build's identity.
 The owned debugger session and tunnel were closed, and BN exited normally.
 This closes the generic Personal handoff acceptance; it does not establish a live
-securekernel/CVE handoff. Full securekernel export coverage remains a separate
-follow-up. Ultimate stays tentative.
+securekernel/CVE handoff.
+
+The [2026-09-11 securekernel exporter follow-up](securekernel-export-followup.md)
+identified BN's unsupported `CLRBHB` instruction as the cause of the eight omitted
+functions per side. A narrowly scoped export fallback preserves those instructions
+without changing BN analysis or weakening import guards. The real recapture passed:
+3,117 matches, zero omissions or unresolved rows, unchanged state, and clean quit.
+Coverage is complete for the captured BN function inventory; BN's decoder still
+does not provide instruction text for those entries. Ultimate stays tentative.
 
 ## Assumptions and defaults
 

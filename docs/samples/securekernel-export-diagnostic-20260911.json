@@ -1,0 +1,443 @@
+{
+  "recorded_date": "2026-09-11",
+  "cve": "CVE-2026-83498",
+  "scope": "Static exporter coverage diagnosis, not CVE attribution",
+  "companion_commit": "19844b59fa595378480f418e2ddd1260a312d911",
+  "diagnostic_source": "securekernel-export-diagnostic-20260911.py",
+  "diagnostic_source_sha256": "8922f002c41b27dd5931a576bbabe41f2cb6594fd5ef068d9ec98a6a8a06f628",
+  "raw_diagnostic_sha256": "34fa96dda9e8c19db1ff0cd9fb8c8e5e9a77013bd84a4d0c1bf4195092bed6be",
+  "normalization": "Temporary acquisition prefix removed; opaque binary IDs replaced by reference/target. Binaries snapshot precedes update_analysis_and_wait; per-function observations and export were collected after it.",
+  "capture": {
+    "bn_version": "6.0.10601 Personal",
+    "ok": true,
+    "binaries": [
+      {
+        "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+        "hash_source": "original Raw view",
+        "image_name": "securekernel.exe",
+        "binary_id": "target",
+        "path": "securekernel.exe/target/securekernel.exe",
+        "display_name": "securekernel.exe",
+        "active": true,
+        "architecture": "aarch64",
+        "analysis_state": "DiscoveryState",
+        "image_base": "0x0000000140000000",
+        "identity": {
+          "timestamp": 1188430604,
+          "size": 1290240,
+          "pdb": {
+            "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+            "age": 1
+          }
+        },
+        "generation": [
+          "target",
+          5368709120,
+          0
+        ],
+        "modified": false
+      },
+      {
+        "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+        "hash_source": "original Raw view",
+        "image_name": "securekernel.exe",
+        "binary_id": "reference",
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "display_name": "securekernel.exe",
+        "active": false,
+        "architecture": "aarch64",
+        "analysis_state": "DiscoveryState",
+        "image_base": "0x0000000140000000",
+        "identity": {
+          "timestamp": 3350698326,
+          "size": 1245184,
+          "pdb": {
+            "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+            "age": 1
+          }
+        },
+        "generation": [
+          "reference",
+          5368709120,
+          0
+        ],
+        "modified": false
+      }
+    ],
+    "functions": [
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11ac00",
+        "address": "0x14011ac00",
+        "name": "FrontendBhbClrKiUserExceptionHandler",
+        "highest_address": "0x14011ac03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011ac00",
+            "end": "0x14011ac04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11ac80",
+        "address": "0x14011ac80",
+        "name": "FrontendBhbClrKiUserInterruptHandler",
+        "highest_address": "0x14011ac83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011ac80",
+            "end": "0x14011ac84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11ad00",
+        "address": "0x14011ad00",
+        "name": "FrontendBhbClrKiUserFiqHandler",
+        "highest_address": "0x14011ad03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011ad00",
+            "end": "0x14011ad04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11ad80",
+        "address": "0x14011ad80",
+        "name": "FrontendBhbClrKiUserSystemErrorHandler",
+        "highest_address": "0x14011ad83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011ad80",
+            "end": "0x14011ad84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11ae00",
+        "address": "0x14011ae00",
+        "name": "FrontendBhbClrKiUser32ExceptionHandler",
+        "highest_address": "0x14011ae03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011ae00",
+            "end": "0x14011ae04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11ae80",
+        "address": "0x14011ae80",
+        "name": "FrontendBhbClrKiUser32InterruptHandler",
+        "highest_address": "0x14011ae83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011ae80",
+            "end": "0x14011ae84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11af00",
+        "address": "0x14011af00",
+        "name": "FrontendBhbClrKiUser32FiqHandler",
+        "highest_address": "0x14011af03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011af00",
+            "end": "0x14011af04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/target/securekernel.exe",
+        "rva": "0x11af80",
+        "address": "0x14011af80",
+        "name": "FrontendBhbClrKiUser32SystemErrorHandler",
+        "highest_address": "0x14011af83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14011af80",
+            "end": "0x14011af84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10fc00",
+        "address": "0x14010fc00",
+        "name": "FrontendBhbClrKiUserExceptionHandler",
+        "highest_address": "0x14010fc03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010fc00",
+            "end": "0x14010fc04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10fc80",
+        "address": "0x14010fc80",
+        "name": "FrontendBhbClrKiUserInterruptHandler",
+        "highest_address": "0x14010fc83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010fc80",
+            "end": "0x14010fc84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10fd00",
+        "address": "0x14010fd00",
+        "name": "FrontendBhbClrKiUserFiqHandler",
+        "highest_address": "0x14010fd03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010fd00",
+            "end": "0x14010fd04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10fd80",
+        "address": "0x14010fd80",
+        "name": "FrontendBhbClrKiUserSystemErrorHandler",
+        "highest_address": "0x14010fd83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010fd80",
+            "end": "0x14010fd84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10fe00",
+        "address": "0x14010fe00",
+        "name": "FrontendBhbClrKiUser32ExceptionHandler",
+        "highest_address": "0x14010fe03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010fe00",
+            "end": "0x14010fe04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10fe80",
+        "address": "0x14010fe80",
+        "name": "FrontendBhbClrKiUser32InterruptHandler",
+        "highest_address": "0x14010fe83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010fe80",
+            "end": "0x14010fe84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10ff00",
+        "address": "0x14010ff00",
+        "name": "FrontendBhbClrKiUser32FiqHandler",
+        "highest_address": "0x14010ff03",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010ff00",
+            "end": "0x14010ff04",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      },
+      {
+        "path": "securekernel.exe/reference/securekernel.exe",
+        "rva": "0x10ff80",
+        "address": "0x14010ff80",
+        "name": "FrontendBhbClrKiUser32SystemErrorHandler",
+        "highest_address": "0x14010ff83",
+        "total_bytes": 4,
+        "block_count": 1,
+        "blocks": [
+          {
+            "start": "0x14010ff80",
+            "end": "0x14010ff84",
+            "length": 4,
+            "instructions": []
+          }
+        ],
+        "bytes_32": "df2203d5df3f03d5fe1300140000000000000000000000000000000000000000",
+        "sections": [
+          ".text"
+        ],
+        "export_reports_flow_graph": false,
+        "code_refs_to": []
+      }
+    ]
+  },
+  "gui_exit": {
+    "exited": true,
+    "forced": false,
+    "returncode": 0
+  }
+}
