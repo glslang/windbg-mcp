@@ -16,6 +16,7 @@ mod batch;
 mod cast;
 mod cfg;
 mod client;
+mod device;
 mod driver;
 mod engine;
 mod fault;
