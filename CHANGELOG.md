@@ -9,6 +9,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`device_security` — who may open a device.** The security descriptor off the object header as principals and access masks, the two device words that qualify it, and the symbolic links in `\GLOBAL??` that reach it from user mode. It resolves an object path through the kernel's own namespace, so the name a user-mode caller knows works as well as the device's: a symbolic link is followed once, and the answer says which one it followed.
+
+  Each ACE comes back as its SID **and** the account that SID reads as, with the mask named as a **device's** rights -- `FILE_READ_DATA` rather than the same bit's meaning on a registry key -- and the two the I/O manager checks a control code's `RequiredAccess` against picked out as `reads`/`writes`. That is the join to `ioctl_map`: a code requiring `FILE_WRITE_DATA` cannot be sent through a handle whose ACE grants neither.
+
+  **Three pairs of facts are kept apart that a renderer would collapse.** A NULL DACL grants every caller everything and is read off the control bit, so it is never confused with a DACL that could not be read. An object carrying no descriptor is not a descriptor that would not read -- the second is what a kernel minidump answers for every object in it. And an empty list of symbolic links means "nothing reaches this device" only when the search saw the whole directory, which `link_search` says.
+
+  `FILE_DEVICE_SECURE_OPEN` is called out where it is **missing**: without it the descriptor is checked when the device is opened by name and not when a path beneath it is opened, so a driver that parses its own paths is reachable through a relative open by a caller the descriptor would have refused.
+
+  Needs a **live kernel target**. A kernel minidump carries no object namespace -- the root directory pointer, the type table and the header cookie all read as unavailable -- and the refusal says so rather than sending someone to check a device name that was correct.
+
 - **`ioctl_map` — which control codes a dispatch routine accepts.** Recovered from the driver's own code and decoded: device type, function code, method and required access, with the site that recognises each code and the routine it reaches. It follows compare chains, the `sub`-and-compare form a rebased switch compiles to, and a jump table when the bounds check and the table's base were both recovered and the switch is indexed by the code itself.
 
   **A value is followed only while it is whole.** A control code is a `ULONG`, so a two-byte read or copy of one carries part of it and is not reported as a code -- the register's width is the decoder's answer, as is whether a table's entries were sign-extended, which decides whether a case sits before its base or four gigabytes past the image.

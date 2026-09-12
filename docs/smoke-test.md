@@ -481,6 +481,28 @@ says nothing about any of them. Run the tier on a host with a bundled engine bef
 `analysis` claim is covered. The missing PDB does cost something, but not the module: both
 buckets end `!unknown_function` whichever way the table above falls.
 
+**`device_security` against a dump, which is the one target it cannot answer about.** A kernel
+minidump captures no object namespace: `nt!ObpRootDirectoryObject`, `nt!ObpInfoMaskToOffset` and
+`nt!ObHeaderCookie` all read `????????`, none of them being in the small set of pages a bug check
+writes. The failure this asserts is the quiet one -- a walk treating an unreadable root as an empty
+directory reports every device as **not found**, which is a sentence about the caller's device name
+and says nothing about the dump.
+
+So what it checks is the refusal's **category**, and the wording deliberately not. Measured
+2026-09-12: this tier's worker reads the sample with symbol path `srv*` and no cache, so `nt` loads
+with **no symbols** and the walk is turned away before the globals are ever reached -- it cannot
+locate `_OBJECT_DIRECTORY_ENTRY`. A bench whose symbols resolve gets past that and is refused at the
+unreadable globals instead, with different and equally correct prose. Both are `debugger`, which is
+the half that matters: `invalid_argument` is what "that device is not in that directory" would
+carry, and it sends a reader to check a name that was correct.
+
+That split is *also* pinned as a unit test (`a_namespace_refusal_says_whose_fault_it_is`), because
+this tier cannot reach it -- the walk fails earlier here, and a live kernel answers rather than
+failing, so nothing that runs anywhere exercises the mapping. It was green under a mutation making
+every variant `invalid_argument` until that test existed. The positive half is the live-kernel tier
+below; there is no dump-tier answer to this tool, and that is a property of dumps rather than a gap
+here.
+
 **`ioctl_map` against a real driver, and against one this build cannot decode.** The x64 driver
 crash carries `mountmgr`, whose control codes
 [`driver-ioctl-walkthrough.md`](driver-ioctl-walkthrough.md) recovered by hand before there was a
@@ -1291,6 +1313,20 @@ about. This is the other half — an attach that lands:
   tags are four raw bytes, unprintable ones render as `.` — and so does a literal `.` — so a tag
   containing one cannot be turned back into the bytes it came from. That is a fact about rendering
   and says nothing about the walk, so it skips the comparison with a note rather than failing.
+
+- **`device_security` reproduces a published gate.** `\Device\MountPointManager` is on every
+  Windows kernel and [`driver-ioctl-walkthrough.md`](driver-ioctl-walkthrough.md) recovered its
+  four-ACE DACL by hand -- `dt nt!_SECURITY_DESCRIPTOR_RELATIVE`, `dt nt!_ACL`, `db`, parsed by eye
+  -- before there was a tool, so every figure asserted comes from that document rather than from
+  this code: Everyone and RESTRICTED at `0x001200a0`, SYSTEM and Administrators at `0x001f01ff`, in
+  that order, with `FILE_DEVICE_SECURE_OPEN` set. A descriptor reader that agreed with itself and
+  not with the kernel still fails here. The assertion the rest exists for is the last: Everyone's
+  mask carries neither `FILE_READ_DATA` nor `FILE_WRITE_DATA`, checked as the `reads`/`writes`
+  booleans rather than by matching the hex, because those are what a caller joining this to an
+  IOCTL map reads and a mask quoted correctly into fields nobody computed would pass a text match.
+  It also checks the namespace half -- the global link `\GLOBAL??\MountPointManager` is found and
+  `link_search` is `complete`, which is what makes an empty list mean "nothing reaches this device"
+  rather than "the search stopped".
 
 The attach test also records a **transcript** and checks the supplied KD key is nowhere in it. The
 protocol tier passes a raw connection too, but its attach is refused for its shape before anything
