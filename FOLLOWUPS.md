@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in fifteen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in sixteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -24,7 +24,9 @@ collapsing the coverage rule to "bound every command except `index_trace`" meant
 `Execute` calls rather than the ops, which found one left on a shared helper that three callers
 reach on three different clocks (2026-08-31) — and item 58 from
 [#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
-call that names a target's machine turns out to name the *processor's* (2026-09-05).
+call that names a target's machine turns out to name the *processor's* (2026-09-05), and items
+61–65 from completing Personal similarity delivery while separating CVE-specific investigation,
+upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09-12).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -862,3 +864,74 @@ searches that thread's stack. Found by Codex on
 
 **Where it picks up.** `worker::exception_triage` in `src/worker.rs`, `fault::render`'s `STACK`
 line, and dbgscope's `src/dbgeng.rs` beside `current_thread_system_id`.
+
+## 61. [windbg-mcp] Attribute the CVE-2026-83498 fix independently of similarity scores
+
+Personal comparison and export coverage are complete, but the Windows component filenames
+remain candidates: MSRC did not identify an affected file, and cumulative-update differences
+do not establish which change fixes the CVE.
+
+- **Why deferred:** the user requested delivery and tracking, rather than further investigation,
+  on 2026-09-12. This does not gate Personal delivery.
+- **What would close it:** evidence tying a specific component and changed behavior across the
+  applicable fix boundary to the CVE; retain alternative explanations and distinguish inferred
+  attribution from authoritative confirmation. No exploit trigger is required.
+- **Where it picks up:** [CVE acceptance](docs/cve-patch-diff-acceptance.md),
+  [securekernel export follow-up](docs/securekernel-export-followup.md), and the
+  [MSRC patch-diff skill](skills/msrc-patch-diff/SKILL.md). Under Codex the investigation uses
+  `gpt-daybreak-blue-latest` as the skill specifies.
+
+## 62. [windbg-mcp + binja-windbg-mcp] Capture a live securekernel handoff
+
+The benign ARM64 fixture closes generic similarity-to-WinDbg acceptance. It does not establish
+a live securekernel handoff. Existing evidence identifies no disposable, paused session with
+the exact selected securekernel build already loaded.
+
+- **Why deferred:** the user requested tracking on 2026-09-12. Acquiring a PE or comparing it
+  does not authorize loading a driver, resuming a target, or creating a vulnerability trigger.
+- **What would close it:** identify an existing suitable session and loaded-module identity,
+  navigate to a target match, capture a guarded read/runtime-byte comparison, and record refusal
+  for the other build's identity. Preserve execution state and unrelated sessions. Record
+  breakpoint/run-to evidence separately if such execution is subsequently authorized.
+- **Where it picks up:** [generic handoff](docs/similarity-windbg-acceptance.md),
+  [securekernel capture](docs/securekernel-export-followup.md), and the skill's live-handoff
+  preconditions. This is an optional CVE-specific extension, not a Personal release gate.
+
+## 63. [Binary Ninja upstream] Decode AArch64 CLRBHB in instruction text and analysis
+
+BN 6.0.10601 exposes the affected entries as four-byte functions without instruction text.
+The companion's exact-encoding export fallback supplies flow-graph bytes without changing
+Binary Ninja's decoder, IL, or function boundaries.
+
+- **Why deferred:** exporter acceptance is complete; correcting native analysis is separate
+  upstream work. Textual similarity for these entries remains limited by the decoder.
+- **What would close it:** verify an upstream version decodes `df2203d5` as CLRBHB and provides
+  instruction text, then check the affected function analysis and comparison output. Keep the
+  fallback for older supported versions unless their support is explicitly dropped.
+- **Where it picks up:** [diagnosis and retained graph evidence](docs/securekernel-export-followup.md).
+  Check upstream decoder status before proposing or removing a workaround.
+
+## 64. [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
+
+[Vector35/binaryninja-api#8549](https://github.com/Vector35/binaryninja-api/issues/8549) tracks
+the macOS application Quit path attempting to delete a stack-allocated first-run wizard.
+The guarded capture workflow avoids that trigger; it does not fix Binary Ninja itself.
+
+- **Why deferred:** the upstream issue remained open at the 2026-09-12 delivery check.
+- **What would close it:** an upstream fix and an isolated reproduction showing normal exit
+  with the original wizard scenario, followed by the documented active-export/matching checks.
+  Retain modal startup/quit guards unless the supported-version contract changes.
+- **Where it picks up:** [shutdown investigation](docs/bn-shutdown-investigation.md) and the
+  upstream issue, including their native stack evidence. Run one disposable GUI at a time.
+
+## 65. [binja-windbg-mcp] Native Ultimate validation — deferred due to cost
+
+Ultimate is unavailable and prohibitively expensive for the user. Purchasing it is not a
+requirement, and its absence does not gate Personal/external BinDiff delivery.
+
+- **Why deferred:** explicitly excluded from further work by the user on 2026-09-12.
+- **What would reopen it:** access to an appropriate Ultimate installation without requiring
+  purchase, and a user decision to validate it. Then capture provider discovery, BinDiff/WARP
+  comparisons, cancellation, and lifecycle behavior against the native backend.
+- **Where it picks up:** [similarity plan](docs/binja6-similarity-plan.md). Native-boundary
+  test doubles do not count as Ultimate execution evidence.
