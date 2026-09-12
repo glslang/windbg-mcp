@@ -827,7 +827,6 @@ fn simulate(
                         &instructions[..terminator],
                         last,
                         arrived,
-                        &facts,
                         layout,
                         reader,
                         in_image,
@@ -1128,7 +1127,15 @@ fn update(
                 }
                 _ => None,
             };
-            let value = rebased.or_else(|| source_value(facts, instruction, layout, traced));
+            // **And it is stored only in a register wide enough to hold it.** The guard above is
+            // the `ULONG` width, because that is all a destination alone can be asked; what a
+            // *pointer* needs is the target's, and `lea eax,[rip+table]` writes four bytes of one
+            // -- the decoder still reports the whole address it computed, so the table would be
+            // read at an address execution never formed. Asked here rather than in each arm, since
+            // it is the value that knows what it needs.
+            let value = rebased
+                .or_else(|| source_value(facts, instruction, layout, traced))
+                .filter(|value| written.width >= value.carried_by(layout));
             set(facts, &destination, value);
         }
         // `sub eax, 6D0034h` rebases the code: the register now holds `code - (offset + K)`, and
@@ -1222,6 +1229,13 @@ fn update(
 /// leaves its result in the same register, which carries the bound forward rather than ending it.
 /// Anything else -- an arithmetic adjustment, a copy from elsewhere, a zeroing, a load indexed by
 /// something else -- takes it away.
+///
+/// **The `add` that folds an image base into a loaded entry used to be exempt too, and is not.**
+/// It happens *after* the load, so the bound it would have to survive is one nothing reads by
+/// then: [`follow_table`] asks for the bound that stood **at the load**, which is the only place
+/// the index means anything. Exempting it here instead let `cmp eax,2` / `ja default` /
+/// `add eax,ecx` / `movsxd rdx,[table+rax*4]` index the table by something unbounded and report
+/// its slots as the codes the check admitted.
 fn keeps_a_bound(instruction: &Instruction, register: &str) -> bool {
     match instruction.operands.get(1) {
         // A byte per index or a dword per case, read **through** the bounded register: the two
@@ -1235,11 +1249,6 @@ fn keeps_a_bound(instruction: &Instruction, register: &str) -> bool {
                 .is_some_and(|index| index.full == register);
             through && ((memory.scale == 1 && memory.size.unwrap_or(1) == 1) || memory.scale == 4)
         }
-        // `add rcx,rdx` folding the image base into an entry, which is the step between the load
-        // and the jump. What the bound describes -- the limit, the offset, the shift and the
-        // default -- is a fact about the index *before* these, and `follow_table` re-derives the
-        // chain from the jump backwards; this is only about which writes end it.
-        Some(Operand::Register(_)) if instruction.effect == Effect::Add => true,
         _ => false,
     }
 }
@@ -1438,25 +1447,23 @@ struct Resolved {
 /// define the register the jump reads, the index has to be one a bounds check on this path covered,
 /// and every entry has to be code in this image.
 ///
-/// **Every register is read where the code reads it.** `facts` is what the block leaves at its
-/// jump, which is the right place to ask about the *bound* -- that is a statement about the path
-/// -- and the wrong place to ask what a base register held, since a block is free to reuse one
-/// after the load: `movsxd rcx,[rbx+rax*4]` / `lea rbx,[rip+another]` / `add rcx,rdx` / `jmp rcx`
-/// indexed through the old `rbx` and would be read against the new one, giving a table nobody
-/// addressed and cases nobody wrote. So `arrived` is what the block was entered with, and the
+/// **Every register is read where the code reads it**, and the block's facts at its *jump* answer
+/// for none of them. A block is free to reuse a register after the load -- `movsxd rcx,[rbx+rax*4]`
+/// / `lea rbx,[rip+another]` / `add rcx,rdx` / `jmp rcx` indexed through the old `rbx` and would be
+/// read against the new one, giving a table nobody addressed -- and the **bound** is the same
+/// question pointed the other way, since what the block does to the index *after* the load is about
+/// the target rather than about the index. So `arrived` is what the block was entered with, and the
 /// instructions before a position are replayed onto it to answer for that position.
 #[allow(clippy::too_many_arguments)]
 fn follow_table(
     instructions: &[Instruction],
     jump: &Instruction,
     arrived: &Facts,
-    facts: &Facts,
     layout: Layout,
     reader: Option<&mut ReadOnce<'_>>,
     in_image: &impl Fn(u64) -> bool,
 ) -> Option<Resolved> {
     let reader = reader?;
-    let bound = facts.bound.clone()?;
     let facts_at = |position: usize| {
         let mut replay = arrived.clone();
         let mut traced = false;
@@ -1545,6 +1552,14 @@ fn follow_table(
                             && written.width >= layout.pointer
                             && source.width >= layout.pointer =>
                     {
+                        // **One fold, and not several.** `add rcx,rdx` / `add rcx,r8` makes the
+                        // target the sum of the entry and *both*, and keeping one of them
+                        // reconstructs addresses nobody computed -- published as cases wherever
+                        // they happen to be executable. A compiler emits one; anything else is a
+                        // shape this does not follow.
+                        if added.is_some() {
+                            return None;
+                        }
                         added = Some((source.full.clone(), position));
                         continue;
                     }
@@ -1568,6 +1583,11 @@ fn follow_table(
         _ => return None,
     };
 
+    // **The bound that matters is the one standing at the load.** That is the only instruction
+    // the index means anything to: what a block does to the register afterwards -- folding an
+    // image base into the entry it just read, most of all -- is about the *target* and not about
+    // the index, while what it does before is exactly what takes the check away.
+    let bound = facts_at(at_load).bound.clone()?;
     let index = memory.index.as_ref()?.full.clone();
     if index != bound.register {
         return None;
@@ -1607,7 +1627,10 @@ fn follow_table(
     // **MSVC's dense switch has two tables**: a byte per index saying which case it is, then a
     // dword per case holding its RVA. It reuses one register for both, so the dword load's index
     // carries the bounded register's name and none of its meaning unless the byte map is read too.
-    let byte_map = instructions
+    // **Before the dword load, because that is the stage it feeds.** Searching the whole block
+    // takes a later, unrelated byte load for the first stage -- the target was already in hand by
+    // then -- and remaps every code through arbitrary bytes.
+    let byte_map = instructions[..at_load.min(instructions.len())]
         .iter()
         .enumerate()
         .rev()
@@ -6119,6 +6142,431 @@ mod tests {
             (Some(true), Some(0x7000)),
             "and a status loaded into the return register and cleared before the `ret` told \
              nothing else about it"
+        );
+    }
+
+    /// A table's base is an **address**, so a narrow `lea` does not establish one.
+    ///
+    /// `lea eax,[rip+table]` writes four bytes of a kernel address and the decoder still reports
+    /// the whole one it computed, so the table would be read where execution never pointed -- and
+    /// its entries published as this switch's codes. The same `lea` at the target's width is the
+    /// base, which is what makes this about the width.
+    #[test]
+    fn a_narrow_lea_does_not_establish_a_table_base() {
+        const TABLE: i64 = 0x9000;
+        let based = |spelling: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg(spelling), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x21,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x28,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x2b, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
+        let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let whole = map(DISPATCH, &based("rcx"), Layout::X64, &read, in_image, never);
+        assert_eq!(whole.cases.len(), 2, "{:?}", whole.cases);
+
+        served.set(0);
+        let narrow = map(DISPATCH, &based("ecx"), Layout::X64, &read, in_image, never);
+
+        assert!(
+            narrow.cases.is_empty(),
+            "four bytes of an address is not where the table is: {:?}",
+            narrow.cases
+        );
+        assert_eq!(narrow.unresolved, vec![DISPATCH + 0x2b]);
+        assert_eq!(served.get(), 0, "and nothing was read");
+    }
+
+    /// The bound that matters is the one standing **at the load**.
+    ///
+    /// `cmp eax,1` / `ja default` / `add eax,ecx` / `mov eax,[table+rax*4]` indexes the table by
+    /// something the check never covered, and reporting its slots gives the codes the check
+    /// admitted for entries execution reaches by another number entirely. The same `add` *after*
+    /// the load is the image base being folded into the entry, which is the shape every compiled
+    /// switch has -- so this is about where the write is, not about the `add`.
+    #[test]
+    fn a_write_to_the_index_before_the_load_ends_the_bound() {
+        const TABLE: i64 = 0x9000;
+        let adjusted = |before: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if before {
+                block.push(insn(
+                    DISPATCH + 0x21,
+                    "add",
+                    vec![reg("eax"), reg("esi")],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0x24,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                // The fold every compiled switch has, which is the same `add` on the other side.
+                insn(
+                    DISPATCH + 0x2b,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x2e, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
+        let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let after = map(
+            DISPATCH,
+            &adjusted(false),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            after.cases.len(),
+            2,
+            "the fold after the load is the switch: {:?}",
+            after.cases
+        );
+
+        served.set(0);
+        let ahead = map(
+            DISPATCH,
+            &adjusted(true),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+
+        assert!(
+            ahead.cases.is_empty(),
+            "the index is not the number the check covered: {:?}",
+            ahead.cases
+        );
+        assert_eq!(ahead.unresolved, vec![DISPATCH + 0x2e]);
+        assert_eq!(served.get(), 0, "and the table was not read");
+    }
+
+    /// One fold, and not several.
+    ///
+    /// `add rcx,rdx` / `add rcx,r8` makes the target the sum of the entry and **both**, and
+    /// keeping one of them reconstructs addresses nobody computed -- published as cases wherever
+    /// they happen to be executable, with the jump reported as followed.
+    #[test]
+    fn a_target_folded_twice_is_not_followed() {
+        const TABLE: i64 = 0x9000;
+        let folded = |twice: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x21,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x28,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if twice {
+                block.push(insn(
+                    DISPATCH + 0x2b,
+                    "add",
+                    vec![reg("rax"), reg("rsi")],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.push(insn(
+                DISPATCH + 0x2e,
+                "jmp",
+                vec![reg("rax")],
+                Flow::Jmp(None),
+            ));
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        assert_eq!(
+            map(
+                DISPATCH,
+                &folded(false),
+                Layout::X64,
+                &read,
+                in_image,
+                never
+            )
+            .cases
+            .len(),
+            2,
+            "one fold is the switch"
+        );
+        let twice = map(DISPATCH, &folded(true), Layout::X64, &read, in_image, never);
+        assert!(
+            twice.cases.is_empty(),
+            "and two is a target this did not compute: {:?}",
+            twice.cases
+        );
+        assert_eq!(twice.unresolved, vec![DISPATCH + 0x2e]);
+    }
+
+    /// A byte map is looked for **before** the load it feeds.
+    ///
+    /// It is the first stage of a two-table switch, so a byte load *after* the dword table read is
+    /// something else entirely -- the target was already in hand by then. Taken for the map it
+    /// remaps every code through arbitrary bytes. The fixture's reader answers at the map's
+    /// address as readily as at the table's, so what says the later load was ignored is that the
+    /// map was never asked for.
+    #[test]
+    fn a_byte_map_after_the_load_is_not_the_map() {
+        const MAP: i64 = 0x5b90;
+        const TABLE: i64 = 0x5b80;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            // The dword table, read into the register the jump reads.
+            insn(
+                DISPATCH + 0x21,
+                "mov",
+                vec![reg("edx"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            // A byte load into the index, *after* the target was in hand: not the first stage of
+            // anything.
+            insn(
+                DISPATCH + 0x28,
+                "movzx",
+                vec![
+                    reg("eax"),
+                    Operand::Memory(MemoryOperand {
+                        size: Some(1),
+                        segment: None,
+                        base: Some(named("rcx")),
+                        index: Some(named("rax")),
+                        scale: 1,
+                        displacement: MAP,
+                        address: None,
+                    }),
+                ],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2f,
+                "add",
+                vec![reg("rdx"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x32, "jmp", vec![reg("rdx")], Flow::Jmp(None)),
+        ]);
+        let map_at = IMAGE_BASE.wrapping_add(MAP as u64);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let asked: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let read = |at: u64, len: usize| {
+            asked.borrow_mut().push(at);
+            if at == map_at {
+                // Both slots remapped onto the second entry, which is what taking this for the
+                // map would show.
+                return Some(vec![1u8, 1][..len.min(2)].to_vec());
+            }
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc004, IMAGE_BASE + 0x1000),
+                (0x6dc005, IMAGE_BASE + 0x1100)
+            ],
+            "one slot per index, not both through a byte the switch never read: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            asked.borrow().as_slice(),
+            &[table_at],
+            "and the map was never asked for"
         );
     }
 
