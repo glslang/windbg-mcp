@@ -194,6 +194,7 @@ pub(crate) fn in_listing_order(
                 effect: Effect::Other,
                 condition: None,
                 writes_flags: false,
+                writes: Vec::new(),
             })
         })
         .collect()
@@ -1219,6 +1220,9 @@ mod tests {
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
+            // The walk reads the flow and nothing else the decoder answers, which the test below
+            // says in as many words.
+            writes: Vec::new(),
         }
     }
 

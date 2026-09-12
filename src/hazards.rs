@@ -930,6 +930,8 @@ mod tests {
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
+            // are not, and neither is the register set an instruction writes.
+            writes: Vec::new(),
         }
     }
 

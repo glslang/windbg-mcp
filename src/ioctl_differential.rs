@@ -211,6 +211,17 @@ impl Machine {
             (Effect::BitXor, Some(source)) => self.read(destination) ^ source,
             (Effect::BitAnd, Some(source)) => self.read(destination) & source,
             (Effect::BitOr, Some(source)) => self.read(destination) | source,
+            // **A multiply writes two registers and names neither**, which is the shape a
+            // first-operand rule cannot see. Executed here so the walk's answer about it can be
+            // checked rather than assumed.
+            (Effect::Other, _) if instruction.mnemonic == "mul" => {
+                let by = self.read(destination) & 0xffff_ffff;
+                let product = (self.get("rax") & 0xffff_ffff) * by;
+                self.registers
+                    .insert("rax".to_string(), product & 0xffff_ffff);
+                self.registers.insert("rdx".to_string(), product >> 32);
+                return;
+            }
             // `xchg`, and everything else this vocabulary contains that the walk does not model.
             (Effect::Other, Some(source)) if instruction.mnemonic == "xchg" => {
                 let left = self.read(destination);
@@ -346,7 +357,7 @@ struct Routine {
 /// Each is a shape a review finding on #305 was about: a partial write, an exchange writing its
 /// second operand, an implicit destination, a call over the volatile registers, a narrow copy.
 fn noise(seed: &mut Seed, at: u64) -> Vec<Instruction> {
-    let which = seed.below(8);
+    let which = seed.below(9);
     let one = |mnemonic: &str, operands: Vec<Operand>, flow: Flow| {
         vec![insn(at, mnemonic, operands, flow)]
     };
@@ -366,6 +377,7 @@ fn noise(seed: &mut Seed, at: u64) -> Vec<Instruction> {
             vec![reg("r13w"), imm(1 + seed.below(8))],
             Flow::Fallthrough,
         ),
+        7 => one("mul", vec![reg("ecx")], Flow::Fallthrough),
         _ => Vec::new(),
     }
 }
