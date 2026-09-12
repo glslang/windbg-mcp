@@ -249,6 +249,10 @@ enum Value {
     OutputLength,
     /// A constant address, from a RIP-relative `lea` — what a jump table is indexed against.
     Address(u64),
+    /// A literal a `mov` put in a register, which is how a status reaches the IRP: MSVC writes
+    /// `mov ecx,0C0000010h` / `mov [rbx+30h],ecx` as readily as it writes the constant into the
+    /// field, and the second of those says nothing about a refusal on its own.
+    Literal(u32),
 }
 
 /// Where the fields this reads live, which is a question about the target's **bitness** rather
@@ -1306,6 +1310,11 @@ fn source_value(
     traced: &mut bool,
 ) -> Option<Value> {
     match instruction.operands.get(1)? {
+        // A constant, which is worth keeping for one reason: a refusal's status reaches
+        // `Irp->IoStatus.Status` through a register as often as it is written straight into it.
+        Operand::Immediate(value) if instruction.effect == Effect::Move => {
+            u32::try_from(*value).ok().map(Value::Literal)
+        }
         // **A copy carries the value only if it carries all of it.** `movzx ecx,ax` and a plain
         // `mov cx,ax` both leave two bytes of a `ULONG` behind, and a compare against that is a
         // statement about part of a field reported as one about the field -- a control code whose
@@ -1461,7 +1470,9 @@ impl Value {
     fn carried_by(self, layout: Layout) -> u32 {
         match self {
             Value::Irp | Value::StackLocation | Value::Address(_) => layout.pointer,
-            Value::Code { .. } | Value::InputLength | Value::OutputLength => FIELD_WIDTH,
+            Value::Code { .. } | Value::InputLength | Value::OutputLength | Value::Literal(_) => {
+                FIELD_WIDTH
+            }
         }
     }
 }
@@ -1677,11 +1688,11 @@ fn follow_table(
     // **Before the dword load, because that is the stage it feeds.** Searching the whole block
     // takes a later, unrelated byte load for the first stage -- the target was already in hand by
     // then -- and remaps every code through arbitrary bytes.
-    let byte_map = instructions[..at_load.min(instructions.len())]
+    let stages: Vec<_> = instructions[..at_load.min(instructions.len())]
         .iter()
         .enumerate()
         .rev()
-        .find_map(|(position, instruction)| {
+        .filter_map(|(position, instruction)| {
             if instruction.effect != Effect::Move {
                 return None;
             }
@@ -1693,7 +1704,17 @@ fn follow_table(
                 return None;
             };
             (memory.scale == 1 && memory.size.unwrap_or(1) == 1).then_some((memory, position))
-        });
+        })
+        .collect();
+    // **One stage, and not several.** Two byte maps in a row make the case number
+    // `second[first[code]]`, and reading only the nearest pairs every code with the entry some
+    // other index selects -- published wherever that entry happens to be executable, with the jump
+    // reported as followed. Composing them is readable in principle and is a second table's worth
+    // of reads for a shape no compiler emits; one is the switch, more is not this.
+    if stages.len() > 1 {
+        return None;
+    }
+    let byte_map = stages.into_iter().next();
 
     let cases: Vec<usize> = match byte_map {
         Some((map, at_map)) => {
@@ -1854,9 +1875,21 @@ fn status_after(
     // on its way out -- so treating that as a write would stop this recognising the shape it
     // exists for. What that costs is a routine which loads a status, calls something that replaces
     // it, and returns without reloading; compilers reload.
+    // **The literal, wherever it came from.** Written straight into the destination, or carried
+    // there in a register: `mov ecx,0C0000010h` / `mov [rbx+30h],ecx` is the same refusal as the
+    // one-instruction form, and reading only the immediate takes it for a store of something
+    // unknown -- which clears the field's status and loses the rejection.
+    let written = match instruction.operands.get(1) {
+        Some(Operand::Immediate(value)) => u32::try_from(*value).ok(),
+        Some(Operand::Register(register)) => match facts.registers.get(&register.full) {
+            Some(Value::Literal(value)) if register.width >= FIELD_WIDTH => Some(*value),
+            _ => None,
+        },
+        _ => None,
+    };
     let refusal = instruction.effect == Effect::Move
-        && match instruction.operands.get(1).and_then(immediate_of) {
-            Some(value) => u32::try_from(value).is_ok_and(|value| value >> 30 == 0b11),
+        && match written {
+            Some(value) => value >> 30 == 0b11,
             // The destination was written with something that is not a literal status: whatever
             // is there now is no longer the refusal that was loaded.
             None => false,
@@ -7308,6 +7341,225 @@ mod tests {
         assert!(
             past.cap_hit,
             "and this jump is unresolved because of a bound in here, not one in the driver"
+        );
+    }
+
+    /// One byte-map stage, and not several.
+    ///
+    /// Two maps in a row make the case number `second[first[code]]`, and reading only the nearest
+    /// pairs every code with the entry some other index selects -- published wherever that entry
+    /// happens to be executable, with the jump reported as followed. One stage is the switch MSVC
+    /// emits; two is a shape this does not read.
+    #[test]
+    fn two_byte_map_stages_are_not_followed() {
+        const FIRST: i64 = 0x5b90;
+        const SECOND: i64 = 0x5c90;
+        const TABLE: i64 = 0x5b80;
+        let staged = |twice: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x21,
+                    "movzx",
+                    vec![
+                        reg("eax"),
+                        Operand::Memory(MemoryOperand {
+                            size: Some(1),
+                            segment: None,
+                            base: Some(named("rcx")),
+                            index: Some(named("rax")),
+                            scale: 1,
+                            displacement: FIRST,
+                            address: None,
+                        }),
+                    ],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if twice {
+                block.push(insn(
+                    DISPATCH + 0x28,
+                    "movzx",
+                    vec![
+                        reg("eax"),
+                        Operand::Memory(MemoryOperand {
+                            size: Some(1),
+                            segment: None,
+                            base: Some(named("rcx")),
+                            index: Some(named("rax")),
+                            scale: 1,
+                            displacement: SECOND,
+                            address: None,
+                        }),
+                    ],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0x2f,
+                    "mov",
+                    vec![reg("edx"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x36,
+                    "add",
+                    vec![reg("rdx"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x39, "jmp", vec![reg("rdx")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| -> Option<Vec<u8>> {
+            if at == IMAGE_BASE.wrapping_add(FIRST as u64)
+                || at == IMAGE_BASE.wrapping_add(SECOND as u64)
+            {
+                return Some(vec![0u8, 1][..len.min(2)].to_vec());
+            }
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let once = map(
+            DISPATCH,
+            &staged(false),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            once.cases.len(),
+            2,
+            "one stage is the switch: {:?}",
+            once.cases
+        );
+
+        let twice = map(DISPATCH, &staged(true), Layout::X64, &read, in_image, never);
+
+        assert!(
+            twice.cases.is_empty(),
+            "a code's case number is what both maps say, not what the second does: {:?}",
+            twice.cases
+        );
+        assert_eq!(twice.unresolved, vec![DISPATCH + 0x39]);
+    }
+
+    /// A status reaches the IRP through a register as readily as it is written into it.
+    ///
+    /// `mov ecx,0C0000010h` / `mov [rbx+30h],ecx` is the same refusal as the one-instruction form,
+    /// and reading only the immediate takes the store for one of something unknown -- which clears
+    /// the field and loses the rejection, so the completion call is reported as an accepted case's
+    /// handler. The routine returns **success** here, which is what makes the IRP's copy the only
+    /// evidence there is.
+    #[test]
+    fn a_status_carried_in_a_register_still_reaches_the_irp() {
+        let through = |register: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("rbx"), reg("rdx")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+            ]);
+            let mut at = DISPATCH + 0x40;
+            let source = match register {
+                true => {
+                    block.push(insn(
+                        at,
+                        "mov",
+                        vec![reg("ecx"), imm(0xc000_0010)],
+                        Flow::Fallthrough,
+                    ));
+                    at += 5;
+                    reg("ecx")
+                }
+                false => imm(0xc000_0010),
+            };
+            block.extend([
+                insn(at, "mov", vec![mem("rbx", 0x30), source], Flow::Fallthrough),
+                insn(
+                    at + 7,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                // The dispatch routine returns success; the completed IRP carries the error.
+                insn(
+                    at + 0xc,
+                    "xor",
+                    vec![reg("eax"), reg("eax")],
+                    Flow::Fallthrough,
+                ),
+                insn(at + 0xe, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            (found.cases[0].accepted, found.cases[0].handler)
+        };
+
+        assert_eq!(
+            through(false),
+            (Some(false), None),
+            "the constant written straight into the field is a refusal"
+        );
+        assert_eq!(
+            through(true),
+            (Some(false), None),
+            "and so is the same constant carried there in a register"
         );
     }
 
