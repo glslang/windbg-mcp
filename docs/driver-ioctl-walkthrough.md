@@ -63,7 +63,9 @@ ioctl_map { "dispatch": "mountmgr!MountMgrDeviceControl" }
 Each case comes back decoded, with the compare that recognises it and the block it routes to, and
 anything the recovery could not follow is listed rather than left out — a map with entries in
 `unresolved` is a lower bound on what the driver accepts. Measured against the x64 kernel minidump
-under `docs/samples/` on 2026-09-11: **43 case records, nothing unresolved** — the `0x6d00xx` and
+under `docs/samples/` on 2026-09-12: **45 case records over 23 codes, nothing unresolved** — a
+code compared in two places is two records, which is why there are more of the first than the
+second — the `0x6d00xx` and
 `0x6d40xx` tiers below from the compare chain, and `0x6dc004`–`0x6dc054` from the two jump tables,
 every one of them `METHOD_BUFFERED`. The tables are 81 entries each and 13 of each are codes; the
 rest go to the switch's default and are not reported as codes the driver accepts. The rest of this section is how that

@@ -68,7 +68,13 @@ use crate::cfg;
 use crate::walk::Halt;
 
 /// Bounds. A malformed or hostile driver decides how much work this is, so every list the answer
-/// carries has a cap and a count beside it that stays exact.
+/// carries has a cap, and [`Map::cap_hit`] says one was reached.
+///
+/// The **case** count stays exact past its cap, because how many codes a driver accepts is the
+/// question the map answers. The other two lists are evidence rather than the answer, and a
+/// truncated one supports the same reading as a full one -- entries in `unresolved` say the map is
+/// a lower bound whether there are three of them or three thousand -- so they are bounded and not
+/// counted.
 ///
 /// The numbers are far past what a real driver produces — the largest dispatch routine measured
 /// here recognises 28 codes — and are here to bound the absurd rather than to shape an answer.
@@ -76,6 +82,11 @@ pub(crate) const MAX_CASES: usize = 4096;
 /// The most entries followed out of one jump table. A table is `entries * 4` bytes of reads, so
 /// this is also what bounds the reading.
 pub(crate) const MAX_TABLE_ENTRIES: usize = 4096;
+/// The most jump tables and unresolved transfers one map carries. A block has one terminator, so
+/// these are bounded by the routine's size -- which is the target's to decide, and a listing that
+/// begins mid-code is indirect jumps all the way down.
+pub(crate) const MAX_TABLES: usize = 256;
+pub(crate) const MAX_UNRESOLVED: usize = 1024;
 
 /// How a case was recovered, which is what says how much of it to trust.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -170,11 +181,12 @@ pub(crate) struct Map {
     pub(crate) cases: Vec<Case>,
     /// How many were found, exact however many are listed.
     pub(crate) case_count: usize,
-    /// The jump tables that were followed.
+    /// The jump tables that were followed, up to [`MAX_TABLES`].
     pub(crate) tables: Vec<Table>,
     /// Indirect transfers that were **not** followed, by address: an unresolved switch, a call
     /// through a pointer. Each one is a place a code could be recognised and was not, which is
-    /// what stops a short case list reading as a complete one.
+    /// what stops a short case list reading as a complete one. Up to [`MAX_UNRESOLVED`], past
+    /// which [`Map::cap_hit`] carries the same warning the list does.
     pub(crate) unresolved: Vec<u64>,
     /// Why the walk stopped early, when it did.
     pub(crate) halted: Option<Halt>,
@@ -246,6 +258,15 @@ pub(crate) struct Layout {
     /// How wide a pointer is on this target, which is what a load of the IRP's stack location has
     /// to be to have loaded one.
     pointer: u32,
+    /// The registers a `call` may return over, spelled as **this target's** decoder spells a full
+    /// register.
+    ///
+    /// Per layout rather than one list, because the spellings do not overlap: `eax` is part of
+    /// `rax` on x64 and is the whole register on x86, so an x64 list applied to a 32-bit target
+    /// forgets nothing at all -- and a routine that loads the code into `eax`, calls a helper and
+    /// compares the helper's **return value** would have that compare reported as a case the
+    /// driver accepts.
+    volatile: &'static [&'static str],
     /// The register a dispatch routine's `Irp` argument arrives in, when the calling convention
     /// puts it in one.
     ///
@@ -263,6 +284,7 @@ impl Layout {
         output_length: 0x08,
         return_register: "rax",
         pointer: 8,
+        volatile: &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"],
         irp_register: Some("rdx"),
     };
     pub(crate) const X86: Self = Self {
@@ -272,6 +294,7 @@ impl Layout {
         output_length: 0x04,
         return_register: "eax",
         pointer: 4,
+        volatile: &["eax", "ecx", "edx"],
         irp_register: None,
     };
 }
@@ -611,10 +634,18 @@ fn record(
                 resolved.proved,
             );
         }
-        tables.push(resolved.table);
+        if tables.len() < MAX_TABLES {
+            tables.push(resolved.table);
+        } else {
+            *cap_hit = true;
+        }
     }
     if let Some(at) = run.unresolved {
-        unresolved.push(at);
+        if unresolved.len() < MAX_UNRESOLVED {
+            unresolved.push(at);
+        } else {
+            *cap_hit = true;
+        }
     }
 }
 
@@ -819,9 +850,6 @@ fn immediate_of(operand: &Operand) -> Option<u64> {
     }
 }
 
-/// The registers a `call` may return over, which is what makes a belief about one stale.
-const VOLATILE: [&str; 7] = ["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"];
-
 /// The state one compare leaves for the branch that reads it.
 #[derive(Debug, Clone)]
 struct Compared {
@@ -869,13 +897,13 @@ fn update(
     // A call returns over the volatile registers, so a belief about one does not survive it --
     // including a bound whose index is one of them.
     if matches!(instruction.flow, Flow::Call(_)) {
-        for volatile in VOLATILE {
-            facts.registers.remove(volatile);
+        for volatile in layout.volatile {
+            facts.registers.remove(*volatile);
         }
         if facts
             .bound
             .as_ref()
-            .is_some_and(|bound| VOLATILE.contains(&bound.register.as_str()))
+            .is_some_and(|bound| layout.volatile.contains(&bound.register.as_str()))
         {
             facts.bound = None;
         }
@@ -2230,6 +2258,11 @@ mod tests {
     /// The case that makes this visible needs the code in a **volatile** register: in a preserved
     /// one the value really does survive the call, so a pass that forgot nothing would agree with
     /// one that forgets the right registers, and the test would pass on the wrong rule.
+    ///
+    /// And it needs asserting on **both** targets, because the spellings do not overlap: `eax` is
+    /// part of `rax` on x64 and is the whole register on x86, so one target's list applied to the
+    /// other forgets nothing whatever. The x86 half is the same routine written for the target
+    /// where both arguments arrive on the stack.
     #[test]
     fn a_call_forgets_the_registers_it_may_return_over() {
         let mut block = prologue(DISPATCH);
@@ -2272,6 +2305,187 @@ mod tests {
             "`eax` did not survive the call and `r13d` did: {:?}",
             found.cases
         );
+
+        let block32 = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg32("esi"), mem32("ebp", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 3,
+                "mov",
+                vec![reg32("edi"), mem32("esi", 0x60)],
+                Flow::Fallthrough,
+            ),
+            // The code into a volatile register, and into a preserved one beside it.
+            insn(
+                DISPATCH + 6,
+                "mov",
+                vec![reg32("eax"), mem32("edi", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 9,
+                "mov",
+                vec![reg32("ebx"), mem32("edi", 0x0c)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "call",
+                vec![Operand::Target(0xdead)],
+                Flow::Call(Some(0xdead)),
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg32("eax"), imm(0x6d0008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x17,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x30)),
+            ),
+            insn(
+                DISPATCH + 0x1d,
+                "cmp",
+                vec![reg32("ebx"), imm(0x6d4020)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x23,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(DISPATCH + 0x29, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found32 = map(DISPATCH, &block32, Layout::X86, unreadable, in_image, never);
+
+        assert_eq!(
+            found32
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x6d4020],
+            "on a 32-bit target the register a call returns over is `eax`, not `rax`: {:?}",
+            found32.cases
+        );
+    }
+
+    /// The evidence lists are bounded as the case list is, and `cap_hit` says one was reached.
+    ///
+    /// A block has one terminator, so how many jump tables and unresolved transfers a routine has
+    /// is the *target's* to decide -- a listing that begins mid-code is indirect jumps all the way
+    /// down. Uncapped, `MAX_CASES` bounds the answer and neither of these bounds the payload
+    /// carrying it. The cases a table produced are still reported past the cap, because they are
+    /// the answer and the table record is evidence for it.
+    #[test]
+    fn the_table_and_unresolved_lists_are_bounded_too() {
+        // One unit: rebase, bound, and a one-entry table jumped through. The bounds check's own
+        // branch goes to the *next* unit, which is what keeps every one of them reachable -- a
+        // block nothing reaches believes nothing, and a table with no bound is not followed.
+        const TABLES: usize = MAX_TABLES + 1;
+        const UNIT: u64 = 0x40;
+        const FIRST: u64 = DISPATCH + 0x100;
+        const TABLE: i64 = 0x20000;
+        let unit = |index: usize| {
+            let at = FIRST + (index as u64) * UNIT;
+            let next = at + UNIT;
+            vec![
+                insn(at, "mov", vec![reg("eax"), reg("r13d")], Flow::Fallthrough),
+                insn(
+                    at + 8,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc000 + index as u64 * 4)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    at + 0x10,
+                    "cmp",
+                    vec![reg("eax"), imm(0)],
+                    Flow::Fallthrough,
+                ),
+                insn(at + 0x18, "ja", Vec::new(), Flow::Branch(Some(next))),
+                insn(
+                    at + 0x20,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    at + 0x28,
+                    "mov",
+                    vec![
+                        reg("eax"),
+                        indexed(Some("rcx"), "rax", TABLE + (index as i64) * 4, None),
+                    ],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    at + 0x30,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(at + 0x38, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            ]
+        };
+        let mut block = prologue(DISPATCH);
+        block.push(insn(
+            DISPATCH + 8,
+            "jmp",
+            Vec::new(),
+            Flow::Jmp(Some(FIRST)),
+        ));
+        for index in 0..TABLES {
+            block.extend(unit(index));
+        }
+        // Every table holds one entry, and it lands somewhere in this image that is not the
+        // bounds check's own target.
+        let read = |at: u64, len: usize| {
+            let first = IMAGE_BASE.wrapping_add(TABLE as u64);
+            (at >= first && at < first + (TABLES as u64) * 4 && len == 4)
+                .then(|| 0x3000u32.to_le_bytes().to_vec())
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert_eq!(found.tables.len(), MAX_TABLES, "the table list stops");
+        assert_eq!(
+            found.cases.len(),
+            TABLES,
+            "and the cases the last table produced are still the answer: {}",
+            found.cases.len()
+        );
+        assert!(found.cap_hit, "which the answer says");
+
+        // The other list, on a routine that is nothing but indirect jumps.
+        let jumps: Vec<Instruction> = (0..MAX_UNRESOLVED + 8)
+            .map(|index| {
+                insn(
+                    DISPATCH + (index as u64) * 4,
+                    "jmp",
+                    vec![reg("rax")],
+                    Flow::Jmp(None),
+                )
+            })
+            .collect();
+
+        let found = map(DISPATCH, &jumps, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(
+            found.unresolved.len(),
+            MAX_UNRESOLVED,
+            "the unresolved list stops"
+        );
+        assert!(found.cap_hit, "which the answer says");
     }
 
     /// A bounded jump table becomes one case per entry, read out of the image -- and a **shifted**
