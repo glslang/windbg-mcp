@@ -1513,10 +1513,10 @@ fn follow_table(
                 ) {
                     continue;
                 }
-                let Some(written) = instruction.operands.first().and_then(register_full) else {
+                let Some(Operand::Register(written)) = instruction.operands.first() else {
                     continue;
                 };
-                if written != wanted {
+                if written.full != wanted {
                     continue;
                 }
                 match instruction.operands.get(1) {
@@ -1537,11 +1537,27 @@ fn follow_table(
                     // `add rcx,rdx` folds the image base into the entry: the value being followed
                     // is still the one in `rcx`. **Which register was added is recorded**, because
                     // that -- and not the load's base -- is what execution adds to every entry.
-                    Some(Operand::Register(source)) if instruction.effect == Effect::Add => {
+                    // **Folded at the target's width.** `add eax,ecx` keeps four bytes of an
+                    // address the jump then reads eight of, so what the entries are measured from
+                    // is not what this computed.
+                    Some(Operand::Register(source))
+                        if instruction.effect == Effect::Add
+                            && written.width >= layout.pointer
+                            && source.width >= layout.pointer =>
+                    {
                         added = Some((source.full.clone(), position));
                         continue;
                     }
-                    Some(Operand::Register(source)) if instruction.effect == Effect::Move => {
+                    // **And copied at it.** Everything from the `add` to the jump is an *address*,
+                    // so `mov edx,ecx` zero-extends the low half of one: the jump goes somewhere
+                    // this walk did not compute, and the table's targets are published for it. The
+                    // **load** is the exception and is matched above: a table entry really is four
+                    // bytes, and `mov eax,[table+rax*4]` really does zero-extend it on purpose.
+                    Some(Operand::Register(source))
+                        if instruction.effect == Effect::Move
+                            && written.width >= layout.pointer
+                            && source.width >= layout.pointer =>
+                    {
                         wanted = source.full.clone();
                     }
                     _ => return None,
@@ -1700,12 +1716,12 @@ fn follow_table(
 fn error_status(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> bool {
     let mut facts = arrived.clone();
     let mut traced = false;
-    let mut status = false;
+    let mut status = Status::default();
     for instruction in instructions {
         status = status_after(status, instruction, layout, &facts);
         update(&mut facts, instruction, layout, &mut traced);
     }
-    status
+    status.refusing()
 }
 
 /// What one instruction does to the status a block has established so far.
@@ -1713,31 +1729,38 @@ fn error_status(instructions: &[Instruction], layout: Layout, arrived: &Facts) -
 /// A fold rather than a rescan, because [`failure_block`] needs the answer **at every position**
 /// and asking [`error_status`] for each prefix makes one refusal check cost the square of the
 /// block's length -- which a malformed routine chooses.
-fn status_after(status: bool, instruction: &Instruction, layout: Layout, facts: &Facts) -> bool {
-    // Does this write one of the two places a dispatch routine's status lives?
+fn status_after(
+    status: Status,
+    instruction: &Instruction,
+    layout: Layout,
+    facts: &Facts,
+) -> Status {
+    // Which of the two places a dispatch routine's status lives does this write?
     let writes_status = match instruction.operands.first() {
         // The return register, by the full-width name the decoder gives it.
-        Some(Operand::Register(register)) => register.full == layout.return_register,
+        Some(Operand::Register(register)) if register.full == layout.return_register => Some(false),
         // Or `Irp->IoStatus.Status`, which is the other place a refusal writes one -- and **that
         // field**, not any store. A case that puts an error-looking constant in a stack local or a
         // diagnostic structure and then returns would otherwise be read as refusing the request:
         // the case comes back rejected and its handler is taken away, which is a wrong answer
         // about a code the driver accepts. So the destination has to be a dword at that
         // displacement off a register this walk watched the IRP reach.
-        Some(Operand::Memory(memory)) => {
-            memory.index.is_none()
+        Some(Operand::Memory(memory))
+            if memory.index.is_none()
                 && memory.size == Some(FIELD_WIDTH)
                 && memory.displacement == layout.status_field
                 && memory
                     .base
                     .as_ref()
-                    .is_some_and(|base| facts.registers.get(&base.full) == Some(&Value::Irp))
+                    .is_some_and(|base| facts.registers.get(&base.full) == Some(&Value::Irp)) =>
+        {
+            Some(true)
         }
-        _ => false,
+        _ => None,
     };
-    if !writes_status {
+    let Some(into_the_irp) = writes_status else {
         return status;
-    }
+    };
     // **Every write to it replaces what is there, and only one shape puts a refusal there.**
     // `mov eax,0C0000010h` / `xor eax,eax` / `ret` returns success, and reading the load alone
     // reports that case as one the driver refuses. So anything that is not a move of a literal
@@ -1748,14 +1771,43 @@ fn status_after(status: bool, instruction: &Instruction, layout: Layout, facts: 
     // on its way out -- so treating that as a write would stop this recognising the shape it
     // exists for. What that costs is a routine which loads a status, calls something that replaces
     // it, and returns without reloading; compilers reload.
-    if instruction.effect != Effect::Move {
-        return false;
+    let refusal = instruction.effect == Effect::Move
+        && match instruction.operands.get(1).and_then(immediate_of) {
+            Some(value) => u32::try_from(value).is_ok_and(|value| value >> 30 == 0b11),
+            // The destination was written with something that is not a literal status: whatever
+            // is there now is no longer the refusal that was loaded.
+            None => false,
+        };
+    match into_the_irp {
+        true => Status {
+            irp: refusal,
+            ..status
+        },
+        false => Status {
+            returned: refusal,
+            ..status
+        },
     }
-    match instruction.operands.get(1).and_then(immediate_of) {
-        Some(value) => u32::try_from(value).is_ok_and(|value| value >> 30 == 0b11),
-        // The destination was written with something that is not a literal status: whatever this
-        // block returns is no longer the refusal that was loaded.
-        None => false,
+}
+
+/// Where a dispatch routine's status stands, which is **two** places and not one.
+///
+/// A refusal can put an error in either, and they are independent: a block that stores one into
+/// `Irp->IoStatus.Status`, completes the request and then returns success has refused the code, and
+/// folding the two into one flag has the `xor eax,eax` take the IRP's error away with it. The case
+/// then reads as accepted, with the completion routine reported as its handler.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Status {
+    /// An error literal in the return register, as it stands.
+    returned: bool,
+    /// An error literal in `Irp->IoStatus.Status`.
+    irp: bool,
+}
+
+impl Status {
+    /// Whether either of them is a refusal.
+    fn refusing(self) -> bool {
+        self.returned || self.irp
     }
 }
 
@@ -1773,8 +1825,8 @@ fn failure_block(
     instructions: &[Instruction],
     layout: Layout,
     arrived: &Facts,
-    incoming: bool,
-) -> (bool, bool) {
+    incoming: Status,
+) -> (bool, Status) {
     // **Read where the store is, not where the block starts.** Whether a destination is
     // `Irp->IoStatus.Status` is a question about a register, and a block is free to reuse one: a
     // `rbx` that arrives holding the IRP and is reassigned to a diagnostic object before the store
@@ -1790,22 +1842,22 @@ fn failure_block(
         status = status_after(status, instruction, layout, &facts);
         update(&mut facts, instruction, layout, &mut traced);
         match instruction.flow {
-            Flow::Return => return (status, status),
+            Flow::Return => return (status.refusing(), status),
             // A completion call after the status is part of the rejection; one before it is a
             // block doing something else.
-            Flow::Call(_) if status => {}
+            Flow::Call(_) if status.refusing() => {}
             // **An unconditional tail jump carries the status it established.**
             // `mov eax,0C0000010h` / `jmp common_ret` is one rejection written across two blocks,
             // and starting the next one from nothing loses it -- the shared return block is then
             // reported as this case's handler. Whether that jump is followed at all is
             // [`refuses_in`]'s question; this says what goes with it.
             Flow::Jmp(Some(_)) => return (false, status),
-            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return (false, false),
-            Flow::Unreadable | Flow::Unknown => return (false, false),
+            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return (false, Status::default()),
+            Flow::Unreadable | Flow::Unknown => return (false, Status::default()),
             Flow::Fallthrough | Flow::Trap => {}
         }
     }
-    (false, false)
+    (false, Status::default())
 }
 
 /// Whether the block at `index` **refuses** the request, following the tail jumps a shared
@@ -1824,7 +1876,7 @@ fn refuses_in(
     blind: bool,
 ) -> bool {
     let mut at = index;
-    let mut status = false;
+    let mut status = Status::default();
     for hop in 0..3 {
         let block = &graph.blocks[at];
         let instructions = &listing[block.start..block.end];
@@ -5873,6 +5925,201 @@ mod tests {
         );
         assert_eq!(across.unresolved, vec![DISPATCH + 0x30]);
         assert_eq!(served.get(), 0, "and the table was not read");
+    }
+
+    /// From the `add` to the jump the chain carries an **address**, so it is copied whole.
+    ///
+    /// `mov edx,ecx` zero-extends the low half of one, and the jump then goes somewhere this walk
+    /// did not compute -- with the table's targets published for it. The **load** is the exception
+    /// and stays: a table entry really is four bytes, and `mov eax,[table+rax*4]` really does
+    /// zero-extend it on purpose, which is `mountmgr` verbatim. So only the copy after the fold
+    /// has a width to answer for, and the two halves here differ in nothing else.
+    #[test]
+    fn a_jump_target_is_copied_at_a_pointers_width() {
+        const TABLE: i64 = 0x9000;
+        let copied = |spelling: (&str, &str)| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                // The entry, four bytes wide, zero-extended on purpose.
+                insn(
+                    DISPATCH + 0x21,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x28,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                // And the copy, which is of a whole address or of half of one.
+                insn(
+                    DISPATCH + 0x2b,
+                    "mov",
+                    vec![reg(spelling.0), reg(spelling.1)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x2e, "jmp", vec![reg("rdx")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
+        let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let whole = map(
+            DISPATCH,
+            &copied(("rdx", "rax")),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            whole.cases.len(),
+            2,
+            "a whole address is the one the jump reads: {:?}",
+            whole.cases
+        );
+
+        served.set(0);
+        let half = map(
+            DISPATCH,
+            &copied(("edx", "eax")),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+
+        assert!(
+            half.cases.is_empty(),
+            "and half of one is not: {:?}",
+            half.cases
+        );
+        assert_eq!(half.unresolved, vec![DISPATCH + 0x2e]);
+        assert_eq!(served.get(), 0, "and the table was not read");
+    }
+
+    /// The two places a status lives are two facts.
+    ///
+    /// A block that stores an error into `Irp->IoStatus.Status`, completes the request and then
+    /// returns success has **refused** the code: the completed IRP carries the error whatever the
+    /// dispatch routine returned. Folded into one flag, the `xor eax,eax` takes the IRP's error
+    /// away with it -- the case reads as accepted and the completion routine is reported as its
+    /// handler, which is a routine a reader would go and look up.
+    ///
+    /// The other direction still has to hold, and is what the first half asserts: an error loaded
+    /// into the return register and overwritten before the `ret` is not a refusal, because nothing
+    /// else was told about it.
+    #[test]
+    fn the_return_register_and_the_irps_status_are_separate() {
+        let refused = |into_the_irp: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("rbx"), reg("rdx")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+                // The status, into one place or the other.
+                insn(
+                    DISPATCH + 0x40,
+                    "mov",
+                    vec![
+                        match into_the_irp {
+                            true => mem("rbx", 0x30),
+                            false => reg("eax"),
+                        },
+                        imm(0xc000_0010),
+                    ],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x47,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                // And the return register cleared on the way out, either way.
+                insn(
+                    DISPATCH + 0x4c,
+                    "xor",
+                    vec![reg("eax"), reg("eax")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x4e, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            (found.cases[0].accepted, found.cases[0].handler)
+        };
+
+        assert_eq!(
+            refused(true),
+            (Some(false), None),
+            "the completed IRP carries the error whatever the routine returned"
+        );
+        assert_eq!(
+            refused(false),
+            (Some(true), Some(0x7000)),
+            "and a status loaded into the return register and cleared before the `ret` told \
+             nothing else about it"
+        );
     }
 
     /// A bound is about a register's **value**, so a write that is not part of the table pattern
