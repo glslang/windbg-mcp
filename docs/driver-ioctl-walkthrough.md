@@ -111,21 +111,36 @@ All `METHOD_BUFFERED` (no `METHOD_NEITHER` raw-pointer surface).
 ## 5. Openable gate — the device DACL
 
 ```jsonc
-device_object { "device": "\\Device\\MountPointManager" }
+device_security { "device": "\\Device\\MountPointManager" }
 ```
 
 ```text
-SecurityDescriptor ffff8680fc6912a0   Characteristics (0x100) FILE_DEVICE_SECURE_OPEN
+\Device\MountPointManager at 0xffffb90a0c0e5030
+  Driver          0xffffb90a0a1b2c00
+  DeviceType      0x002d
+  Characteristics 0x00000100  FILE_DEVICE_SECURE_OPEN
+  Flags           0x00000040
+  Security descriptor at 0xffff8680fc6912a0
+    Owner  S-1-5-32-544 (Administrators)
+    DACL   4 ACE(s)
+      allow  Everyone                     0x001200a0  READ_CONTROL SYNCHRONIZE ...
 ```
 
-> **Gotcha:** `!sd` is **not** in the bundled engine, so `device_object` surfaces the SD pointer
-> and you decode the DACL by reading the structure:
+The DACL comes back as `security.dacl.entries[]`, each carrying `sid`, `account`, `mask`,
+`rights[]` and the two booleans that decide whether a control code can be sent at all — `reads`
+and `writes`, from `FILE_READ_DATA` and `FILE_WRITE_DATA`.
 
-```jsonc
-execute { "command": "dt nt!_SECURITY_DESCRIPTOR_RELATIVE ffff8680fc6912a0" }  // Control 0x8004, Dacl +0x14
-execute { "command": "dt nt!_ACL ffff8680fc6912b4" }                            // 4 ACEs
-execute { "command": "db ffff8680fc6912b4 L5c" }                                // raw ACEs → parse
-```
+> **How this is derived**, and how it was done before the tool. `!sd` is **not** in the bundled
+> engine, so `device_object` surfaces the descriptor pointer and the structure is read by hand:
+>
+> ```jsonc
+> execute { "command": "dt nt!_SECURITY_DESCRIPTOR_RELATIVE ffff8680fc6912a0" }  // Control 0x8004, Dacl +0x14
+> execute { "command": "dt nt!_ACL ffff8680fc6912b4" }                            // 4 ACEs
+> execute { "command": "db ffff8680fc6912b4 L5c" }                                // raw ACEs → parse
+> ```
+>
+> `device_security` makes the same three reads as fields rather than as renderings, which is why
+> it can answer `reads`/`writes` where this section could only quote a hex mask.
 
 Parsed DACL:
 
@@ -142,6 +157,21 @@ asking for `GENERIC_READ` is itself access-denied.
 
 ## 6. Namespace gate
 
+The same call answers this, which is why it is one tool rather than two: whether a device is
+reachable from user mode is half of who may open it.
+
+```text
+  Reachable as:
+    \GLOBAL??\MountPointManager  -> \Device\MountPointManager
+```
+
+A global symbolic link → `CreateFile("\\.\MountPointManager")` resolves from any session. Not a
+barrier for normal users here.
+
+`link_search` is what makes an **empty** list mean something: `complete` says every entry of
+`\GLOBAL??` was examined and none of them reaches this device, while `partial` or `unavailable`
+says the search saw less than the directory. By hand it is one link at a time:
+
 ```jsonc
 execute { "command": "!object \\GLOBAL??\\MountPointManager" }
 ```
@@ -149,9 +179,6 @@ execute { "command": "!object \\GLOBAL??\\MountPointManager" }
 ```text
 SymbolicLink … Target String is '\Device\MountPointManager'
 ```
-
-A global symbolic link → `CreateFile("\\.\MountPointManager")` resolves from any session. Not a
-barrier for normal users here.
 
 ## 7. Dynamic confirmation
 
