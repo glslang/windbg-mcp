@@ -268,6 +268,8 @@ pub(crate) struct Layout {
     /// How wide a pointer is on this target, which is what a load of the IRP's stack location has
     /// to be to have loaded one.
     pointer: u32,
+    /// `Irp->IoStatus.Status`, which with the return register is where a refusal puts its status.
+    status_field: i64,
     /// The registers a `call` may return over, spelled as **this target's** decoder spells a full
     /// register.
     ///
@@ -294,6 +296,7 @@ impl Layout {
         output_length: 0x08,
         return_register: "rax",
         pointer: 8,
+        status_field: 0x30,
         volatile: &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"],
         irp_register: Some("rdx"),
     };
@@ -304,6 +307,7 @@ impl Layout {
         output_length: 0x04,
         return_register: "eax",
         pointer: 4,
+        status_field: 0x18,
         volatile: &["eax", "ecx", "edx"],
         irp_register: None,
     };
@@ -551,15 +555,19 @@ fn map_within(
     // **Asked once per block rather than once per case**: several codes share a landing --
     // `mountmgr` has one that six reach -- and following that block's tail jumps again for each of
     // them is work the target chose the size of.
-    let refusals: std::cell::RefCell<HashMap<usize, bool>> =
+    //
+    // The second half of that key is the jump-table rule above: whether a store is to the IRP's
+    // status field is a question about a register, so a case read with nothing believed gets a
+    // different answer from one read with the block's own.
+    let refusals: std::cell::RefCell<HashMap<(usize, bool), bool>> =
         std::cell::RefCell::new(HashMap::new());
-    let refuses_at = |at: usize| {
-        let known = refusals.borrow().get(&at).copied();
+    let refuses_at = |at: usize, blind: bool| {
+        let known = refusals.borrow().get(&(at, blind)).copied();
         if let Some(known) = known {
             return known;
         }
-        let answer = refuses_in(at, &graph, block, layout);
-        refusals.borrow_mut().insert(at, answer);
+        let answer = refuses_in(at, &graph, block, layout, &entry, blind);
+        refusals.borrow_mut().insert((at, blind), answer);
         answer
     };
     for case in &mut cases {
@@ -594,8 +602,13 @@ fn map_within(
         };
         let instructions = &block[graph.blocks[at].start..graph.blocks[at].end];
         case.handler = handler_in(instructions);
-        let refuses = refuses_at(at);
-        case.accepted = match (refuses, case.handler, error_status(instructions, layout)) {
+        let blind = case.recovered == Recovery::JumpTable;
+        let refuses = refuses_at(at, blind);
+        case.accepted = match (
+            refuses,
+            case.handler,
+            error_status(instructions, layout, &facts),
+        ) {
             (true, _, _) => Some(false),
             (false, Some(_), false) => Some(true),
             _ => None,
@@ -609,7 +622,7 @@ fn map_within(
             index_of
                 .get(&address)
                 .and_then(|&at| graph.holding(at))
-                .is_some_and(&refuses_at)
+                .is_some_and(|at| refuses_at(at, false))
         });
         case.in_size = input;
         case.out_size = output;
@@ -843,6 +856,19 @@ fn simulate(
             Condition::UnsignedAbove | Condition::UnsignedAboveOrEqual
         )
         && let (Some((register, offset, shift)), Some(limit)) = (was.index.clone(), was.bound)
+        // **A bound is about the register's value from here on, so the register has to still hold
+        // what was compared.** The pending compare deliberately outlives a flag-neutral
+        // instruction between the `cmp` and its branch -- that is where a compiler puts the case's
+        // setup -- but `cmp eax,2` / `mov eax,ecx` / `ja default` leaves a bound describing a value
+        // `eax` no longer has, and a table indexed by `eax` is then read to a limit nothing
+        // checked. The *case* built from the same compare needs no such thing: a comparison that
+        // already happened is what the branch reads, whatever the register holds by then.
+        && facts.registers.get(&register)
+            == Some(&Value::Code {
+                offset,
+                shift,
+                proved: was.proved,
+            })
         && let Some(limit) = match condition {
             Condition::UnsignedAbove => Some(limit),
             _ => limit.checked_sub(1),
@@ -1198,6 +1224,14 @@ fn source_value(
             // reaches a register.
             if instruction.effect == Effect::LoadAddress {
                 return memory.address.map(Value::Address);
+            }
+            // **A field is at a displacement, not at a displacement plus whatever is in a
+            // register.** `mov eax,[rbx+rcx*4+18h]` is an array element off a structure this walk
+            // happens to know, and reading it as `IoControlCode` publishes an array's contents as
+            // proved control codes. Every pattern below names a fixed field, so none of them
+            // admits an index.
+            if memory.index.is_some() {
+                return None;
             }
             let base = memory.base.as_ref().map(|base| base.full.clone());
             let held = base.as_ref().and_then(|base| facts.registers.get(base));
@@ -1580,9 +1614,9 @@ fn follow_table(
 /// request. So only those two destinations count, and a later write of the return register with
 /// anything else takes the finding back -- a block that loads a status and then returns something
 /// derived from a call is not refusing here.
-fn error_status(instructions: &[Instruction], layout: Layout) -> bool {
+fn error_status(instructions: &[Instruction], layout: Layout, facts: &Facts) -> bool {
     instructions.iter().fold(false, |status, instruction| {
-        status_after(status, instruction, layout)
+        status_after(status, instruction, layout, facts)
     })
 }
 
@@ -1591,16 +1625,28 @@ fn error_status(instructions: &[Instruction], layout: Layout) -> bool {
 /// A fold rather than a rescan, because [`failure_block`] needs the answer **at every position**
 /// and asking [`error_status`] for each prefix makes one refusal check cost the square of the
 /// block's length -- which a malformed routine chooses.
-fn status_after(status: bool, instruction: &Instruction, layout: Layout) -> bool {
+fn status_after(status: bool, instruction: &Instruction, layout: Layout, facts: &Facts) -> bool {
     if instruction.effect != Effect::Move {
         return status;
     }
     let returned = match instruction.operands.first() {
         // The return register, by the full-width name the decoder gives it.
         Some(Operand::Register(register)) => register.full == layout.return_register,
-        // A store: the IRP's status field is the other place a refusal writes one, and its
-        // displacement is a question about a structure this does not otherwise read.
-        Some(Operand::Memory(_)) => true,
+        // Or `Irp->IoStatus.Status`, which is the other place a refusal writes one -- and **that
+        // field**, not any store. A case that puts an error-looking constant in a stack local or a
+        // diagnostic structure and then returns would otherwise be read as refusing the request:
+        // the case comes back rejected and its handler is taken away, which is a wrong answer
+        // about a code the driver accepts. So the destination has to be a dword at that
+        // displacement off a register this walk watched the IRP reach.
+        Some(Operand::Memory(memory)) => {
+            memory.index.is_none()
+                && memory.size == Some(FIELD_WIDTH)
+                && memory.displacement == layout.status_field
+                && memory
+                    .base
+                    .as_ref()
+                    .is_some_and(|base| facts.registers.get(&base.full) == Some(&Value::Irp))
+        }
         _ => false,
     };
     if !returned {
@@ -1624,12 +1670,12 @@ fn status_after(status: bool, instruction: &Instruction, layout: Layout) -> bool
 ///
 /// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
 /// here, and [`refuses_in`] is what follows that jump.
-fn failure_block(instructions: &[Instruction], layout: Layout) -> bool {
+fn failure_block(instructions: &[Instruction], layout: Layout, facts: &Facts) -> bool {
     let mut status = false;
     for instruction in instructions {
         // What the block has established **so far**, which is what says whether the call it is
         // about to make is a completion on the way out or a block doing something else.
-        status = status_after(status, instruction, layout);
+        status = status_after(status, instruction, layout, facts);
         match instruction.flow {
             Flow::Return => return status,
             // A completion call after the status is part of the rejection; one before it is a
@@ -1650,12 +1696,27 @@ fn failure_block(instructions: &[Instruction], layout: Layout) -> bool {
 /// invalid-request epilogue, and reading it as a handler presents the error tail as this code's
 /// routine. The graph already has that edge, so following it is a lookup rather than a guess --
 /// bounded to a few hops, since a chain longer than that is not an epilogue.
-fn refuses_in(index: usize, graph: &cfg::Graph, listing: &[Instruction], layout: Layout) -> bool {
+fn refuses_in(
+    index: usize,
+    graph: &cfg::Graph,
+    listing: &[Instruction],
+    layout: Layout,
+    entry: &[Option<Facts>],
+    blind: bool,
+) -> bool {
     let mut at = index;
-    for _ in 0..3 {
+    for hop in 0..3 {
         let block = &graph.blocks[at];
         let instructions = &listing[block.start..block.end];
-        if failure_block(instructions, layout) {
+        // The **first** block is the one a case landed in, and a case the table selected landed
+        // there along an edge this graph does not have -- so it is read with nothing believed,
+        // exactly as its sizes are. Every hop after that is a tail jump the graph *does* carry, so
+        // those blocks are read with what reached them.
+        let facts = match blind && hop == 0 {
+            true => Facts::default(),
+            false => entry.get(at).cloned().flatten().unwrap_or_default(),
+        };
+        if failure_block(instructions, layout, &facts) {
             return true;
         }
         // Only an unconditional tail jump is followed: a block that decides something is deciding
@@ -3310,54 +3371,77 @@ mod tests {
         assert_eq!(served.get(), 0, "nothing was read");
     }
 
-    /// A block that completes the IRP with an error status is a **rejection**, call and all.
+    /// A block that puts an error status in the **IRP** and completes the request is refusing it.
     ///
-    /// This is the ordinary shape of one: the status goes into the IRP, a completion routine is
-    /// called, and the routine returns. A scan that stopped at the first call would see a block
-    /// that calls something, report `accepted: true`, and publish the completion routine as this
-    /// code's handler — which is a reader sent to test a code the driver refuses and a name that
-    /// is not the handler's.
+    /// That is the ordinary rejection: `mov dword ptr [rbx+30h],0C0000010h` into
+    /// `Irp->IoStatus.Status`, a call to the completion routine, and out -- so a call alone is
+    /// never read as acceptance, and the routine it calls is not reported as this code's handler.
+    ///
+    /// **That field, though, and not any store.** A case that puts an error-looking constant in a
+    /// stack local or a diagnostic structure and then returns would otherwise come back rejected
+    /// with its handler taken away, which is a wrong answer about a code the driver accepts. The
+    /// three halves here differ only in where the constant goes: the status field off a register
+    /// this walk watched the IRP reach, the `Information` beside it, and a stack slot at the same
+    /// displacement off something else.
     #[test]
     fn a_block_that_completes_with_an_error_status_is_a_rejection() {
-        let mut block = prologue(DISPATCH);
-        block.extend([
-            insn(
-                DISPATCH + 8,
-                "cmp",
-                vec![reg("r13d"), imm(0x222003)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0xe,
-                "je",
-                Vec::new(),
-                Flow::Branch(Some(DISPATCH + 0x40)),
-            ),
-            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
-            // `mov dword ptr [rbx+30h],0C0000010h` -- the status into the IRP.
-            insn(
-                DISPATCH + 0x40,
-                "mov",
-                vec![mem("rbx", 0x30), imm(0xc000_0010)],
-                Flow::Fallthrough,
-            ),
-            insn(
-                DISPATCH + 0x47,
-                "call",
-                vec![Operand::Target(0x7000)],
-                Flow::Call(Some(0x7000)),
-            ),
-            insn(DISPATCH + 0x4c, "ret", Vec::new(), Flow::Return),
-        ]);
+        let stored = |destination: Operand| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                // The IRP into a register the case block still has it in, which is what a
+                // dispatch routine's prologue does.
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("rbx"), reg("rdx")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x40,
+                    "mov",
+                    vec![destination, imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x47,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(DISPATCH + 0x4c, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            (found.cases[0].accepted, found.cases[0].handler)
+        };
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
-
-        assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
-        assert_eq!(found.cases[0].accepted, Some(false), "{:?}", found.cases[0]);
         assert_eq!(
-            found.cases[0].handler, None,
-            "the completion routine is not this code's handler: {:?}",
-            found.cases[0]
+            stored(mem("rbx", 0x30)),
+            (Some(false), None),
+            "the status into the IRP and a completion call is a rejection, and the routine it              completes through is not this code's handler"
+        );
+        assert_eq!(
+            stored(mem("rbx", 0x38)),
+            (Some(true), Some(0x7000)),
+            "`Information` is not `Status`, so this is a case that reaches a routine"
+        );
+        assert_eq!(
+            stored(mem("rsp", 0x30)),
+            (Some(true), Some(0x7000)),
+            "and neither is a stack slot at the same displacement off something else"
         );
     }
 
@@ -4772,6 +4856,193 @@ mod tests {
             vec![true, true, false],
             "and the clock stopped the per-case pass at the last of them: {:?}",
             found.cases
+        );
+    }
+
+    /// A bound is about the register's value **from here on**, so the register has to still hold
+    /// what was compared.
+    ///
+    /// The pending compare deliberately outlives a flag-neutral instruction between the `cmp` and
+    /// its branch, because that is where a compiler puts the case's setup. `cmp eax,1` /
+    /// `mov eax,ecx` / `ja default` uses that to leave a bound describing a value `eax` no longer
+    /// has, and the table indexed by `eax` is then read to a limit nothing checked. One
+    /// instruction is the whole difference between the two halves here.
+    ///
+    /// The *case* built from such a compare is untouched, and should be: a comparison that already
+    /// happened is what the branch reads, whatever the register holds by then.
+    #[test]
+    fn a_bound_needs_the_register_to_still_hold_what_was_compared() {
+        const TABLE: i64 = 0x9000;
+        let overwritten = |moved: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if moved {
+                // Writes no flags, so the compare still stands -- and `eax` is somebody else's.
+                block.push(insn(
+                    DISPATCH + 0x14,
+                    "mov",
+                    vec![reg("eax"), reg("ecx")],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0x16,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1c,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x23,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x2a,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x2d, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
+        let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
+            (at == table_at && len == 8).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let kept = map(
+            DISPATCH,
+            &overwritten(false),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            kept.cases.len(),
+            2,
+            "the register still holds the index, so this is the switch: {:?}",
+            kept.cases
+        );
+
+        served.set(0);
+        let lost = map(
+            DISPATCH,
+            &overwritten(true),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+
+        assert!(
+            lost.cases.is_empty(),
+            "the bound is about a value `eax` no longer has: {:?}",
+            lost.cases
+        );
+        assert_eq!(lost.unresolved, vec![DISPATCH + 0x2d]);
+        assert_eq!(served.get(), 0, "and the table was not read");
+    }
+
+    /// An **indexed** access is not a fixed structure field.
+    ///
+    /// `mov r13d,[rax+rcx*4+18h]` is an array element off a structure this walk happens to know,
+    /// and reading it as `IoControlCode` publishes that array's contents as proved control codes.
+    /// Every pattern the chain recognises names a field at a displacement, so none of them admits
+    /// an index -- and the same access without one is the control code, which is what makes this
+    /// about the index.
+    #[test]
+    fn an_indexed_access_is_not_a_structure_field() {
+        let read_with = |index: Option<&str>| {
+            let mut block = vec![insn(
+                DISPATCH,
+                "mov",
+                vec![reg("rax"), pointer("rdx", 0xb8)],
+                Flow::Fallthrough,
+            )];
+            let source = match index {
+                Some(index) => Operand::Memory(MemoryOperand {
+                    size: Some(4),
+                    segment: None,
+                    base: Some(named("rax")),
+                    index: Some(named(index)),
+                    scale: 4,
+                    displacement: 0x18,
+                    address: None,
+                }),
+                None => mem("rax", 0x18),
+            };
+            block.extend([
+                insn(
+                    DISPATCH + 4,
+                    "mov",
+                    vec![reg("r13d"), source],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        let element = read_with(Some("rcx"));
+        assert!(
+            element.cases.is_empty() && !element.code_proved,
+            "an array element off the stack location is not the control code: {:?}",
+            element.cases
+        );
+
+        let field = read_with(None);
+        assert_eq!(
+            field
+                .cases
+                .iter()
+                .map(|case| (case.code, case.proved))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, true)],
+            "and the field itself is: {:?}",
+            field.cases
         );
     }
 
