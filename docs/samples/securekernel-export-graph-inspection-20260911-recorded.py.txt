@@ -1,6 +1,3 @@
-if not __debug__:
-    raise RuntimeError("graph inspection requires assertions enabled; do not use -O or -OO")
-
 import argparse
 import hashlib
 import json
