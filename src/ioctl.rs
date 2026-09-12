@@ -668,7 +668,11 @@ fn map_within(
         case.accepted = match (
             refuses,
             case.handler,
-            error_status(instructions, layout, &facts),
+            // A jump target this listing does not hold is a routine of its own, and the block
+            // reaching it returns whatever that routine does.
+            error_status(instructions, layout, &facts, &|target| {
+                !index_of.contains_key(&target)
+            }),
         ) {
             (true, _, _) => Some(false),
             (false, Some(_), false) => Some(true),
@@ -1856,11 +1860,29 @@ fn follow_table(
 /// request. So only those two destinations count, and a later write of the return register with
 /// anything else takes the finding back -- a block that loads a status and then returns something
 /// derived from a call is not refusing here.
-fn error_status(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> bool {
+fn error_status(
+    instructions: &[Instruction],
+    layout: Layout,
+    arrived: &Facts,
+    leaves: &impl Fn(u64) -> bool,
+) -> bool {
     let mut facts = arrived.clone();
     let mut traced = false;
     for instruction in instructions {
         update(&mut facts, instruction, layout, &mut traced);
+        // **A tail jump out of the routine hands the request on exactly as a call does**, and what
+        // the routine returns is then the callee's. A dispatcher that loads a default error before
+        // its compare chain and reaches a case through `jmp handler` accepts that code, and
+        // reading the status the case arrived with as its answer reports it undecided instead. A
+        // jump that stays *inside* the routine is one path continuing -- `jmp common_ret` is how a
+        // rejection is written across two blocks -- and that one carries, which is
+        // [`refuses_in`]'s question. `Irp->IoStatus.Status` survives both, for the reason it
+        // survives a call: a callee is free to leave it alone.
+        if let Flow::Jmp(Some(target)) = instruction.flow
+            && leaves(target)
+        {
+            facts.status.returned = false;
+        }
     }
     facts.status.refusing()
 }
@@ -1889,15 +1911,25 @@ fn status_after(
         return status;
     }
     // Which of the two places a dispatch routine's status lives does this write?
-    let writes_status = match instruction.operands.first() {
-        // The return register, by the full-width name the decoder gives it.
-        Some(Operand::Register(register)) if register.full == layout.return_register => Some(false),
-        // Or `Irp->IoStatus.Status`, which is the other place a refusal writes one -- and **that
-        // field**, not any store. A case that puts an error-looking constant in a stack local or a
-        // diagnostic structure and then returns would otherwise be read as refusing the request:
-        // the case comes back rejected and its handler is taken away, which is a wrong answer
-        // about a code the driver accepts. So the destination has to be a dword at that
-        // displacement off a register this walk watched the IRP reach.
+    //
+    // **The return register is the decoder's answer and not the first operand's.** `mul ecx`
+    // writes `rax` and names it nowhere; `xchg r13d,eax` writes it as its *second* operand. A rule
+    // reading only the destination keeps a status in a register the instruction overwrote, and the
+    // block then reads as refusing a code the driver accepts, with its handler taken away. A
+    // status **is** a register fact, so it dies where the register does -- the rule [`update`]
+    // applies to every other fact it keeps.
+    let returns = instruction
+        .writes
+        .iter()
+        .any(|written| written.full == layout.return_register);
+    // Or `Irp->IoStatus.Status`, which is the other place a refusal writes one -- and **that
+    // field**, not any store. A case that puts an error-looking constant in a stack local or a
+    // diagnostic structure and then returns would otherwise be read as refusing the request: the
+    // case comes back rejected and its handler is taken away, which is a wrong answer about a code
+    // the driver accepts. So the destination has to be a dword at that displacement off a register
+    // this walk watched the IRP reach.
+    let stores = matches!(
+        instruction.operands.first(),
         Some(Operand::Memory(memory))
             if memory.index.is_none()
                 && memory.size == Some(FIELD_WIDTH)
@@ -1905,15 +1937,11 @@ fn status_after(
                 && memory
                     .base
                     .as_ref()
-                    .is_some_and(|base| facts.registers.get(&base.full) == Some(&Value::Irp)) =>
-        {
-            Some(true)
-        }
-        _ => None,
-    };
-    let Some(into_the_irp) = writes_status else {
+                    .is_some_and(|base| facts.registers.get(&base.full) == Some(&Value::Irp))
+    );
+    if !returns && !stores {
         return status;
-    };
+    }
     // **Every write to it replaces what is there, and only one shape puts a refusal there.**
     // `mov eax,0C0000010h` / `xor eax,eax` / `ret` returns success, and reading the load alone
     // reports that case as one the driver refuses. So anything that is not a move of a literal
@@ -1943,14 +1971,23 @@ fn status_after(
             // is there now is no longer the refusal that was loaded.
             None => false,
         };
-    match into_the_irp {
-        true => Status {
-            irp: refusal,
-            ..status
+    // **What is in the return register now**, which this pass can say only for a write it
+    // modelled: a destination it recognised, taking something the arms above could read. An
+    // implicit write names nothing for them, so what it left is neither a refusal nor the status
+    // that was there -- and *gone* is the answer that cannot invent one.
+    let modelled = matches!(
+        instruction.operands.first(),
+        Some(Operand::Register(register)) if register.full == layout.return_register
+    );
+    Status {
+        returned: match (returns, modelled) {
+            (false, _) => status.returned,
+            (true, true) => refusal,
+            (true, false) => false,
         },
-        false => Status {
-            returned: refusal,
-            ..status
+        irp: match stores {
+            true => refusal,
+            false => status.irp,
         },
     }
 }
@@ -2547,18 +2584,24 @@ mod tests {
             effect,
             condition,
             writes,
-            writes_flags: matches!(
-                effect,
-                Effect::Compare
-                    | Effect::Test
-                    | Effect::Add
-                    | Effect::Subtract
-                    | Effect::ShiftLeft
-                    | Effect::ShiftRight
-                    | Effect::BitAnd
-                    | Effect::BitOr
-                    | Effect::BitXor
-            ),
+            // **A multiply writes the flags too**, and it is filed here under `Other` -- so a
+            // fixture deriving this from the effect alone says the opposite of what the decoder
+            // says (`rflags_written()`, which for `mul` is the carry and the overflow). A test
+            // putting one between a compare and its branch would then be pinning a rule the real
+            // answer does not reach.
+            writes_flags: matches!(mnemonic, "mul" | "div")
+                || matches!(
+                    effect,
+                    Effect::Compare
+                        | Effect::Test
+                        | Effect::Add
+                        | Effect::Subtract
+                        | Effect::ShiftLeft
+                        | Effect::ShiftRight
+                        | Effect::BitAnd
+                        | Effect::BitOr
+                        | Effect::BitXor
+                ),
         }
     }
 
@@ -7868,6 +7911,157 @@ mod tests {
             (Some(false), None),
             "as does one put back after the call, which is how a driver returns what it completed \
              with"
+        );
+    }
+
+    /// A status in the return register dies where the **register** does, and the decoder is what
+    /// says when that is.
+    ///
+    /// `mul ecx` writes `rax` and names it nowhere; `xchg r13d,eax` writes it as its *second*
+    /// operand. Reading the destination alone leaves the status standing in a register the
+    /// instruction overwrote, and a block that goes on to return something computed is then read
+    /// as refusing the code -- which takes the handler off a case the driver accepts. The same
+    /// write set the registers are forgotten by answers this, because a status is one of them.
+    #[test]
+    fn a_status_in_the_return_register_dies_with_the_register() {
+        #[derive(Clone, Copy)]
+        enum Clobber {
+            /// Nothing touches it, so the load is what the routine returns.
+            None,
+            /// Named, but as the second operand rather than the destination.
+            Named,
+            /// Written and named nowhere at all.
+            Implicit,
+        }
+        let refusing = |clobber: Clobber| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+                // The case handles the code, and then decides what to return.
+                insn(
+                    DISPATCH + 0x40,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(
+                    DISPATCH + 0x45,
+                    "mov",
+                    vec![reg("eax"), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            match clobber {
+                Clobber::None => {}
+                Clobber::Named => block.push(insn(
+                    DISPATCH + 0x4a,
+                    "xchg",
+                    vec![reg("r13d"), reg("eax")],
+                    Flow::Fallthrough,
+                )),
+                Clobber::Implicit => block.push(insn(
+                    DISPATCH + 0x4a,
+                    "mul",
+                    vec![reg("ecx")],
+                    Flow::Fallthrough,
+                )),
+            }
+            block.push(insn(DISPATCH + 0x4d, "ret", Vec::new(), Flow::Return));
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            (found.cases[0].accepted, found.cases[0].handler)
+        };
+
+        assert_eq!(
+            refusing(Clobber::None),
+            (Some(false), None),
+            "the status it loaded after the call is the one it returns"
+        );
+        assert_eq!(
+            refusing(Clobber::Named),
+            (Some(true), Some(0x7000)),
+            "an exchange returns the other register, and names this one second"
+        );
+        assert_eq!(
+            refusing(Clobber::Implicit),
+            (Some(true), Some(0x7000)),
+            "and a multiply returns its product, naming neither register it wrote"
+        );
+    }
+
+    /// A status in the return register does not survive a tail jump **out of the routine**, and
+    /// does survive one that stays inside it.
+    ///
+    /// They are not the same instruction doing the same thing. `jmp handler` ends this routine and
+    /// the callee supplies its return value, exactly as a call does -- so a dispatcher that loads
+    /// a default error before its compare chain and reaches a case that way accepts the code, and
+    /// reading the arrived status as its answer reports it undecided. `jmp common_ret` is one path
+    /// continuing, and the rejection written across those two blocks is lost if the status does
+    /// not go with it.
+    #[test]
+    fn a_status_does_not_survive_a_tail_jump_out_of_the_routine() {
+        const CASE: u64 = DISPATCH + 0x40;
+        const SHARED: u64 = DISPATCH + 0x50;
+        let refusing = |inside: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                // The default the routine returns for anything it does not recognise, loaded
+                // before it has recognised anything.
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x14, "je", Vec::new(), Flow::Branch(Some(CASE))),
+                insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
+                // The case, which is one jump.
+                insn(
+                    CASE,
+                    "jmp",
+                    vec![Operand::Target(match inside {
+                        true => SHARED,
+                        false => 0x7000,
+                    })],
+                    Flow::Jmp(Some(match inside {
+                        true => SHARED,
+                        false => 0x7000,
+                    })),
+                ),
+                insn(SHARED, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            (found.cases[0].accepted, found.cases[0].handler)
+        };
+
+        assert_eq!(
+            refusing(false),
+            (Some(true), Some(0x7000)),
+            "the routine it jumps to returns what it likes, so the default is not the answer"
+        );
+        assert_eq!(
+            refusing(true),
+            (None, Some(SHARED)),
+            "and a jump that lands in this listing carries what the case established"
         );
     }
 
