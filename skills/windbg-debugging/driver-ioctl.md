@@ -19,8 +19,8 @@ caller token. An IOCTL is only useful to a user if it passes all four:
 
 | Gate | Question | How to answer |
 |------|----------|---------------|
-| **Openable** | Can this token open the device at all? | `device_object` → `SecurityDescriptor` pointer + `FILE_DEVICE_SECURE_OPEN` (decode the DACL with `!sd <ptr>` where that extension is present) |
-| **Namespace-visible** | Does `CreateFile(\\.\Foo)` resolve in the caller's session? | symbolic-link scope (`\GLOBAL??\Foo` vs. session-local) via `execute` → `!object \GLOBAL??` |
+| **Openable** | Can this token open the device at all? | `device_security` → the DACL as principals and access masks, with `secure_open` beside it. On a dump, where there is no object namespace: `device_object` for the `SecurityDescriptor` pointer, then `!sd <ptr>` where that extension is present |
+| **Namespace-visible** | Does `CreateFile(\\.\Foo)` resolve in the caller's session? | the same `device_security` call: its `links[]` are the `\GLOBAL??` links that reach this device, and `link_search` says whether the whole directory was seen |
 | **Deliverable** | Does the I/O manager forward the IRP to the driver? | `decode_ioctl` → `RequiredAccess` (bits 14–15) checked against the handle's *granted* access **before** the IRP reaches the driver |
 | **Handled** | Does the driver do something, or reject it? | `irp_stack` at the break + `Irp->IoStatus.Status` on return (a `default:` case returns `STATUS_INVALID_DEVICE_REQUEST` / `STATUS_NOT_SUPPORTED`) |
 
@@ -56,11 +56,15 @@ reads.
    `cmp`/case constant is a candidate IOCTL.
 3. **Decode each candidate** with `decode_ioctl` to get its method + required access (and the
    `METHOD_NEITHER`/`FILE_ANY_ACCESS` flags).
-4. **Device surface.** `device_object { "device": "\\Device\\MyDevice" }` (`!devobj`) for the
-   device type, characteristics, and `SecurityDescriptor` pointer (the *openable* gate). Where the
-   `!sd` extension is present, `execute { "command": "!sd <SecurityDescriptor> 1" }` decodes the
-   DACL; it is not in the bundled engine, so otherwise inspect the SD by address. Inspect the
-   symbolic link with `execute { "command": "!object \\GLOBAL??" }` for the *namespace* gate.
+4. **Device surface.** `device_security { "device": "\\Device\\MyDevice" }` answers the
+   *openable* and *namespace* gates together: the DACL as principals and masks, `secure_open`,
+   and the `\GLOBAL??` links that reach the device. Each ACE carries `reads`/`writes`, which is
+   what the *deliverable* gate below is checked against. It needs a **live kernel** -- a dump
+   carries no object namespace. On a dump, fall back to the hand method: `device_object` for the
+   device type, characteristics and `SecurityDescriptor` pointer, then
+   `execute { "command": "!sd <SecurityDescriptor> 1" }` where that extension is present (it is
+   not in the bundled engine, so otherwise inspect the SD by address), and
+   `execute { "command": "!object \\GLOBAL??" }` for the symbolic link.
 
 > **Symbols — ask for the PDB when it exists.** Production/third-party drivers usually ship no
 > PDB, so `module!Dispatch` won't resolve and you work **address-based** (rebase static RVAs to the
