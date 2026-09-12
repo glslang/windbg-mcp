@@ -481,6 +481,27 @@ says nothing about any of them. Run the tier on a host with a bundled engine bef
 `analysis` claim is covered. The missing PDB does cost something, but not the module: both
 buckets end `!unknown_function` whichever way the table above falls.
 
+**`ioctl_map` against a real driver, and against one this build cannot decode.** The x64 driver
+crash carries `mountmgr`, whose control codes
+[`driver-ioctl-walkthrough.md`](driver-ioctl-walkthrough.md) recovered by hand before there was a
+tool — so the map has a published oracle: 45 case records over 23 codes, every one
+`METHOD_BUFFERED` and device type `0x6d`, two 81-entry switch tables followed to 13 codes each, and
+nothing left unresolved. A code compared in two places is two records, which is why there are more
+of the first figure than the second. Each of those numbers moves in a direction a reader would
+believe if the recovery breaks — a table read at a guessed length gives *more* codes, a chain that
+loses its `sub` rebase gives different ones, a graph missing an edge gives fewer — which is what
+makes this the oracle for any change to the walk rather than a demonstration of it. **A kernel
+minidump carries no driver pages**, so the bytes come from the image file the symbol server
+supplies and the engine caches; a host that cannot disassemble the routine stands the test down
+rather than asserting an empty map, and the probe for that is `disassemble` — a different tool
+reading the same bytes, so a regression in the one under test cannot be what silences it.
+
+The ARM64 driver crash is the negative, and it is asserted rather than skipped: an x64 engine reads
+that dump perfectly well, so the map has to be **refused**, naming the machine it found, rather
+than answered. A walk over instructions this build cannot decode finds no compare and no switch,
+and "this driver accepts no control codes" is a real driver's answer — a reader has no way to tell
+the two apart.
+
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module
 records rather than as the third token of a rendered row, which is what used to break on a column

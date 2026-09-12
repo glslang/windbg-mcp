@@ -9532,6 +9532,192 @@ fn assert_driver_crash_names_its_driver(sample: &DriverCrashSample) {
     );
 }
 
+/// `ioctl_map` against a **real driver**, whose answer is published rather than mine.
+///
+/// `docs/driver-ioctl-walkthrough.md` recovered `mountmgr`'s control codes by hand, from this
+/// dump, before there was a tool: three access tiers out of a compare chain and two dense switch
+/// tables. Every figure below is one the walk can get wrong in a direction a reader would believe
+/// — a table read at a guessed length gives *more* codes, a chain that loses the `sub` rebase
+/// gives different ones, and a graph missing an edge gives fewer — so this is the oracle for every
+/// change to the recovery, and hand-running it was how each round of this work was checked.
+///
+/// **A kernel minidump carries no driver pages**, so the bytes come from the image file, which the
+/// symbol server supplies and the engine caches. A host that cannot read `mountmgr`'s code stands
+/// this down rather than asserting an empty map — and the probe is `disassemble`, a different tool
+/// reading the same bytes, so a regression in the tool under test cannot be what silences it.
+#[test]
+fn an_ioctl_map_of_a_driver_in_a_dump_is_its_chain_and_both_its_tables() {
+    if target_tier().is_none() {
+        return;
+    }
+    if !std::path::Path::new(DRIVER_CRASH_DUMP).exists() {
+        skip(&format!("sample dump not found at {DRIVER_CRASH_DUMP}"));
+        return;
+    }
+    const DISPATCH: &str = "mountmgr!MountMgrDeviceControl";
+    let mut server = Server::started();
+    let opened = server.call_tool(
+        "open_dump",
+        json!({ "path": DRIVER_CRASH_DUMP }),
+        TARGET_STEP,
+    );
+    assert_no_error(&opened, "open_dump");
+    let session_id = session_id_of(&opened["result"]);
+
+    // Can this host read the driver's code at all? Asked of another tool, and of the first
+    // instruction rather than of the symbol: a routine whose pages are missing disassembles as
+    // `???`, which is not a prologue.
+    let probe = server.call_tool(
+        "disassemble",
+        json!({ "session_id": session_id, "address": DISPATCH, "count": 1 }),
+        TARGET_STEP,
+    );
+    let readable = !is_tool_error(&probe)
+        && probe["result"]["structuredContent"]["instructions"]
+            .as_array()
+            .and_then(|rows| rows.first().cloned())
+            .and_then(|row| row["text"].as_str().map(|t| !t.contains('?')))
+            .unwrap_or(false);
+    if !readable {
+        skip(
+            "this host could not disassemble `mountmgr`, so the driver's own bytes are not here \
+             to recover codes from: a kernel minidump carries no driver pages and the image file \
+             was not served. The map would be empty for want of code rather than for want of \
+             codes, which is not something to assert.",
+        );
+        return;
+    }
+
+    let map = server.tool_data(
+        "ioctl_map",
+        json!({ "session_id": session_id, "dispatch": DISPATCH }),
+        TARGET_STEP,
+    );
+
+    assert_eq!(
+        map["code_proved"], true,
+        "the code came through the IRP's stack location, which is what makes these `mountmgr`'s \
+         control codes rather than some other structure's `+0x18`: {map}"
+    );
+    let cases = map["cases"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`ioctl_map` answered without cases: {map}"));
+    assert_eq!(
+        map["case_count"],
+        cases.len(),
+        "nothing was capped, so the count and the list agree: {map}"
+    );
+
+    // A case per **site**: this driver compares several codes in two places, so there are more
+    // records than codes and both figures are worth pinning.
+    let codes: std::collections::BTreeSet<&str> = cases
+        .iter()
+        .filter_map(|case| case["code"].as_str())
+        .collect();
+    assert_eq!(
+        (cases.len(), codes.len()),
+        (45, 23),
+        "45 records over 23 codes is what the walkthrough publishes: {codes:?}"
+    );
+    for tier in ["0x006d0008", "0x006d4020", "0x006dc004", "0x006dc054"] {
+        assert!(
+            codes.contains(tier),
+            "the walkthrough's own example codes are in the map: {codes:?}"
+        );
+    }
+    assert!(
+        cases.iter().all(|case| case["method"] == "buffered"),
+        "every one of this driver's codes is METHOD_BUFFERED: {map}"
+    );
+    assert!(
+        cases.iter().all(|case| case["device_type"] == 0x6d),
+        "and every one is device type 0x6d: {map}"
+    );
+
+    // The two dense switches, each covering its whole index range with the unused slots going to
+    // the default — which is why 81 entries are 13 codes and not 81.
+    let tables = map["tables"]
+        .as_array()
+        .unwrap_or_else(|| panic!("`ioctl_map` answered without tables: {map}"));
+    assert_eq!(
+        tables
+            .iter()
+            .map(|table| (table["entries"].clone(), table["followed"].clone()))
+            .collect::<Vec<_>>(),
+        vec![(json!(81), json!(13)), (json!(81), json!(13))],
+        "two 81-entry tables, 13 codes each: {map}"
+    );
+    // Absent or empty: an empty list is left out of the payload rather than serialised.
+    assert!(
+        map["unresolved"]
+            .as_array()
+            .is_none_or(|rows| rows.is_empty()),
+        "nothing here is a lower bound: every transfer this routine makes was followed: {map}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
+/// An architecture this build cannot decode is **refused**, not answered.
+///
+/// The ARM64 driver crash is the fixture, opened on whatever host runs this: an x64 engine reads
+/// an ARM64 kernel dump perfectly well, which is exactly what makes the failure available. A walk
+/// over instructions it cannot decode finds no compare and no switch, and the honest answer to
+/// that is not a driver that accepts no control codes — that is a real driver's map, and a reader
+/// has no way to tell the two apart.
+#[test]
+fn an_ioctl_map_of_an_architecture_this_build_cannot_decode_is_refused() {
+    if target_tier().is_none() {
+        return;
+    }
+    if !std::path::Path::new(ARM64_DRIVER_CRASH_DUMP).exists() {
+        skip(&format!(
+            "sample dump not found at {ARM64_DRIVER_CRASH_DUMP}"
+        ));
+        return;
+    }
+    let mut server = Server::started();
+    let opened = server.call_tool(
+        "open_dump",
+        json!({ "path": ARM64_DRIVER_CRASH_DUMP }),
+        TARGET_STEP,
+    );
+    assert_no_error(&opened, "open_dump");
+    let session_id = session_id_of(&opened["result"]);
+
+    let response = server.call_tool(
+        "ioctl_map",
+        json!({ "session_id": session_id, "dispatch": "HEVD!IrpDeviceIoCtlHandler" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "ioctl_map on an ARM64 target");
+    assert!(
+        is_tool_error(&response),
+        "a target this build cannot decode has to be refused rather than mapped: {response}"
+    );
+    let data = &response["result"]["structuredContent"];
+    assert_eq!(
+        data["status"], "error",
+        "the refusal carries structured content, as the schema promises: {response}"
+    );
+    let message = data["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("0xaa64"),
+        "and says which machine it found, so the refusal is about this target rather than about \
+         the tool: {response}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
 /// `debug_batch` end to end against a real engine: a batch that commits, and one that fails an
 /// assertion — with the same `always` block on both.
 ///
