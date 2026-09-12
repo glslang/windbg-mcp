@@ -582,6 +582,12 @@ fn map_within(
         refusals.borrow_mut().insert((from, blind), answer);
         answer
     };
+    // **Every field on a case that is listed is an answer.** `handler`, `accepted` and the sizes
+    // are absent when the block gave no evidence for them, so a case this loop never reached would
+    // say the same thing about a block nobody read -- indistinguishable, and the more misleading
+    // of the two because the codes around it *were* read. So a stop here ends the list where it
+    // ends the work, exactly as a bound does, and `case_count` stays exact over both.
+    let mut enriched = 0usize;
     for case in &mut cases {
         // Polled here as well as in the two passes above: this loop is bounded by the case list,
         // which the target decides the length of, and a caller that has gone should not be waited
@@ -593,6 +599,7 @@ fn map_within(
             halted = Some(why);
             break;
         }
+        enriched += 1;
         // **Read from where it lands, not from where its block begins.** A landing is a block's
         // first instruction only when some *edge* goes there, and a jump table's does not -- so
         // two entries into one shared tail both sit inside a block that starts above them, and
@@ -646,6 +653,7 @@ fn map_within(
         case.in_size = input;
         case.out_size = output;
     }
+    cases.truncate(enriched);
 
     Map {
         dispatch,
@@ -687,6 +695,10 @@ struct Run {
     table: Option<Resolved>,
     /// An indirect transfer this block ends in that was **not** resolved.
     unresolved: Option<u64>,
+    /// Whether that transfer was left unresolved by a **bound** rather than by a shape this walk
+    /// does not read. Without it the answer says no bound ended anything early while a table
+    /// larger than [`MAX_TABLE_ENTRIES`] is exactly why the switch is in `unresolved`.
+    capped: bool,
     /// Whether a control code was traced from the IRP anywhere in this block.
     traced: bool,
     blind: usize,
@@ -708,6 +720,7 @@ fn record(
     examined: &mut usize,
 ) {
     *traced |= run.traced;
+    *cap_hit |= run.capped;
     *blind += run.blind;
     *examined += run.examined;
     for (code, lands, site, proved) in run.cases {
@@ -784,6 +797,7 @@ fn simulate(
     let mut cases = Vec::new();
     let mut table = None;
     let mut unresolved = None;
+    let mut capped = false;
 
     let instructions = &listing[block.start..block.end];
     let terminator = instructions.len().saturating_sub(1);
@@ -847,6 +861,7 @@ fn simulate(
                         layout,
                         reader,
                         in_image,
+                        &mut capped,
                     )
                 }) {
                     Some(resolved) => table = Some(resolved),
@@ -933,6 +948,7 @@ fn simulate(
         cases,
         table,
         unresolved,
+        capped,
         traced,
         blind,
         examined: instructions.len(),
@@ -1491,6 +1507,7 @@ fn follow_table(
     layout: Layout,
     reader: Option<&mut ReadOnce<'_>>,
     in_image: &impl Fn(u64) -> bool,
+    capped: &mut bool,
 ) -> Option<Resolved> {
     let reader = reader?;
     let facts_at = |position: usize| {
@@ -1633,6 +1650,7 @@ fn follow_table(
     }
     let entries = usize::try_from(bound.limit.checked_add(1)?).ok()?;
     if entries == 0 || entries > MAX_TABLE_ENTRIES {
+        *capped |= entries > MAX_TABLE_ENTRIES;
         return None;
     }
 
@@ -1704,6 +1722,7 @@ fn follow_table(
     };
     let dwords = cases.iter().copied().max()?.checked_add(1)?;
     if dwords > MAX_TABLE_ENTRIES {
+        *capped = true;
         return None;
     }
     reader.served += 1;
@@ -1787,6 +1806,18 @@ fn status_after(
     layout: Layout,
     facts: &Facts,
 ) -> Status {
+    // **Only an instruction that *writes* its first operand replaces what is there.**
+    // `test eax,eax` and `cmp [rbx+30h],0` name the destination and change nothing, so reading
+    // them as writes takes back a refusal the block still has -- and the case then reads as
+    // accepted, with whatever it called reported as its handler. An instruction this pass does not
+    // model stays in: it may write what it names, and clearing a status is the direction that
+    // cannot invent one.
+    if matches!(
+        instruction.effect,
+        Effect::Compare | Effect::Test | Effect::Push
+    ) {
+        return status;
+    }
     // Which of the two places a dispatch routine's status lives does this write?
     let writes_status = match instruction.operands.first() {
         // The return register, by the full-width name the decoder gives it.
@@ -5116,19 +5147,21 @@ mod tests {
 
         assert_eq!(found.halted, Some(Halt::Deadline));
         assert_eq!(
-            found.cases.len(),
-            3,
-            "the recording pass finished, so every case is here: {:?}",
-            found.cases
+            found.case_count, 3,
+            "the recording pass finished, so the count is every case it found"
         );
+        // **And the list ends where the work did.** A case this pass never reached would come back
+        // with no handler, no acceptance and no sizes -- which is what a case whose block gave no
+        // evidence says, and there would be nothing to tell the two apart. So the clock ends the
+        // list as a bound does, and the count stays exact over the difference.
         assert_eq!(
             found
                 .cases
                 .iter()
-                .map(|case| case.handler.is_some())
+                .map(|case| (case.code, case.handler))
                 .collect::<Vec<_>>(),
-            vec![true, true, false],
-            "and the clock stopped the per-case pass at the last of them: {:?}",
+            vec![(0x222003, Some(0x7000)), (0x222007, Some(0x7100))],
+            "every case listed is one this finished reading: {:?}",
             found.cases
         );
     }
@@ -7125,6 +7158,156 @@ mod tests {
             (case.accepted, case.handler),
             (Some(false), None),
             "this path put the IRP where the status goes, whatever the other one did: {case:?}"
+        );
+    }
+
+    /// Only an instruction that **writes** the return register replaces the status in it.
+    ///
+    /// `test eax,eax` and `cmp [rbx+30h],0` name the destination and change nothing, so reading
+    /// them as writes takes back a refusal the block still has -- and the case then reads as
+    /// accepted with whatever it called reported as its handler. Both halves here load the status
+    /// and then *read* it, which is what a driver does before branching on what it just decided.
+    #[test]
+    fn reading_the_status_back_does_not_replace_it() {
+        let followed_by = |mnemonic: &str, operands: Vec<Operand>| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("rbx"), reg("rdx")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x40,
+                    "mov",
+                    vec![reg("eax"), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x45, mnemonic, operands, Flow::Fallthrough),
+                insn(DISPATCH + 0x4b, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            found.cases[0].accepted
+        };
+
+        assert_eq!(
+            followed_by("test", vec![reg("eax"), reg("eax")]),
+            Some(false),
+            "a `test` reads the status and leaves it where it is"
+        );
+        assert_eq!(
+            followed_by("cmp", vec![mem("rbx", 0x30), imm(0)]),
+            Some(false),
+            "and so does a compare against the field it was stored in"
+        );
+        assert_eq!(
+            followed_by("xor", vec![reg("eax"), reg("eax")]),
+            None,
+            "while something that writes it really does replace it"
+        );
+    }
+
+    /// A table refused for its **size** is a bound that ended something, and the answer says so.
+    ///
+    /// `cap_hit` is what tells a reader that a list stopped where this module's bounds are rather
+    /// than where the driver's code is. A bounds check admitting more entries than
+    /// [`MAX_TABLE_ENTRIES`] leaves the jump in `unresolved` for exactly that reason, and saying
+    /// no bound was reached sends the reader looking at the driver for an answer that is here.
+    #[test]
+    fn a_table_larger_than_the_cap_says_a_bound_stopped_it() {
+        const TABLE: i64 = 0x9000;
+        let admitting = |limit: u64| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(limit)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x21,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x28,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x2b, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at).then(|| {
+                std::iter::repeat(0x1000u32)
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let within = map(DISPATCH, &admitting(1), Layout::X64, &read, in_image, never);
+        assert_eq!(within.cases.len(), 2, "{:?}", within.cases);
+        assert!(!within.cap_hit, "nothing here reached a bound");
+
+        let past = map(
+            DISPATCH,
+            &admitting(MAX_TABLE_ENTRIES as u64),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+
+        assert!(past.cases.is_empty(), "{:?}", past.cases);
+        assert_eq!(past.unresolved, vec![DISPATCH + 0x2b]);
+        assert!(
+            past.cap_hit,
+            "and this jump is unresolved because of a bound in here, not one in the driver"
         );
     }
 
