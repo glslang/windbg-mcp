@@ -9,6 +9,25 @@ from pathlib import Path
 ROOT = Path('/private/tmp/bn-windbg-handoff-20260911')
 
 
+async def call_tool(client, name, args=None, *, report, save, label=None, require_ok=True):
+    """Retain this probe's launch handle before recording or validating the response."""
+    response = await client.call_tool(name, args or {})
+    data = response.structured_content
+    if name == 'launch' and isinstance(data, dict):
+        opened = data if data.get('status') == 'ok' else (
+            data.get('error') if data.get('target') in ('yes', 'pending') else None)
+        session = opened.get('session_id') if isinstance(opened, dict) else None
+        if isinstance(session, str) and session:
+            report['owned_session'] = session
+    report['calls'][label or name] = {'is_error': response.is_error, 'data': data,
+        'text': [c.text for c in response.content if hasattr(c, 'text')] if data is None else []}
+    save()
+    if require_ok:
+        assert not response.is_error and isinstance(data, dict), name
+        assert data.get('status') not in ('error', 'unavailable', 'uncertain'), (name, data)
+    return data
+
+
 async def cleanup_debugger(call, local, remote, comparison, session, initial, report):
     """Attempt each release independently; leave an active capture exception intact."""
     report['session_inventory_restored'] = False
@@ -54,21 +73,12 @@ def run():
         from mcp import Client
         from mcp.client.streamable_http import streamable_http_client
         private = json.loads((ROOT/'windbg-private.json').read_text(encoding='utf-8-sig'))
-        async def call(client, name, args=None, label=None, require_ok=True):
-            response = await client.call_tool(name, args or {})
-            data = response.structured_content
-            report['calls'][label or name] = {'is_error': response.is_error, 'data': data,
-                'text': [c.text for c in response.content if hasattr(c, 'text')] if data is None else []}
-            save()
-            if require_ok:
-                assert not response.is_error and isinstance(data, dict), name
-                assert data.get('status') not in ('error', 'unavailable', 'uncertain'), (name, data)
-            return data
+        async def call(client, name, args=None, **kwargs):
+            return await call_tool(client, name, args, report=report, save=save, **kwargs)
         async with httpx2.AsyncClient(headers={'Authorization':'Bearer '+private['token']}, trust_env=False) as remote_http:
             async with Client(streamable_http_client(private['url'], http_client=remote_http), read_timeout_seconds=90) as remote:
                 initial = await call(remote, 'session_status', label='sessions_before')
                 assert len(initial['sessions']) < initial['max_sessions']
-                session = None
                 async with httpx2.AsyncClient(headers={'Authorization':'Bearer '+profiles.token}, trust_env=False) as local_http:
                     async with Client(streamable_http_client(f'http://127.0.0.1:{listener.port}/mcp', http_client=local_http), read_timeout_seconds=90) as local:
                         comparison = None
@@ -92,8 +102,6 @@ def run():
                             await call(local,'similarity_diff',{'comparison_id':comparison,'result_id':step['result_id']})
                             launch = await call(remote,'launch',{'command_line':r'C:\workspace\bn-windbg-handoff-20260911\target\handoff_probe.exe'})
                             session = launch['session_id']
-                            report['owned_session'] = session
-                            save()
                             modules = await call(remote,'modules',{'session_id':session,'limit':1024})
                             module, = [m for m in modules['modules'] if m['name'].lower() == 'handoff_probe']
                             report['loaded_module'] = module
@@ -136,7 +144,7 @@ def run():
                             report['breakpoint_reached_match'] = True
                             report['ok'] = True
                         finally:
-                            await cleanup_debugger(call, local, remote, comparison, session, initial, report)
+                            await cleanup_debugger(call, local, remote, comparison, report.get('owned_session'), initial, report)
     try:
         main_thread(context)
         for side in ('reference','target'):
