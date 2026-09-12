@@ -96,10 +96,16 @@ The reproduction probe now attempts unpairing, comparison closure, owned-session
 termination, and inventory verification independently. Cleanup errors set `ok` to
 false and are recorded by stage without replacing the original capture failure.
 A failed inventory read or mismatch leaves `session_inventory_restored` false.
+Launch responses retain the owned session before recording or checking success,
+including `error.session_id` when `target` is `yes` (post-commit failure) or `pending`
+(timeout). The final cleanup therefore ends that session even when launch raises;
+a pre-commit refusal does not adopt a session for termination.
 
 The [offline regression](samples/test_similarity_windbg_probe.py) injects failures
 in each cleanup call, simultaneous failures, and an inventory mismatch; it also
-checks cleanup with no resource handles. The failure cases reproduced the original
+checks cleanup with no resource handles and successful, post-commit, timeout, and
+pre-commit launch outcomes. Launch errors cover both the MCP error flag and the
+structured status check. The failure cases reproduced the original
 exception replacement before the fix. The 2026-09-11 live capture remains unchanged;
 its source reference now names the archived exact script. These failure injections
 are offline tests, not new live debugger acceptance runs.

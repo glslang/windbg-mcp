@@ -3,6 +3,8 @@
 import importlib.util
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 spec = importlib.util.spec_from_file_location(
     "handoff_probe", Path(__file__).with_name("similarity-windbg-probe-20260911.py")
@@ -12,6 +14,85 @@ spec.loader.exec_module(probe)
 
 
 class CleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_launch_outcomes_release_only_the_returned_owned_session(self):
+        outcomes = [
+            ({"status": "ok", "session_id": "owned"}, False, "owned"),
+            *[
+                (
+                    {
+                        "status": "error",
+                        "target": target,
+                        "error": {"session_id": "owned", "message": "launch failed"},
+                    },
+                    is_error,
+                    "owned",
+                )
+                for target in ("yes", "pending")
+                for is_error in (True, False)
+            ],
+            ({"status": "error", "target": "no", "error": {}}, True, None),
+            (
+                {
+                    "status": "error",
+                    "target": "no",
+                    "error": {"session_id": "preexisting"},
+                },
+                True,
+                None,
+            ),
+        ]
+        for data, is_error, expected_session in outcomes:
+            with self.subTest(data=data, is_error=is_error):
+                report = {"ok": False, "calls": {}}
+                remote = SimpleNamespace(
+                    call_tool=AsyncMock(
+                        return_value=SimpleNamespace(
+                            structured_content=data, is_error=is_error, content=[]
+                        )
+                    )
+                )
+                cleanup = AsyncMock(return_value={"sessions": ["preexisting"]})
+                saved_handles = []
+
+                def save(report=report, saved_handles=saved_handles):
+                    saved_handles.append(report.get("owned_session"))
+
+                failure = None
+                try:
+                    await probe.call_tool(
+                        remote,
+                        "launch",
+                        {"command_line": "fixture.exe"},
+                        report=report,
+                        save=save,
+                    )
+                except AssertionError as error:
+                    failure = error
+                finally:
+                    await probe.cleanup_debugger(
+                        cleanup,
+                        "local",
+                        remote,
+                        "comparison",
+                        report.get("owned_session"),
+                        {"sessions": ["preexisting"]},
+                        report,
+                    )
+                self.assertEqual(failure is not None, data["status"] == "error")
+                self.assertEqual(saved_handles, [expected_session])
+                self.assertEqual(report["calls"]["launch"]["data"], data)
+                ends = [
+                    call
+                    for call in cleanup.call_args_list
+                    if call.args[1] == "end_session"
+                ]
+                self.assertEqual(len(ends), int(expected_session is not None))
+                if ends:
+                    self.assertEqual(
+                        ends[0].args, (remote, "end_session", {"session_id": "owned"})
+                    )
+                self.assertTrue(report["session_inventory_restored"])
+
     async def test_each_failure_still_attempts_later_cleanup_and_keeps_original_error(
         self,
     ):
