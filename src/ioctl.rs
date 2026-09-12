@@ -2456,11 +2456,14 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
 
 #[cfg(test)]
 mod tests {
-    //! The oracle that is not this pass lives beside these: `src/ioctl_differential.rs` runs the
-    //! same routines on a small concrete interpreter and checks every case this reports against
-    //! where execution actually went. It is a separate file because it shares nothing with the
-    //! code under test on purpose, and because this module is long enough.
-    #[path = "../../ioctl_differential.rs"]
+    //! The oracle that is **not** this pass lives beside these, at
+    //! `src/ioctl/tests/differential.rs`: it runs the same routines on a small concrete
+    //! interpreter and checks every case this module reports against where execution actually
+    //! went. A child of *this* module rather than of `ioctl`, because what it needs is the fixture
+    //! vocabulary below -- and an ordinary `mod` rather than a `#[path]` to somewhere else, which
+    //! is the shape that resolves on every platform: a relative path out of a module directory
+    //! that does not exist is canonicalised by Windows and walked component by component by POSIX,
+    //! so the first spelling of this built here and would not have built on Linux.
     mod differential;
 
     use super::*;
