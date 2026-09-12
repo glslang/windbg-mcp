@@ -1,5 +1,25 @@
 # Binary Ninja bridge validation
 
+## Current acceptance status — 2026-09-12
+
+The core bridge acceptance below is complete for the identified HEVD/mountmgr
+builds. Its 16-tool counts and test totals are dated baseline measurements. The
+current companion exposes 22 tools after adding similarity; Personal comparison,
+lifecycle and generic WinDbg handoff acceptance are recorded in the
+[similarity plan](binja6-similarity-plan.md). The companion's
+[2026-09-12 preparation-race follow-up](https://github.com/glslang/binja-windbg-mcp/blob/main/docs/binja-windbg-mcp-validation.md#preparation-race-review-follow-up--2026-09-12)
+records 187 passing tests and Ruff checks after the final race fixes. A fresh
+2026-09-12 run against companion source `81f473e` also passed all 187 tests, with no
+skips, using a cached `uv` test environment whose 28 runtime packages matched the
+pinned requirements. The companion's runtime-only `.venv` lacked pytest; the
+[companion verification instructions](https://github.com/glslang/binja-windbg-mcp/blob/main/README.md#verification)
+now explicitly supply development tools. HTTP tests require loopback socket access.
+
+Structured dispatch reachability completed item 60 on 2026-09-10. The
+[integration plan](binja-windbg-mcp-plan.md#status--2026-09-12) distinguishes completed
+delivery from optional investigations and deferred Ultimate acceptance. The dated
+results below are historical evidence, not fresh Windows or GUI test runs.
+
 ## Companion 0.2 refactor (2026-09-06)
 
 The companion targets Binary Ninja 6.0.10601 Personal and Python 3.13. Its reduced surface
@@ -194,5 +214,6 @@ identified ARM64 HEVD/mountmgr builds in Binary Ninja 6.0.10601 Personal. These 
 not establish recovery for other builds, runtime execution of every static case, silo
 runtime behavior, force-quit cleanup, or other Windows security configurations. Partial
 security recovery and bounded sink traversal remain explicit supported outcomes.
-Structured `reachable_from_dispatch` remains follow-up #60; broader coverage import and
-report export remain deferred as specified in the [plan](binja-windbg-mcp-plan.md).
+Structured `reachable_from_dispatch` subsequently completed item 60 on 2026-09-10;
+broader coverage import and report export remain deferred as specified in the
+[plan](binja-windbg-mcp-plan.md).
