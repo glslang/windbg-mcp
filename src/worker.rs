@@ -6749,7 +6749,15 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
                 within_module(module.base, module.size, at, len)
                     .then(|| e.read_memory(at, len).ok())?
             };
-            pe::read_image(module.base, &mut headers).ok()
+            let mut image = pe::read_image(module.base, &mut headers).ok()?;
+            // **The loader's extent wins**, for the reason `driver_hazards` gives at length: every
+            // bound in `src/pe.rs` is a `checked_va` against `SizeOfImage`, which on an untrusted
+            // driver is memory that driver may have written. A section declared past the loaded
+            // extent would otherwise put the next module's code inside this one's ranges, and a
+            // table entry landing there would be published as this driver's case with the jump
+            // reported as followed.
+            image.size_of_image = smaller_extent(image.size_of_image, module.size);
+            Some(image)
         })
         .map(|image| image.executable_ranges())
         .unwrap_or_default();
@@ -7548,6 +7556,21 @@ fn ",
             body.contains("image.size_of_image = smaller_extent("),
             "`driver_hazards` no longer clamps the image's extent to the loader's, so every bound \
              in `src/pe.rs` is against a number the image itself supplies."
+        );
+
+        // And `ioctl_map`, which derives the executable ranges a jump-table entry has to land in
+        // from the same header. Unclamped, a section declared past the loaded extent puts the next
+        // module's code inside this one's ranges, and an entry landing there is published as this
+        // driver's case with the jump reported as followed.
+        let walk = code
+            .split_once("\nfn ioctl_map(")
+            .expect("this module has an `ioctl_map`")
+            .1;
+        let walk = walk.split_once("\nfn ").map_or(walk, |(walk, _)| walk);
+        assert!(
+            walk.contains("image.size_of_image = smaller_extent("),
+            "`ioctl_map` no longer clamps the image's extent to the loader's, so a jump-table \
+             entry can land in the next module and be published as this driver's case."
         );
     }
 

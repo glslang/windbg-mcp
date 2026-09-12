@@ -1491,6 +1491,19 @@ fn follow_table(
                 if matches!(instruction.flow, Flow::Call(_)) {
                     return None;
                 }
+                // **An instruction this pass does not model ends the chain if it names the
+                // register at all.** `xchg edx,eax` writes `eax` as its *second* operand, so a
+                // walk that looks only at the first steps over it and resolves the jump from a
+                // load execution overwrote -- the same fault the forward walk had, from the other
+                // direction. What an unmodelled instruction did to a register it names is not
+                // something this knows, and the answer to that is to stop.
+                if instruction.effect == Effect::Other
+                    && instruction.operands.iter().any(|operand| {
+                        matches!(operand, Operand::Register(register) if register.full == wanted)
+                    })
+                {
+                    return None;
+                }
                 // **Only an instruction that *defines* the register continues the chain.** A
                 // `cmp rcx,[base+rax*4+table]` reads it and writes nothing but the flags, and
                 // reading that as the load turns an unrelated array into a table.
@@ -1607,10 +1620,17 @@ fn follow_table(
             }
             .checked_add_signed(map.displacement)?;
             reader.served += 1;
-            (reader.read)(at, entries)?
-                .into_iter()
-                .map(usize::from)
-                .collect()
+            let map = (reader.read)(at, entries)?;
+            // **A short read is not the map.** A partial dump, or a read that runs into a page
+            // that was never captured, comes back with a prefix rather than nothing -- and taking
+            // it resolves the table from the indices that did read, leaves the rest absent from
+            // `cases`, and still takes the jump out of `unresolved` while `entries` advertises the
+            // full bound. An incomplete answer reading as a complete one is the one thing this
+            // module refuses to produce, so the table goes back unresolved instead.
+            if map.len() != entries {
+                return None;
+            }
+            map.into_iter().map(usize::from).collect()
         }
         None => (0..entries).collect(),
     };
@@ -5622,6 +5642,237 @@ mod tests {
             None,
             "and an element beside it is not"
         );
+    }
+
+    /// A **short** read of the byte map is not the byte map.
+    ///
+    /// A partial dump, or a read that runs into a page the capture left out, comes back with a
+    /// prefix rather than with nothing. Taking it resolves the table from the indices that did
+    /// read, leaves the rest absent from `cases`, and still takes the jump out of `unresolved`
+    /// while the table record advertises the full bound -- an incomplete answer reading as a
+    /// complete one. The two halves differ only in how many bytes the reader hands back.
+    #[test]
+    fn a_short_byte_map_read_leaves_the_jump_unresolved() {
+        const MAP: i64 = 0x5b90;
+        const TABLE: i64 = 0x5b80;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            // The byte map: one byte an index, saying which case that index is.
+            insn(
+                DISPATCH + 0x21,
+                "movzx",
+                vec![
+                    reg("eax"),
+                    Operand::Memory(MemoryOperand {
+                        size: Some(1),
+                        segment: None,
+                        base: Some(named("rcx")),
+                        index: Some(named("rax")),
+                        scale: 1,
+                        displacement: MAP,
+                        address: None,
+                    }),
+                ],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x2f,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x32, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let map_at = IMAGE_BASE.wrapping_add(MAP as u64);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = |bytes: usize| {
+            move |at: u64, len: usize| -> Option<Vec<u8>> {
+                if at == map_at {
+                    // Three indices, and a reader that hands back as many bytes as it has.
+                    return Some(vec![0u8, 1, 2][..bytes.min(len)].to_vec());
+                }
+                // Served at whatever length is asked for, so that a refusal here is the map's
+                // length and not the table read failing to find the one it expected.
+                (at == table_at).then(|| {
+                    [0x1000u32, 0x1100, 0x1200]
+                        .iter()
+                        .flat_map(|rva| rva.to_le_bytes())
+                        .take(len)
+                        .collect()
+                })
+            }
+        };
+
+        let whole = map(DISPATCH, &block, Layout::X64, served(3), in_image, never);
+        assert_eq!(
+            whole.cases.len(),
+            3,
+            "the whole map is this driver's switch: {:?}",
+            whole.cases
+        );
+
+        let short = map(DISPATCH, &block, Layout::X64, served(2), in_image, never);
+
+        assert!(
+            short.cases.is_empty(),
+            "a prefix of the map is not two thirds of an answer: {:?}",
+            short.cases
+        );
+        assert!(short.tables.is_empty(), "{:?}", short.tables);
+        assert_eq!(short.unresolved, vec![DISPATCH + 0x32]);
+    }
+
+    /// The chain walk stops at any write to the register it is following.
+    ///
+    /// `mov eax,[table+ecx*4]` / `xchg edx,eax` / `jmp rax` jumps to the old `edx`, and `xchg`
+    /// writes `eax` as its **second** operand -- so a walk that looks only at the first steps over
+    /// it and resolves the jump from a load execution overwrote. It is the same fault the forward
+    /// walk had, from the other direction, and the same answer: what an unmodelled instruction did
+    /// to a register it names is not something this knows.
+    #[test]
+    fn the_chain_walk_stops_at_any_write_to_the_register_it_wants() {
+        const TABLE: i64 = 0x9000;
+        let exchanged = |swapped: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                // Into a register that is **not** the bounded index: an `xchg` naming the index
+                // would have the forward walk take the bound away, and this test would pass on
+                // that rule rather than on the one it is for.
+                insn(
+                    DISPATCH + 0x21,
+                    "mov",
+                    vec![reg("edx"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x28,
+                    "add",
+                    vec![reg("rdx"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if swapped {
+                // The wanted register as the **second** operand, which is the whole point.
+                block.push(insn(
+                    DISPATCH + 0x2b,
+                    "xchg",
+                    vec![reg("rsi"), reg("rdx")],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.push(insn(
+                DISPATCH + 0x30,
+                "jmp",
+                vec![reg("rdx")],
+                Flow::Jmp(None),
+            ));
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
+        let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
+            (at == table_at && len == 8).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let straight = map(
+            DISPATCH,
+            &exchanged(false),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+        assert_eq!(straight.cases.len(), 2, "{:?}", straight.cases);
+
+        served.set(0);
+        let across = map(
+            DISPATCH,
+            &exchanged(true),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+
+        assert!(
+            across.cases.is_empty(),
+            "the jump goes to whatever `rsi` held: {:?}",
+            across.cases
+        );
+        assert_eq!(across.unresolved, vec![DISPATCH + 0x30]);
+        assert_eq!(served.get(), 0, "and the table was not read");
     }
 
     /// A bound is about a register's **value**, so a write that is not part of the table pattern
