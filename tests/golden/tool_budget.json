@@ -109,6 +109,15 @@
       "wire": 901
     },
     {
+      "annotations": 82,
+      "description": 634,
+      "inputSchema": 723,
+      "modelVisible": 1413,
+      "name": "device_security",
+      "outputSchema": 3715,
+      "wire": 5241
+    },
+    {
       "annotations": 64,
       "description": 790,
       "inputSchema": 629,
@@ -533,15 +542,15 @@
     }
   ],
   "totals": {
-    "annotations": 6241,
-    "description": 33006,
-    "inputSchema": 51052,
+    "annotations": 6323,
+    "description": 33640,
+    "inputSchema": 51775,
     "instructions": 1983,
-    "modelVisible": 87155,
-    "outputSchema": 136281,
-    "payload": 231336,
-    "tools": 59,
-    "wire": 231266,
+    "modelVisible": 88568,
+    "outputSchema": 139996,
+    "payload": 236578,
+    "tools": 60,
+    "wire": 236507,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

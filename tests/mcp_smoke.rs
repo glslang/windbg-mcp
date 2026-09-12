@@ -1862,7 +1862,16 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// the model of it was not, which is the failure mode a derived figure has and a recorded one
 /// does not. It is why `tests/golden/tool_budget.json` is the source and this line is a ceiling.
 /// The bridge adds guarded coordinate inputs and current_location; see docs/token-budget.md.
-const MODEL_VISIBLE_CEILING: usize = 88_000;
+///
+/// **88,000 -> 91,000 for `device_security`** (2026-09-12), with the arithmetic that says it is
+/// headroom rather than a leak: the model-visible surface went 87,155 -> 88,568, a difference of
+/// 1,413, and the tool's own model-visible definition is 1,413 B. Nothing else moved -- no
+/// `TOOL_NOTES` cross-reference was added for it, so unlike the `interrupt` case recorded above
+/// there is no second term. Of that, 634 B is description and 723 B input schema; the 3,715 B
+/// `outputSchema` is on the wire and not here, which is the whole reason these two ceilings are
+/// separate numbers. The new figure leaves 2,432 B, which is 2.7%, and is deliberately not sized
+/// for `driver_surface` -- that one raises it again, with its own arithmetic.
+const MODEL_VISIBLE_CEILING: usize = 91_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -1921,7 +1930,16 @@ const MODEL_VISIBLE_CEILING: usize = 88_000;
 /// type is inlined once per tool's own `$defs` closure, so a third consumer is a third copy rather
 /// than a product. It is the larger of the two driver schemas because a case carries a decoded
 /// code, two coordinates and its evidence. The new figure leaves 5,194 B, which is 2.2%.
-const WIRE_CEILING: usize = 236_000;
+///
+/// **236,000 -> 242,000 for `device_security`** (2026-09-12), the third of those three. The payload
+/// went 231,336 -> 236,578, a difference of 5,242: the tool is 5,241 B of wire and the remaining
+/// byte is the array's own comma. **Nothing else moved at all** -- not one other tool changed by a
+/// byte, which is the cleanest this arithmetic has ever come out and is itself the answer to the
+/// question this ceiling exists to force. It shares no output type with the two driver schemas
+/// beside it: a device's gate is a descriptor, an access list and a symbolic link, none of which
+/// appear anywhere else in this surface, so there was nothing available to multiply. 3,715 B of the
+/// 5,241 is `outputSchema`, which no model reads. The new figure leaves 5,422 B, which is 2.3%.
+const WIRE_CEILING: usize = 242_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -2831,6 +2849,13 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             json!({ "dispatch": "mydriver!DispatchDeviceControl" }),
             "error",
         ),
+        // No argument screen at all on this one -- `device` reaches the object namespace rather
+        // than a command -- so every refusal it has is the session's, and this row is it.
+        (
+            "device_security",
+            json!({ "device": r"\Device\MountPointManager" }),
+            "error",
+        ),
         // A well-formed request, so it takes the *session* refusal path like every row above it
         // rather than the argument one — which this tool also has, and which is checked in
         // `a_malformed_walk_is_refused_before_a_session_is_needed`.
@@ -3713,7 +3738,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 59 tools (session, crash)"),
+        log.contains("serving 13 of 60 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3745,7 +3770,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 59 tools (session, inspect) — except bench serves 13 of 59 tools \
+            "serving 20 of 60 tools (session, inspect) — except bench serves 13 of 60 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),

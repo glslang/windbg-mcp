@@ -56,6 +56,7 @@ use dbgscope::pool::{
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
 use crate::batch::{self, BatchOp, Debuggee, Ran};
+use crate::device;
 use crate::driver::{
     fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_lm_base,
     parse_windbg_addr, path_recipe, reachability, structured_report,
@@ -68,6 +69,7 @@ use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Interrupted, MAX_MODULE_ROWS,
     Output, PoolOp, ReachabilityOp, SymbolPathSetting, TargetOrigin, WorkerMessage, WorkerRequest,
 };
+use crate::sd;
 use crate::server::{
     EXEC_WAIT_MS, hexdump, matches_module_pattern, module_pattern, parse_eval, parse_u64,
 };
@@ -1756,6 +1758,30 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                          routine and report back. Nothing was read. It waited {}s behind other \
                          work on this session; issue it when the session is idle, or raise the \
                          server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                    ),
+                )),
+            }
+        }
+        EngineOp::DeviceSecurity {
+            device,
+            patience_ms,
+        } => {
+            // Refused rather than started with no clock, exactly as the map above is. The link
+            // search is hundreds of reads, so a call with nothing left would answer with the
+            // device's fields and no links -- which is what a device nothing reaches looks like.
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, queued) {
+                Some(budget) => device_security(e, &device, Instant::now() + budget),
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This device query was not run: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to walk the object namespace \
+                         and report back. Nothing was read. It waited {}s behind other work on \
+                         this session; issue it when the session is idle, or raise the server's \
+                         call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
                         patience.saturating_sub(queued).as_secs(),
                         queued.as_secs(),
                     ),
@@ -6658,6 +6684,235 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     // stop is the one that happened.
     report.stopped = report.stopped.or_else(|| stopped.get());
     Ok(Output::typed(hazards::render(&report), report))
+}
+
+/// The directory a device's user-mode name lives in.
+///
+/// `\GLOBAL??` is the system-wide DOS device directory -- what `\\.\Name` resolves through for a
+/// caller in no particular session. A link in a session's own `\Sessions\<n>\DosDevices\...` is
+/// not here and is not searched: those are per-logon, so there is no one answer to give about
+/// them, and [`structured::DeviceSecurity::link_directory`] names what was searched for that
+/// reason.
+const LINK_DIRECTORY: &str = "\\GLOBAL??";
+
+/// The object type name a symbolic link carries.
+const SYMBOLIC_LINK: &str = "SymbolicLink";
+
+/// The object type name a device carries.
+const DEVICE: &str = "Device";
+
+/// Why a namespace walk could not answer, as this server's categories.
+///
+/// **The split is by whose fault it is, which is what a caller does something different about.** A
+/// path that is not one, or names nothing, is the argument; a namespace that will not read is the
+/// target -- and on a kernel minidump that is every object, which is why the first of these says
+/// so rather than sending someone to check a device name that was perfectly correct.
+fn object_failure(what: &str, why: &dbgscope::object::ObjectError) -> Failed {
+    use dbgscope::object::ObjectError;
+    let category = match why {
+        ObjectError::BadPath { .. }
+        | ObjectError::NotFound { .. }
+        | ObjectError::NotADirectory { .. } => structured::ErrorCategory::InvalidArgument,
+        _ => structured::ErrorCategory::Debugger,
+    };
+    let advice = match why {
+        ObjectError::Unreadable { .. }
+        | ObjectError::Malformed { .. }
+        | ObjectError::Unavailable { .. } => {
+            " A kernel minidump carries no object namespace -- its root directory, the type table \
+             and the header cookie all read as unavailable -- so this tool needs a live kernel \
+             target. `driver_object` and `device_object` work on a dump."
+        }
+        _ => "",
+    };
+    Failed::categorised(category, format!("{what}: {why}.{advice}"))
+}
+
+/// Where a `_DEVICE_OBJECT`'s fields are on **this** target.
+///
+/// Every offset from the target's own type information, for the reason [`crate::device`] gives at
+/// length: a table of constants here would decode a different build confidently and wrongly. The
+/// pointer width comes from the namespace layout, which derived it from two adjacent fields rather
+/// than from the host's.
+fn device_layout(e: &DebugEngine, pointer: usize) -> Result<device::Layout, Failed> {
+    let module = e.kernel_base().map_err(failed)?;
+    let id = e.type_id(module, "_DEVICE_OBJECT").map_err(|why| {
+        Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this target has no type information for `_DEVICE_OBJECT` ({why}), so a device's \
+                 fields cannot be located. Check that the kernel's symbols resolve: \
+                 `set_symbol_path`, then `modules` on `nt`."
+            ),
+        )
+    })?;
+    let of = |field: &str| e.field_offset(module, id, field).map_err(failed);
+    Ok(device::Layout {
+        pointer,
+        size: e.type_size(module, id).map_err(failed)?,
+        device_type: of("DeviceType")?,
+        characteristics: of("Characteristics")?,
+        flags: of("Flags")?,
+        driver: of("DriverObject")?,
+    })
+}
+
+/// What decides who may open a device.
+///
+/// What only the worker can do is here and nothing else is: resolve a path through the object
+/// namespace, read the two structures behind it, and list a directory. [`crate::device`] and
+/// [`crate::sd`] take bytes and have never seen an engine.
+fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<Output, Failed> {
+    let _ = remaining(deadline, "the object namespace was walked")?;
+    // **One namespace for the whole call, rather than the `DebugEngine` convenience wrappers.**
+    // Each of those derives the layout again -- a dozen type lookups -- and this resolves a link
+    // per entry of a directory holding hundreds, so the wrappers would spend thousands of lookups
+    // re-deriving one answer that cannot change during a call.
+    let memory = |at: u64, len: usize| e.read_memory(at, len).ok();
+    let layout = e.object_layout().map_err(|why| {
+        Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this target has no type information for the object manager's structures ({why}), \
+                 so its namespace cannot be walked. Check that the kernel's symbols resolve: \
+                 `set_symbol_path`, then `modules` on `nt`."
+            ),
+        )
+    })?;
+    let globals = e.object_globals().map_err(failed)?;
+    let namespace = dbgscope::object::Namespace::new(&memory, layout, globals)
+        .map_err(|why| object_failure("the object namespace", &why))?;
+
+    // The path, with one hop through a symbolic link so that the name a user-mode caller knows
+    // works as well as the device's own. **One hop rather than a chain**: `\DosDevices` is itself
+    // a link, so a chain would let a path resolve through several and this reports which one it
+    // followed -- a fact that stops being sayable once there is more than one.
+    let mut path = device.to_string();
+    let mut object = namespace
+        .object_at(&path)
+        .map_err(|why| object_failure(&path, &why))?;
+    let mut followed_link = None;
+    if object.type_name.as_deref() == Some(SYMBOLIC_LINK) {
+        let target = namespace
+            .link_target(object.address)
+            .map_err(|why| object_failure(&path, &why))?;
+        followed_link = Some(std::mem::replace(&mut path, target));
+        object = namespace
+            .object_at(&path)
+            .map_err(|why| object_failure(&path, &why))?;
+    }
+    // **An object of the wrong type is refused rather than read as a device.** `_DEVICE_OBJECT` is
+    // 0x150 bytes, and every object in the namespace has bytes there: a directory or a mutant read
+    // this way answers with a device type, a characteristics word and a driver pointer, all of
+    // them fiction, and nothing in the answer would say so.
+    //
+    // A type the namespace could **not** read is a third case and is not refused: a build whose
+    // header cookie this cannot resolve types nothing at all, and refusing there would take the
+    // tool away from a target that can answer perfectly well. It is reported instead --
+    // `type_confirmed` is the field, and it is false exactly there.
+    let type_confirmed = match object.type_name.as_deref() {
+        Some(DEVICE) => true,
+        None => false,
+        Some(other) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                format!(
+                    "`{path}` is a {other}, not a device. This reads a `_DEVICE_OBJECT`, and \
+                     reading one off an object of another type would answer with fields that are \
+                     fiction. `driver_object` lists a driver's devices."
+                ),
+            ));
+        }
+    };
+
+    let fields = device::read_device(object.address, device_layout(e, layout.pointer)?, memory)
+        .map_err(|why| {
+            Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!(
+                    "the device object at {:#018x} could not be read: {why}",
+                    object.address
+                ),
+            )
+        })?;
+
+    // The descriptor hangs off the object *header*, which the namespace walk already read and
+    // masked the fast-reference count out of. Three outcomes, and they are kept apart for the
+    // reason [`device::Security`] gives: an object with no descriptor and a descriptor that would
+    // not read are different facts about who may open this.
+    let security = match object.security_descriptor {
+        None => device::Security::Absent,
+        Some(at) => match sd::read_descriptor(at, memory) {
+            Ok(descriptor) => device::Security::Read { at, descriptor },
+            Err(why) => device::Security::Failed { at, why },
+        },
+    };
+
+    // The links. One listing, then a target read per symbolic link in it -- which is where this
+    // call's time goes, so the deadline is polled **between links** rather than only before the
+    // loop. A bounded loop still needs a check inside it.
+    let stop = || {
+        if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        }
+    };
+    let mut links = Vec::new();
+    let mut links_unread = 0usize;
+    let mut examined = None;
+    let mut halted = None;
+    let mut search = structured::LinkSearch::Unavailable;
+    if let Ok(entries) = namespace.objects_in(LINK_DIRECTORY) {
+        let mut seen = 0usize;
+        for entry in &entries {
+            if let Some(why) = stop() {
+                halted = Some(why);
+                break;
+            }
+            seen += 1;
+            if entry.type_name.as_deref() != Some(SYMBOLIC_LINK) {
+                continue;
+            }
+            let Ok(target) = namespace.link_target(entry.address) else {
+                // Counted rather than skipped. Each is a place this device could be reachable
+                // from and was not checked, and an empty list beside a count of these is a
+                // different answer from an empty list beside none.
+                links_unread += 1;
+                continue;
+            };
+            if device::same_object_path(&target, &path) {
+                links.push(device::Link {
+                    path: format!("{LINK_DIRECTORY}\\{}", entry.name),
+                    target,
+                });
+            }
+        }
+        examined = Some(seen);
+        search = match halted {
+            Some(_) => structured::LinkSearch::Partial,
+            None => structured::LinkSearch::Complete,
+        };
+    }
+
+    let found = device::Found {
+        device: path,
+        followed_link,
+        address: object.address,
+        type_confirmed,
+        fields,
+        security,
+        link_directory: LINK_DIRECTORY.to_string(),
+        links,
+        link_search: search,
+        links_examined: examined,
+        links_unread,
+        stopped: halted,
+    };
+    let report = device::structured_report(&found);
+    Ok(Output::typed(device::render(&report), report))
 }
 
 /// Recovers the control codes a dispatch routine accepts.

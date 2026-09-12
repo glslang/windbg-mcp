@@ -238,7 +238,7 @@ fn read_acl(at: u64, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) -> Res
     let revision = header[0];
     let size = usize::from(u16::from_le_bytes([header[2], header[3]]));
     let ace_count = usize::from(u16::from_le_bytes([header[4], header[5]]));
-    if size < 8 || size > MAX_ACL_BYTES {
+    if !(8..=MAX_ACL_BYTES).contains(&size) {
         return Err(SdError::Malformed {
             reason: "the ACL's size is not a size an access control list has",
         });

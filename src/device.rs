@@ -172,6 +172,334 @@ pub(crate) fn read_device(
     })
 }
 
+/// One symbolic link that reaches a device.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Link {
+    /// The link's own path, which is what a user-mode caller opens.
+    pub(crate) path: String,
+    /// What it points at, verbatim. Kept rather than discarded once it has matched: it is the
+    /// evidence for the match, and a link to `\Device\Foo\Bar` is a different claim from one
+    /// to `\Device\Foo`.
+    pub(crate) target: String,
+}
+
+/// Whether a device carries a security descriptor, and what came of reading it.
+///
+/// **Three outcomes rather than an `Option`**, because the three send a reader somewhere
+/// different: a descriptor, an object the object manager guards by its parent directory alone, and
+/// a target that did not answer -- which on a kernel minidump is every object, and must not be
+/// reported as a device nothing guards.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Security {
+    /// It carries one, at this address, and this is what it says.
+    Read {
+        at: u64,
+        descriptor: crate::sd::Descriptor,
+    },
+    /// The object header's `SecurityDescriptor` field is empty.
+    Absent,
+    /// It carries one at this address and those bytes would not read.
+    Failed { at: u64, why: crate::sd::SdError },
+}
+
+/// Everything an answer about one device is made of, before it is a report.
+///
+/// The worker fills this in -- resolving a path, reading an object header, listing a directory --
+/// and everything below is a pure mapping over it, so the report and its rendering are tested
+/// against values rather than against a machine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Found {
+    /// The object path the answer is about, after a link was followed.
+    pub(crate) device: String,
+    /// The link the caller named, when they named one rather than the device.
+    pub(crate) followed_link: Option<String>,
+    /// The `_DEVICE_OBJECT` itself.
+    pub(crate) address: u64,
+    /// Whether the namespace could say this object **is** a device.
+    pub(crate) type_confirmed: bool,
+    pub(crate) fields: Device,
+    pub(crate) security: Security,
+    /// The directory that was searched for links, whether or not it could be listed.
+    pub(crate) link_directory: String,
+    pub(crate) links: Vec<Link>,
+    pub(crate) link_search: crate::structured::LinkSearch,
+    pub(crate) links_examined: Option<usize>,
+    pub(crate) links_unread: usize,
+    pub(crate) stopped: Option<crate::walk::Halt>,
+}
+
+/// Whether two object paths name the same object.
+///
+/// **A textual match, and the two things it is not are the reason this is a named function rather
+/// than an `==`.** The object manager is case-insensitive for names, so `\Device\Foo` and
+/// `\DEVICE\FOO` are one object; and a trailing separator is a caller's habit rather than part
+/// of a name. Neither is true of a *prefix*: a link to `\Device\HarddiskVolume1\dir` is not a
+/// link to `\Device\HarddiskVolume1`, and matching it as one would report a volume as reachable
+/// under a name that opens a file on it.
+pub(crate) fn same_object_path(one: &str, other: &str) -> bool {
+    let trim = |path: &str| path.trim_end_matches('\\').to_string();
+    trim(one).eq_ignore_ascii_case(&trim(other))
+}
+
+/// One ACE, as fields a caller can branch on.
+fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
+    let (reads, writes) = crate::sd::data_access(ace.mask);
+    crate::structured::AccessEntry {
+        kind: ace.kind.name().to_string(),
+        ace_type: ace.ace_type,
+        flags: ace.flags,
+        sid: ace.sid.as_ref().map(|sid| sid.text.clone()),
+        account: ace
+            .sid
+            .as_ref()
+            .and_then(|sid| sid.name)
+            .map(str::to_string),
+        mask: format!("{:#010x}", ace.mask),
+        rights: crate::sd::rights(ace.mask)
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        reads,
+        writes,
+    }
+}
+
+fn access_list(acl: &crate::sd::Acl) -> crate::structured::AccessControlList {
+    crate::structured::AccessControlList {
+        revision: acl.revision,
+        ace_count: acl.ace_count,
+        entries: acl.aces.iter().map(access_entry).collect(),
+    }
+}
+
+/// The answer, as a value.
+pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecurity {
+    let security = match &found.security {
+        Security::Read { at, descriptor } => Some(crate::structured::SecurityDescriptor {
+            address: format!("{at:#018x}"),
+            revision: descriptor.revision,
+            control: format!("{:#06x}", descriptor.control),
+            owner: descriptor.owner.as_ref().map(|sid| sid.text.clone()),
+            owner_account: descriptor
+                .owner
+                .as_ref()
+                .and_then(|sid| sid.name)
+                .map(str::to_string),
+            group: descriptor.group.as_ref().map(|sid| sid.text.clone()),
+            group_account: descriptor
+                .group
+                .as_ref()
+                .and_then(|sid| sid.name)
+                .map(str::to_string),
+            dacl_present: descriptor.dacl_present(),
+            dacl: descriptor.dacl.as_ref().map(access_list),
+            sacl: descriptor.sacl.as_ref().map(access_list),
+        }),
+        _ => None,
+    };
+    let security_absent = match &found.security {
+        Security::Read { .. } => None,
+        Security::Absent => Some(
+            "this object carries no security descriptor, so the object manager checks the              directory holding it rather than the object"
+                .to_string(),
+        ),
+        Security::Failed { at, why } => Some(format!(
+            "the descriptor at {at:#018x} could not be read: {why}"
+        )),
+    };
+    crate::structured::DeviceSecurity {
+        device: found.device.clone(),
+        followed_link: found.followed_link.clone(),
+        address: format!("{:#018x}", found.address),
+        type_confirmed: found.type_confirmed,
+        driver: format!("{:#018x}", found.fields.driver),
+        device_type: format!("{:#06x}", found.fields.device_type),
+        characteristics: format!("{:#010x}", found.fields.characteristics),
+        secure_open: found.fields.secure_open,
+        flags: format!("{:#010x}", found.fields.flags),
+        exclusive: found.fields.exclusive,
+        security,
+        security_absent,
+        link_directory: found.link_directory.clone(),
+        links: found
+            .links
+            .iter()
+            .map(|link| crate::structured::DeviceLink {
+                path: link.path.clone(),
+                target: link.target.clone(),
+            })
+            .collect(),
+        link_search: found.link_search,
+        links_examined: found.links_examined,
+        links_unread: found.links_unread,
+        stopped: found.stopped.map(|halt| match halt {
+            crate::walk::Halt::Deadline => crate::structured::WalkHalt::Deadline,
+            crate::walk::Halt::Interrupted => crate::structured::WalkHalt::Interrupted,
+        }),
+    }
+}
+
+/// The same answer for a person to read.
+pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "{} at {}", report.device, report.address);
+    if let Some(link) = &report.followed_link {
+        let _ = writeln!(out, "  reached by following {link}");
+    }
+    let _ = writeln!(out, "  Driver          {}", report.driver);
+    let _ = writeln!(out, "  DeviceType      {}", report.device_type);
+    let _ = writeln!(
+        out,
+        "  Characteristics {}{}",
+        report.characteristics,
+        match report.secure_open {
+            true => "  FILE_DEVICE_SECURE_OPEN",
+            false => "",
+        }
+    );
+    let _ = writeln!(
+        out,
+        "  Flags           {}{}",
+        report.flags,
+        match report.exclusive {
+            true => "  DO_EXCLUSIVE",
+            false => "",
+        }
+    );
+    // Said where it is true rather than left to be inferred from an absent word. Whether the
+    // descriptor below is checked on a *relative* open is the difference between a gate and a
+    // gate with a way around it, and it is the one line here a reader is most likely to act on.
+    if !report.secure_open {
+        let _ = writeln!(
+            out,
+            "  [!] no FILE_DEVICE_SECURE_OPEN: the descriptor below is checked when this device              is opened by name, and not when a path beneath it is opened -- so a driver that              parses its own paths can be reached by a caller the descriptor would refuse"
+        );
+    }
+
+    match (&report.security, &report.security_absent) {
+        (Some(security), _) => {
+            let _ = writeln!(out, "  Security descriptor at {}", security.address);
+            for (what, sid, account) in [
+                ("Owner", &security.owner, &security.owner_account),
+                ("Group", &security.group, &security.group_account),
+            ] {
+                if let Some(sid) = sid {
+                    let _ = writeln!(
+                        out,
+                        "    {what}  {sid}{}",
+                        account
+                            .as_ref()
+                            .map(|name| format!(" ({name})"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            match (&security.dacl, security.dacl_present) {
+                // The most permissive object there is, and the one line of this report that has
+                // to be unmissable: a NULL DACL grants every caller everything.
+                (_, false) => {
+                    let _ = writeln!(
+                        out,
+                        "    [!] no DACL: every caller is granted every access to this device"
+                    );
+                }
+                (None, true) => {
+                    let _ = writeln!(
+                        out,
+                        "    [!] a DACL is present and this could not read it, so who may open                          this device is unanswered"
+                    );
+                }
+                (Some(dacl), true) => render_acl(&mut out, "DACL", dacl),
+            }
+            if let Some(sacl) = &security.sacl {
+                render_acl(&mut out, "SACL", sacl);
+            }
+        }
+        (None, Some(why)) => {
+            let _ = writeln!(out, "  [!] {why}");
+        }
+        // Neither, which the report builder does not produce -- said rather than rendered as a
+        // device with no gate, because that is the reading to never print by accident.
+        (None, None) => {
+            let _ = writeln!(out, "  [!] nothing was read about this device's security");
+        }
+    }
+
+    match report.link_search {
+        crate::structured::LinkSearch::Unavailable => {
+            let _ = writeln!(
+                out,
+                "  [!] {} could not be listed, so nothing here says whether this device is                  reachable from user mode",
+                report.link_directory
+            );
+        }
+        search => {
+            if report.links.is_empty() {
+                let _ = writeln!(
+                    out,
+                    "  No symbolic link in {} points at this device",
+                    report.link_directory
+                );
+            } else {
+                let _ = writeln!(out, "  Reachable as:");
+                for link in &report.links {
+                    let _ = writeln!(out, "    {}  -> {}", link.path, link.target);
+                }
+            }
+            if report.links_unread > 0 {
+                let _ = writeln!(
+                    out,
+                    "  [!] {} link(s) in {} could not be read, so any of them may reach this \
+                     device",
+                    report.links_unread, report.link_directory
+                );
+            }
+            if matches!(search, crate::structured::LinkSearch::Partial) {
+                let _ = writeln!(
+                    out,
+                    "  [!] the search of {} stopped part-way, so this is some of the links rather                      than all of them",
+                    report.link_directory
+                );
+            }
+        }
+    }
+    if let Some(stopped) = &report.stopped {
+        let _ = writeln!(
+            out,
+            "  [!] stopped early ({})",
+            match stopped {
+                crate::structured::WalkHalt::Deadline => "the call's clock ran out",
+                crate::structured::WalkHalt::Interrupted => "interrupted",
+            }
+        );
+    }
+    out
+}
+
+fn render_acl(out: &mut String, what: &str, acl: &crate::structured::AccessControlList) {
+    use std::fmt::Write as _;
+    let short = match acl.entries.len() < acl.ace_count {
+        true => format!(", {} listed", acl.entries.len()),
+        false => String::new(),
+    };
+    let _ = writeln!(out, "    {what}  {} ACE(s){short}", acl.ace_count);
+    for entry in &acl.entries {
+        let _ = writeln!(
+            out,
+            "      {:<6} {:<28} {}  {}",
+            entry.kind,
+            entry
+                .account
+                .clone()
+                .or_else(|| entry.sid.clone())
+                .unwrap_or_else(|| "<no principal>".to_string()),
+            entry.mask,
+            entry.rights.join(" ")
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,6 +601,299 @@ mod tests {
         assert_eq!(
             read_device(AT, layout(), |_, _| Some(vec![0u8; 0x20])),
             Err(DeviceError::Unreadable { at: AT, len: 0x150 })
+        );
+    }
+
+    /// A device as [`Found`] would carry it, with everything benign, so each test below moves
+    /// exactly the one thing it is about.
+    fn found() -> Found {
+        Found {
+            device: "\\Device\\MountPointManager".to_string(),
+            followed_link: None,
+            address: AT,
+            type_confirmed: true,
+            fields: Device {
+                device_type: 0x2d,
+                characteristics: FILE_DEVICE_SECURE_OPEN,
+                secure_open: true,
+                exclusive: false,
+                flags: 0x40,
+                driver: 0xffff_b000_0000_0000,
+            },
+            security: Security::Read {
+                at: 0xffff_8680_fc69_12a0,
+                descriptor: descriptor(Some(acl(vec![ace(
+                    crate::sd::AceKind::Allow,
+                    "S-1-1-0",
+                    Some("Everyone"),
+                    0x0012_00a0,
+                )]))),
+            },
+            link_directory: "\\GLOBAL??".to_string(),
+            links: vec![Link {
+                path: "\\GLOBAL??\\MountPointManager".to_string(),
+                target: "\\Device\\MountPointManager".to_string(),
+            }],
+            link_search: crate::structured::LinkSearch::Complete,
+            links_examined: Some(400),
+            links_unread: 0,
+            stopped: None,
+        }
+    }
+
+    fn ace(
+        kind: crate::sd::AceKind,
+        sid: &str,
+        name: Option<&'static str>,
+        mask: u32,
+    ) -> crate::sd::Ace {
+        crate::sd::Ace {
+            kind,
+            ace_type: match kind {
+                crate::sd::AceKind::Allow => 0,
+                crate::sd::AceKind::Deny => 1,
+                _ => 2,
+            },
+            flags: 0,
+            mask,
+            sid: Some(crate::sd::Sid {
+                text: sid.to_string(),
+                name,
+            }),
+        }
+    }
+
+    fn acl(aces: Vec<crate::sd::Ace>) -> crate::sd::Acl {
+        crate::sd::Acl {
+            revision: 2,
+            ace_count: aces.len(),
+            aces,
+        }
+    }
+
+    /// A self-relative descriptor with `SE_DACL_PRESENT` set exactly when it has a DACL, which is
+    /// what makes the NULL-DACL test below about the control bit rather than about a missing field.
+    fn descriptor(dacl: Option<crate::sd::Acl>) -> crate::sd::Descriptor {
+        crate::sd::Descriptor {
+            revision: 1,
+            control: match dacl {
+                Some(_) => 0x8004,
+                None => 0x8000,
+            },
+            owner: Some(crate::sd::Sid {
+                text: "S-1-5-32-544".to_string(),
+                name: Some("Administrators"),
+            }),
+            group: None,
+            dacl,
+            sacl: None,
+        }
+    }
+
+    /// **Two paths naming one object, and two that do not.** The object manager is
+    /// case-insensitive and a trailing separator is a caller's habit -- but a *prefix* is a
+    /// different object, and matching one as this device would report a volume as reachable under
+    /// a name that opens a file on it.
+    #[test]
+    fn a_link_target_matches_the_device_it_names_and_not_the_one_it_is_inside() {
+        assert!(same_object_path(
+            "\\Device\\MountPointManager",
+            "\\DEVICE\\MOUNTPOINTMANAGER"
+        ));
+        assert!(same_object_path(
+            "\\Device\\MountPointManager\\",
+            "\\Device\\MountPointManager"
+        ));
+        assert!(
+            !same_object_path(
+                "\\Device\\MountPointManager\\sub",
+                "\\Device\\MountPointManager"
+            ),
+            "a link into the device is not a link to it"
+        );
+        assert!(
+            !same_object_path(
+                "\\Device\\MountPointManagerExtra",
+                "\\Device\\MountPointManager"
+            ),
+            "nor is a longer name beginning with it"
+        );
+    }
+
+    /// The fields a caller branches on come through as fields, and the principal comes through
+    /// twice: as the SID it is and as the account it reads as.
+    #[test]
+    fn the_report_carries_the_gate_as_values() {
+        let report = structured_report(&found());
+        assert_eq!(
+            (
+                report.device.as_str(),
+                report.secure_open,
+                report.exclusive,
+                report.characteristics.as_str(),
+                report.flags.as_str()
+            ),
+            (
+                "\\Device\\MountPointManager",
+                true,
+                false,
+                "0x00000100",
+                "0x00000040"
+            )
+        );
+        let dacl = report
+            .security
+            .as_ref()
+            .and_then(|security| security.dacl.as_ref())
+            .expect("the fixture has a DACL");
+        let entry = &dacl.entries[0];
+        assert_eq!(
+            (
+                entry.kind.as_str(),
+                entry.sid.as_deref(),
+                entry.account.as_deref(),
+                entry.mask.as_str()
+            ),
+            ("allow", Some("S-1-1-0"), Some("Everyone"), "0x001200a0")
+        );
+        assert_eq!(
+            (entry.reads, entry.writes),
+            (false, false),
+            "0x1200a0 carries neither FILE_READ_DATA nor FILE_WRITE_DATA, which is the join to an \
+             IOCTL map and has to be read off the mask rather than off the word `allow`"
+        );
+    }
+
+    /// **A NULL DACL is the most permissive object there is, and it is read off the control bit.**
+    /// A descriptor whose DACL offset is zero *with* `SE_DACL_PRESENT` set is a different object
+    /// from one without the bit, and reporting the first as "no DACL found" would describe a
+    /// device that grants everyone everything as one this could not read.
+    #[test]
+    fn a_null_dacl_is_reported_as_granting_everyone_everything() {
+        let mut found = found();
+        found.security = Security::Read {
+            at: 0xffff_8680_fc69_12a0,
+            descriptor: descriptor(None),
+        };
+        let report = structured_report(&found);
+        assert!(
+            !report
+                .security
+                .as_ref()
+                .expect("the descriptor read")
+                .dacl_present
+        );
+        let text = render(&report);
+        assert!(
+            text.contains("every caller is granted every access"),
+            "{text}"
+        );
+
+        // And a DACL that *is* present and could not be read says the opposite thing: who may open
+        // this is unanswered, not unrestricted.
+        let mut present = descriptor(None);
+        present.control = 0x8004;
+        found.security = Security::Read {
+            at: 0xffff_8680_fc69_12a0,
+            descriptor: present,
+        };
+        let text = render(&structured_report(&found));
+        assert!(text.contains("could not read it"), "{text}");
+        assert!(
+            !text.contains("every caller is granted every access"),
+            "an unread DACL is not a NULL one: {text}"
+        );
+    }
+
+    /// **An object with no descriptor and a descriptor that would not read are different facts.**
+    /// A kernel minidump answers the second for every object in it, and reporting that as a device
+    /// nothing guards is the one reading this must never produce.
+    #[test]
+    fn a_descriptor_that_will_not_read_is_not_a_device_with_no_descriptor() {
+        let mut found = found();
+        found.security = Security::Absent;
+        let absent = structured_report(&found);
+        assert!(absent.security.is_none());
+        assert!(
+            absent
+                .security_absent
+                .as_deref()
+                .expect("a reason")
+                .contains("carries no security descriptor")
+        );
+
+        found.security = Security::Failed {
+            at: 0xffff_8680_fc69_12a0,
+            why: crate::sd::SdError::Unreadable {
+                at: 0xffff_8680_fc69_12a0,
+                len: 20,
+            },
+        };
+        let failed = structured_report(&found);
+        assert!(failed.security.is_none());
+        let why = failed.security_absent.as_deref().expect("a reason");
+        assert!(why.contains("could not be read"), "{why}");
+        assert!(
+            !why.contains("carries no security descriptor"),
+            "the two outcomes must not read alike: {why}"
+        );
+    }
+
+    /// **A short list of links must not read as a complete one.** An empty list under
+    /// `Complete` is a fact -- nothing reaches this device; under anything else it is an absence,
+    /// and the difference is what decides whether a device looks unreachable from user mode.
+    #[test]
+    fn a_link_search_that_saw_less_than_the_directory_says_so() {
+        let complete = render(&structured_report(&Found {
+            links: vec![],
+            ..found()
+        }));
+        assert!(
+            complete.contains("No symbolic link in"),
+            "a completed search that found none says so plainly: {complete}"
+        );
+        assert!(!complete.contains("[!]"), "and warns about nothing");
+
+        let partial = render(&structured_report(&Found {
+            links: vec![],
+            link_search: crate::structured::LinkSearch::Partial,
+            stopped: Some(crate::walk::Halt::Deadline),
+            ..found()
+        }));
+        assert!(partial.contains("stopped part-way"), "{partial}");
+
+        let unavailable = render(&structured_report(&Found {
+            links: vec![],
+            link_search: crate::structured::LinkSearch::Unavailable,
+            links_examined: None,
+            ..found()
+        }));
+        assert!(unavailable.contains("could not be listed"), "{unavailable}");
+        assert!(
+            !unavailable.contains("No symbolic link in"),
+            "a directory nobody listed says nothing about links: {unavailable}"
+        );
+
+        let unread = render(&structured_report(&Found {
+            links: vec![],
+            links_unread: 3,
+            ..found()
+        }));
+        assert!(unread.contains("3 link(s)"), "{unread}");
+    }
+
+    /// The one line a reader is most likely to act on is said where it is true, rather than left
+    /// to be inferred from an absent word.
+    #[test]
+    fn a_device_opened_relatively_is_called_out_rather_than_left_unsaid() {
+        let mut relative = found();
+        relative.fields.characteristics = 0;
+        relative.fields.secure_open = false;
+        let text = render(&structured_report(&relative));
+        assert!(text.contains("no FILE_DEVICE_SECURE_OPEN"), "{text}");
+        assert!(
+            !render(&structured_report(&found())).contains("no FILE_DEVICE_SECURE_OPEN"),
+            "and not where it is false"
         );
     }
 
