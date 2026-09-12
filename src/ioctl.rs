@@ -2002,13 +2002,31 @@ impl Status {
 ///
 /// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
 /// here, and [`refuses_in`] is what follows that jump.
-fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> Ending {
+fn failure_block(
+    instructions: &[Instruction],
+    layout: Layout,
+    arrived: &Facts,
+    incoming: Status,
+) -> Ending {
     // **Read where the store is, not where the block starts.** Whether a destination is
     // `Irp->IoStatus.Status` is a question about a register, and a block is free to reuse one: a
     // `rbx` that arrives holding the IRP and is reassigned to a diagnostic object before the store
     // would otherwise have that store read as a refusal, taking a handler away from a code the
     // driver accepts. Same rule, and same replay, as a jump table's base.
-    let mut facts = arrived.clone();
+    //
+    // **The status starts where this walk starts, and not where the block's facts do.** A refusal
+    // is a verdict, and a status the block *arrived* with does not support one: a dispatch routine
+    // that puts `STATUS_INVALID_DEVICE_REQUEST` in the IRP before it decides anything and lets
+    // each case overwrite it is an ordinary shape, and reading that as every case refusing takes
+    // the handler away from every code the driver accepts. What the arrived status still does is
+    // stop this claiming **acceptance**: `error_status` reads the case's own facts, which do carry
+    // it, so such a case comes back undecided rather than wrong in either direction. A status
+    // carried over an unconditional **tail jump** is different and is passed in here: that is one
+    // path continuing, not a fact established before the routine chose.
+    let mut facts = Facts {
+        status: incoming,
+        ..arrived.clone()
+    };
     let mut traced = false;
     for instruction in instructions {
         // What the block has established **so far**, which is what says whether the call it is
@@ -2067,6 +2085,8 @@ fn refuses_in(
 ) -> bool {
     let mut at = index;
     let mut start = from;
+    // The status this walk has established so far, which starts at nothing: see `failure_block`.
+    let mut status = Status::default();
     // What the block before this one left, once there has been one. **Carried rather than looked
     // up**: a tail edge is one path into a shared block, and that block's entry facts are what
     // *every* path into it agreed on -- so a case that copies the IRP into a register before
@@ -2092,10 +2112,11 @@ fn refuses_in(
             },
             (None, None) => entry.get(at).cloned().flatten().unwrap_or_default(),
         };
-        let ending = failure_block(instructions, layout, &facts);
+        let ending = failure_block(instructions, layout, &facts, status);
         if ending.refuses {
             return true;
         }
+        status = ending.facts.status;
         carried = Some(ending.facts);
         // Only an unconditional tail jump is followed: a block that decides something is deciding
         // it, and whatever it reaches is not simply this block's answer.
@@ -7628,19 +7649,24 @@ mod tests {
         );
     }
 
-    /// A status established **before** the branch reaches the case that branch selects.
+    /// A status established **before** the branch leaves the case that branch selects undecided.
     ///
-    /// A routine that stores the error into the IRP and then decides -- `mov [rbx+30h],0C0000010h`
-    /// / `cmp code,N` / `je complete` -- has the store in one block and the completion in another.
-    /// Reading the second alone sees a block that calls something and returns success, so the case
-    /// comes back accepted with the completion routine as its handler, while the IRP it completed
-    /// carries an error.
+    /// `mov [rbx+30h],0C0000010h` / `cmp code,N` / `je complete` puts the store in one block and
+    /// the completion in another. Reading the second alone sees a block that calls something and
+    /// returns success, and answers **accepted** with the completion routine as its handler --
+    /// while the IRP it completed carries an error.
     ///
-    /// The status is a fact about the path now, so it crosses that edge the way a register's value
-    /// does -- and **joins** the way one does, which is the third half of this: a path that reaches
-    /// the same compare without passing the store leaves the block knowing nothing about it.
+    /// It is not a refusal either, and that is the half this test exists to pin. Storing a default
+    /// failure into the IRP before deciding and letting each case overwrite it is an ordinary
+    /// shape, so a verdict of "refused" here takes the handler away from every code the driver
+    /// accepts. The status crosses the edge as **evidence**: enough to stop this claiming
+    /// acceptance, not enough to claim the opposite.
+    ///
+    /// And it **joins** the way a register's value does, which is the third half: a path that
+    /// reaches the same compare without passing the store leaves the block knowing nothing at all,
+    /// and the case is accepted again.
     #[test]
-    fn a_status_set_before_the_branch_reaches_the_case_it_selects() {
+    fn a_status_set_before_the_branch_leaves_the_case_it_selects_undecided() {
         const JOIN: u64 = DISPATCH + 0x1a;
         const COMPLETE: u64 = DISPATCH + 0x40;
         let refusing = |stored: bool, skipping: bool| {
@@ -7711,8 +7737,8 @@ mod tests {
 
         assert_eq!(
             refusing(true, false),
-            (Some(false), None),
-            "the IRP this completes carries the error the block before it stored"
+            (None, Some(0x7000)),
+            "the IRP this completes carries the error the block before it stored, which is not              enough to call the case refused and is too much to call it accepted"
         );
         assert_eq!(
             refusing(false, false),
@@ -7809,8 +7835,8 @@ mod tests {
         );
         assert_eq!(
             refusing(Put::Irp),
-            (Some(false), None),
-            "and a call writes no field of the IRP, so that one still stands"
+            (None, Some(0x7000)),
+            "a call writes no field of the IRP, so that status still stands -- as evidence, since              it was established before this case was chosen rather than by it"
         );
         assert_eq!(
             refusing(Put::Reloaded),
@@ -7943,8 +7969,8 @@ mod tests {
 
         assert_eq!(
             refusing(true),
-            vec![(Some(false), None), (None, Some(0x7100))],
-            "the code that returns completes an IRP carrying the error stored before the switch,              and the one that leaves for a block which decides something is undecided rather than              accepted -- both from the same status, read in the two places a case reads one"
+            vec![(None, Some(0x7000)), (None, Some(0x7100))],
+            "both codes complete an IRP carrying the error stored before the switch, which stops              this calling either accepted -- one reached through the block's own return and the              other through a block that decides something, which is the two places a case reads a              status"
         );
         assert_eq!(
             refusing(false),
