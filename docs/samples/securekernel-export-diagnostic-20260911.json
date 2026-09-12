@@ -3,7 +3,7 @@
   "cve": "CVE-2026-83498",
   "scope": "Static exporter coverage diagnosis, not CVE attribution",
   "companion_commit": "19844b59fa595378480f418e2ddd1260a312d911",
-  "diagnostic_source": "securekernel-export-diagnostic-20260911.py",
+  "diagnostic_source": "securekernel-export-diagnostic-20260911-recorded.py.txt",
   "diagnostic_source_sha256": "8922f002c41b27dd5931a576bbabe41f2cb6594fd5ef068d9ec98a6a8a06f628",
   "raw_diagnostic_sha256": "34fa96dda9e8c19db1ff0cd9fb8c8e5e9a77013bd84a4d0c1bf4195092bed6be",
   "normalization": "Temporary acquisition prefix removed; opaque binary IDs replaced by reference/target. Binaries snapshot precedes update_analysis_and_wait; per-function observations and export were collected after it.",

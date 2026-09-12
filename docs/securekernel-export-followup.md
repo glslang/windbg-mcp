@@ -25,8 +25,14 @@ records each function's name, bounds, bytes, empty instruction list, and absent
 exported flow graph, together with the input hashes and normal GUI exit. Its
 binary-list snapshot precedes analysis completion; the per-function and export
 observations were collected after `update_analysis_and_wait`. The
-[executed probe](samples/securekernel-export-diagnostic-20260911.py) is retained
-with its source hash. The earlier full comparison remains preserved in the
+[recorded source](samples/securekernel-export-diagnostic-20260911-recorded.py.txt)
+is retained byte-for-byte with its source hash as a text archive, not a runnable
+reproduction tool. It assumes a disposable GUI: it does not check for existing
+views before opening inputs and requests application Quit even after a diagnostic
+failure. For new comparison captures, use the maintained
+[capture helper](../skills/msrc-patch-diff/scripts/gui_capture.py), whose `start()`
+checks for an empty GUI on the UI thread before scheduling work and defaults to
+`quit_on_finish=False`. The earlier full comparison remains preserved in the
 [ARM64 acceptance record](cve-patch-diff-acceptance.md#arm64-generation-follow-up--2026-09-10).
 
 ## Validation scope
