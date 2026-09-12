@@ -44,7 +44,9 @@ async def cleanup_debugger(call, local, remote, comparison, session, initial, re
         try:
             if name == 'session_status':
                 final = await call(client, name, args, label='sessions_after')
-                if final['sessions'] != initial['sessions']:
+                before_ids = sorted(item['session_id'] for item in initial['sessions'])
+                after_ids = sorted(item['session_id'] for item in final['sessions'])
+                if after_ids != before_ids:
                     raise ValueError('session inventory was not restored')
                 report['session_inventory_restored'] = True
             else:
@@ -67,6 +69,8 @@ def finish_gui(plugin, FileContext, application, ui_context, report, save):
 
     def listener_state():
         report['listener_thread_alive_after_shutdown'] = plugin.listener.thread.is_alive()
+        if report['listener_thread_alive_after_shutdown']:
+            raise RuntimeError('listener thread survived shutdown')
 
     def clear_modified():
         for context in FileContext.getOpenFileContexts():

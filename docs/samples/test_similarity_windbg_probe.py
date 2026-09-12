@@ -14,6 +14,47 @@ spec.loader.exec_module(probe)
 
 
 class CleanupTests(unittest.IsolatedAsyncioTestCase):
+    async def test_inventory_compares_session_ids_and_detects_membership_changes(self):
+        initial = {
+            "sessions": [
+                {"session_id": "first", "age_ms": 100, "in_state_for_ms": 10},
+                {"session_id": "second", "age_ms": 200, "in_state_for_ms": 20},
+            ]
+        }
+        updated = [
+            {"session_id": "second", "age_ms": 1200, "in_state_for_ms": 1020},
+            {"session_id": "first", "age_ms": 1100, "in_state_for_ms": 1010},
+        ]
+        for sessions, restored in (
+            (updated, True),
+            (list(reversed(updated)), True),
+            (list(reversed(initial["sessions"])), True),
+            (updated + [{"session_id": "owned"}], False),
+            (updated[:1], False),
+            ([updated[0], {"session_id": "replacement"}], False),
+        ):
+            with self.subTest(sessions=sessions):
+                report = {"ok": True}
+                call = AsyncMock(return_value={"sessions": sessions})
+                await probe.cleanup_debugger(
+                    call, "local", "remote", None, "owned", initial, report
+                )
+                self.assertEqual(report["ok"], restored)
+                self.assertEqual(report["session_inventory_restored"], restored)
+                call.assert_any_await("remote", "end_session", {"session_id": "owned"})
+                self.assertEqual(
+                    [
+                        c.args[2]
+                        for c in call.await_args_list
+                        if c.args[1] == "end_session"
+                    ],
+                    [{"session_id": "owned"}],
+                )
+                if not restored:
+                    self.assertEqual(
+                        report["cleanup_errors"][0]["stage"], "session_status"
+                    )
+
     async def test_launch_outcomes_release_only_the_returned_owned_session(self):
         outcomes = [
             ({"status": "ok", "session_id": "owned"}, False, "owned"),
@@ -51,7 +92,9 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
                         )
                     )
                 )
-                cleanup = AsyncMock(return_value={"sessions": ["preexisting"]})
+                cleanup = AsyncMock(
+                    return_value={"sessions": [{"session_id": "preexisting"}]}
+                )
                 saved_handles = []
 
                 def save(report=report, saved_handles=saved_handles):
@@ -75,7 +118,7 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
                         remote,
                         "comparison",
                         report.get("owned_session"),
-                        {"sessions": ["preexisting"]},
+                        {"sessions": [{"session_id": "preexisting"}]},
                         report,
                     )
                 self.assertEqual(failure is not None, data["status"] == "error")
@@ -109,7 +152,11 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
                     calls.append((client, name, args))
                     if failure in (name, "all"):
                         raise ValueError("cleanup failure: " + name)
-                    return {"sessions": ["other"] if failure == "inventory" else []}
+                    return {
+                        "sessions": [{"session_id": "other"}]
+                        if failure == "inventory"
+                        else []
+                    }
 
                 with self.assertRaises(RuntimeError) as caught:
                     try:
@@ -145,10 +192,16 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
 
         async def call(client, name, args=None, **kwargs):
             calls.append(name)
-            return {"sessions": ["preexisting"]}
+            return {"sessions": [{"session_id": "preexisting"}]}
 
         await probe.cleanup_debugger(
-            call, "local", "remote", None, None, {"sessions": ["preexisting"]}, report
+            call,
+            "local",
+            "remote",
+            None,
+            None,
+            {"sessions": [{"session_id": "preexisting"}]},
+            report,
         )
         self.assertEqual(calls, ["unpair_windbg", "session_status"])
         self.assertTrue(report["ok"])

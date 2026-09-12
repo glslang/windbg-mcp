@@ -22,7 +22,7 @@ handoff_spec.loader.exec_module(handoff_probe)
 
 
 class FinalizationTests(unittest.TestCase):
-    def finish(self, failure=None, modal=False, handoff=False):
+    def finish(self, failure=None, modal=False, handoff=False, listener_alive=False):
         report = {"ok": True, "error": "original capture failure"}
         events = []
 
@@ -55,7 +55,9 @@ class FinalizationTests(unittest.TestCase):
         application = SimpleNamespace(aboutToQuit=SimpleNamespace(connect=connect))
         plugin = SimpleNamespace(
             shutdown=lambda: stage("plugin_shutdown"),
-            listener=SimpleNamespace(thread=SimpleNamespace(is_alive=lambda: False)),
+            listener=SimpleNamespace(
+                thread=SimpleNamespace(is_alive=lambda: listener_alive)
+            ),
         )
         save = Mock(side_effect=lambda: stage("save"))
         if handoff:
@@ -77,6 +79,18 @@ class FinalizationTests(unittest.TestCase):
             save,
         )
         return report, events, view
+
+    def test_live_listener_fails_acceptance_but_still_attempts_quit(self):
+        for handoff in (False, True):
+            with self.subTest(handoff=handoff):
+                report, events, view = self.finish(handoff=handoff, listener_alive=True)
+                self.assertTrue(report["listener_thread_alive_after_shutdown"])
+                self.assertFalse(report["ok"])
+                self.assertEqual(report["cleanup_errors"][0]["stage"], "listener_state")
+                self.assertEqual(report["error"], "original capture failure")
+                self.assertFalse(view.file.modified)
+                self.assertIn("quit", events)
+                self.assertTrue(report["application_about_to_quit"])
 
     def test_handoff_shutdown_errors_still_attempt_guarded_quit(self):
         for failure in (None, "plugin_shutdown", "quit_hook", "save"):

@@ -96,6 +96,9 @@ The reproduction probe now attempts unpairing, comparison closure, owned-session
 termination, and inventory verification independently. Cleanup errors set `ok` to
 false and are recorded by stage without replacing the original capture failure.
 A failed inventory read or mismatch leaves `session_inventory_restored` false.
+Inventory checks compare session IDs regardless of ordering or changing age/state
+metadata; an added, missing, or replaced session still fails the check. They do
+not assert that unrelated sessions remained in the same execution state.
 Launch responses retain the owned session before recording or checking success,
 including `error.session_id` when `target` is `yes` (post-commit failure) or `pending`
 (timeout). The final cleanup therefore ends that session even when launch raises;
@@ -104,6 +107,8 @@ GUI finalization also attempts plugin shutdown, listener inspection, view cleanu
 quit-hook registration, and guarded Quit independently. The modal-dialog and
 valid-action guards remain enforced. The reproduction probe refuses optimized
 Python (`-O`/`-OO`), which would disable its guards and acceptance assertions.
+A listener still alive after shutdown marks cleanup unsuccessful while later
+GUI cleanup stages, including guarded Quit, are still attempted.
 
 The [offline regression](samples/test_similarity_windbg_probe.py) injects failures
 in each cleanup call, simultaneous failures, and an inventory mismatch; it also
