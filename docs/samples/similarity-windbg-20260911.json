@@ -13,8 +13,8 @@
     "transport": "authenticated loopback MCP through an owned SSH tunnel"
   },
   "source_sha256": {
-    "docs/samples/similarity-windbg-probe-20260911.py": "20c9cc0a54c7d6afb5b2894ceb6ac2e37859bab00fdd638dce15741e51b19fdf",
-    "docs/samples/similarity-windbg-fixture-20260911.rs": "8824cee3c8c159f168a7942398550b8d573a3d441ffdc7dd05d57be7157f088c"
+    "docs/samples/similarity-windbg-fixture-20260911.rs": "8824cee3c8c159f168a7942398550b8d573a3d441ffdc7dd05d57be7157f088c",
+    "docs/samples/similarity-windbg-probe-20260911-recorded.py": "20c9cc0a54c7d6afb5b2894ceb6ac2e37859bab00fdd638dce15741e51b19fdf"
   },
   "companion_sha256": {
     "binja_windbg_mcp/adapter.py": "f46bd4f3bd1d30a1710146bc9e09fdc025611393c389062d70096b4df475a6d3",
