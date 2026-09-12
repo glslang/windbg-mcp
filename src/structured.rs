@@ -2498,6 +2498,13 @@ pub struct IoctlMap {
     /// Why the walk stopped early, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<WalkHalt>,
+    /// How many of `case_count` tested a value that was **not** traced to the IRP.
+    ///
+    /// Exact past the cap, as the count is. A figure taken from the cases that were kept reads
+    /// `0 of 4096` under a `code_proved: false` that fired because the one the cap dropped was the
+    /// unproved one, which is a result contradicting itself.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub unproved: usize,
     /// True when a bound ended a list early — the cases, or one table's entries.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cap_hit: bool,
