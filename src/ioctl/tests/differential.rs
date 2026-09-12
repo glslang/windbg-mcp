@@ -17,6 +17,14 @@
 //! routes somewhere the map never mentions is the module working as described. What must never
 //! happen is the map naming a code, or a destination, that the machine does not agree with.
 //!
+//! **Where this file lives is load-bearing.** It is a child of `ioctl`'s test module, so it is at
+//! `src/ioctl/tests/differential.rs` and is declared with an ordinary `mod differential;`. The
+//! first spelling reached it with `#[path = "../../ioctl_differential.rs"]`, which resolves
+//! against a module directory that does not exist -- Windows canonicalises the `..` components
+//! before touching the filesystem and opens it, POSIX walks each one and does not. It built and
+//! tested green on this bench and would not have compiled on Linux, and CI's Rust jobs are Windows
+//! runners, so nothing here could have said so.
+//!
 //! **The interpreter shares no code with the walk**, which is the whole of its value. It reads the
 //! same [`Instruction`] values, and everything it does with them -- flags, memory, control flow --
 //! is written out again here. A helper reused from the pass under test would agree with that pass
@@ -24,6 +32,8 @@
 
 use std::collections::HashMap;
 
+// The fixture vocabulary -- `insn`, the operand builders, `DISPATCH`, `IMAGE_BASE` -- and, through
+// it, the module under test.
 use super::*;
 
 /// Where the fixture's IRP lives, and the stack location it points at.

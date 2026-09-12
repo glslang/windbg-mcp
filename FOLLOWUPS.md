@@ -959,7 +959,7 @@ where an instruction nobody anticipated falls out rather than falls through.
   changes that cost less and buy more: the decoder's write set
   ([dbgscope#155](https://github.com/glslang/dbgscope/issues/155)), which closes the
   implicit-destination family at the source, and the differential oracle in
-  `src/ioctl_differential.rs`, which is what would tell a rewrite it had not lost anything. Both are
+  `src/ioctl/tests/differential.rs`, which is what would tell a rewrite it had not lost anything. Both are
   in [#307](https://github.com/glslang/windbg-mcp/pull/307).
 - **What would close it:** `follow_table` replaced by a small set of named idioms — the one-table
   `lea`/`mov`/`add`/`jmp` form, the two-table dense switch, and the 32-bit `jmp [table+idx*4]` —
@@ -974,4 +974,4 @@ where an instruction nobody anticipated falls out rather than falls through.
 
 **Where it picks up.** `ioctl::follow_table` and `keeps_a_bound` in `src/ioctl.rs`, the fixtures
 around `a_two_table_switch_is_read_through_its_byte_map`, and the generated routines in
-`src/ioctl_differential.rs`, which is where a rewrite would be shown not to have lost a shape.
+`src/ioctl/tests/differential.rs`, which is where a rewrite would be shown not to have lost a shape.
