@@ -2399,6 +2399,13 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
 
 #[cfg(test)]
 mod tests {
+    //! The oracle that is not this pass lives beside these: `src/ioctl_differential.rs` runs the
+    //! same routines on a small concrete interpreter and checks every case this reports against
+    //! where execution actually went. It is a separate file because it shares nothing with the
+    //! code under test on purpose, and because this module is long enough.
+    #[path = "../../ioctl_differential.rs"]
+    mod differential;
+
     use super::*;
     use dbgscope::dbgeng::{MemoryOperand, RegisterOperand};
 
