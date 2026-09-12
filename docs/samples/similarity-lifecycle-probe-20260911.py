@@ -24,6 +24,8 @@ def finish_gui(timer, observer, plugin, FileContext, UIContext, application, ui_
 
     def listener_state():
         report['listener_thread_alive_after_shutdown'] = plugin.listener.thread.is_alive()
+        if report['listener_thread_alive_after_shutdown']:
+            raise RuntimeError('listener thread survived shutdown')
 
     def clear_modified():
         for context in FileContext.getOpenFileContexts():
