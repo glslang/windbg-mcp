@@ -196,6 +196,12 @@ pub(crate) struct Map {
     pub(crate) halted: Option<Halt>,
     /// True when a bound above ended something early.
     pub(crate) cap_hit: bool,
+    /// How many of [`Self::case_count`] tested a value that was not traced to the IRP.
+    ///
+    /// Exact past the cap, as the count is: a figure taken from the cases that were **kept** reads
+    /// `0 of 4096` under a warning that fired because the four thousand and ninety-seventh was the
+    /// unproved one.
+    pub(crate) unproved: usize,
     /// True when the block walk ran out of sweeps before the facts stopped moving.
     ///
     /// Everything that depends on a fact is **discarded** in that state rather than reported, so
@@ -471,7 +477,7 @@ fn map_within(
     // block is walked.
     let mut cases: Vec<Case> = Vec::new();
     let mut case_count = 0usize;
-    let mut all_proved = true;
+    let mut unproved = 0usize;
     let mut tables: Vec<Table> = Vec::new();
     let mut unresolved: Vec<u64> = Vec::new();
     let mut traced = false;
@@ -510,7 +516,7 @@ fn map_within(
                 run,
                 &mut cases,
                 &mut case_count,
-                &mut all_proved,
+                &mut unproved,
                 &mut cap_hit,
                 &mut tables,
                 &mut unresolved,
@@ -534,7 +540,7 @@ fn map_within(
             run,
             &mut cases,
             &mut case_count,
-            &mut all_proved,
+            &mut unproved,
             &mut cap_hit,
             &mut tables,
             &mut unresolved,
@@ -564,13 +570,16 @@ fn map_within(
     // different answer from one read with the block's own.
     let refusals: std::cell::RefCell<HashMap<(usize, bool), bool>> =
         std::cell::RefCell::new(HashMap::new());
-    let refuses_at = |at: usize, blind: bool| {
-        let known = refusals.borrow().get(&(at, blind)).copied();
+    let refuses_at = |from: usize, blind: bool| {
+        let known = refusals.borrow().get(&(from, blind)).copied();
         if let Some(known) = known {
             return known;
         }
-        let answer = refuses_in(at, &graph, block, layout, &entry, blind);
-        refusals.borrow_mut().insert((at, blind), answer);
+        let answer = match graph.holding(from) {
+            Some(at) => refuses_in(at, from, &graph, block, layout, &entry, blind),
+            None => false,
+        };
+        refusals.borrow_mut().insert((from, blind), answer);
         answer
     };
     for case in &mut cases {
@@ -584,7 +593,15 @@ fn map_within(
             halted = Some(why);
             break;
         }
-        let Some(at) = index_of.get(&case.lands).and_then(|&at| graph.holding(at)) else {
+        // **Read from where it lands, not from where its block begins.** A landing is a block's
+        // first instruction only when some *edge* goes there, and a jump table's does not -- so
+        // two entries into one shared tail both sit inside a block that starts above them, and
+        // reading the block whole gives each of them instructions the other's path executes:
+        // another case's handler, or a refusal neither reaches.
+        let Some(&from) = index_of.get(&case.lands) else {
+            continue;
+        };
+        let Some(at) = graph.holding(from) else {
             continue;
         };
         // **A jump-table case arrives along an edge this graph does not have.** Its blocks and
@@ -603,10 +620,10 @@ fn map_within(
             Recovery::JumpTable => Facts::default(),
             Recovery::Compare => entry[at].clone().unwrap_or_default(),
         };
-        let instructions = &block[graph.blocks[at].start..graph.blocks[at].end];
+        let instructions = &block[from..graph.blocks[at].end];
         case.handler = handler_in(instructions);
         let blind = case.recovered == Recovery::JumpTable;
-        let refuses = refuses_at(at, blind);
+        let refuses = refuses_at(from, blind);
         case.accepted = match (
             refuses,
             case.handler,
@@ -624,8 +641,7 @@ fn map_within(
         let (input, output) = sizes_in(instructions, &facts, layout, &|address| {
             index_of
                 .get(&address)
-                .and_then(|&at| graph.holding(at))
-                .is_some_and(|at| refuses_at(at, false))
+                .is_some_and(|&from| refuses_at(from, false))
         });
         case.in_size = input;
         case.out_size = output;
@@ -638,7 +654,8 @@ fn map_within(
         // borrow the second's credibility -- and the first is exactly the one a reader needs
         // warning about. With no cases at all this says whether the code was read, which is what
         // makes an empty answer readable.
-        code_proved: traced && all_proved,
+        code_proved: traced && unproved == 0,
+        unproved,
         cases,
         case_count,
         tables,
@@ -682,7 +699,7 @@ fn record(
     run: Run,
     cases: &mut Vec<Case>,
     case_count: &mut usize,
-    all_proved: &mut bool,
+    unproved: &mut usize,
     cap_hit: &mut bool,
     tables: &mut Vec<Table>,
     unresolved: &mut Vec<u64>,
@@ -697,7 +714,7 @@ fn record(
         push_case(
             cases,
             case_count,
-            all_proved,
+            unproved,
             cap_hit,
             code,
             Recovery::Compare,
@@ -711,7 +728,7 @@ fn record(
             push_case(
                 cases,
                 case_count,
-                all_proved,
+                unproved,
                 cap_hit,
                 code,
                 Recovery::JumpTable,
@@ -927,7 +944,7 @@ fn simulate(
 fn push_case(
     cases: &mut Vec<Case>,
     count: &mut usize,
-    all_proved: &mut bool,
+    unproved: &mut usize,
     cap_hit: &mut bool,
     code: u64,
     recovered: Recovery,
@@ -943,8 +960,12 @@ fn push_case(
     *count += 1;
     // **Every case found, not every case kept.** `code_proved` is about the whole routine and
     // `case_count` stays exact past the cap, so reading provenance off the retained prefix would
-    // report a map as wholly traced while counting a case that came from the bare displacement.
-    *all_proved &= proved;
+    // report a map as wholly traced while counting a case that came from the bare displacement --
+    // and counted rather than flagged, because the answer says *how many* and a figure taken from
+    // the retained list contradicts the flag it is printed under.
+    if !proved {
+        *unproved += 1;
+    }
     if cases.len() >= MAX_CASES {
         *cap_hit = true;
         return;
@@ -1224,11 +1245,17 @@ fn update(
 /// selects, and reading it as a bound reports every entry of that table as a code the driver
 /// accepts when execution can reach only one.
 ///
-/// The writes that are exempt are the table pattern's own, and only while they **read** the
-/// bounded register: a dense switch loads a byte map or a dword table *through* the index and
-/// leaves its result in the same register, which carries the bound forward rather than ending it.
-/// Anything else -- an arithmetic adjustment, a copy from elsewhere, a zeroing, a load indexed by
-/// something else -- takes it away.
+/// One write is exempt, and only while it **reads** the bounded register: MSVC's dense switch
+/// loads a **byte map** through the index and leaves the case number in the same register, and
+/// the dword table read after it is indexed by that -- so this one write carries the bound
+/// forward rather than ending it. Anything else -- an arithmetic adjustment, a copy from
+/// elsewhere, a zeroing, a load indexed by something else -- takes it away.
+///
+/// **The dword table's own load used to be exempt too, and is not.** It does not need to be: the
+/// bound is read at that load, before it executes, so what it leaves in the index is nobody's
+/// question. Exempt, it carried a bound over `mov rax,qword ptr [foo+rax*4]` -- a scale-4 load
+/// that is not a table entry -- and the switch after that was resolved to the slots a check on
+/// some earlier value admitted.
 ///
 /// **The `add` that folds an image base into a loaded entry used to be exempt too, and is not.**
 /// It happens *after* the load, so the bound it would have to survive is one nothing reads by
@@ -1247,7 +1274,7 @@ fn keeps_a_bound(instruction: &Instruction, register: &str) -> bool {
                 .index
                 .as_ref()
                 .is_some_and(|index| index.full == register);
-            through && ((memory.scale == 1 && memory.size.unwrap_or(1) == 1) || memory.scale == 4)
+            through && memory.scale == 1 && memory.size.unwrap_or(1) == 1
         }
         _ => false,
     }
@@ -1892,6 +1919,7 @@ fn failure_block(
 /// bounded to a few hops, since a chain longer than that is not an epilogue.
 fn refuses_in(
     index: usize,
+    from: usize,
     graph: &cfg::Graph,
     listing: &[Instruction],
     layout: Layout,
@@ -1899,10 +1927,13 @@ fn refuses_in(
     blind: bool,
 ) -> bool {
     let mut at = index;
+    let mut start = from;
     let mut status = Status::default();
     for hop in 0..3 {
         let block = &graph.blocks[at];
-        let instructions = &listing[block.start..block.end];
+        // The first block is read from the landing, which a jump table's need not be the start
+        // of; a tail jump is an edge, so every block after this one is entered at its own.
+        let instructions = &listing[start.max(block.start)..block.end];
         // The **first** block is the one a case landed in, and a case the table selected landed
         // there along an edge this graph does not have -- so it is read with nothing believed,
         // exactly as its sizes are. Every hop after that is a tail jump the graph *does* carry, so
@@ -1922,7 +1953,10 @@ fn refuses_in(
             .last()
             .is_some_and(|last| matches!(last.flow, Flow::Jmp(Some(_))));
         match (tail, block.successors.as_slice()) {
-            (true, [next]) => at = *next,
+            (true, [next]) => {
+                at = *next;
+                start = graph.blocks[at].start;
+            }
             _ => return false,
         }
     }
@@ -2138,6 +2172,7 @@ pub(crate) fn structured_report(
             Halt::Interrupted => crate::structured::WalkHalt::Interrupted,
         }),
         cap_hit: found.cap_hit,
+        unproved: found.unproved,
         unsettled: found.unsettled,
         blind: found.blind,
     }
@@ -2156,8 +2191,7 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
         out.push_str(&format!(
             "  [!] {} of {} case(s) tested a value taken from a displacement this could not trace \
              back to the IRP, so those compares may be about another structure\n",
-            report.cases.iter().filter(|case| !case.proved).count(),
-            report.cases.len()
+            report.unproved, report.case_count
         ));
     }
     if report.cases.is_empty() {
@@ -6570,6 +6604,224 @@ mod tests {
         );
     }
 
+    /// A case is read from **where it lands**, not from where its block begins.
+    ///
+    /// A landing is a block's first instruction only when some *edge* goes there, and a jump
+    /// table's does not -- so two entries into one shared tail both sit inside a block that starts
+    /// above them. Read whole, each gets instructions the other's path executes: the fixture's
+    /// first entry lands on a `call` that is its handler, and the second lands *past* it, so
+    /// reading from the block's start hands the second case the first one's routine.
+    #[test]
+    fn a_case_is_read_from_where_it_lands() {
+        const TABLE: i64 = 0x9000;
+        const FIRST: u64 = DISPATCH + 0x40;
+        const SECOND: u64 = DISPATCH + 0x4a;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x21,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2b, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            // One tail, entered at two points. Nothing branches to either, so the graph has one
+            // block starting at the first.
+            insn(
+                FIRST,
+                "call",
+                vec![Operand::Target(0x7000)],
+                Flow::Call(Some(0x7000)),
+            ),
+            insn(
+                SECOND,
+                "call",
+                vec![Operand::Target(0x7100)],
+                Flow::Call(Some(0x7100)),
+            ),
+            insn(SECOND + 5, "ret", Vec::new(), Flow::Return),
+        ]);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at).then(|| {
+                [(FIRST - IMAGE_BASE) as u32, (SECOND - IMAGE_BASE) as u32]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.handler))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc004, FIRST, Some(0x7000)),
+                (0x6dc005, SECOND, Some(0x7100)),
+            ],
+            "each entry reaches the routine at its own landing: {:?}",
+            found.cases
+        );
+    }
+
+    /// The dword table's own load does not carry a bound, because it does not need to.
+    ///
+    /// The bound is read **at** that load, before it executes, so what it leaves in the index is
+    /// nobody's question -- and exempting it carried a bound over
+    /// `mov rax,qword ptr [foo+rax*4]`, a scale-4 load that is not a table entry. The switch after
+    /// that was then resolved to the slots a check on some earlier value admitted. The byte map,
+    /// which really does feed the load that follows it, still carries one; the `a_two_table_switch`
+    /// fixture is what says so.
+    #[test]
+    fn a_scale_four_load_that_is_not_an_entry_ends_the_bound() {
+        const TABLE: i64 = 0x9000;
+        let through = |wide: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "cmp",
+                    vec![reg("eax"), imm(1)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x1a,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if wide {
+                // Eight bytes a slot: whatever this is, it is not the table's entries, and what
+                // it leaves in the index is not the number the check covered.
+                block.push(insn(
+                    DISPATCH + 0x21,
+                    "mov",
+                    vec![
+                        reg("rax"),
+                        indexed_sized(Some("rcx"), "rax", 0x8000, Some(8)),
+                    ],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0x28,
+                    "mov",
+                    vec![reg("edx"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x2f,
+                    "add",
+                    vec![reg("rdx"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x32, "jmp", vec![reg("rdx")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
+        let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        let straight = map(
+            DISPATCH,
+            &through(false),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+        assert_eq!(straight.cases.len(), 2, "{:?}", straight.cases);
+
+        served.set(0);
+        let indirect = map(
+            DISPATCH,
+            &through(true),
+            Layout::X64,
+            &read,
+            in_image,
+            never,
+        );
+
+        assert!(
+            indirect.cases.is_empty(),
+            "the index is whatever eight bytes of somebody's array said: {:?}",
+            indirect.cases
+        );
+        assert_eq!(indirect.unresolved, vec![DISPATCH + 0x32]);
+        assert_eq!(served.get(), 0, "and the table was not read");
+    }
+
     /// A bound is about a register's **value**, so a write that is not part of the table pattern
     /// ends it.
     ///
@@ -7786,6 +8038,11 @@ mod tests {
         assert!(
             !mixed.code_proved,
             "and the one it dropped is not, which is what this says"
+        );
+        assert_eq!(
+            mixed.unproved, 1,
+            "and the figure printed under that warning counts it: read off the cases that were \
+             kept it is zero, under a warning that fired because of the one that was not"
         );
     }
 
