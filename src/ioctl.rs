@@ -1122,35 +1122,37 @@ fn update(
             facts.bound = None;
         }
     }
-    // Neither of these writes a register, and `test` is the other thing that writes only flags.
-    if matches!(instruction.effect, Effect::Test | Effect::Push) {
-        return None;
-    }
-    // **An instruction this pass does not model may write more than its first operand.**
-    // `xchg eax,r13d` writes both, and clearing only the first leaves a tracked control code in a
-    // register that now holds the old `eax` -- reported, when a later `cmp r13d,N` reads it, as a
-    // code the driver accepts. Nothing here knows which registers an unmodelled instruction
-    // writes, so every register it **names** stops being believed: the conservative reading, and
-    // the one that cannot invent a case.
+    // **Everything this instruction writes stops being believed**, and the decoder says what that
+    // is. `xchg eax,r13d` writes both operands; `mul ecx` writes `eax` and `edx` and names
+    // neither. A pass inferring it from the first operand keeps believing in a register the
+    // instruction overwrote, and a control code that survives that way is reported as a code the
+    // driver accepts.
     //
-    // It does not reach an **implicit** destination -- `mul ecx` writes `eax` and `edx` and names
-    // neither -- and closing that means the decoder saying which registers an instruction writes,
-    // which is [glslang/dbgscope#155](https://github.com/glslang/dbgscope/issues/155). A mnemonic
-    // table here is the thing this module stopped keeping.
-    if instruction.effect == Effect::Other {
-        for operand in &instruction.operands {
-            let Operand::Register(register) = operand else {
-                continue;
-            };
-            set(facts, &register.full, None);
-            if facts
-                .bound
-                .as_ref()
-                .is_some_and(|bound| bound.register == register.full)
-            {
-                facts.bound = None;
-            }
+    // This used to be as much of the answer as could be had here -- every register an unmodelled
+    // instruction *named* -- which reached the first of those and could not reach the second
+    // without the mnemonic table this module stopped keeping. `Instruction::writes`
+    // ([glslang/dbgscope#155](https://github.com/glslang/dbgscope/issues/155)) is that answer from
+    // the decoder, so it is also **narrower**: a register an instruction only reads is left alone.
+    //
+    // The destination is skipped because the arms below are about to say what it holds, and the
+    // bound that goes with it is the one write this has an exemption for -- the byte map's.
+    let destination = instruction.operands.first().and_then(register_full);
+    for written in &instruction.writes {
+        if destination.as_deref() == Some(written.full.as_str()) {
+            continue;
         }
+        set(facts, &written.full, None);
+        if facts
+            .bound
+            .as_ref()
+            .is_some_and(|bound| bound.register == written.full)
+        {
+            facts.bound = None;
+        }
+    }
+    // Neither of these writes a register this pass tracks, and `test` is the other thing that
+    // writes only flags.
+    if matches!(instruction.effect, Effect::Test | Effect::Push) {
         return None;
     }
     let operands = &instruction.operands;
@@ -1609,33 +1611,27 @@ fn follow_table(
                 if matches!(instruction.flow, Flow::Call(_)) {
                     return None;
                 }
-                // **An instruction this pass does not model ends the chain if it names the
-                // register at all.** `xchg edx,eax` writes `eax` as its *second* operand, so a
-                // walk that looks only at the first steps over it and resolves the jump from a
-                // load execution overwrote -- the same fault the forward walk had, from the other
-                // direction. What an unmodelled instruction did to a register it names is not
-                // something this knows, and the answer to that is to stop.
-                if instruction.effect == Effect::Other
-                    && instruction.operands.iter().any(|operand| {
-                        matches!(operand, Operand::Register(register) if register.full == wanted)
-                    })
+                // **Only an instruction that *writes* the register continues the chain**, and the
+                // decoder says which do. A `cmp rcx,[base+rax*4+table]` reads it and writes
+                // nothing but the flags, so reading that as the load would turn an unrelated array
+                // into a table; `xchg edx,eax` writes `eax` as its *second* operand, so a walk
+                // looking only at the first would step over it and resolve the jump from a load
+                // execution had overwritten.
+                if !instruction
+                    .writes
+                    .iter()
+                    .any(|register| register.full == wanted)
                 {
-                    return None;
-                }
-                // **Only an instruction that *defines* the register continues the chain.** A
-                // `cmp rcx,[base+rax*4+table]` reads it and writes nothing but the flags, and
-                // reading that as the load turns an unrelated array into a table.
-                if matches!(
-                    instruction.effect,
-                    Effect::Compare | Effect::Test | Effect::Push
-                ) {
                     continue;
                 }
+                // It writes it. Either it is one of the shapes below, or this walk cannot say what
+                // is in the register and stops -- including the case where the write is not the
+                // first operand at all, which is what an `xchg` is.
                 let Some(Operand::Register(written)) = instruction.operands.first() else {
-                    continue;
+                    return None;
                 };
                 if written.full != wanted {
-                    continue;
+                    return None;
                 }
                 match instruction.operands.get(1) {
                     // **And it reads a `DWORD`.** The entries are decoded four bytes at a time
@@ -2512,6 +2508,31 @@ mod tests {
             "jle" | "jng" => Some(Condition::SignedLessOrEqual),
             _ => None,
         };
+        // **Which registers the instruction writes**, as the decoder would answer: the first
+        // operand when it has one, both of an `xchg`, and none at all for the two that write only
+        // flags. Spelled out here rather than derived from the effect the walk branches on,
+        // because a fixture sharing that decision with the code under test agrees with it about a
+        // wrong one -- and the real answers for these shapes are pinned in dbgscope's own test,
+        // which is where this has to stay consistent with.
+        let writes: Vec<RegisterOperand> = match (mnemonic, effect) {
+            // `push rax` reads `rax` and writes `rsp`, which nothing here tracks.
+            (_, Effect::Compare | Effect::Test | Effect::Push) => Vec::new(),
+            // **The implicit destination**, which is the shape a first-operand rule cannot reach:
+            // `mul ecx` reads `ecx` and writes `rax` and `rdx`, naming neither. dbgscope's own
+            // test pins that against the decoder, which is what this has to stay true to.
+            ("mul" | "div", _) => vec![named("rax"), named("rdx")],
+            ("xchg", _) => operands
+                .iter()
+                .filter_map(|operand| match operand {
+                    Operand::Register(register) => Some(register.clone()),
+                    _ => None,
+                })
+                .collect(),
+            _ => match operands.first() {
+                Some(Operand::Register(register)) => vec![register.clone()],
+                _ => Vec::new(),
+            },
+        };
         Instruction {
             address,
             bytes: String::new(),
@@ -2522,6 +2543,7 @@ mod tests {
             privileged: false,
             effect,
             condition,
+            writes,
             writes_flags: matches!(
                 effect,
                 Effect::Compare
@@ -7976,6 +7998,61 @@ mod tests {
             refusing(false),
             vec![(Some(true), Some(0x7000)), (Some(true), Some(0x7100))],
             "and with nothing stored they are cases that reach routines"
+        );
+    }
+
+    /// An **implicit** destination is a write like any other.
+    ///
+    /// `mul ecx` reads `ecx` and writes `rax` and `rdx`, naming neither. A pass inferring what an
+    /// instruction wrote from its first operand keeps believing in a register that no longer holds
+    /// what it did, and a control code surviving that way is reported as a code the driver
+    /// accepts. Nothing in this module could reach that shape until the decoder began answering
+    /// which registers an instruction writes; the rule it replaced could only take the registers
+    /// an instruction **named**.
+    #[test]
+    fn an_implicit_destination_is_a_write_like_any_other() {
+        let multiplied = |between: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            )]);
+            if between {
+                block.push(insn(
+                    DISPATCH + 0xb,
+                    "mul",
+                    vec![reg("ecx")],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.extend([
+                insn(
+                    DISPATCH + 0xd,
+                    "cmp",
+                    vec![reg("eax"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x13, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x19, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert_eq!(
+            multiplied(false)
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x222003],
+            "the register still holds the code"
+        );
+        assert!(
+            multiplied(true).cases.is_empty(),
+            "and here a multiply put its own result there, naming neither register it wrote: {:?}",
+            multiplied(true).cases
         );
     }
 
