@@ -471,6 +471,7 @@ fn map_within(
     // block is walked.
     let mut cases: Vec<Case> = Vec::new();
     let mut case_count = 0usize;
+    let mut all_proved = true;
     let mut tables: Vec<Table> = Vec::new();
     let mut unresolved: Vec<u64> = Vec::new();
     let mut traced = false;
@@ -509,6 +510,7 @@ fn map_within(
                 run,
                 &mut cases,
                 &mut case_count,
+                &mut all_proved,
                 &mut cap_hit,
                 &mut tables,
                 &mut unresolved,
@@ -532,6 +534,7 @@ fn map_within(
             run,
             &mut cases,
             &mut case_count,
+            &mut all_proved,
             &mut cap_hit,
             &mut tables,
             &mut unresolved,
@@ -635,7 +638,7 @@ fn map_within(
         // borrow the second's credibility -- and the first is exactly the one a reader needs
         // warning about. With no cases at all this says whether the code was read, which is what
         // makes an empty answer readable.
-        code_proved: traced && cases.iter().all(|case| case.proved),
+        code_proved: traced && all_proved,
         cases,
         case_count,
         tables,
@@ -679,6 +682,7 @@ fn record(
     run: Run,
     cases: &mut Vec<Case>,
     case_count: &mut usize,
+    all_proved: &mut bool,
     cap_hit: &mut bool,
     tables: &mut Vec<Table>,
     unresolved: &mut Vec<u64>,
@@ -693,6 +697,7 @@ fn record(
         push_case(
             cases,
             case_count,
+            all_proved,
             cap_hit,
             code,
             Recovery::Compare,
@@ -706,6 +711,7 @@ fn record(
             push_case(
                 cases,
                 case_count,
+                all_proved,
                 cap_hit,
                 code,
                 Recovery::JumpTable,
@@ -895,8 +901,14 @@ fn simulate(
             to.push((taken, carried.clone()));
         }
     } else {
+        // **A bound survives a branch that is about something else.** It is a claim about one
+        // register's value, and every way that value can change already takes it away: a write
+        // that is not the table pattern, a call over a volatile register, a join with a path that
+        // never had it. Clearing it here as well would mean a bounds check only ever reaches the
+        // block immediately after it, so a compiler that puts an unrelated test in between leaves
+        // a switch unresolved -- an answer reported as a lower bound for no reason in the code.
         for &successor in &graph.blocks[index].successors {
-            to.push((successor, carried.clone()));
+            to.push((successor, facts.clone()));
         }
     }
 
@@ -916,6 +928,7 @@ fn simulate(
 fn push_case(
     cases: &mut Vec<Case>,
     count: &mut usize,
+    all_proved: &mut bool,
     cap_hit: &mut bool,
     code: u64,
     recovered: Recovery,
@@ -929,6 +942,10 @@ fn push_case(
         return;
     };
     *count += 1;
+    // **Every case found, not every case kept.** `code_proved` is about the whole routine and
+    // `case_count` stays exact past the cap, so reading provenance off the retained prefix would
+    // report a map as wholly traced while counting a case that came from the bare displacement.
+    *all_proved &= proved;
     if cases.len() >= MAX_CASES {
         *cap_hit = true;
         return;
@@ -1614,10 +1631,15 @@ fn follow_table(
 /// request. So only those two destinations count, and a later write of the return register with
 /// anything else takes the finding back -- a block that loads a status and then returns something
 /// derived from a call is not refusing here.
-fn error_status(instructions: &[Instruction], layout: Layout, facts: &Facts) -> bool {
-    instructions.iter().fold(false, |status, instruction| {
-        status_after(status, instruction, layout, facts)
-    })
+fn error_status(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> bool {
+    let mut facts = arrived.clone();
+    let mut traced = false;
+    let mut status = false;
+    for instruction in instructions {
+        status = status_after(status, instruction, layout, &facts);
+        update(&mut facts, instruction, layout, &mut traced);
+    }
+    status
 }
 
 /// What one instruction does to the status a block has established so far.
@@ -1670,12 +1692,21 @@ fn status_after(status: bool, instruction: &Instruction, layout: Layout, facts: 
 ///
 /// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
 /// here, and [`refuses_in`] is what follows that jump.
-fn failure_block(instructions: &[Instruction], layout: Layout, facts: &Facts) -> bool {
+fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> bool {
+    // **Read where the store is, not where the block starts.** Whether a destination is
+    // `Irp->IoStatus.Status` is a question about a register, and a block is free to reuse one: a
+    // `rbx` that arrives holding the IRP and is reassigned to a diagnostic object before the store
+    // would otherwise have that store read as a refusal, taking a handler away from a code the
+    // driver accepts. Same rule, and same replay, as a jump table's base.
+    let mut facts = arrived.clone();
+    let mut traced = false;
     let mut status = false;
     for instruction in instructions {
         // What the block has established **so far**, which is what says whether the call it is
-        // about to make is a completion on the way out or a block doing something else.
-        status = status_after(status, instruction, layout, facts);
+        // about to make is a completion on the way out or a block doing something else. Asked
+        // before the instruction is applied, because a store reads its base as it stands.
+        status = status_after(status, instruction, layout, &facts);
+        update(&mut facts, instruction, layout, &mut traced);
         match instruction.flow {
             Flow::Return => return status,
             // A completion call after the status is part of the rejection; one before it is a
@@ -5046,6 +5077,179 @@ mod tests {
         );
     }
 
+    /// A status store is read against the register **at the store**.
+    ///
+    /// Whether a destination is `Irp->IoStatus.Status` is a question about a register, and a block
+    /// is free to reuse one: a `rbx` that arrives holding the IRP and is reassigned before the
+    /// store would otherwise have that store read as a refusal, taking the handler away from a
+    /// code the driver accepts. One instruction is the whole difference between the two halves.
+    #[test]
+    fn a_status_store_is_read_against_the_register_at_the_store() {
+        let reassigned = |moved: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("rbx"), reg("rdx")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+            ]);
+            let mut at = DISPATCH + 0x40;
+            if moved {
+                // Whatever `rsi` is, it is not the IRP.
+                block.push(insn(
+                    at,
+                    "mov",
+                    vec![reg("rbx"), reg("rsi")],
+                    Flow::Fallthrough,
+                ));
+                at += 3;
+            }
+            block.extend([
+                insn(
+                    at,
+                    "mov",
+                    vec![mem("rbx", 0x30), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    at + 7,
+                    "call",
+                    vec![Operand::Target(0x7000)],
+                    Flow::Call(Some(0x7000)),
+                ),
+                insn(at + 0xc, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            (found.cases[0].accepted, found.cases[0].handler)
+        };
+
+        assert_eq!(
+            reassigned(false),
+            (Some(false), None),
+            "the IRP is still in the register the status goes through"
+        );
+        assert_eq!(
+            reassigned(true),
+            (Some(true), Some(0x7000)),
+            "and here it is not, so this is a case that reaches a routine"
+        );
+    }
+
+    /// A bound outlives a branch that is about something else.
+    ///
+    /// It is a claim about one register's value, and every way that value can change already takes
+    /// it away. Cleared at every block boundary as well, a bounds check reaches only the block
+    /// immediately after it -- so a compiler that puts an unrelated test between the check and the
+    /// switch leaves that switch unresolved, and the map says it is a lower bound for no reason
+    /// that is in the driver.
+    #[test]
+    fn a_bound_outlives_a_branch_that_does_not_touch_its_index() {
+        const TABLE: i64 = 0x9000;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            // A block in between that decides something else entirely.
+            insn(
+                DISPATCH + 0x1a,
+                "test",
+                vec![reg("ecx"), reg("ecx")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x60)),
+            ),
+            // The switch, still indexed by the register the bounds check covered.
+            insn(
+                DISPATCH + 0x22,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x29,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x30,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x33, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            insn(DISPATCH + 0x60, "ret", Vec::new(), Flow::Return),
+        ]);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let read = |at: u64, len: usize| {
+            (at == table_at && len == 8).then(|| {
+                [0x1000u32, 0x1100]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc004, IMAGE_BASE + 0x1000),
+                (0x6dc005, IMAGE_BASE + 0x1100)
+            ],
+            "the test in between says nothing about the index: {:?}",
+            found.cases
+        );
+        assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
+    }
+
     /// A bound is about a register's **value**, so a write that is not part of the table pattern
     /// ends it.
     ///
@@ -6225,6 +6429,44 @@ mod tests {
             found.case_count
         );
         assert!(found.cap_hit);
+        assert!(
+            found.code_proved,
+            "every one of these came through the IRP's stack location"
+        );
+
+        // **And neither does the provenance.** `code_proved` is about the whole routine, so a case
+        // the cap dropped counts: read off the retained prefix it would report a map as wholly
+        // traced while `case_count` includes one that came from a bare `+0x18` off a register
+        // nothing followed -- which is exactly the case a reader needs warning about.
+        block.extend([
+            insn(
+                at,
+                "mov",
+                vec![reg("r12d"), mem("rsi", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                at + 4,
+                "cmp",
+                vec![reg("r12d"), imm(0x333000)],
+                Flow::Fallthrough,
+            ),
+            insn(at + 0xa, "je", Vec::new(), Flow::Branch(Some(0x8000))),
+            insn(at + 0x10, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let mixed = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(mixed.cases.len(), MAX_CASES);
+        assert_eq!(mixed.case_count, MAX_CASES + 17);
+        assert!(
+            mixed.cases.iter().all(|case| case.proved),
+            "the list this kept is all traced"
+        );
+        assert!(
+            !mixed.code_proved,
+            "and the one it dropped is not, which is what this says"
+        );
     }
 
     /// A halted walk says so rather than answering as one that finished.
