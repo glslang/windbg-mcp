@@ -230,6 +230,9 @@ impl Machine {
                 self.registers
                     .insert("rax".to_string(), product & 0xffff_ffff);
                 self.registers.insert("rdx".to_string(), product >> 32);
+                // It writes the carry and leaves the flag a `je` reads **undefined**, so this is
+                // one legal machine among several and the walk has to be right for all of them.
+                self.compared = None;
                 return;
             }
             // `xchg`, and everything else this vocabulary contains that the walk does not model.
@@ -245,9 +248,26 @@ impl Machine {
         // Arithmetic sets the flags, and a branch after one reads them. Written out rather than
         // taken from the decoder's `writes_flags`, so that a wrong answer there cannot be
         // agreed with here.
+        //
+        // **Everything that writes them is in this list, whatever the generator can currently
+        // put where a branch reads it.** `noise` keeps a flag write out from between a compare and
+        // its branch, so today nothing here reaches a conditional that is not the compare's own --
+        // but a machine that is right only for the positions one vocabulary happens to use is one
+        // the next change to that vocabulary makes wrong in silence. What the omission cost when
+        // the logical operations were missing: `xor ecx,ecx` before a `je` sets the zero flag, so
+        // the branch is taken whatever the code is, and a machine still reading the compare falls
+        // through to the next case and confirms a landing execution never reaches.
+        // `the_machine_reads_the_flags_the_last_instruction_left` is what holds this, since the
+        // property above no longer can.
         if matches!(
             instruction.effect,
-            Effect::Add | Effect::Subtract | Effect::ShiftRight | Effect::ShiftLeft
+            Effect::Add
+                | Effect::Subtract
+                | Effect::ShiftRight
+                | Effect::ShiftLeft
+                | Effect::BitAnd
+                | Effect::BitOr
+                | Effect::BitXor
         ) {
             self.compared = Some((value, 0));
         }
@@ -333,6 +353,58 @@ impl Machine {
     }
 }
 
+/// The machine branches on the flags the **last** instruction left, and not on the last compare.
+///
+/// `xor ecx,ecx` between a compare and its branch sets the zero flag, so the `je` after it is taken
+/// whatever was compared. A machine that skipped it would keep reading the compare, fall through,
+/// and agree with the walk about a landing execution never reaches -- an oracle wrong in the one
+/// direction that makes it useless. The generator deliberately never emits that shape (see
+/// [`noise`]), so this is where the rule is held.
+#[test]
+fn the_machine_reads_the_flags_the_last_instruction_left() {
+    const TAKEN: u64 = DISPATCH + 0x100;
+    let ran = |between: Option<&str>| {
+        let mut listing = vec![
+            // Something non-zero in it, or an `and` with itself leaves a zero too and the two
+            // halves below stop being different instructions.
+            insn(DISPATCH, "mov", vec![reg("ecx"), imm(1)], Flow::Fallthrough),
+            insn(
+                DISPATCH + 4,
+                "cmp",
+                vec![reg("r13d"), imm(0x1234)],
+                Flow::Fallthrough,
+            ),
+        ];
+        if let Some(mnemonic) = between {
+            listing.push(insn(
+                DISPATCH + 8,
+                mnemonic,
+                vec![reg("ecx"), reg("ecx")],
+                Flow::Fallthrough,
+            ));
+        }
+        listing.extend([
+            insn(DISPATCH + 0x10, "je", Vec::new(), Flow::Branch(Some(TAKEN))),
+            insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return),
+            insn(TAKEN, "ret", Vec::new(), Flow::Return),
+        ]);
+        // A code that is **not** the one compared, so the compare's own answer is to fall through.
+        Machine::new(0x4321).run(&listing, &[TAKEN])
+    };
+
+    assert_eq!(ran(None), Ran::Returned, "the compare says these differ");
+    assert_eq!(
+        ran(Some("xor")),
+        Ran::Reached(TAKEN),
+        "and a self-exclusive-or leaves zero, which is what the branch then reads"
+    );
+    assert_eq!(
+        ran(Some("and")),
+        Ran::Returned,
+        "while anding a register with itself leaves whatever was in it, here not zero"
+    );
+}
+
 /// A seeded generator, so a failure names a number that reproduces it.
 struct Seed(u64);
 
@@ -366,8 +438,21 @@ struct Routine {
 ///
 /// Each is a shape a review finding on #305 was about: a partial write, an exchange writing its
 /// second operand, an implicit destination, a call over the volatile registers, a narrow copy.
-fn noise(seed: &mut Seed, at: u64) -> Vec<Instruction> {
-    let which = seed.below(9);
+///
+/// `flags` says whether this position may hold something that **writes** them. Between a compare
+/// and its branch it may not, and that is a statement about compilers rather than a convenience:
+/// a compiler cannot put a flag write there without breaking its own branch, so a routine with one
+/// is not a routine this generator is a model of. What it would measure instead is the walk's
+/// assumption that **both edges of a branch it cannot decide are live** -- `xor ecx,ecx` before a
+/// `je` makes that branch unconditional, the fall-through dead, and every case recovered along it
+/// one execution never reaches. That assumption is `FOLLOWUPS.md` item 67 and is a property of a
+/// path-insensitive walk, not of this vocabulary.
+fn noise(seed: &mut Seed, at: u64, flags: bool) -> Vec<Instruction> {
+    let which = match flags {
+        true => seed.below(9),
+        // The three that write no flag, and the empty one.
+        false => [0, 1, 4, 8][seed.below(4) as usize],
+    };
     let one = |mnemonic: &str, operands: Vec<Operand>, flow: Flow| {
         vec![insn(at, mnemonic, operands, flow)]
     };
@@ -439,7 +524,7 @@ fn routine(seed: &mut Seed) -> Routine {
 
     // Noise between the load and the first compare, which is where a value has to survive.
     for _ in 0..seed.below(3) {
-        listing.extend(noise(seed, at));
+        listing.extend(noise(seed, at, true));
         at += 8;
     }
 
@@ -493,9 +578,10 @@ fn routine(seed: &mut Seed) -> Routine {
             Flow::Fallthrough,
         ));
         at += 8;
-        // Noise between the compare and its branch, which a compiler really does emit.
+        // Noise between the compare and its branch, which a compiler really does emit -- and
+        // which is why it writes no flags: see `noise`.
         if seed.chance(3) {
-            listing.extend(noise(seed, at));
+            listing.extend(noise(seed, at, false));
             at += 8;
         }
         listing.push(insn(at, "je", Vec::new(), Flow::Branch(Some(land))));
@@ -532,8 +618,9 @@ fn routine(seed: &mut Seed) -> Routine {
             ),
         ]);
         at += 32;
+        // After the bounds check has been branched on, so this one is free to write flags.
         if seed.chance(3) {
-            listing.extend(noise(seed, at));
+            listing.extend(noise(seed, at, true));
             at += 8;
         }
         listing.extend([
@@ -622,7 +709,7 @@ fn routine(seed: &mut Seed) -> Routine {
 fn every_case_the_map_reports_is_one_the_machine_produces() {
     let mut checked = 0usize;
     let mut tables = 0usize;
-    for seed in 0..512u64 {
+    for seed in 0..1024u64 {
         let mut seed_state = Seed(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15) | 1);
         let built = routine(&mut seed_state);
         let entries = built.entries.clone();
@@ -671,7 +758,7 @@ fn every_case_the_map_reports_is_one_the_machine_produces() {
     }
     // **A green run has to mean something was run.** These routines are generated, so a change to
     // the vocabulary or the seeds could quietly stop producing cases and leave this test passing
-    // over nothing. Measured at 884 cases over 135 resolved tables on 512 seeds (2026-09-12); the
+    // over nothing. Measured at 1,098 cases over 262 resolved tables on 1,024 seeds (2026-09-12); the
     // floors are well under that and are here to catch a collapse rather than to pin a number.
     assert!(
         checked > 500 && tables > 50,

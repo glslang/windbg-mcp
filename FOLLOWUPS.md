@@ -26,10 +26,12 @@ reach on three different clocks (2026-08-31) — item 58 from
 [#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
 call that names a target's machine turns out to name the *processor's* (2026-09-05), items
 61–65 from completing Personal similarity delivery while separating CVE-specific investigation,
-upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09-12), and item 66
-from the IOCTL recovery in [#305](https://github.com/glslang/windbg-mcp/pull/305), where thirty-nine
-review findings over fourteen rounds were one default: a backwards walk that refuses what it trips
-over rather than recognising what a compiler emits (2026-09-12).
+upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09-12), and items
+66–67 from the IOCTL recovery in [#305](https://github.com/glslang/windbg-mcp/pull/305) and
+[#307](https://github.com/glslang/windbg-mcp/pull/307): thirty-nine review findings over fourteen
+rounds that were one default — a backwards walk refusing what it trips over rather than recognising
+what a compiler emits — and then, from the differential oracle those rounds produced, the walk
+reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -975,3 +977,39 @@ where an instruction nobody anticipated falls out rather than falls through.
 **Where it picks up.** `ioctl::follow_table` and `keeps_a_bound` in `src/ioctl.rs`, the fixtures
 around `a_two_table_switch_is_read_through_its_byte_map`, and the generated routines in
 `src/ioctl/tests/differential.rs`, which is where a rewrite would be shown not to have lost a shape.
+
+## 67. [windbg-mcp] A branch with a constant condition has a dead edge the walk still reads
+
+`ioctl::map_within` explores **both** edges of every conditional branch, which is what a
+path-insensitive walk does and is right whenever the condition depends on anything. It is wrong when
+the condition is a constant. `xor ecx,ecx` immediately before a `je` sets the zero flag, so that
+branch is taken for every input and its fall-through is unreachable — and every compare the walk
+then finds along it is a case the driver has, in a block execution never enters. The map reports
+those codes with landings, handlers and sizes, and nothing in the answer says the path was
+hypothetical.
+
+The walk already does half of this correctly: an instruction that writes the flags drops the pending
+compare (`instruction.writes_flags`, pinned by
+`a_compare_survives_an_instruction_that_writes_no_flags`), so no case is invented **at** the poisoned
+branch. What it does not do is stop believing the edge.
+
+- **Why deferred:** the shape needs a flag write between a compare and its branch, which a compiler
+  cannot emit — its own branch would break — so this is a hand-written or obfuscated driver rather
+  than a compiled one, and no measured driver moves. The general fix is path sensitivity, which this
+  module deliberately does not have; the specific one below is small but is a new kind of fact in
+  `Facts` and belongs on a clock somebody chooses.
+- **What would close it:** fold the self-cancelling idioms — `xor r,r`, `sub r,r`, and `test r,r`
+  against a register known to hold a literal — into a known zero flag, and drop the edge the
+  condition excludes rather than sweeping it. A case recovered in a block no live edge reaches is
+  then not recovered at all. The alternative, marking such cases rather than dropping them, needs a
+  field on `IoctlCase` and a sentence in every renderer.
+- **How it was found, which is the part worth keeping:** the differential oracle in
+  `src/ioctl/tests/differential.rs`, on seed 102 of the 512 it ran then, the first time its
+  interpreter modelled the flags the logical operations write. The walk said code `0x6dfffe` reached a landing; execution
+  took the earlier branch and never arrived. The generator now keeps flag writes out from between a
+  compare and its branch — see `noise` — so the property measures the walk's **recovery** rather
+  than this assumption, and closing this item is what would let that restriction go.
+
+**Where it picks up.** The terminator arm in `ioctl::map_within` that reads `compared` against
+`Flow::Branch`, the `writes_flags` fold above it, and `noise` in `src/ioctl/tests/differential.rs`,
+whose `flags` parameter exists only because of this.
