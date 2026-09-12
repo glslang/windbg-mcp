@@ -1694,10 +1694,8 @@ fn error_status(instructions: &[Instruction], layout: Layout, arrived: &Facts) -
 /// and asking [`error_status`] for each prefix makes one refusal check cost the square of the
 /// block's length -- which a malformed routine chooses.
 fn status_after(status: bool, instruction: &Instruction, layout: Layout, facts: &Facts) -> bool {
-    if instruction.effect != Effect::Move {
-        return status;
-    }
-    let returned = match instruction.operands.first() {
+    // Does this write one of the two places a dispatch routine's status lives?
+    let writes_status = match instruction.operands.first() {
         // The return register, by the full-width name the decoder gives it.
         Some(Operand::Register(register)) => register.full == layout.return_register,
         // Or `Irp->IoStatus.Status`, which is the other place a refusal writes one -- and **that
@@ -1717,8 +1715,21 @@ fn status_after(status: bool, instruction: &Instruction, layout: Layout, facts: 
         }
         _ => false,
     };
-    if !returned {
+    if !writes_status {
         return status;
+    }
+    // **Every write to it replaces what is there, and only one shape puts a refusal there.**
+    // `mov eax,0C0000010h` / `xor eax,eax` / `ret` returns success, and reading the load alone
+    // reports that case as one the driver refuses. So anything that is not a move of a literal
+    // takes the finding back rather than leaving it standing.
+    //
+    // A **call** is the exception and is deliberately not one of these: it writes the return
+    // register implicitly and names nothing, and the ordinary rejection calls a completion routine
+    // on its way out -- so treating that as a write would stop this recognising the shape it
+    // exists for. What that costs is a routine which loads a status, calls something that replaces
+    // it, and returns without reloading; compilers reload.
+    if instruction.effect != Effect::Move {
+        return false;
     }
     match instruction.operands.get(1).and_then(immediate_of) {
         Some(value) => u32::try_from(value).is_ok_and(|value| value >> 30 == 0b11),
@@ -1738,7 +1749,12 @@ fn status_after(status: bool, instruction: &Instruction, layout: Layout, facts: 
 ///
 /// It says nothing when it says nothing. A failure that jumps to a shared tail answers `false`
 /// here, and [`refuses_in`] is what follows that jump.
-fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) -> bool {
+fn failure_block(
+    instructions: &[Instruction],
+    layout: Layout,
+    arrived: &Facts,
+    incoming: bool,
+) -> (bool, bool) {
     // **Read where the store is, not where the block starts.** Whether a destination is
     // `Irp->IoStatus.Status` is a question about a register, and a block is free to reuse one: a
     // `rbx` that arrives holding the IRP and is reassigned to a diagnostic object before the store
@@ -1746,7 +1762,7 @@ fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) 
     // driver accepts. Same rule, and same replay, as a jump table's base.
     let mut facts = arrived.clone();
     let mut traced = false;
-    let mut status = false;
+    let mut status = incoming;
     for instruction in instructions {
         // What the block has established **so far**, which is what says whether the call it is
         // about to make is a completion on the way out or a block doing something else. Asked
@@ -1754,16 +1770,22 @@ fn failure_block(instructions: &[Instruction], layout: Layout, arrived: &Facts) 
         status = status_after(status, instruction, layout, &facts);
         update(&mut facts, instruction, layout, &mut traced);
         match instruction.flow {
-            Flow::Return => return status,
+            Flow::Return => return (status, status),
             // A completion call after the status is part of the rejection; one before it is a
             // block doing something else.
             Flow::Call(_) if status => {}
-            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return false,
-            Flow::Unreadable | Flow::Unknown => return false,
+            // **An unconditional tail jump carries the status it established.**
+            // `mov eax,0C0000010h` / `jmp common_ret` is one rejection written across two blocks,
+            // and starting the next one from nothing loses it -- the shared return block is then
+            // reported as this case's handler. Whether that jump is followed at all is
+            // [`refuses_in`]'s question; this says what goes with it.
+            Flow::Jmp(Some(_)) => return (false, status),
+            Flow::Call(_) | Flow::Branch(_) | Flow::Jmp(_) => return (false, false),
+            Flow::Unreadable | Flow::Unknown => return (false, false),
             Flow::Fallthrough | Flow::Trap => {}
         }
     }
-    false
+    (false, false)
 }
 
 /// Whether the block at `index` **refuses** the request, following the tail jumps a shared
@@ -1782,6 +1804,7 @@ fn refuses_in(
     blind: bool,
 ) -> bool {
     let mut at = index;
+    let mut status = false;
     for hop in 0..3 {
         let block = &graph.blocks[at];
         let instructions = &listing[block.start..block.end];
@@ -1793,9 +1816,11 @@ fn refuses_in(
             true => Facts::default(),
             false => entry.get(at).cloned().flatten().unwrap_or_default(),
         };
-        if failure_block(instructions, layout, &facts) {
+        let (refuses, carried) = failure_block(instructions, layout, &facts, status);
+        if refuses {
             return true;
         }
+        status = carried;
         // Only an unconditional tail jump is followed: a block that decides something is deciding
         // it, and whatever it reaches is not simply this block's answer.
         let tail = instructions
@@ -1857,8 +1882,13 @@ fn sizes_in(
             pending = None;
             let length = match instruction.operands.first() {
                 // The field where it lives.
+                // At the field's width, off a base this walk watched the stack location reach,
+                // and **at a displacement** -- `cmp [rbx+rcx*4+10h],20h` is an array element
+                // beside the field, and reported as `InputBufferLength` it publishes an exact
+                // size the driver never required.
                 Some(Operand::Memory(memory))
-                    if memory.size == Some(4)
+                    if memory.size == Some(FIELD_WIDTH)
+                        && memory.index.is_none()
                         && memory.base.as_ref().is_some_and(|base| {
                             facts.registers.get(&base.full) == Some(&Value::StackLocation)
                         }) =>
@@ -5409,6 +5439,188 @@ mod tests {
             exchanged(true).cases.is_empty(),
             "and here it holds whatever was in `eax`: {:?}",
             exchanged(true).cases
+        );
+    }
+
+    /// A status is only what the return register holds **when the block returns**.
+    ///
+    /// `mov eax,0C0000010h` / `xor eax,eax` / `ret` returns success. Reading the load alone reports
+    /// that case as one the driver refuses and takes its handler away, which is a wrong answer
+    /// about a code it accepts. One instruction is the whole difference between the two halves.
+    #[test]
+    fn a_status_overwritten_before_the_return_is_not_a_refusal() {
+        let zeroed = |cleared: bool| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x40,
+                    "mov",
+                    vec![reg("eax"), imm(0xc000_0010)],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            let mut at = DISPATCH + 0x45;
+            if cleared {
+                block.push(insn(
+                    at,
+                    "xor",
+                    vec![reg("eax"), reg("eax")],
+                    Flow::Fallthrough,
+                ));
+                at += 2;
+            }
+            block.push(insn(at, "ret", Vec::new(), Flow::Return));
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            found.cases[0].accepted
+        };
+
+        assert_eq!(zeroed(false), Some(false), "the status is what it returns");
+        assert_eq!(
+            zeroed(true),
+            None,
+            "and here it returns success, whatever it loaded first"
+        );
+    }
+
+    /// A rejection written across two blocks is still a rejection.
+    ///
+    /// `mov eax,0C0000010h` / `jmp common_ret` is the ordinary way to share an epilogue, and
+    /// starting the block it jumps to from nothing loses the status -- the shared return block is
+    /// then reported as this case's **handler**, which is a routine a reader would go and look up.
+    /// The tail jump is already followed; what this is about is what goes with it.
+    #[test]
+    fn a_status_carries_across_the_tail_jump_that_follows_it() {
+        const TAIL: u64 = DISPATCH + 0x60;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x40)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            // The case block: a status, and out to the shared epilogue.
+            insn(
+                DISPATCH + 0x40,
+                "mov",
+                vec![reg("eax"), imm(0xc000_0010)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x45, "jmp", Vec::new(), Flow::Jmp(Some(TAIL))),
+            // The epilogue, which is not this code's handler.
+            insn(TAIL, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+        assert_eq!(
+            (found.cases[0].accepted, found.cases[0].handler),
+            (Some(false), None),
+            "the status the first block set is what the second one returns: {:?}",
+            found.cases[0]
+        );
+    }
+
+    /// A length check is against the **field**, not an element beside it.
+    ///
+    /// `cmp dword ptr [rbx+rcx*4+10h],20h` off a base this walk watched the stack location reach
+    /// is an array element, and reported as `InputBufferLength` it publishes a size the driver
+    /// never required -- a caller sizing a buffer from it is refused by the driver it was obeying.
+    /// The same compare without an index is the field.
+    #[test]
+    fn a_length_check_is_against_the_field_and_not_an_element_beside_it() {
+        let checked = |index: Option<&str>| {
+            let mut block = prologue(DISPATCH);
+            let length = match index {
+                Some(index) => Operand::Memory(MemoryOperand {
+                    size: Some(4),
+                    segment: None,
+                    base: Some(named("rax")),
+                    index: Some(named(index)),
+                    scale: 4,
+                    displacement: 0x10,
+                    address: None,
+                }),
+                None => mem("rax", 0x10),
+            };
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x222003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x40,
+                    "cmp",
+                    vec![length, imm(0x20)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x48,
+                    "jne",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x60)),
+                ),
+                insn(
+                    DISPATCH + 0x4e,
+                    "call",
+                    vec![Operand::Target(0x5000)],
+                    Flow::Call(Some(0x5000)),
+                ),
+                insn(DISPATCH + 0x53, "ret", Vec::new(), Flow::Return),
+                // The refusal the check's other edge reaches, which is what makes it exact.
+                insn(
+                    DISPATCH + 0x60,
+                    "mov",
+                    vec![reg("eax"), imm(0xc000_0023)],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x65, "ret", Vec::new(), Flow::Return),
+            ]);
+            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            found.cases[0].in_size.map(|size| (size.value, size.exact))
+        };
+
+        assert_eq!(
+            checked(None),
+            Some((0x20, true)),
+            "the field itself is the length"
+        );
+        assert_eq!(
+            checked(Some("rcx")),
+            None,
+            "and an element beside it is not"
         );
     }
 
