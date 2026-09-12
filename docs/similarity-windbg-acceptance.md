@@ -100,6 +100,10 @@ Launch responses retain the owned session before recording or checking success,
 including `error.session_id` when `target` is `yes` (post-commit failure) or `pending`
 (timeout). The final cleanup therefore ends that session even when launch raises;
 a pre-commit refusal does not adopt a session for termination.
+GUI finalization also attempts plugin shutdown, listener inspection, view cleanup,
+quit-hook registration, and guarded Quit independently. The modal-dialog and
+valid-action guards remain enforced. The reproduction probe refuses optimized
+Python (`-O`/`-OO`), which would disable its guards and acceptance assertions.
 
 The [offline regression](samples/test_similarity_windbg_probe.py) injects failures
 in each cleanup call, simultaneous failures, and an inventory mismatch; it also
@@ -109,6 +113,9 @@ structured status check. The failure cases reproduced the original
 exception replacement before the fix. The 2026-09-11 live capture remains unchanged;
 its source reference now names the archived exact script. These failure injections
 are offline tests, not new live debugger acceptance runs.
+The [GUI finalization regressions](samples/test_similarity_lifecycle_probe.py)
+also inject handoff shutdown failures, check guarded Quit refusal, and verify
+that both reproduction probes reject optimized Python before importing GUI code.
 
 ```console
 python3 -m unittest discover -s docs/samples -p test_similarity_windbg_probe.py

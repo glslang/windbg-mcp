@@ -90,6 +90,8 @@ GUI cleanup and Quit request. The reproduction probe now records cleanup errors
 by stage, marks the run unsuccessful, and still attempts the later stages. It
 preserves the original capture error and the modal-dialog and valid-action guards
 on application Quit. A guarded refusal remains a failed cleanup, not a forced exit.
+The reproduction probe refuses optimized Python (`-O`/`-OO`) before importing GUI
+code: its acceptance assertions and operational guards must both remain enabled.
 
 The [offline regressions](samples/test_similarity_lifecycle_probe.py) reproduced
 the skipped Quit request with an injected shutdown exception before the fix.

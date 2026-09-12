@@ -1,5 +1,8 @@
 """Opt-in lifecycle acceptance in one empty, disposable BN6 Personal GUI."""
 
+if not __debug__:
+    raise RuntimeError('acceptance probes require assertions enabled; do not use -O or -OO')
+
 import asyncio
 import json
 import socket
