@@ -2646,6 +2646,195 @@ pub struct DriverHazards {
     pub cap_hit: bool,
 }
 
+/// One access control entry, as the bits say and as a person reads it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AccessEntry {
+    /// `allow`, `deny`, `audit`, or `other` for a type this does not name.
+    pub kind: String,
+    /// The raw `AceType` byte, which is what identifies a type `kind` calls `other`.
+    pub ace_type: u8,
+    /// `AceFlags`, as encoded. Inheritance and audit bits; a device object inherits nothing, so
+    /// these are ordinarily zero and a non-zero one is worth seeing.
+    pub flags: u8,
+    /// The principal's SID in the textual form (`S-1-5-32-544`), when the ACE carries one where
+    /// this could find it. An object ACE puts GUIDs before its SID.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sid: Option<String>,
+    /// The account that SID **is**, for a well-known one: `Everyone`, `SYSTEM`, `Administrators`.
+    ///
+    /// Absent for a SID that names a local account or a domain principal, which this cannot
+    /// resolve from a debugger and does not guess at. [`Self::sid`] is the identity either way --
+    /// this is the reading, and a reading is not an identifier.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub account: Option<String>,
+    /// The access mask, as encoded.
+    pub mask: String,
+    /// The rights that mask names, as a **device**'s: `FILE_READ_DATA` rather than the same bit's
+    /// meaning on a registry key. An unnamed bit is in `mask` and not here.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rights: Vec<String>,
+    /// Whether the mask carries `FILE_READ_DATA` and `FILE_WRITE_DATA` -- the two the I/O manager
+    /// checks a control code's `RequiredAccess` against.
+    ///
+    /// Named separately from [`Self::rights`] because this is the join to an IOCTL map: a code
+    /// requiring `FILE_WRITE_DATA` cannot be sent through a handle whose ACE grants neither.
+    pub reads: bool,
+    pub writes: bool,
+}
+
+/// An access control list, as much of it as was there.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct AccessControlList {
+    pub revision: u8,
+    /// What the header says it holds. Compare it with the length of [`Self::entries`]: a list
+    /// shorter than its own count is one this stopped reading part-way, and the difference is the
+    /// part of the gate nobody has seen.
+    pub ace_count: usize,
+    pub entries: Vec<AccessEntry>,
+}
+
+/// A device object's security descriptor, read as fields.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecurityDescriptor {
+    /// Where it is, so a reader can go and look at the bytes.
+    pub address: String,
+    pub revision: u8,
+    /// The `Control` word, as encoded.
+    pub control: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub owner_account: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub group_account: Option<String>,
+    /// Whether a DACL is present at all, from the control bit rather than from whether one was
+    /// found.
+    ///
+    /// **This and an empty [`Self::dacl`] are opposite answers, and the distinction is the whole
+    /// of this field.** No DACL (`dacl_present` false) means everyone is granted everything, which
+    /// is the most permissive object there is; a DACL present and empty denies everyone.
+    pub dacl_present: bool,
+    /// Who may open the object.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dacl: Option<AccessControlList>,
+    /// The system ACL, which audits rather than granting.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sacl: Option<AccessControlList>,
+}
+
+/// One symbolic link that reaches a device.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeviceLink {
+    /// The link's own path, which is what a user-mode caller opens: `\GLOBAL??\MountPointManager`
+    /// is `\\.\MountPointManager`.
+    pub path: String,
+    /// What the link points at, verbatim, which is how it was matched to the device.
+    pub target: String,
+}
+
+/// Whether the search for symbolic links saw the whole directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum LinkSearch {
+    /// Every entry was listed and every link resolved. An empty list here is a fact: nothing in
+    /// the directory reaches this device.
+    Complete,
+    /// The search stopped part-way, so the links listed are some of them rather than all.
+    ///
+    /// This is what keeps a short list from reading as a complete one. Without it a device with no
+    /// listed link looks unreachable from user mode, which is the wrong half of the answer to be
+    /// wrong about.
+    Partial,
+    /// The directory could not be listed at all, so nothing here says anything about links.
+    Unavailable,
+}
+
+/// What decides who may open a device, in one answer.
+///
+/// The fields are read rather than rendered, for the reason [`crate::device`] gives: whether a
+/// standard user can reach this driver is assembled from a descriptor, two words of device flags
+/// and a symbolic link, and a renderer's line breaks are a poor place to assemble it from.
+///
+/// **Three boundaries, carried here because a reader acting on this has to know them:**
+///
+/// - The descriptor is the **device object's**, which is what an `IRP_MJ_CREATE` by name is
+///   checked against. A file opened *beneath* the device is the driver's own business, and
+///   [`Self::secure_open`] is what says whether the kernel checks this descriptor there too.
+/// - The links are the ones in one directory, named by [`Self::link_directory`]. A device reached
+///   through a link somewhere else has an empty list here and is still reachable.
+/// - An access mask is what the object manager grants, not what the driver enforces. A driver is
+///   free to refuse a caller the descriptor admitted, and many do.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DeviceSecurity {
+    /// The object path this answers about.
+    pub device: String,
+    /// The symbolic link the caller named, when they named one rather than the device.
+    ///
+    /// Present means [`Self::device`] is not what was asked for -- it is where the link pointed,
+    /// and the answer is about that.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub followed_link: Option<String>,
+    /// The `_DEVICE_OBJECT` itself, which is what `device_object` takes.
+    pub address: String,
+    /// Whether the object was **typed** as a device, or only found where one was asked for.
+    ///
+    /// False says the namespace could not read the type table -- a build without the globals that
+    /// deobfuscate an object header's type index -- so the fields below were read off an object
+    /// nothing confirmed is a device object. They are still a device's if the path was, and this
+    /// is here so that a reader knows which of those they have.
+    pub type_confirmed: bool,
+    /// The `_DRIVER_OBJECT` behind it, which is what `driver_object` takes.
+    pub driver: String,
+    /// `DeviceType`, as the number it is. `decode_ioctl` names the same field of a control code.
+    pub device_type: String,
+    /// `Characteristics`, whole.
+    pub characteristics: String,
+    /// `FILE_DEVICE_SECURE_OPEN`, the one characteristic that changes who may open this.
+    ///
+    /// Without it the descriptor below is checked when the device is opened **by name** and not
+    /// when something is opened beneath it, so a driver that parses its own paths can be reached
+    /// through a relative open by a caller the descriptor would have refused.
+    pub secure_open: bool,
+    /// `Flags`, whole.
+    pub flags: String,
+    /// `DO_EXCLUSIVE`: only one handle to this device may be open at a time.
+    pub exclusive: bool,
+    /// Who may open it, when the descriptor could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityDescriptor>,
+    /// Why there is no descriptor above, when there is none.
+    ///
+    /// **An object with no descriptor and a descriptor that would not read are different facts**,
+    /// and this says which: the first is a device the object manager guards by its parent
+    /// directory alone, the second is a target that did not answer -- the ordinary outcome on a
+    /// kernel minidump, which captures no pool.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_absent: Option<String>,
+    /// The directory searched for symbolic links.
+    pub link_directory: String,
+    /// The links found there pointing at this device, in the order the directory holds them.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub links: Vec<DeviceLink>,
+    /// Whether that search saw the whole directory. See [`LinkSearch`].
+    pub link_search: LinkSearch,
+    /// How many of the directory's entries were examined. Under [`LinkSearch::Complete`] that
+    /// is every one of them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub links_examined: Option<usize>,
+    /// Links in the directory whose target could not be read.
+    ///
+    /// Each is a place this device could be reachable from and was not checked, which is what
+    /// stops an empty [`Self::links`] beside a non-zero count here from reading as "nothing
+    /// reaches this device".
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub links_unread: usize,
+    /// Why the link search stopped early, when it did.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WalkHalt>,
+}
+
 /// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.
 ///
 /// Every field is `!analyze`'s own, extracted from its summary block. They are here because they

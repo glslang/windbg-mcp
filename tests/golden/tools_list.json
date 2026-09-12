@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 59,
+  "toolCount": 60,
   "tools": [
     {
       "hints": {
@@ -394,6 +394,43 @@
         "device"
       ],
       "title": "Inspect device object"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "device_security",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/DeviceSecurity",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "device: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "device"
+      ],
+      "title": "Read a device's openable gate"
     },
     {
       "hints": {

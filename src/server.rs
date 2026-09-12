@@ -1400,6 +1400,19 @@ pub struct DriverHazardsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct DeviceSecurityArgs {
+    /// The object path, as `!object` takes it: "\\Device\\MountPointManager". A symbolic
+    /// link is followed once, so "\\GLOBAL??\\MountPointManager" reaches the same device.
+    /// An address is not accepted: the security descriptor hangs off the object header,
+    /// which is reached by walking the namespace to the object rather than from its body.
+    pub device: String,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DeviceObjectArgs {
     /// Device object: a name (e.g. "\\Device\\MyDevice") or an address (0x-hex).
     pub device: String,
@@ -4468,6 +4481,46 @@ impl WindbgServer {
                 args.session_id.as_deref(),
                 EngineOp::DriverHazards {
                     module: args.module,
+                    // Filled in by the supervisor's pump when this job reaches the front of its
+                    // session's queue, exactly as the walk's is.
+                    patience_ms: 0,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// What decides who may open a device: its security descriptor as principals and
+    /// access masks, the two device words that qualify it, and the symbolic links in
+    /// `\GLOBAL??` that reach it from user mode. `FILE_DEVICE_SECURE_OPEN` is called
+    /// out because without it the descriptor is checked on an open **by name** only,
+    /// so a driver parsing its own paths is reachable through a relative open by a
+    /// caller the descriptor would refuse. An access mask is what the object manager
+    /// grants, never what the driver enforces. **Needs a live kernel target**: a
+    /// kernel minidump captures no object namespace, so nothing here can be read from
+    /// one.
+    #[rmcp::tool(
+        annotations(
+            title = "Read a device's openable gate",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::DeviceSecurity>>()
+    )]
+    async fn device_security(
+        &self,
+        Parameters(args): Parameters<DeviceSecurityArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // **No command screen, and that is a decision rather than an omission.** `device` reaches
+        // `object_at`, which walks the namespace over typed memory reads -- it is never pasted
+        // into a command, so there is no grammar for a separator or a quote to break out of. The
+        // same reason `driver_hazards` dropped its screen; `ioctl_map` still has one because its
+        // argument reaches `uf`.
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::DeviceSecurity {
+                    device: args.device,
                     // Filled in by the supervisor's pump when this job reaches the front of its
                     // session's queue, exactly as the walk's is.
                     patience_ms: 0,

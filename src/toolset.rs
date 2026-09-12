@@ -1,7 +1,7 @@
-//! Which of this server's fifty-seven tools a run advertises.
+//! Which of this server's sixty tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 84,506 bytes — roughly 21k tokens (measured 2026-09-07; every figure here moves with any edit
+//! 88,568 bytes — roughly 22k tokens (measured 2026-09-12; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -27,11 +27,12 @@
 //!   batch          1   10,021  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
-//!   ioctl          8    9,143  driver objects, IRP stacks, reachability, hazards and IOCTL maps
+//!   ioctl          9   10,556  driver objects, IRP stacks, reachability, hazards, IOCTL maps and
+//!                                device security
 //! ```
 //!
-//! Those bytes are a measurement of **2026-09-07** and move with any edit to a description — the
-//! whole surface they are shares of is 57 tools and 84,506 B. Re-derive rather than quoting them.
+//! Those bytes are a measurement of **2026-09-12** and move with any edit to a description — the
+//! whole surface they are shares of is 60 tools and 88,568 B. Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
 //! 19,078 bytes, not the 20,244 its two rows add to, because the thirteen tools it keeps also stop
@@ -164,6 +165,7 @@ const GROUPS: &[Group] = &[
             "reachable_from_dispatch",
             "driver_hazards",
             "ioctl_map",
+            "device_security",
         ],
     },
     Group {
@@ -516,7 +518,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "13 of 59 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 60 tools (session, crash)");
     }
 
     #[test]
@@ -527,7 +529,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 59 tools (session, backtrace, registers)"
+            "12 of 60 tools (session, backtrace, registers)"
         );
     }
 
@@ -639,7 +641,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("13 of 59 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 60 tools (session, crash)"), "{said}");
         }
     }
 

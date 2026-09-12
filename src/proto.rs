@@ -306,6 +306,21 @@ pub enum EngineOp {
         /// filled in by the supervisor's pump.
         patience_ms: u32,
     },
+    /// What decides who may open a device: its object header's security descriptor, the two
+    /// words of device flags that qualify it, and the symbolic links that reach it.
+    ///
+    /// One indivisible job for the reason [`Self::Reachability`] is, and more plainly than any of
+    /// them: it walks the object namespace, reads a descriptor out of pool, and lists a directory
+    /// resolving every link in it. That is hundreds of reads of a namespace another call could
+    /// move underneath it.
+    DeviceSecurity {
+        /// The object path, as `!object` would take it -- `\Device\MountPointManager`. A
+        /// symbolic link is followed once, so the name a user-mode caller knows works too.
+        device: String,
+        /// Whatever is left of the caller's own clock when this reaches the front of the queue,
+        /// filled in by the supervisor's pump.
+        patience_ms: u32,
+    },
     /// Which control codes a driver's dispatch routine accepts, recovered from its own code.
     ///
     /// One indivisible job for the reason [`Self::Reachability`] is: it disassembles a function
@@ -478,6 +493,7 @@ impl EngineOp {
             | Self::Reachability(ReachabilityOp { patience_ms, .. })
             | Self::DriverHazards { patience_ms, .. }
             | Self::IoctlMap { patience_ms, .. }
+            | Self::DeviceSecurity { patience_ms, .. }
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
             _ => None,
         }
