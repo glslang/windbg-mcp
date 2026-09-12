@@ -6736,12 +6736,24 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
         within_module(module.base, module.size, at, len).then(|| e.read_memory(at, len).ok())?
     };
 
-    // Whether a resolved jump-table entry is code in this driver at all, which is what a table
-    // recognised by accident fails. An image the session cannot place the routine in answers
-    // `false` for everything, so no table is followed there rather than every one being trusted.
-    let in_image = |address: u64| {
-        holding.is_some_and(|module| address >= module.base && address < module.end())
-    };
+    // Whether a resolved jump-table entry is **code** in this driver, which is what a table
+    // recognised by accident fails. The loader's extent is not that question: `.rdata`, `.data`
+    // and the headers are all inside it, so a malformed or accidentally matched table full of
+    // module-relative *data* addresses would pass and be published as cases, with the jump taken
+    // out of `unresolved` and the map reading as complete. The image's own section table answers
+    // it instead, and an image whose headers will not read answers `false` for everything -- no
+    // table is followed there rather than every one being trusted, and the jumps say so.
+    let executable: Vec<std::ops::Range<u64>> = holding
+        .and_then(|module| {
+            let mut headers = |at: u64, len: usize| {
+                within_module(module.base, module.size, at, len)
+                    .then(|| e.read_memory(at, len).ok())?
+            };
+            pe::read_image(module.base, &mut headers).ok()
+        })
+        .map(|image| image.executable_ranges())
+        .unwrap_or_default();
+    let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
     // **The structure offsets follow the target, and the check above is what makes this pair
     // exhaustive**: an instruction set whose operands are not read was refused before this point,
     // so the only two left are the two that have a layout.
