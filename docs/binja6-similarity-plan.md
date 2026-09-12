@@ -1,6 +1,6 @@
 # BN6 similarity in the Binary Ninja–WinDbg companion
 
-Status: revised and implemented 2026-09-08 in the companion. Personal GUI exports,
+Status: Personal implementation and acceptance complete as of 2026-09-12. GUI exports,
 real external BinDiff comparisons, textual differences, and target navigation passed
 on synthetic identical, relocated and changed PE fixtures. The changed fixture's
 additional function was reported unmatched. Names, types, comments, bytes,
@@ -12,6 +12,13 @@ Ultimate execution remains unvalidated and tentative: Ultimate is unavailable du
 to cost, and purchasing it is not a requirement for Personal delivery. The
 [2026-09-11 live handoff](similarity-windbg-acceptance.md) passed runtime-byte
 comparison, run-to, breakpoint, and wrong-build refusal on a disposable ARM64 fixture.
+
+Personal implementation and acceptance landed in windbg-mcp PR #308 and companion
+PR #4 on 2026-09-12. Remaining investigation and upstream work is tracked in
+FOLLOWUPS.md items 61–65: CVE attribution, live securekernel handoff, native CLRBHB
+decoding, the first-run-wizard shutdown fix, and Ultimate validation. The user
+requested delivery readiness and tracking of the investigation, without publishing
+a release or purchasing Ultimate.
 
 ## Summary
 
