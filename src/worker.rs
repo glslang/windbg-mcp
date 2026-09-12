@@ -7829,6 +7829,88 @@ fn ",
         );
     }
 
+    /// **A namespace refusal is categorised by whose fault it is**, which is what a caller does
+    /// something different about: `invalid_argument` sends someone to fix the device name they
+    /// passed, `debugger` says the target could not supply what the walk needs.
+    ///
+    /// Here rather than in a tier, and that is the point rather than a convenience. The dump tier
+    /// reaches `device_security`'s *other* refusal -- this bench's worker has no kernel symbols, so
+    /// the walk is turned away before an `ObjectError` is ever produced -- and a live kernel
+    /// answers rather than failing. So nothing that runs anywhere exercises this mapping, and it
+    /// was **green under a mutation that made every variant `invalid_argument`** until this test
+    /// existed. A dump reported as "that device is not in that directory" is the failure it
+    /// prevents: a sentence about an argument that was perfectly correct.
+    #[test]
+    fn a_namespace_refusal_says_whose_fault_it_is() {
+        use dbgscope::object::ObjectError;
+        let category = |why: &ObjectError| object_failure("x", why).category;
+        let argument = Some(structured::ErrorCategory::InvalidArgument);
+        let target = Some(structured::ErrorCategory::Debugger);
+
+        // The three a caller can fix by asking differently.
+        assert_eq!(
+            category(&ObjectError::BadPath {
+                path: "Device".into(),
+                reason: "it does not begin at the root",
+            }),
+            argument
+        );
+        assert_eq!(
+            category(&ObjectError::NotFound {
+                directory: "Device".into(),
+                component: "Nope".into(),
+            }),
+            argument
+        );
+        assert_eq!(
+            category(&ObjectError::NotADirectory {
+                component: "Nope".into(),
+                rest: "Deeper".into(),
+            }),
+            argument
+        );
+
+        // And the rest, which are the target's: nothing the caller types changes them.
+        for why in &[
+            ObjectError::Unreadable { at: 0x1000, len: 8 },
+            ObjectError::Malformed { reason: "no" },
+            ObjectError::Unavailable { what: "the root" },
+            ObjectError::Untyped {
+                component: "Nope".into(),
+            },
+            ObjectError::TooMany {
+                what: "entries",
+                bound: 8,
+            },
+        ] {
+            assert_eq!(
+                category(why),
+                target,
+                "{why:?} is the target failing to answer, not the argument"
+            );
+        }
+
+        // The advice is attached to exactly the three that a dump produces, and to no other:
+        // telling someone whose *path* was wrong to go and find a live kernel is worse than
+        // telling them nothing.
+        assert!(
+            object_failure("x", &ObjectError::Unreadable { at: 0x1000, len: 8 })
+                .message
+                .contains("minidump")
+        );
+        assert!(
+            !object_failure(
+                "x",
+                &ObjectError::NotFound {
+                    directory: "Device".into(),
+                    component: "Nope".into(),
+                }
+            )
+            .message
+            .contains("minidump")
+        );
+    }
+
     /// The driver scan runs **no debugger command at all**, which is what lets its `module`
     /// argument go unscreened.
     ///
