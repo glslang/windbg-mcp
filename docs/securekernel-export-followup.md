@@ -83,6 +83,10 @@ files. All sixteen entries have the expected addresses, raw bytes `df2203d5`, an
 mnemonic `clrbhb`; there are 3,120 reference graphs and 3,143 target graphs.
 The manifest retains those observations and export hashes. No BN or BinDiff
 process remained after the final diagnostic.
+`graph_inspection_raw_output_sha256` hashes the original `graph-inspection.json`
+[raw output](samples/securekernel-export-graph-inspection-20260911-raw.json) before
+export paths were reduced to basenames in the manifest;
+`graph_inspection_script.sha256` separately hashes the retained inspection script.
 
 The native helper build and its CTest regression passed, including rejection of
 wrong architectures, unaligned addresses, short input, null input, and a nearby

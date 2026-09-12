@@ -1,0 +1,205 @@
+{
+  "schema": "securekernel-binexport-graph-inspection-v1",
+  "checks": {
+    "exact_expected_entries": true,
+    "eight_graphs_per_side": true,
+    "entry_raw_bytes_are_clrbhb": true,
+    "entry_mnemonics_are_clrbhb": true
+  },
+  "exports": [
+    {
+      "side": "reference",
+      "path": "/private/tmp/securekernel-export-fixed-diagnostic-20260911/capture/reference.BinExport",
+      "sha256": "821df8d911fe5cefd377f27340ef513af0cd109541ff671c3225cbf890d3f6ba",
+      "total_flow_graphs": 3120,
+      "recovered_graph_count": 8,
+      "recovered_graphs": [
+        {
+          "flow_graph_index": 2808,
+          "entry_basic_block_index": 37662,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167765,
+          "instruction_address": "0x14010fc00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2810,
+          "entry_basic_block_index": 37664,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167768,
+          "instruction_address": "0x14010fc80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2812,
+          "entry_basic_block_index": 37666,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167771,
+          "instruction_address": "0x14010fd00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2814,
+          "entry_basic_block_index": 37668,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167774,
+          "instruction_address": "0x14010fd80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2816,
+          "entry_basic_block_index": 37670,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167777,
+          "instruction_address": "0x14010fe00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2818,
+          "entry_basic_block_index": 37672,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167780,
+          "instruction_address": "0x14010fe80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2820,
+          "entry_basic_block_index": 37674,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167783,
+          "instruction_address": "0x14010ff00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2822,
+          "entry_basic_block_index": 37676,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 167786,
+          "instruction_address": "0x14010ff80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        }
+      ]
+    },
+    {
+      "side": "target",
+      "path": "/private/tmp/securekernel-export-fixed-diagnostic-20260911/capture/target.BinExport",
+      "sha256": "a7213e36039bb880cbc3801195e643d6fe2985d101128e026e3da763e91e8954",
+      "total_flow_graphs": 3143,
+      "recovered_graph_count": 8,
+      "recovered_graphs": [
+        {
+          "flow_graph_index": 2831,
+          "entry_basic_block_index": 40322,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178829,
+          "instruction_address": "0x14011ac00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2833,
+          "entry_basic_block_index": 40324,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178832,
+          "instruction_address": "0x14011ac80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2835,
+          "entry_basic_block_index": 40326,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178835,
+          "instruction_address": "0x14011ad00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2837,
+          "entry_basic_block_index": 40328,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178838,
+          "instruction_address": "0x14011ad80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2839,
+          "entry_basic_block_index": 40330,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178841,
+          "instruction_address": "0x14011ae00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2841,
+          "entry_basic_block_index": 40332,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178844,
+          "instruction_address": "0x14011ae80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2843,
+          "entry_basic_block_index": 40334,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178847,
+          "instruction_address": "0x14011af00",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        },
+        {
+          "flow_graph_index": 2845,
+          "entry_basic_block_index": 40336,
+          "entry_instruction_range_index": 0,
+          "entry_instruction_begin_index": 178850,
+          "instruction_address": "0x14011af80",
+          "address_source": "explicit",
+          "raw_bytes": "df2203d5",
+          "mnemonic_index": 119,
+          "mnemonic": "clrbhb"
+        }
+      ]
+    }
+  ]
+}

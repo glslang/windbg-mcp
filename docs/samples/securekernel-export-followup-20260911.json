@@ -1167,7 +1167,9 @@
       }
     ]
   },
-  "graph_inspection_source_sha256": "c0cee5f6d80cc1f71394d3ddf67c394b03c890f4fdff3de432662f2eef4b8756",
+  "graph_inspection_raw_output_file": "securekernel-export-graph-inspection-20260911-raw.json",
+  "graph_inspection_raw_output_sha256": "c0cee5f6d80cc1f71394d3ddf67c394b03c890f4fdff3de432662f2eef4b8756",
+  "graph_inspection_normalization": "The raw output is graph-inspection.json; graph_inspection retains its JSON content with export paths reduced to basenames. The raw-output hash is distinct from the script hash below.",
   "graph_inspection_script": {
     "file": "securekernel-export-graph-inspection-20260911.py",
     "sha256": "25684794252dc93c8bb098db703362772a07501ff039567fcaec05c661dcf42f"
