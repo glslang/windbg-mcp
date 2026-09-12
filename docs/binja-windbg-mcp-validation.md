@@ -8,10 +8,10 @@ current companion exposes 22 tools after adding similarity; Personal comparison,
 lifecycle and generic WinDbg handoff acceptance are recorded in the
 [similarity plan](binja6-similarity-plan.md). The companion's
 [2026-09-12 preparation-race follow-up](https://github.com/glslang/binja-windbg-mcp/blob/main/docs/binja-windbg-mcp-validation.md#preparation-race-review-follow-up--2026-09-12)
-records 187 passing tests and Ruff checks after the final race fixes. A fresh
-2026-09-12 run against companion source `81f473e` also passed all 187 tests, with no
-skips, using a cached `uv` test environment whose 28 runtime packages matched the
-pinned requirements. The companion's runtime-only `.venv` lacked pytest; the
+records 187 passing tests and Ruff checks after the final race fixes. A post-rebase
+2026-09-12 run also passed all 187 tests, with no skips. Its companion runtime/test
+sources match merged baseline [`6fc0e44`](https://github.com/glslang/binja-windbg-mcp/commit/6fc0e44beab8ac53a66fc4dd9f24d356a3bd397d).
+The cached `uv` test environment matched all 28 pinned runtime package versions. The companion's runtime-only `.venv` lacked pytest; the
 [companion verification instructions](https://github.com/glslang/binja-windbg-mcp/blob/main/README.md#verification)
 now explicitly supply development tools. HTTP tests require loopback socket access.
 
