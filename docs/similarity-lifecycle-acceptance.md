@@ -76,10 +76,32 @@ The new regression test failed on the original callback and passes with the fix.
 All **181 companion tests** and Ruff passed. The
 [final captures](samples/similarity-lifecycle-20260911.json) retain the original
 close-view failure, the fixed rerun, restart, rebase, and tested source hashes.
-The [instrumented GUI probe](samples/similarity-lifecycle-probe-20260911.py)
-preserves the executed assertions. Its `start(case, reference, target, bindiff,
+The [recorded GUI probe](samples/similarity-lifecycle-probe-20260911-recorded.py)
+preserves the executed source and its original hash. The
+[reproduction probe](samples/similarity-lifecycle-probe-20260911.py) includes the
+cleanup correction below. Its `start(case, reference, target, bindiff,
 output)` entry point expects an empty, wizard-free disposable GUI and a new output
 directory; it creates its own listener and requests application exit after cleanup.
+
+## Cleanup review follow-up — 2026-09-12
+
+An exception during the probe's plugin shutdown previously skipped its remaining
+GUI cleanup and Quit request. The reproduction probe now records cleanup errors
+by stage, marks the run unsuccessful, and still attempts the later stages. It
+preserves the original capture error and the modal-dialog and valid-action guards
+on application Quit. A guarded refusal remains a failed cleanup, not a forced exit.
+
+The [offline regressions](samples/test_similarity_lifecycle_probe.py) reproduced
+the skipped Quit request with an injected shutdown exception before the fix.
+They also cover other cleanup-stage failures, successful finalization, and refusal
+to quit with a modal dialog after shutdown fails. These tests exercise the Python
+probe; they do not establish that plugin shutdown threw in a recorded GUI run or
+that Binary Ninja exits cleanly after such a failure. Captured results and the
+archived source hash are unchanged; actual exit status remains separate evidence.
+
+```console
+python3 -m unittest discover -s docs/samples -p 'test_similarity_*_probe.py'
+```
 
 ## Shutdown crash and process cleanup
 

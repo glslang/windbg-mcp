@@ -9,48 +9,6 @@ import traceback
 from pathlib import Path
 
 
-def finish_gui(timer, observer, plugin, FileContext, UIContext, application, ui_context, report, save):
-    """Attempt each cleanup stage without bypassing the guarded application Quit."""
-    def attempt(stage, action):
-        try:
-            action()
-        except Exception:
-            report['ok'] = False
-            report.setdefault('cleanup_errors', []).append(
-                {'stage': stage, 'error': traceback.format_exc()})
-
-    def listener_state():
-        report['listener_thread_alive_after_shutdown'] = plugin.listener.thread.is_alive()
-
-    def clear_modified():
-        for context in FileContext.getOpenFileContexts():
-            for view in context.getAllDataViews():
-                view.file.modified = False
-
-    def quitting():
-        report['application_about_to_quit'] = True
-        attempt('save', save)
-
-    def request_quit():
-        handler = ui_context().getCurrentActionHandler()
-        assert handler.isValidAction('Quit')
-        handler.executeAction('Quit')
-
-    attempt('save', save)
-    if timer:
-        attempt('timer_stop', timer.stop)
-    if observer:
-        attempt('observer_unregister', lambda: UIContext.unregisterNotification(observer))
-    if plugin:
-        attempt('plugin_shutdown', plugin.shutdown)
-        attempt('listener_state', listener_state)
-    attempt('clear_modified', clear_modified)
-    attempt('quit_hook', lambda: application.aboutToQuit.connect(quitting))
-    attempt('save', save)
-    attempt('quit', request_quit)
-    attempt('save', save)
-
-
 def run(case, reference, target, bindiff, output):
     import binaryninja as bn
     from binaryninjaui import FileContext, UIContext, UIContextNotification
@@ -277,9 +235,26 @@ def run(case, reference, target, bindiff, output):
     except Exception:
         report['error'] = traceback.format_exc()
     finally:
+        save()
         def finish():
-            finish_gui(timer, observer, plugin, FileContext, UIContext,
-                       QApplication.instance(), ui_context, report, save)
+            if timer:
+                timer.stop()
+            if observer:
+                UIContext.unregisterNotification(observer)
+            if plugin:
+                plugin.shutdown()
+                report['listener_thread_alive_after_shutdown'] = plugin.listener.thread.is_alive()
+            for context in FileContext.getOpenFileContexts():
+                for view in context.getAllDataViews():
+                    view.file.modified = False
+            def quitting():
+                report['application_about_to_quit'] = True
+                save()
+            QApplication.instance().aboutToQuit.connect(quitting)
+            save()
+            handler = ui_context().getCurrentActionHandler()
+            assert handler.isValidAction('Quit')
+            handler.executeAction('Quit')
         try:
             main_thread(finish)
         except Exception:

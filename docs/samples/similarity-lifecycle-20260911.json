@@ -2,6 +2,7 @@
   "recorded_date": "2026-09-11",
   "bn_version": "6.0.10601 Personal",
   "companion_base": "2eb95c5",
+  "probe_source": "docs/samples/similarity-lifecycle-probe-20260911-recorded.py",
   "probe_sha256": "69d17ded743a5e5a7f88e60116381aba52cfcdc9cbb62bc8fc23be074e769b8b",
   "cases": {
     "restart-v2": {
