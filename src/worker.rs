@@ -3127,7 +3127,16 @@ fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize)
 /// backtick for the note's code span. That guard is what holds this container shut too, which is
 /// why it is not repeated here.
 fn fenced(table: &str) -> String {
-    format!("```\n{table}```\n")
+    // **The closing fence gets its own line whether or not the body ended one.** Every caller
+    // happens to end with a `writeln!` today, so this changes nothing now -- but that is a
+    // property of the last branch each renderer takes rather than anything enforced, and a body
+    // ending with `write!` would put the fence on the end of a text line, leaving the block
+    // unclosed and handing everything after it to a Markdown client as markup. Silently: the
+    // content is all still there, so no assertion about what the report *says* would notice.
+    match table.ends_with('\n') {
+        true => format!("```\n{table}```\n"),
+        false => format!("```\n{table}\n```\n"),
+    }
 }
 
 /// Everything a bug check is, gathered as one indivisible job.
@@ -8639,6 +8648,16 @@ mod tests {
             2,
             "the report is one block, opened and closed exactly once: {out:?}"
         );
+
+        // **The closing fence is on its own line even for a body that did not end one**, which no
+        // caller does today and nothing stops one doing tomorrow. Unclosed, the block leaks every
+        // line after it to a Markdown client, and it leaks them looking exactly like the report.
+        let unterminated = super::fenced("  DriverName  x");
+        assert!(
+            unterminated.ends_with("\n```\n"),
+            "a body with no trailing newline still closes its own block: {unterminated:?}"
+        );
+        assert_eq!(unterminated.matches("```").count(), 2);
         assert!(
             !body.contains('`'),
             "no backtick survives escaping, which is what keeps the count above at two: {body}"
