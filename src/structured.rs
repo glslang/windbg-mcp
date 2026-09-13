@@ -2196,6 +2196,21 @@ pub enum WalkHalt {
     Interrupted,
 }
 
+impl WalkHalt {
+    /// How a sentence about this walk finishes: "this survey *ran out of time*".
+    ///
+    /// The twin of [`crate::walk::Halt::phrase`], and here for the reason that one is: a deadline
+    /// sends a reader to the call timeout and an interrupt is their own request, so a message
+    /// offering both commits to neither -- and a wording written at each site is one that will
+    /// differ at one of them.
+    pub(crate) fn phrase(self) -> &'static str {
+        match self {
+            Self::Deadline => "ran out of time",
+            Self::Interrupted => "was interrupted",
+        }
+    }
+}
+
 /// How control left one function for the next on the path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]

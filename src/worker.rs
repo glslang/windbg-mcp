@@ -6949,8 +6949,38 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     let image_at = locate(fields.image_base);
     let module = image_at.module.clone();
 
+    // **The deadline is checked before each section, not only inside them.** The four run in
+    // sequence on one clock, so a section reached after it has expired starts a fresh run of
+    // engine calls for an answer nobody is waiting for -- holding the session against every job
+    // behind it. Two rounds of review found that one section at a time: the gate pass, which polls
+    // per device now, and then the hazard scan, whose `modules` call and header reads come before
+    // its first poll. Checking once per section is the rule those two are instances of, so that is
+    // what is here rather than a third check bolted to a third section.
+    //
+    // **`error` rather than `partial`**, deliberately: nothing in such a section was read, and
+    // `partial` invites a caller to read what is there -- which for `hazards: null` is "scanned,
+    // found nothing". The whole of this tool is about not letting an emptiness read as a finding.
+    let not_started = |what: &str, halt: structured::WalkHalt| {
+        format!(
+            "this survey {} before the {what} section was started, so none of it was read. Raise \
+             the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue this when the \
+             session is idle.",
+            halt.phrase()
+        )
+    };
+
     // ---- the devices -----------------------------------------------------
-    let devices = driver_devices(e, &namespace, &fields, layout.pointer, deadline);
+    let devices = match attribution_stop(e, deadline) {
+        Some(halt) => structured::DevicesSection {
+            status: structured::SectionStatus::Error,
+            note: Some(not_started("device", halt)),
+            devices: Vec::new(),
+            device_count: 0,
+            named_in: DEVICE_DIRECTORY.to_string(),
+            unnamed: 0,
+        },
+        None => driver_devices(e, &namespace, &fields, layout.pointer, deadline),
+    };
 
     // ---- the control codes, off `MajorFunction[0x0e]` --------------------
     //
@@ -6958,7 +6988,13 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     // kernel's stub for a major this driver does not handle, or a filter forwarding into the
     // driver below it; mapping either would report another image's control codes as this
     // driver's.
-    let ioctl = match dispatch.device_control.as_ref().map(|at| &at.address) {
+    let ioctl = match attribution_stop(e, deadline) {
+        Some(halt) => structured::IoctlSection {
+            status: structured::SectionStatus::Error,
+            note: Some(not_started("IOCTL", halt)),
+            map: None,
+        },
+        None => match dispatch.device_control.as_ref().map(|at| &at.address) {
         None => structured::IoctlSection {
             status: structured::SectionStatus::Unavailable,
             note: Some(
@@ -7003,32 +7039,40 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                 },
             },
         },
+        },
     };
 
     // ---- and what the image can do ---------------------------------------
-    let hazards = match &module {
-        None => unattributed_image(
-            attribution_halted.get(),
-            image_at.attribution_failed,
-            fields.image_base,
-        ),
-        Some(module) => match scan_of(e, module, fields.image_base, deadline) {
-            Ok(scan) => structured::HazardsSection {
-                status: match scan.stopped.is_some() {
-                    true => structured::SectionStatus::Partial,
-                    false => structured::SectionStatus::Ok,
-                },
-                note: scan.stopped.is_some().then(|| {
-                    "the scan stopped early; its own `stopped` field says why, and its \
+    let hazards = match attribution_stop(e, deadline) {
+        Some(halt) => structured::HazardsSection {
+            status: structured::SectionStatus::Error,
+            note: Some(not_started("hazard", halt)),
+            hazards: None,
+        },
+        None => match &module {
+            None => unattributed_image(
+                attribution_halted.get(),
+                image_at.attribution_failed,
+                fields.image_base,
+            ),
+            Some(module) => match scan_of(e, module, fields.image_base, deadline) {
+                Ok(scan) => structured::HazardsSection {
+                    status: match scan.stopped.is_some() {
+                        true => structured::SectionStatus::Partial,
+                        false => structured::SectionStatus::Ok,
+                    },
+                    note: scan.stopped.is_some().then(|| {
+                        "the scan stopped early; its own `stopped` field says why, and its \
                      `unreadable` list says which ranges went unscanned."
-                        .to_string()
-                }),
-                hazards: Some(scan),
-            },
-            Err(why) => structured::HazardsSection {
-                status: structured::SectionStatus::Error,
-                note: Some(why.message.clone()),
-                hazards: None,
+                            .to_string()
+                    }),
+                    hazards: Some(scan),
+                },
+                Err(why) => structured::HazardsSection {
+                    status: structured::SectionStatus::Error,
+                    note: Some(why.message.clone()),
+                    hazards: None,
+                },
             },
         },
     };
@@ -7310,10 +7354,7 @@ fn unattributed_image(
                  scanned. That is about this call rather than about the target: raise the \
                  server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or ask `driver_hazards` \
                  for the module directly.",
-                match halt {
-                    structured::WalkHalt::Interrupted => "was interrupted",
-                    structured::WalkHalt::Deadline => "ran out of time",
-                },
+                halt.phrase(),
                 structured::addr(base)
             )),
             hazards: None,

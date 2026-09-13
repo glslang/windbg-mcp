@@ -54,13 +54,22 @@ gate on each, the control codes its IOCTL handler accepts, and its sensitive imp
 carries its own status, so a dispatch routine that will not disassemble still leaves the import and
 security evidence standing.
 
-**On a kernel dump none of that works, and neither do steps 1 and 4 below.** A minidump carries no
-object namespace, so `driver_surface`, `driver_object`, `device_object` and `device_security` all
-fail there for the one reason — measured, `!drvobj` and `!devobj` both answer `Unable to get value
-of ObpRootDirectoryObject`. What reads on a dump is the **image**: `driver_hazards` on the module
-name, and `ioctl_map` once you have the dispatch address from somewhere other than the driver
-object (a previous live session, a disassembler, or a symbol). There is no dump route to the device
-list or its DACLs at all.
+**On a kernel dump anything that resolves a *name* fails, and that is steps 1 and 4 below.** A
+minidump carries no object namespace, so `driver_surface`, `driver_object`, `device_security`, and
+`device_object` **given a device name**, all fail there for the one reason — measured, `!drvobj
+<name>` and `!devobj <name>` both answer `Unable to get value of ObpRootDirectoryObject`.
+
+What reads on a dump is the **image**: `driver_hazards` on the module name, and `ioctl_map` once you
+have the dispatch address from somewhere other than the driver object (a previous live session, a
+disassembler, or a symbol).
+
+**And an address is not a name.** `device_object` given an *address* does not touch the namespace —
+measured on the same dump, `!devobj <address>` reads the address and answers about it rather than
+failing on `ObpRootDirectoryObject` — and `!sd <address>` decodes a descriptor whose bytes are in
+the dump, where that extension is present. So a device object address carried in from somewhere else
+is a route to that one device and its DACL. What a dump has no route to is **enumerating** them:
+the chain is reached through the driver object and the names through the namespace, and neither
+resolves there.
 
 Do the numbered steps by hand on a **live kernel** when you already have the dispatch address and
 want only the map, or when you want the symbolic links, which the composite leaves to
