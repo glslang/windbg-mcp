@@ -1977,7 +1977,7 @@ const MODEL_VISIBLE_CEILING: usize = 92_000;
 /// the tool is 11,843 B of wire, and the remaining byte is the array's own comma. Nothing else
 /// moved by a byte, checked against the per-tool golden keyed by name.
 ///
-/// **9,973 B of that 11,448 is `outputSchema`, and the question this ceiling exists to force is
+/// **9,973 B of that 11,843 is `outputSchema`, and the question this ceiling exists to force is
 /// whether sharing multiplied.** It did not, and a composite is the case where that had to be
 /// checked rather than assumed: `DriverSurface` embeds `IoctlMap` and `DriverHazards` whole and
 /// reuses `SecurityDescriptor`, so all three are inlined into this tool's own `$defs` closure --
@@ -9851,11 +9851,24 @@ fn a_driver_survey_against_a_dump_is_refused_rather_than_answered_with_four_empt
         "and it is about the target rather than the argument -- `invalid_argument` here would \
          send a reader to check a driver name that was correct: {response}"
     );
-    // The one thing this tool can get wrong that its three constituents cannot: answering.
-    assert!(
-        data.get("surface").is_none() && data.get("dispatch").is_none(),
-        "a refusal must not also carry a partial survey: {response}"
-    );
+    // The one thing this tool can get wrong that its three constituents cannot: answering. Every
+    // section is named, because a refusal leaking *any* of them is a refusal that also reports a
+    // driver with nothing in it -- and the first version of this named one of the four plus
+    // `surface`, which is not a field this tool has ever returned, so half of it could not fail.
+    for section in ["dispatch", "devices", "ioctl", "hazards"] {
+        assert!(
+            data.get(section).is_none(),
+            "a refusal must not also carry a `{section}` section: {response}"
+        );
+    }
+    // And nothing above the sections either: the driver object is what failed to resolve, so
+    // there is no path, address or image to report it under.
+    for field in ["driver", "address", "module", "image_base"] {
+        assert!(
+            data.get(field).is_none(),
+            "a refusal must not describe the driver it could not reach (`{field}`): {response}"
+        );
+    }
 
     server.tool_data(
         "end_session",

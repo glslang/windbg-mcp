@@ -484,9 +484,10 @@ buckets end `!unknown_function` whichever way the table above falls.
 **`driver_surface` against a dump, where the failure to look for is a successful call.** The
 composite's selling point is that a section which cannot answer does not take the others down with
 it, and the tempting mistake is to apply that to the whole tool and answer with four `unavailable`
-sections instead of a refusal -- a successful call reporting a driver with no dispatch table, no
-devices, no control codes and no sensitive imports, which is exactly what a clean driver looks
-like. So the per-section rule stops at the driver object, every section being read from something
+sections instead of a refusal -- a successful call reporting a driver with no devices, no control
+codes and no sensitive imports, which is exactly what a clean driver looks like. The fourth, an
+empty dispatch table, is not something any driver has, so it is the one tell -- and a tell a reader
+should not have to notice is not a safeguard. So the per-section rule stops at the driver object, every section being read from something
 it points at, and the test asserts a refusal, its `debugger` category, and that no partial survey
 came back beside it. Not the message text: which refusal arrives depends on whether this bench's
 `nt` symbols resolved, and the advice inside it is pinned by a **unit** test instead, where it is
@@ -935,7 +936,7 @@ passed, because each supplies the identity itself.
   and no description `bench` is served names `modules`, `debug_batch`, `go` or `backtrace` (item
   41), while `local`'s `open_dump` still says which tool lists the module table. Both directions
   are asserted, because deleting the cross-references outright would satisfy the first and lose the
-  pointer the fifty-seven-tool client is the one that can use. Backticked names, not bare ones: this
+  pointer the full-surface client is the one that can use. Backticked names, not bare ones: this
   surface says frames are "attributed to modules" and that a stuck session "does not let go", and
   neither sentence points anywhere.
 - *A **token file** naming two clients serves both* — the item-31 test in the list further up,

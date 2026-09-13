@@ -6826,7 +6826,7 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         }
         false => {
             let mut found = None;
-            let mut last = None;
+            let mut failures = Vec::new();
             for directory in DRIVER_DIRECTORIES {
                 let candidate = format!("{directory}\\{driver}");
                 match namespace.object_at(&candidate) {
@@ -6834,13 +6834,17 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                         found = Some((candidate, object));
                         break;
                     }
-                    Err(why) => last = Some((candidate, why)),
+                    Err(why) => failures.push((candidate, why)),
                 }
             }
             match found {
                 Some(found) => found,
                 None => {
-                    let (candidate, why) = last.expect("at least one directory was tried");
+                    let chosen = worst_refusal(&failures);
+                    let (candidate, why) = failures
+                        .into_iter()
+                        .nth(chosen)
+                        .expect("at least one directory was tried");
                     return Err(match why {
                         dbgscope::object::ObjectError::NotFound { .. } => Failed::categorised(
                             structured::ErrorCategory::InvalidArgument,
@@ -6901,10 +6905,12 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         })?;
 
     let mut attributor = Attributor::default();
-    let stopped = std::cell::Cell::new(None);
+    // Written by every attribution below, and read twice: by the hazard section, which must not
+    // report this call's clock as a target with no such module, and by nothing else.
+    let attribution_halted = std::cell::Cell::new(None);
     let attribution_halt = || attribution_stop(e, deadline);
     let mut locate = |address: u64| {
-        locate_within(address, &stopped, attribution_halt, |address| {
+        locate_within(address, &attribution_halted, attribution_halt, |address| {
             attributor.locate(e, address)
         })
     };
@@ -6972,15 +6978,7 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
 
     // ---- and what the image can do ---------------------------------------
     let hazards = match &module {
-        None => structured::HazardsSection {
-            status: structured::SectionStatus::Unavailable,
-            note: Some(format!(
-                "this driver's image base {} is in no module the engine could name, so there is \
-                 no image to scan. `modules` lists what is loaded.",
-                structured::addr(fields.image_base)
-            )),
-            hazards: None,
-        },
+        None => unattributed_image(attribution_halted.get(), fields.image_base),
         Some(module) => match hazards_of(e, module, deadline) {
             Ok(scan) => structured::HazardsSection {
                 status: match scan.stopped.is_some() {
@@ -7212,6 +7210,72 @@ const LINK_DIRECTORY: &str = "\\GLOBAL??";
 
 /// The object type name a device carries.
 const DEVICE: &str = "Device";
+
+/// The hazard section for a driver whose image base named no module.
+///
+/// **Two answers, and which one turns on whether this call stopped asking.** A lookup cut short by
+/// the caller's clock or their own interrupt is not a target with no such module -- the same
+/// distinction [`structured::CodeLocation::attribution_failed`] exists for one layer down, and the
+/// same one `object_failure` makes by whose fault it is. Reported as `unavailable` it blames the
+/// target for this call's clock and sends a reader to `modules` to look for an image that is
+/// loaded and was simply never asked about.
+fn unattributed_image(
+    halted: Option<structured::WalkHalt>,
+    base: u64,
+) -> structured::HazardsSection {
+    match halted {
+        Some(halt) => structured::HazardsSection {
+            status: structured::SectionStatus::Partial,
+            note: Some(format!(
+                "this survey {} before it could say which module holds {}, so its image was not \
+                 scanned. That is about this call rather than about the target: raise the \
+                 server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or ask `driver_hazards` \
+                 for the module directly.",
+                match halt {
+                    structured::WalkHalt::Interrupted => "was interrupted",
+                    structured::WalkHalt::Deadline => "ran out of time",
+                },
+                structured::addr(base)
+            )),
+            hazards: None,
+        },
+        None => structured::HazardsSection {
+            status: structured::SectionStatus::Unavailable,
+            note: Some(format!(
+                "this driver's image base {} is in no module the engine could name, so there is \
+                 no image to scan. `modules` lists what is loaded.",
+                structured::addr(base)
+            )),
+            hazards: None,
+        },
+    }
+}
+
+/// Which of several failed lookups to report, when a bare name was tried in each directory.
+///
+/// **A target-side failure outranks a "not found", whichever directory it came from.** Keeping the
+/// last error lets `\Driver` fail because the namespace would not read and `\FileSystem` then
+/// answer a clean `NotFound` -- which [`object_failure`] categorises as the *argument's* fault, and
+/// which sends a reader to check a driver name that was perfectly correct. It is the same split
+/// that function makes, applied one level up: by whose fault it is, not by which directory came
+/// first.
+///
+/// Returns an index into `failures`, which is never empty at any call site; an empty one answers
+/// zero rather than panicking, and the caller's `nth` then yields `None` for it.
+fn worst_refusal(failures: &[(String, dbgscope::object::ObjectError)]) -> usize {
+    use dbgscope::object::ObjectError;
+    failures
+        .iter()
+        .position(|(_, why)| {
+            !matches!(
+                why,
+                ObjectError::BadPath { .. }
+                    | ObjectError::NotFound { .. }
+                    | ObjectError::NotADirectory { .. }
+            )
+        })
+        .unwrap_or(failures.len().saturating_sub(1))
+}
 
 /// Why a namespace walk could not answer, as this server's categories.
 ///
@@ -8175,6 +8239,86 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    /// **An image the clock never asked about is not an image in no module.**
+    ///
+    /// `unavailable` is the target having no such module and is a fact about the target;
+    /// `partial` is this call having stopped asking, and is a fact about this call. They send a
+    /// reader to opposite places -- `modules`, or the call timeout -- so the branch that picks
+    /// between them is worth a test rather than an eye.
+    #[test]
+    fn an_image_this_call_stopped_asking_about_is_not_one_in_no_module() {
+        let base = 0xffff_f805_5ebf_0000;
+
+        let never_asked = super::unattributed_image(Some(structured::WalkHalt::Deadline), base);
+        assert_eq!(never_asked.status, structured::SectionStatus::Partial);
+        let note = never_asked.note.unwrap_or_default();
+        assert!(note.contains("ran out of time"), "{note}");
+        assert!(
+            !note.contains("is in no module"),
+            "it must not report this call's clock as a fact about the target: {note}"
+        );
+
+        let interrupted =
+            super::unattributed_image(Some(structured::WalkHalt::Interrupted), base).note;
+        assert!(
+            interrupted.unwrap_or_default().contains("was interrupted"),
+            "a break and a deadline have different remedies and read differently"
+        );
+
+        // And the genuine case keeps its own answer.
+        let no_such_module = super::unattributed_image(None, base);
+        assert_eq!(
+            no_such_module.status,
+            structured::SectionStatus::Unavailable
+        );
+        assert!(
+            no_such_module
+                .note
+                .unwrap_or_default()
+                .contains("is in no module")
+        );
+    }
+
+    /// **A target-side failure outranks a "not found", whichever directory raised it.**
+    ///
+    /// A bare name is tried under `\Driver` and then `\FileSystem`, and keeping the *last* error
+    /// is how a namespace that would not read comes back as a name that does not exist: the first
+    /// is the target's fault and the second the caller's, and only the second sends a reader to
+    /// check a driver name that was perfectly correct.
+    #[test]
+    fn a_target_side_refusal_outranks_a_name_that_is_simply_not_there() {
+        use dbgscope::object::ObjectError;
+        let at = |name: &str, why: ObjectError| (name.to_string(), why);
+        let unreadable = || ObjectError::Unreadable { at: 0, len: 8 };
+        let missing = || ObjectError::NotFound {
+            directory: "\\Driver".to_string(),
+            component: "nope".to_string(),
+        };
+
+        // The shape the finding is about: the target failed first, the name was simply absent
+        // second, and the second is the one that reads as the caller's mistake.
+        let both = [
+            at("\\Driver\\x", unreadable()),
+            at("\\FileSystem\\x", missing()),
+        ];
+        assert_eq!(super::worst_refusal(&both), 0, "the target's failure wins");
+
+        // Either order, since the rule is about whose fault it is rather than which came first.
+        let flipped = [
+            at("\\Driver\\x", missing()),
+            at("\\FileSystem\\x", unreadable()),
+        ];
+        assert_eq!(super::worst_refusal(&flipped), 1);
+
+        // And with nothing target-side, the last is as good an answer as any -- both say the same
+        // thing, and the second names the directory a reader is likelier to have meant.
+        let neither = [
+            at("\\Driver\\x", missing()),
+            at("\\FileSystem\\x", missing()),
+        ];
+        assert_eq!(super::worst_refusal(&neither), 1);
+    }
+
     /// **A refusal must not offer a fallback that fails for the reason it just gave.**
     ///
     /// `object_failure`'s advice ended `"`driver_object` and `device_object` work on a dump."`
