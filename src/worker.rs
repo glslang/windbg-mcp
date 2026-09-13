@@ -6812,18 +6812,20 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
             .object_at(&path)
             .map_err(|why| object_failure(&path, &why))?;
     }
-    // **An object of the wrong type is refused rather than read as a device.** `_DEVICE_OBJECT` is
-    // 0x150 bytes, and every object in the namespace has bytes there: a directory or a mutant read
-    // this way answers with a device type, a characteristics word and a driver pointer, all of
-    // them fiction, and nothing in the answer would say so.
+    // **An object this cannot confirm is a device is refused, and so is one of another type.**
+    // `_DEVICE_OBJECT` is 0x150 bytes and every object in the namespace has bytes there, so a
+    // directory or a symbolic link read this way answers with a device type, a characteristics
+    // word and a driver pointer, all of them fiction.
     //
-    // A type the namespace could **not** read is a third case and is not refused: a build whose
-    // header cookie this cannot resolve types nothing at all, and refusing there would take the
-    // tool away from a target that can answer perfectly well. It is reported instead --
-    // `type_confirmed` is the field, and it is false exactly there.
-    let type_confirmed = match object.type_name.as_deref() {
-        Some(DEVICE) => true,
-        None => false,
+    // **An unreadable type used to be a third case that carried on**, reported through a
+    // `type_confirmed` field, on the reasoning that a build which types nothing at all can still
+    // answer about a device. That was wrong twice over and is the third time this walk has been
+    // caught reading `None` as a "no": the link hop above tests for a type too, so an untyped
+    // `\GLOBAL??\Name` was never followed and the *link* was decoded as the device -- and the
+    // rendering never carried the field, so the fiction arrived with nothing beside it. What made
+    // that reachable was choosing to proceed on doubt; the choice is gone rather than guarded.
+    match object.type_name.as_deref() {
+        Some(DEVICE) => {}
         Some(other) => {
             return Err(Failed::categorised(
                 structured::ErrorCategory::InvalidArgument,
@@ -6834,7 +6836,19 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
                 ),
             ));
         }
-    };
+        None => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!(
+                    "`{path}` resolved, and this target could not say what type of object it is, \
+                     so reading it as a device would answer with fields that may be fiction. The \
+                     object manager's type table is deobfuscated with `nt!ObHeaderCookie` and \
+                     `nt!ObTypeIndexTable`; check the kernel's symbols resolve with \
+                     `set_symbol_path`, then `modules` on `nt`."
+                ),
+            ));
+        }
+    }
 
     let fields = device::read_device(object.address, device_layout(e, layout.pointer)?, memory)
         .map_err(|why| {
@@ -6950,7 +6964,6 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         device: path,
         followed_link,
         address: object.address,
-        type_confirmed,
         fields,
         security,
         link_directory: LINK_DIRECTORY.to_string(),

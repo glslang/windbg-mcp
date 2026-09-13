@@ -2814,13 +2814,6 @@ pub struct DeviceSecurity {
     pub followed_link: Option<String>,
     /// The `_DEVICE_OBJECT` itself, which is what `device_object` takes.
     pub address: String,
-    /// Whether the object was **typed** as a device, or only found where one was asked for.
-    ///
-    /// False says the namespace could not read the type table -- a build without the globals that
-    /// deobfuscate an object header's type index -- so the fields below were read off an object
-    /// nothing confirmed is a device object. They are still a device's if the path was, and this
-    /// is here so that a reader knows which of those they have.
-    pub type_confirmed: bool,
     /// The `_DRIVER_OBJECT` behind it, which is what `driver_object` takes.
     pub driver: String,
     /// `DeviceType`, as the number it is. `decode_ioctl` names the same field of a control code.

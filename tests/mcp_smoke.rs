@@ -1867,14 +1867,14 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// headroom rather than a leak: the model-visible surface went 87,155 -> 88,568, a difference of
 /// 1,413, and the tool's own model-visible definition is 1,413 B. Nothing else moved -- no
 /// `TOOL_NOTES` cross-reference was added for it, so unlike the `interrupt` case recorded above
-/// there is no second term. Of that, 634 B is description and 723 B input schema; the 3,853 B
+/// there is no second term. Of that, 634 B is description and 723 B input schema; the 3,834 B
 /// `outputSchema` is on the wire and not here, which is the whole reason these two ceilings are
 /// separate numbers. The new figure leaves 2,432 B, which is 2.7%, and is deliberately not sized
 /// for `driver_surface` -- that one raises it again, with its own arithmetic.
 ///
-/// **And the separation earned its keep under review**: the output schema grew three times,
-/// 3,715 -> 3,778 -> 3,820 -> 3,853, and this figure did not move a byte any of them. A single
-/// ceiling over both would have read those as the surface growing.
+/// **And the separation earned its keep under review**: the output schema moved on all five
+/// rounds, 3,715 to 3,834 in total, and this figure did not move a byte through any of them. A
+/// single ceiling over both would have read every one as the surface growing.
 const MODEL_VISIBLE_CEILING: usize = 91_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -1935,20 +1935,21 @@ const MODEL_VISIBLE_CEILING: usize = 91_000;
 /// than a product. It is the larger of the two driver schemas because a case carries a decoded
 /// code, two coordinates and its evidence. The new figure leaves 5,194 B, which is 2.2%.
 ///
-/// **236,000 -> 242,000 for `device_security`** (2026-09-13). The payload went 231,336 -> 236,716,
-/// a difference of 5,380: the tool is 5,379 B of wire and the remaining byte is the array's own
-/// comma. **Nothing else moved at all** -- not one other tool changed by a byte, which is the
-/// cleanest this arithmetic has ever come out and is itself the answer to the question this
-/// ceiling exists to force. It shares no output type with the two driver schemas beside it: a
-/// device's gate is a descriptor, an access list and a symbolic link, none of which appear
-/// anywhere else in this surface, so there was nothing available to multiply. 3,887 B of the
-/// 5,413 is `outputSchema`, which no model reads. The new figure leaves 5,250 B, which is 2.2%.
+/// **236,000 -> 242,000 for `device_security`** (2026-09-13). Measured at the close of review:
+/// the payload is 236,697 against the ceiling, leaving 5,303 B, which is 2.2%. The tool is 5,360 B
+/// of wire, of which 3,834 B is `outputSchema` that no model reads. **Nothing else moved at all**
+/// -- not one other tool changed by a byte, which is the cleanest this arithmetic has come out and
+/// is itself the answer to the question this ceiling exists to force. It shares no output type
+/// with the two driver schemas beside it: a device's gate is a descriptor, an access list and a
+/// symbolic link, none of which appear anywhere else in this surface, so there was nothing
+/// available to multiply.
 ///
-/// **The tool's figure moved on four consecutive review rounds while this paragraph stood**, from
-/// 5,241 to 5,413, every time a field was split or added to the output schema. The intermediate
-/// values are deliberately not listed: a running log of them is what this file keeps getting
-/// wrong, so re-derive from the golden rather than reading any figure here as current. What the
-/// ceiling guards is the headroom, and it absorbed all four without needing to move again.
+/// **The tool's figure moved on every one of five review rounds while this paragraph stood**, from
+/// 5,241 to 5,360 -- up four times as fields were split or added, and back down on the fifth when
+/// one was deleted. The intermediate values are deliberately not listed: keeping a running log of
+/// them is what this file gets wrong, and two of the figures above were left disagreeing with each
+/// other by exactly that. Re-derive from the golden rather than reading any number here as
+/// current. What the ceiling guards is the headroom, and it absorbed all five without moving.
 const WIRE_CEILING: usize = 242_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
