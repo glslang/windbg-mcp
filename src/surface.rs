@@ -1887,7 +1887,7 @@ mod tests {
     /// client showing the text does not.
     ///
     /// The escaping is `structured::renderable`, which this crate already applied at nine sites in
-    /// `worker.rs` and at none in the five renderers it had extracted to be engine-free -- this one
+    /// `worker.rs` and at none in the four renderers it had extracted to be engine-free -- this one
     /// among them.
     #[test]
     fn a_driver_name_cannot_write_a_line_of_its_own_report() {

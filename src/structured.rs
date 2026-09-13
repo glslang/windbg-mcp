@@ -51,12 +51,15 @@ use serde::{Deserialize, Serialize};
 use crate::engine::{EngineError, SessionKind, SessionState};
 
 /// **Here rather than in `src/worker.rs`, which is where it was written and used.** Every
-/// renderer this crate has extracted to be engine-free -- `device`, `sd`, `ioctl`, `hazards`,
-/// `surface` -- left that module and lost reach of this on the way out, and all five print
-/// strings the *target* chose: a driver's `DriverName`, an object path, and the library and
-/// import names read out of a hostile image's own import table. None of them escaped one until
-/// review found it on the newest of the five. [`addr`] is the other formatting helper those
-/// modules share and was already here, so this needs no module of its own.
+/// renderer this crate has extracted to be engine-free -- `device`, `ioctl`, `hazards` and
+/// `surface` -- left that module and lost reach of this on the way out, and all four print strings
+/// the *target* chose: a driver's `DriverName`, an object path, and the import and library names
+/// read out of a hostile image's own import table. None of them escaped one until review found it
+/// on the newest of the four. [`addr`] is the other formatting helper those modules share and was
+/// already here, so this needs no module of its own.
+///
+/// (`sd` is **not** among them, though two commit messages on this branch said so: it parses a
+/// security descriptor into values and renders nothing at all -- `device` renders what it parses.)
 ///
 /// A string from **outside this server**, made safe to put in the listing: anything that could
 /// break out of the row or the span it is printed in is rendered as an escape rather than acted on.
