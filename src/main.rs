@@ -34,6 +34,7 @@ mod sd;
 mod server;
 mod service;
 mod structured;
+mod surface;
 mod target;
 mod toolset;
 mod triage;

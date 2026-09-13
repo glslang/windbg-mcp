@@ -105,6 +105,12 @@ pub(crate) struct Layout {
     pub(crate) characteristics: u32,
     pub(crate) flags: u32,
     pub(crate) driver: u32,
+    /// `_DEVICE_OBJECT::NextDevice` -- the next device its driver created.
+    ///
+    /// Here rather than in [`crate::surface`] because the chain link comes out of the
+    /// **same read** as the fields beside it: a device object is read whole, so following a
+    /// driver's chain costs one read per device rather than two.
+    pub(crate) next_device: u32,
     /// `_DEVICE_OBJECT::SecurityDescriptor` -- the device's own, which for this object type is
     /// the only one there is. See the module docs for why the object header's is not it.
     pub(crate) security: u32,
@@ -134,7 +140,7 @@ impl Layout {
         {
             return bad("a field sits outside the device object");
         }
-        let pointers = [self.driver, self.security];
+        let pointers = [self.driver, self.security, self.next_device];
         if pointers
             .iter()
             .any(|offset| (*offset as usize).saturating_add(self.pointer) > size)
@@ -160,6 +166,12 @@ pub(crate) struct Device {
     pub(crate) flags: u32,
     /// The `_DRIVER_OBJECT` behind it, so a caller can join this to `driver_object`.
     pub(crate) driver: u64,
+    /// The next device on this driver's chain, or zero at its end.
+    ///
+    /// Zero rather than `Option`: the end of a chain is what a null `NextDevice` **means**,
+    /// and there is no second thing an empty field could be. [`crate::surface::device_chain`]
+    /// is what follows it, and what bounds the following.
+    pub(crate) next: u64,
     /// The device's own security descriptor, or `None` where the field is empty.
     ///
     /// `None` is the honest answer for a device the I/O manager never gave one, and is **not**
@@ -206,6 +218,7 @@ pub(crate) fn read_device(
         exclusive: flags & DO_EXCLUSIVE != 0,
         flags,
         driver: pointer(layout.driver),
+        next: pointer(layout.next_device),
         security_descriptor: (security != 0).then_some(security),
     })
 }
@@ -823,6 +836,7 @@ mod tests {
             characteristics: 0x34,
             flags: 0x30,
             driver: 0x08,
+            next_device: 0x10,
             security: 0x110,
         }
     }
@@ -978,6 +992,7 @@ mod tests {
                 exclusive: false,
                 flags: 0x40,
                 driver: 0xffff_b000_0000_0000,
+                next: 0,
                 security_descriptor: Some(0xffff_8680_fc69_12a0),
             },
             security: Security::Read {
@@ -1824,6 +1839,10 @@ mod tests {
             },
             Layout {
                 security: 0x14c,
+                ..layout()
+            },
+            Layout {
+                next_device: 0x14c,
                 ..layout()
             },
         ] {
