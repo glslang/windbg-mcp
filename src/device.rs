@@ -224,9 +224,15 @@ pub(crate) struct Link {
 /// Whether a device carries a security descriptor, and what came of reading it.
 ///
 /// **Three outcomes rather than an `Option`**, because the three send a reader somewhere
-/// different: a descriptor, an object the object manager guards by its parent directory alone, and
-/// a target that did not answer -- which on a kernel minidump is every object, and must not be
-/// reported as a device nothing guards.
+/// different: a descriptor; an object carrying none, where whatever may or may not guard it
+/// instead is not something this reads; and a target that did not answer -- which on a kernel
+/// minidump is every object, and must not be reported as a device nothing guards.
+///
+/// The middle one used to say the object manager guards such an object by its parent directory
+/// alone. That is the ordinary account of the mechanism and has never been measured here, and no
+/// device on a measured 26100 guest reaches this variant at all -- 231 of them across every driver
+/// chain, the 66 unnamed ones included, each carrying its own descriptor. `FOLLOWUPS.md` item 68
+/// holds what is left of the question.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Security {
     /// It carries one, at this address, and this is what it says.
@@ -234,7 +240,11 @@ pub(crate) enum Security {
         at: u64,
         descriptor: crate::sd::Descriptor,
     },
-    /// The object header's `SecurityDescriptor` field is empty.
+    /// The **device object's own** `SecurityDescriptor` field is null.
+    ///
+    /// Not the object header's, which is null for every device and is the confusion this
+    /// module exists to avoid -- this doc comment said "object header's" until
+    /// 2026-09-13, describing the bug rather than the code, long after the code was right.
     Absent,
     /// It carries one at this address and those bytes would not read.
     Failed { at: u64, why: crate::sd::SdError },

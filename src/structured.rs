@@ -2845,9 +2845,11 @@ pub struct DeviceSecurity {
     /// Why there is no descriptor above, when there is none.
     ///
     /// **An object with no descriptor and a descriptor that would not read are different facts**,
-    /// and this says which: the first is a device the object manager guards by its parent
-    /// directory alone, the second is a target that did not answer -- the ordinary outcome on a
-    /// kernel minidump, which captures no pool.
+    /// and this says which: the first is a device carrying none of its own, with whatever may or
+    /// may not guard it instead left unread rather than named; the second is a target that did not
+    /// answer -- the ordinary outcome on a kernel minidump, which captures no pool. The two are
+    /// told apart by the reason string, so a caller branches on that rather than on the field
+    /// being present.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security_absent: Option<String>,
     /// The directory searched for symbolic links.
