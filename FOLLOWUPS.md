@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in eighteen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in nineteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -35,7 +35,9 @@ what a compiler emits — and then, from the differential oracle those rounds pr
 reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and items
 68–70 from `device_security` ([#311](https://github.com/glslang/windbg-mcp/pull/311)), where
 eleven rounds of review on one tool ended with its own live-kernel measurement contradicting the
-item an earlier round of it had produced (2026-09-13).
+item an earlier round of it had produced (2026-09-13), and item 71 from `driver_surface`, the
+fourth driver tool, whose specification included a dispatch-to-sink traversal that did not land
+with it (2026-09-13).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1140,3 +1142,34 @@ absence it has not established.
   through (2026-09-13).
 
 **Where it picks up.** `Namespace::object_at` in `dbgscope`'s `src/object.rs`.
+
+## 71. [windbg-mcp] `driver_surface` does not say which control code reaches which sink
+
+**Repo:** `windbg-mcp`.
+
+`docs/binja-windbg-mcp-plan.md:138` specifies a bounded dispatch-to-sink traversal -- "disabled for
+ordinary map calls and enabled by `driver_surface`", default depth 2 and 128 functions, hard maxima
+of depth 8 and 1,024 functions, with cancellation and deadline checks. **That did not land.** The
+composite reports `ioctl_map`'s cases and `driver_hazards`' sinks side by side, and nothing joins
+them: a reader gets "this driver accepts `0x222003`" and "this driver calls `MmMapIoSpace` at 79
+sites" and has to ask `reachable_from_dispatch` per pair to find out whether the first reaches the
+second.
+
+That join is the analysis Driver Buddy Revolutions is actually valued for, and it is the one thing a
+composite is better placed to do than its parts -- it already holds the case list, the sink call
+sites and one disassembly budget.
+
+- **Why deferred:** it is a fifth analysis rather than a composition of the four, it needs the
+  traversal bounds the plan fixes and a per-case halt story of its own, and the composite is worth
+  having without it. Landing it inside the branch that added the tool would have put a new walk
+  behind a surface change that was already the largest wire raise in this file's history.
+- **What would close it:** the traversal, bounded as the plan's figures say, reported per case
+  rather than per driver -- a case that reaches a sink, with the path, and a case whose reachability
+  was not settled within the bounds saying so rather than reading as one that reaches nothing. The
+  asymmetry `reachable_from_dispatch` already documents is the shape to follow: reachable is sound,
+  not-reachable is bounded-effort, and the two must not be a boolean.
+- **How it was found:** writing `driver_surface` against the plan that specifies it, and comparing
+  what shipped with `docs/binja-windbg-mcp-plan.md:138` line by line (2026-09-13).
+
+**Where it picks up.** `driver_surface` in `src/worker.rs`, the walk in `src/driver.rs`, and the
+bounds at `docs/binja-windbg-mcp-plan.md:138`.

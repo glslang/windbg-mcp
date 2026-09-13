@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`driver_surface` — one driver, in one call.** Its dispatch table, every device it created with the gate on each, the control codes its IOCTL handler accepts, and what its image can do. The fourth and last of the native Driver Buddy Revolutions tools, and the one the other three were built toward: it joins them at the driver object's own fields rather than leaving a caller to match a module name to a device path by hand. 60 → 61 tools.
+
+  **Four sections, each answering for itself.** They are read from different things — a dispatch table and a device chain out of pool, a control-code map out of the driver's code, an import table out of its image — and they fail independently, so there is no overall "did this work". Each carries `ok`, `partial`, `unavailable` or `error` with a note, and `unavailable` is kept apart from `error` because a target that cannot answer a section is not a failure of the call. The rule that shape exists to enforce: **a failed dispatch recovery must not discard the import or security evidence**, the fragile analysis being the code one and the two that still answer being the two a reader most often wants.
+
+  The IOCTL and hazard sections are `ioctl_map`'s and `driver_hazards`' own answers **whole**, rendered by their own renderers — a digest would be a second shape restating what the map already says, and a composite whose caller has to go back for the detail has not composed anything.
+
+  **The per-section rule stops at the driver object**, and that boundary is the point rather than an omission: every section is read from something the driver object points at, so a driver object that will not resolve is the whole call failing. Four empty sections is precisely what a driver with no devices, no control codes and no sensitive imports looks like.
+
+  **A bare name resolves under `\Driver` then `\FileSystem`, and one that resolves in neither is refused** — not evaluated as an expression, which is what `!drvobj` does, and how `!drvobj mountmgr 7` comes to answer with mountmgr's image base reported as `is not a driver object`.
+
+  The dispatch table is **grouped by handler** with every major accounted for, the null entries included; how many majors the table holds is read off the target rather than taken as `wdm.h`'s 28. A device carries its descriptor but **not** the symbolic links that reach it — that search lists a whole directory per device — and `device_security` on one path is where the links are.
+
+  Needs a **live kernel target**, for the reason `device_security` does and no other: a driver object is in pool and is reached through the object namespace. The two sections that read the *image* answer perfectly well on a dump, and the refusal names `driver_hazards` and `ioctl_map` for that.
+
 - **`device_security` — who may open a device.** The security descriptor the device object keeps, as principals and access masks, the two device words that qualify it, and the symbolic links in `\GLOBAL??` that reach it from user mode. It resolves an object path through the kernel's own namespace, so the name a user-mode caller knows works as well as the device's: a symbolic link is followed once, and the answer says which one it followed.
 
   Each ACE comes back as its SID **and** the account that SID reads as, with the mask named as a **device's** rights -- `FILE_READ_DATA` rather than the same bit's meaning on a registry key -- and the two the I/O manager checks a control code's `RequiredAccess` against picked out as `reads`/`writes`. That is the join to `ioctl_map`: a code requiring `FILE_WRITE_DATA` cannot be sent through a handle whose ACE grants neither.
@@ -20,6 +34,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `FILE_DEVICE_SECURE_OPEN` is called out where it is **missing**: without it the descriptor is checked when the device is opened by name and not when a path beneath it is opened, so a driver that parses its own paths is reachable through a relative open by a caller the descriptor would have refused.
 
   Needs a **live kernel target**. A kernel minidump carries no object namespace -- the root directory pointer, the type table and the header cookie all read as unavailable -- and the refusal says so rather than sending someone to check a device name that was correct.
+
+- **The refusal for a namespace a dump cannot supply stopped offering two tools that fail the same way.** It ended "`driver_object` and `device_object` work on a dump"; measured against the checked-in sample, both answer `Unable to get value of ObpRootDirectoryObject`, because both resolve their argument through the very namespace the refusal is about. `!drvobj` given a name it cannot resolve is worse than a refusal — it evaluates the name as an expression, so `!drvobj mountmgr 7` answers with mountmgr's image base described as not being a driver object. The advice now names what a minidump does still serve: the image, through `driver_hazards` and `ioctl_map`.
 
 - **`ioctl_map` — which control codes a dispatch routine accepts.** Recovered from the driver's own code and decoded: device type, function code, method and required access, with the site that recognises each code and the routine it reaches. It follows compare chains, the `sub`-and-compare form a rebased switch compiles to, and a jump table when the bounds check and the table's base were both recovered and the switch is indexed by the code itself.
 

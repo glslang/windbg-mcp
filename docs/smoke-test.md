@@ -481,6 +481,30 @@ says nothing about any of them. Run the tier on a host with a bundled engine bef
 `analysis` claim is covered. The missing PDB does cost something, but not the module: both
 buckets end `!unknown_function` whichever way the table above falls.
 
+**`driver_surface` against a dump, where the failure to look for is a successful call.** The
+composite's selling point is that a section which cannot answer does not take the others down with
+it, and the tempting mistake is to apply that to the whole tool and answer with four `unavailable`
+sections instead of a refusal -- a successful call reporting a driver with no dispatch table, no
+devices, no control codes and no sensitive imports, which is exactly what a clean driver looks
+like. So the per-section rule stops at the driver object, every section being read from something
+it points at, and the test asserts a refusal, its `debugger` category, and that no partial survey
+came back beside it. Not the message text: which refusal arrives depends on whether this bench's
+`nt` symbols resolved, and the advice inside it is pinned by a **unit** test instead, where it is
+deterministic.
+
+**`driver_surface` on a live kernel, where what is checked is that it composes.** Its three
+constituents each have an oracle already, so restating those here would test `ioctl_map` a second
+time rather than test that the composite *returns* `ioctl_map`'s answer -- and a section quietly
+built from a second, drifted copy of the analysis is the failure a composite is most likely to
+have. The test is therefore a differential: `driver_surface` on `\Driver\mountmgr`, then
+`ioctl_map`, `driver_hazards` and `device_security` called separately on what the survey says the
+dispatch routine, the image and the device are, with the embedded answers compared as values.
+Because those arguments come from the survey's own report, the driver object is first checked
+against `!drvobj` -- somebody else's extension -- so a survey of the wrong driver cannot compare a
+wrong answer against a wrong oracle and pass. It also asserts the link search is **absent** from
+the composite's devices, so that adding it later is a visible change rather than a silent one that
+would make the `TOOL_NOTES` pointer at `device_security` wrong.
+
 **`device_security` against a dump, which is the one target it cannot answer about.** A kernel
 minidump captures no object namespace: `nt!ObpRootDirectoryObject`, `nt!ObpInfoMaskToOffset` and
 `nt!ObHeaderCookie` all read `????????`, none of them being in the small set of pages a bug check

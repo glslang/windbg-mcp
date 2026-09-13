@@ -1007,6 +1007,235 @@ mod tests {
         assert_eq!(chain.stopped, Some(ChainHalt::Unreadable));
     }
 
+    // ---- the dispatch report ----------------------------------------------
+
+    /// A coordinate with no engine behind it, so the grouping is what is under test.
+    fn at(address: u64) -> crate::structured::CodeLocation {
+        crate::structured::CodeLocation {
+            address: crate::structured::addr(address),
+            module: Some("mydriver".to_string()),
+            rva: Some(format!("{address:#x}")),
+            attribution_failed: false,
+        }
+    }
+
+    /// A driver whose dispatch table is `handlers`, with a real image extent behind it.
+    fn with_table(handlers: &[u64]) -> Driver {
+        Driver {
+            name: None,
+            image_base: 0x1000,
+            image_size: 0x1_0000,
+            flags: 0,
+            init: 0,
+            start_io: 0,
+            unload: 0,
+            fast_io: 0,
+            device_object: 0,
+            major_function: handlers.to_vec(),
+        }
+    }
+
+    /// **The shape of a real dispatch table**: three of the driver's own routines and a kernel
+    /// stub on everything else, grouped so the three are what you read.
+    #[test]
+    fn a_dispatch_table_is_grouped_by_the_routine_each_major_reaches() {
+        const STUB: u64 = 0xffff_f805_0000_0000;
+        let mut table = [STUB; 28];
+        table[0x00] = 0x2000; // IRP_MJ_CREATE
+        table[0x02] = 0x2000; // IRP_MJ_CLOSE, same routine
+        table[0x0e] = 0x3000; // IRP_MJ_DEVICE_CONTROL
+        let driver = with_table(&table);
+
+        let section = dispatch_section(&driver, at);
+
+        assert_eq!(section.major_count, 28);
+        assert_eq!(
+            section.handlers.len(),
+            3,
+            "two of the driver's routines and the stub, not 28 rows: {:#?}",
+            section.handlers
+        );
+        // Order is the order each handler is **first** reached, which is the order the table holds.
+        assert_eq!(
+            section.handlers[0].majors,
+            vec!["0x00 IRP_MJ_CREATE", "0x02 IRP_MJ_CLOSE"]
+        );
+        assert!(section.handlers[0].owned);
+        assert_eq!(
+            section.handlers[1].majors.len(),
+            25,
+            "every major that reaches the stub is on the stub's row"
+        );
+        assert!(
+            !section.handlers[1].owned,
+            "the kernel's stub is outside this driver's image, which is the half a reader acts on"
+        );
+        assert_eq!(
+            section.handlers[2].majors,
+            vec!["0x0e IRP_MJ_DEVICE_CONTROL"]
+        );
+
+        // And the one entry a caller feeds to `ioctl_map`.
+        assert_eq!(
+            section.device_control.map(|at| at.address),
+            Some(crate::structured::addr(0x3000))
+        );
+    }
+
+    /// **No entry is dropped, the null ones included.** The I/O manager fills an unhandled major
+    /// with its own stub rather than leaving it empty, so a null entry is a driver object that has
+    /// been written to -- which is the thing not to quietly omit.
+    #[test]
+    fn a_null_dispatch_entry_is_a_row_rather_than_a_gap() {
+        let mut table = [0x2000u64; 28];
+        table[0x03] = 0;
+        let section = dispatch_section(&with_table(&table), at);
+
+        let majors: Vec<&String> = section
+            .handlers
+            .iter()
+            .flat_map(|one| &one.majors)
+            .collect();
+        assert_eq!(majors.len(), 28, "every major is accounted for: {majors:?}");
+        assert!(
+            section
+                .handlers
+                .iter()
+                .any(|one| one.majors == vec!["0x03 IRP_MJ_READ"]),
+            "the null entry is its own row: {:#?}",
+            section.handlers
+        );
+    }
+
+    /// A null IOCTL entry yields **no** `device_control`, rather than a coordinate at zero.
+    #[test]
+    fn a_null_ioctl_entry_is_not_an_address_to_map() {
+        let mut table = [0x2000u64; 28];
+        table[IRP_MJ_DEVICE_CONTROL] = 0;
+        let section = dispatch_section(&with_table(&table), at);
+        assert!(
+            section.device_control.is_none(),
+            "zero is not something to feed `ioctl_map`: {:?}",
+            section.device_control
+        );
+    }
+
+    /// A table longer than the published name list numbers the extra entries rather than naming
+    /// them, and **never** borrows a neighbour's name.
+    #[test]
+    fn a_major_past_the_published_names_is_numbered_and_not_named() {
+        assert_eq!(major_label(0x0e), "0x0e IRP_MJ_DEVICE_CONTROL");
+        assert_eq!(
+            major_label(0x1b),
+            "0x1b IRP_MJ_PNP",
+            "the last published one"
+        );
+        assert_eq!(
+            major_label(0x1c),
+            "0x1c",
+            "a build with a longer table is a thing to notice, and a made-up label on the entry \
+             that would say so is the one answer worse than no label"
+        );
+    }
+
+    // ---- the rendering ----------------------------------------------------
+
+    fn rendered(devices: Vec<crate::structured::SurfaceDevice>) -> String {
+        use crate::structured as s;
+        render(&s::DriverSurface {
+            images: Vec::new(),
+            driver: "\\Driver\\mydriver".to_string(),
+            address: s::addr(0x9000),
+            name: Some("\\Driver\\mydriver".to_string()),
+            module: Some("mydriver".to_string()),
+            image_base: s::addr(0x1000),
+            image_size: "0x10000".to_string(),
+            unload: None,
+            dispatch: dispatch_section(&with_table(&[0x2000; 28]), at),
+            devices: s::DevicesSection {
+                status: s::SectionStatus::Ok,
+                note: None,
+                device_count: devices.len(),
+                unnamed: devices.iter().filter(|one| one.path.is_none()).count(),
+                devices,
+                named_in: "\\Device".to_string(),
+            },
+            ioctl: s::IoctlSection {
+                status: s::SectionStatus::Unavailable,
+                note: Some("no IOCTL handler".to_string()),
+                map: None,
+            },
+            hazards: s::HazardsSection {
+                status: s::SectionStatus::Ok,
+                note: None,
+                hazards: None,
+            },
+        })
+    }
+
+    fn a_device(path: Option<&str>) -> crate::structured::SurfaceDevice {
+        crate::structured::SurfaceDevice {
+            address: crate::structured::addr(0x5000),
+            path: path.map(str::to_string),
+            device_type: "0x0022".to_string(),
+            characteristics: "0x00000100".to_string(),
+            secure_open: true,
+            flags: "0x00000040".to_string(),
+            exclusive: false,
+            security: None,
+            security_absent: Some("nothing was read".to_string()),
+        }
+    }
+
+    /// **A device with no path is not called unnamed.**
+    ///
+    /// The rule this pins is the one the field's own doc comment states: an absent path covers a
+    /// device the object manager filed under no name *and* one filed in a different directory, and
+    /// a listing of one directory cannot tell them apart. Calling it "unnamed" picks the first,
+    /// which on a measured 26100 guest would be wrong for some unknown share of the 66 devices
+    /// that carry no name -- because that measurement counted object headers, and this counts a
+    /// directory.
+    #[test]
+    fn a_device_with_no_path_is_not_reported_as_one_with_no_name() {
+        let out = rendered(vec![a_device(None)]);
+        assert!(
+            !out.contains("unnamed") && !out.contains("no name"),
+            "a directory listing cannot say a device is unnamed: {out}"
+        );
+        assert!(
+            out.contains("(not in this directory)"),
+            "it says what was searched instead: {out}"
+        );
+    }
+
+    /// A section that is `ok` is not marked; one that is short of something is.
+    #[test]
+    fn only_a_section_that_is_short_of_something_carries_a_marker() {
+        let out = rendered(vec![a_device(Some("\\Device\\mydevice"))]);
+        assert!(
+            out.contains("IOCTL map  [unavailable]"),
+            "the section that has nothing says so: {out}"
+        );
+        assert!(
+            !out.contains("Devices (1)  [ok]") && !out.contains("[ok]"),
+            "and the ordinary ones are not marked, or the marker stops meaning anything: {out}"
+        );
+    }
+
+    /// An embedded renderer's output is indented under its heading **without** gaining a line of
+    /// trailing whitespace, which is what a naive split on a body ending in a newline produces.
+    #[test]
+    fn an_embedded_section_is_indented_and_gains_no_trailing_whitespace() {
+        let mut out = String::new();
+        indented(&mut out, "  ", "one\n\ntwo\n");
+        assert_eq!(out, "  one\n\n  two\n");
+        assert!(
+            !out.lines()
+                .any(|line| !line.is_empty() && line.trim().is_empty()),
+            "no line is whitespace alone: {out:?}"
+        );
+    }
+
     /// The clock is polled **per device**, so a long chain is interruptible partway rather than
     /// only before it starts.
     #[test]
