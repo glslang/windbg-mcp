@@ -115,16 +115,34 @@ device_security { "device": "\\Device\\MountPointManager" }
 ```
 
 ```text
-\Device\MountPointManager at 0xffffb90a0c0e5030
-  Driver          0xffffb90a0a1b2c00
-  DeviceType      0x002d
+\Device\MountPointManager at 0xffff940e21047280
+  Driver          0xffff940e21047060
+  DeviceType      0x0012
   Characteristics 0x00000100  FILE_DEVICE_SECURE_OPEN
-  Flags           0x00000040
-  Security descriptor at 0xffff8680fc6912a0
+  Flags           0x00000840
+  Security descriptor at 0xffffe506857f53a0
     Owner  S-1-5-32-544 (Administrators)
-    DACL   4 ACE(s)
-      allow  Everyone                     0x001200a0  READ_CONTROL SYNCHRONIZE ...
+    Group  S-1-5-18 (SYSTEM)
+    DACL  4 ACE(s)
+      allow  Everyone                     0x001200a0  FILE_EXECUTE FILE_READ_ATTRIBUTES READ_CONTROL SYNCHRONIZE
+      allow  SYSTEM                       0x001f01ff  FILE_READ_DATA FILE_WRITE_DATA ...
+      allow  Administrators               0x001f01ff  FILE_READ_DATA FILE_WRITE_DATA ...
+      allow  RESTRICTED                   0x001200a0  FILE_EXECUTE FILE_READ_ATTRIBUTES READ_CONTROL SYNCHRONIZE
+  Reachable as:
+    \GLOBAL??\MountPointManager  -> \Device\MountPointManager
+  [!] 2 of \GLOBAL??'s entries could not be checked (1 this could not name, 1 whose target
+      would not read), so any of them may reach this device
 ```
+
+Real output, from Windows Server 26100 over KDNET on 2026-09-13, with the two longest rights lists
+elided. The addresses are that machine's and will not be yours; the four ACEs and their masks are
+the ones this document recovered by hand, which is why the live-kernel smoke test asserts them.
+
+Two things in it are worth reading twice. The last line is what stops an empty `Reachable as` from
+meaning "nothing reaches this device" -- a directory entry whose name is paged out is one this
+could not check. And the DACL's **order** here is not the table below: the kernel builds it
+Everyone, SYSTEM, Administrators, RESTRICTED, while the table is grouped by the access it grants.
+Order decides a DACL only when a deny follows an allow, and all four of these are allows.
 
 The DACL comes back as `security.dacl.entries[]`, each carrying `sid`, `account`, `mask`,
 `rights[]` and the two booleans that decide whether a control code can be sent at all — `reads`

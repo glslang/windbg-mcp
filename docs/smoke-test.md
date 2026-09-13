@@ -1314,19 +1314,30 @@ about. This is the other half — an attach that lands:
   containing one cannot be turned back into the bytes it came from. That is a fact about rendering
   and says nothing about the walk, so it skips the comparison with a note rather than failing.
 
-- **`device_security` reproduces a published gate.** `\Device\MountPointManager` is on every
-  Windows kernel and [`driver-ioctl-walkthrough.md`](driver-ioctl-walkthrough.md) recovered its
-  four-ACE DACL by hand -- `dt nt!_SECURITY_DESCRIPTOR_RELATIVE`, `dt nt!_ACL`, `db`, parsed by eye
-  -- before there was a tool, so every figure asserted comes from that document rather than from
-  this code: Everyone and RESTRICTED at `0x001200a0`, SYSTEM and Administrators at `0x001f01ff`, in
-  that order, with `FILE_DEVICE_SECURE_OPEN` set. A descriptor reader that agreed with itself and
-  not with the kernel still fails here. The assertion the rest exists for is the last: Everyone's
-  mask carries neither `FILE_READ_DATA` nor `FILE_WRITE_DATA`, checked as the `reads`/`writes`
-  booleans rather than by matching the hex, because those are what a caller joining this to an
-  IOCTL map reads and a mask quoted correctly into fields nobody computed would pass a text match.
-  It also checks the namespace half -- the global link `\GLOBAL??\MountPointManager` is found and
-  `link_search` is `complete`, which is what makes an empty list mean "nothing reaches this device"
-  rather than "the search stopped".
+- **`device_security` is checked against the debugger's own view of the same device.** Three
+  oracles, none of them this server's code. `!devobj` -- somebody else's extension -- names the
+  device object, its driver and **its security descriptor**, and every one of those has to be the
+  value the tool answered with. `!object` on `\GLOBAL??` lists the directory, and its entry count
+  has to equal `links_examined + links_unnamed`; the target is broken in throughout, so the two
+  readings are of one state. And the four-ACE DACL
+  [`driver-ioctl-walkthrough.md`](driver-ioctl-walkthrough.md) recovered by hand -- Everyone and
+  RESTRICTED at `0x001200a0`, SYSTEM and Administrators at `0x001f01ff` -- asserted as a **set**,
+  because the kernel builds them in a different order from the document's table and all four are
+  allows, so order decides nothing here.
+
+  Both halves earned their place by failing. The descriptor assertion is why the tool reads
+  `_DEVICE_OBJECT`'s own field rather than the object header's, which is null for a device and
+  would have reported every device on that build as unguarded; no unit test could have caught it,
+  because a fixture would have had whatever the code expected. The count identity is why
+  `links_unnamed` and `links_unread` are two fields: one figure overshot `!object` by exactly the
+  one link whose target failed, because an unnamed entry is outside `links_examined` and an unread
+  target is inside it.
+
+  **It needs the engine's extension directories beside the dev build**, which `ci.yml` does not
+  copy and a fresh `cargo build` does not create: `!devobj` and `!object` are `winext\ext.dll`
+  exports, and without them this fails with `No export devobj found` rather than skipping. Copy
+  `winext\`, `winxp\` and `triage\` from `targetelease` (see
+  [`install.md`](install.md)) before running the tier.
 
 The attach test also records a **transcript** and checks the supplied KD key is nowhere in it. The
 protocol tier passes a raw connection too, but its attach is refused for its shape before anything
