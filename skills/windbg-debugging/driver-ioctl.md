@@ -61,10 +61,13 @@ reads.
    and the `\GLOBAL??` links that reach the device. Each ACE carries `reads`/`writes`, which is
    what the *deliverable* gate below is checked against.
 
-   **A `security_absent` answer is not an open device, and not a finished one either.** A device
-   with no descriptor of its own is guarded by the directory holding it, which this does not read
-   — so the openable gate is unanswered rather than absent, and the directory is where to look
-   next. That is the common case on a server build. It needs a **live kernel** -- a dump
+   **A `security_absent` answer is not an open device, and not a finished one either.** The
+   openable gate is unanswered rather than absent: this tool read no descriptor on the device and
+   did not go looking for one elsewhere, so the holding directory is where to look next. Do not
+   treat "the directory is what the kernel checks instead" as established -- it is the ordinary
+   account of it, and nothing here has measured it. Expect this answer to be **rare or
+   unreachable** rather than common: every device object on a measured Windows Server 26100 guest
+   carries its own descriptor, the unnamed ones included. It needs a **live kernel** -- a dump
    carries no object namespace. On a dump, fall back to the hand method: `device_object` for the
    device type, characteristics and `SecurityDescriptor` pointer, then
    `execute { "command": "!sd <SecurityDescriptor> 1" }` where that extension is present (it is
