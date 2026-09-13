@@ -6905,8 +6905,10 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         })?;
 
     let mut attributor = Attributor::default();
-    // Written by every attribution below, and read twice: by the hazard section, which must not
-    // report this call's clock as a target with no such module, and by nothing else.
+    // Set by whichever attribution below stops first, and read by one place: the hazard
+    // section, which must not report this call's clock as a target with no such module.
+    // Once it is set every later `locate` short-circuits, so a `module` of `None` beside a
+    // set cell is a lookup that never ran rather than an address in no image.
     let attribution_halted = std::cell::Cell::new(None);
     let attribution_halt = || attribution_stop(e, deadline);
     let mut locate = |address: u64| {
