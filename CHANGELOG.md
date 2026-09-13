@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`device_security` — who may open a device.** The security descriptor off the object header as principals and access masks, the two device words that qualify it, and the symbolic links in `\GLOBAL??` that reach it from user mode. It resolves an object path through the kernel's own namespace, so the name a user-mode caller knows works as well as the device's: a symbolic link is followed once, and the answer says which one it followed.
+- **`device_security` — who may open a device.** The security descriptor the device object keeps, as principals and access masks, the two device words that qualify it, and the symbolic links in `\GLOBAL??` that reach it from user mode. It resolves an object path through the kernel's own namespace, so the name a user-mode caller knows works as well as the device's: a symbolic link is followed once, and the answer says which one it followed.
 
   Each ACE comes back as its SID **and** the account that SID reads as, with the mask named as a **device's** rights -- `FILE_READ_DATA` rather than the same bit's meaning on a registry key -- and the two the I/O manager checks a control code's `RequiredAccess` against picked out as `reads`/`writes`. That is the join to `ioctl_map`: a code requiring `FILE_WRITE_DATA` cannot be sent through a handle whose ACE grants neither.
 

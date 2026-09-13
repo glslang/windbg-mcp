@@ -1336,7 +1336,7 @@ about. This is the other half — an attach that lands:
   **It needs the engine's extension directories beside the dev build**, which `ci.yml` does not
   copy and a fresh `cargo build` does not create: `!devobj` and `!object` are `winext\ext.dll`
   exports, and without them this fails with `No export devobj found` rather than skipping. Copy
-  `winext\`, `winxp\` and `triage\` from `targetelease` (see
+  `winext\`, `winxp\` and `triage\` from `target\release` (see
   [`install.md`](install.md)) before running the tier.
 
 The attach test also records a **transcript** and checks the supplied KD key is nowhere in it. The

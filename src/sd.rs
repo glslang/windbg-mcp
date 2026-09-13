@@ -117,6 +117,16 @@ pub(crate) enum AceKind {
 }
 
 impl AceKind {
+    /// Whether an entry of this kind carries a principal where this reader looks for one.
+    ///
+    /// True for everything but [`Self::Other`], which is the kind for an ACE whose SID this
+    /// cannot place -- an object ACE puts up to two GUIDs before it. So for every other kind a
+    /// missing [`Ace::sid`] means the bytes that should have held one did not parse, which is a
+    /// different fact from an ACE that has none, and the only way to tell them apart.
+    pub(crate) fn carries_sid(self) -> bool {
+        !matches!(self, Self::Other(_))
+    }
+
     /// Whether this entry's mask is an **access** mask, and so nameable as device rights.
     ///
     /// The distinction the type exists for: an allow, a deny and an audit entry all carry one, and
@@ -147,8 +157,13 @@ pub(crate) struct Ace {
     pub(crate) flags: u8,
     /// The access mask, as encoded.
     pub(crate) mask: u32,
-    /// The principal, when the ACE carries one where this can find it. An object ACE puts GUIDs
-    /// before its SID, and a type this does not decode has one it cannot place.
+    /// The principal, when the ACE carries one where this can find it.
+    ///
+    /// **Absent means two different things, and [`AceKind::carries_sid`] is what tells them
+    /// apart.** For [`AceKind::Other`] it is an ACE whose SID this cannot place -- an object ACE
+    /// puts up to two GUIDs before it. For every other kind the bytes that should have held a SID
+    /// did not parse, which on a descriptor read out of a target this server did not write is
+    /// evidence rather than a wrinkle: it is an entry granting a mask to somebody nobody can name.
     pub(crate) sid: Option<Sid>,
 }
 

@@ -19,7 +19,7 @@ caller token. An IOCTL is only useful to a user if it passes all four:
 
 | Gate | Question | How to answer |
 |------|----------|---------------|
-| **Openable** | Can this token open the device at all? | `device_security` → the DACL as principals and access masks, with `secure_open` beside it. On a dump, where there is no object namespace: `device_object` for the `SecurityDescriptor` pointer, then `!sd <ptr>` where that extension is present |
+| **Openable** | Can this token open the device at all? | `device_security` → the DACL as principals and access masks, with `secure_open` beside it. **Only when the device carries a descriptor**: where it answers `security_absent`, most devices on a server build, the object manager checks the directory holding the device and this tool does not read it — inspect that directory's DACL separately. On a dump, where there is no object namespace: `device_object` for the `SecurityDescriptor` pointer, then `!sd <ptr>` where that extension is present |
 | **Namespace-visible** | Does `CreateFile(\\.\Foo)` resolve in the caller's session? | the same `device_security` call: its `links[]` are the `\GLOBAL??` links that reach this device, and `link_search` says whether the whole directory was seen |
 | **Deliverable** | Does the I/O manager forward the IRP to the driver? | `decode_ioctl` → `RequiredAccess` (bits 14–15) checked against the handle's *granted* access **before** the IRP reaches the driver |
 | **Handled** | Does the driver do something, or reject it? | `irp_stack` at the break + `Irp->IoStatus.Status` on return (a `default:` case returns `STATUS_INVALID_DEVICE_REQUEST` / `STATUS_NOT_SUPPORTED`) |
@@ -59,7 +59,12 @@ reads.
 4. **Device surface.** `device_security { "device": "\\Device\\MyDevice" }` answers the
    *openable* and *namespace* gates together: the DACL as principals and masks, `secure_open`,
    and the `\GLOBAL??` links that reach the device. Each ACE carries `reads`/`writes`, which is
-   what the *deliverable* gate below is checked against. It needs a **live kernel** -- a dump
+   what the *deliverable* gate below is checked against.
+
+   **A `security_absent` answer is not an open device, and not a finished one either.** A device
+   with no descriptor of its own is guarded by the directory holding it, which this does not read
+   — so the openable gate is unanswered rather than absent, and the directory is where to look
+   next. That is the common case on a server build. It needs a **live kernel** -- a dump
    carries no object namespace. On a dump, fall back to the hand method: `device_object` for the
    device type, characteristics and `SecurityDescriptor` pointer, then
    `execute { "command": "!sd <SecurityDescriptor> 1" }` where that extension is present (it is

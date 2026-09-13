@@ -309,6 +309,7 @@ fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
             .as_ref()
             .and_then(|sid| sid.name)
             .map(str::to_string),
+        principal_unreadable: ace.kind.carries_sid() && ace.sid.is_none(),
         mask: format!("{:#010x}", ace.mask),
         rights: rights.into_iter().map(str::to_string).collect(),
         reads,
@@ -569,7 +570,13 @@ fn render_acl(out: &mut String, what: &str, acl: &crate::structured::AccessContr
                 .account
                 .clone()
                 .or_else(|| entry.sid.clone())
-                .unwrap_or_else(|| "<no principal>".to_string()),
+                .unwrap_or_else(|| match entry.principal_unreadable {
+                    // **Not the same as an ACE that has none.** This entry grants its mask to
+                    // somebody, and the bytes naming them did not parse -- so who it lets in is
+                    // unknown rather than nobody, which is what `<no principal>` reads as.
+                    true => "<principal did not parse>".to_string(),
+                    false => "<no principal>".to_string(),
+                }),
             entry.mask,
             entry.rights.join(" ")
         );
@@ -953,6 +960,55 @@ mod tests {
                 "{absent} was printed for a real DACL: {real}"
             );
         }
+    }
+
+    /// **An ACE whose principal did not parse is not an ACE with no principal.**
+    ///
+    /// `sid_from` is given bytes out of target memory, so a SID whose revision is not 1 or whose
+    /// sub-authority count runs past the entry is a thing a corrupt or hostile descriptor
+    /// produces. The entry still grants its mask -- to somebody nobody can name -- and rendering
+    /// that as `<no principal>`, which is what an ACE this reader cannot place its SID in gets,
+    /// reads as "this grants nothing to nobody".
+    #[test]
+    fn an_ace_whose_principal_did_not_parse_is_not_one_that_has_none() {
+        let mut torn = ace(
+            crate::sd::AceKind::Allow,
+            "S-1-1-0",
+            Some("Everyone"),
+            0x1f01ff,
+        );
+        torn.sid = None;
+        let entry = access_entry(&torn);
+        assert!(
+            entry.principal_unreadable,
+            "an allow entry always carries a principal, so an absent one did not parse: {entry:?}"
+        );
+
+        // An object ACE is the other case: this reader does not look where its SID is, and
+        // nothing is wrong with the entry.
+        let mut placed = ace(crate::sd::AceKind::Other(0x05), "S-1-1-0", None, 0x1f01ff);
+        placed.sid = None;
+        assert!(
+            !access_entry(&placed).principal_unreadable,
+            "an object ACE's SID is somewhere this does not read, which is not a fault"
+        );
+
+        // And the two render differently, which is the point of telling them apart at all.
+        let with = |entry: crate::structured::AccessEntry| {
+            let mut out = String::new();
+            render_acl(
+                &mut out,
+                "DACL",
+                &crate::structured::AccessControlList {
+                    revision: 2,
+                    ace_count: 1,
+                    entries: vec![entry],
+                },
+            );
+            out
+        };
+        assert!(with(access_entry(&torn)).contains("did not parse"));
+        assert!(with(access_entry(&placed)).contains("<no principal>"));
     }
 
     /// **A mask is named as access only when it is one.**
