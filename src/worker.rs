@@ -74,6 +74,7 @@ use crate::server::{
     EXEC_WAIT_MS, hexdump, matches_module_pattern, module_pattern, parse_eval, parse_u64,
 };
 use crate::structured;
+use crate::surface;
 use crate::target::{Arch, Opening};
 use crate::triage::{self, Analysis, AttributedFrame, Attribution};
 use crate::walk;
@@ -1758,6 +1759,31 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                          routine and report back. Nothing was read. It waited {}s behind other \
                          work on this session; issue it when the session is idle, or raise the \
                          server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
+                        patience.saturating_sub(queued).as_secs(),
+                        queued.as_secs(),
+                    ),
+                )),
+            }
+        }
+        EngineOp::DriverSurface {
+            driver,
+            patience_ms,
+        } => {
+            // Refused rather than started with no clock, as its three constituents are. This one
+            // has the most to lose from starting anyway: with nothing left, every section would
+            // report itself empty or unavailable, which is a composite shaped exactly like a
+            // driver with no devices, no control codes and no sensitive imports.
+            let patience = Duration::from_millis(u64::from(patience_ms));
+            match walk_budget(patience, queued) {
+                Some(budget) => driver_surface(e, &driver, Instant::now() + budget),
+                None => Err(Failed::categorised(
+                    structured::ErrorCategory::NotRun,
+                    format!(
+                        "This driver survey was not run: it reached the engine with {}s of its \
+                         caller's timeout left, which is not enough to walk the object namespace, \
+                         read a device chain and parse an image. Nothing was read. It waited {}s \
+                         behind other work on this session; issue it when the session is idle, or \
+                         raise the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS).",
                         patience.saturating_sub(queued).as_secs(),
                         queued.as_secs(),
                     ),
@@ -6700,6 +6726,455 @@ fn hazards_of(
     // stop is the one that happened.
     report.stopped = report.stopped.or_else(|| stopped.get());
     Ok(report)
+}
+
+/// The directory a driver object is filed in, and the one a file-system driver is filed in.
+///
+/// Searched in this order for a caller who named a bare `mountmgr` rather than a path. **Two
+/// rather than one** because a file system's driver object is under `\FileSystem` and is a
+/// `Driver` object in every other respect -- the same split `device_security`'s own measurement
+/// walked, where the 231 devices came off driver chains in both directories.
+const DRIVER_DIRECTORIES: [&str; 2] = ["\\Driver", "\\FileSystem"];
+
+/// The object type name a driver object carries.
+const DRIVER: &str = "Driver";
+
+/// The directory a device's path is looked up in.
+///
+/// Not the same question as [`LINK_DIRECTORY`], which is about what reaches a device from user
+/// mode. This is about what the object manager filed the device itself under, and it is why
+/// [`structured::DevicesSection::named_in`] is a field: a device with no path here may be filed
+/// somewhere else or filed nowhere at all, and a listing of one directory cannot tell them apart.
+const DEVICE_DIRECTORY: &str = "\\Device";
+
+/// Where a `_DRIVER_OBJECT`'s fields are on **this** target.
+///
+/// Every offset from the target's own type information, for the reason [`device_layout`] gives.
+fn driver_layout(e: &DebugEngine, pointer: usize) -> Result<surface::Layout, Failed> {
+    let module = e.kernel_base().map_err(failed)?;
+    let id = e.type_id(module, "_DRIVER_OBJECT").map_err(|why| {
+        Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this target has no type information for `_DRIVER_OBJECT` ({why}), so a driver's \
+                 fields cannot be located. Check that the kernel's symbols resolve: \
+                 `set_symbol_path`, then `modules` on `nt`."
+            ),
+        )
+    })?;
+    let unicode = e.type_id(module, "_UNICODE_STRING").map_err(failed)?;
+    let of = |field: &str| e.field_offset(module, id, field).map_err(failed);
+    Ok(surface::Layout {
+        pointer,
+        size: e.type_size(module, id).map_err(failed)?,
+        device_object: of("DeviceObject")?,
+        flags: of("Flags")?,
+        driver_start: of("DriverStart")?,
+        driver_size: of("DriverSize")?,
+        driver_name: of("DriverName")?,
+        driver_init: of("DriverInit")?,
+        driver_start_io: of("DriverStartIo")?,
+        driver_unload: of("DriverUnload")?,
+        fast_io: of("FastIoDispatch")?,
+        major_function: of("MajorFunction")?,
+        unicode_length: e.field_offset(module, unicode, "Length").map_err(failed)?,
+        unicode_buffer: e.field_offset(module, unicode, "Buffer").map_err(failed)?,
+    })
+}
+
+/// Everything this server can say about one driver, from its driver object outward.
+///
+/// What only the worker can do is here: resolve a path through the object namespace, read the two
+/// structures behind it, and drive the two image analyses. [`crate::surface`], [`crate::device`]
+/// and [`crate::sd`] take bytes and have never seen an engine.
+///
+/// **The sections are assembled in order of what they cost and what they depend on**, and one
+/// rule governs the whole function: a section that fails is a section that says so, never one that
+/// takes the others down with it. The driver object itself is the exception and has to be -- every
+/// section is read from something it points at, so a driver object that will not read is the whole
+/// answer failing rather than a section of it.
+fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Output, Failed> {
+    let _ = remaining(deadline, "the object namespace was walked")?;
+    let stop_walking = || matches!(e.interrupted(), Ok(true)) || Instant::now() >= deadline;
+    let memory = |at: u64, len: usize| e.read_memory(at, len).ok();
+    let layout = e.object_layout().map_err(|why| {
+        Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this target has no type information for the object manager's structures ({why}), \
+                 so its namespace cannot be walked. Check that the kernel's symbols resolve: \
+                 `set_symbol_path`, then `modules` on `nt`."
+            ),
+        )
+    })?;
+    let globals = e.object_globals().map_err(failed)?;
+    let namespace = dbgscope::object::Namespace::new(&memory, layout, globals)
+        .map_err(|why| object_failure("the object namespace", &why))?
+        .halting(&stop_walking);
+
+    // **A bare name is resolved, and resolving it is a refusal when it does not.** `!drvobj`
+    // given a name it cannot resolve evaluates it as an *expression* instead, so `!drvobj
+    // mountmgr` on a dump answers with mountmgr's image base described as not being a driver
+    // object -- a wrong answer wearing a refusal's clothes, measured 2026-09-13. Nothing here
+    // falls back to arithmetic: a name is a name, and a path is a path.
+    let (path, object) = match driver.starts_with('\\') {
+        true => {
+            let object = namespace
+                .object_at(driver)
+                .map_err(|why| object_failure(driver, &why))?;
+            (driver.to_string(), object)
+        }
+        false => {
+            let mut found = None;
+            let mut last = None;
+            for directory in DRIVER_DIRECTORIES {
+                let candidate = format!("{directory}\\{driver}");
+                match namespace.object_at(&candidate) {
+                    Ok(object) => {
+                        found = Some((candidate, object));
+                        break;
+                    }
+                    Err(why) => last = Some((candidate, why)),
+                }
+            }
+            match found {
+                Some(found) => found,
+                None => {
+                    let (candidate, why) = last.expect("at least one directory was tried");
+                    return Err(match why {
+                        dbgscope::object::ObjectError::NotFound { .. } => Failed::categorised(
+                            structured::ErrorCategory::InvalidArgument,
+                            format!(
+                                "no driver named `{driver}` is filed in {} or {}. This takes a \
+                                 driver object's path or the bare name under one of those two, \
+                                 and a name it cannot resolve is refused rather than evaluated as \
+                                 an expression -- which is what `!drvobj` does, and how a module \
+                                 base comes to be reported as a driver object.",
+                                DRIVER_DIRECTORIES[0], DRIVER_DIRECTORIES[1],
+                            ),
+                        ),
+                        why => object_failure(&candidate, &why),
+                    });
+                }
+            }
+        }
+    };
+
+    // **An object this cannot confirm is a driver is refused, and so is one of another type**, for
+    // the reason `device_security` refuses the same: a `_DRIVER_OBJECT` is 0x150 bytes and every
+    // object in the namespace has bytes there, so a directory read this way answers with an image
+    // base, a device chain and a dispatch table, all of them fiction.
+    match object.type_name.as_deref() {
+        Some(DRIVER) => {}
+        Some(other) => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::InvalidArgument,
+                format!(
+                    "`{path}` is a {other}, not a driver. This reads a `_DRIVER_OBJECT`, and \
+                     reading one off an object of another type would answer with a dispatch table \
+                     that is fiction. `device_security` answers about a device."
+                ),
+            ));
+        }
+        None => {
+            return Err(Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!(
+                    "`{path}` resolved, and this target could not say what type of object it is, \
+                     so reading it as a driver would answer with fields that may be fiction. \
+                     Check the kernel's symbols resolve with `set_symbol_path`, then `modules` on \
+                     `nt`."
+                ),
+            ));
+        }
+    }
+
+    let fields = surface::read_driver(object.address, driver_layout(e, layout.pointer)?, memory)
+        .map_err(|why| {
+            Failed::categorised(
+                structured::ErrorCategory::Debugger,
+                format!(
+                    "the driver object at {:#018x} could not be read: {why}",
+                    object.address
+                ),
+            )
+        })?;
+
+    let mut attributor = Attributor::default();
+    let stopped = std::cell::Cell::new(None);
+    let attribution_halt = || attribution_stop(e, deadline);
+    let mut locate = |address: u64| {
+        locate_within(address, &stopped, attribution_halt, |address| {
+            attributor.locate(e, address)
+        })
+    };
+
+    // ---- the dispatch table, which came with the driver object ------------
+    let dispatch = surface::dispatch_section(&fields, &mut locate);
+    let unload = (fields.unload != 0).then(|| locate(fields.unload));
+    let module = locate(fields.image_base).module;
+
+    // ---- the devices -----------------------------------------------------
+    let devices = driver_devices(e, &namespace, &fields, layout.pointer, deadline);
+
+    // ---- the control codes, off `MajorFunction[0x0e]` --------------------
+    //
+    // **Only when the handler is the driver's own.** An entry pointing outside the image is the
+    // kernel's stub for a major this driver does not handle, or a filter forwarding into the
+    // driver below it; mapping either would report another image's control codes as this
+    // driver's.
+    let ioctl = match dispatch.device_control.as_ref().map(|at| &at.address) {
+        None => structured::IoctlSection {
+            status: structured::SectionStatus::Unavailable,
+            note: Some(
+                "this driver's `MajorFunction[0x0e]` is null, so it has no IOCTL dispatch routine \
+                 to map."
+                    .to_string(),
+            ),
+            map: None,
+        },
+        Some(address) => match fields.device_control().filter(|at| fields.owns(*at)) {
+            None => structured::IoctlSection {
+                status: structured::SectionStatus::Unavailable,
+                note: Some(format!(
+                    "this driver's IOCTL handler is at {address}, which is outside its own image \
+                     -- the kernel's stub for a major function it does not handle, or a filter \
+                     forwarding to the driver below it. Mapping it would report another image's \
+                     control codes as this driver's. `ioctl_map` takes that address directly if \
+                     it is wanted anyway."
+                )),
+                map: None,
+            },
+            Some(at) => match ioctl_map_of(e, &structured::addr(at), deadline) {
+                Ok(map) => structured::IoctlSection {
+                    // A map that stopped early says so in its own `stopped`/`cap_hit`/`unsettled`
+                    // fields, which are richer than this one -- so the section is `partial` and
+                    // points at them rather than restating them worse.
+                    status: match map.stopped.is_some() || map.cap_hit || map.unsettled {
+                        true => structured::SectionStatus::Partial,
+                        false => structured::SectionStatus::Ok,
+                    },
+                    note: (map.stopped.is_some() || map.cap_hit || map.unsettled).then(|| {
+                        "the map did not run to completion; its own `stopped`, `cap_hit` and \
+                         `unsettled` fields say which, and what each one costs the answer."
+                            .to_string()
+                    }),
+                    map: Some(map),
+                },
+                Err(why) => structured::IoctlSection {
+                    status: structured::SectionStatus::Error,
+                    note: Some(why.message.clone()),
+                    map: None,
+                },
+            },
+        },
+    };
+
+    // ---- and what the image can do ---------------------------------------
+    let hazards = match &module {
+        None => structured::HazardsSection {
+            status: structured::SectionStatus::Unavailable,
+            note: Some(format!(
+                "this driver's image base {} is in no module the engine could name, so there is \
+                 no image to scan. `modules` lists what is loaded.",
+                structured::addr(fields.image_base)
+            )),
+            hazards: None,
+        },
+        Some(module) => match hazards_of(e, module, deadline) {
+            Ok(scan) => structured::HazardsSection {
+                status: match scan.stopped.is_some() {
+                    true => structured::SectionStatus::Partial,
+                    false => structured::SectionStatus::Ok,
+                },
+                note: scan.stopped.is_some().then(|| {
+                    "the scan stopped early; its own `stopped` field says why, and its \
+                     `unreadable` list says which ranges went unscanned."
+                        .to_string()
+                }),
+                hazards: Some(scan),
+            },
+            Err(why) => structured::HazardsSection {
+                status: structured::SectionStatus::Error,
+                note: Some(why.message.clone()),
+                hazards: None,
+            },
+        },
+    };
+
+    let report = structured::DriverSurface {
+        images: attributor.images(),
+        driver: path,
+        address: structured::addr(object.address),
+        name: fields.name.clone(),
+        module,
+        image_base: structured::addr(fields.image_base),
+        image_size: format!("{:#x}", fields.image_size),
+        unload,
+        dispatch,
+        devices,
+        ioctl,
+        hazards,
+    };
+    Ok(Output::typed(surface::render(&report), report))
+}
+
+/// Every device on a driver's chain, with the gate that decides who may open it.
+///
+/// **The chain and the naming are two different walks, and the naming is the optional one.** A
+/// device's fields come off the device object; its *path* comes from listing `\Device` and
+/// matching addresses, which is one directory read for the whole chain rather than one per
+/// device. A listing that fails costs the paths and nothing else.
+fn driver_devices(
+    e: &DebugEngine,
+    namespace: &dbgscope::object::Namespace<'_>,
+    driver: &surface::Driver,
+    pointer: usize,
+    deadline: Instant,
+) -> structured::DevicesSection {
+    let memory = |at: u64, len: usize| e.read_memory(at, len).ok();
+    let layout = match device_layout(e, pointer) {
+        Ok(layout) => layout,
+        Err(why) => {
+            return structured::DevicesSection {
+                status: structured::SectionStatus::Error,
+                note: Some(why.message),
+                devices: Vec::new(),
+                device_count: 0,
+                named_in: DEVICE_DIRECTORY.to_string(),
+                unnamed: 0,
+            };
+        }
+    };
+
+    // The chain first: one read per device, which also yields the link to the next.
+    let mut read = HashMap::new();
+    let chain = surface::device_chain(
+        driver.device_object,
+        |at| {
+            let fields = device::read_device(at, layout, memory).ok()?;
+            let next = fields.next;
+            read.insert(at, fields);
+            Some(next)
+        },
+        || {
+            if matches!(e.interrupted(), Ok(true)) {
+                Some(walk::Halt::Interrupted)
+            } else if Instant::now() >= deadline {
+                Some(walk::Halt::Deadline)
+            } else {
+                None
+            }
+        },
+    );
+
+    // Then the paths, from one listing. **Keyed by address**, because a device's name in the
+    // directory is not its identity -- two directories can hold the same name, and the address is
+    // what says this entry is this device.
+    let mut paths: HashMap<u64, String> = HashMap::new();
+    let listing = namespace.objects_in(DEVICE_DIRECTORY).ok();
+    let named_completely = listing
+        .as_ref()
+        .is_some_and(|listing| listing.is_complete());
+    if let Some(listing) = &listing {
+        for object in &listing.objects {
+            if object.exact_name {
+                paths.insert(
+                    object.address,
+                    format!("{DEVICE_DIRECTORY}\\{}", object.name),
+                );
+            }
+        }
+    }
+
+    let devices: Vec<_> = chain
+        .devices
+        .iter()
+        .map(|&at| {
+            let path = paths.get(&at).cloned();
+            let Some(fields) = read.get(&at) else {
+                // The one device on a chain that did not read: it is on the chain, and what is
+                // missing is what it says about itself. Reported with what is known -- its address
+                // and its path -- rather than dropped, which would report a shorter chain.
+                return structured::SurfaceDevice {
+                    address: structured::addr(at),
+                    path,
+                    device_type: String::new(),
+                    characteristics: String::new(),
+                    secure_open: false,
+                    flags: String::new(),
+                    exclusive: false,
+                    security: None,
+                    security_absent: Some(format!(
+                        "the device object at {at:#018x} could not be read, so none of its fields \
+                         above -- including this one -- was read either"
+                    )),
+                };
+            };
+            let security = match fields.security_descriptor {
+                None => device::Security::Absent,
+                Some(at) => match sd::read_descriptor(at, memory) {
+                    Ok(descriptor) => device::Security::Read { at, descriptor },
+                    Err(why) => device::Security::Failed { at, why },
+                },
+            };
+            device::surface_device(structured::addr(at), path, fields, &security)
+        })
+        .collect();
+
+    let unnamed = devices.iter().filter(|one| one.path.is_none()).count();
+    // **`ok` needs both walks whole.** A chain that ended early is missing devices; a directory
+    // that did not list in full is missing paths, and a device with no path then means nothing.
+    let status = match (chain.stopped.is_some(), named_completely) {
+        (false, true) => structured::SectionStatus::Ok,
+        _ => structured::SectionStatus::Partial,
+    };
+    let note = match (chain.stopped, named_completely) {
+        (None, true) => None,
+        (stopped, named) => {
+            let mut why = Vec::new();
+            if let Some(stopped) = stopped {
+                why.push(match stopped {
+                    surface::ChainHalt::Walk(walk::Halt::Deadline) => {
+                        "the chain ran out of time before it ended".to_string()
+                    }
+                    surface::ChainHalt::Walk(walk::Halt::Interrupted) => {
+                        "the chain walk was interrupted".to_string()
+                    }
+                    surface::ChainHalt::Unreadable => {
+                        "a device on the chain would not read, so there was no `NextDevice` to \
+                         follow from it -- the devices listed are a prefix of the chain"
+                            .to_string()
+                    }
+                    surface::ChainHalt::Cycle => {
+                        "the chain returned to a device already visited: it is a ring rather than \
+                         a list, which the object manager does not build"
+                            .to_string()
+                    }
+                    surface::ChainHalt::Capped => format!(
+                        "the chain was still going after {} devices and was not followed further",
+                        surface::MAX_DEVICES
+                    ),
+                });
+            }
+            if !named {
+                why.push(format!(
+                    "{DEVICE_DIRECTORY} could not be listed in full, so a device with no path \
+                     here may simply be one this did not reach"
+                ));
+            }
+            Some(why.join("; "))
+        }
+    };
+
+    structured::DevicesSection {
+        status,
+        note,
+        device_count: devices.len(),
+        devices,
+        named_in: DEVICE_DIRECTORY.to_string(),
+        unnamed,
+    }
 }
 
 /// The directory a device's user-mode name lives in.

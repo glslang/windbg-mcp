@@ -1413,6 +1413,19 @@ pub struct DeviceSecurityArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+pub struct DriverSurfaceArgs {
+    /// The driver object: a path ("\\Driver\\mountmgr"), or the bare name
+    /// ("mountmgr"), which is looked up under "\\Driver" and then "\\FileSystem".
+    /// A name that resolves in neither is refused rather than evaluated as an
+    /// expression.
+    pub driver: String,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
 pub struct DeviceObjectArgs {
     /// Device object: a name (e.g. "\\Device\\MyDevice") or an address (0x-hex).
     pub device: String,
@@ -4490,6 +4503,46 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Everything this server can say about one driver in one call: its dispatch
+    /// table, every device it created with the gate on each, the control codes
+    /// its IOCTL handler accepts, and what its image can do. The four are read
+    /// from different things and **each reports its own status**, so a dispatch
+    /// routine that will not disassemble costs the control codes and not the
+    /// import or security evidence. Joined at the driver object's own fields
+    /// rather than by matching a module name to a device path by hand.
+    /// **Needs a live kernel target**: a driver object is in pool and is reached
+    /// through the object namespace, and a kernel minidump captures neither.
+    #[rmcp::tool(
+        annotations(
+            title = "Survey a driver: dispatch table, devices, control codes and image",
+            read_only_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::DriverSurface>>()
+    )]
+    async fn driver_surface(
+        &self,
+        Parameters(args): Parameters<DriverSurfaceArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // **No command screen, for the reason `device_security` has none.** `driver` reaches
+        // `object_at`, which walks the namespace over typed memory reads; it is never pasted into
+        // a command, so there is no grammar for a separator or a quote to break out of. The one
+        // command this composite reaches is `uf`, and its argument is an address this derived from
+        // the driver object rather than anything the caller wrote.
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::DriverSurface {
+                    driver: args.driver,
+                    // Filled in by the supervisor's pump when this job reaches the front of its
+                    // session's queue, exactly as the walk's is.
+                    patience_ms: 0,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// What decides who may open a device: its security descriptor as principals and
     /// access masks, the two device words that qualify it, and the symbolic links in
     /// `\GLOBAL??` that reach it from user mode. `FILE_DEVICE_SECURE_OPEN` is called
@@ -4863,6 +4916,19 @@ const SUMMARY_NOTES: &[SummaryNote] = &[
 /// served, so if the base description is clean on the tightest surface it is clean on every wider
 /// one.
 const TOOL_NOTES: &[ToolNote] = &[
+    ToolNote {
+        tool: "driver_surface",
+        names: &["device_security"],
+        note: "The devices here carry their descriptor but not the symbolic links that reach \
+               them: that search lists a whole directory per device, so it is `device_security` \
+               on one device's path rather than a chain's worth of them.",
+    },
+    ToolNote {
+        tool: "driver_surface",
+        names: &["ioctl_map", "driver_hazards"],
+        note: "The IOCTL and hazard sections are `ioctl_map`'s and `driver_hazards`' own answers, \
+               whole — call those directly to ask about one dispatch routine or one image.",
+    },
     ToolNote {
         tool: "continue_async",
         names: &["wait_for_stop", "break_in"],

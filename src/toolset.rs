@@ -27,11 +27,11 @@
 //!   batch          1   10,021  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
-//!   ioctl          9   10,556  driver objects, IRP stacks, reachability, hazards, IOCTL maps and
-//!                                device security
+//!   ioctl         10   12,262  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
+//!                                device security and the whole-driver survey
 //! ```
 //!
-//! Those bytes are a measurement of **2026-09-12** and move with any edit to a description — the
+//! Those bytes are a measurement of **2026-09-13** and move with any edit to a description — the
 //! whole surface they are shares of is 60 tools and 88,568 B. Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
@@ -166,6 +166,7 @@ const GROUPS: &[Group] = &[
             "driver_hazards",
             "ioctl_map",
             "device_security",
+            "driver_surface",
         ],
     },
     Group {
@@ -518,7 +519,7 @@ mod tests {
         assert!(set.includes("end_session"));
         assert!(!set.includes("ttd_calls"));
         assert!(!set.includes("debug_batch"));
-        assert_eq!(set.summary(), "13 of 60 tools (session, crash)");
+        assert_eq!(set.summary(), "13 of 61 tools (session, crash)");
     }
 
     #[test]
@@ -529,7 +530,7 @@ mod tests {
         assert!(!set.includes("disassemble"));
         assert_eq!(
             set.summary(),
-            "12 of 60 tools (session, backtrace, registers)"
+            "12 of 61 tools (session, backtrace, registers)"
         );
     }
 
@@ -641,7 +642,7 @@ mod tests {
         // Both name the tool and what is served, because those do not depend on who chose it.
         for said in [&run, &own] {
             assert!(said.contains("`debug_batch`"), "{said}");
-            assert!(said.contains("13 of 60 tools (session, crash)"), "{said}");
+            assert!(said.contains("13 of 61 tools (session, crash)"), "{said}");
         }
     }
 

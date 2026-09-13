@@ -335,22 +335,22 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-09-12** and move with any edit to a description.
+   Both tables are measurements of **2026-09-13** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 18.6% |
-   | `inspect` | 10 | 13,152 | 14.8% |
-   | `session` | 10 | 12,817 | 14.5% |
-   | `exec` | 8 | 11,309 | 12.8% |
-   | `batch` | 1 | 10,021 | 11.3% |
-   | `crash` | 3 | 7,427 | 8.4% |
-   | `ttd` | 9 | 6,829 | 7.7% |
-   | `ioctl` | 9 | 10,556 | 11.9% |
+   | `allocator` | 10 | 16,457 | 18.2% |
+   | `inspect` | 10 | 13,152 | 14.6% |
+   | `session` | 10 | 12,817 | 14.2% |
+   | `ioctl` | 10 | 12,262 | 13.6% |
+   | `exec` | 8 | 11,309 | 12.5% |
+   | `batch` | 1 | 10,021 | 11.1% |
+   | `crash` | 3 | 7,427 | 8.2% |
+   | `ttd` | 9 | 6,829 | 7.6% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 60 | 88,568 |
+   | *(absent)* | 61 | 90,274 |
    | `session,inspect,exec,crash` | 31 | 43,784 |
    | `session,inspect,crash` | 23 | 32,322 |
    | `crash` | 13 | 19,078 |

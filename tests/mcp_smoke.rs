@@ -1875,7 +1875,28 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// **And the separation earned its keep under review**: the output schema moved on all five
 /// rounds, 3,715 to 3,834 in total, and this figure did not move a byte through any of them. A
 /// single ceiling over both would have read every one as the surface growing.
-const MODEL_VISIBLE_CEILING: usize = 91_000;
+///
+/// **91,000 -> 92,000 for `driver_surface`** (2026-09-13), the fourth and last of the plan's
+/// driver tools, and the raise the `device_security` paragraph above said this one would need.
+/// The model-visible surface went 88,568 -> 90,274, a difference of 1,706, and the tool's own
+/// model-visible definition is 1,706 B. **Nothing else moved by a byte**, checked against the
+/// per-tool golden diffed by tool *name* rather than by line -- `positional-diffs-misattribute`,
+/// since a list of records diffed positionally blames whichever tool sits where the new one was
+/// inserted, which for a surface that just grew by one is guaranteed to mislead.
+///
+/// Of the 1,706 B, 1,028 is description and 623 input schema. The description carries **two**
+/// `TOOL_NOTES` cross-references, worth 380 B of it: unlike the `device_security` case above
+/// there *is* a second term, and it lands on this tool rather than on the tools it names, because
+/// a note is appended to the tool it is `tool:` for. So the arithmetic stays a single term even
+/// though the count of moving parts went up.
+///
+/// The 9,973 B `outputSchema` is on the wire and not here, and is by far the largest of any tool
+/// -- which is the whole reason these two ceilings are separate numbers, a composite's cost being
+/// almost entirely a schema no model is served. The new figure leaves 1,726 B, which is 1.9%, and
+/// is the tightest headroom any of these raises has left. That is deliberate: this is the last
+/// tool the driver plan adds, so there is no next one to be quietly sized for, and the five review
+/// rounds that moved `device_security`'s figure moved it by 119 B in total.
+const MODEL_VISIBLE_CEILING: usize = 92_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -1950,7 +1971,23 @@ const MODEL_VISIBLE_CEILING: usize = 91_000;
 /// them is what this file gets wrong, and two of the figures above were left disagreeing with each
 /// other by exactly that. Re-derive from the golden rather than reading any number here as
 /// current. What the ceiling guards is the headroom, and it absorbed all five without moving.
-const WIRE_CEILING: usize = 242_000;
+///
+/// **242,000 -> 254,000 for `driver_surface`** (2026-09-13), and it is the largest single raise
+/// any tool here has asked for. The payload went 236,791 -> 248,620, a difference of **11,829**:
+/// the tool is 11,828 B of wire, and the remaining byte is the array's own comma. Nothing else
+/// moved by a byte, checked against the per-tool golden keyed by name.
+///
+/// **9,973 B of that 11,448 is `outputSchema`, and the question this ceiling exists to force is
+/// whether sharing multiplied.** It did not, and a composite is the case where that had to be
+/// checked rather than assumed: `DriverSurface` embeds `IoctlMap` and `DriverHazards` whole and
+/// reuses `SecurityDescriptor`, so all three are inlined into this tool's own `$defs` closure --
+/// which is a fourth copy of each, by the same construction the three raises above recorded, and
+/// not a product. Embedding them whole is a decision rather than an accident: a digest would be a
+/// second shape restating what the map already says, kept in step by hand, and a composite whose
+/// caller must go back for the detail has not composed anything.
+///
+/// The new figure leaves 5,380 B, which is 2.1% -- the same headroom the last three raises left.
+const WIRE_CEILING: usize = 254_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -2862,6 +2899,13 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         ),
         // No argument screen at all on this one -- `device` reaches the object namespace rather
         // than a command -- so every refusal it has is the session's, and this row is it.
+        // The composite takes a driver object path. With no session it takes the session
+        // refusal, like the rest of this table.
+        (
+            "driver_surface",
+            json!({ "driver": r"\Driver\mydriver" }),
+            "error",
+        ),
         (
             "device_security",
             json!({ "device": r"\Device\MountPointManager" }),
@@ -3749,7 +3793,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 60 tools (session, crash)"),
+        log.contains("serving 13 of 61 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3781,7 +3825,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 60 tools (session, inspect) — except bench serves 13 of 60 tools \
+            "serving 20 of 61 tools (session, inspect) — except bench serves 13 of 61 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
