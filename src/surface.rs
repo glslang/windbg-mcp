@@ -518,6 +518,187 @@ pub(crate) fn dispatch_section(
     }
 }
 
+/// A section's status as a word a reader can act on, or nothing where it is simply fine.
+///
+/// **`ok` prints nothing**, deliberately: a composite is four sections, and marking the ordinary
+/// ones draws the eye away from the one that is short. What is worth a marker is what is missing.
+fn section_marker(status: crate::structured::SectionStatus) -> &'static str {
+    use crate::structured::SectionStatus as S;
+    match status {
+        S::Ok => "",
+        S::Partial => "  [partial]",
+        S::Unavailable => "  [unavailable]",
+        S::Error => "  [error]",
+    }
+}
+
+/// The composite, for a person to read.
+///
+/// **The two embedded analyses are rendered by their own renderers**, not by a second one here.
+/// `ioctl::render` and `hazards::render` are what `ioctl_map` and `driver_hazards` print, so a
+/// reader who knows one of those tools reads the same table here -- and there is one renderer per
+/// answer rather than two that drift.
+pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
+    use std::fmt::Write as _;
+    let mut out = String::new();
+    let _ = writeln!(out, "{} at {}", report.driver, report.address);
+    // Printed only when it differs from the path, which is the case worth looking at: the name is
+    // what the driver told the I/O manager, the path is where the object manager filed it.
+    if let Some(name) = &report.name
+        && *name != report.driver
+    {
+        let _ = writeln!(out, "  DriverName      {name}");
+    }
+    let _ = writeln!(
+        out,
+        "  Image           {} at {} ({} bytes)",
+        report.module.as_deref().unwrap_or("(in no loaded module)"),
+        report.image_base,
+        report.image_size,
+    );
+    if let Some(unload) = &report.unload {
+        let _ = writeln!(out, "  DriverUnload    {}", location(unload));
+    }
+
+    // ---- dispatch --------------------------------------------------------
+    let _ = writeln!(
+        out,
+        "\nDispatch table ({} major functions){}",
+        report.dispatch.major_count,
+        section_marker(report.dispatch.status)
+    );
+    if let Some(note) = &report.dispatch.note {
+        let _ = writeln!(out, "  [!] {note}");
+    }
+    for handler in &report.dispatch.handlers {
+        let _ = writeln!(
+            out,
+            "  {}{}",
+            location(&handler.location),
+            match handler.owned {
+                true => "",
+                // The half a reader acts on, said rather than left to be worked out by comparing
+                // the address with the image base two screens up.
+                false => "   (outside this driver's image)",
+            }
+        );
+        for major in &handler.majors {
+            let _ = writeln!(out, "      {major}");
+        }
+    }
+
+    // ---- devices ---------------------------------------------------------
+    let _ = writeln!(
+        out,
+        "\nDevices ({}){}",
+        report.devices.device_count,
+        section_marker(report.devices.status)
+    );
+    if let Some(note) = &report.devices.note {
+        let _ = writeln!(out, "  [!] {note}");
+    }
+    if report.devices.devices.is_empty() {
+        let _ = writeln!(out, "  This driver created no devices.");
+    }
+    for device in &report.devices.devices {
+        let _ = writeln!(
+            out,
+            "  {} {}",
+            device.address,
+            device
+                .path
+                .as_deref()
+                // **Not "unnamed".** A device with no path here is one *this directory* does not
+                // hold, which covers a device filed under no name and one filed somewhere else,
+                // and nothing in a directory listing tells them apart.
+                .unwrap_or("(not in this directory)")
+        );
+        if !device.device_type.is_empty() {
+            let _ = writeln!(
+                out,
+                "    DeviceType {}  Characteristics {}{}  Flags {}{}",
+                device.device_type,
+                device.characteristics,
+                match device.secure_open {
+                    true => " FILE_DEVICE_SECURE_OPEN",
+                    false => "",
+                },
+                device.flags,
+                match device.exclusive {
+                    true => " DO_EXCLUSIVE",
+                    false => "",
+                }
+            );
+        }
+        // The same gate `device_security` prints, by the same code -- see `device::render_gate`.
+        crate::device::render_gate(
+            &mut out,
+            "    ",
+            device.secure_open,
+            &device.security,
+            &device.security_absent,
+        );
+    }
+    if report.devices.unnamed > 0 {
+        let _ = writeln!(
+            out,
+            "  {} of these are not in {}. `device_security` takes a path, so those are reachable \
+             here and not there.",
+            report.devices.unnamed, report.devices.named_in
+        );
+    }
+
+    // ---- the control codes -----------------------------------------------
+    let _ = writeln!(out, "\nIOCTL map{}", section_marker(report.ioctl.status));
+    if let Some(note) = &report.ioctl.note {
+        let _ = writeln!(out, "  [!] {note}");
+    }
+    if let Some(map) = &report.ioctl.map {
+        indented(&mut out, "  ", &crate::ioctl::render(map));
+    }
+
+    // ---- and the image ---------------------------------------------------
+    let _ = writeln!(out, "\nHazards{}", section_marker(report.hazards.status));
+    if let Some(note) = &report.hazards.note {
+        let _ = writeln!(out, "  [!] {note}");
+    }
+    if let Some(scan) = &report.hazards.hazards {
+        indented(&mut out, "  ", &crate::hazards::render(scan));
+    }
+    out
+}
+
+/// An address with its coordinate, where there is one.
+fn location(at: &crate::structured::CodeLocation) -> String {
+    match (&at.module, &at.rva) {
+        (Some(module), Some(rva)) => format!("{} {module}+{rva}", at.address),
+        // **Says which of the two it is.** An address in no loaded image and an address the
+        // lookup did not answer for are different facts, and the second is about this call rather
+        // than about the target -- see `CodeLocation::attribution_failed`.
+        _ => match at.attribution_failed {
+            true => format!("{} (not attributed)", at.address),
+            false => format!("{} (in no loaded image)", at.address),
+        },
+    }
+}
+
+/// Another renderer's output, indented under this one's heading.
+///
+/// **A trailing newline is not a line**, which is the one thing to get right here: every renderer
+/// in this crate ends with one, so splitting naively appends an indent to an empty last line and
+/// every embedded section gains a line of trailing whitespace.
+fn indented(out: &mut String, indent: &str, body: &str) {
+    use std::fmt::Write as _;
+    for line in body.trim_end_matches('\n').split('\n') {
+        match line.is_empty() {
+            true => out.push('\n'),
+            false => {
+                let _ = writeln!(out, "{indent}{line}");
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

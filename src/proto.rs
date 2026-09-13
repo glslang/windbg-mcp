@@ -327,6 +327,21 @@ pub enum EngineOp {
         /// filled in by the supervisor's pump.
         patience_ms: u32,
     },
+    /// Everything this server can say about one driver, from its driver object outward.
+    ///
+    /// One indivisible job, and the most plainly so of any of them: it walks the object namespace
+    /// to a driver object, follows the chain of devices it created reading a security descriptor
+    /// out of pool for each, disassembles its IOCTL dispatch routine and parses its whole image.
+    /// That is four analyses over one target, and letting another call for this session interleave
+    /// would let them describe four different moments.
+    DriverSurface {
+        /// The driver object: a path (`\\Driver\\mountmgr`), or the bare name under `\\Driver` or
+        /// `\\FileSystem`.
+        driver: String,
+        /// Whatever is left of the caller's own clock when this reaches the front of the queue,
+        /// filled in by the supervisor's pump.
+        patience_ms: u32,
+    },
     /// Which control codes a driver's dispatch routine accepts, recovered from its own code.
     ///
     /// One indivisible job for the reason [`Self::Reachability`] is: it disassembles a function
@@ -500,6 +515,7 @@ impl EngineOp {
             | Self::DriverHazards { patience_ms, .. }
             | Self::IoctlMap { patience_ms, .. }
             | Self::DeviceSecurity { patience_ms, .. }
+            | Self::DriverSurface { patience_ms, .. }
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),
             _ => None,
         }

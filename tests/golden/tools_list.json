@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 60,
+  "toolCount": 61,
   "tools": [
     {
       "hints": {
@@ -522,6 +522,43 @@
         "name"
       ],
       "title": "Inspect driver object"
+    },
+    {
+      "hints": {
+        "destructive": null,
+        "idempotent": null,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "driver_surface",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/DriverSurface",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "driver: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "driver"
+      ],
+      "title": "Survey a driver: dispatch table, devices, control codes and image"
     },
     {
       "hints": {

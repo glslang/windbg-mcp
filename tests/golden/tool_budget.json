@@ -145,6 +145,15 @@
       "wire": 869
     },
     {
+      "annotations": 118,
+      "description": 1028,
+      "inputSchema": 623,
+      "modelVisible": 1706,
+      "name": "driver_surface",
+      "outputSchema": 9973,
+      "wire": 11828
+    },
+    {
       "annotations": 130,
       "description": 279,
       "inputSchema": 467,
@@ -542,15 +551,15 @@
     }
   ],
   "totals": {
-    "annotations": 6323,
-    "description": 33640,
-    "inputSchema": 51775,
+    "annotations": 6441,
+    "description": 34668,
+    "inputSchema": 52398,
     "instructions": 1983,
-    "modelVisible": 88568,
-    "outputSchema": 140209,
-    "payload": 236791,
-    "tools": 60,
-    "wire": 236720,
+    "modelVisible": 90274,
+    "outputSchema": 150182,
+    "payload": 248620,
+    "tools": 61,
+    "wire": 248548,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

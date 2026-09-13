@@ -522,9 +522,15 @@ fn access_list(acl: &crate::sd::Acl) -> crate::structured::AccessControlList {
     }
 }
 
-/// The answer, as a value.
-pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecurity {
-    let security = match &found.security {
+/// A descriptor that was read, as a value.
+///
+/// Shared by [`structured_report`] and [`surface_device`] rather than written twice: the two
+/// answer about the same gate, one for a device a caller named and one for every device on a
+/// driver's chain.
+pub(crate) fn descriptor_read(
+    security: &Security,
+) -> Option<crate::structured::SecurityDescriptor> {
+    match security {
         Security::Read { at, descriptor } => Some(crate::structured::SecurityDescriptor {
             address: format!("{at:#018x}"),
             revision: descriptor.revision,
@@ -546,8 +552,19 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
             sacl: descriptor.sacl.as_ref().map(access_list),
         }),
         _ => None,
-    };
-    let security_absent = match &found.security {
+    }
+}
+
+/// Why there is no descriptor above, when there is none.
+///
+/// **One function rather than a sentence at each call site**, and that is the whole reason it
+/// exists. This sentence had four copies -- the emitted string, the schema doc, `docs/limitations.md`
+/// and the shipped skill -- and correcting it took six review rounds in
+/// [#312](https://github.com/glslang/windbg-mcp/pull/312), because each pass fixed the wording it
+/// had just been shown and the next copy shared no searchable substring with it. A second emitter
+/// here would start that again.
+pub(crate) fn security_absent(security: &Security) -> Option<String> {
+    match security {
         Security::Read { .. } => None,
         // **States what was read, and nothing about what is checked in its place.** This used
         // to go on to say the object manager checks the directory holding the object -- the
@@ -563,7 +580,38 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
         Security::Failed { at, why } => Some(format!(
             "the descriptor at {at:#018x} could not be read: {why}"
         )),
-    };
+    }
+}
+
+/// One device on a driver's chain, as `driver_surface` reports it.
+///
+/// The same gate [`structured_report`] answers with, **minus the symbolic-link search**: that
+/// lists a whole directory per device, so running it down a chain would multiply the most
+/// expensive part of the query by the device count. `device_security` on one path is where the
+/// links are.
+pub(crate) fn surface_device(
+    address: String,
+    path: Option<String>,
+    fields: &Device,
+    security: &Security,
+) -> crate::structured::SurfaceDevice {
+    crate::structured::SurfaceDevice {
+        address,
+        path,
+        device_type: format!("{:#06x}", fields.device_type),
+        characteristics: format!("{:#010x}", fields.characteristics),
+        secure_open: fields.secure_open,
+        flags: format!("{:#010x}", fields.flags),
+        exclusive: fields.exclusive,
+        security: descriptor_read(security),
+        security_absent: security_absent(security),
+    }
+}
+
+/// The answer, as a value.
+pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecurity {
+    let security = descriptor_read(&found.security);
+    let security_absent = security_absent(&found.security);
     crate::structured::DeviceSecurity {
         device: found.device.clone(),
         followed_link: found.followed_link.clone(),
@@ -597,6 +645,103 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
     }
 }
 
+/// The gate a device carries, rendered the one way.
+///
+/// **Shared by `device_security` and `driver_surface` rather than written twice**, for the
+/// reason [`security_absent`] is: every warning below is a sentence about who may open a
+/// device, and the last four copies of one such sentence took six review rounds to correct.
+/// `indent` is the only thing that differs between the two -- one device named by a caller,
+/// against a list of them under a driver.
+pub(crate) fn render_gate(
+    out: &mut String,
+    indent: &str,
+    secure_open: bool,
+    security: &Option<crate::structured::SecurityDescriptor>,
+    security_absent: &Option<String>,
+) {
+    use std::fmt::Write as _;
+    // Said where it is true rather than left to be inferred from an absent word. Whether the
+    // descriptor below is checked on a *relative* open is the difference between a gate and a
+    // gate with a way around it, and it is the one line here a reader is most likely to act on.
+    if !secure_open {
+        let _ = writeln!(
+            out,
+            "{indent}[!] no FILE_DEVICE_SECURE_OPEN: the descriptor below is checked when this device \
+             is opened by name, and not when a path beneath it is opened -- so a driver that \
+             parses its own paths can be reached by a caller the descriptor would refuse"
+        );
+    }
+
+    match (security, security_absent) {
+        (Some(security), _) => {
+            let _ = writeln!(out, "{indent}Security descriptor at {}", security.address);
+            for (what, sid, account) in [
+                ("Owner", &security.owner, &security.owner_account),
+                ("Group", &security.group, &security.group_account),
+            ] {
+                if let Some(sid) = sid {
+                    let _ = writeln!(
+                        out,
+                        "{indent}  {what}  {sid}{}",
+                        account
+                            .as_ref()
+                            .map(|name| format!(" ({name})"))
+                            .unwrap_or_default()
+                    );
+                }
+            }
+            // **Four states, and three of them are the permissive ones a renderer must not
+            // blur.** `None` here never means "could not be read" -- a DACL whose bytes would not
+            // read fails the whole descriptor, which arrives as `Security::Failed` and is printed
+            // above. So the only way to reach `None` is an absent list, and both ways of being
+            // absent grant every caller everything. Saying "this could not be read" of either,
+            // which is what this did, reports the most permissive device there is as an
+            // unanswered question.
+            match (&security.dacl, security.dacl_present) {
+                (None, false) => {
+                    let _ = writeln!(
+                        out,
+                        "{indent}  [!] no DACL at all: every caller is granted every access to this \
+                         device"
+                    );
+                }
+                (None, true) => {
+                    let _ = writeln!(
+                        out,
+                        "{indent}  [!] a NULL DACL: the list is present and empty of restrictions, so \
+                         every caller is granted every access to this device"
+                    );
+                }
+                // The opposite extreme, and it looks almost the same in a listing: a DACL with no
+                // entries grants nobody anything. Rendered as `0 ACE(s)` alone it reads like the
+                // cases above rather than like their inverse.
+                (Some(dacl), _) if dacl.entries.is_empty() && dacl.ace_count == 0 => {
+                    let _ = writeln!(
+                        out,
+                        "{indent}  [!] an empty DACL: every caller is denied every access to this \
+                         device"
+                    );
+                }
+                (Some(dacl), _) => render_acl(out, indent, "DACL", dacl),
+            }
+            if let Some(sacl) = &security.sacl {
+                render_acl(out, indent, "SACL", sacl);
+            }
+        }
+        (None, Some(why)) => {
+            let _ = writeln!(out, "{indent}[!] {why}");
+        }
+        // Neither, which the report builder does not produce -- said rather than rendered as a
+        // device with no gate, because that is the reading to never print by accident.
+        (None, None) => {
+            let _ = writeln!(
+                out,
+                "{indent}[!] nothing was read about this device's security"
+            );
+        }
+    }
+}
+
 /// The same answer for a person to read.
 pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
     use std::fmt::Write as _;
@@ -625,83 +770,13 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
             false => "",
         }
     );
-    // Said where it is true rather than left to be inferred from an absent word. Whether the
-    // descriptor below is checked on a *relative* open is the difference between a gate and a
-    // gate with a way around it, and it is the one line here a reader is most likely to act on.
-    if !report.secure_open {
-        let _ = writeln!(
-            out,
-            "  [!] no FILE_DEVICE_SECURE_OPEN: the descriptor below is checked when this device \
-             is opened by name, and not when a path beneath it is opened -- so a driver that \
-             parses its own paths can be reached by a caller the descriptor would refuse"
-        );
-    }
-
-    match (&report.security, &report.security_absent) {
-        (Some(security), _) => {
-            let _ = writeln!(out, "  Security descriptor at {}", security.address);
-            for (what, sid, account) in [
-                ("Owner", &security.owner, &security.owner_account),
-                ("Group", &security.group, &security.group_account),
-            ] {
-                if let Some(sid) = sid {
-                    let _ = writeln!(
-                        out,
-                        "    {what}  {sid}{}",
-                        account
-                            .as_ref()
-                            .map(|name| format!(" ({name})"))
-                            .unwrap_or_default()
-                    );
-                }
-            }
-            // **Four states, and three of them are the permissive ones a renderer must not
-            // blur.** `None` here never means "could not be read" -- a DACL whose bytes would not
-            // read fails the whole descriptor, which arrives as `Security::Failed` and is printed
-            // above. So the only way to reach `None` is an absent list, and both ways of being
-            // absent grant every caller everything. Saying "this could not be read" of either,
-            // which is what this did, reports the most permissive device there is as an
-            // unanswered question.
-            match (&security.dacl, security.dacl_present) {
-                (None, false) => {
-                    let _ = writeln!(
-                        out,
-                        "    [!] no DACL at all: every caller is granted every access to this \
-                         device"
-                    );
-                }
-                (None, true) => {
-                    let _ = writeln!(
-                        out,
-                        "    [!] a NULL DACL: the list is present and empty of restrictions, so \
-                         every caller is granted every access to this device"
-                    );
-                }
-                // The opposite extreme, and it looks almost the same in a listing: a DACL with no
-                // entries grants nobody anything. Rendered as `0 ACE(s)` alone it reads like the
-                // cases above rather than like their inverse.
-                (Some(dacl), _) if dacl.entries.is_empty() && dacl.ace_count == 0 => {
-                    let _ = writeln!(
-                        out,
-                        "    [!] an empty DACL: every caller is denied every access to this \
-                         device"
-                    );
-                }
-                (Some(dacl), _) => render_acl(&mut out, "DACL", dacl),
-            }
-            if let Some(sacl) = &security.sacl {
-                render_acl(&mut out, "SACL", sacl);
-            }
-        }
-        (None, Some(why)) => {
-            let _ = writeln!(out, "  [!] {why}");
-        }
-        // Neither, which the report builder does not produce -- said rather than rendered as a
-        // device with no gate, because that is the reading to never print by accident.
-        (None, None) => {
-            let _ = writeln!(out, "  [!] nothing was read about this device's security");
-        }
-    }
+    render_gate(
+        &mut out,
+        "  ",
+        report.secure_open,
+        &report.security,
+        &report.security_absent,
+    );
 
     match report.link_search {
         crate::structured::LinkSearch::Unavailable => {
@@ -780,17 +855,22 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
     out
 }
 
-fn render_acl(out: &mut String, what: &str, acl: &crate::structured::AccessControlList) {
+fn render_acl(
+    out: &mut String,
+    indent: &str,
+    what: &str,
+    acl: &crate::structured::AccessControlList,
+) {
     use std::fmt::Write as _;
     let short = match acl.entries.len() < acl.ace_count {
         true => format!(", {} listed", acl.entries.len()),
         false => String::new(),
     };
-    let _ = writeln!(out, "    {what}  {} ACE(s){short}", acl.ace_count);
+    let _ = writeln!(out, "{indent}  {what}  {} ACE(s){short}", acl.ace_count);
     for entry in &acl.entries {
         let _ = writeln!(
             out,
-            "      {:<6} {:<28} {}  {}",
+            "{indent}    {:<6} {:<28} {}  {}",
             entry.kind,
             entry
                 .account
@@ -1260,6 +1340,7 @@ mod tests {
             let mut out = String::new();
             render_acl(
                 &mut out,
+                "  ",
                 "DACL",
                 &crate::structured::AccessControlList {
                     revision: 2,
@@ -1413,7 +1494,7 @@ mod tests {
                 entries: vec![entry],
             };
             let mut out = String::new();
-            render_acl(&mut out, "DACL", &acl);
+            render_acl(&mut out, "  ", "DACL", &acl);
             out
         };
 
