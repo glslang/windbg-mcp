@@ -264,10 +264,44 @@ pub(crate) struct Found {
     pub(crate) links_examined: Option<usize>,
     /// Entries the namespace could not name, which are **not** among those examined.
     pub(crate) links_unnamed: usize,
-    /// Examined links whose target would not read, which **are**.
+    /// Examined entries this could not check -- a target that would not read, or a type that
+    /// would not -- which **are** among those examined.
     pub(crate) links_unread: usize,
     pub(crate) stopped: Option<crate::walk::Halt>,
 }
+
+/// What a directory entry is, for the purpose of finding what reaches a device.
+///
+/// **Three answers, not two**, and the third is the one that was missing: the namespace reports a
+/// type of `None` where it could not deobfuscate the object header's type index, which is not the
+/// same as an object that is some other kind. Folded into "not a link" it made an entry that may
+/// well be the link disappear from the search without either unchecked counter seeing it -- which
+/// left a completed search claimable over a directory that had not been fully checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Candidate {
+    /// A symbolic link: resolve its target and compare.
+    Link,
+    /// Something else. Nothing to check, and nothing missing.
+    Other,
+    /// The namespace could not say. It may be a link, so it is counted as unchecked.
+    Unknown,
+}
+
+/// Which of the three an entry's type name is.
+///
+/// A named function rather than a `match` in the loop because the loop needs an engine and this
+/// rule does not, and a rule that can only be exercised against a live kernel is one no test here
+/// reaches.
+pub(crate) fn candidate(type_name: Option<&str>) -> Candidate {
+    match type_name {
+        Some(SYMBOLIC_LINK) => Candidate::Link,
+        Some(_) => Candidate::Other,
+        None => Candidate::Unknown,
+    }
+}
+
+/// The object type name a symbolic link carries.
+pub(crate) const SYMBOLIC_LINK: &str = "SymbolicLink";
 
 /// Whether two object paths name the same object.
 ///
@@ -309,6 +343,7 @@ fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
             .as_ref()
             .and_then(|sid| sid.name)
             .map(str::to_string),
+        conditional: ace.conditional,
         principal_unreadable: ace.kind.carries_sid() && ace.sid.is_none(),
         mask: format!("{:#010x}", ace.mask),
         rights: rights.into_iter().map(str::to_string).collect(),
@@ -511,11 +546,24 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
         }
         search => {
             if report.links.is_empty() {
-                let _ = writeln!(
-                    out,
-                    "  No symbolic link in {} points at this device",
-                    report.link_directory
-                );
+                // **The absolute claim is the completed search's alone.** Under `Partial` the
+                // warnings below already say the search fell short, and this line contradicted
+                // them in the sentence a reader meets first -- which is the half an MCP client
+                // renders, so the qualification arrived after the conclusion it was there to
+                // prevent.
+                let _ = match search {
+                    crate::structured::LinkSearch::Complete => writeln!(
+                        out,
+                        "  No symbolic link in {} points at this device",
+                        report.link_directory
+                    ),
+                    _ => writeln!(
+                        out,
+                        "  No symbolic link among the entries of {} that were checked points at \
+                         this device",
+                        report.link_directory
+                    ),
+                };
             } else {
                 let _ = writeln!(out, "  Reachable as:");
                 for link in &report.links {
@@ -578,7 +626,10 @@ fn render_acl(out: &mut String, what: &str, acl: &crate::structured::AccessContr
                     false => "<no principal>".to_string(),
                 }),
             entry.mask,
-            entry.rights.join(" ")
+            match entry.conditional {
+                true => format!("[if] {}", entry.rights.join(" ")),
+                false => entry.rights.join(" "),
+            }
         );
     }
 }
@@ -787,6 +838,7 @@ mod tests {
             },
             flags: 0,
             mask,
+            conditional: false,
             sid: Some(crate::sd::Sid {
                 text: sid.to_string(),
                 name,
@@ -1009,6 +1061,55 @@ mod tests {
         };
         assert!(with(access_entry(&torn)).contains("did not parse"));
         assert!(with(access_entry(&placed)).contains("<no principal>"));
+    }
+
+    /// **An entry whose type the namespace could not read may be the link.**
+    ///
+    /// `None` is "this walk could not say", which is a third answer beside "a link" and "not a
+    /// link" -- and folding it into the second makes an entry vanish from the search with neither
+    /// unchecked counter seeing it, leaving `complete` claimable over a directory that was not
+    /// fully checked.
+    #[test]
+    fn an_entry_of_unknown_type_is_unchecked_rather_than_not_a_link() {
+        assert_eq!(candidate(Some("SymbolicLink")), Candidate::Link);
+        assert_eq!(candidate(Some("Device")), Candidate::Other);
+        assert_eq!(
+            candidate(None),
+            Candidate::Unknown,
+            "a type that would not read is not a type that is not a link"
+        );
+    }
+
+    /// **The absolute claim belongs to a completed search.**
+    ///
+    /// "No symbolic link points at this device" is the sentence an MCP client renders first, and
+    /// under a partial search it contradicted the warning printed below it -- the qualification
+    /// arriving after the conclusion it was there to prevent.
+    #[test]
+    fn no_links_found_is_only_stated_absolutely_when_everything_was_checked() {
+        let rendered = |search, unnamed| {
+            render(&structured_report(&Found {
+                links: vec![],
+                link_search: search,
+                links_unnamed: unnamed,
+                ..found()
+            }))
+        };
+        let complete = rendered(crate::structured::LinkSearch::Complete, 0);
+        assert!(
+            complete.contains("No symbolic link in"),
+            "a completed search says it plainly: {complete}"
+        );
+
+        let partial = rendered(crate::structured::LinkSearch::Partial, 1);
+        assert!(
+            partial.contains("among the entries") && partial.contains("that were checked"),
+            "and a partial one says what it checked instead: {partial}"
+        );
+        assert!(
+            !partial.contains("No symbolic link in "),
+            "never the absolute claim: {partial}"
+        );
     }
 
     /// **A mask is named as access only when it is one.**

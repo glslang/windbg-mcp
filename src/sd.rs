@@ -157,6 +157,13 @@ pub(crate) struct Ace {
     pub(crate) flags: u8,
     /// The access mask, as encoded.
     pub(crate) mask: u32,
+    /// Whether this entry applies **conditionally**.
+    ///
+    /// A callback ACE carries an expression after its SID that the kernel evaluates against the
+    /// caller's token; the entry decides nothing until that is true. This reader does not evaluate
+    /// it, so an entry with this set grants or denies its mask *if the condition holds* -- which
+    /// is not the same claim as the [`Self::kind`] beside it makes on its own.
+    pub(crate) conditional: bool,
     /// The principal, when the ACE carries one where this can find it.
     ///
     /// **Absent means two different things, and [`AceKind::carries_sid`] is what tells them
@@ -330,16 +337,25 @@ fn read_acl(at: u64, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) -> Res
 /// Decodes one ACE from its own bytes.
 fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
     let kind = match ace_type {
-        // ACCESS_ALLOWED and its callback variant. The **compound** variant is not here: see the
-        // SID offset below.
+        // ACCESS_ALLOWED and its callback variant.
         0x00 | 0x09 => AceKind::Allow,
         // ACCESS_DENIED and its callback variant.
         0x01 | 0x0a => AceKind::Deny,
-        // ACCESS_ALLOWED_COMPOUND_ACE. An allow like the others, and the one whose SID is not at
-        // byte 8.
-        0x04 => AceKind::Allow,
         // SYSTEM_AUDIT and its callback variant.
         0x02 | 0x0d => AceKind::Audit,
+        // **`ACCESS_ALLOWED_COMPOUND_ACE` (0x04) is deliberately not decoded**, and that is a
+        // decision reached by two review rounds landing on it. It puts a `CompoundAceType` and a
+        // reserved word between the mask and its principals, and then carries *two* of them -- a
+        // server SID and a client SID -- granting the mask to the client only while the server
+        // impersonates it. Reading the first as "the principal" states a grant to the wrong
+        // identity; reading one of two as either is a confident wrong answer, which is the thing
+        // this module refuses elsewhere. It is a Windows NT-era type that current Windows does
+        // not emit, so there is no target here to check a decode against. `Other` says exactly
+        // what is true: the header was read and the body was not.
+        //
+        // The mask still comes back, and the raw `ace_type` with it, so an entry that does turn
+        // up is visible rather than silently dropped.
+
         // The two SACL types whose four bytes after the header are **not** an access mask.
         0x11 => AceKind::Label,
         0x13 => AceKind::ScopedPolicy,
@@ -356,27 +372,25 @@ fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
             });
         }
     };
-    // **Where the SID starts is per type, not per kind**, which is why this is a second match.
-    // `ACCESS_ALLOWED_COMPOUND_ACE` puts a `CompoundAceType` and a `Reserved` word between the
-    // mask and the principal, so reading it at byte 8 hands `sid_from` four bytes of metadata as
-    // a SID header -- which either fails, losing the principal, or succeeds on a revision byte
-    // that happens to be 1 and reports somebody who is not there.
-    let sid_at = match ace_type {
-        0x04 => Some(12),
-        _ => match kind {
-            AceKind::Other(_) => None,
-            _ => Some(8),
-        },
+    // Every kind decoded above puts its principal straight after the mask. The types that do not
+    // are `Other`, which is what that variant means and why it reports none.
+    let sid = match kind {
+        AceKind::Other(_) => None,
+        _ => sid_from(&body[8..]).ok(),
     };
-    let sid = sid_at
-        .filter(|start| body.len() >= *start)
-        .and_then(|start| sid_from(&body[start..]).ok());
     Ok(Ace {
         kind,
         ace_type,
         flags,
         mask,
         sid,
+        // **A callback ACE decides at evaluation time, and this reads bytes.** The application
+        // data after the SID is a conditional expression the kernel evaluates against the caller's
+        // token, so the entry applies only when that expression is true. Reporting it as a plain
+        // allow says the principal has the mask, which is one branch of a question this cannot
+        // answer -- and the expression is not decoded here, so the honest thing is to say the
+        // decision is conditional rather than to guess which way.
+        conditional: matches!(ace_type, 0x09 | 0x0a | 0x0d),
     })
 }
 
@@ -650,33 +664,72 @@ mod tests {
         out
     }
 
-    /// **A compound ACE's principal is at byte 12, and reading it at 8 reports somebody else.**
+    /// **A compound ACE reports no principal rather than one of its two.**
     ///
-    /// `ACCESS_ALLOWED_COMPOUND_ACE` carries a `CompoundAceType` and a reserved word between its
-    /// mask and its SID. The four bytes at offset 8 are therefore metadata, and handing them to
-    /// the SID reader is not merely wrong but *quietly* wrong: `CompoundAceType` is 1, which is
-    /// also a valid SID revision, so the read succeeds and produces a principal nobody granted
-    /// anything to. This fixture makes those bytes parse as `S-1-0-0` on purpose, so a regression
-    /// reports a plausible SID rather than failing.
+    /// `ACCESS_ALLOWED_COMPOUND_ACE` carries a `CompoundAceType` and a reserved word, then a
+    /// *server* SID and a *client* SID: the mask is granted to the client while the server
+    /// impersonates it. Two review rounds landed on this one type -- the first because the SID
+    /// was being read at byte 8, which is metadata, the second because byte 12 is only the first
+    /// of the two -- so what is wrong is the decoding rather than the offset, and the decoding is
+    /// what went.
+    ///
+    /// The fixture is built so a regression is loud: the bytes at offset 8 parse as a valid SID,
+    /// and so do the bytes at 12, so any reader that resumes guessing produces a plausible
+    /// principal rather than an error.
     #[test]
-    fn a_compound_ace_reads_its_principal_past_the_two_fields_before_it() {
-        // Revision 1, one sub-authority, authority 0 -- what offset 8 holds, and what a reader
-        // that stopped there would answer with.
+    fn a_compound_ace_names_nobody_rather_than_one_of_its_two_principals() {
         let metadata = [1u8, 1, 0, 0];
-        let principal = sid(5, &[32, 544]);
-        let bytes = compound_ace(0x0012_00a0, &metadata, &principal);
-        let decoded = read_ace(0x04, 0, &bytes).expect("a compound ACE decodes");
+        let server = sid(5, &[32, 544]);
+        let client = sid(5, &[21, 1000]);
+        let mut tail = server.clone();
+        tail.extend_from_slice(&client);
+        let bytes = compound_ace(0x0012_00a0, &metadata, &tail);
+        let decoded = read_ace(0x04, 0, &bytes).expect("the header still reads");
 
         assert_eq!(
-            decoded.sid.as_ref().map(|sid| sid.text.as_str()),
-            Some("S-1-5-32-544"),
-            "the principal is the one past the compound fields: {decoded:?}"
+            decoded.kind,
+            AceKind::Other(0x04),
+            "the body is not decoded, and `Other` is what says so: {decoded:?}"
         );
         assert_eq!(
-            decoded.mask, 0x0012_00a0,
-            "and the mask is still where every ACE keeps it"
+            decoded.sid, None,
+            "neither principal is claimed as the principal"
         );
-        assert_eq!(decoded.kind, AceKind::Allow, "a compound ACE grants");
+        assert_eq!(
+            (decoded.mask, decoded.ace_type),
+            (0x0012_00a0, 0x04),
+            "while the mask and the raw type still come back, so the entry is visible"
+        );
+    }
+
+    /// **A callback ACE decides at evaluation time, and this says so.**
+    ///
+    /// `ACCESS_ALLOWED_CALLBACK_ACE` carries a conditional expression after its SID which the
+    /// kernel evaluates against the caller's token; the entry grants nothing until that is true.
+    /// Reported as a plain allow it claims the principal simply has the mask, which is one branch
+    /// of a question this reader cannot answer.
+    #[test]
+    fn a_callback_ace_is_an_allow_that_has_not_been_decided_yet() {
+        let plain = read_ace(0x00, 0, &ace(0x00, 0, 0x1f01ff, &sid(1, &[0]))).expect("decodes");
+        assert!(!plain.conditional, "an ordinary allow decides on its own");
+
+        for conditional_type in [0x09u8, 0x0a, 0x0d] {
+            let decoded = read_ace(
+                conditional_type,
+                0,
+                &ace(conditional_type, 0, 0x1f01ff, &sid(1, &[0])),
+            )
+            .expect("decodes");
+            assert!(
+                decoded.conditional,
+                "type {conditional_type:#04x} carries a condition: {decoded:?}"
+            );
+            assert_eq!(
+                decoded.sid.as_ref().map(|sid| sid.text.as_str()),
+                Some("S-1-1-0"),
+                "and its principal is still where an ordinary one is"
+            );
+        }
     }
 
     /// `\Device\MountPointManager`'s DACL, whose four ACEs `docs/driver-ioctl-walkthrough.md`
