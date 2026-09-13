@@ -2946,7 +2946,7 @@ fn refresh_note(refresh: Option<&structured::ModuleRefresh>, loaded: usize) -> O
     // A failure with no reason is a state this worker does not produce, but the sentence above is
     // the load-bearing half and must not depend on one having survived the trip.
     Some(match &refresh.error {
-        Some(why) => format!("{warning} The engine said: {}", renderable(why)),
+        Some(why) => format!("{warning} The engine said: {}", structured::renderable(why)),
         None => warning.to_string(),
     })
 }
@@ -2968,7 +2968,7 @@ fn refresh_note(refresh: Option<&structured::ModuleRefresh>, loaded: usize) -> O
 fn module_table(rows: &[structured::ModuleInfo], names: &str) -> String {
     let listed: Vec<_> = rows
         .iter()
-        .map(|row| renderable(row.listed_name()))
+        .map(|row| structured::renderable(row.listed_name()))
         .collect();
     // At least as wide as the column's own header, which is also the answer for a table with no
     // rows in it — `format!`'s width counts characters, so this does too.
@@ -3085,7 +3085,7 @@ const WHERE_UNLOADED: &str = "listed above under `Unloaded modules` and carried 
 /// answer rather than a miss, so it is reported as a count of what was found and not as a caveat
 /// about what was not.
 fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize) -> String {
-    let pattern = renderable(pattern);
+    let pattern = structured::renderable(pattern);
     match (matched, unloaded) {
         // Nothing at all. The only branch that offers advice, because it is the only one where the
         // caller has nothing and may have asked the wrong question.
@@ -3106,66 +3106,6 @@ fn narrowing_note(pattern: &str, matched: usize, loaded: usize, unloaded: usize)
              since **unloaded** — {WHERE_UNLOADED}"
         ),
     }
-}
-
-/// A string from **outside this server**, made safe to put in the listing: anything that could
-/// break out of the row or the span it is printed in is rendered as an escape rather than acted on.
-///
-/// Two such strings, and the reason is the same for both. The listing is line-oriented and its rows
-/// begin with an address, so a string carrying a line break prints as *two* lines — and the second
-/// can be shaped exactly like a row, putting a module in the text that the values beside it do not
-/// have. That is the one property this rendering exists to hold, and it must not depend on what a
-/// caller typed or on what the target calls itself:
-///
-/// * **the caller's `filter`**, quoted into the note. Until #120 it was command text and
-///   `reject_command_breakers` refused line breaks along with `;`; the command went, and the
-///   refusal with it, which is what left this open.
-/// * **the module and image names**, which come from the target. Windows file names exclude the
-///   characters below `0x20`, and nothing else: a driver may legally be named with a `U+2028`, and
-///   a target being *analysed* is the last place to assume it is not — this server is pointed at
-///   malware on purpose.
-///
-/// Escaped rather than refused, because "nothing matches this" is a perfectly good answer to a
-/// pattern no module is named, and because a module named something hostile still has to be
-/// listable. It also covers `\r` and an ANSI escape for the same money, where refusing line breaks
-/// would let those through to a terminal.
-///
-/// [`renderable`] is not Markdown escaping and does not try to be — the backtick is in the set
-/// because it is the delimiter this listing quotes with, so a string carrying one can hand what
-/// follows it to a Markdown-rendering client as markup.
-fn renderable(text: &str) -> std::borrow::Cow<'_, str> {
-    if !text.contains(escapes_the_listing) {
-        return std::borrow::Cow::Borrowed(text);
-    }
-    let mut out = String::with_capacity(text.len());
-    for c in text.chars() {
-        match c {
-            // `escape_debug` leaves a *printable* character alone, and a backtick is printable: it
-            // is escaped here for what it does to the container, not for what it is.
-            '`' => out.push_str("\\u{60}"),
-            c if escapes_the_listing(c) => out.extend(c.escape_debug()),
-            c => out.push(c),
-        }
-    }
-    std::borrow::Cow::Owned(out)
-}
-
-/// Whether a character could put what follows it outside the row or the span it was printed in.
-///
-/// **Line breaks, in any renderer** — not only in [`str::lines`]. [`char::is_control`] is the
-/// obvious test and is not enough: it is the `Cc` category, which holds `\n`, `\r`, `\u{b}`,
-/// `\u{c}` and NEL, but *not* `U+2028 LINE SEPARATOR` or `U+2029 PARAGRAPH SEPARATOR` — which are
-/// `Zl`/`Zp`, break a line in a Unicode-aware renderer, and are invisible to `lines()` and so to a
-/// test written against it. Those two are the rest of Unicode's line-break set.
-///
-/// The controls that are *not* line breaks stay in for a second reason: an ESC in a listing is an
-/// ANSI sequence a terminal acts on.
-///
-/// **And the backtick**, which is the listing's own quoting delimiter: a pattern containing one
-/// closes the code span it was quoted into, and everything after it is markup to a client that
-/// renders Markdown — `<br>` included, which is a line break this would otherwise never see.
-fn escapes_the_listing(c: char) -> bool {
-    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '`')
 }
 
 /// Puts a table in a fenced block, which is the container its rows are written for.
@@ -3970,7 +3910,7 @@ fn render_backtrace(trace: &structured::StackTrace, asked: usize) -> String {
         listing.push_str(&format!(
             "{:02} {}\n",
             frame.index,
-            renderable(&triage::describe(frame))
+            structured::renderable(&triage::describe(frame))
         ));
     }
     let mut out = fenced(&listing);
@@ -4128,9 +4068,9 @@ fn render_disassembly(disassembly: &structured::Disassembly) -> String {
         };
         listing.push_str(&format!(
             "{:<18} {:<20} {}\n",
-            renderable(&coordinate),
-            renderable(&instruction.bytes),
-            renderable(&instruction.text),
+            structured::renderable(&coordinate),
+            structured::renderable(&instruction.bytes),
+            structured::renderable(&instruction.text),
         ));
     }
     let mut out = fenced(&listing);
@@ -4151,7 +4091,7 @@ fn render_disassembly(disassembly: &structured::Disassembly) -> String {
         // defect `summary_text` already guards against for the same construct.
         match disassembly.instructions.first() {
             Some(first) => match first.module.as_deref() {
-                Some(module) => format!(" in `{}`", renderable(module)),
+                Some(module) => format!(" in `{}`", structured::renderable(module)),
                 // The row for this instruction says the lookup failed; the sentence must not turn
                 // the same absence into a finding about the target two lines below it.
                 None if first.attribution_failed => {
@@ -6405,7 +6345,7 @@ fn summary_text(diagnostic: &str, summary: &structured::TargetSummary) -> String
             // a fence, so it carries the span instead.
             Some(module) => format!(
                 "{loaded} module(s) loaded, `{}` at {}.",
-                renderable(&module.name),
+                structured::renderable(&module.name),
                 module.start
             ),
             None => format!("{loaded} module(s) loaded."),
@@ -6979,7 +6919,14 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
             named_in: DEVICE_DIRECTORY.to_string(),
             unnamed: 0,
         },
-        None => driver_devices(e, &namespace, &fields, layout.pointer, deadline),
+        None => driver_devices(
+            e,
+            &namespace,
+            &fields,
+            object.address,
+            layout.pointer,
+            deadline,
+        ),
     };
 
     // ---- the control codes, off `MajorFunction[0x0e]` --------------------
@@ -7106,6 +7053,7 @@ fn driver_devices(
     e: &DebugEngine,
     namespace: &dbgscope::object::Namespace<'_>,
     driver: &surface::Driver,
+    driver_at: u64,
     pointer: usize,
     deadline: Instant,
 ) -> structured::DevicesSection {
@@ -7159,9 +7107,17 @@ fn driver_devices(
         driver.device_object,
         |at| {
             let fields = device::read_device(at, layout, memory).ok()?;
-            let next = fields.next;
+            // **The backpointer comes out of the same read**, so checking who owns this device
+            // costs nothing beyond the comparison. `driver_at` is the object the survey resolved.
+            let link = surface::Owned {
+                next: fields.next,
+                owner: surface::Owner {
+                    driver: fields.driver,
+                    is_this_driver: fields.driver == driver_at,
+                },
+            };
             read.insert(at, fields);
-            Some(next)
+            Some(link)
         },
         halt,
     );
@@ -7259,6 +7215,12 @@ fn driver_devices(
                          a list, which the object manager does not build"
                             .to_string()
                     }
+                    surface::ChainHalt::Foreign { at, owner } => format!(
+                        "the device at {at:#018x} says driver object {owner:#018x} owns it, not \
+                         the one this survey is about -- so the chain left this driver and the \
+                         walk stopped rather than reporting another driver's devices, and their \
+                         security descriptors, as this one's"
+                    ),
                     surface::ChainHalt::Capped => format!(
                         "the chain was still going after {} devices and was not followed further",
                         surface::MAX_DEVICES

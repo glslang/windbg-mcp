@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **Every renderer that reads a target now escapes what the target chose.** `renderable` — which turns a line break, an ANSI escape, a `U+2028` or a backtick into something that cannot leave the row it was printed in — lived in `src/worker.rs` and was applied at nine sites there. The five renderers this crate had extracted to be **engine-free** (`device`, `sd`, `ioctl`, `hazards`, `surface`) left that module and lost reach of it on the way out, and every one of them prints strings the target chose: a driver's `DriverName`, an object path out of the namespace, a module name, and — sharpest, because `src/pe.rs` exists to distrust exactly these bytes — the library and import names read out of a hostile image's own import table. A driver named with a newline could write a section heading of its own into the human-readable result, with `structuredContent` staying correct beside it. The helper now lives in `src/structured.rs` next to `addr`, where those modules already look for formatting.
+
+- **`driver_surface` stops where a device chain leaves its driver.** `_DEVICE_OBJECT::DriverObject` is the authoritative answer to who owns a device and the chain walk reads it on every device anyway; nothing compared it with the driver object the survey had resolved. A corrupted or hostile `NextDevice` pointing at a readable device owned by somebody else was followed, and that device's fields, **its security descriptor** and the rest of *its* chain came back attributed to the driver that was asked about. The walk now stops at the boundary and says which driver claimed it — and the foreign device is not listed, because it is real and only the claim that it belongs here is false.
+
+- **`driver_surface` no longer says a device is absent from a directory it did not finish reading.** Where the `\Device` listing was partial or failed, a device with no path was rendered as "not in this directory" — an absence, from a search that did not complete. It reports "no path found" instead, which is the rule this renderer already applied to "this driver created no devices" and `device_security` applies to its link search.
+
 ### Added
 
 - **`driver_surface` — one driver, in one call.** Its dispatch table, every device it created with the gate on each, the control codes its IOCTL handler accepts, and what its image can do. The fourth and last of the native Driver Buddy Revolutions tools, and the one the other three were built toward: it joins them at the driver object's own fields rather than leaving a caller to match a module name to a device path by hand. 60 → 61 tools.

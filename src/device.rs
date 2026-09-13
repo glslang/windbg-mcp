@@ -797,9 +797,21 @@ pub(crate) fn render_gate(
 pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
     use std::fmt::Write as _;
     let mut out = String::new();
-    let _ = writeln!(out, "{} at {}", report.device, report.address);
+    // The device path, the link paths and their targets are the **target's** to choose --
+    // see `structured::renderable`. The masks, flags and addresses beside them are this
+    // crate's own formatting.
+    let _ = writeln!(
+        out,
+        "{} at {}",
+        crate::structured::renderable(&report.device),
+        report.address
+    );
     if let Some(link) = &report.followed_link {
-        let _ = writeln!(out, "  reached by following {link}");
+        let _ = writeln!(
+            out,
+            "  reached by following {}",
+            crate::structured::renderable(link)
+        );
     }
     let _ = writeln!(out, "  Driver          {}", report.driver);
     let _ = writeln!(out, "  DeviceType      {}", report.device_type);
@@ -861,7 +873,12 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
             } else {
                 let _ = writeln!(out, "  Reachable as:");
                 for link in &report.links {
-                    let _ = writeln!(out, "    {}  -> {}", link.path, link.target);
+                    let _ = writeln!(
+                        out,
+                        "    {}  -> {}",
+                        crate::structured::renderable(&link.path),
+                        crate::structured::renderable(&link.target)
+                    );
                 }
             }
             let unchecked = report.links_unnamed + report.links_unread + report.links_unfolded;
