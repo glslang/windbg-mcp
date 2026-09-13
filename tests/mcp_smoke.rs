@@ -1973,8 +1973,8 @@ const MODEL_VISIBLE_CEILING: usize = 92_000;
 /// current. What the ceiling guards is the headroom, and it absorbed all five without moving.
 ///
 /// **242,000 -> 254,000 for `driver_surface`** (2026-09-13), and it is the largest single raise
-/// any tool here has asked for. The payload went 236,791 -> 248,620, a difference of **11,829**:
-/// the tool is 11,828 B of wire, and the remaining byte is the array's own comma. Nothing else
+/// any tool here has asked for. The payload went 236,791 -> 248,635, a difference of **11,844**:
+/// the tool is 11,843 B of wire, and the remaining byte is the array's own comma. Nothing else
 /// moved by a byte, checked against the per-tool golden keyed by name.
 ///
 /// **9,973 B of that 11,448 is `outputSchema`, and the question this ceiling exists to force is
@@ -1986,7 +1986,7 @@ const MODEL_VISIBLE_CEILING: usize = 92_000;
 /// second shape restating what the map already says, kept in step by hand, and a composite whose
 /// caller must go back for the detail has not composed anything.
 ///
-/// The new figure leaves 5,380 B, which is 2.1% -- the same headroom the last three raises left.
+/// The new figure leaves 5,365 B, which is 2.1% -- the same headroom the last three raises left.
 const WIRE_CEILING: usize = 254_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021

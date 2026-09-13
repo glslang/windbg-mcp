@@ -404,13 +404,13 @@ pub(crate) fn device_chain(
             stopped = Some(ChainHalt::Capped);
             break;
         }
-        // **Recorded before it is followed**, so a device that will not read is still reported as
-        // being on the chain. It is a device this driver created; what is missing is what it says
-        // about itself, and dropping it would report a shorter chain rather than a hole in one.
         if !seen.insert(at) {
             stopped = Some(ChainHalt::Cycle);
             break;
         }
+        // **Recorded before it is followed**, so a device that will not read is still reported as
+        // being on the chain. It is a device this driver created; what is missing is what it says
+        // about itself, and dropping it would report a shorter chain rather than a hole in one.
         devices.push(at);
         match next_of(at) {
             Some(next) => at = next,
@@ -421,6 +421,91 @@ pub(crate) fn device_chain(
         }
     }
     Chain { devices, stopped }
+}
+
+/// Every device on a chain, with the gate on each, and what went unread.
+#[derive(Debug, Clone)]
+pub(crate) struct Gates {
+    pub(crate) devices: Vec<crate::structured::SurfaceDevice>,
+    /// Devices carrying a descriptor whose bytes would not read.
+    ///
+    /// **Only that one of the three outcomes.** A device carrying *none* is an answer rather than
+    /// a failure -- and a branch no measured device has reached, 231 of them on a 26100 guest each
+    /// carrying one -- so counting it would report a complete section as partial on the strength
+    /// of something that did not happen.
+    pub(crate) unread_gates: usize,
+    /// Devices whose object could not be read at all, or was never reached because the clock ran
+    /// out. Each says which in its own `unread`.
+    pub(crate) unread_devices: usize,
+    /// Why the pass stopped reading, when it did. The devices after that point are still listed.
+    pub(crate) stopped: Option<Halt>,
+}
+
+/// Reads the gate on every device of a chain.
+///
+/// **Polled per device, which is the whole reason this is a function rather than a loop at the
+/// call site.** Discovering the chain is one read per device and [`device_chain`] polls it;
+/// reading the gates is several target reads per device *on top of that*, up to [`MAX_DEVICES`]
+/// times -- so an unpolled second pass is where a survey whose caller has already timed out goes
+/// on occupying the session. Review found that missing, on a loop sitting directly beneath the
+/// comment saying a bounded loop still needs a check inside it.
+///
+/// A device reached after the halt is **still listed**, with its `unread` saying why. It is on the
+/// chain -- the walk above found it -- and what is missing is its fields; dropping the rest would
+/// report a driver with fewer devices than it has.
+pub(crate) fn device_gates(
+    devices: &[u64],
+    path_of: impl Fn(u64) -> Option<String>,
+    mut gate_of: impl FnMut(u64) -> Option<(crate::device::Device, crate::device::Security)>,
+    halt: impl Fn() -> Option<Halt>,
+) -> Gates {
+    let mut out = Vec::with_capacity(devices.len());
+    let mut unread_gates = 0usize;
+    let mut stopped = None;
+    for &at in devices {
+        let path = path_of(at);
+        if stopped.is_none() {
+            stopped = halt();
+        }
+        if let Some(why) = stopped {
+            out.push(crate::device::unread_device(
+                crate::structured::addr(at),
+                path,
+                format!(
+                    "this survey {} before this device's fields were read",
+                    why.phrase()
+                ),
+            ));
+            continue;
+        }
+        let Some((fields, security)) = gate_of(at) else {
+            out.push(crate::device::unread_device(
+                crate::structured::addr(at),
+                path,
+                format!(
+                    "the device object at {at:#018x} could not be read, so nothing this device \
+                     says about itself was read"
+                ),
+            ));
+            continue;
+        };
+        if matches!(security, crate::device::Security::Failed { .. }) {
+            unread_gates += 1;
+        }
+        out.push(crate::device::surface_device(
+            crate::structured::addr(at),
+            path,
+            &fields,
+            &security,
+        ));
+    }
+    let unread_devices = out.iter().filter(|one| one.unread.is_some()).count();
+    Gates {
+        devices: out,
+        unread_gates,
+        unread_devices,
+        stopped,
+    }
 }
 
 /// The major functions, as `wdm.h` names them, index `0x00` through `IRP_MJ_MAXIMUM_FUNCTION`.
@@ -613,20 +698,28 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
                 // and nothing in a directory listing tells them apart.
                 .unwrap_or("(not in this directory)")
         );
-        if !device.device_type.is_empty() {
+        // A device whose object would not read says so and stops there. **Not followed by the
+        // gate**, which would print "nothing was read about this device's security" beneath a
+        // line already saying nothing was read about the device at all -- two sentences for one
+        // fact, the second of which sounds like a finding about a descriptor.
+        if let Some(why) = &device.unread {
+            let _ = writeln!(out, "    [!] {why}");
+            continue;
+        }
+        if let (Some(device_type), Some(characteristics), Some(flags)) =
+            (&device.device_type, &device.characteristics, &device.flags)
+        {
             let _ = writeln!(
                 out,
-                "    DeviceType {}  Characteristics {}{}  Flags {}{}",
-                device.device_type,
-                device.characteristics,
+                "    DeviceType {device_type}  Characteristics {characteristics}{}  Flags \
+                 {flags}{}",
                 match device.secure_open {
-                    true => " FILE_DEVICE_SECURE_OPEN",
-                    false => "",
+                    Some(true) => " FILE_DEVICE_SECURE_OPEN",
+                    _ => "",
                 },
-                device.flags,
                 match device.exclusive {
-                    true => " DO_EXCLUSIVE",
-                    false => "",
+                    Some(true) => " DO_EXCLUSIVE",
+                    _ => "",
                 }
             );
         }
@@ -634,7 +727,7 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
         crate::device::render_gate(
             &mut out,
             "    ",
-            device.secure_open,
+            device.secure_open.unwrap_or(false),
             &device.security,
             &device.security_absent,
         );
@@ -1177,11 +1270,12 @@ mod tests {
         crate::structured::SurfaceDevice {
             address: crate::structured::addr(0x5000),
             path: path.map(str::to_string),
-            device_type: "0x0022".to_string(),
-            characteristics: "0x00000100".to_string(),
-            secure_open: true,
-            flags: "0x00000040".to_string(),
-            exclusive: false,
+            unread: None,
+            device_type: Some("0x0022".to_string()),
+            characteristics: Some("0x00000100".to_string()),
+            secure_open: Some(true),
+            flags: Some("0x00000040".to_string()),
+            exclusive: Some(false),
             security: None,
             security_absent: Some("nothing was read".to_string()),
         }
@@ -1205,6 +1299,210 @@ mod tests {
         assert!(
             out.contains("(not in this directory)"),
             "it says what was searched instead: {out}"
+        );
+    }
+
+    // ---- the descriptor pass ----------------------------------------------
+
+    /// A device with the fields a gate is read from, and nothing else that matters here.
+    fn gate_device(security_descriptor: Option<u64>) -> crate::device::Device {
+        crate::device::Device {
+            device_type: 0x22,
+            characteristics: 0,
+            secure_open: false,
+            exclusive: false,
+            flags: 0,
+            driver: 0x9000,
+            next: 0,
+            security_descriptor,
+        }
+    }
+
+    /// **The clock is polled between devices, not once before the pass.**
+    ///
+    /// The rule review added, and the one this whole function was moved out of `worker.rs` to make
+    /// testable: reading the gates is several target reads per device, up to `MAX_DEVICES` times,
+    /// so an unpolled pass keeps a session busy long after its caller stopped waiting. Before the
+    /// move it lived where nothing without a `DebugEngine` could reach it.
+    #[test]
+    fn the_descriptor_pass_stops_reading_when_the_clock_runs_out() {
+        let chain = [0x100, 0x200, 0x300, 0x400];
+        let reads = std::cell::Cell::new(0usize);
+        let polls = std::cell::Cell::new(0usize);
+
+        let gates = device_gates(
+            &chain,
+            |_| None,
+            |_| {
+                reads.set(reads.get() + 1);
+                Some((gate_device(None), crate::device::Security::Absent))
+            },
+            || {
+                polls.set(polls.get() + 1);
+                (polls.get() > 2).then_some(Halt::Deadline)
+            },
+        );
+
+        assert_eq!(reads.get(), 2, "it stopped reading rather than reading on");
+        assert_eq!(gates.stopped, Some(Halt::Deadline));
+        // **Every device is still listed**, which is the other half of the rule: they are on the
+        // chain, and dropping the ones after the halt would report a driver with fewer devices
+        // than it has.
+        assert_eq!(gates.devices.len(), 4, "the chain's length is unchanged");
+        assert_eq!(gates.unread_devices, 2, "the two it did not reach say so");
+        for late in &gates.devices[2..] {
+            assert!(
+                late.unread
+                    .as_deref()
+                    .is_some_and(|why| why.contains("ran out of time")),
+                "a device the clock cut off says that, rather than looking unreadable: {late:?}"
+            );
+        }
+    }
+
+    /// **A break and a deadline are two answers, and the message says which.**
+    ///
+    /// They send a reader to different places: a deadline is the call timeout, an interrupt is
+    /// their own request. The first version of this message offered both -- "ran out of time or
+    /// was interrupted" -- which commits to neither, and the field carrying the reason was
+    /// unread in production, which is what `cargo clippy` noticed. It is the same distinction
+    /// `worker::attribution_stop` states in as many words for its own poll.
+    #[test]
+    fn a_break_and_a_deadline_do_not_read_alike() {
+        let cut_off_by = |why: Halt| {
+            let gates = device_gates(&[0x100], |_| None, |_| None, || Some(why));
+            gates.devices[0]
+                .unread
+                .clone()
+                .expect("a device the halt cut off")
+        };
+
+        let deadline = cut_off_by(Halt::Deadline);
+        let interrupted = cut_off_by(Halt::Interrupted);
+        assert!(deadline.contains("ran out of time"), "{deadline}");
+        assert!(interrupted.contains("was interrupted"), "{interrupted}");
+        assert_ne!(
+            deadline, interrupted,
+            "one message for both halts is a message that commits to neither remedy"
+        );
+        for message in [&deadline, &interrupted] {
+            assert!(
+                !message.contains(" or "),
+                "and neither offers the reader both: {message}"
+            );
+        }
+    }
+
+    /// **Only a descriptor that would not read counts against the section.**
+    ///
+    /// The three outcomes are not interchangeable. A device carrying none is an *answer* -- and a
+    /// branch no measured device has reached -- so counting it would report a complete section as
+    /// partial on the strength of something that did not happen. This is the same distinction
+    /// `security_absent` carries, applied to a count instead of a sentence.
+    #[test]
+    fn a_device_carrying_no_descriptor_is_not_a_gate_that_failed_to_read() {
+        let chain = [0x100, 0x200, 0x300];
+        let gates = device_gates(
+            &chain,
+            |_| None,
+            |at| {
+                let security = match at {
+                    0x100 => crate::device::Security::Absent,
+                    0x200 => crate::device::Security::Failed {
+                        at: 0xdead,
+                        why: crate::sd::SdError::Unreadable {
+                            at: 0xdead,
+                            len: 20,
+                        },
+                    },
+                    _ => crate::device::Security::Read {
+                        at: 0xbeef,
+                        descriptor: crate::sd::Descriptor {
+                            revision: 1,
+                            control: 0,
+                            owner: None,
+                            group: None,
+                            dacl: None,
+                            sacl: None,
+                        },
+                    },
+                };
+                Some((gate_device(Some(0xdead)), security))
+            },
+            || None,
+        );
+
+        assert_eq!(
+            gates.unread_gates, 1,
+            "the one whose bytes would not read, and not the one carrying none"
+        );
+        assert_eq!(gates.unread_devices, 0, "every device object itself read");
+        assert_eq!(gates.stopped, None);
+    }
+
+    /// A device whose object would not read is listed, counted, and **not** a failed gate.
+    #[test]
+    fn a_device_object_that_would_not_read_is_not_counted_as_an_unread_gate() {
+        let gates = device_gates(&[0x100], |_| None, |_| None, || None);
+        assert_eq!(gates.devices.len(), 1, "it is still on the chain");
+        assert_eq!(gates.unread_devices, 1);
+        assert_eq!(
+            gates.unread_gates, 0,
+            "there was no descriptor field to find unreadable -- the object itself did not read"
+        );
+    }
+
+    /// **A device whose object would not read says so in its own field, and leaves
+    /// `security_absent` alone.**
+    ///
+    /// That field carries two outcomes about the *descriptor* -- carries none, or carries one
+    /// whose bytes would not read -- told apart by their reason string, and a caller is documented
+    /// as branching on that string. A third outcome put in there would be branched on by the same
+    /// caller and mean something else entirely, which is the shape `device_security` spent six
+    /// review rounds taking back out of one sentence. The first version of this walk did exactly
+    /// that.
+    ///
+    /// The numeric fields go **absent** rather than empty for the same reason in miniature: a
+    /// caller parsing `device_type` as hex can act on a missing field and cannot act on `""`.
+    #[test]
+    fn a_device_that_would_not_read_does_not_borrow_the_descriptors_field_to_say_so() {
+        let device = crate::device::unread_device(
+            crate::structured::addr(0x5000),
+            Some("\\Device\\mydevice".to_string()),
+            "the device object could not be read".to_string(),
+        );
+
+        assert!(device.unread.is_some(), "it says so in its own field");
+        assert!(
+            device.security_absent.is_none(),
+            "and not in the descriptor's, which carries two other outcomes a caller branches on \
+             by reading the string: {:?}",
+            device.security_absent
+        );
+        for absent in [
+            device.device_type.is_none(),
+            device.characteristics.is_none(),
+            device.flags.is_none(),
+        ] {
+            assert!(
+                absent,
+                "an unread field is absent rather than an empty string"
+            );
+        }
+        // The address and the path survive, which is the whole reason such a device is reported at
+        // all rather than dropped from the chain.
+        assert_eq!(device.address, crate::structured::addr(0x5000));
+        assert_eq!(device.path.as_deref(), Some("\\Device\\mydevice"));
+
+        // And it renders as **one** sentence. Falling through to the gate would print "nothing was
+        // read about this device's security" under a line already saying nothing was read about
+        // the device -- two sentences for one fact, the second sounding like a finding about a
+        // descriptor that was never reached.
+        let out = rendered(vec![device]);
+        assert!(out.contains("the device object could not be read"), "{out}");
+        assert!(
+            !out.contains("nothing was read about this device's security"),
+            "a device that did not read has no descriptor to report on: {out}"
         );
     }
 

@@ -407,6 +407,21 @@ pub enum Halt {
     Interrupted,
 }
 
+impl Halt {
+    /// How a sentence about this walk finishes: "this survey *ran out of time*".
+    ///
+    /// **One phrase per variant, here rather than at each call site**, because the two are exactly
+    /// the pair not to blur: a deadline sends a reader to the call timeout and an interrupt is
+    /// their own request, so a message offering both commits to neither. A wording written twice
+    /// is a wording that will differ once.
+    pub(crate) fn phrase(self) -> &'static str {
+        match self {
+            Self::Deadline => "ran out of time",
+            Self::Interrupted => "was interrupted",
+        }
+    }
+}
+
 /// Walks `source`, reading `fields` out of every node it reaches.
 ///
 /// `read` fetches bytes and returns `None` for memory the debugger could not read — the whole

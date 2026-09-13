@@ -7047,6 +7047,19 @@ fn driver_devices(
         }
     };
 
+    // One halt for both passes, since both are the caller's time. Interrupt first, for the
+    // reason every other poll in this file gives: both can be true in one moment, and
+    // reporting a deadline for a break somebody just asked for sends them to the timeout
+    // setting instead of to their own request.
+    let halt = || {
+        if matches!(e.interrupted(), Ok(true)) {
+            Some(walk::Halt::Interrupted)
+        } else if Instant::now() >= deadline {
+            Some(walk::Halt::Deadline)
+        } else {
+            None
+        }
+    };
     // The chain first: one read per device, which also yields the link to the next.
     let mut read = HashMap::new();
     let chain = surface::device_chain(
@@ -7057,15 +7070,7 @@ fn driver_devices(
             read.insert(at, fields);
             Some(next)
         },
-        || {
-            if matches!(e.interrupted(), Ok(true)) {
-                Some(walk::Halt::Interrupted)
-            } else if Instant::now() >= deadline {
-                Some(walk::Halt::Deadline)
-            } else {
-                None
-            }
-        },
+        halt,
     );
 
     // Then the paths, from one listing. **Keyed by address**, because a device's name in the
@@ -7087,30 +7092,14 @@ fn driver_devices(
         }
     }
 
-    let devices: Vec<_> = chain
-        .devices
-        .iter()
-        .map(|&at| {
-            let path = paths.get(&at).cloned();
-            let Some(fields) = read.get(&at) else {
-                // The one device on a chain that did not read: it is on the chain, and what is
-                // missing is what it says about itself. Reported with what is known -- its address
-                // and its path -- rather than dropped, which would report a shorter chain.
-                return structured::SurfaceDevice {
-                    address: structured::addr(at),
-                    path,
-                    device_type: String::new(),
-                    characteristics: String::new(),
-                    secure_open: false,
-                    flags: String::new(),
-                    exclusive: false,
-                    security: None,
-                    security_absent: Some(format!(
-                        "the device object at {at:#018x} could not be read, so none of its fields \
-                         above -- including this one -- was read either"
-                    )),
-                };
-            };
+    // The gates, polled per device. The loop is `surface::device_gates` rather than code here,
+    // because the clock it keeps is a rule and a rule that needs a `DebugEngine` to exercise is one
+    // no test in this repository reaches -- the standard `crate::device` sets for itself.
+    let gates = surface::device_gates(
+        &chain.devices,
+        |at| paths.get(&at).cloned(),
+        |at| {
+            let fields = read.get(&at)?.clone();
             let security = match fields.security_descriptor {
                 None => device::Security::Absent,
                 Some(at) => match sd::read_descriptor(at, memory) {
@@ -7118,22 +7107,35 @@ fn driver_devices(
                     Err(why) => device::Security::Failed { at, why },
                 },
             };
-            device::surface_device(structured::addr(at), path, fields, &security)
-        })
-        .collect();
+            Some((fields, security))
+        },
+        halt,
+    );
+    let devices = gates.devices;
+    let gates_unread = gates.unread_gates;
+    let fields_unread = gates.unread_devices;
+    let gates_stopped = gates.stopped;
 
     let unnamed = devices.iter().filter(|one| one.path.is_none()).count();
-    // **`ok` needs both walks whole.** A chain that ended early is missing devices; a directory
-    // that did not list in full is missing paths, and a device with no path then means nothing.
-    let status = match (chain.stopped.is_some(), named_completely) {
-        (false, true) => structured::SectionStatus::Ok,
-        _ => structured::SectionStatus::Partial,
+    // **`ok` needs both walks whole *and* every gate read.** A chain that ended early is missing
+    // devices; a directory that did not list in full is missing paths, so a device with no path
+    // then means nothing; and a descriptor that would not read is a gate this section did not
+    // answer, which is the case the first version reported as `ok` -- misstating security coverage
+    // in exactly the place a reader is relying on it.
+    let whole = chain.stopped.is_none()
+        && gates_stopped.is_none()
+        && named_completely
+        && fields_unread == 0
+        && gates_unread == 0;
+    let status = match whole {
+        true => structured::SectionStatus::Ok,
+        false => structured::SectionStatus::Partial,
     };
-    let note = match (chain.stopped, named_completely) {
-        (None, true) => None,
-        (stopped, named) => {
+    let note = match whole {
+        true => None,
+        false => {
             let mut why = Vec::new();
-            if let Some(stopped) = stopped {
+            if let Some(stopped) = chain.stopped {
                 why.push(match stopped {
                     surface::ChainHalt::Walk(walk::Halt::Deadline) => {
                         "the chain ran out of time before it ended".to_string()
@@ -7157,10 +7159,32 @@ fn driver_devices(
                     ),
                 });
             }
-            if !named {
+            if !named_completely {
                 why.push(format!(
                     "{DEVICE_DIRECTORY} could not be listed in full, so a device with no path \
                      here may simply be one this did not reach"
+                ));
+            }
+            // **The gate pass's own halt, which is not the chain's.** The chain can run to
+            // its end and this second pass still be cut short, in which case `chain.stopped` is
+            // `None` and nothing else here says why the last devices have no fields.
+            if let Some(halt) = gates_stopped {
+                why.push(format!(
+                    "reading the devices' security descriptors {} part-way through the chain",
+                    halt.phrase()
+                ));
+            }
+            if fields_unread > 0 {
+                why.push(format!(
+                    "{fields_unread} of the devices listed carry no fields of their own -- each \
+                     says why in its `unread`"
+                ));
+            }
+            if gates_unread > 0 {
+                why.push(format!(
+                    "{gates_unread} of the devices carry a security descriptor whose bytes would \
+                     not read, so this section does not say who may open them -- each names the \
+                     address in its `security_absent`"
                 ));
             }
             Some(why.join("; "))
