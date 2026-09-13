@@ -3124,7 +3124,14 @@ pub struct DevicesSection {
     /// What it governs is whether an absent `path` is an **absence**. Read in full, a device with
     /// no path is one this directory does not hold; read in part, it may be an entry nobody
     /// reached.
-    pub named_completely: bool,
+    ///
+    /// **Absent where no listing was attempted**, which is a third thing and not either of the
+    /// other two: with no devices there is nothing for a directory to name, so it is not read, and
+    /// saying it was read in full or that it fell short are both statements about a search that
+    /// did not happen. It was a `bool` for one commit and the three paths that reach an empty
+    /// section set it two different ways between them.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub named_completely: Option<bool>,
     /// The directory searched to give the devices above a path.
     ///
     /// Here rather than implied, for the reason [`DeviceSecurity::link_directory`] is named: a

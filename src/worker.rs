@@ -6511,7 +6511,12 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
 /// `counts-belong-in-the-type` says not to build.
 fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Output, Failed> {
     let report = hazards_of(e, module, deadline)?;
-    Ok(Output::typed(hazards::render(&report), report))
+    // **Fenced, which is the other half of `structured::renderable`.** That helper escapes a
+    // backtick precisely so a target-chosen string cannot close the block it is printed in -- and
+    // a block is what makes `<br>` inert, where escaping `<` instead would display as `&lt;` in
+    // the nine already-fenced listings this crate has. It is also what these renderers' column
+    // padding has always needed: bare, a Markdown client reflows the rows into a paragraph.
+    Ok(Output::typed(fenced(&hazards::render(&report)), report))
 }
 
 /// The scan itself, as a value.
@@ -6917,7 +6922,8 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
             devices: Vec::new(),
             device_count: 0,
             named_in: DEVICE_DIRECTORY.to_string(),
-            named_completely: false,
+            // Nothing was listed, because this section never started.
+            named_completely: None,
             unnamed: 0,
         },
         None => driver_devices(
@@ -7041,7 +7047,9 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         ioctl,
         hazards,
     };
-    Ok(Output::typed(surface::render(&report), report))
+    // Fenced once, at the top: the composite embeds `ioctl::render` and `hazards::render`,
+    // and a fence inside a fence closes the outer one early.
+    Ok(Output::typed(fenced(&surface::render(&report)), report))
 }
 
 /// Every device on a driver's chain, with the gate that decides who may open it.
@@ -7072,9 +7080,8 @@ fn driver_devices(
             devices: Vec::new(),
             device_count: 0,
             named_in: DEVICE_DIRECTORY.to_string(),
-            // No devices, so no listing was attempted and none was owed: there was nothing for it
-            // to name. True here says "no absent path is left unexplained", which holds vacuously.
-            named_completely: true,
+            // No devices, so nothing for a directory to name and no listing attempted.
+            named_completely: None,
             unnamed: 0,
         };
     }
@@ -7087,7 +7094,8 @@ fn driver_devices(
                 devices: Vec::new(),
                 device_count: 0,
                 named_in: DEVICE_DIRECTORY.to_string(),
-                named_completely: false,
+                // The layout failed before any listing was attempted.
+                named_completely: None,
                 unnamed: 0,
             };
         }
@@ -7146,9 +7154,12 @@ fn driver_devices(
     // the note below both short-circuit on an empty chain. An earlier version made this `true` for
     // an empty chain "so it says the truthful thing", which no caller could observe -- a mutation
     // deleting it changed no test, which is how the redundancy was noticed.
+    // `None` where no listing was attempted -- which here means the chain had no devices for one
+    // to name, the only way `listing` is `None` without a failure.
     let named_completely = listing
         .as_ref()
-        .is_some_and(|listing| listing.is_complete());
+        .map(|listing| listing.is_complete())
+        .or_else(|| (!chain.devices.is_empty()).then_some(false));
     if let Some(listing) = &listing {
         for object in &listing.objects {
             if object.exact_name {
@@ -7179,7 +7190,7 @@ fn driver_devices(
     // **Asked before the fields are moved out**, which is what keeps this from needing a copy of
     // the whole device list -- up to `MAX_DEVICES` of them, each carrying a descriptor with its
     // ACLs, ACEs and SIDs.
-    let whole = devices_are_whole(&chain, &gates, named_completely);
+    let whole = devices_are_whole(&chain, &gates, named_completely.unwrap_or(true));
     let devices = gates.devices;
     let gates_unread = gates.unread_gates;
     let fields_unread = gates.unread_devices;
@@ -7193,7 +7204,7 @@ fn driver_devices(
     // in exactly the place a reader is relying on it.
     // Mirrors the rule inside [`devices_are_whole`], which is where it is stated and tested: the
     // listing bears on this answer only where there are devices for it to name.
-    let named_where_it_matters = devices.is_empty() || named_completely;
+    let named_where_it_matters = devices.is_empty() || named_completely.unwrap_or(true);
     let status = match whole {
         true => structured::SectionStatus::Ok,
         false => structured::SectionStatus::Partial,
@@ -7712,7 +7723,7 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         stopped: halted,
     };
     let report = device::structured_report(&found);
-    Ok(Output::typed(device::render(&report), report))
+    Ok(Output::typed(fenced(&device::render(&report)), report))
 }
 
 /// Recovers the control codes a dispatch routine accepts.
@@ -7726,7 +7737,7 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
 /// the reason [`driver_hazards`] is.
 fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Output, Failed> {
     let report = ioctl_map_of(e, dispatch, deadline)?;
-    Ok(Output::typed(ioctl::render(&report), report))
+    Ok(Output::typed(fenced(&ioctl::render(&report)), report))
 }
 
 /// The map itself, as a value.
@@ -8601,6 +8612,58 @@ mod tests {
             at("\\FileSystem\\x", missing()),
         ];
         assert_eq!(super::worst_refusal(&neither), 1);
+    }
+
+    /// **A target-chosen name cannot leave the block its report is printed in.**
+    ///
+    /// `structured::renderable` and [`fenced`] are two halves of one mechanism and only work
+    /// together. The escaping handles what breaks a *line* -- a newline, a `U+2028`, an ANSI escape
+    /// -- and deliberately not `<` or `>`, because the container is a code block where those are
+    /// inert and where `&lt;` would display literally. The fence is what supplies that container,
+    /// and the backtick is in the escape set precisely so nothing can close it early.
+    ///
+    /// The four driver tools were escaping without fencing, so `<br>Hazards<br>` in a driver's
+    /// name or an image's import table was still HTML to a Markdown-rendering client. The
+    /// line-count test in `src/surface.rs` cannot see that: an HTML injection adds no newline, so
+    /// the shape it measures is unchanged.
+    #[test]
+    fn a_name_cannot_leave_the_block_its_report_is_printed_in() {
+        let hostile = "<br>Hazards<br>  Sensitive imports: none`\u{60}```\nforged";
+        let body = structured::renderable(hostile);
+        let out = super::fenced(&format!("  DriverName  {body}\n"));
+
+        // One fence, opened once and closed once: a name carrying a backtick or a whole ``` run
+        // cannot end the block early and start writing markup.
+        assert_eq!(
+            out.matches("```").count(),
+            2,
+            "the report is one block, opened and closed exactly once: {out:?}"
+        );
+        assert!(
+            !body.contains('`'),
+            "no backtick survives escaping, which is what keeps the count above at two: {body}"
+        );
+
+        // `<` and `>` are left **alone**, and that is the decision rather than an omission: inside
+        // a fence they are inert, and escaping them would put `&lt;` in front of a reader.
+        assert!(
+            body.contains("<br>"),
+            "angle brackets are not escaped, because the container makes them inert: {body}"
+        );
+
+        // And the payload sits inside the fence rather than after it.
+        let inner = out
+            .split_once("```\n")
+            .and_then(|(_, rest)| rest.split_once("```"))
+            .map(|(inner, _)| inner)
+            .expect("a fenced body");
+        assert!(inner.contains("<br>Hazards"), "{inner:?}");
+        assert_eq!(
+            inner.lines().count(),
+            1,
+            "the whole payload is one line -- the newline in the name was escaped rather than \
+             written, which is what stops it forging a row of its own inside the block: {inner:?}"
+        );
     }
 
     /// **A refusal must not offer a fallback that fails for the reason it just gave.**

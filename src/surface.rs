@@ -785,9 +785,11 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
                 // covers a third: an entry nobody reached. The absolute form belongs to the
                 // complete search alone, which is the rule this renderer applies to "created no
                 // devices" two screens up and `device_security` applies to its link search.
+                // `None` cannot reach here: a device with no path means devices exist, and
+                // devices mean a listing was attempted.
                 match report.devices.named_completely {
-                    true => "(not in this directory)",
-                    false => "(no path found)",
+                    Some(true) | None => "(not in this directory)",
+                    Some(false) => "(no path found)",
                 },
             ))
         );
@@ -827,7 +829,7 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
     }
     if report.devices.unnamed > 0 {
         let _ = match report.devices.named_completely {
-            true => writeln!(
+            Some(true) | None => writeln!(
                 out,
                 "  {} of these are not in {}. `device_security` takes a path, so those are \
                  reachable here and not there.",
@@ -837,7 +839,7 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
             // exists". Branching on the **directory's** own completeness rather than the section's
             // status, which is `partial` for four other reasons and would say the directory fell
             // short whenever a descriptor did.
-            false => writeln!(
+            Some(false) => writeln!(
                 out,
                 "  {} of these have no path. {} was not read in full, so that is a search this \
                  call did not finish rather than a fact about those devices -- the note above \
@@ -1429,7 +1431,7 @@ mod tests {
     // ---- the rendering ----------------------------------------------------
 
     fn rendered(devices: Vec<crate::structured::SurfaceDevice>) -> String {
-        rendered_with(devices, crate::structured::SectionStatus::Ok, true)
+        rendered_with(devices, crate::structured::SectionStatus::Ok, Some(true))
     }
 
     /// **The status and the directory's completeness are separate arguments**, because they are
@@ -1438,7 +1440,7 @@ mod tests {
     fn rendered_with(
         devices: Vec<crate::structured::SurfaceDevice>,
         devices_status: crate::structured::SectionStatus,
-        named_completely: bool,
+        named_completely: Option<bool>,
     ) -> String {
         use crate::structured as s;
         render(&s::DriverSurface {
@@ -1802,14 +1804,14 @@ mod tests {
     fn only_a_complete_device_section_may_say_the_driver_created_none() {
         use crate::structured::SectionStatus as S;
 
-        let complete = rendered_with(Vec::new(), S::Ok, true);
+        let complete = rendered_with(Vec::new(), S::Ok, Some(true));
         assert!(
             complete.contains("This driver created no devices."),
             "a section that read everything and found nothing says so: {complete}"
         );
 
         for short in [S::Partial, S::Unavailable, S::Error] {
-            let out = rendered_with(Vec::new(), short, true);
+            let out = rendered_with(Vec::new(), short, Some(true));
             assert!(
                 !out.contains("created no devices"),
                 "{short:?} with an empty list is a section that did not read, not a driver with \
@@ -1907,7 +1909,7 @@ mod tests {
                     devices: Vec::new(),
                     device_count: 0,
                     named_in: "\\Device".to_string(),
-                    named_completely: true,
+                    named_completely: Some(true),
                     unnamed: 0,
                 },
                 ioctl: s::IoctlSection {
@@ -1961,13 +1963,13 @@ mod tests {
     fn a_device_has_no_path_rather_than_no_entry_when_the_listing_fell_short() {
         use crate::structured::SectionStatus as S;
 
-        let complete = rendered_with(vec![a_device(None)], S::Ok, true);
+        let complete = rendered_with(vec![a_device(None)], S::Ok, Some(true));
         assert!(
             complete.contains("(not in this directory)"),
             "a directory read in full can say the device is not in it: {complete}"
         );
 
-        let short = rendered_with(vec![a_device(None)], S::Partial, false);
+        let short = rendered_with(vec![a_device(None)], S::Partial, Some(false));
         assert!(
             short.contains("(no path found)"),
             "a listing that did not finish reports what it found: {short}"
@@ -1982,7 +1984,7 @@ mod tests {
         // not make the report say the *directory* fell short. Branching on the status said exactly
         // that, about a search that in fact completed.
         for status in [S::Partial, S::Unavailable, S::Error] {
-            let out = rendered_with(vec![a_device(None)], status, true);
+            let out = rendered_with(vec![a_device(None)], status, Some(true));
             assert!(
                 out.contains("(not in this directory)"),
                 "{status:?} for some other reason leaves the directory's own answer intact: {out}"
