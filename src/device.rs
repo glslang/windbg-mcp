@@ -526,9 +526,15 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
     };
     let security_absent = match &found.security {
         Security::Read { .. } => None,
+        // **States what was read, and nothing about what is checked in its place.** This used
+        // to go on to say the object manager checks the directory holding the object -- the
+        // ordinary account of it, never measured here, and not something this call went and
+        // looked at. A reader who acted on it would inspect a descriptor this never read, on
+        // the strength of a sentence that only sounded like a finding. `FOLLOWUPS.md` item 68
+        // is where the unmeasured half of it lives.
         Security::Absent => Some(
-            "this object carries no security descriptor, so the object manager checks the \
-             directory holding it rather than the object"
+            "this object carries no security descriptor of its own; what the object manager \
+             checks in its place is not something this read"
                 .to_string(),
         ),
         Security::Failed { at, why } => Some(format!(
@@ -1643,12 +1649,17 @@ mod tests {
         found.security = Security::Absent;
         let absent = structured_report(&found);
         assert!(absent.security.is_none());
+        let none = absent.security_absent.as_deref().expect("a reason");
+        assert!(none.contains("carries no security descriptor"), "{none}");
+        // **And it says nothing about what is checked in place of the descriptor it did not
+        // find.** This sentence used to name the directory holding the object as the thing the
+        // object manager checks instead -- the ordinary account of it, but not something this
+        // call reads, and a reader acting on it would go and inspect a descriptor no part of
+        // this ever looked at. An absence is allowed to report an absence; it is not allowed to
+        // supply the mechanism it did not measure.
         assert!(
-            absent
-                .security_absent
-                .as_deref()
-                .expect("a reason")
-                .contains("carries no security descriptor")
+            !none.contains("directory"),
+            "reporting no descriptor must not assert what is checked instead: {none}"
         );
 
         found.security = Security::Failed {
