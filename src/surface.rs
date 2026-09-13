@@ -434,8 +434,12 @@ pub(crate) struct Gates {
     /// carrying one -- so counting it would report a complete section as partial on the strength
     /// of something that did not happen.
     pub(crate) unread_gates: usize,
-    /// Devices whose object could not be read at all, or was never reached because the clock ran
-    /// out. Each says which in its own `unread`.
+    /// Devices whose **object** could not be read at all. Each says so in its own `unread`.
+    ///
+    /// Not devices whose *gate* went unread: the chain walk read every object it reached, so a
+    /// halt costs the descriptor and leaves the fields, and those devices are ordinary entries
+    /// whose `security_absent` says the call stopped. [`Self::stopped`] is what says that
+    /// happened.
     pub(crate) unread_devices: usize,
     /// Why the pass stopped reading, when it did. The devices after that point are still listed.
     pub(crate) stopped: Option<Halt>,
@@ -450,13 +454,16 @@ pub(crate) struct Gates {
 /// on occupying the session. Review found that missing, on a loop sitting directly beneath the
 /// comment saying a bounded loop still needs a check inside it.
 ///
-/// A device reached after the halt is **still listed**, with its `unread` saying why. It is on the
-/// chain -- the walk above found it -- and what is missing is its fields; dropping the rest would
-/// report a driver with fewer devices than it has.
+/// A device reached after the halt is **still listed, with its fields**. The chain walk read every
+/// device object whole -- that is how it found the next one -- so those are in hand and only the
+/// descriptor is missing: it comes back [`crate::device::Security::Unattempted`], and the device's
+/// `security_absent` says this call stopped rather than that the device carries nothing. An
+/// earlier version replaced each of them with an `unread` device and threw the cached fields away.
 pub(crate) fn device_gates(
     devices: &[u64],
     path_of: impl Fn(u64) -> Option<String>,
-    mut gate_of: impl FnMut(u64) -> Option<(crate::device::Device, crate::device::Security)>,
+    fields_of: impl Fn(u64) -> Option<crate::device::Device>,
+    mut gate_of: impl FnMut(&crate::device::Device) -> crate::device::Security,
     halt: impl Fn() -> Option<Halt>,
 ) -> Gates {
     let mut out = Vec::with_capacity(devices.len());
@@ -464,21 +471,11 @@ pub(crate) fn device_gates(
     let mut stopped = None;
     for &at in devices {
         let path = path_of(at);
-        if stopped.is_none() {
-            stopped = halt();
-        }
-        if let Some(why) = stopped {
-            out.push(crate::device::unread_device(
-                crate::structured::addr(at),
-                path,
-                format!(
-                    "this survey {} before this device's fields were read",
-                    why.phrase()
-                ),
-            ));
-            continue;
-        }
-        let Some((fields, security)) = gate_of(at) else {
+        // **The fields come from what the chain walk already read**, so a halt costs the gate and
+        // nothing else. The first version replaced every device after the halt with an `unread`
+        // one, discarding a `device_type`, a `Characteristics` and a `secure_open` sitting in the
+        // cache -- and telling a caller they had never been read, which was false.
+        let Some(fields) = fields_of(at) else {
             out.push(crate::device::unread_device(
                 crate::structured::addr(at),
                 path,
@@ -488,6 +485,15 @@ pub(crate) fn device_gates(
                 ),
             ));
             continue;
+        };
+        if stopped.is_none() {
+            stopped = halt();
+        }
+        // Polled per device, which is the whole reason this is a function rather than a loop at
+        // the call site: the gate read below is several target reads, `MAX_DEVICES` times over.
+        let security = match stopped {
+            Some(why) => crate::device::Security::Unattempted(why),
+            None => gate_of(&fields),
         };
         if matches!(security, crate::device::Security::Failed { .. }) {
             unread_gates += 1;
@@ -1353,9 +1359,10 @@ mod tests {
         let gates = device_gates(
             &chain,
             |_| None,
+            |_| Some(gate_device(None)),
             |_| {
                 reads.set(reads.get() + 1);
-                Some((gate_device(None), crate::device::Security::Absent))
+                crate::device::Security::Absent
             },
             || {
                 polls.set(polls.get() + 1);
@@ -1369,13 +1376,31 @@ mod tests {
         // chain, and dropping the ones after the halt would report a driver with fewer devices
         // than it has.
         assert_eq!(gates.devices.len(), 4, "the chain's length is unchanged");
-        assert_eq!(gates.unread_devices, 2, "the two it did not reach say so");
+
+        // **And each keeps the fields the chain walk already read.** The halt costs the gate and
+        // nothing else -- an earlier version replaced these with `unread` devices and threw away a
+        // `device_type`, a `Characteristics` and a `secure_open` that were in hand, telling a
+        // caller they had never been read.
+        assert_eq!(
+            gates.unread_devices, 0,
+            "none of these objects failed to read; only their gates went unasked"
+        );
         for late in &gates.devices[2..] {
+            assert!(late.unread.is_none(), "its object read perfectly: {late:?}");
+            assert_eq!(
+                late.device_type.as_deref(),
+                Some("0x0022"),
+                "the cached fields survive the halt: {late:?}"
+            );
+            let why = late.security_absent.as_deref().unwrap_or_default();
             assert!(
-                late.unread
-                    .as_deref()
-                    .is_some_and(|why| why.contains("ran out of time")),
-                "a device the clock cut off says that, rather than looking unreadable: {late:?}"
+                why.contains("ran out of time"),
+                "and the gate says this call stopped: {why}"
+            );
+            assert!(
+                !why.contains("carries no security descriptor"),
+                "never that the device carries none, which is the opposite claim and the \
+                 permissive one: {why}"
             );
         }
     }
@@ -1390,11 +1415,17 @@ mod tests {
     #[test]
     fn a_break_and_a_deadline_do_not_read_alike() {
         let cut_off_by = |why: Halt| {
-            let gates = device_gates(&[0x100], |_| None, |_| None, || Some(why));
+            let gates = device_gates(
+                &[0x100],
+                |_| None,
+                |_| Some(gate_device(None)),
+                |_| crate::device::Security::Absent,
+                || Some(why),
+            );
             gates.devices[0]
-                .unread
+                .security_absent
                 .clone()
-                .expect("a device the halt cut off")
+                .expect("a gate the halt cut off")
         };
 
         let deadline = cut_off_by(Halt::Deadline);
@@ -1422,13 +1453,16 @@ mod tests {
     #[test]
     fn a_device_carrying_no_descriptor_is_not_a_gate_that_failed_to_read() {
         let chain = [0x100, 0x200, 0x300];
+        let seen = std::cell::Cell::new(0usize);
         let gates = device_gates(
             &chain,
             |_| None,
-            |at| {
-                let security = match at {
-                    0x100 => crate::device::Security::Absent,
-                    0x200 => crate::device::Security::Failed {
+            |_| Some(gate_device(Some(0xdead))),
+            |_| {
+                seen.set(seen.get() + 1);
+                match seen.get() {
+                    1 => crate::device::Security::Absent,
+                    2 => crate::device::Security::Failed {
                         at: 0xdead,
                         why: crate::sd::SdError::Unreadable {
                             at: 0xdead,
@@ -1446,8 +1480,7 @@ mod tests {
                             sacl: None,
                         },
                     },
-                };
-                Some((gate_device(Some(0xdead)), security))
+                }
             },
             || None,
         );
@@ -1463,7 +1496,13 @@ mod tests {
     /// A device whose object would not read is listed, counted, and **not** a failed gate.
     #[test]
     fn a_device_object_that_would_not_read_is_not_counted_as_an_unread_gate() {
-        let gates = device_gates(&[0x100], |_| None, |_| None, || None);
+        let gates = device_gates(
+            &[0x100],
+            |_| None,
+            |_| None,
+            |_| crate::device::Security::Absent,
+            || None,
+        );
         assert_eq!(gates.devices.len(), 1, "it is still on the chain");
         assert_eq!(gates.unread_devices, 1);
         assert_eq!(
