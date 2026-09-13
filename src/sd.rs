@@ -144,10 +144,15 @@ impl AceKind {
     /// was reported with no rights and `writes: false`: a client joining this to an IOCTL map
     /// would call a write-required control code unreachable through a handle that has it. A type
     /// outside that range is one nothing here knows, and stays false.
+    ///
+    /// The run ends at `0x10`, `SYSTEM_ALARM_CALLBACK_OBJECT_ACE_TYPE`, which is the last of them
+    /// -- `0x11` is the mandatory label. It was first written `0x04`..=`0x0f` out of doubt about
+    /// whether `0x10` was a type at all; it is one, and leaving it out was the same mistake in
+    /// miniature as leaving the object-callback types out of [`Ace::callback`].
     pub(crate) fn mask_is_access(self) -> bool {
         match self {
             Self::Allow | Self::Deny | Self::Audit => true,
-            Self::Other(ace_type) => (0x04..=0x0f).contains(&ace_type),
+            Self::Other(ace_type) => (0x04..=0x10).contains(&ace_type),
             Self::Label | Self::ScopedPolicy => false,
         }
     }
@@ -367,10 +372,19 @@ const CONDITIONAL_ACE_SIGNATURE: &[u8] = b"artx";
 
 /// Decodes one ACE from its own bytes.
 fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
-    // The callback types whose principal sits where this reads one. `0x0b`/`0x0c`/`0x0e` are also
-    // callback ACEs and are deliberately not here: they carry an object GUID first, so they decode
-    // as `Other` and have no SID for the application data to follow.
-    let callback = matches!(ace_type, 0x09 | 0x0a | 0x0d);
+    // **Every callback type, which is the whole documented run `0x09`..=`0x10`**: the plain
+    // allow and deny callbacks, their object variants, and the audit and alarm callbacks with
+    // theirs. This used to be the three whose principal sits where this reads one, with a comment
+    // saying the other five were *deliberately* left out -- which was wrong, and only looked
+    // harmless because `Other` reported no rights at all. Widening `mask_is_access` to name an
+    // object ACE's mask is what made it bite: an object-callback ACE then printed its rights with
+    // nothing beside them, reading as an entry that simply applies when trailing callback data
+    // decides whether it applies at all.
+    //
+    // What stays narrow is `conditional` below, and for a reason about layout rather than about
+    // kind: those five put one or two GUIDs before the SID, so the offset the application data
+    // starts at is not one this computes.
+    let callback = (0x09..=0x10).contains(&ace_type);
     let kind = match ace_type {
         // ACCESS_ALLOWED and its callback variant.
         0x00 | 0x09 => AceKind::Allow,
@@ -429,11 +443,13 @@ fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
         // data is application-defined, which this does not decode and will not name. The data
         // starts after the header, the mask and the SID, whose length its own sub-authority count
         // gives -- and `body` is the ACE's own bytes, cut to its `AceSize`, so a blob running past
-        // the entry reads as absent rather than into the next one. Only the three types below are
-        // asked: the object-callback types put a GUID where this expects the SID, and they decode
-        // as `Other` for that reason.
+        // the entry reads as absent rather than into the next one. Only the three types asked
+        // here put their SID at that offset; the object-callback variants put a GUID there, so
+        // their data begins somewhere this does not compute and `conditional` stays false while
+        // `callback` above is true -- which is the pair saying "something decides this, and it is
+        // not something this can read".
         callback,
-        conditional: callback
+        conditional: matches!(ace_type, 0x09 | 0x0a | 0x0d)
             && body
                 .get(9)
                 .map(|count| 16 + 4 * usize::from(*count))
@@ -656,12 +672,15 @@ mod tests {
     /// exactly the right it needs.
     #[test]
     fn an_ace_this_cannot_decode_still_has_an_access_mask() {
-        for object_ace in [0x04u8, 0x05, 0x06, 0x07, 0x08, 0x0b, 0x0c, 0x0e, 0x0f] {
+        for object_ace in [0x04u8, 0x05, 0x06, 0x07, 0x08, 0x0b, 0x0c, 0x0e, 0x0f, 0x10] {
             assert!(
                 AceKind::Other(object_ace).mask_is_access(),
                 "type {object_ace:#04x} carries an ACCESS_MASK wherever its principal is"
             );
         }
+        // `0x11` is the mandatory label and the first type past the run, which is what makes
+        // `0x10` the end of it rather than a guess about where to stop.
+        assert!(!AceKind::Other(0x11).mask_is_access());
         // A type nothing here knows is a mask nothing here can name, which is the honest answer
         // and the one the range above is drawn to leave room for.
         assert!(!AceKind::Other(0x40).mask_is_access());
@@ -882,6 +901,66 @@ mod tests {
                 "an empty blob is not an expression: {bare:?}"
             );
         }
+
+        // **The five whose data this cannot even find are still callbacks.** They put one or two
+        // GUIDs before the SID, so `conditional` cannot be asked -- and reporting them with
+        // neither flag left an object-callback ACE printing its rights as though nothing decided
+        // them, which is what widening `mask_is_access` to name that mask exposed.
+        for object_callback in [0x0bu8, 0x0c, 0x0e, 0x0f, 0x10] {
+            let decoded = read_ace(
+                object_callback,
+                0,
+                &ace(object_callback, 0, 0x1f01ff, &sid(1, &[0])),
+            )
+            .expect("decodes");
+            assert_eq!(
+                (decoded.conditional, decoded.callback),
+                (false, true),
+                "type {object_callback:#04x} is a callback whose data this cannot locate: \
+                 {decoded:?}"
+            );
+            assert!(
+                decoded.kind.mask_is_access(),
+                "and its mask is still an access mask, which is what makes the flag matter"
+            );
+        }
+
+        // The label past the end of the run is neither, which is what keeps the range honest.
+        let label = read_ace(0x11, 0, &ace(0x11, 0, 0x0000_0001, &sid(1, &[0]))).expect("decodes");
+        assert_eq!((label.conditional, label.callback), (false, false));
+
+        // **And `conditional` is not merely *false* for those five, it is not asked.** The
+        // distinction needs a construction, because asking would read the signature at an offset
+        // computed from bytes that are not a SID -- which normally finds nothing and so looks
+        // correct. Here it finds something.
+        //
+        // An object ACE puts a `u32` of its own flags at 8 and the `ObjectType` GUID at 12. The
+        // arithmetic for a *plain* callback ACE takes byte 9 for a sub-authority count and lands
+        // at `16 + 4 * count`; byte 9 is the second byte of those flags, zero for every real one,
+        // so it lands at 16 -- five bytes into the GUID. A GUID carrying `artx` there is
+        // therefore an object ACE that a widened test would call conditional, on four bytes of
+        // somebody's type identifier.
+        let mut guid = [0xaau8; 16];
+        guid[4..8].copy_from_slice(CONDITIONAL_ACE_SIGNATURE);
+        let principal = sid(1, &[0]);
+        let mut body = vec![0x0bu8, 0];
+        let size = (12 + guid.len() + principal.len()) as u16;
+        body.extend_from_slice(&size.to_le_bytes());
+        body.extend_from_slice(&0x001f_01ffu32.to_le_bytes());
+        body.extend_from_slice(&1u32.to_le_bytes()); // Flags: an object type is present
+        body.extend_from_slice(&guid);
+        body.extend_from_slice(&principal);
+        assert_eq!(
+            &body[16..20],
+            CONDITIONAL_ACE_SIGNATURE,
+            "the fixture only says anything if the bytes are where the bad arithmetic looks"
+        );
+        let decoded = read_ace(0x0b, 0, &body).expect("decodes");
+        assert_eq!(
+            (decoded.conditional, decoded.callback),
+            (false, true),
+            "an object ACE's GUID is not its application data, and is not read as one: {decoded:?}"
+        );
     }
 
     /// `\Device\MountPointManager`'s DACL, whose four ACEs `docs/driver-ioctl-walkthrough.md`
