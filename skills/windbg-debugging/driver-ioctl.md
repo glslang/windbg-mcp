@@ -70,8 +70,8 @@ reads.
      message carries its address. That address is the gate: go and inspect it there. Looking at
      the holding directory instead would answer a question about a device this one is not.
    - *"carries no security descriptor of its own"* -- nothing was found on the device, and the
-     tool says in as many words that what the object manager checks in its place is not something
-     it read. The holding directory is the obvious next place to look, but do not treat "the
+     tool says in as many words that whether anything guards it in its place is not something it
+     read -- which is not the same as saying something does. The holding directory is the obvious next place to look, but do not treat "the
      directory is what the kernel checks instead" as established -- that is the ordinary account
      of it and nothing here has measured it. Expect this reason to be **rare or unreachable**
      anyway: every device object on a measured Windows Server 26100 guest carries its own
