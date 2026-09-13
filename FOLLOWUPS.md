@@ -1035,16 +1035,30 @@ and which a later round of the same PR fixed; this entry was written from the bu
 nobody re-derived it afterwards.
 
 - **Re-measured 2026-09-13**, on the same live Windows Server 26100 guest, against the field the
-  tool now reads. Every device object in `\Device` -- **157 of them, zero nulls**. The filter was
-  run with a negative control (the object header's field on `\Device\KsecDD`, which is null and
-  did print), so the empty result is a measurement rather than a query that silently matched
-  nothing. `\Device\KsecDD` is `0xffffe50685598320` and `\Device\Tcp` is `0xffffe506857f53a0`.
+  tool now reads. First every device object in `\Device` -- **157 of them, zero nulls** -- and then,
+  because that sweep can only see devices the namespace names, every device object reachable from
+  every driver object in `\Driver` and `\FileSystem`: **231 devices off 122 driver chains, zero
+  nulls**, of which **66 carry no name at all** (`_OBJECT_HEADER.InfoMask` is `0`, against `2` on
+  `\Device\MountPointManager`). Both runs carried a negative control -- the object header's
+  descriptor field, null on all 231 and printed -- so an empty result is a measurement rather than
+  a query that silently matched nothing. `\Device\KsecDD` is `0xffffe50685598320` and `\Device\Tcp`
+  is `0xffffe506857f53a0`.
+- **So an unnamed device does not answer this either**, which is worth stating because it is the
+  obvious place to look: `IoCreateDevice` called with no name still leaves a descriptor on all 66
+  measured here. A test fixture in `src/device.rs` claimed the opposite in a doc comment and is
+  corrected in the same commit as this entry.
 - **What is actually left**, and it is much smaller: `device::Security::Absent` exists, renders the
   sentence "carries no security descriptor", and tells the reader the directory holding the device
-  is checked instead. On this build nothing reaches it. So two questions are open and neither is
-  the one above -- whether a device object can have a null descriptor at all (`ObInsertObject`
-  assigns one from the type's default, which is why it may be unreachable by construction), and
-  whether that sentence's advice about the directory is true, which was never measured either.
+  is checked instead. On this build nothing reaches it. Two questions are open, and neither is the
+  one this entry was filed with -- whether a **path-resolvable** device can lack its body
+  descriptor (`ObInsertObject` assigns one from the type's default, which is why it may be
+  unreachable by construction), and whether that sentence's advice about the directory is true,
+  which was never measured either.
+- **Scoped to a named device deliberately.** `device_security` takes an object path and refuses an
+  address, reaching the descriptor by walking the namespace, so a device with no name is outside
+  what it can be asked about however it is built -- and has no parent directory to supply the
+  fallback this entry is about. Widening the question to "any device object" would make it one
+  this tool could not act on the answer to.
 - **Why deferred:** it is a question about an unreachable branch's honesty, not a missing feature.
   Deleting the branch needs proof that it cannot be reached on any build, which is a stronger claim
   than one guest supports; keeping it needs its sentence checked rather than assumed.
@@ -1056,16 +1070,22 @@ nobody re-derived it afterwards.
 **Where it picks up.** The `Security` enum and `render` in `src/device.rs`, and the
 `security_absent` field in `src/structured.rs`.
 
-## 69. [windbg-mcp] The callback-ACE round is wider than anything a device DACL can hold
+## 69. [windbg-mcp] The callback-ACE round is wider than any device DACL measured here
 
 **Repo:** `windbg-mcp`.
 
 Rounds eight and ten of [#311](https://github.com/glslang/windbg-mcp/pull/311) classified ACE types
 this tool will not meet. `AceKind::mask_is_access` names `0x04`..=`0x10` and `Ace::callback` covers
 `0x09`..=`0x10`, which pulls in the object-callback types and `SYSTEM_ALARM_CALLBACK`. Both changes
-are correct and neither is reachable: object ACEs carry an `ObjectType` GUID naming a directory
-service property set or extended right, which is meaningless for a device, and the `SYSTEM_ALARM_*`
-family has never been implemented by Windows at all.
+are correct, and nothing observed here exercises either: an object ACE's `ObjectType` GUID names a
+directory service property set or extended right, which is meaningless for a device, and the
+`SYSTEM_ALARM_*` family has never been implemented by Windows at all.
+
+**Unexercised is not unreachable, and the distinction is the whole of why this is a trim and not a
+removal.** A device's DACL is whatever was assigned to it, so an installer is free to put any
+documented ACE type in one, and a descriptor read off a target is bytes rather than something
+Windows vouches for. The sweep below bounds what one machine's *defaults* contain; it does not
+bound the parser's input.
 
 Measured the same day and not applied to the finding: across every distinct descriptor behind every
 device in `\Device` on a 26100 guest -- 41 descriptors, 149 ACEs -- **every ACE is type `0x00`**.
@@ -1074,13 +1094,18 @@ Not one callback ACE of any kind, let alone an object-callback one.
 - **Why deferred:** the code is right, so this is trimming rather than fixing, and it landed on a
   branch that had already run eleven rounds. Raised by the maintainer as reading artificial, which
   it is.
-- **What would close it:** drop the `0x10` extension and the object-ACE GUID fixture in
-  `sd.rs`'s `a_callback_ace_is_conditional_only_when_it_carries_a_condition` -- which builds a GUID
-  carrying `artx` at the four bytes a miscomputed offset lands on, to pin a mutation of code that
-  guards an empty input domain. Keep `0x0b`/`0x0c` in `callback`, since those are implemented types
-  and the field would otherwise be false where `sd.rs` is ever pointed at a non-device object. Put
-  the 149-of-149 figure in `sd.rs` beside the ACE-kind rules, so the next finding in this family is
-  weighed against it instead of implemented.
+- **What would close it:** drop the **object-ACE GUID fixture** in `sd.rs`'s
+  `a_callback_ace_is_conditional_only_when_it_carries_a_condition` -- which builds a GUID carrying
+  `artx` at the four bytes a miscomputed offset lands on, so as to pin a mutation of code guarding
+  an input domain nothing has been seen to produce. That fixture is the artificial part and is all
+  that should go. **Keep every classification as it is**, `0x10` included: `0x10` carries an
+  `ACCESS_MASK` at the documented offset whether or not Windows implements alarms, so naming it is
+  right independently of whether it is ever met, and `0x0b`/`0x0c` are implemented types whose
+  flag would otherwise be false wherever `sd.rs` is pointed at a non-device object. Removing a
+  correct classification because one machine's defaults did not exercise it would misreport a
+  custom descriptor, which is worse than the test it would save. Put the 149-of-149 figure in
+  `sd.rs` beside the ACE-kind rules, so the next finding in this family is weighed against it
+  rather than implemented.
 - **How it was found:** the maintainer, reading the round-ten commit and saying so.
 
 **Where it picks up.** `AceKind::mask_is_access` and `read_ace` in `src/sd.rs`, and that test.
