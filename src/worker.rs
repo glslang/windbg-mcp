@@ -6757,6 +6757,7 @@ fn device_layout(e: &DebugEngine, pointer: usize) -> Result<device::Layout, Fail
         characteristics: of("Characteristics")?,
         flags: of("Flags")?,
         driver: of("DriverObject")?,
+        next_device: of("NextDevice")?,
         security: of("SecurityDescriptor")?,
     })
 }
