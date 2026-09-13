@@ -22,18 +22,20 @@ in the microseconds after a run built its stop is recorded in that result's pros
 no watchdog in either crate can currently cut short (2026-08-30), item 56 from closing item 14 —
 collapsing the coverage rule to "bound every command except `index_trace`" meant enumerating the
 `Execute` calls rather than the ops, which found one left on a shared helper that three callers
-reach on three different clocks (2026-08-31) — item 58 from
+reach on three different clocks (2026-08-31) — items 58–59 from
 [#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
-call that names a target's machine turns out to name the *processor's* (2026-09-05), items
+call that names a target's machine turns out to name the *processor's*, and where nothing can ask
+which thread the engine has selected (2026-09-05), items
 61–65 from completing Personal similarity delivery while separating CVE-specific investigation,
 upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09-12), and items
 66–67 from the IOCTL recovery in [#305](https://github.com/glslang/windbg-mcp/pull/305) and
 [#307](https://github.com/glslang/windbg-mcp/pull/307): thirty-nine review findings over fourteen
 rounds that were one default — a backwards walk refusing what it trips over rather than recognising
 what a compiler emits — and then, from the differential oracle those rounds produced, the walk
-reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and item
-68 from running `device_security` against a live kernel, where the descriptor a device carries turns
-out to be absent on most of them and the gate is the directory's instead (2026-09-13).
+reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and items
+68–70 from `device_security` ([#311](https://github.com/glslang/windbg-mcp/pull/311)), where
+eleven rounds of review on one tool ended with its own live-kernel measurement contradicting the
+item an earlier round of it had produced (2026-09-13).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1016,45 +1018,95 @@ branch. What it does not do is stop believing the edge.
 `Flow::Branch`, the `writes_flags` fold above it, and `noise` in `src/ioctl/tests/differential.rs`,
 whose `flags` parameter exists only because of this.
 
-## 68. [windbg-mcp] The gate a device with no descriptor of its own is actually behind
+## 68. [windbg-mcp] Whether a device can have no security descriptor at all
 
 **Repo:** `windbg-mcp`.
 
-`device_security` reads `_DEVICE_OBJECT::SecurityDescriptor`, which is the descriptor the kernel
-checks for that device — `Device`'s object type carries
-`TypeInfo.SecurityProcedure = nt!IopGetSetSecurityObject`, and that routine keeps it there rather
-than in the object header. Where the field is **empty** the tool says so, in the words the object
-manager's own behaviour warrants: the directory holding the device is what gets checked instead.
+**This item's original premise was wrong, and the correction is the content.** It was filed saying
+that most devices carry no descriptor of their own, so the gate that applies is the directory's and
+`device_security` stops one lookup short of it. `\Device\KsecDD` and `\Device\Tcp` were named as
+examples. Both of them do carry one.
 
-It then stops, and the gate that actually applies is one lookup away and unreported.
+What was being read was the **object header's** `SecurityDescriptor`, which is null for every
+device -- the `Device` object type carries
+`TypeInfo.SecurityProcedure = nt!IopGetSetSecurityObject`, so the descriptor lives in the body at
+`_DEVICE_OBJECT+0x110` instead. That confusion is the same defect the tool itself had at the time
+and which a later round of the same PR fixed; this entry was written from the buggy reading and
+nobody re-derived it afterwards.
 
-- **Why it matters more than it sounds:** measured on a live Windows Server 26100 guest,
-  2026-09-13, this is the **common** case rather than the edge one.
-  `\Device\MountPointManager` has one; `\Device\KsecDD` and `\Device\Tcp` do not, and neither does
-  most of `\Device`. The directory `\Device` itself does — its object header carries one at
-  `ffffe506832228af`, count bits and all. So for a majority of devices on that machine the tool
-  answers "no descriptor here, look at the directory" and a reader has to go and do by hand
-  precisely what this tool exists to do for them.
-- **Why deferred:** it is a second answer rather than a longer one, and the shape is a decision
-  somebody should make rather than one to slip in. The directory's descriptor is a **different
-  object's**, so presenting it as the device's would be the category error this module is otherwise
-  careful about; it wants its own field, saying which directory it came from, and the renderer has
-  to make the distinction impossible to miss. There is also a real question about how far up to
-  walk — `\Device` has one, but a device nested deeper might not, and "the first ancestor with a
-  descriptor" is a rule the object manager does not actually implement.
-- **What would close it:** the descriptor comes from the object **header** of the directory object
-  the namespace walk already passed through, so the read is one `security_of` on an address the
-  walk holds. It needs a `directory_security` field on `DeviceSecurity` beside `security`, never
-  merged into it, with the directory's path beside it; and `security_absent` becomes the reason
-  the fallback was consulted rather than the end of the answer. Check the fast-reference count is
-  masked off — this one **is** an `_EX_FAST_REF`, unlike the device object's plain pointer, which
-  is exactly the sort of difference that gets missed when a second path is added to a first.
-- **How it was found:** the live-kernel differential
-  (`a_device_security_query_on_a_live_kernel_agrees_with_the_debugger`) compared this tool against
-  `!devobj` on the one device that does carry a descriptor. Checking the others by hand while
-  chasing that is what showed most of them do not.
+- **Re-measured 2026-09-13**, on the same live Windows Server 26100 guest, against the field the
+  tool now reads. Every device object in `\Device` -- **157 of them, zero nulls**. The filter was
+  run with a negative control (the object header's field on `\Device\KsecDD`, which is null and
+  did print), so the empty result is a measurement rather than a query that silently matched
+  nothing. `\Device\KsecDD` is `0xffffe50685598320` and `\Device\Tcp` is `0xffffe506857f53a0`.
+- **What is actually left**, and it is much smaller: `device::Security::Absent` exists, renders the
+  sentence "carries no security descriptor", and tells the reader the directory holding the device
+  is checked instead. On this build nothing reaches it. So two questions are open and neither is
+  the one above -- whether a device object can have a null descriptor at all (`ObInsertObject`
+  assigns one from the type's default, which is why it may be unreachable by construction), and
+  whether that sentence's advice about the directory is true, which was never measured either.
+- **Why deferred:** it is a question about an unreachable branch's honesty, not a missing feature.
+  Deleting the branch needs proof that it cannot be reached on any build, which is a stronger claim
+  than one guest supports; keeping it needs its sentence checked rather than assumed.
+- **What would close it:** either a construction that produces a device with a null descriptor --
+  at which point the directory-fallback question becomes real and the original entry can be
+  rewritten back -- or a decision that `Security::Absent` states only what was read and makes no
+  claim about what is checked instead.
 
-**Where it picks up.** `device_security` in `src/worker.rs`, the `Security` enum in
-`src/device.rs`, and `dbgscope`'s `Namespace::object_at`, which resolves the directory on the way
-and currently keeps nothing about it.
+**Where it picks up.** The `Security` enum and `render` in `src/device.rs`, and the
+`security_absent` field in `src/structured.rs`.
 
+## 69. [windbg-mcp] The callback-ACE round is wider than anything a device DACL can hold
+
+**Repo:** `windbg-mcp`.
+
+Rounds eight and ten of [#311](https://github.com/glslang/windbg-mcp/pull/311) classified ACE types
+this tool will not meet. `AceKind::mask_is_access` names `0x04`..=`0x10` and `Ace::callback` covers
+`0x09`..=`0x10`, which pulls in the object-callback types and `SYSTEM_ALARM_CALLBACK`. Both changes
+are correct and neither is reachable: object ACEs carry an `ObjectType` GUID naming a directory
+service property set or extended right, which is meaningless for a device, and the `SYSTEM_ALARM_*`
+family has never been implemented by Windows at all.
+
+Measured the same day and not applied to the finding: across every distinct descriptor behind every
+device in `\Device` on a 26100 guest -- 41 descriptors, 149 ACEs -- **every ACE is type `0x00`**.
+Not one callback ACE of any kind, let alone an object-callback one.
+
+- **Why deferred:** the code is right, so this is trimming rather than fixing, and it landed on a
+  branch that had already run eleven rounds. Raised by the maintainer as reading artificial, which
+  it is.
+- **What would close it:** drop the `0x10` extension and the object-ACE GUID fixture in
+  `sd.rs`'s `a_callback_ace_is_conditional_only_when_it_carries_a_condition` -- which builds a GUID
+  carrying `artx` at the four bytes a miscomputed offset lands on, to pin a mutation of code that
+  guards an empty input domain. Keep `0x0b`/`0x0c` in `callback`, since those are implemented types
+  and the field would otherwise be false where `sd.rs` is ever pointed at a non-device object. Put
+  the 149-of-149 figure in `sd.rs` beside the ACE-kind rules, so the next finding in this family is
+  weighed against it instead of implemented.
+- **How it was found:** the maintainer, reading the round-ten commit and saying so.
+
+**Where it picks up.** `AceKind::mask_is_access` and `read_ace` in `src/sd.rs`, and that test.
+
+## 70. [dbgscope] A path component is matched by folding ASCII
+
+**Repo:** `dbgscope`.
+
+`Namespace::object_at` resolves each component with
+`object.name.eq_ignore_ascii_case(component)`. The object manager compares through the system's
+uppercase table, not through the twenty-six letters of ASCII -- which is the same defect
+`windbg-mcp`'s `device::same_object_path` took three review rounds to settle, one repository over
+and in a function that has never been looked at for it.
+
+The settled shape is in `src/device.rs` there, and it is worth copying rather than re-deriving:
+`nt!ObpLookupDirectoryEntry` folds one `WCHAR` at a time in three bands -- `a`-`z` inline,
+nothing below `U+00C0`, and the 8-4-4 `UnicodeUpcaseTable844` trie above it -- and a comparison the
+stand-in cannot make is reported as undecided rather than as a mismatch, so a lookup never reports
+absence it has not established.
+
+- **Why deferred:** pre-existing, untouched by the PR that found it, and the maintainer called it a
+  follow-up rather than something to expand an eight-round branch into.
+- **What would close it:** the three-band fold and its `Match`-style third answer, and
+  `ObjectError::NotFound` not being returned where the fold could not decide -- `NotFoundInPart`
+  already exists for the neighbouring case and is the shape to follow.
+- **How it was found:** reading `object_at` while fixing the halt it accepts a found component
+  through (2026-09-13).
+
+**Where it picks up.** `Namespace::object_at` in `dbgscope`'s `src/object.rs`.
