@@ -253,8 +253,6 @@ pub(crate) struct Found {
     pub(crate) followed_link: Option<String>,
     /// The `_DEVICE_OBJECT` itself.
     pub(crate) address: u64,
-    /// Whether the namespace could say this object **is** a device.
-    pub(crate) type_confirmed: bool,
     pub(crate) fields: Device,
     pub(crate) security: Security,
     /// The directory that was searched for links, whether or not it could be listed.
@@ -312,8 +310,17 @@ pub(crate) const SYMBOLIC_LINK: &str = "SymbolicLink";
 /// link to `\Device\HarddiskVolume1`, and matching it as one would report a volume as reachable
 /// under a name that opens a file on it.
 pub(crate) fn same_object_path(one: &str, other: &str) -> bool {
-    let trim = |path: &str| path.trim_end_matches('\\').to_string();
-    trim(one).eq_ignore_ascii_case(&trim(other))
+    // **Folded over the whole of Unicode, not the twenty-six letters of ASCII.** An object name is
+    // a counted run of UTF-16 and the object manager compares it through the system's uppercase
+    // table, so two names differing only in the case of a non-ASCII letter are one object to the
+    // kernel. Folding ASCII alone leaves them unequal, which drops a link that does reach the
+    // device -- and the search then reports itself complete, having missed it.
+    //
+    // Rust's casing is the Unicode default one, which is not byte-for-byte the kernel's table and
+    // is not claimed to be; it agrees on every case this is likely to meet and is strictly closer
+    // than folding nothing.
+    let trim = |path: &str| path.trim_end_matches('\\').to_lowercase();
+    trim(one) == trim(other)
 }
 
 /// One ACE, as fields a caller can branch on.
@@ -408,7 +415,6 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
         device: found.device.clone(),
         followed_link: found.followed_link.clone(),
         address: format!("{:#018x}", found.address),
-        type_confirmed: found.type_confirmed,
         driver: format!("{:#018x}", found.fields.driver),
         device_type: format!("{:#06x}", found.fields.device_type),
         characteristics: format!("{:#010x}", found.fields.characteristics),
@@ -810,7 +816,6 @@ mod tests {
             device: "\\Device\\MountPointManager".to_string(),
             followed_link: None,
             address: AT,
-            type_confirmed: true,
             fields: Device {
                 device_type: 0x2d,
                 characteristics: FILE_DEVICE_SECURE_OPEN,
@@ -919,6 +924,15 @@ mod tests {
                 "\\Device\\MountPointManager"
             ),
             "nor is a longer name beginning with it"
+        );
+
+        // **And the fold is not ASCII's.** The object manager compares through the system's
+        // uppercase table, which covers every letter that has a case -- so folding A to Z alone
+        // leaves two spellings of one object unequal, drops the link that reaches it, and lets
+        // the search call itself complete having missed it.
+        assert!(
+            same_object_path("\\Device\\Käse", "\\Device\\KÄSE"),
+            "a name differing only in the case of a non-ASCII letter is the same object"
         );
     }
 
