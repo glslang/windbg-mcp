@@ -6637,7 +6637,30 @@ fn hazards_of(
             ));
         }
     };
+    hazards_at(e, module, base, loaded_size, deadline)
+}
 
+/// The scan itself, over an extent a caller has already resolved.
+///
+/// **Split from the name lookup because a caller may hold the identity rather than the name.**
+/// `driver_surface` does: a driver object's `DriverStart` says which image is its, and the module
+/// containing that address is unambiguous by construction -- where the *name* is a display form,
+/// and re-resolving it means asking the inventory a question that can come back ambiguous for an
+/// image this already identified. That is `a-rendering-is-not-an-identifier` applied to the one
+/// join in this crate that had an identity in hand and passed a name instead.
+///
+/// **Whether two loaded modules can actually share a name is not something measured here.**
+/// `modules()` lists loaded modules only, and no two on the sample target share one; constructing
+/// the collision was not attempted. So this is not the fix for a bug anybody has seen -- it is
+/// declining to ask a question whose answer was already in hand, which costs nothing and removes
+/// the need to know.
+fn hazards_at(
+    e: &DebugEngine,
+    module: &str,
+    base: u64,
+    loaded_size: u32,
+    deadline: Instant,
+) -> Result<structured::DriverHazards, Failed> {
     // The headers, then the imports. Both read through one closure, and a read that does not
     // answer is `PeError::Unreadable` naming what could not be read rather than a zero parsed as a
     // structure — which on a dump is the ordinary case for anything outside the read-only
@@ -6989,7 +7012,7 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
             image_at.attribution_failed,
             fields.image_base,
         ),
-        Some(module) => match hazards_of(e, module, deadline) {
+        Some(module) => match scan_of(e, module, fields.image_base, deadline) {
             Ok(scan) => structured::HazardsSection {
                 status: match scan.stopped.is_some() {
                     true => structured::SectionStatus::Partial,
@@ -7041,6 +7064,22 @@ fn driver_devices(
     deadline: Instant,
 ) -> structured::DevicesSection {
     let memory = |at: u64, len: usize| e.read_memory(at, len).ok();
+    // **A driver that created no devices is answered before anything can fail.** The chain is the
+    // driver object's own `DeviceObject` field, so a null one settles this section completely --
+    // and everything below it is work whose result that answer does not use: a `_DEVICE_OBJECT`
+    // layout nothing will be read with, and a directory listing that would name nothing. Resolving
+    // the layout first meant a build whose `_DEVICE_OBJECT` field names this does not recognise
+    // turned a complete answer into an `error` section.
+    if driver.device_object == 0 {
+        return structured::DevicesSection {
+            status: structured::SectionStatus::Ok,
+            note: None,
+            devices: Vec::new(),
+            device_count: 0,
+            named_in: DEVICE_DIRECTORY.to_string(),
+            unnamed: 0,
+        };
+    }
     let layout = match device_layout(e, pointer) {
         Ok(layout) => layout,
         Err(why) => {
@@ -7313,6 +7352,30 @@ fn devices_are_whole(
         && named_where_it_matters
         && gates.unread_devices == 0
         && gates.unread_gates == 0
+}
+
+/// The hazard scan for the image a driver object names, by **where** it is rather than by name.
+///
+/// `DriverStart` is the driver object's own answer about which image is its, and the loaded module
+/// whose extent contains it is unambiguous. Falls back to the name only when no loaded module holds
+/// that address, which is the shape a coordinate that named a module could not produce -- kept so
+/// that a future caller of this helper without a coordinate still gets an answer rather than a
+/// hole.
+fn scan_of(
+    e: &DebugEngine,
+    module: &str,
+    image_base: u64,
+    deadline: Instant,
+) -> Result<structured::DriverHazards, Failed> {
+    let holding = e.modules().ok().and_then(|loaded| {
+        loaded
+            .into_iter()
+            .find(|one| image_base >= one.base && image_base < one.end())
+    });
+    match holding {
+        Some(one) => hazards_at(e, &one.name, one.base, one.size, deadline),
+        None => hazards_of(e, module, deadline),
+    }
 }
 
 /// Which of several failed lookups to report, when a bare name was tried in each directory.
@@ -8307,6 +8370,43 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    /// The bodies of the named functions, concatenated, each one required to exist.
+    ///
+    /// **The `floor` is the point of this helper.** A guard that scans a function whose body has
+    /// since moved elsewhere finds nothing and passes, and that has happened twice on this pair as
+    /// they were split for testability -- once for the PE reader's bound and once for the rule that
+    /// the scan builds no debugger command, which is the standing reason its `module` argument
+    /// needs no injection screen. A minimum size cannot say the right code is present; it can say
+    /// the scan is not looking at a four-line wrapper, which is the failure that was silent both
+    /// times. Naming every function the code flows through is the other half: a body moving
+    /// *between* them then changes nothing, and a rename fails loudly on the `expect`.
+    fn bodies_of(names: &[&str], floor: usize) -> String {
+        let code = include_str!("worker.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this module has a test half")
+            .0;
+        let mut out = String::new();
+        for name in names {
+            let anchor = format!("\nfn {name}(");
+            let body = code
+                .split_once(&anchor)
+                .unwrap_or_else(|| panic!("this module has no `{name}`"))
+                .1;
+            out.push_str(body.split_once("\nfn ").map_or(body, |(body, _)| body));
+        }
+        assert!(
+            out.len() >= floor,
+            "these guards scanned {} bytes of {names:?}, under the {floor} expected -- the code \
+             they are about has moved out of those functions and they are now reading wrappers, \
+             which is the way this fails without failing",
+            out.len()
+        );
+        out
+    }
+
+    /// The functions a driver scan's work is spread across, in flow order.
+    const SCAN: &[&str] = &["driver_hazards", "scan_of", "hazards_of", "hazards_at"];
+
     /// **A driver the chain proved has no devices is a complete section, whatever the directory
     /// did.**
     ///
@@ -8651,27 +8751,7 @@ mod tests {
 
         // And that the scan's reader is the bounded one. The closure needs an engine, so what is
         // checked is that it is still built from this.
-        let code = include_str!("worker.rs")
-            .split_once(
-                "
-#[cfg(test)]",
-            )
-            .expect("this module has a test half")
-            .0;
-        // `hazards_of`, which is where the body went when the scan was split in two.
-        let body = code
-            .split_once(
-                "
-fn hazards_of(",
-            )
-            .expect("this module has a `hazards_of`")
-            .1;
-        let body = body
-            .split_once(
-                "
-fn ",
-            )
-            .map_or(body, |(body, _)| body);
+        let body = bodies_of(SCAN, 4_000);
         assert!(
             body.contains("within_module(base, loaded_size, at, len)"),
             "`driver_hazards` reads the image unbounded again, so a header field can send the              parser into whatever is mapped after the module."
@@ -8776,19 +8856,7 @@ fn ",
         // And that it is **applied**, which the arithmetic above cannot say: the clamp lives in a
         // function that needs an engine, so what is checked here is that the call is still there.
         // Without it the three assertions above pass over a scan that trusts the header.
-        let code = include_str!("worker.rs")
-            .split_once("\n#[cfg(test)]")
-            .expect("this module has a test half")
-            .0;
-        // **`hazards_of`, not `driver_hazards`.** The scan was split into a value half and a
-        // rendering half so `driver_surface` could embed it, and the body went with the value
-        // half; `driver_hazards` is now the four-line wrapper above it. Anchored on the wrapper
-        // this guard scans nothing and passes, which is the one way it could fail silently.
-        let body = code
-            .split_once("\nfn hazards_of(")
-            .expect("this module has a `hazards_of`")
-            .1;
-        let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
+        let body = bodies_of(SCAN, 4_000);
         assert!(
             body.contains("image.size_of_image = smaller_extent("),
             "`driver_hazards` no longer clamps the image's extent to the loader's, so every bound \
@@ -8799,12 +8867,7 @@ fn ",
         // from the same header. Unclamped, a section declared past the loaded extent puts the next
         // module's code inside this one's ranges, and an entry landing there is published as this
         // driver's case with the jump reported as followed.
-        // `ioctl_map_of`, for the reason the scan's anchor above gives.
-        let walk = code
-            .split_once("\nfn ioctl_map_of(")
-            .expect("this module has an `ioctl_map_of`")
-            .1;
-        let walk = walk.split_once("\nfn ").map_or(walk, |(walk, _)| walk);
+        let walk = bodies_of(&["ioctl_map", "ioctl_map_of"], 4_000);
         assert!(
             walk.contains("image.size_of_image = smaller_extent("),
             "`ioctl_map` no longer clamps the image's extent to the loader's, so a jump-table \
@@ -8924,19 +8987,7 @@ fn ",
     /// being missed.
     #[test]
     fn the_driver_scan_runs_no_command() {
-        let code = include_str!("worker.rs")
-            .split_once("\n#[cfg(test)]")
-            .expect("this module has a test half")
-            .0;
-        // **`hazards_of`, not `driver_hazards`.** The scan was split into a value half and a
-        // rendering half so `driver_surface` could embed it, and the body went with the value
-        // half; `driver_hazards` is now the four-line wrapper above it. Anchored on the wrapper
-        // this guard scans nothing and passes, which is the one way it could fail silently.
-        let body = code
-            .split_once("\nfn hazards_of(")
-            .expect("this module has a `hazards_of`")
-            .1;
-        let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
+        let body = bodies_of(SCAN, 4_000);
         assert!(
             !body.contains("execute_command"),
             "`driver_hazards` builds a debugger command again. Its `module` argument is a \

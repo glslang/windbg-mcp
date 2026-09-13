@@ -501,7 +501,7 @@ pub(crate) fn device_gates(
         // now called only when there is a descriptor to fetch.
         let security = match (stopped, fields.security_descriptor) {
             (_, None) => crate::device::Security::Absent,
-            (Some(why), Some(_)) => crate::device::Security::Unattempted(why),
+            (Some(why), Some(at)) => crate::device::Security::Unattempted { at, why },
             (None, Some(_)) => gate_of(&fields),
         };
         if matches!(security, crate::device::Security::Failed { .. }) {
@@ -1457,6 +1457,56 @@ mod tests {
                 "and neither offers the reader both: {message}"
             );
         }
+    }
+
+    /// **A descriptor the halt stopped short of is a descriptor the device *has*.**
+    ///
+    /// The chain pass reads the whole `_DEVICE_OBJECT`, so a non-null `SecurityDescriptor` field
+    /// establishes two things before the gate pass starts: that the device carries one, and where.
+    /// Only its contents are unknown. The first version of this outcome carried neither -- it held
+    /// the halt alone and its sentence said "whether it carries one is not something this
+    /// answered", giving away both, and reading as the *permissive* case (an object with no
+    /// descriptor) rather than as a guarded one this call ran out of time to decode.
+    ///
+    /// That was the fourth consecutive round of review on this seam, each one a different fact the
+    /// gate pass still had and the report gave away. `Unattempted` carrying `at` is what closes it:
+    /// every variant of `Security` now holds everything known where it is built, so there is no
+    /// known fact left for one to drop.
+    #[test]
+    fn a_descriptor_not_read_says_the_device_carries_one() {
+        const AT: u64 = 0xffff_8680_fc69_12a0;
+        let gates = device_gates(
+            &[0x100],
+            |_| None,
+            |_| Some(gate_device(Some(AT))),
+            |_| panic!("the halt fired, so nothing should be fetched"),
+            || Some(Halt::Deadline),
+        );
+
+        let why = gates.devices[0]
+            .security_absent
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            why.contains(&format!("{AT:#018x}")),
+            "the address the chain pass read is kept, so a reader can go and look: {why}"
+        );
+        assert!(
+            why.contains("does carry one"),
+            "and presence is stated, that being known too: {why}"
+        );
+        assert!(
+            !why.contains("whether it carries"),
+            "never as an open question -- that reads as the permissive case, which is the \
+             opposite of what was established: {why}"
+        );
+        assert!(
+            why.contains("ran out of time"),
+            "with the reason it went unread, which is this call rather than the device: {why}"
+        );
+        // It is not a gate that *failed*: nothing tried. The section says so through `stopped`.
+        assert_eq!(gates.unread_gates, 0);
+        assert_eq!(gates.stopped, Some(Halt::Deadline));
     }
 
     /// **A descriptor already known absent stays known, halt or no halt.**
