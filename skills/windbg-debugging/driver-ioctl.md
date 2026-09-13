@@ -54,11 +54,17 @@ gate on each, the control codes its IOCTL handler accepts, and its sensitive imp
 carries its own status, so a dispatch routine that will not disassemble still leaves the import and
 security evidence standing.
 
-Do the steps by hand when you are on a **dump** — the composite needs the object namespace and a
-kernel minidump has none, while `driver_hazards` and `ioctl_map` read the image and work there —
-when you already have the dispatch address and want only the map, or when you want the symbolic
-links, which the composite leaves to `device_security` because that search lists a whole directory
-per device.
+**On a kernel dump none of that works, and neither do steps 1 and 4 below.** A minidump carries no
+object namespace, so `driver_surface`, `driver_object`, `device_object` and `device_security` all
+fail there for the one reason — measured, `!drvobj` and `!devobj` both answer `Unable to get value
+of ObpRootDirectoryObject`. What reads on a dump is the **image**: `driver_hazards` on the module
+name, and `ioctl_map` once you have the dispatch address from somewhere other than the driver
+object (a previous live session, a disassembler, or a symbol). There is no dump route to the device
+list or its DACLs at all.
+
+Do the numbered steps by hand on a **live kernel** when you already have the dispatch address and
+want only the map, or when you want the symbolic links, which the composite leaves to
+`device_security` because that search lists a whole directory per device.
 
 1. **Find the dispatch routine.** `driver_object { "name": "mydriver" }` (`!drvobj <name> 7`)
    dumps the `MajorFunction` table. Index **`0x0e`** (`IRP_MJ_DEVICE_CONTROL`) is the IOCTL

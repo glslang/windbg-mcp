@@ -15,7 +15,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The IOCTL and hazard sections are `ioctl_map`'s and `driver_hazards`' own answers **whole**, rendered by their own renderers — a digest would be a second shape restating what the map already says, and a composite whose caller has to go back for the detail has not composed anything.
 
-  **The per-section rule stops at the driver object**, and that boundary is the point rather than an omission: every section is read from something the driver object points at, so a driver object that will not resolve is the whole call failing. Four empty sections is precisely what a driver with no devices, no control codes and no sensitive imports looks like.
+  **The per-section rule stops at the driver object**, and that boundary is the point rather than an omission: every section is read from something the driver object points at, so a driver object that will not resolve is the whole call failing — because three empty sections is exactly what a driver with no devices, no control codes and no sensitive imports looks like, and the fourth -- an empty dispatch table -- is not something any driver has at all, which is a tell a reader should not have to notice.
 
   **A bare name resolves under `\Driver` then `\FileSystem`, and one that resolves in neither is refused** — not evaluated as an expression, which is what `!drvobj` does, and how `!drvobj mountmgr 7` comes to answer with mountmgr's image base reported as `is not a driver object`.
 

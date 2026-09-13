@@ -682,8 +682,21 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
     if let Some(note) = &report.devices.note {
         let _ = writeln!(out, "  [!] {note}");
     }
+    // **The absolute claim belongs to the complete section alone**, which is the rule
+    // `device_security`'s own renderer states for its link search and this did not borrow. A
+    // layout that would not read comes back as an `error` section with an empty list, and "this
+    // driver created no devices" is then a statement about the target derived from a failure of
+    // this call -- the one reading to never print by accident.
     if report.devices.devices.is_empty() {
-        let _ = writeln!(out, "  This driver created no devices.");
+        let _ = match report.devices.status {
+            crate::structured::SectionStatus::Ok => {
+                writeln!(out, "  This driver created no devices.")
+            }
+            _ => writeln!(
+                out,
+                "  No devices were read, which is not the same as this driver having none."
+            ),
+        };
     }
     for device in &report.devices.devices {
         let _ = writeln!(
@@ -1234,6 +1247,13 @@ mod tests {
     // ---- the rendering ----------------------------------------------------
 
     fn rendered(devices: Vec<crate::structured::SurfaceDevice>) -> String {
+        rendered_with(devices, crate::structured::SectionStatus::Ok)
+    }
+
+    fn rendered_with(
+        devices: Vec<crate::structured::SurfaceDevice>,
+        devices_status: crate::structured::SectionStatus,
+    ) -> String {
         use crate::structured as s;
         render(&s::DriverSurface {
             images: Vec::new(),
@@ -1246,7 +1266,7 @@ mod tests {
             unload: None,
             dispatch: dispatch_section(&with_table(&[0x2000; 28]), at),
             devices: s::DevicesSection {
-                status: s::SectionStatus::Ok,
+                status: devices_status,
                 note: None,
                 device_count: devices.len(),
                 unnamed: devices.iter().filter(|one| one.path.is_none()).count(),
@@ -1450,6 +1470,37 @@ mod tests {
             gates.unread_gates, 0,
             "there was no descriptor field to find unreadable -- the object itself did not read"
         );
+    }
+
+    /// **"This driver created no devices" is the complete section's sentence alone.**
+    ///
+    /// `driver_devices` answers `error` with an empty list when the device layout will not read,
+    /// and the renderer printed the absolute claim for it -- a statement about the target derived
+    /// from a failure of this call, which is the one reading never to print by accident. The rule
+    /// is not new here: `device_security`'s own renderer reserves its absolute sentence for a
+    /// `LinkSearch::Complete` search and says why, and this did not borrow it.
+    #[test]
+    fn only_a_complete_device_section_may_say_the_driver_created_none() {
+        use crate::structured::SectionStatus as S;
+
+        let complete = rendered_with(Vec::new(), S::Ok);
+        assert!(
+            complete.contains("This driver created no devices."),
+            "a section that read everything and found nothing says so: {complete}"
+        );
+
+        for short in [S::Partial, S::Unavailable, S::Error] {
+            let out = rendered_with(Vec::new(), short);
+            assert!(
+                !out.contains("created no devices"),
+                "{short:?} with an empty list is a section that did not read, not a driver with \
+                 no devices: {out}"
+            );
+            assert!(
+                out.contains("No devices were read"),
+                "and it says which it is rather than saying nothing: {out}"
+            );
+        }
     }
 
     /// **A device whose object would not read says so in its own field, and leaves

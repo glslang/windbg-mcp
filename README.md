@@ -96,7 +96,7 @@ native analysis of it works and always has — and says so in the opener's `limi
 
 ## Tools
 
-Fifty-seven tools in eight `--tools` groups; the rows below split some of those groups by theme. The
+Sixty-one tools in eight `--tools` groups; the rows below split some of those groups by theme. The
 `--tools` column is the name that selects one — see
 [Serving fewer tools](docs/tool-surface.md#serving-fewer-tools---tools).
 
@@ -111,14 +111,14 @@ Fifty-seven tools in eight `--tools` groups; the rows below split some of those 
 | Transaction | `batch` | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
 | TTD nav | `ttd` | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd` | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
-| Driver IOCTL | `ioctl` | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch`, `driver_hazards`, `ioctl_map` — the control codes a dispatch routine accepts, recovered from its own code and decoded; `device_security` — who may open a device: its descriptor as principals and access masks, `FILE_DEVICE_SECURE_OPEN`, and the symbolic links that reach it; `driver_surface` — all of the above for one driver in one call, each section reporting its own status |
+| Driver IOCTL | `ioctl` | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch`, `driver_hazards`, `ioctl_map` — the control codes a dispatch routine accepts, recovered from its own code and decoded; `device_security` — who may open a device: its descriptor as principals and access masks, `FILE_DEVICE_SECURE_OPEN`, and the symbolic links that reach it; `driver_surface` — one driver in one call: its dispatch table, its devices with the gate on each (no symbolic links), `ioctl_map`'s answer and `driver_hazards`', each section reporting its own status |
 | Kernel pool | `allocator` | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
 | User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 
-All of them are served unless you say otherwise, and the definitions cost the model **88,568 bytes —
-about 22k tokens — before it has asked anything** (measured 2026-09-12). `--tools
+All of them are served unless you say otherwise, and the definitions cost the model **90,274 bytes —
+about 23k tokens — before it has asked anything** (measured 2026-09-13). `--tools
 session,inspect,crash` cuts that to 32,322 B for twenty-three tools, and a `--listen` client can be
 given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
 is always included, and what a typed operand may not contain.
