@@ -1047,13 +1047,15 @@ nobody re-derived it afterwards.
   obvious place to look: `IoCreateDevice` called with no name still leaves a descriptor on all 66
   measured here. A test fixture in `src/device.rs` claimed the opposite in a doc comment and is
   corrected in the same commit as this entry.
-- **What is actually left**, and it is much smaller: `device::Security::Absent` exists, renders the
-  sentence "carries no security descriptor", and tells the reader the directory holding the device
-  is checked instead. On this build nothing reaches it. Two questions are open, and neither is the
-  one this entry was filed with -- whether a **path-resolvable** device can lack its body
-  descriptor (`ObInsertObject` assigns one from the type's default, which is why it may be
-  unreachable by construction), and whether that sentence's advice about the directory is true,
-  which was never measured either.
+- **Half of this has now landed, and the entry is what is left.** `Security::Absent`'s sentence no
+  longer claims the directory holding the object is checked instead: it states what was read and
+  says the rest is not something it looked at. That was one of the two closing options below,
+  taken because a tool asserting an unmeasured mechanism is worse than one admitting a gap.
+- **What is actually left**, and it is much smaller: whether a **path-resolvable** device can lack
+  its body descriptor at all. `ObInsertObject` assigns one from the type's default, which is why it
+  may be unreachable by construction, and `device::Security::Absent` is a branch nothing on this
+  build reaches. Whether the object manager really does fall back to the directory is still
+  unmeasured -- it is simply no longer *claimed* anywhere.
 - **Scoped to a named device deliberately.** `device_security` takes an object path and refuses an
   address, reaching the descriptor by walking the namespace, so a device with no name is outside
   what it can be asked about however it is built -- and has no parent directory to supply the
@@ -1062,10 +1064,11 @@ nobody re-derived it afterwards.
 - **Why deferred:** it is a question about an unreachable branch's honesty, not a missing feature.
   Deleting the branch needs proof that it cannot be reached on any build, which is a stronger claim
   than one guest supports; keeping it needs its sentence checked rather than assumed.
-- **What would close it:** either a construction that produces a device with a null descriptor --
-  at which point the directory-fallback question becomes real and the original entry can be
-  rewritten back -- or a decision that `Security::Absent` states only what was read and makes no
-  claim about what is checked instead.
+- **What would close it:** a construction that produces a path-resolvable device with a null
+  descriptor -- at which point the directory-fallback question becomes real, is worth measuring
+  against `nt!ObpCheckObjectAccess`, and the original entry can be rewritten back. Failing that, a
+  decision that an unreachable branch carrying an honest sentence is a resting state rather than a
+  defect, which closes it with no code change at all.
 
 **Where it picks up.** The `Security` enum and `render` in `src/device.rs`, and the
 `security_absent` field in `src/structured.rs`.
