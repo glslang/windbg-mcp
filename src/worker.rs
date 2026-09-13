@@ -6913,9 +6913,13 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
             }
         }
         examined = Some(seen);
-        search = match halted {
-            Some(_) => structured::LinkSearch::Partial,
-            None => structured::LinkSearch::Complete,
+        // **`Complete` is a guarantee rather than a description of how the loop ended.** It says
+        // an empty list proves nothing reaches this device, so it cannot be claimed while an
+        // entry went unnamed or a target unread -- either of those may be the link. Running to
+        // the end is necessary and was, on its own, taken for sufficient.
+        search = match (halted, links_unnamed + links_unread) {
+            (None, 0) => structured::LinkSearch::Complete,
+            _ => structured::LinkSearch::Partial,
         };
     }
 

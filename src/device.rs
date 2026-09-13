@@ -284,7 +284,21 @@ pub(crate) fn same_object_path(one: &str, other: &str) -> bool {
 
 /// One ACE, as fields a caller can branch on.
 fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
-    let (reads, writes) = crate::sd::data_access(ace.mask);
+    // **Only an access mask is named as access.** A mandatory label and a scoped policy id carry
+    // something else in the same four bytes, and putting those through a table of file rights
+    // reports a label's `NO_WRITE_UP` as `FILE_READ_DATA` with `reads: true` -- a bit that says
+    // the opposite of what it is printed as. The raw `mask` is carried either way, so nothing is
+    // lost by declining to name it.
+    let access = ace.kind.mask_is_access();
+    let (reads, writes) = match access {
+        true => crate::sd::data_access(ace.mask),
+        false => (false, false),
+    };
+    let rights = match (access, ace.kind) {
+        (true, _) => crate::sd::rights(ace.mask),
+        (false, crate::sd::AceKind::Label) => crate::sd::label_policy(ace.mask),
+        (false, _) => Vec::new(),
+    };
     crate::structured::AccessEntry {
         kind: ace.kind.name().to_string(),
         ace_type: ace.ace_type,
@@ -296,10 +310,7 @@ fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
             .and_then(|sid| sid.name)
             .map(str::to_string),
         mask: format!("{:#010x}", ace.mask),
-        rights: crate::sd::rights(ace.mask)
-            .into_iter()
-            .map(str::to_string)
-            .collect(),
+        rights: rights.into_iter().map(str::to_string).collect(),
         reads,
         writes,
     }
@@ -440,23 +451,39 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
                     );
                 }
             }
+            // **Four states, and three of them are the permissive ones a renderer must not
+            // blur.** `None` here never means "could not be read" -- a DACL whose bytes would not
+            // read fails the whole descriptor, which arrives as `Security::Failed` and is printed
+            // above. So the only way to reach `None` is an absent list, and both ways of being
+            // absent grant every caller everything. Saying "this could not be read" of either,
+            // which is what this did, reports the most permissive device there is as an
+            // unanswered question.
             match (&security.dacl, security.dacl_present) {
-                // The most permissive object there is, and the one line of this report that has
-                // to be unmissable: a NULL DACL grants every caller everything.
-                (_, false) => {
+                (None, false) => {
                     let _ = writeln!(
                         out,
-                        "    [!] no DACL: every caller is granted every access to this device"
+                        "    [!] no DACL at all: every caller is granted every access to this \
+                         device"
                     );
                 }
                 (None, true) => {
                     let _ = writeln!(
                         out,
-                        "    [!] a DACL is present and this could not read it, so who may open \
-                         this device is unanswered"
+                        "    [!] a NULL DACL: the list is present and empty of restrictions, so \
+                         every caller is granted every access to this device"
                     );
                 }
-                (Some(dacl), true) => render_acl(&mut out, "DACL", dacl),
+                // The opposite extreme, and it looks almost the same in a listing: a DACL with no
+                // entries grants nobody anything. Rendered as `0 ACE(s)` alone it reads like the
+                // cases above rather than like their inverse.
+                (Some(dacl), _) if dacl.entries.is_empty() && dacl.ace_count == 0 => {
+                    let _ = writeln!(
+                        out,
+                        "    [!] an empty DACL: every caller is denied every access to this \
+                         device"
+                    );
+                }
+                (Some(dacl), _) => render_acl(&mut out, "DACL", dacl),
             }
             if let Some(sacl) = &security.sacl {
                 render_acl(&mut out, "SACL", sacl);
@@ -861,44 +888,115 @@ mod tests {
         );
     }
 
-    /// **A NULL DACL is the most permissive object there is, and it is read off the control bit.**
-    /// A descriptor whose DACL offset is zero *with* `SE_DACL_PRESENT` set is a different object
-    /// from one without the bit, and reporting the first as "no DACL found" would describe a
-    /// device that grants everyone everything as one this could not read.
+    /// **The four states a DACL can be in, three of which are about who is let in and only one
+    /// of which restricts anybody.**
+    ///
+    /// No DACL at all and a NULL DACL both grant every caller every access, and an empty DACL --
+    /// present, with no entries -- denies everyone. Those are the extremes of the range, and in a
+    /// listing the last of them prints as `0 ACE(s)`, which reads like the first two rather than
+    /// like their inverse.
+    ///
+    /// **There is no "could not read it" state here, and believing there was is what this test is
+    /// for.** A DACL whose bytes will not read fails the whole descriptor, which arrives as
+    /// [`Security::Failed`]; `dacl: None` with the present bit set can only be the offset being
+    /// zero, which is the NULL DACL. This renderer said "a DACL is present and this could not read
+    /// it" for exactly that, reporting the most permissive device there is as an unanswered
+    /// question -- and the first version of this test asserted that wording, which is how a
+    /// careful-looking test came to pin the defect.
     #[test]
-    fn a_null_dacl_is_reported_as_granting_everyone_everything() {
-        let mut found = found();
-        found.security = Security::Read {
-            at: 0xffff_8680_fc69_12a0,
-            descriptor: descriptor(None),
+    fn every_way_a_dacl_can_be_absent_says_who_that_lets_in() {
+        let with = |dacl: Option<crate::sd::Acl>, control: u16| {
+            let mut descriptor = descriptor(dacl);
+            descriptor.control = control;
+            render(&structured_report(&Found {
+                security: Security::Read {
+                    at: 0xffff_8680_fc69_12a0,
+                    descriptor,
+                },
+                ..found()
+            }))
         };
-        let report = structured_report(&found);
+
+        // SE_SELF_RELATIVE alone: no DACL at all.
+        let none = with(None, 0x8000);
+        assert!(none.contains("no DACL at all"), "{none}");
+        assert!(none.contains("granted every access"), "{none}");
+
+        // SE_SELF_RELATIVE | SE_DACL_PRESENT with nothing behind it: a NULL DACL.
+        let null = with(None, 0x8004);
+        assert!(null.contains("NULL DACL"), "{null}");
         assert!(
-            !report
-                .security
-                .as_ref()
-                .expect("the descriptor read")
-                .dacl_present
+            null.contains("granted every access"),
+            "a NULL DACL is the most permissive object there is, not an unread one: {null}"
         );
-        let text = render(&report);
         assert!(
-            text.contains("every caller is granted every access"),
-            "{text}"
+            !null.contains("could not read"),
+            "and saying so is the defect this test exists for: {null}"
         );
 
-        // And a DACL that *is* present and could not be read says the opposite thing: who may open
-        // this is unanswered, not unrestricted.
-        let mut present = descriptor(None);
-        present.control = 0x8004;
-        found.security = Security::Read {
-            at: 0xffff_8680_fc69_12a0,
-            descriptor: present,
-        };
-        let text = render(&structured_report(&found));
-        assert!(text.contains("could not read it"), "{text}");
+        // Present, and holding nothing: the opposite extreme.
+        let empty = with(Some(acl(vec![])), 0x8004);
         assert!(
-            !text.contains("every caller is granted every access"),
-            "an unread DACL is not a NULL one: {text}"
+            empty.contains("denied every access"),
+            "an empty DACL denies everyone, which `0 ACE(s)` alone does not say: {empty}"
+        );
+
+        // And a DACL with entries is rendered as entries, not as any of the above.
+        let real = render(&structured_report(&found()));
+        assert!(
+            real.contains("1 ACE(s)") && real.contains("Everyone"),
+            "{real}"
+        );
+        for absent in ["no DACL at all", "NULL DACL", "denied every access"] {
+            assert!(
+                !real.contains(absent),
+                "{absent} was printed for a real DACL: {real}"
+            );
+        }
+    }
+
+    /// **A mask is named as access only when it is one.**
+    ///
+    /// A mandatory integrity label carries `NO_WRITE_UP` / `NO_READ_UP` / `NO_EXECUTE_UP` in the
+    /// four bytes an allow entry uses for an access mask. Put through the device-rights table,
+    /// `NO_WRITE_UP` (bit 0) comes out as `FILE_READ_DATA` with `reads: true` -- so a device
+    /// carrying a label would answer that its caller may read its data, off a bit that restricts
+    /// them. The label's own three bits are named instead, and `reads`/`writes` are false because
+    /// there is no access in that mask to have.
+    #[test]
+    fn a_label_is_not_an_allow_and_its_mask_is_not_rights() {
+        let label = access_entry(&ace(
+            crate::sd::AceKind::Label,
+            "S-1-16-8192",
+            Some("Medium Mandatory Level"),
+            0x0000_0001,
+        ));
+        assert_eq!(
+            (label.kind.as_str(), label.reads, label.writes),
+            ("label", false, false),
+            "bit 0 of a label is NO_WRITE_UP, not FILE_READ_DATA: {label:?}"
+        );
+        assert_eq!(label.rights, vec!["NO_WRITE_UP".to_string()]);
+        assert_eq!(
+            label.mask, "0x00000001",
+            "and the raw mask is carried either way, so naming nothing costs nothing"
+        );
+
+        // The same bit on an entry whose mask really is an access mask.
+        let allow = access_entry(&ace(
+            crate::sd::AceKind::Allow,
+            "S-1-1-0",
+            Some("Everyone"),
+            0x0000_0001,
+        ));
+        assert_eq!(
+            (
+                allow.kind.as_str(),
+                allow.reads,
+                allow.rights.first().map(String::as_str)
+            ),
+            ("allow", true, Some("FILE_READ_DATA")),
+            "which is the reading the label must not get: {allow:?}"
         );
     }
 
