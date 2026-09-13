@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in seventeen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in eighteen clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -31,7 +31,9 @@ upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09
 [#307](https://github.com/glslang/windbg-mcp/pull/307): thirty-nine review findings over fourteen
 rounds that were one default — a backwards walk refusing what it trips over rather than recognising
 what a compiler emits — and then, from the differential oracle those rounds produced, the walk
-reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12).
+reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and item
+68 from running `device_security` against a live kernel, where the descriptor a device carries turns
+out to be absent on most of them and the gate is the directory's instead (2026-09-13).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1013,3 +1015,46 @@ branch. What it does not do is stop believing the edge.
 **Where it picks up.** The terminator arm in `ioctl::map_within` that reads `compared` against
 `Flow::Branch`, the `writes_flags` fold above it, and `noise` in `src/ioctl/tests/differential.rs`,
 whose `flags` parameter exists only because of this.
+
+## 68. [windbg-mcp] The gate a device with no descriptor of its own is actually behind
+
+**Repo:** `windbg-mcp`.
+
+`device_security` reads `_DEVICE_OBJECT::SecurityDescriptor`, which is the descriptor the kernel
+checks for that device — `Device`'s object type carries
+`TypeInfo.SecurityProcedure = nt!IopGetSetSecurityObject`, and that routine keeps it there rather
+than in the object header. Where the field is **empty** the tool says so, in the words the object
+manager's own behaviour warrants: the directory holding the device is what gets checked instead.
+
+It then stops, and the gate that actually applies is one lookup away and unreported.
+
+- **Why it matters more than it sounds:** measured on a live Windows Server 26100 guest,
+  2026-09-13, this is the **common** case rather than the edge one.
+  `\Device\MountPointManager` has one; `\Device\KsecDD` and `\Device\Tcp` do not, and neither does
+  most of `\Device`. The directory `\Device` itself does — its object header carries one at
+  `ffffe506832228af`, count bits and all. So for a majority of devices on that machine the tool
+  answers "no descriptor here, look at the directory" and a reader has to go and do by hand
+  precisely what this tool exists to do for them.
+- **Why deferred:** it is a second answer rather than a longer one, and the shape is a decision
+  somebody should make rather than one to slip in. The directory's descriptor is a **different
+  object's**, so presenting it as the device's would be the category error this module is otherwise
+  careful about; it wants its own field, saying which directory it came from, and the renderer has
+  to make the distinction impossible to miss. There is also a real question about how far up to
+  walk — `\Device` has one, but a device nested deeper might not, and "the first ancestor with a
+  descriptor" is a rule the object manager does not actually implement.
+- **What would close it:** the descriptor comes from the object **header** of the directory object
+  the namespace walk already passed through, so the read is one `security_of` on an address the
+  walk holds. It needs a `directory_security` field on `DeviceSecurity` beside `security`, never
+  merged into it, with the directory's path beside it; and `security_absent` becomes the reason
+  the fallback was consulted rather than the end of the answer. Check the fast-reference count is
+  masked off — this one **is** an `_EX_FAST_REF`, unlike the device object's plain pointer, which
+  is exactly the sort of difference that gets missed when a second path is added to a first.
+- **How it was found:** the live-kernel differential
+  (`a_device_security_query_on_a_live_kernel_agrees_with_the_debugger`) compared this tool against
+  `!devobj` on the one device that does carry a descriptor. Checking the others by hand while
+  chasing that is what showed most of them do not.
+
+**Where it picks up.** `device_security` in `src/worker.rs`, the `Security` enum in
+`src/device.rs`, and `dbgscope`'s `Namespace::object_at`, which resolves the directory on the way
+and currently keeps nothing about it.
+
