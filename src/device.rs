@@ -310,17 +310,63 @@ pub(crate) const SYMBOLIC_LINK: &str = "SymbolicLink";
 /// link to `\Device\HarddiskVolume1`, and matching it as one would report a volume as reachable
 /// under a name that opens a file on it.
 pub(crate) fn same_object_path(one: &str, other: &str) -> bool {
-    // **Folded over the whole of Unicode, not the twenty-six letters of ASCII.** An object name is
-    // a counted run of UTF-16 and the object manager compares it through the system's uppercase
-    // table, so two names differing only in the case of a non-ASCII letter are one object to the
-    // kernel. Folding ASCII alone leaves them unequal, which drops a link that does reach the
-    // device -- and the search then reports itself complete, having missed it.
-    //
-    // Rust's casing is the Unicode default one, which is not byte-for-byte the kernel's table and
-    // is not claimed to be; it agrees on every case this is likely to meet and is strictly closer
-    // than folding nothing.
-    let trim = |path: &str| path.trim_end_matches('\\').to_lowercase();
+    let trim = |path: &str| upcase(path.trim_end_matches('\\'));
     trim(one) == trim(other)
+}
+
+/// A name folded the way the object manager folds one: **one UTF-16 code unit in, one out.**
+///
+/// Read out of `nt!ObpLookupDirectoryEntry` on 26100 rather than assumed, because the first two
+/// goes at this were assumed and both were wrong. It compares a name one `WCHAR` at a time, in
+/// three bands: `U+0061`..`U+007A` gets `0x20` subtracted inline; **anything else below `U+00C0`
+/// is not folded at all**, no table being consulted for it; and at or above `U+00C0` the code unit
+/// indexes `UnicodeUpcaseTable844`, an 8-4-4 trie -- high byte, then middle nibble, then low
+/// nibble -- whose leaf is a delta added to the code unit. One unit in, one out, no expansion, no
+/// context. Case-insensitively, because `nt!ObpCaseInsensitive` is 1 on that build.
+///
+/// **Rust's `to_lowercase` is the *full* Unicode mapping, and it is wrong in both directions**,
+/// which is how two consecutive rounds of review arrived here. It **expands**: `U+0130` lowercases
+/// to `i` followed by `U+0307`, so that name and the two-code-unit spelling of it -- two objects to
+/// the kernel -- compared equal, and a link to one would be reported as reaching the other. And it
+/// is **contextual**: a sigma at the end of a word lowercases to the final form and elsewhere to
+/// the medial one, so two spellings the kernel folds together compared unequal, dropping a link
+/// that does reach the device while the search still called itself complete.
+///
+/// So the bands above are reproduced, and each earns its place. Keeping only single-code-unit
+/// results is what makes this one-to-one, and it is why `U+00DF` stays put instead of becoming
+/// `SS`. The `U+00C0` floor is why `U+00B5` stays put too, its Unicode uppercase being a Greek
+/// capital mu and so a change of script the kernel's table does not make. A surrogate is left alone
+/// because a `WCHAR` fold is handed half a character at a time and cannot fold a non-BMP letter, so
+/// two spellings of one Deseret name are genuinely two objects and folding over scalar values would
+/// merge them.
+///
+/// **What this is not is the target's own table.** That is
+/// `PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`, which is per-silo and
+/// wants a debugger -- and this module deliberately has none, so that every pass here is testable
+/// without one. What the substitution leaves is the Unicode version behind each table, for code
+/// units at or above `U+00C0`: the silo's is frozen at the target's build and this one moves with
+/// the toolchain.
+fn upcase(name: &str) -> Vec<u16> {
+    name.encode_utf16()
+        .map(|unit| match unit {
+            // The comparison's own fast path, written the way it writes it.
+            0x61..=0x7a => unit - 0x20,
+            // Below the floor the kernel reaches for no table, so neither does this.
+            0..=0xbf => unit,
+            _ => {
+                // A surrogate is not a scalar value, so this is also the non-BMP case: the half
+                // goes through unfolded, as the kernel's per-`WCHAR` fold leaves it.
+                let Some(one) = char::from_u32(u32::from(unit)) else {
+                    return unit;
+                };
+                let mut upper = one.to_uppercase();
+                match (upper.next(), upper.next()) {
+                    (Some(only), None) => u16::try_from(u32::from(only)).unwrap_or(unit),
+                    _ => unit,
+                }
+            }
+        })
+        .collect()
 }
 
 /// One ACE, as fields a caller can branch on.
@@ -1142,6 +1188,55 @@ mod tests {
         assert!(
             !partial.contains("No symbolic link in "),
             "never the absolute claim: {partial}"
+        );
+    }
+
+    /// **The fold is the object manager's, and the nearest `str` method is not it.**
+    ///
+    /// Five constructions, because the two rounds that landed here broke in opposite directions
+    /// and each property fails on a case the others reach right past. What is *not* pinned below is
+    /// the direction: the kernel upcases, and no construction this is sure of tells a one-to-one
+    /// uppercase from a one-to-one lowercase, so that rests on reading the fold out of
+    /// `nt!ObpLookupDirectoryEntry` rather than on an assertion.
+    #[test]
+    fn a_name_is_folded_one_code_unit_at_a_time_as_the_object_manager_folds_it() {
+        // **Expansion, downwards.** `to_lowercase` turns `U+0130` into `i` and `U+0307`, which is
+        // code unit for code unit the other name -- so these compared equal, and a link to one was
+        // reported as reaching the other.
+        assert!(
+            !same_object_path("\\Device\\\u{0130}", "\\Device\\i\u{0307}"),
+            "a fold that expands makes one object out of two"
+        );
+
+        // **Context.** `to_lowercase` picks the final sigma at the end of a word and the medial one
+        // elsewhere, so these compared unequal -- dropping a link that does reach the device while
+        // the search reported itself complete. Both upcase to `U+03A3`.
+        assert!(
+            same_object_path("\\Device\\\u{0391}\u{03A3}", "\\Device\\\u{0391}\u{03C3}"),
+            "one object spelt with either sigma is still one object"
+        );
+
+        // **Expansion, upwards**, which the case above does not reach: `U+00DF` fully uppercases to
+        // `SS`, and the kernel's one-to-one table leaves it alone.
+        assert!(
+            !same_object_path("\\Device\\\u{00df}", "\\Device\\SS"),
+            "a one-to-one fold does not turn one letter into two"
+        );
+
+        // **A surrogate pair is not a letter to a `WCHAR` fold.** The kernel cannot case-fold a
+        // non-BMP letter at all, so these are two objects; folding over scalar values would merge
+        // them.
+        assert!(
+            !same_object_path("\\Device\\\u{10400}", "\\Device\\\u{10428}"),
+            "what the kernel cannot fold, this does not fold either"
+        );
+
+        // **The floor at `U+00C0`.** `U+00B5` is below it, so the comparison consults no table and
+        // leaves it alone -- where Unicode would fold it to `U+039C`, a Greek capital mu, changing
+        // its script on the way. Two objects to the kernel.
+        assert!(
+            !same_object_path("\\Device\\\u{00b5}", "\\Device\\\u{039c}"),
+            "a fold the kernel does not reach for is not one to make here"
         );
     }
 
