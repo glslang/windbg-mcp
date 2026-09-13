@@ -14102,6 +14102,32 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
     with_live_kernel_session(&mut server, &connection, |server, session| {
         const DRIVER: &str = r"\Driver\mountmgr";
 
+        // **Resynchronise the module inventory first, and that is a finding rather than setup.**
+        // A fresh KDNET attach reports **one** module -- measured 2026-09-13 on this bench, `nt`
+        // and nothing else -- because the debugger's list holds the loads it *saw*, and every
+        // driver loaded before the attach is absent from it. Without this the survey still
+        // answers, and answers *worse* in a way no dump can reproduce: 19 control codes instead of
+        // 45, both of mountmgr's 81-entry jump tables unresolved, every address unattributed and
+        // the hazard section `unavailable`. Following a table needs the image's executable ranges,
+        // which need the module extent, which needs the inventory.
+        //
+        // The tool is honest about it -- the unrefreshed map lists both tables under `unresolved`,
+        // so it reads as the lower bound it is -- and `unattributed_image` now names `refresh` as
+        // the remedy. This test asserts the *refreshed* behaviour, which is the one the published
+        // oracles in `docs/driver-ioctl-walkthrough.md` were written against.
+        let refreshed = server.call_tool(
+            "modules",
+            json!({ "session_id": session, "refresh": true, "filter": "mountmgr" }),
+            TARGET_STEP,
+        );
+        assert_no_error(&refreshed, "modules refresh");
+        let inventory = &refreshed["result"]["structuredContent"];
+        assert_eq!(
+            inventory["matched"], 1,
+            "mountmgr is loaded on every Windows kernel; if the refresh did not find it, nothing \
+             below is about the driver it claims to be: {inventory}"
+        );
+
         let response = server.call_tool(
             "driver_surface",
             json!({ "session_id": session, "driver": DRIVER }),
@@ -14178,15 +14204,41 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
         );
         assert_no_error(&standalone, "driver_hazards");
         let scan = &standalone["result"]["structuredContent"];
-        assert_eq!(scan["status"], "ok", "{scan}");
-        assert_eq!(
-            survey["hazards"]["hazards"]["sinks"], scan["sinks"],
-            "the composite's hazard section is not `driver_hazards`' answer"
-        );
-        assert_eq!(
-            survey["hazards"]["hazards"]["privileged"], scan["privileged"],
-            "nor its privileged instructions"
-        );
+
+        // **Whatever it answered, the composite answered the same.** Demanding `ok` here tested
+        // this target's paging state rather than the composition: mountmgr's import directory is
+        // in a pageable section, and on a live kernel it is often simply not resident -- measured
+        // on this bench, 512 bytes at `0xfffff80237249fae` unreadable, so the scan cannot succeed
+        // however healthy the tool is. A composite that returns the tool's *failure* unchanged is
+        // composing as faithfully as one that returns its success, so both directions are checked.
+        match scan["status"].as_str() {
+            Some("ok") => {
+                assert_eq!(
+                    survey["hazards"]["hazards"]["sinks"], scan["sinks"],
+                    "the composite's hazard section is not `driver_hazards`' answer"
+                );
+                assert_eq!(
+                    survey["hazards"]["hazards"]["privileged"], scan["privileged"],
+                    "nor its privileged instructions"
+                );
+                assert_eq!(survey["hazards"]["status"], "ok");
+            }
+            _ => {
+                assert_eq!(
+                    survey["hazards"]["status"], "error",
+                    "the scan failed, so the section carrying it must say so rather than reading \
+                     as a driver with no sensitive imports: {survey}"
+                );
+                assert_eq!(
+                    survey["hazards"]["note"], scan["error"]["message"],
+                    "and it must carry that failure's own reason, not a second account of it"
+                );
+                assert!(
+                    survey["hazards"]["hazards"].is_null(),
+                    "with no findings beside it: {survey}"
+                );
+            }
+        }
 
         // ---- the device, against the tool that answers about one ----------------------------
         //

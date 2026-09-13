@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in nineteen clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -37,7 +37,9 @@ reporting a code down the dead edge of a branch whose condition is a constant (2
 eleven rounds of review on one tool ended with its own live-kernel measurement contradicting the
 item an earlier round of it had produced (2026-09-13), and item 71 from `driver_surface`, the
 fourth driver tool, whose specification included a dispatch-to-sink traversal that did not land
-with it (2026-09-13).
+with it, and item 72 from running that tool's live-kernel tier, where a fresh attach turns out to
+leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
+against (2026-09-13).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1173,3 +1175,38 @@ sites and one disassembly budget.
 
 **Where it picks up.** `driver_surface` in `src/worker.rs`, the walk in `src/driver.rs`, and the
 bounds at `docs/binja-windbg-mcp-plan.md:138`.
+
+## 72. [windbg-mcp] The driver tools name a module refresh they could run themselves
+
+**Repo:** `windbg-mcp`.
+
+A fresh kernel attach leaves the debugger's module inventory holding `nt` and little else --
+measured on a KDNET target 2026-09-13, **1** module at attach against **156** after `modules
+{ "refresh": true }`. Every driver loaded before the attach is absent from the inventory rather
+than from the target, and the driver tools have nothing to resolve a module extent against.
+
+They still answer, and answer worse: `driver_surface` on `mountmgr` recovered **19** control codes
+instead of **45**, both 81-entry jump tables unresolved, every address unattributed and the hazard
+section `unavailable`. Following a table needs the image's executable ranges, which need the module
+extent, which needs the inventory.
+
+The tools are honest about it -- the map lists the tables under `unresolved`, so it reads as the
+lower bound it is, and `unattributed_image` now says the inventory looks like a fresh attach and
+names the refresh. What they do not do is *run* it, so a caller gets a poorer answer and a second
+call to make.
+
+- **Why deferred:** resynchronising has **no wall-clock bound** of its own -- that is item 54, still
+  open -- so starting one inside a deadline-bounded composite is a way to spend a caller's whole
+  budget on a call nothing can cut short. Fixing item 54 first makes this safe; doing it before
+  makes the composite's deadline a fiction.
+- **What would close it:** a bounded refresh, run **once** and only where a module lookup has
+  already failed, with the result reported (a section that says "the inventory was resynchronised
+  and the module was still not there" is a different answer from one that never looked). It should
+  stay opt-outable: a caller driving many tools over one attach wants to pay for it once, not per
+  tool.
+- **How it was found:** running the live-kernel tier for `driver_surface` after
+  [#314](https://github.com/glslang/windbg-mcp/pull/314) merged, which is the only tier where a
+  module inventory can be stale at all -- a dump's is complete the moment it opens (2026-09-13).
+
+**Where it picks up.** `unattributed_image` and `scan_of` in `src/worker.rs`, `modules`'s own
+`refresh` in the same file, and item 54 for the bound it needs.

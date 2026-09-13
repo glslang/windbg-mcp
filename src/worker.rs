@@ -7015,9 +7015,11 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         }
     } else {
         match &module {
+            // The inventory size is only asked for on the path that is already failing.
             None => unattributed_image(
                 attribution_halted.get(),
                 image_at.attribution_failed,
+                e.modules().map(|loaded| loaded.len()).unwrap_or_default(),
                 fields.image_base,
             ),
             Some(module) => match scan_of(e, module, fields.image_base, deadline) {
@@ -7318,6 +7320,7 @@ const DEVICE: &str = "Device";
 fn unattributed_image(
     halted: Option<structured::WalkHalt>,
     lookup_failed: bool,
+    inventory: usize,
     base: u64,
 ) -> structured::HazardsSection {
     match halted {
@@ -7349,13 +7352,34 @@ fn unattributed_image(
             )),
             hazards: None,
         },
+        // **The inventory's own size is the diagnosis, and it is measured rather than
+        // guessed.** The debugger's module list holds the loads it *saw*, so a fresh kernel attach
+        // holds `nt` and little else and every driver loaded before it reads as absent -- measured
+        // on a KDNET target 2026-09-13: one module at attach, 156 after a refresh, with the driver
+        // at exactly the base its driver object had given all along. The advice here used to be
+        // "`modules` lists what is loaded", which on that target lists nothing and sends a reader
+        // to confirm a conclusion that is wrong.
         None => structured::HazardsSection {
             status: structured::SectionStatus::Unavailable,
-            note: Some(format!(
-                "this driver's image base {} is in no module the engine could name, so there is \
-                 no image to scan. `modules` lists what is loaded.",
-                structured::addr(base)
-            )),
+            note: Some(match inventory {
+                0..=8 => format!(
+                    "this driver's image base {} is in no module the debugger has -- and its \
+                     inventory holds only {inventory}, which is what a **fresh kernel attach** \
+                     looks like: the list holds the loads the debugger saw, so a driver loaded \
+                     before the attach is absent from it rather than from the target. Run \
+                     `modules` with `refresh: true` and ask again. Until then this scan, and any \
+                     jump table whose entries have to land inside this image, have nothing to \
+                     resolve against.",
+                    structured::addr(base)
+                ),
+                _ => format!(
+                    "this driver's image base {} is in no module the engine could name, out of \
+                     the {inventory} it has. `modules` with `refresh: true` resynchronises the \
+                     inventory with the target, which is worth trying before concluding the image \
+                     is not loaded.",
+                    structured::addr(base)
+                ),
+            }),
             hazards: None,
         },
     }
@@ -7985,10 +8009,22 @@ fn pe_failure(module: &str, why: &pe::PeError, stopped_by: Option<walk::Halt>) -
             _ => structured::ErrorCategory::Interrupted,
         },
     };
+    // **Both targets, because the remedies are opposite and only one used to be named.** On a
+    // dump the bytes were never captured and the *image file* supplies them. On a live kernel a
+    // driver's pageable sections are simply not resident: nothing is missing that a reload would
+    // bring back, and the answer is the target's state. Naming only the dump case told a
+    // live-kernel caller to set an image path for bytes that are on the machine in front of them,
+    // paged out -- measured on `ctf-vm`, where mountmgr's import directory reads as unavailable.
+    //
+    // Which target this is cannot be asked here: `is_kernel_target` does not separate a live
+    // kernel from a kernel dump, and dbgscope's `is_live_kernel` is private. So both are named and
+    // the reader picks, rather than one being guessed at.
     let hint = match why {
         pe::PeError::Unreadable { .. } => {
-            " On a dump the image is what supplies these bytes: use a symbol path that serves \
-             image binaries, or set an executable image path and `.reload /f`."
+            " On a **dump** the image file is what supplies these bytes: use a symbol path that \
+             serves image binaries, or set an executable image path and `.reload /f`. On a **live \
+             kernel** a driver's pageable sections may simply not be resident, in which case this \
+             is the target's state rather than a missing image and there is nothing to reload."
         }
         _ => "",
     };
@@ -8535,7 +8571,7 @@ mod tests {
         let base = 0xffff_f805_5ebf_0000;
 
         let never_asked =
-            super::unattributed_image(Some(structured::WalkHalt::Deadline), false, base);
+            super::unattributed_image(Some(structured::WalkHalt::Deadline), false, 156, base);
         assert_eq!(never_asked.status, structured::SectionStatus::Partial);
         let note = never_asked.note.unwrap_or_default();
         assert!(note.contains("ran out of time"), "{note}");
@@ -8545,14 +8581,15 @@ mod tests {
         );
 
         let interrupted =
-            super::unattributed_image(Some(structured::WalkHalt::Interrupted), false, base).note;
+            super::unattributed_image(Some(structured::WalkHalt::Interrupted), false, 156, base)
+                .note;
         assert!(
             interrupted.unwrap_or_default().contains("was interrupted"),
             "a break and a deadline have different remedies and read differently"
         );
 
         // And the genuine case keeps its own answer.
-        let no_such_module = super::unattributed_image(None, false, base);
+        let no_such_module = super::unattributed_image(None, false, 156, base);
         assert_eq!(
             no_such_module.status,
             structured::SectionStatus::Unavailable
@@ -8569,7 +8606,7 @@ mod tests {
         // so without this the case fell into the branch above and reported the target as having no
         // such module -- blaming it for a debugger call that did not answer. Three ways to have no
         // module, three answers, and each sends a reader somewhere different.
-        let lookup_failed = super::unattributed_image(None, true, base);
+        let lookup_failed = super::unattributed_image(None, true, 156, base);
         assert_eq!(
             lookup_failed.status,
             structured::SectionStatus::Error,
@@ -8580,6 +8617,51 @@ mod tests {
         assert!(
             !note.contains("is in no module"),
             "and must not say the address is in none, which is the claim it cannot make: {note}"
+        );
+    }
+
+    /// **An empty module inventory is a fresh attach, not a driver that is not loaded.**
+    ///
+    /// Measured on a KDNET target 2026-09-13, and the reason this branch exists: a live kernel
+    /// attach reports **one** module -- `nt` -- because the debugger's list holds the loads it
+    /// *saw*, and every driver loaded before the attach is absent from it rather than from the
+    /// target. `modules` with `refresh: true` then found 156, mountmgr among them, at exactly the
+    /// base its driver object had been reporting all along.
+    ///
+    /// The advice here used to be "`modules` lists what is loaded", which on that target lists
+    /// nothing: it sent a reader to confirm a conclusion that was wrong. What it costs is not
+    /// cosmetic -- in that state `driver_surface` recovered 19 control codes instead of 45, both
+    /// of mountmgr's 81-entry jump tables unresolved, because following a table needs the image's
+    /// executable ranges, which need the module extent, which needs the inventory.
+    #[test]
+    fn an_empty_module_inventory_is_named_as_the_fresh_attach_it_is() {
+        let base = 0xffff_f802_3724_0000;
+
+        let fresh = super::unattributed_image(None, false, 1, base);
+        assert_eq!(fresh.status, structured::SectionStatus::Unavailable);
+        let note = fresh.note.unwrap_or_default();
+        assert!(
+            note.contains("refresh"),
+            "it names the thing that fixes it: {note}"
+        );
+        assert!(
+            note.contains("fresh kernel attach"),
+            "and says why the inventory is empty rather than leaving it a mystery: {note}"
+        );
+        assert!(
+            !note.contains("`modules` lists what is loaded"),
+            "never the old advice, which lists nothing in this state: {note}"
+        );
+
+        // A populated inventory is a different answer: the module really is not there. It still
+        // mentions `refresh`, because that is cheap and the conclusion is worth one more check --
+        // but it does not claim the inventory is empty when it is not.
+        let populated = super::unattributed_image(None, false, 156, base);
+        let note = populated.note.unwrap_or_default();
+        assert!(note.contains("156"), "{note}");
+        assert!(
+            !note.contains("fresh kernel attach"),
+            "156 modules is not a fresh attach and must not be described as one: {note}"
         );
     }
 
