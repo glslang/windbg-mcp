@@ -6537,7 +6537,23 @@ fn run_to_address(e: &DebugEngine, address: &str, wait: u32) -> Result<Output, F
 /// rebase the module, read its headers, and decode its code — each of them bounded by what is left
 /// of the caller's clock, for the reason `reachable` is: the preliminaries run before the scan, so
 /// a deadline first consulted inside it is one the caller can outlive.
+/// What a driver's image says it can do, rendered for a caller.
+///
+/// The analysis is [`hazards_of`]; this is the half that turns it into an `Output`. Split so that
+/// `driver_surface` can have the value without the rendering -- a composite embeds the scan whole
+/// and renders the sections together, and re-parsing a rendering to do that is exactly what
+/// `counts-belong-in-the-type` says not to build.
 fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Output, Failed> {
+    let report = hazards_of(e, module, deadline)?;
+    Ok(Output::typed(hazards::render(&report), report))
+}
+
+/// The scan itself, as a value.
+fn hazards_of(
+    e: &DebugEngine,
+    module: &str,
+    deadline: Instant,
+) -> Result<structured::DriverHazards, Failed> {
     // Refused outright on an instruction set whose encodings this build does not decode, exactly
     // as the reachability walk is and for a sharper reason: every instruction would come back
     // `Flow::Unknown` with no operands, so a scan would report *no* privileged instructions and no
@@ -6683,7 +6699,7 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     // stopped for a reason of its own -- an interrupt, where this is a deadline -- and the first
     // stop is the one that happened.
     report.stopped = report.stopped.or_else(|| stopped.get());
-    Ok(Output::typed(hazards::render(&report), report))
+    Ok(report)
 }
 
 /// The directory a device's user-mode name lives in.
@@ -6999,7 +7015,21 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
 /// What only the worker can do is here and nothing else is: disassemble the routine, find the
 /// image behind it, and read that image's own bytes for a jump table. [`ioctl::map`] takes those
 /// three as closures and has never seen an engine.
+/// Which control codes a dispatch routine accepts, rendered for a caller.
+///
+/// The recovery is [`ioctl_map_of`]; this is the half that turns it into an `Output`, split for
+/// the reason [`driver_hazards`] is.
 fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Output, Failed> {
+    let report = ioctl_map_of(e, dispatch, deadline)?;
+    Ok(Output::typed(ioctl::render(&report), report))
+}
+
+/// The map itself, as a value.
+fn ioctl_map_of(
+    e: &DebugEngine,
+    dispatch: &str,
+    deadline: Instant,
+) -> Result<structured::IoctlMap, Failed> {
     // Refused on an instruction set this build does not decode, exactly as the walk and the hazard
     // scan are. Every instruction would come back with no operands, so every compare would be
     // invisible and the answer would be a driver that accepts no control codes -- which is what a
@@ -7127,7 +7157,7 @@ fn ioctl_map(e: &DebugEngine, dispatch: &str, deadline: Instant) -> Result<Outpu
     report.images = attributor.images();
     // The walk's own stop wins, for the reason the scan's does above.
     report.stopped = report.stopped.or_else(|| stopped.get());
-    Ok(Output::typed(ioctl::render(&report), report))
+    Ok(report)
 }
 
 /// Why attribution should stop, or `None` to carry on.
@@ -7812,12 +7842,13 @@ mod tests {
             )
             .expect("this module has a test half")
             .0;
+        // `hazards_of`, which is where the body went when the scan was split in two.
         let body = code
             .split_once(
                 "
-fn driver_hazards(",
+fn hazards_of(",
             )
-            .expect("this module has a `driver_hazards`")
+            .expect("this module has a `hazards_of`")
             .1;
         let body = body
             .split_once(
@@ -7933,9 +7964,13 @@ fn ",
             .split_once("\n#[cfg(test)]")
             .expect("this module has a test half")
             .0;
+        // **`hazards_of`, not `driver_hazards`.** The scan was split into a value half and a
+        // rendering half so `driver_surface` could embed it, and the body went with the value
+        // half; `driver_hazards` is now the four-line wrapper above it. Anchored on the wrapper
+        // this guard scans nothing and passes, which is the one way it could fail silently.
         let body = code
-            .split_once("\nfn driver_hazards(")
-            .expect("this module has a `driver_hazards`")
+            .split_once("\nfn hazards_of(")
+            .expect("this module has a `hazards_of`")
             .1;
         let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
         assert!(
@@ -7948,9 +7983,10 @@ fn ",
         // from the same header. Unclamped, a section declared past the loaded extent puts the next
         // module's code inside this one's ranges, and an entry landing there is published as this
         // driver's case with the jump reported as followed.
+        // `ioctl_map_of`, for the reason the scan's anchor above gives.
         let walk = code
-            .split_once("\nfn ioctl_map(")
-            .expect("this module has an `ioctl_map`")
+            .split_once("\nfn ioctl_map_of(")
+            .expect("this module has an `ioctl_map_of`")
             .1;
         let walk = walk.split_once("\nfn ").map_or(walk, |(walk, _)| walk);
         assert!(
@@ -8076,9 +8112,13 @@ fn ",
             .split_once("\n#[cfg(test)]")
             .expect("this module has a test half")
             .0;
+        // **`hazards_of`, not `driver_hazards`.** The scan was split into a value half and a
+        // rendering half so `driver_surface` could embed it, and the body went with the value
+        // half; `driver_hazards` is now the four-line wrapper above it. Anchored on the wrapper
+        // this guard scans nothing and passes, which is the one way it could fail silently.
         let body = code
-            .split_once("\nfn driver_hazards(")
-            .expect("this module has a `driver_hazards`")
+            .split_once("\nfn hazards_of(")
+            .expect("this module has a `hazards_of`")
             .1;
         let body = body.split_once("\nfn ").map_or(body, |(body, _)| body);
         assert!(
