@@ -150,8 +150,8 @@
       "inputSchema": 623,
       "modelVisible": 1706,
       "name": "driver_surface",
-      "outputSchema": 9988,
-      "wire": 11843
+      "outputSchema": 10045,
+      "wire": 11900
     },
     {
       "annotations": 130,
@@ -556,10 +556,10 @@
     "inputSchema": 52398,
     "instructions": 1983,
     "modelVisible": 90274,
-    "outputSchema": 150197,
-    "payload": 248635,
+    "outputSchema": 150254,
+    "payload": 248692,
     "tools": 61,
-    "wire": 248563,
+    "wire": 248620,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

@@ -434,14 +434,25 @@ pub(crate) fn device_chain(
             stopped = Some(ChainHalt::Cycle);
             break;
         }
-        // **Recorded before it is followed**, so a device that will not read is still reported as
-        // being on the chain. It is a device this driver created; what is missing is what it says
-        // about itself, and dropping it would report a shorter chain rather than a hole in one.
-        devices.push(at);
+        // **Read first, then decide whether it is this driver's to record.** `next_of` answers
+        // with the device's own `DriverObject` backpointer, so what it says about ownership is
+        // about *this* device -- and recording it before asking put a foreign device on the list,
+        // where the gate pass went on to read its security descriptor and report it as this
+        // driver's. That is the failure this check exists to prevent, and it was one statement
+        // too late.
         match next_of(at) {
-            // **The backpointer is checked before the link is followed**, so a foreign device is
-            // named and not described: it is on the chain the walk was told to follow, and what it
-            // says about itself belongs to another driver's answer.
+            None => {
+                // Unreadable, and **still recorded**: it is a device this driver created, and
+                // what is missing is only what it says about itself. Dropping it would report a
+                // shorter chain rather than a hole in one.
+                devices.push(at);
+                stopped = Some(ChainHalt::Unreadable);
+                break;
+            }
+            // **Not recorded**, which is where this halt differs from every other one here. The
+            // others report the device and then stop, because it belongs to this driver and
+            // something about it is missing. This device is real and belongs to somebody else, so
+            // the only false thing would be listing it: it is named in the halt instead.
             Some(Owned { owner, .. }) if !owner.is_this_driver => {
                 stopped = Some(ChainHalt::Foreign {
                     at,
@@ -449,10 +460,9 @@ pub(crate) fn device_chain(
                 });
                 break;
             }
-            Some(Owned { next, .. }) => at = next,
-            None => {
-                stopped = Some(ChainHalt::Unreadable);
-                break;
+            Some(Owned { next, .. }) => {
+                devices.push(at);
+                at = next;
             }
         }
     }
@@ -775,9 +785,9 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
                 // covers a third: an entry nobody reached. The absolute form belongs to the
                 // complete search alone, which is the rule this renderer applies to "created no
                 // devices" two screens up and `device_security` applies to its link search.
-                match report.devices.status {
-                    crate::structured::SectionStatus::Ok => "(not in this directory)",
-                    _ => "(no path found)",
+                match report.devices.named_completely {
+                    true => "(not in this directory)",
+                    false => "(no path found)",
                 },
             ))
         );
@@ -816,17 +826,18 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
         );
     }
     if report.devices.unnamed > 0 {
-        let _ = match report.devices.status {
-            crate::structured::SectionStatus::Ok => writeln!(
+        let _ = match report.devices.named_completely {
+            true => writeln!(
                 out,
                 "  {} of these are not in {}. `device_security` takes a path, so those are \
                  reachable here and not there.",
                 report.devices.unnamed, report.devices.named_in
             ),
-            // The listing fell short, so this count is "no path was found", not "no path exists".
-            // The section's own note says which, and saying it twice differently is how the two
-            // come to disagree.
-            _ => writeln!(
+            // The listing fell short, so this count is "no path was found", not "no path
+            // exists". Branching on the **directory's** own completeness rather than the section's
+            // status, which is `partial` for four other reasons and would say the directory fell
+            // short whenever a descriptor did.
+            false => writeln!(
                 out,
                 "  {} of these have no path. {} was not read in full, so that is a search this \
                  call did not finish rather than a fact about those devices -- the note above \
@@ -1207,7 +1218,10 @@ mod tests {
             },
         };
 
-        // Two of ours, then one that says another driver owns it.
+        // One of ours, then one that says another driver owns it. **`owner` describes the device
+        // the closure was handed**, not the one it points at -- which is the thing the first
+        // version of this test got wrong in the same direction as the code, so it asserted the
+        // defect as the expected answer.
         let chain = device_chain(
             0x100,
             |at| match at {
@@ -1220,8 +1234,10 @@ mod tests {
 
         assert_eq!(
             chain.devices,
-            vec![0x100, 0x200],
-            "the walk keeps what it established and stops at the boundary"
+            vec![0x100],
+            "the foreign device is **not** on this driver's list -- it is real, and the only false \
+             thing available is listing it here. Anything in `devices` is read by the gate pass, \
+             so leaving it in publishes another driver's security descriptor as this driver's"
         );
         assert_eq!(
             chain.stopped,
@@ -1229,12 +1245,24 @@ mod tests {
                 at: 0x200,
                 owner: THEIRS
             }),
-            "and names the device that said so, and which driver claimed it"
+            "and the halt names it, and which driver claimed it, so nothing is silently dropped"
         );
+
+        // **A foreign head yields nothing at all**, which the case above cannot show: with one of
+        // ours in front, an off-by-one still produces a plausible list.
+        let all_theirs = device_chain(0x100, |_| Some(foreign(0x200)), || None);
         assert!(
-            !chain.devices.contains(&0x300),
-            "the foreign device is not on this driver's list"
+            all_theirs.devices.is_empty(),
+            "a chain whose first device belongs to someone else lists none of it: {:?}",
+            all_theirs.devices
         );
+
+        // And the unreadable case is unchanged: that device **is** recorded, because it is this
+        // driver's and only what it says about itself is missing. Asserted here because the fix
+        // moved the `push` into the match, where it would have been easy to move both.
+        let unreadable = device_chain(0x100, |_| None, || None);
+        assert_eq!(unreadable.devices, vec![0x100]);
+        assert_eq!(unreadable.stopped, Some(ChainHalt::Unreadable));
     }
 
     /// **A ring is reported as a ring**, and the device that closes it is not listed twice.
@@ -1401,12 +1429,16 @@ mod tests {
     // ---- the rendering ----------------------------------------------------
 
     fn rendered(devices: Vec<crate::structured::SurfaceDevice>) -> String {
-        rendered_with(devices, crate::structured::SectionStatus::Ok)
+        rendered_with(devices, crate::structured::SectionStatus::Ok, true)
     }
 
+    /// **The status and the directory's completeness are separate arguments**, because they are
+    /// separate facts: a section is `partial` for five reasons and only one of them is the
+    /// listing. Passing one and inferring the other is what the test below exists to stop.
     fn rendered_with(
         devices: Vec<crate::structured::SurfaceDevice>,
         devices_status: crate::structured::SectionStatus,
+        named_completely: bool,
     ) -> String {
         use crate::structured as s;
         render(&s::DriverSurface {
@@ -1426,6 +1458,7 @@ mod tests {
                 unnamed: devices.iter().filter(|one| one.path.is_none()).count(),
                 devices,
                 named_in: "\\Device".to_string(),
+                named_completely,
             },
             ioctl: s::IoctlSection {
                 status: s::SectionStatus::Unavailable,
@@ -1769,14 +1802,14 @@ mod tests {
     fn only_a_complete_device_section_may_say_the_driver_created_none() {
         use crate::structured::SectionStatus as S;
 
-        let complete = rendered_with(Vec::new(), S::Ok);
+        let complete = rendered_with(Vec::new(), S::Ok, true);
         assert!(
             complete.contains("This driver created no devices."),
             "a section that read everything and found nothing says so: {complete}"
         );
 
         for short in [S::Partial, S::Unavailable, S::Error] {
-            let out = rendered_with(Vec::new(), short);
+            let out = rendered_with(Vec::new(), short, true);
             assert!(
                 !out.contains("created no devices"),
                 "{short:?} with an empty list is a section that did not read, not a driver with \
@@ -1874,6 +1907,7 @@ mod tests {
                     devices: Vec::new(),
                     device_count: 0,
                     named_in: "\\Device".to_string(),
+                    named_completely: true,
                     unnamed: 0,
                 },
                 ioctl: s::IoctlSection {
@@ -1927,21 +1961,35 @@ mod tests {
     fn a_device_has_no_path_rather_than_no_entry_when_the_listing_fell_short() {
         use crate::structured::SectionStatus as S;
 
-        let complete = rendered_with(vec![a_device(None)], S::Ok);
+        let complete = rendered_with(vec![a_device(None)], S::Ok, true);
         assert!(
             complete.contains("(not in this directory)"),
             "a directory read in full can say the device is not in it: {complete}"
         );
 
-        for short in [S::Partial, S::Unavailable, S::Error] {
-            let out = rendered_with(vec![a_device(None)], short);
+        let short = rendered_with(vec![a_device(None)], S::Partial, false);
+        assert!(
+            short.contains("(no path found)"),
+            "a listing that did not finish reports what it found: {short}"
+        );
+        assert!(
+            !short.contains("(not in this directory)"),
+            "and does not state an absence it did not establish: {short}"
+        );
+
+        // **The crossed case, which is the whole of the finding.** A section is `partial` for five
+        // reasons and only one of them is the listing -- so a descriptor that would not read must
+        // not make the report say the *directory* fell short. Branching on the status said exactly
+        // that, about a search that in fact completed.
+        for status in [S::Partial, S::Unavailable, S::Error] {
+            let out = rendered_with(vec![a_device(None)], status, true);
             assert!(
-                out.contains("(no path found)"),
-                "{short:?} means the search did not finish, so it reports what it found: {out}"
+                out.contains("(not in this directory)"),
+                "{status:?} for some other reason leaves the directory's own answer intact: {out}"
             );
             assert!(
-                !out.contains("(not in this directory)"),
-                "and does not state an absence it did not establish: {out}"
+                !out.contains("was not read in full"),
+                "and must not claim a completed listing fell short: {out}"
             );
         }
     }
