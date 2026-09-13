@@ -493,6 +493,21 @@ came back beside it. Not the message text: which refusal arrives depends on whet
 `nt` symbols resolved, and the advice inside it is pinned by a **unit** test instead, where it is
 deterministic.
 
+**A fresh kernel attach has one module in it, and that is not a detail.** Measured on this bench
+2026-09-13: `attach_kernel` reports **1 module** loaded (`nt`), and `modules { "filter":
+"mountmgr" }` matches nothing — the debugger's inventory holds the loads it *saw*, so every driver
+loaded before the attach is absent from it rather than from the target. `refresh: true` then finds
+156, mountmgr among them, at exactly the base its driver object had been reporting all along.
+
+What that costs is not cosmetic. In the unrefreshed state `driver_surface` recovered **19** control
+codes instead of **45**, with both of mountmgr's 81-entry jump tables unresolved, every address
+unattributed and the hazard section `unavailable` — because following a table needs the image's
+executable ranges, which need the module extent, which need the inventory. The tool is honest about
+it (the map lists both tables under `unresolved`, so it reads as the lower bound it is), and
+`unattributed_image` now names `refresh` as the remedy rather than plain `modules`, which in that
+state lists nothing. **So the live-kernel driver tests refresh first**, and that line is a finding
+rather than setup.
+
 **`driver_surface` on a live kernel, where what is checked is that it composes.** Its three
 constituents each have an oracle already, so restating those here would test `ioctl_map` a second
 time rather than test that the composite *returns* `ioctl_map`'s answer -- and a section quietly
@@ -502,7 +517,12 @@ have. The test is therefore a differential: `driver_surface` on `\Driver\mountmg
 dispatch routine, the image and the device are, with the embedded answers compared as values.
 Because those arguments come from the survey's own report, the driver object is first checked
 against `!drvobj` -- somebody else's extension -- so a survey of the wrong driver cannot compare a
-wrong answer against a wrong oracle and pass. It also asserts the link search is **absent** from
+wrong answer against a wrong oracle and pass. The hazard halves are compared **whichever way they answered**, not only on success:
+mountmgr's import directory is in a pageable section and is often not resident on a live kernel, so
+`driver_hazards` there cannot succeed however healthy it is — measured, 512 bytes at
+`0xfffff80237249fae` unreadable. Requiring `ok` would have tested the target's paging state rather
+than the composition, and a composite that returns the tool's *failure* unchanged is composing as
+faithfully as one that returns its success. It also asserts the link search is **absent** from
 the composite's devices, so that adding it later is a visible change rather than a silent one that
 would make the `TOOL_NOTES` pointer at `device_security` wrong.
 
@@ -1219,7 +1239,7 @@ presents VirtIO, and `1AF4` is not in the Debugging Tools' `VerifiedNICList.xml`
 are **transport-specific and skip themselves** rather than failing: the KD endpoint being owned by
 the worker process is a UDP claim, and the key-redaction claim needs a key to look for.
 
-**Nor does the target have to be x64** — but two of the eight tests need one. The pool tools
+**Nor does the target have to be x64** — but two of the ten tests need one. The pool tools
 document it (*"Needs a broken-in x64 kernel target"*) because the walker decodes x64 pool
 descriptors, so `a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` and
 `a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer` stand down against anything
@@ -1232,7 +1252,7 @@ tests: **a pool walk over a 115200-baud serial link will not finish inside any s
 reads every committed pool page. If you point the tier at a serial target, expect those two to time
 out rather than to skip, unless the target is also non-x64 and stands down first.
 
-`--test-threads=1` is required, not tidiness: the filter matches **eight** tests, and the KD
+`--test-threads=1` is required, not tidiness: the filter matches **ten** tests, and the KD
 transport is single-owner. Run them in parallel and the later attaches fail, which can leave the
 target halted.
 
@@ -1381,7 +1401,7 @@ it fails.
 
 ### A `debug_batch` that really mutates the target
 
-Five of the eight tests are about a batch that **patches a byte of the running kernel and puts it
+Five of the ten tests are about a batch that **patches a byte of the running kernel and puts it
 back**, which is the thing the tool exists for and the thing no dump can test: a byte "patched" in a
 crash dump is patched in a file nobody reads again, so a rollback that silently did nothing would
 satisfy every assertion the debugger tier can make. Here the byte either reads back as it was or it
