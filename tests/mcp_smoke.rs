@@ -1890,7 +1890,7 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// a note is appended to the tool it is `tool:` for. So the arithmetic stays a single term even
 /// though the count of moving parts went up.
 ///
-/// The 9,988 B `outputSchema` is on the wire and not here, and is by far the largest of any tool
+/// The 10,045 B `outputSchema` is on the wire and not here, and is by far the largest of any tool
 /// -- which is the whole reason these two ceilings are separate numbers, a composite's cost being
 /// almost entirely a schema no model is served. The new figure leaves 1,726 B, which is 1.9%, and
 /// is the tightest headroom any of these raises has left. That is deliberate: this is the last
@@ -1973,11 +1973,11 @@ const MODEL_VISIBLE_CEILING: usize = 92_000;
 /// current. What the ceiling guards is the headroom, and it absorbed all five without moving.
 ///
 /// **242,000 -> 254,000 for `driver_surface`** (2026-09-13), and it is the largest single raise
-/// any tool here has asked for. The payload went 236,791 -> 248,635, a difference of **11,844**:
-/// the tool is 11,843 B of wire, and the remaining byte is the array's own comma. Nothing else
+/// any tool here has asked for. The payload went 236,791 -> 248,692, a difference of **11,901**:
+/// the tool is 11,900 B of wire, and the remaining byte is the array's own comma. Nothing else
 /// moved by a byte, checked against the per-tool golden keyed by name.
 ///
-/// **9,988 B of that 11,843 is `outputSchema`, and the question this ceiling exists to force is
+/// **10,045 B of that 11,900 is `outputSchema`, and the question this ceiling exists to force is
 /// whether sharing multiplied.** It did not, and a composite is the case where that had to be
 /// checked rather than assumed: `DriverSurface` embeds `IoctlMap` and `DriverHazards` whole and
 /// reuses `SecurityDescriptor`, so all three are inlined into this tool's own `$defs` closure --
@@ -1986,7 +1986,7 @@ const MODEL_VISIBLE_CEILING: usize = 92_000;
 /// second shape restating what the map already says, kept in step by hand, and a composite whose
 /// caller must go back for the detail has not composed anything.
 ///
-/// The new figure leaves 5,365 B, which is 2.1% -- the same headroom the last three raises left.
+/// The new figure leaves 5,308 B, which is 2.1% -- the same headroom the last three raises left.
 const WIRE_CEILING: usize = 254_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021

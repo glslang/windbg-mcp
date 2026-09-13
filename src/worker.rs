@@ -6917,6 +6917,7 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
             devices: Vec::new(),
             device_count: 0,
             named_in: DEVICE_DIRECTORY.to_string(),
+            named_completely: false,
             unnamed: 0,
         },
         None => driver_devices(
@@ -7071,6 +7072,9 @@ fn driver_devices(
             devices: Vec::new(),
             device_count: 0,
             named_in: DEVICE_DIRECTORY.to_string(),
+            // No devices, so no listing was attempted and none was owed: there was nothing for it
+            // to name. True here says "no absent path is left unexplained", which holds vacuously.
+            named_completely: true,
             unnamed: 0,
         };
     }
@@ -7083,6 +7087,7 @@ fn driver_devices(
                 devices: Vec::new(),
                 device_count: 0,
                 named_in: DEVICE_DIRECTORY.to_string(),
+                named_completely: false,
                 unnamed: 0,
             };
         }
@@ -7265,6 +7270,7 @@ fn driver_devices(
         device_count: devices.len(),
         devices,
         named_in: DEVICE_DIRECTORY.to_string(),
+        named_completely,
         unnamed,
     }
 }

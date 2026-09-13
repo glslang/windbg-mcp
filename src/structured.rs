@@ -3113,6 +3113,18 @@ pub struct DevicesSection {
     pub devices: Vec<SurfaceDevice>,
     /// How many were found, exact however many are listed.
     pub device_count: usize,
+    /// Whether that directory was read **in full**.
+    ///
+    /// **Its own field rather than something read off [`Self::status`]**, which is `partial` for
+    /// five different reasons -- a chain that stopped, a gate pass that stopped, a device object
+    /// that would not read, a descriptor that would not read, and this. Inferring this one from
+    /// the aggregate says the directory fell short whenever any of the other four did, which is a
+    /// statement about a search that in fact completed.
+    ///
+    /// What it governs is whether an absent `path` is an **absence**. Read in full, a device with
+    /// no path is one this directory does not hold; read in part, it may be an entry nobody
+    /// reached.
+    pub named_completely: bool,
     /// The directory searched to give the devices above a path.
     ///
     /// Here rather than implied, for the reason [`DeviceSecurity::link_directory`] is named: a
