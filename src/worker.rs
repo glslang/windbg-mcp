@@ -7106,7 +7106,10 @@ fn driver_devices(
         },
         halt,
     );
-    let gates_summary = gates.clone();
+    // **Asked before the fields are moved out**, which is what keeps this from needing a copy of
+    // the whole device list -- up to `MAX_DEVICES` of them, each carrying a descriptor with its
+    // ACLs, ACEs and SIDs.
+    let whole = devices_are_whole(&chain, &gates, named_completely);
     let devices = gates.devices;
     let gates_unread = gates.unread_gates;
     let fields_unread = gates.unread_devices;
@@ -7118,8 +7121,9 @@ fn driver_devices(
     // then means nothing; and a descriptor that would not read is a gate this section did not
     // answer, which is the case the first version reported as `ok` -- misstating security coverage
     // in exactly the place a reader is relying on it.
+    // Mirrors the rule inside [`devices_are_whole`], which is where it is stated and tested: the
+    // listing bears on this answer only where there are devices for it to name.
     let named_where_it_matters = devices.is_empty() || named_completely;
-    let whole = devices_are_whole(&chain, &gates_summary, named_completely);
     let status = match whole {
         true => structured::SectionStatus::Ok,
         false => structured::SectionStatus::Partial,
