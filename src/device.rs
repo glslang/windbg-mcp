@@ -533,8 +533,8 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
         // the strength of a sentence that only sounded like a finding. `FOLLOWUPS.md` item 68
         // is where the unmeasured half of it lives.
         Security::Absent => Some(
-            "this object carries no security descriptor of its own; what the object manager \
-             checks in its place is not something this read"
+            "this object carries no security descriptor of its own; whether anything guards it \
+             in its place is not something this read"
                 .to_string(),
         ),
         Security::Failed { at, why } => Some(format!(
@@ -1661,6 +1661,20 @@ mod tests {
             !none.contains("directory"),
             "reporting no descriptor must not assert what is checked instead: {none}"
         );
+        // **And it must not imply that *anything* checks in its place.** Naming no mechanism is
+        // not enough: "what the object manager checks in its place is not something this read"
+        // names none and still presupposes one, and a caller reads that as "protected, just not
+        // by something visible from here" -- the most dangerous direction to be wrong in, since
+        // no descriptor at all is the most permissive state there is. So any word claiming
+        // something checks or guards has to arrive with its own hedge.
+        let claims = ["check", "guard", "protect", "govern"];
+        let hedges = ["whether", "if anything", "may or may not"];
+        if claims.iter().any(|word| none.contains(word)) {
+            assert!(
+                hedges.iter().any(|word| none.contains(word)),
+                "an absent descriptor must not imply something else guards the object: {none}"
+            );
+        }
 
         found.security = Security::Failed {
             at: 0xffff_8680_fc69_12a0,
