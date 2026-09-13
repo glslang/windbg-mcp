@@ -324,7 +324,14 @@ fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
     // the opposite of what it is printed as. The raw `mask` is carried either way, so nothing is
     // lost by declining to name it.
     let access = ace.kind.mask_is_access();
-    let (reads, writes) = match access {
+    // **An inherit-only entry is not applied to the object carrying it.** Its mask says what a
+    // child would get, and the access check on this device skips it entirely -- so an inherit-only
+    // deny read as effective reports a device nobody may open, and an inherit-only allow reports a
+    // grant that does not exist. `reads` and `writes` are about *this* device's gate, which is why
+    // they go false here while `rights` still names the mask: the mask is real, its application to
+    // this object is not.
+    let inherit_only = ace.flags & crate::sd::INHERIT_ONLY_ACE != 0;
+    let (reads, writes) = match access && !inherit_only {
         true => crate::sd::data_access(ace.mask),
         false => (false, false),
     };
@@ -344,6 +351,7 @@ fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
             .and_then(|sid| sid.name)
             .map(str::to_string),
         conditional: ace.conditional,
+        inherit_only,
         principal_unreadable: ace.kind.carries_sid() && ace.sid.is_none(),
         mask: format!("{:#010x}", ace.mask),
         rights: rights.into_iter().map(str::to_string).collect(),
@@ -575,11 +583,18 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
                 let _ = writeln!(
                     out,
                     "  [!] {unchecked} of {}'s entries could not be checked ({} this could not \
-                     name, {} whose target would not read), so any of them may reach this device",
+                     name, {} whose type or target would not read), so any of them may reach \
+                     this device",
                     report.link_directory, report.links_unnamed, report.links_unread
                 );
             }
-            if matches!(search, crate::structured::LinkSearch::Partial) {
+            // **Only a search that halted stopped part-way.** `Partial` covers a second case
+            // since the completeness fix -- the directory was enumerated to its end and some
+            // entries could not be checked -- and this sentence, written when `Partial` meant
+            // only the first, reported that common case as a deadline or an interrupt. The count
+            // above already says what went unchecked, so there is nothing to add when nothing
+            // halted.
+            if report.stopped.is_some() {
                 let _ = writeln!(
                     out,
                     "  [!] the search of {} stopped part-way, so this is some of the links rather \
@@ -626,9 +641,13 @@ fn render_acl(out: &mut String, what: &str, acl: &crate::structured::AccessContr
                     false => "<no principal>".to_string(),
                 }),
             entry.mask,
-            match entry.conditional {
-                true => format!("[if] {}", entry.rights.join(" ")),
-                false => entry.rights.join(" "),
+            {
+                let rights = entry.rights.join(" ");
+                match (entry.conditional, entry.inherit_only) {
+                    (_, true) => format!("[inherit-only] {rights}"),
+                    (true, false) => format!("[if] {rights}"),
+                    (false, false) => rights,
+                }
             }
         );
     }
@@ -1112,6 +1131,84 @@ mod tests {
         );
     }
 
+    /// **An inherit-only entry decides nothing about this device.**
+    ///
+    /// `INHERIT_ONLY_ACE` means the entry exists to be handed to children and is skipped by the
+    /// access check on the object carrying it. The renderer does not print the flags byte, so
+    /// without this an inherit-only deny reads as a device nobody may open and an inherit-only
+    /// allow as a grant that is not there.
+    #[test]
+    fn an_inherit_only_entry_grants_nothing_on_the_device_carrying_it() {
+        let mut only = ace(
+            crate::sd::AceKind::Allow,
+            "S-1-1-0",
+            Some("Everyone"),
+            0x001f_01ff,
+        );
+        only.flags = crate::sd::INHERIT_ONLY_ACE;
+        let entry = access_entry(&only);
+        assert!(entry.inherit_only, "{entry:?}");
+        assert_eq!(
+            (entry.reads, entry.writes),
+            (false, false),
+            "the two that answer \"can this handle send a control code\" are about *this* \
+             device, and this entry is not applied to it: {entry:?}"
+        );
+        assert!(
+            entry.rights.contains(&"FILE_READ_DATA".to_string()),
+            "while the mask is still named, since that is what a child would be given: {entry:?}"
+        );
+
+        // The same ACE without the flag is an effective grant, which is the reading the one above
+        // must not get.
+        let effective = access_entry(&ace(
+            crate::sd::AceKind::Allow,
+            "S-1-1-0",
+            Some("Everyone"),
+            0x001f_01ff,
+        ));
+        assert_eq!((effective.reads, effective.writes), (true, true));
+        assert!(!effective.inherit_only);
+    }
+
+    /// **Two sentences that outlived the meanings they described.**
+    ///
+    /// Both are debris from earlier rounds of this change rather than original defects, which is
+    /// the failure worth pinning: the count was widened to cover an entry whose *type* would not
+    /// read, and `Partial` was widened to cover a search that ran to the end and could not check
+    /// everything -- and the prose describing each stayed as it was. So a target with no type
+    /// information was told its link *targets* were unreadable, and an ordinary completed search
+    /// was told it had been cut short by a deadline.
+    #[test]
+    fn the_warnings_describe_what_the_counts_and_the_verdict_now_mean() {
+        let unresolved = render(&structured_report(&Found {
+            links: vec![],
+            link_search: crate::structured::LinkSearch::Partial,
+            links_unread: 2,
+            stopped: None,
+            ..found()
+        }));
+        assert!(
+            unresolved.contains("type or target would not read"),
+            "the count covers a type that would not read as well: {unresolved}"
+        );
+        assert!(
+            !unresolved.contains("stopped part-way"),
+            "and a search that ran to the end did not stop: {unresolved}"
+        );
+
+        let halted = render(&structured_report(&Found {
+            links: vec![],
+            link_search: crate::structured::LinkSearch::Partial,
+            stopped: Some(crate::walk::Halt::Deadline),
+            ..found()
+        }));
+        assert!(
+            halted.contains("stopped part-way"),
+            "while one that halted says so: {halted}"
+        );
+    }
+
     /// **A mask is named as access only when it is one.**
     ///
     /// A mandatory integrity label carries `NO_WRITE_UP` / `NO_READ_UP` / `NO_EXECUTE_UP` in the
@@ -1213,6 +1310,10 @@ mod tests {
             ..found()
         }));
         assert!(partial.contains("stopped part-way"), "{partial}");
+        assert!(
+            partial.contains("among the entries"),
+            "and the absolute claim is not made either way: {partial}"
+        );
 
         let unavailable = render(&structured_report(&Found {
             links: vec![],

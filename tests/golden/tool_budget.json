@@ -114,8 +114,8 @@
       "inputSchema": 723,
       "modelVisible": 1413,
       "name": "device_security",
-      "outputSchema": 3853,
-      "wire": 5379
+      "outputSchema": 3887,
+      "wire": 5413
     },
     {
       "annotations": 64,
@@ -547,10 +547,10 @@
     "inputSchema": 51775,
     "instructions": 1983,
     "modelVisible": 88568,
-    "outputSchema": 140134,
-    "payload": 236716,
+    "outputSchema": 140168,
+    "payload": 236750,
     "tools": 60,
-    "wire": 236645,
+    "wire": 236679,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

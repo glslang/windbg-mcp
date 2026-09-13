@@ -60,6 +60,10 @@ const MAX_ACL_BYTES: usize = 64 * 1024;
 /// A SID's own limit: `SID_MAX_SUB_AUTHORITIES`, which is the structure's, not a choice.
 const MAX_SUBAUTHORITIES: usize = 15;
 
+/// `INHERIT_ONLY_ACE`. The entry exists to be inherited and is **not** applied to the object
+/// carrying it, so it decides nothing about who may open this device.
+pub(crate) const INHERIT_ONLY_ACE: u8 = 0x08;
+
 /// `SECURITY_DESCRIPTOR_RELATIVE`'s control bits, the three that change what the rest means.
 const SE_DACL_PRESENT: u16 = 0x0004;
 const SE_SACL_PRESENT: u16 = 0x0010;
