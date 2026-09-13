@@ -2738,10 +2738,22 @@ pub struct DeviceLink {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum LinkSearch {
-    /// Every entry was listed and every link resolved. An empty list here is a fact: nothing in
-    /// the directory reaches this device.
+    /// Every entry was listed **and** every link resolved. An empty list here is a fact: nothing
+    /// in the directory reaches this device.
+    ///
+    /// So this requires [`DeviceSecurity::links_unnamed`] and
+    /// [`DeviceSecurity::links_unread`] to be zero as well as the search running to the end. It
+    /// used to mean only the second, which made the guarantee above false whenever a single name
+    /// was paged out: a caller following the documented rule would have reported a device as
+    /// unreachable on the strength of a directory it had not fully read.
     Complete,
-    /// The search stopped part-way, so the links listed are some of them rather than all.
+    /// The search did not check everything, so the links listed are some of them rather than all.
+    ///
+    /// **Three ways to get here, and the other fields say which**: the search stopped part-way
+    /// (`stopped` is set), an entry could not be named (`links_unnamed`), or a link's target would
+    /// not read (`links_unread`). They are one verdict because a caller does the same thing about
+    /// all three -- stop treating an empty list as proof -- and three fields because the remedies
+    /// differ.
     ///
     /// This is what keeps a short list from reading as a complete one. Without it a device with no
     /// listed link looks unreachable from user mode, which is the wrong half of the answer to be

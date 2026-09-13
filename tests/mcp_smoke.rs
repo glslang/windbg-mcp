@@ -14041,10 +14041,19 @@ fn a_device_security_query_on_a_live_kernel_agrees_with_the_debugger() {
             count("links_unread") <= count("links_examined"),
             "a link whose target would not read is one that was examined: {data}"
         );
+        // **The contract rather than a fixed value.** `complete` promises an empty `links` list
+        // proves nothing reaches this device, so it may only be claimed when nothing went
+        // unchecked -- and on a live kernel something usually does, a paged-out name being
+        // ordinary. Asserting the value would have passed on a guest that happened to be quiet
+        // and said nothing about the rule.
+        let unchecked = count("links_unnamed") + count("links_unread");
         assert_eq!(
             data["link_search"].as_str(),
-            Some("complete"),
-            "and it says it saw all of them: {data}"
+            Some(match unchecked {
+                0 => "complete",
+                _ => "partial",
+            }),
+            "`complete` is exactly the case where nothing went unchecked: {data}"
         );
         let links: Vec<&str> = data["links"]
             .as_array()

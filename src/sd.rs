@@ -95,19 +95,43 @@ pub(crate) enum AceKind {
     /// requested access is fully granted or any of it is denied, so a deny after an allow may
     /// never be reached.
     Deny,
-    /// Audits rather than deciding — a SACL entry.
+    /// Audits rather than deciding — a SACL entry. Its mask is still an access mask: it names
+    /// the accesses whose use is recorded.
     Audit,
+    /// A mandatory integrity label (`SYSTEM_MANDATORY_LABEL_ACE`), whose **mask is not an access
+    /// mask at all**: its low three bits are `NO_WRITE_UP`, `NO_READ_UP` and `NO_EXECUTE_UP`, the
+    /// policy the label enforces against a lower-integrity caller.
+    ///
+    /// Its own kind rather than an audit entry, because naming it one puts its mask through a
+    /// table of **file** rights and reports `NO_WRITE_UP` as `FILE_READ_DATA` — a device carrying
+    /// a label then answers that Everyone may read its data, off a bit that says the opposite.
+    /// The principal is an integrity level, which [`Sid::name`] already names.
+    Label,
+    /// `SYSTEM_SCOPED_POLICY_ID_ACE`, whose mask is reserved and means nothing. Distinct from
+    /// [`Self::Other`] because its SID *is* readable and worth reporting; distinct from
+    /// [`Self::Audit`] because there is no access in it to name.
+    ScopedPolicy,
     /// A type this does not decode past its header. Reported rather than skipped: an ACE nobody
     /// read is a principal nobody saw.
     Other(u8),
 }
 
 impl AceKind {
+    /// Whether this entry's mask is an **access** mask, and so nameable as device rights.
+    ///
+    /// The distinction the type exists for: an allow, a deny and an audit entry all carry one, and
+    /// a mandatory label and a scoped policy id carry something else in the same four bytes.
+    pub(crate) fn mask_is_access(self) -> bool {
+        matches!(self, Self::Allow | Self::Deny | Self::Audit)
+    }
+
     pub(crate) fn name(self) -> &'static str {
         match self {
             Self::Allow => "allow",
             Self::Deny => "deny",
             Self::Audit => "audit",
+            Self::Label => "label",
+            Self::ScopedPolicy => "scoped_policy",
             Self::Other(_) => "other",
         }
     }
@@ -291,14 +315,19 @@ fn read_acl(at: u64, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) -> Res
 /// Decodes one ACE from its own bytes.
 fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
     let kind = match ace_type {
-        // ACCESS_ALLOWED, and its callback and compound variants, which put the SID in the same
-        // place.
-        0x00 | 0x09 | 0x04 => AceKind::Allow,
+        // ACCESS_ALLOWED and its callback variant. The **compound** variant is not here: see the
+        // SID offset below.
+        0x00 | 0x09 => AceKind::Allow,
         // ACCESS_DENIED and its callback variant.
         0x01 | 0x0a => AceKind::Deny,
-        // SYSTEM_AUDIT, its callback variant, and the mandatory-label and scoped-policy types,
-        // which are SACL entries with the same shape.
-        0x02 | 0x0d | 0x11 | 0x13 => AceKind::Audit,
+        // ACCESS_ALLOWED_COMPOUND_ACE. An allow like the others, and the one whose SID is not at
+        // byte 8.
+        0x04 => AceKind::Allow,
+        // SYSTEM_AUDIT and its callback variant.
+        0x02 | 0x0d => AceKind::Audit,
+        // The two SACL types whose four bytes after the header are **not** an access mask.
+        0x11 => AceKind::Label,
+        0x13 => AceKind::ScopedPolicy,
         other => AceKind::Other(other),
     };
     // Every type above this one puts a four-byte mask after the header. An object ACE (0x05, 0x06,
@@ -312,10 +341,21 @@ fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
             });
         }
     };
-    let sid = match kind {
-        AceKind::Other(_) => None,
-        _ => sid_from(&body[8..]).ok(),
+    // **Where the SID starts is per type, not per kind**, which is why this is a second match.
+    // `ACCESS_ALLOWED_COMPOUND_ACE` puts a `CompoundAceType` and a `Reserved` word between the
+    // mask and the principal, so reading it at byte 8 hands `sid_from` four bytes of metadata as
+    // a SID header -- which either fails, losing the principal, or succeeds on a revision byte
+    // that happens to be 1 and reports somebody who is not there.
+    let sid_at = match ace_type {
+        0x04 => Some(12),
+        _ => match kind {
+            AceKind::Other(_) => None,
+            _ => Some(8),
+        },
     };
+    let sid = sid_at
+        .filter(|start| body.len() >= *start)
+        .and_then(|start| sid_from(&body[start..]).ok());
     Ok(Ace {
         kind,
         ace_type,
@@ -479,6 +519,25 @@ pub(crate) fn rights(mask: u32) -> Vec<&'static str> {
     named
 }
 
+/// The policy a mandatory integrity label enforces, which is what its four bytes hold instead of
+/// an access mask.
+///
+/// Three published bits, used as published for the reason [`crate::device`]'s module docs give
+/// about `FILE_DEVICE_SECURE_OPEN`. They restrict a caller whose integrity is **lower** than the
+/// label's, and say nothing about one at or above it.
+pub(crate) fn label_policy(mask: u32) -> Vec<&'static str> {
+    const POLICY: [(u32, &str); 3] = [
+        (0x0001, "NO_WRITE_UP"),
+        (0x0002, "NO_READ_UP"),
+        (0x0004, "NO_EXECUTE_UP"),
+    ];
+    POLICY
+        .iter()
+        .filter(|(bit, _)| mask & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
 /// Whether a mask carries the two rights that decide whether a handle can send an IOCTL at all.
 ///
 /// `FILE_READ_DATA` and `FILE_WRITE_DATA` are what the I/O manager checks a control code's
@@ -530,6 +589,21 @@ mod tests {
         out
     }
 
+    /// `ACCESS_ALLOWED_COMPOUND_ACE`, which puts a `CompoundAceType` and a `Reserved` word
+    /// between the mask and the principal. Written out rather than derived from [`ace`], so the
+    /// fixture cannot share the offset with the parser and agree with it about a wrong one.
+    fn compound_ace(mask: u32, server: &[u8], sid: &[u8]) -> Vec<u8> {
+        let size = (12 + sid.len()) as u16;
+        let mut out = vec![0x04u8, 0];
+        out.extend_from_slice(&size.to_le_bytes());
+        out.extend_from_slice(&mask.to_le_bytes());
+        // `CompoundAceType` = 1 (IMPERSONATE), then two reserved bytes. `server` stands for the
+        // bytes a reader at offset 8 would take for a SID header.
+        out.extend_from_slice(server);
+        out.extend_from_slice(sid);
+        out
+    }
+
     /// An ACL around a list of ACEs, with the count the header claims taken from the list unless
     /// a test says otherwise.
     fn acl(revision: u8, aces: &[Vec<u8>], claimed: Option<u16>) -> Vec<u8> {
@@ -559,6 +633,35 @@ mod tests {
             out.extend_from_slice(dacl);
         }
         out
+    }
+
+    /// **A compound ACE's principal is at byte 12, and reading it at 8 reports somebody else.**
+    ///
+    /// `ACCESS_ALLOWED_COMPOUND_ACE` carries a `CompoundAceType` and a reserved word between its
+    /// mask and its SID. The four bytes at offset 8 are therefore metadata, and handing them to
+    /// the SID reader is not merely wrong but *quietly* wrong: `CompoundAceType` is 1, which is
+    /// also a valid SID revision, so the read succeeds and produces a principal nobody granted
+    /// anything to. This fixture makes those bytes parse as `S-1-0-0` on purpose, so a regression
+    /// reports a plausible SID rather than failing.
+    #[test]
+    fn a_compound_ace_reads_its_principal_past_the_two_fields_before_it() {
+        // Revision 1, one sub-authority, authority 0 -- what offset 8 holds, and what a reader
+        // that stopped there would answer with.
+        let metadata = [1u8, 1, 0, 0];
+        let principal = sid(5, &[32, 544]);
+        let bytes = compound_ace(0x0012_00a0, &metadata, &principal);
+        let decoded = read_ace(0x04, 0, &bytes).expect("a compound ACE decodes");
+
+        assert_eq!(
+            decoded.sid.as_ref().map(|sid| sid.text.as_str()),
+            Some("S-1-5-32-544"),
+            "the principal is the one past the compound fields: {decoded:?}"
+        );
+        assert_eq!(
+            decoded.mask, 0x0012_00a0,
+            "and the mask is still where every ACE keeps it"
+        );
+        assert_eq!(decoded.kind, AceKind::Allow, "a compound ACE grants");
     }
 
     /// `\Device\MountPointManager`'s DACL, whose four ACEs `docs/driver-ioctl-walkthrough.md`
