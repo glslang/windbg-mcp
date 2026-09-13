@@ -135,8 +135,21 @@ impl AceKind {
     ///
     /// The distinction the type exists for: an allow, a deny and an audit entry all carry one, and
     /// a mandatory label and a scoped policy id carry something else in the same four bytes.
+    ///
+    /// **[`Self::Other`] is not one answer**, and reading it as one was a defect. That kind says
+    /// this reader cannot place the ACE's *principal* -- an object ACE puts up to two GUIDs before
+    /// it, a compound ACE two SIDs -- which is a different fact from its mask not being access.
+    /// Every documented allow/deny/audit/alarm type carries an `ACCESS_MASK` in the same four
+    /// bytes, object and callback variants included, so an object ACE granting `FILE_WRITE_DATA`
+    /// was reported with no rights and `writes: false`: a client joining this to an IOCTL map
+    /// would call a write-required control code unreachable through a handle that has it. A type
+    /// outside that range is one nothing here knows, and stays false.
     pub(crate) fn mask_is_access(self) -> bool {
-        matches!(self, Self::Allow | Self::Deny | Self::Audit)
+        match self {
+            Self::Allow | Self::Deny | Self::Audit => true,
+            Self::Other(ace_type) => (0x04..=0x0f).contains(&ace_type),
+            Self::Label | Self::ScopedPolicy => false,
+        }
     }
 
     pub(crate) fn name(self) -> &'static str {
@@ -631,6 +644,31 @@ pub(crate) fn data_access(mask: u32) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **An ACE whose principal this cannot place still has an access mask.**
+    ///
+    /// `Other` is the kind for an ACE this does not decode past its header, and the reason is
+    /// always the *principal*: an object ACE puts up to two GUIDs before the SID, a compound ACE
+    /// two SIDs. The mask sits at the same offset in all of them and is an `ACCESS_MASK` in every
+    /// documented allow/deny/audit/alarm type. Reading `Other` as "no access mask" reported an
+    /// object ACE granting `FILE_WRITE_DATA` as granting nothing nameable, which joined to an
+    /// IOCTL map says a write-required control code cannot be reached through a handle that has
+    /// exactly the right it needs.
+    #[test]
+    fn an_ace_this_cannot_decode_still_has_an_access_mask() {
+        for object_ace in [0x04u8, 0x05, 0x06, 0x07, 0x08, 0x0b, 0x0c, 0x0e, 0x0f] {
+            assert!(
+                AceKind::Other(object_ace).mask_is_access(),
+                "type {object_ace:#04x} carries an ACCESS_MASK wherever its principal is"
+            );
+        }
+        // A type nothing here knows is a mask nothing here can name, which is the honest answer
+        // and the one the range above is drawn to leave room for.
+        assert!(!AceKind::Other(0x40).mask_is_access());
+        // And the two whose four bytes really are something else stay out.
+        assert!(!AceKind::Label.mask_is_access());
+        assert!(!AceKind::ScopedPolicy.mask_is_access());
+    }
 
     /// **A generic bit is not a data right, and mapping it here would invent access.**
     ///
