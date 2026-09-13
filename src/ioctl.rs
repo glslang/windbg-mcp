@@ -2387,7 +2387,11 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
     let mut out = String::new();
     let where_ =
         |location: &crate::structured::CodeLocation| match (&location.module, &location.rva) {
-            (Some(module), Some(rva)) => format!("{module}+{rva}"),
+            // The module name is the target's -- see `structured::renderable`. The RVA
+            // beside it is this crate's own formatting.
+            (Some(module), Some(rva)) => {
+                format!("{}+{rva}", crate::structured::renderable(module))
+            }
             _ => location.address.clone(),
         };
     out.push_str(&format!("IOCTL map of {}\n", where_(&report.dispatch)));

@@ -50,6 +50,74 @@ use serde::{Deserialize, Serialize};
 
 use crate::engine::{EngineError, SessionKind, SessionState};
 
+/// **Here rather than in `src/worker.rs`, which is where it was written and used.** Every
+/// renderer this crate has extracted to be engine-free -- `device`, `sd`, `ioctl`, `hazards`,
+/// `surface` -- left that module and lost reach of this on the way out, and all five print
+/// strings the *target* chose: a driver's `DriverName`, an object path, and the library and
+/// import names read out of a hostile image's own import table. None of them escaped one until
+/// review found it on the newest of the five. [`addr`] is the other formatting helper those
+/// modules share and was already here, so this needs no module of its own.
+///
+/// A string from **outside this server**, made safe to put in the listing: anything that could
+/// break out of the row or the span it is printed in is rendered as an escape rather than acted on.
+///
+/// Two such strings, and the reason is the same for both. The listing is line-oriented and its rows
+/// begin with an address, so a string carrying a line break prints as *two* lines â€” and the second
+/// can be shaped exactly like a row, putting a module in the text that the values beside it do not
+/// have. That is the one property this rendering exists to hold, and it must not depend on what a
+/// caller typed or on what the target calls itself:
+///
+/// * **the caller's `filter`**, quoted into the note. Until #120 it was command text and
+///   `reject_command_breakers` refused line breaks along with `;`; the command went, and the
+///   refusal with it, which is what left this open.
+/// * **the module and image names**, which come from the target. Windows file names exclude the
+///   characters below `0x20`, and nothing else: a driver may legally be named with a `U+2028`, and
+///   a target being *analysed* is the last place to assume it is not â€” this server is pointed at
+///   malware on purpose.
+///
+/// Escaped rather than refused, because "nothing matches this" is a perfectly good answer to a
+/// pattern no module is named, and because a module named something hostile still has to be
+/// listable. It also covers `\r` and an ANSI escape for the same money, where refusing line breaks
+/// would let those through to a terminal.
+///
+/// [`renderable`] is not Markdown escaping and does not try to be â€” the backtick is in the set
+/// because it is the delimiter this listing quotes with, so a string carrying one can hand what
+/// follows it to a Markdown-rendering client as markup.
+pub(crate) fn renderable(text: &str) -> std::borrow::Cow<'_, str> {
+    if !text.contains(escapes_the_listing) {
+        return std::borrow::Cow::Borrowed(text);
+    }
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
+        match c {
+            // `escape_debug` leaves a *printable* character alone, and a backtick is printable: it
+            // is escaped here for what it does to the container, not for what it is.
+            '`' => out.push_str("\\u{60}"),
+            c if escapes_the_listing(c) => out.extend(c.escape_debug()),
+            c => out.push(c),
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
+/// Whether a character could put what follows it outside the row or the span it was printed in.
+///
+/// **Line breaks, in any renderer** â€” not only in [`str::lines`]. [`char::is_control`] is the
+/// obvious test and is not enough: it is the `Cc` category, which holds `\n`, `\r`, `\u{b}`,
+/// `\u{c}` and NEL, but *not* `U+2028 LINE SEPARATOR` or `U+2029 PARAGRAPH SEPARATOR` â€” which are
+/// `Zl`/`Zp`, break a line in a Unicode-aware renderer, and are invisible to `lines()` and so to a
+/// test written against it. Those two are the rest of Unicode's line-break set.
+///
+/// The controls that are *not* line breaks stay in for a second reason: an ESC in a listing is an
+/// ANSI sequence a terminal acts on.
+///
+/// **And the backtick**, which is the listing's own quoting delimiter: a pattern containing one
+/// closes the code span it was quoted into, and everything after it is markup to a client that
+/// renders Markdown â€” `<br>` included, which is a line break this would otherwise never see.
+fn escapes_the_listing(c: char) -> bool {
+    c.is_control() || matches!(c, '\u{2028}' | '\u{2029}' | '`')
+}
+
 /// Renders a value in this module's one address representation.
 ///
 /// See the module docs: `0x`-prefixed, lowercase, zero-padded to 16 digits.

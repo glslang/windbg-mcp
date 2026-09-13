@@ -730,9 +730,14 @@ fn scanned_range(range: &Scanned) -> crate::structured::ScannedRange {
 /// rather than built in parallel with it, which is one fewer place for the two to disagree about
 /// a count.
 pub fn render(report: &crate::structured::DriverHazards) -> String {
+    // **The module name and every library and import name below come out of the image**, which
+    // on this tool's subject is a file somebody built to be analysed. `src/pe.rs` exists to
+    // distrust those bytes as *structure*; this is the same distrust applied to them as *text*.
     let mut out = format!(
         "Driver hazards: {} at {}\n  sink list v{}\n",
-        report.module, report.base, report.sink_list_version
+        crate::structured::renderable(&report.module),
+        report.base,
+        report.sink_list_version
     );
 
     // Said above the findings rather than below them, because it changes what an empty list means:
@@ -777,7 +782,9 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
             };
             out.push_str(&format!(
                 "    {:<32} {:<20} {} call site(s){listed}\n",
-                sink.name, sink.kind, sink.call_site_count
+                crate::structured::renderable(&sink.name),
+                sink.kind,
+                sink.call_site_count
             ));
         }
     }
@@ -798,7 +805,9 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
             let rva = found.at.rva.as_deref().unwrap_or("?");
             out.push_str(&format!(
                 "    {:<16} {:<24} {}\n",
-                found.mnemonic, found.kind, rva
+                crate::structured::renderable(&found.mnemonic),
+                found.kind,
+                rva
             ));
         }
     }
@@ -814,7 +823,12 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
     if !report.unnamed_libraries.is_empty() {
         out.push_str(&format!(
             "  Not nameable (bound imports): {}\n",
-            report.unnamed_libraries.join(", ")
+            report
+                .unnamed_libraries
+                .iter()
+                .map(|one| crate::structured::renderable(one))
+                .collect::<Vec<_>>()
+                .join(", ")
         ));
     }
     // **Names no tool**, which is `FOLLOWUPS.md` item 43's rule and applies here for its sharper
