@@ -265,6 +265,9 @@ pub(crate) struct Found {
     /// Examined entries this could not check -- a target that would not read, or a type that
     /// would not -- which **are** among those examined.
     pub(crate) links_unread: usize,
+    /// Entries whose name differs from this device's only where [`upcase`] cannot speak for the
+    /// kernel's table, so whether they reach it is unknown rather than answered.
+    pub(crate) links_unfolded: usize,
     pub(crate) stopped: Option<crate::walk::Halt>,
 }
 
@@ -309,9 +312,37 @@ pub(crate) const SYMBOLIC_LINK: &str = "SymbolicLink";
 /// of a name. Neither is true of a *prefix*: a link to `\Device\HarddiskVolume1\dir` is not a
 /// link to `\Device\HarddiskVolume1`, and matching it as one would report a volume as reachable
 /// under a name that opens a file on it.
-pub(crate) fn same_object_path(one: &str, other: &str) -> bool {
-    let trim = |path: &str| upcase(path.trim_end_matches('\\'));
-    trim(one) == trim(other)
+pub(crate) fn same_object_path(one: &str, other: &str) -> Match {
+    let (one, one_sure) = upcase(one.trim_end_matches('\\'));
+    let (other, other_sure) = upcase(other.trim_end_matches('\\'));
+    match (one == other, one_sure && other_sure) {
+        // **Equal needs no certainty.** Equal sequences of code units fold to equal sequences
+        // under any per-unit table, whatever this could not say about the units themselves -- so
+        // a match is a match even where the fold is guessing.
+        (true, _) => Match::Same,
+        (false, true) => Match::Different,
+        (false, false) => Match::Unknown,
+    }
+}
+
+/// What a fold is entitled to say about two object paths.
+///
+/// **Three answers because two produced three rounds of review findings.** Folding is an
+/// approximation of the kernel's table -- see [`upcase`] -- and each round found a character the
+/// approximation got wrong, every one of them reported as *not a match* and so as a link that does
+/// not reach the device, while the search still called itself `Complete`. The bug was never the
+/// imperfect fold; it was a perfect claim made on top of one. A comparison that turns on a code
+/// unit this cannot fold the way the kernel does is now `Unknown`, and an `Unknown` in the search
+/// is what stops `Complete` being claimed. No character can make this answer *wrongly* any more,
+/// only vaguely.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Match {
+    /// One object.
+    Same,
+    /// Two objects.
+    Different,
+    /// They differ only where this fold cannot speak for the kernel's table.
+    Unknown,
 }
 
 /// A name folded the way the object manager folds one: **one UTF-16 code unit in, one out.**
@@ -346,27 +377,73 @@ pub(crate) fn same_object_path(one: &str, other: &str) -> bool {
 /// without one. What the substitution leaves is the Unicode version behind each table, for code
 /// units at or above `U+00C0`: the silo's is frozen at the target's build and this one moves with
 /// the toolchain.
-fn upcase(name: &str) -> Vec<u16> {
-    name.encode_utf16()
+fn upcase(name: &str) -> (Vec<u16>, bool) {
+    let mut sure = true;
+    let folded = name
+        .encode_utf16()
         .map(|unit| match unit {
             // The comparison's own fast path, written the way it writes it.
             0x61..=0x7a => unit - 0x20,
-            // Below the floor the kernel reaches for no table, so neither does this.
+            // Below the floor the kernel reaches for no table, so neither does this -- and that
+            // is knowledge rather than a guess, so certainty survives it.
             0..=0xbf => unit,
             _ => {
                 // A surrogate is not a scalar value, so this is also the non-BMP case: the half
-                // goes through unfolded, as the kernel's per-`WCHAR` fold leaves it.
+                // goes through unfolded, as the kernel's per-`WCHAR` fold leaves it. Certain for
+                // the same reason -- a `WCHAR` fold cannot reach it either.
                 let Some(one) = char::from_u32(u32::from(unit)) else {
                     return unit;
                 };
                 let mut upper = one.to_uppercase();
                 match (upper.next(), upper.next()) {
-                    (Some(only), None) => u16::try_from(u32::from(only)).unwrap_or(unit),
-                    _ => unit,
+                    (Some(only), None) => match u16::try_from(u32::from(only)) {
+                        Ok(folded) => folded,
+                        // A BMP unit folding out of the BMP is not something this can express as
+                        // one unit, and not something to claim the kernel does either.
+                        Err(_) => {
+                            sure = false;
+                            unit
+                        }
+                    },
+                    // **The expansion case, and the one this cannot answer.** Rust offers the
+                    // *full* mapping only, so a unit whose full uppercase is several units hides
+                    // whatever its one-unit simple mapping is -- `U+1F80` expands to `U+1F08`
+                    // `U+0399` here while the kernel's table maps it to `U+1F88`, one unit, and
+                    // `U+00DF` expands to `SS` where the table leaves it alone. Both look
+                    // identical from inside this `match`, so the unit is left as it is and the
+                    // fold stops claiming to know.
+                    _ => {
+                        sure = false;
+                        unit
+                    }
                 }
             }
         })
-        .collect()
+        .collect();
+    (folded, sure)
+}
+
+/// Whether an empty [`Found::links`] is a fact about the device or an absence in the search.
+///
+/// **A guarantee rather than a description of how the loop ended.** `Complete` says that nothing
+/// in the directory reaches this device -- so it cannot be claimed while any entry went unchecked,
+/// whichever way: unnamed by the namespace, its type or target unreadable, or its name one
+/// [`same_object_path`] could not decide. Any of those may be the link.
+///
+/// Here rather than in the worker beside its one caller, for the reason [`candidate`] is: the rule
+/// needs no engine, and a rule only a live kernel can exercise is one no test here reaches. The
+/// three counts are taken apart rather than summed by the caller so that forgetting one is a
+/// failing test rather than a quieter answer.
+pub(crate) fn link_search(
+    halted: bool,
+    unnamed: usize,
+    unread: usize,
+    unfolded: usize,
+) -> crate::structured::LinkSearch {
+    match (halted, unnamed + unread + unfolded) {
+        (false, 0) => crate::structured::LinkSearch::Complete,
+        _ => crate::structured::LinkSearch::Partial,
+    }
 }
 
 /// One ACE, as fields a caller can branch on.
@@ -483,6 +560,7 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
         links_examined: found.links_examined,
         links_unnamed: found.links_unnamed,
         links_unread: found.links_unread,
+        links_unfolded: found.links_unfolded,
         stopped: found.stopped.map(|halt| match halt {
             crate::walk::Halt::Deadline => crate::structured::WalkHalt::Deadline,
             crate::walk::Halt::Interrupted => crate::structured::WalkHalt::Interrupted,
@@ -631,14 +709,17 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
                     let _ = writeln!(out, "    {}  -> {}", link.path, link.target);
                 }
             }
-            let unchecked = report.links_unnamed + report.links_unread;
+            let unchecked = report.links_unnamed + report.links_unread + report.links_unfolded;
             if unchecked > 0 {
                 let _ = writeln!(
                     out,
                     "  [!] {unchecked} of {}'s entries could not be checked ({} this could not \
-                     name, {} whose type or target would not read), so any of them may reach \
-                     this device",
-                    report.link_directory, report.links_unnamed, report.links_unread
+                     name, {} whose type or target would not read, {} whose name this cannot \
+                     fold as the kernel does), so any of them may reach this device",
+                    report.link_directory,
+                    report.links_unnamed,
+                    report.links_unread,
+                    report.links_unfolded
                 );
             }
             // **Only a search that halted stopped part-way.** `Partial` covers a second case
@@ -895,6 +976,7 @@ mod tests {
             links_examined: Some(400),
             links_unnamed: 0,
             links_unread: 0,
+            links_unfolded: 0,
             stopped: None,
         }
     }
@@ -956,26 +1038,31 @@ mod tests {
     /// a name that opens a file on it.
     #[test]
     fn a_link_target_matches_the_device_it_names_and_not_the_one_it_is_inside() {
-        assert!(same_object_path(
-            "\\Device\\MountPointManager",
-            "\\DEVICE\\MOUNTPOINTMANAGER"
-        ));
-        assert!(same_object_path(
-            "\\Device\\MountPointManager\\",
-            "\\Device\\MountPointManager"
-        ));
-        assert!(
-            !same_object_path(
+        assert_eq!(
+            same_object_path("\\Device\\MountPointManager", "\\DEVICE\\MOUNTPOINTMANAGER"),
+            Match::Same
+        );
+        assert_eq!(
+            same_object_path(
+                "\\Device\\MountPointManager\\",
+                "\\Device\\MountPointManager"
+            ),
+            Match::Same
+        );
+        assert_eq!(
+            same_object_path(
                 "\\Device\\MountPointManager\\sub",
                 "\\Device\\MountPointManager"
             ),
+            Match::Different,
             "a link into the device is not a link to it"
         );
-        assert!(
-            !same_object_path(
+        assert_eq!(
+            same_object_path(
                 "\\Device\\MountPointManagerExtra",
                 "\\Device\\MountPointManager"
             ),
+            Match::Different,
             "nor is a longer name beginning with it"
         );
 
@@ -984,7 +1071,7 @@ mod tests {
         // leaves two spellings of one object unequal, drops the link that reaches it, and lets
         // the search call itself complete having missed it.
         assert!(
-            same_object_path("\\Device\\Käse", "\\Device\\KÄSE"),
+            same_object_path("\\Device\\Käse", "\\Device\\KÄSE") == Match::Same,
             "a name differing only in the case of a non-ASCII letter is the same object"
         );
     }
@@ -1210,39 +1297,57 @@ mod tests {
         // **Expansion, downwards.** `to_lowercase` turns `U+0130` into `i` and `U+0307`, which is
         // code unit for code unit the other name -- so these compared equal, and a link to one was
         // reported as reaching the other.
-        assert!(
-            !same_object_path("\\Device\\\u{0130}", "\\Device\\i\u{0307}"),
+        assert_eq!(
+            same_object_path("\\Device\\\u{0130}", "\\Device\\i\u{0307}"),
+            Match::Different,
             "a fold that expands makes one object out of two"
         );
 
         // **Context.** `to_lowercase` picks the final sigma at the end of a word and the medial one
         // elsewhere, so these compared unequal -- dropping a link that does reach the device while
         // the search reported itself complete. Both upcase to `U+03A3`.
-        assert!(
+        assert_eq!(
             same_object_path("\\Device\\\u{0391}\u{03A3}", "\\Device\\\u{0391}\u{03C3}"),
+            Match::Same,
             "one object spelt with either sigma is still one object"
         );
 
-        // **Expansion, upwards**, which the case above does not reach: `U+00DF` fully uppercases to
-        // `SS`, and the kernel's one-to-one table leaves it alone.
-        assert!(
-            !same_object_path("\\Device\\\u{00df}", "\\Device\\SS"),
-            "a one-to-one fold does not turn one letter into two"
+        // **Expansion, upwards**, which the case above does not reach: `U+00DF` fully uppercases
+        // to `SS`, and the kernel's table leaves it alone. Not `Different` but `Unknown`, and
+        // that is the round-nine correction: the expansion is exactly where Rust stops being able
+        // to show the one-unit mapping, so this cannot tell `U+00DF`, which the table does not
+        // move, from `U+1F80`, which it moves to `U+1F88`. It declines to answer for both rather
+        // than being right about one and wrong about the other.
+        assert_eq!(
+            same_object_path("\\Device\\\u{00df}", "\\Device\\SS"),
+            Match::Unknown,
+            "a fold that cannot see the one-unit mapping does not get to rule the match out"
+        );
+
+        // The case that found it: `U+1F80`'s full uppercase is two units, `U+1F08` `U+0399`, and
+        // its simple mapping is the single `U+1F88` the kernel's table uses. Answered `Different`,
+        // this dropped a link that does reach the device and still called the search complete.
+        assert_eq!(
+            same_object_path("\\Device\\\u{1f80}", "\\Device\\\u{1f88}"),
+            Match::Unknown,
+            "the fold cannot reach this one, and says so rather than guessing"
         );
 
         // **A surrogate pair is not a letter to a `WCHAR` fold.** The kernel cannot case-fold a
         // non-BMP letter at all, so these are two objects; folding over scalar values would merge
         // them.
-        assert!(
-            !same_object_path("\\Device\\\u{10400}", "\\Device\\\u{10428}"),
-            "what the kernel cannot fold, this does not fold either"
+        assert_eq!(
+            same_object_path("\\Device\\\u{10400}", "\\Device\\\u{10428}"),
+            Match::Different,
+            "what the kernel cannot fold, this does not fold either -- and knows it"
         );
 
         // **The floor at `U+00C0`.** `U+00B5` is below it, so the comparison consults no table and
         // leaves it alone -- where Unicode would fold it to `U+039C`, a Greek capital mu, changing
         // its script on the way. Two objects to the kernel.
-        assert!(
-            !same_object_path("\\Device\\\u{00b5}", "\\Device\\\u{039c}"),
+        assert_eq!(
+            same_object_path("\\Device\\\u{00b5}", "\\Device\\\u{039c}"),
+            Match::Different,
             "a fold the kernel does not reach for is not one to make here"
         );
     }
@@ -1301,6 +1406,102 @@ mod tests {
         assert!(
             inherited.contains("[inherit-only]") && !inherited.contains("[if]"),
             "an entry not applied to this device is not a condition on opening it: {inherited}"
+        );
+    }
+
+    /// **An object ACE's rights reach the caller, because its mask is an access mask.**
+    ///
+    /// The rendering half of the rule `AceKind::mask_is_access` states: an entry whose *principal*
+    /// this cannot place is still an entry whose mask it can name, and reporting `writes: false`
+    /// there is the reading that makes a reachable IOCTL look unreachable.
+    #[test]
+    fn an_undecoded_ace_still_reports_the_rights_its_mask_carries() {
+        let object_ace = access_entry(&ace(
+            crate::sd::AceKind::Other(0x05),
+            "S-1-1-0",
+            Some("Everyone"),
+            0x0012_019f,
+        ));
+        assert_eq!(
+            (object_ace.reads, object_ace.writes),
+            (true, true),
+            "FILE_READ_DATA and FILE_WRITE_DATA are in that mask wherever the SID is: \
+             {object_ace:?}"
+        );
+        assert!(
+            object_ace.rights.contains(&"FILE_WRITE_DATA".to_string()),
+            "and the mask is named rather than left empty: {object_ace:?}"
+        );
+
+        // A label's four bytes are still not an access mask, which is the distinction that must
+        // survive widening this one.
+        let label = access_entry(&ace(
+            crate::sd::AceKind::Label,
+            "S-1-16-8192",
+            Some("Medium Mandatory Level"),
+            0x0000_0001,
+        ));
+        assert_eq!((label.reads, label.writes), (false, false), "{label:?}");
+    }
+
+    /// **Every way an entry can go unchecked keeps `Complete` off the answer.**
+    ///
+    /// `Complete` is the only verdict under which an empty link list means "nothing reaches this
+    /// device"; under the others it means "nothing was found among what was looked at". So each
+    /// count is asserted on its own -- summing them in the caller is how one gets left out, and a
+    /// left-out count is a search that quietly promotes itself.
+    #[test]
+    fn every_unchecked_entry_keeps_the_search_from_claiming_completeness() {
+        use crate::structured::LinkSearch;
+        assert_eq!(link_search(false, 0, 0, 0), LinkSearch::Complete);
+        assert_eq!(
+            link_search(true, 0, 0, 0),
+            LinkSearch::Partial,
+            "a walk that stopped never saw the rest of the directory"
+        );
+        for (unnamed, unread, unfolded, what) in [
+            (1, 0, 0, "an entry the namespace could not name"),
+            (0, 1, 0, "an entry whose type or target would not read"),
+            (0, 0, 1, "a name the fold could not decide"),
+        ] {
+            assert_eq!(
+                link_search(false, unnamed, unread, unfolded),
+                LinkSearch::Partial,
+                "{what} may be the link, so nothing here is complete"
+            );
+        }
+    }
+
+    /// **A name this cannot fold is not a link that does not match, and the verdict says so.**
+    ///
+    /// The count exists so that `Complete` is unclaimable whenever the fold was guessing. Without
+    /// it the search reports, in one breath, that no link reaches this device and that it checked
+    /// everything -- on a comparison it could not make.
+    #[test]
+    fn a_name_the_fold_could_not_decide_keeps_the_search_from_claiming_completeness() {
+        let unfolded = render(&structured_report(&Found {
+            links: vec![],
+            link_search: crate::structured::LinkSearch::Partial,
+            links_examined: Some(400),
+            links_unfolded: 1,
+            ..found()
+        }));
+        assert!(
+            unfolded.contains("1 of") && unfolded.contains("cannot fold as the kernel does"),
+            "the count is reported, and named for what it is: {unfolded}"
+        );
+        assert!(
+            !unfolded.contains("No symbolic link in"),
+            "and the absolute claim is not made beside it: {unfolded}"
+        );
+
+        let report = structured_report(&Found {
+            links_unfolded: 1,
+            ..found()
+        });
+        assert_eq!(
+            report.links_unfolded, 1,
+            "and it crosses the seam as a field rather than as a sentence"
         );
     }
 

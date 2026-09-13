@@ -6895,6 +6895,7 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
     let mut links = Vec::new();
     let mut links_unnamed = 0usize;
     let mut links_unread = 0usize;
+    let mut links_unfolded = 0usize;
     let mut examined = None;
     let mut halted = None;
     let mut search = structured::LinkSearch::Unavailable;
@@ -6942,22 +6943,29 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
                 links_unread += 1;
                 continue;
             };
-            if device::same_object_path(&target, &path) {
-                links.push(device::Link {
+            match device::same_object_path(&target, &path) {
+                device::Match::Same => links.push(device::Link {
                     path: format!("{LINK_DIRECTORY}\\{}", entry.name),
                     target,
-                });
+                }),
+                // **A comparison the fold cannot make is not a link that does not match.** The
+                // kernel compares object names through its own uppercase table, which
+                // `device::upcase` stands in for without a debugger; where the stand-in cannot
+                // speak the answer is unknown, and calling it `Different` is what let three
+                // rounds of review each find a character reported as unreachable under a search
+                // still calling itself `Complete`.
+                device::Match::Unknown => links_unfolded += 1,
+                device::Match::Different => {}
             }
         }
         examined = Some(seen);
-        // **`Complete` is a guarantee rather than a description of how the loop ended.** It says
-        // an empty list proves nothing reaches this device, so it cannot be claimed while an
-        // entry went unnamed or a target unread -- either of those may be the link. Running to
-        // the end is necessary and was, on its own, taken for sufficient.
-        search = match (halted, links_unnamed + links_unread) {
-            (None, 0) => structured::LinkSearch::Complete,
-            _ => structured::LinkSearch::Partial,
-        };
+        // The rule itself is [`device::link_search`], which needs no engine and so has a test.
+        search = device::link_search(
+            halted.is_some(),
+            links_unnamed,
+            links_unread,
+            links_unfolded,
+        );
     }
 
     let found = device::Found {
@@ -6972,6 +6980,7 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         links_examined: examined,
         links_unnamed,
         links_unread,
+        links_unfolded,
         stopped: halted,
     };
     let report = device::structured_report(&found);
