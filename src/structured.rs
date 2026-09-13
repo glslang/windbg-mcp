@@ -2667,6 +2667,15 @@ pub struct AccessEntry {
     /// this is the reading, and a reading is not an identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// True when this entry's type carries a principal and the bytes that should have held one
+    /// did not parse.
+    ///
+    /// **Different from [`Self::sid`] simply being absent**, which for an `other` entry means the
+    /// SID is somewhere this reader does not look. Here the entry grants its mask to somebody and
+    /// nobody can say who, which on a descriptor read out of target memory is evidence rather
+    /// than a wrinkle.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub principal_unreadable: bool,
     /// The access mask, as encoded.
     pub mask: String,
     /// The rights that mask names, as a **device**'s: `FILE_READ_DATA` rather than the same bit's

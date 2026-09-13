@@ -1867,10 +1867,14 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// headroom rather than a leak: the model-visible surface went 87,155 -> 88,568, a difference of
 /// 1,413, and the tool's own model-visible definition is 1,413 B. Nothing else moved -- no
 /// `TOOL_NOTES` cross-reference was added for it, so unlike the `interrupt` case recorded above
-/// there is no second term. Of that, 634 B is description and 723 B input schema; the 3,715 B
+/// there is no second term. Of that, 634 B is description and 723 B input schema; the 3,820 B
 /// `outputSchema` is on the wire and not here, which is the whole reason these two ceilings are
 /// separate numbers. The new figure leaves 2,432 B, which is 2.7%, and is deliberately not sized
 /// for `driver_surface` -- that one raises it again, with its own arithmetic.
+///
+/// **And the separation earned its keep under review**: the output schema grew twice, 3,715 ->
+/// 3,778 -> 3,820, and this figure did not move a byte either time. A single ceiling over both
+/// would have read those as the surface growing.
 const MODEL_VISIBLE_CEILING: usize = 91_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -1931,18 +1935,19 @@ const MODEL_VISIBLE_CEILING: usize = 91_000;
 /// than a product. It is the larger of the two driver schemas because a case carries a decoded
 /// code, two coordinates and its evidence. The new figure leaves 5,194 B, which is 2.2%.
 ///
-/// **236,000 -> 242,000 for `device_security`** (2026-09-13). The payload went 231,336 -> 236,641,
-/// a difference of 5,305: the tool is 5,304 B of wire and the remaining byte is the array's own
+/// **236,000 -> 242,000 for `device_security`** (2026-09-13). The payload went 231,336 -> 236,683,
+/// a difference of 5,347: the tool is 5,346 B of wire and the remaining byte is the array's own
 /// comma. **Nothing else moved at all** -- not one other tool changed by a byte, which is the
 /// cleanest this arithmetic has ever come out and is itself the answer to the question this
 /// ceiling exists to force. It shares no output type with the two driver schemas beside it: a
 /// device's gate is a descriptor, an access list and a symbolic link, none of which appear
-/// anywhere else in this surface, so there was nothing available to multiply. 3,778 B of the
-/// 5,304 is `outputSchema`, which no model reads. The new figure leaves 5,359 B, which is 2.2%.
+/// anywhere else in this surface, so there was nothing available to multiply. 3,820 B of the
+/// 5,346 is `outputSchema`, which no model reads. The new figure leaves 5,317 B, which is 2.2%.
 ///
-/// (5,241 and 236,578 while this paragraph was first written; splitting one misleading count into
-/// `links_unnamed` and `links_unread` added 63 B of schema, which is the ordinary way this figure
-/// moves and the reason the instruction is to re-derive it rather than quote it.)
+/// **The tool's own figure moved twice under review while this paragraph stood**, 5,241 -> 5,304
+/// -> 5,346, each time a field was split or added to the output schema. That is the ordinary way
+/// it moves and the reason the instruction is to re-derive rather than quote: the headroom is what
+/// this guards, and it absorbed both without the ceiling needing to move again.
 const WIRE_CEILING: usize = 242_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021

@@ -1403,8 +1403,8 @@ pub struct DriverHazardsArgs {
 pub struct DeviceSecurityArgs {
     /// The object path, as `!object` takes it: "\\Device\\MountPointManager". A symbolic
     /// link is followed once, so "\\GLOBAL??\\MountPointManager" reaches the same device.
-    /// An address is not accepted: the security descriptor hangs off the object header,
-    /// which is reached by walking the namespace to the object rather than from its body.
+    /// An address is not accepted: the descriptor is reached by walking the namespace to
+    /// the object, and a bare address says nothing about where in the namespace it sits.
     pub device: String,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
