@@ -61,14 +61,24 @@ reads.
    and the `\GLOBAL??` links that reach the device. Each ACE carries `reads`/`writes`, which is
    what the *deliverable* gate below is checked against.
 
-   **A `security_absent` answer is not an open device, and not a finished one either.** The
-   openable gate is unanswered rather than absent: this tool read no descriptor on the device and
-   did not go looking for one elsewhere, so the holding directory is where to look next. Do not
-   treat "the directory is what the kernel checks instead" as established -- it is the ordinary
-   account of it, and nothing here has measured it. Expect this answer to be **rare or
-   unreachable** rather than common: every device object on a measured Windows Server 26100 guest
-   carries its own descriptor, the unnamed ones included. It needs a **live kernel** -- a dump
-   carries no object namespace. On a dump, fall back to the hand method: `device_object` for the
+   **A `security_absent` answer is not an open device, and not a finished one either -- and it is
+   two different answers sharing one field.** `security_absent` is set both where the device
+   carries no descriptor and where it carries one whose bytes would not read or parse, so **read
+   the reason string before acting**; the two want opposite next steps.
+
+   - *"the descriptor at `0x...` could not be read"* -- the device **has** a descriptor and the
+     message carries its address. That address is the gate: go and inspect it there. Looking at
+     the holding directory instead would answer a question about a device this one is not.
+   - *"carries no security descriptor of its own"* -- nothing was found on the device, and the
+     tool says in as many words that what the object manager checks in its place is not something
+     it read. The holding directory is the obvious next place to look, but do not treat "the
+     directory is what the kernel checks instead" as established -- that is the ordinary account
+     of it and nothing here has measured it. Expect this reason to be **rare or unreachable**
+     anyway: every device object on a measured Windows Server 26100 guest carries its own
+     descriptor, the unnamed ones included.
+
+   Either way it needs a **live kernel** -- a dump carries no object namespace at all. On a
+   dump, fall back to the hand method: `device_object` for the
    device type, characteristics and `SecurityDescriptor` pointer, then
    `execute { "command": "!sd <SecurityDescriptor> 1" }` where that extension is present (it is
    not in the bundled engine, so otherwise inspect the SD by address), and
