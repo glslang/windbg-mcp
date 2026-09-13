@@ -7906,7 +7906,8 @@ fn ",
             category(&ObjectError::NotFoundInPart {
                 directory: "Device".into(),
                 component: "Nope".into(),
-                skipped: 2,
+                unreadable: 1,
+                malformed: 1,
             }),
             target,
             "an absence this cannot vouch for is the target's failure, not the argument's"
