@@ -598,13 +598,39 @@ pub(crate) fn surface_device(
     crate::structured::SurfaceDevice {
         address,
         path,
-        device_type: format!("{:#06x}", fields.device_type),
-        characteristics: format!("{:#010x}", fields.characteristics),
-        secure_open: fields.secure_open,
-        flags: format!("{:#010x}", fields.flags),
-        exclusive: fields.exclusive,
+        unread: None,
+        device_type: Some(format!("{:#06x}", fields.device_type)),
+        characteristics: Some(format!("{:#010x}", fields.characteristics)),
+        secure_open: Some(fields.secure_open),
+        flags: Some(format!("{:#010x}", fields.flags)),
+        exclusive: Some(fields.exclusive),
         security: descriptor_read(security),
         security_absent: security_absent(security),
+    }
+}
+
+/// A device on the chain whose object would not read.
+///
+/// Everything but where it is, said once here rather than built at the call site, so that the
+/// fields which are absent together stay absent together.
+pub(crate) fn unread_device(
+    address: String,
+    path: Option<String>,
+    why: String,
+) -> crate::structured::SurfaceDevice {
+    crate::structured::SurfaceDevice {
+        address,
+        path,
+        unread: Some(why),
+        device_type: None,
+        characteristics: None,
+        secure_open: None,
+        flags: None,
+        exclusive: None,
+        // **Not borrowed to say the object failed.** This field is about the descriptor, and a
+        // device whose object did not read has no descriptor field to have found empty.
+        security: None,
+        security_absent: None,
     }
 }
 

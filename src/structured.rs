@@ -2979,16 +2979,37 @@ pub struct SurfaceDevice {
     /// object header rather than a directory listing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
+    /// Why none of the fields below was read, for a device object that would not read at all.
+    ///
+    /// **Its own field rather than a third meaning for [`Self::security_absent`]**, which is about
+    /// the descriptor and already carries two outcomes told apart by their reason string. A third
+    /// crammed in there is how a field stops being something a caller can branch on -- and is the
+    /// shape `device_security` spent six review rounds taking back out of one sentence.
+    ///
+    /// Such a device is still **on** the chain: it is one this driver created, and what is missing
+    /// is what it says about itself. Dropping it would report a shorter chain rather than a hole
+    /// in one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unread: Option<String>,
     /// `DeviceType`, as the number it is. `decode_ioctl` names the same field of a control code.
-    pub device_type: String,
+    ///
+    /// This and the four below are absent exactly when [`Self::unread`] is present. **Absent
+    /// rather than an empty string**: a caller parsing this as hex can act on a missing field and
+    /// cannot act on `""`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_type: Option<String>,
     /// `Characteristics`, whole.
-    pub characteristics: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub characteristics: Option<String>,
     /// `FILE_DEVICE_SECURE_OPEN`, the one characteristic that changes who may open this.
-    pub secure_open: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub secure_open: Option<bool>,
     /// `Flags`, whole.
-    pub flags: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub flags: Option<String>,
     /// `DO_EXCLUSIVE`: only one handle to this device may be open at a time.
-    pub exclusive: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exclusive: Option<bool>,
     /// Who may open it, when the descriptor could be read.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub security: Option<SecurityDescriptor>,
