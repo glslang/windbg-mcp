@@ -110,7 +110,7 @@ All `METHOD_BUFFERED` (no `METHOD_NEITHER` raw-pointer surface).
 
 ## 5. Openable gate — the device DACL
 
-> `driver_surface { "driver": "\Driver\mountmgr" }` answers sections 4 and 5 together,
+> `driver_surface { "driver": "\\Driver\\mountmgr" }` answers sections 4 and 5 together,
 > along with the dispatch table section 1 recovers and the image scan, each with its own
 > status. The steps are kept apart here because this page is about how each answer is
 > *derived*; the composite is what to reach for when you want them.

@@ -6920,7 +6920,11 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     // ---- the dispatch table, which came with the driver object ------------
     let dispatch = surface::dispatch_section(&fields, &mut locate);
     let unload = (fields.unload != 0).then(|| locate(fields.unload));
-    let module = locate(fields.image_base).module;
+    // **The whole coordinate, not just its module.** An address in no image and a lookup that did
+    // not answer are different facts, and `CodeLocation` is where they are told apart; taking
+    // `.module` alone threw the second away.
+    let image_at = locate(fields.image_base);
+    let module = image_at.module.clone();
 
     // ---- the devices -----------------------------------------------------
     let devices = driver_devices(e, &namespace, &fields, layout.pointer, deadline);
@@ -6980,7 +6984,11 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
 
     // ---- and what the image can do ---------------------------------------
     let hazards = match &module {
-        None => unattributed_image(attribution_halted.get(), fields.image_base),
+        None => unattributed_image(
+            attribution_halted.get(),
+            image_at.attribution_failed,
+            fields.image_base,
+        ),
         Some(module) => match hazards_of(e, module, deadline) {
             Ok(scan) => structured::HazardsSection {
                 status: match scan.stopped.is_some() {
@@ -7076,8 +7084,22 @@ fn driver_devices(
     // Then the paths, from one listing. **Keyed by address**, because a device's name in the
     // directory is not its identity -- two directories can hold the same name, and the address is
     // what says this entry is this device.
+    // **Not listed at all for a chain with no devices.** The listing exists to give devices a
+    // path, and `devices_are_whole` already ignores its completeness when there are none -- so on
+    // a slow kernel-debug transport this was a walk of a whole directory whose result is
+    // discarded, spending the deadline the IOCTL and hazard sections are about to need and
+    // leaving *those* partial over it.
     let mut paths: HashMap<u64, String> = HashMap::new();
-    let listing = namespace.objects_in(DEVICE_DIRECTORY).ok();
+    let listing = match chain.devices.is_empty() {
+        true => None,
+        false => namespace.objects_in(DEVICE_DIRECTORY).ok(),
+    };
+    // **"The listing ran and saw the whole directory", and nothing more.** For a chain with no
+    // devices it is `false` because no listing was attempted -- and that is harmless rather than
+    // wrong, because every consumer guards on there being devices first: `devices_are_whole` and
+    // the note below both short-circuit on an empty chain. An earlier version made this `true` for
+    // an empty chain "so it says the truthful thing", which no caller could observe -- a mutation
+    // deleting it changed no test, which is how the redundancy was noticed.
     let named_completely = listing
         .as_ref()
         .is_some_and(|listing| listing.is_complete());
@@ -7222,9 +7244,26 @@ const DEVICE: &str = "Device";
 /// loaded and was simply never asked about.
 fn unattributed_image(
     halted: Option<structured::WalkHalt>,
+    lookup_failed: bool,
     base: u64,
 ) -> structured::HazardsSection {
     match halted {
+        // **A lookup that errored is a third answer**, and the one this function was missing:
+        // `Attributor::locate` sets `attribution_failed` when `module_at` itself fails, without
+        // touching the halt cell, so that case fell through to "in no loaded module" -- blaming
+        // the target for a debugger call that did not answer. Same distinction as the halt, one
+        // step along, and the third time this branch has been wrong in the same direction.
+        None if lookup_failed => structured::HazardsSection {
+            status: structured::SectionStatus::Error,
+            note: Some(format!(
+                "the debugger's module lookup for {} did not answer, so this could not say which \
+                 image to scan -- which is not the same as the address being in none. Check the \
+                 kernel's symbols resolve (`set_symbol_path`, then `modules` on `nt`), or ask \
+                 `driver_hazards` for the module directly.",
+                structured::addr(base)
+            )),
+            hazards: None,
+        },
         Some(halt) => structured::HazardsSection {
             status: structured::SectionStatus::Partial,
             note: Some(format!(
@@ -8364,7 +8403,8 @@ mod tests {
     fn an_image_this_call_stopped_asking_about_is_not_one_in_no_module() {
         let base = 0xffff_f805_5ebf_0000;
 
-        let never_asked = super::unattributed_image(Some(structured::WalkHalt::Deadline), base);
+        let never_asked =
+            super::unattributed_image(Some(structured::WalkHalt::Deadline), false, base);
         assert_eq!(never_asked.status, structured::SectionStatus::Partial);
         let note = never_asked.note.unwrap_or_default();
         assert!(note.contains("ran out of time"), "{note}");
@@ -8374,14 +8414,14 @@ mod tests {
         );
 
         let interrupted =
-            super::unattributed_image(Some(structured::WalkHalt::Interrupted), base).note;
+            super::unattributed_image(Some(structured::WalkHalt::Interrupted), false, base).note;
         assert!(
             interrupted.unwrap_or_default().contains("was interrupted"),
             "a break and a deadline have different remedies and read differently"
         );
 
         // And the genuine case keeps its own answer.
-        let no_such_module = super::unattributed_image(None, base);
+        let no_such_module = super::unattributed_image(None, false, base);
         assert_eq!(
             no_such_module.status,
             structured::SectionStatus::Unavailable
@@ -8391,6 +8431,24 @@ mod tests {
                 .note
                 .unwrap_or_default()
                 .contains("is in no module")
+        );
+
+        // **A third answer, for a lookup that errored rather than answering.** `Attributor::locate`
+        // sets `attribution_failed` when `module_at` itself fails and leaves the halt cell alone,
+        // so without this the case fell into the branch above and reported the target as having no
+        // such module -- blaming it for a debugger call that did not answer. Three ways to have no
+        // module, three answers, and each sends a reader somewhere different.
+        let lookup_failed = super::unattributed_image(None, true, base);
+        assert_eq!(
+            lookup_failed.status,
+            structured::SectionStatus::Error,
+            "a call that did not answer is not the target being unable to"
+        );
+        let note = lookup_failed.note.unwrap_or_default();
+        assert!(note.contains("did not answer"), "{note}");
+        assert!(
+            !note.contains("is in no module"),
+            "and must not say the address is in none, which is the claim it cannot make: {note}"
         );
     }
 

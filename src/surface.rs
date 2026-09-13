@@ -491,9 +491,18 @@ pub(crate) fn device_gates(
         }
         // Polled per device, which is the whole reason this is a function rather than a loop at
         // the call site: the gate read below is several target reads, `MAX_DEVICES` times over.
-        let security = match stopped {
-            Some(why) => crate::device::Security::Unattempted(why),
-            None => gate_of(&fields),
+        //
+        // **A device with no descriptor field is answered even after the halt.** The chain pass
+        // read that field, so `Absent` is something already known rather than something this
+        // would have to go and look at -- reporting it as unattempted would say the survey does
+        // not know whether the device carries one when it does know, and would make the section
+        // partial over a read that was never owed. Matching on the field here rather than leaving
+        // it to `gate_of` is what makes "no target read after the halt" structural: `gate_of` is
+        // now called only when there is a descriptor to fetch.
+        let security = match (stopped, fields.security_descriptor) {
+            (_, None) => crate::device::Security::Absent,
+            (Some(why), Some(_)) => crate::device::Security::Unattempted(why),
+            (None, Some(_)) => gate_of(&fields),
         };
         if matches!(security, crate::device::Security::Failed { .. }) {
             unread_gates += 1;
@@ -1359,7 +1368,10 @@ mod tests {
         let gates = device_gates(
             &chain,
             |_| None,
-            |_| Some(gate_device(None)),
+            // **Carrying a descriptor**, or there would be nothing for the halt to prevent: a
+            // device with a null field is answered from what the chain walk already read, halt or
+            // no halt, which is the rule the test below this one pins.
+            |_| Some(gate_device(Some(0xdead))),
             |_| {
                 reads.set(reads.get() + 1);
                 crate::device::Security::Absent
@@ -1418,7 +1430,10 @@ mod tests {
             let gates = device_gates(
                 &[0x100],
                 |_| None,
-                |_| Some(gate_device(None)),
+                // **Carrying a descriptor**, or the halt never applies: a device with a null field
+                // is answered from what the chain walk already read, which is the neighbouring
+                // rule and is pinned by its own test.
+                |_| Some(gate_device(Some(0xdead))),
                 |_| crate::device::Security::Absent,
                 || Some(why),
             );
@@ -1442,6 +1457,49 @@ mod tests {
                 "and neither offers the reader both: {message}"
             );
         }
+    }
+
+    /// **A descriptor already known absent stays known, halt or no halt.**
+    ///
+    /// The chain pass reads the whole `_DEVICE_OBJECT`, `SecurityDescriptor` field included, so a
+    /// null one is a fact in hand rather than a read still owed. Reporting it as unattempted after
+    /// a halt would say the survey does not know whether the device carries a descriptor when it
+    /// does know -- and would make the section partial over a read that was never owed.
+    ///
+    /// Matching on the field in `device_gates` rather than leaving it to `gate_of` is also what
+    /// makes "no target read after the halt" structural: the closure is called only when there is
+    /// something to fetch, so the property does not rest on the closure promising not to read.
+    #[test]
+    fn a_descriptor_already_known_absent_is_not_made_unknown_by_a_halt() {
+        let asked = std::cell::Cell::new(0usize);
+        let gates = device_gates(
+            &[0x100],
+            |_| None,
+            |_| Some(gate_device(None)),
+            |_| {
+                asked.set(asked.get() + 1);
+                crate::device::Security::Absent
+            },
+            || Some(Halt::Deadline),
+        );
+
+        assert_eq!(asked.get(), 0, "there was nothing to fetch, so nothing was");
+        let why = gates.devices[0]
+            .security_absent
+            .as_deref()
+            .unwrap_or_default();
+        assert!(
+            why.contains("carries no security descriptor"),
+            "the field was read and was null, which is an answer: {why}"
+        );
+        assert!(
+            !why.contains("ran out of time"),
+            "and not a question this call failed to ask: {why}"
+        );
+        assert_eq!(
+            gates.unread_gates, 0,
+            "so it counts against nothing, and the section stays whole on its account"
+        );
     }
 
     /// **Only a descriptor that would not read counts against the section.**
