@@ -1073,7 +1073,7 @@ nobody re-derived it afterwards.
 **Where it picks up.** The `Security` enum and `render` in `src/device.rs`, and the
 `security_absent` field in `src/structured.rs`.
 
-## 69. [windbg-mcp] The callback-ACE round is wider than any device DACL measured here
+## 69. [windbg-mcp] Record what the ACE-kind rules were measured against
 
 **Repo:** `windbg-mcp`.
 
@@ -1094,22 +1094,24 @@ Measured the same day and not applied to the finding: across every distinct desc
 device in `\Device` on a 26100 guest -- 41 descriptors, 149 ACEs -- **every ACE is type `0x00`**.
 Not one callback ACE of any kind, let alone an object-callback one.
 
-- **Why deferred:** the code is right, so this is trimming rather than fixing, and it landed on a
-  branch that had already run eleven rounds. Raised by the maintainer as reading artificial, which
-  it is.
-- **What would close it:** drop the **object-ACE GUID fixture** in `sd.rs`'s
-  `a_callback_ace_is_conditional_only_when_it_carries_a_condition` -- which builds a GUID carrying
-  `artx` at the four bytes a miscomputed offset lands on, so as to pin a mutation of code guarding
-  an input domain nothing has been seen to produce. That fixture is the artificial part and is all
-  that should go. **Keep every classification as it is**, `0x10` included: `0x10` carries an
-  `ACCESS_MASK` at the documented offset whether or not Windows implements alarms, so naming it is
-  right independently of whether it is ever met, and `0x0b`/`0x0c` are implemented types whose
-  flag would otherwise be false wherever `sd.rs` is pointed at a non-device object. Removing a
-  correct classification because one machine's defaults did not exercise it would misreport a
-  custom descriptor, which is worse than the test it would save. Put the 149-of-149 figure in
-  `sd.rs` beside the ACE-kind rules, so the next finding in this family is weighed against it
-  rather than implemented.
-- **How it was found:** the maintainer, reading the round-ten commit and saying so.
+- **Why deferred:** the code is right and the tests are right, so nothing here is a fix. What is
+  left is writing the measurement down where the next reader of those rules will meet it.
+- **What would close it:** put the 149-of-149 figure in `sd.rs` beside the ACE-kind rules, with
+  the bound stated -- one machine's *defaults*, not the parser's input domain -- so the next
+  finding in this family is weighed against it rather than implemented, and so nobody reads the
+  measurement as licence to delete the handling.
+- **Two deletions were considered and both are rejected**, which is most of why this entry exists
+  rather than a commit. **The classifications stay**, `0x10` included: it carries an `ACCESS_MASK`
+  at the documented offset whether or not Windows implements alarms, so naming it is right
+  independently of whether it is ever met. **And the object-ACE GUID fixture stays**, which is a
+  reversal: this entry first proposed dropping it as the artificial part, and that contradicted
+  the paragraph above it in this same entry -- if an installer may put any documented ACE type in
+  a device's DACL, then an object ACE is valid input and the fixture covers a valid layout. It is
+  also the only thing standing under that rule: the `conditional`-widened mutation was **not**
+  caught by the suite until that construction existed, so deleting it restores an uncaught
+  mutation. A contrived fixture pinning a real rule beats no fixture.
+- **How it was found:** the maintainer, reading the round-ten commit and calling it artificial --
+  which it read as, and which turned out to be about the entry's framing rather than the test.
 
 **Where it picks up.** `AceKind::mask_is_access` and `read_ace` in `src/sd.rs`, and that test.
 
