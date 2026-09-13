@@ -6768,6 +6768,7 @@ fn device_layout(e: &DebugEngine, pointer: usize) -> Result<device::Layout, Fail
 /// [`crate::sd`] take bytes and have never seen an engine.
 fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<Output, Failed> {
     let _ = remaining(deadline, "the object namespace was walked")?;
+    let stop_walking = || matches!(e.interrupted(), Ok(true)) || Instant::now() >= deadline;
     // **One namespace for the whole call, rather than the `DebugEngine` convenience wrappers.**
     // Each of those derives the layout again -- a dozen type lookups -- and this resolves a link
     // per entry of a directory holding hundreds, so the wrappers would spend thousands of lookups
@@ -6784,8 +6785,14 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         )
     })?;
     let globals = e.object_globals().map_err(failed)?;
+    // **The caller's clock reaches inside the walk, not only around it.** Listing `\GLOBAL??`
+    // is a couple of hundred entries and several target reads apiece, which over a kernel
+    // debugging wire can outlast the whole call -- and a supervisor timeout abandons the *waiter*
+    // rather than this job, so an unstoppable enumeration goes on holding the session after
+    // nobody is waiting for it. Polled per entry and per chain link inside the walk.
     let namespace = dbgscope::object::Namespace::new(&memory, layout, globals)
-        .map_err(|why| object_failure("the object namespace", &why))?;
+        .map_err(|why| object_failure("the object namespace", &why))?
+        .halting(&stop_walking);
 
     // The path, with one hop through a symbolic link so that the name a user-mode caller knows
     // works as well as the device's own. **One hop rather than a chain**: `\DosDevices` is itself
@@ -6885,6 +6892,17 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         // directory holds, which the live-kernel differential caught as an off-by-one against
         // `!object` -- a number that satisfies no identity cannot be checked against anything.
         links_unnamed = listing.skipped();
+        // **A stopped enumeration is a prefix of the directory**, so what follows counts entries
+        // nobody looked at and the identity `examined + unnamed == what the directory holds` does
+        // not hold. Recorded as the halt it was, which makes the verdict `Partial` below and puts
+        // the reason in `stopped` -- where the two counts alone would say the search checked
+        // everything it saw, which is true and not what a reader needs to know.
+        if listing.halted && halted.is_none() {
+            halted = Some(match e.interrupted() {
+                Ok(true) => walk::Halt::Interrupted,
+                _ => walk::Halt::Deadline,
+            });
+        }
         let mut seen = 0usize;
         for entry in &listing.objects {
             if let Some(why) = stop() {

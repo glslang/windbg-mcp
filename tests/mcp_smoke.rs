@@ -14038,6 +14038,13 @@ fn a_device_security_query_on_a_live_kernel_agrees_with_the_debugger() {
         // Summing all three is what the first version of this did, and it overshot `!object` by
         // exactly the one link whose target failed -- which is how the double count was found.
         let count = |field: &str| data[field].as_u64().unwrap_or_default() as usize;
+        // The identity holds over a directory the walk reached the end of. A walk the clock
+        // stopped returns a prefix, and then the entries it never looked at are in neither count
+        // -- so `stopped` is the precondition rather than something to assert away.
+        assert!(
+            data["stopped"].is_null(),
+            "this run was stopped early, so the counts below describe a prefix: {data}"
+        );
         assert_eq!(
             count("links_examined") + count("links_unnamed"),
             entries,
