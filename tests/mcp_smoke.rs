@@ -9798,6 +9798,72 @@ fn an_ioctl_map_of_an_architecture_this_build_cannot_decode_is_refused() {
     );
 }
 
+/// **The composite needs the object namespace, and a dump has none -- so it is refused, and the
+/// refusal has to point somewhere that works.**
+///
+/// The sibling of the `device_security` test below, with one extra thing asserted that only this
+/// tool can get wrong. A composite's whole selling point is that a section which cannot answer
+/// does not take the others down with it, and the tempting mistake here is to apply that inside
+/// the tool and answer with four `unavailable` sections instead of a refusal. That would be a
+/// **successful** call reporting a driver with no dispatch table, no devices, no control codes and
+/// no sensitive imports -- which is exactly what a clean driver looks like.
+///
+/// So the per-section rule stops at the driver object: every section is read from something the
+/// driver object points at, so a driver object that will not resolve is the whole answer failing.
+///
+/// **Not the message text, for the reason the device test gives**: which refusal comes back
+/// depends on whether this bench's `nt` symbols resolved, so the wording is a statement about the
+/// machine it last ran on. Measured here 2026-09-13 this bench's symbols *do* resolve, and the
+/// refusal is the unreadable-globals one carrying the dump advice -- but a bench where they do not
+/// is refused earlier, by a message with no advice in it at all, and both are right.
+///
+/// So the advice is pinned by a **unit** test instead, where it is deterministic:
+/// `worker::tests::the_dump_advice_offers_no_tool_that_fails_for_the_reason_just_given`. What is
+/// asserted here is the category, and that no partial survey came back beside the refusal.
+#[test]
+fn a_driver_survey_against_a_dump_is_refused_rather_than_answered_with_four_empty_sections() {
+    let Some(sample) = native_sample_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let opened = server.call_tool("open_dump", json!({ "path": sample.path }), TARGET_STEP);
+    assert_no_error(&opened, "open_dump");
+    let session_id = session_id_of(&opened["result"]);
+
+    let response = server.call_tool(
+        "driver_surface",
+        json!({ "session_id": session_id, "driver": r"\Driver\mountmgr" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "driver_surface on a dump");
+    assert!(
+        is_tool_error(&response),
+        "a dump carries no namespace to reach a driver object through, so this is a refusal \
+         rather than an answer: {response}"
+    );
+    let data = &response["result"]["structuredContent"];
+    assert_eq!(
+        data["status"], "error",
+        "the refusal carries structured content, as the schema promises: {response}"
+    );
+    assert_eq!(
+        data["error"]["category"], "debugger",
+        "and it is about the target rather than the argument -- `invalid_argument` here would \
+         send a reader to check a driver name that was correct: {response}"
+    );
+    // The one thing this tool can get wrong that its three constituents cannot: answering.
+    assert!(
+        data.get("surface").is_none() && data.get("dispatch").is_none(),
+        "a refusal must not also carry a partial survey: {response}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
 /// **A dump has no object namespace to walk, and the refusal must be about the target rather than
 /// about the device name.**
 ///
@@ -13982,6 +14048,177 @@ fn kernel_scratch(server: &mut Server, session: &str) -> Option<KernelScratch> {
 ///
 /// Live-kernel only: this needs the object namespace, which a dump does not carry --
 /// `a_device_query_against_a_dump_is_refused_about_the_target_not_the_name` is the other half.
+/// **The composite must equal its parts**, checked against a live kernel and against an oracle
+/// that is somebody else's code.
+///
+/// This is the assertion a composite needs and its three constituents cannot supply. Each of them
+/// has its own oracle already -- `!devobj`'s descriptor, the published four-ACE DACL, the
+/// walkthroughs' IOCTL tiers -- and restating those here would test `ioctl_map` a second time
+/// rather than test that `driver_surface` **returns `ioctl_map`'s answer**. The failure that would
+/// hide is the one a composite is most likely to have: a section quietly built from something
+/// else, or from a second copy of the analysis that has drifted.
+///
+/// So the shape is a differential. `driver_surface` on `\Driver\mountmgr`, then `ioctl_map` and
+/// `driver_hazards` called **separately** on what the composite says the dispatch routine and the
+/// image are, and the embedded answers compared with the standalone ones as values.
+///
+/// Two things make that comparison meaningful rather than circular. The arguments to the
+/// standalone calls come from the composite's *own* report, so a composite that surveyed the
+/// wrong driver would compare its wrong answer against a wrong oracle and pass -- which is why the
+/// dispatch table is independently checked against `!drvobj`, an extension written by somebody
+/// else, before anything is compared. And the target is broken in throughout, so the two readings
+/// are of one state.
+///
+/// `mountmgr` rather than a deployed fixture: it is on every Windows kernel, it has a real device
+/// with a real DACL, and its control codes are published in
+/// [`driver-ioctl-walkthrough.md`](../docs/driver-ioctl-walkthrough.md).
+#[test]
+#[ignore = "live kernel tier: needs WINDBG_MCP_SMOKE_KERNEL"]
+fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
+    let Some(connection) = kernel_tier() else {
+        return;
+    };
+    let mut server = Server::spawn();
+    server.initialize(SUPPORTED_REVISIONS[0]);
+    with_live_kernel_session(&mut server, &connection, |server, session| {
+        const DRIVER: &str = r"\Driver\mountmgr";
+
+        let response = server.call_tool(
+            "driver_surface",
+            json!({ "session_id": session, "driver": DRIVER }),
+            TARGET_STEP,
+        );
+        assert_no_error(&response, "driver_surface");
+        assert!(
+            !is_tool_error(&response),
+            "mountmgr is on every Windows kernel: {}",
+            text_of(&response["result"])
+        );
+        let survey = &response["result"]["structuredContent"];
+        assert_eq!(survey["status"], "ok", "{survey}");
+
+        // ---- the driver object, against `!drvobj` ------------------------------------------
+        //
+        // Somebody else's extension, and the one oracle here that does not come from this code.
+        // Without it every comparison below could be self-consistent and wrong.
+        let drvobj = server.tool_text(
+            "driver_object",
+            json!({ "session_id": session, "name": DRIVER }),
+            TARGET_STEP,
+        );
+        let address = survey["address"].as_str().unwrap_or_default();
+        let bare = address.trim_start_matches("0x").trim_start_matches('0');
+        assert!(
+            drvobj
+                .to_lowercase()
+                .replace('`', "")
+                .contains(&bare.to_lowercase()),
+            "`!drvobj` does not name the driver object this surveyed ({address}): {drvobj}"
+        );
+        assert_eq!(
+            survey["module"], "mountmgr",
+            "the image comes from the driver object's own DriverStart, not a name match: {survey}"
+        );
+
+        // The IOCTL handler `!drvobj` prints, against the one this reports. `!drvobj <name> 7`
+        // prints the dispatch table with each major's routine, so the address has to appear.
+        let control = survey["dispatch"]["device_control"]["address"]
+            .as_str()
+            .expect("mountmgr handles IRP_MJ_DEVICE_CONTROL");
+        let control_bare = control.trim_start_matches("0x").trim_start_matches('0');
+        assert!(
+            drvobj
+                .to_lowercase()
+                .replace('`', "")
+                .contains(&control_bare.to_lowercase()),
+            "`!drvobj` does not show {control} as a dispatch routine: {drvobj}"
+        );
+
+        // ---- the IOCTL section is `ioctl_map`'s answer --------------------------------------
+        let standalone = server.call_tool(
+            "ioctl_map",
+            json!({ "session_id": session, "dispatch": control }),
+            TARGET_STEP,
+        );
+        assert_no_error(&standalone, "ioctl_map");
+        let map = &standalone["result"]["structuredContent"];
+        assert_eq!(map["status"], "ok", "{map}");
+        assert_eq!(
+            survey["ioctl"]["map"]["cases"], map["cases"],
+            "the composite's IOCTL section is not `ioctl_map`'s answer -- which is the one failure \
+             a composite is most likely to have, and the reason this test is a differential"
+        );
+        assert_eq!(survey["ioctl"]["map"]["case_count"], map["case_count"]);
+        assert_eq!(survey["ioctl"]["map"]["tables"], map["tables"]);
+
+        // ---- and the hazard section is `driver_hazards`' ------------------------------------
+        let standalone = server.call_tool(
+            "driver_hazards",
+            json!({ "session_id": session, "module": "mountmgr" }),
+            TARGET_STEP,
+        );
+        assert_no_error(&standalone, "driver_hazards");
+        let scan = &standalone["result"]["structuredContent"];
+        assert_eq!(scan["status"], "ok", "{scan}");
+        assert_eq!(
+            survey["hazards"]["hazards"]["sinks"], scan["sinks"],
+            "the composite's hazard section is not `driver_hazards`' answer"
+        );
+        assert_eq!(
+            survey["hazards"]["hazards"]["privileged"], scan["privileged"],
+            "nor its privileged instructions"
+        );
+
+        // ---- the device, against the tool that answers about one ----------------------------
+        //
+        // `\Device\MountPointManager` is mountmgr's, so it has to be on the chain -- and the gate
+        // reported here has to be the gate `device_security` reports, which is the same shared
+        // mapping rendered at a different indent.
+        const DEVICE: &str = r"\Device\MountPointManager";
+        let devices = survey["devices"]["devices"]
+            .as_array()
+            .expect("a device list");
+        let found = devices
+            .iter()
+            .find(|one| one["path"] == DEVICE)
+            .unwrap_or_else(|| {
+                panic!("mountmgr's own device is not on the chain it created: {survey}")
+            });
+
+        let standalone = server.call_tool(
+            "device_security",
+            json!({ "session_id": session, "device": DEVICE }),
+            TARGET_STEP,
+        );
+        assert_no_error(&standalone, "device_security");
+        let gate = &standalone["result"]["structuredContent"];
+        assert_eq!(gate["status"], "ok", "{gate}");
+        for field in [
+            "address",
+            "device_type",
+            "characteristics",
+            "secure_open",
+            "flags",
+            "exclusive",
+            "security",
+        ] {
+            assert_eq!(
+                found[field], gate[field],
+                "the composite and `device_security` disagree about `{field}` on {DEVICE}"
+            );
+        }
+
+        // And the one thing the composite deliberately does **not** carry, asserted so that a
+        // later change adding it silently is visible: the symbolic-link search.
+        assert!(
+            found.get("links").is_none() && found.get("link_search").is_none(),
+            "the composite omits the link search on purpose -- it lists a whole directory per \
+             device. If that changed, the TOOL_NOTES pointer at `device_security` is now wrong: \
+             {found}"
+        );
+    });
+}
+
 #[test]
 #[ignore = "live kernel tier: needs WINDBG_MCP_SMOKE_KERNEL"]
 fn a_device_security_query_on_a_live_kernel_agrees_with_the_debugger() {

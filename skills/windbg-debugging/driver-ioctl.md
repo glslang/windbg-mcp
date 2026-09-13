@@ -48,6 +48,18 @@ A control code is a packed 32-bit value:
 Works on a **local** kernel (`attach_kernel_local`) — it is read-only, but enumeration only
 reads.
 
+**`driver_surface { "driver": "\\Driver\\mydriver" }` does steps 1–4 below in one call** and is
+the place to start on a live kernel: the dispatch table, every device the driver created with the
+gate on each, the control codes its IOCTL handler accepts, and its sensitive imports. Each section
+carries its own status, so a dispatch routine that will not disassemble still leaves the import and
+security evidence standing.
+
+Do the steps by hand when you are on a **dump** — the composite needs the object namespace and a
+kernel minidump has none, while `driver_hazards` and `ioctl_map` read the image and work there —
+when you already have the dispatch address and want only the map, or when you want the symbolic
+links, which the composite leaves to `device_security` because that search lists a whole directory
+per device.
+
 1. **Find the dispatch routine.** `driver_object { "name": "mydriver" }` (`!drvobj <name> 7`)
    dumps the `MajorFunction` table. Index **`0x0e`** (`IRP_MJ_DEVICE_CONTROL`) is the IOCTL
    dispatch handler's address.
