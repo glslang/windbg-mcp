@@ -2667,6 +2667,14 @@ pub struct AccessEntry {
     /// this is the reading, and a reading is not an identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// True when this entry is **inherit-only**: it exists to be inherited and is not applied
+    /// to the object carrying it.
+    ///
+    /// So it decides nothing about who may open this device, and [`Self::reads`] and
+    /// [`Self::writes`] are false whatever the mask holds. [`Self::rights`] still names the mask,
+    /// which is what a child would be given.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub inherit_only: bool,
     /// True when this entry applies only if a condition holds.
     ///
     /// A callback ACE carries an expression the kernel evaluates against the caller's token, and

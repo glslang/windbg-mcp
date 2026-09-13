@@ -1941,13 +1941,14 @@ const MODEL_VISIBLE_CEILING: usize = 91_000;
 /// cleanest this arithmetic has ever come out and is itself the answer to the question this
 /// ceiling exists to force. It shares no output type with the two driver schemas beside it: a
 /// device's gate is a descriptor, an access list and a symbolic link, none of which appear
-/// anywhere else in this surface, so there was nothing available to multiply. 3,853 B of the
-/// 5,379 is `outputSchema`, which no model reads. The new figure leaves 5,284 B, which is 2.2%.
+/// anywhere else in this surface, so there was nothing available to multiply. 3,887 B of the
+/// 5,413 is `outputSchema`, which no model reads. The new figure leaves 5,250 B, which is 2.2%.
 ///
-/// **The tool's own figure moved three times under review while this paragraph stood**, 5,241 ->
-/// 5,304 -> 5,346 -> 5,379, each time a field was split or added to the output schema. That is the ordinary way
-/// it moves and the reason the instruction is to re-derive rather than quote: the headroom is what
-/// this guards, and it absorbed both without the ceiling needing to move again.
+/// **The tool's figure moved on four consecutive review rounds while this paragraph stood**, from
+/// 5,241 to 5,413, every time a field was split or added to the output schema. The intermediate
+/// values are deliberately not listed: a running log of them is what this file keeps getting
+/// wrong, so re-derive from the golden rather than reading any figure here as current. What the
+/// ceiling guards is the headroom, and it absorbed all four without needing to move again.
 const WIRE_CEILING: usize = 242_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
