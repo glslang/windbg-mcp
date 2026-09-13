@@ -6713,6 +6713,12 @@ fn object_failure(what: &str, why: &dbgscope::object::ObjectError) -> Failed {
         ObjectError::BadPath { .. }
         | ObjectError::NotFound { .. }
         | ObjectError::NotADirectory { .. } => structured::ErrorCategory::InvalidArgument,
+        // **`NotFoundInPart` is the target's, not the argument's**, which is the whole reason
+        // dbgscope reports it apart from `NotFound`. That one says the directory read in full and
+        // this name is not in it, so the name is what to fix; this one says some of the directory
+        // could not be read, so the object asked for may be one of the entries nobody could name.
+        // Telling that caller to correct a name would be advice about a name that is very likely
+        // right.
         _ => structured::ErrorCategory::Debugger,
     };
     let advice = match why {
@@ -6754,6 +6760,7 @@ fn device_layout(e: &DebugEngine, pointer: usize) -> Result<device::Layout, Fail
         characteristics: of("Characteristics")?,
         flags: of("Flags")?,
         driver: of("DriverObject")?,
+        security: of("SecurityDescriptor")?,
     })
 }
 
@@ -6836,11 +6843,18 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
             )
         })?;
 
-    // The descriptor hangs off the object *header*, which the namespace walk already read and
-    // masked the fast-reference count out of. Three outcomes, and they are kept apart for the
-    // reason [`device::Security`] gives: an object with no descriptor and a descriptor that would
-    // not read are different facts about who may open this.
-    let security = match object.security_descriptor {
+    // **The descriptor is the device object's own, not its object header's**, which is the one
+    // thing about this tool that a reader should check the code against. Every other object in
+    // the namespace keeps its descriptor in the header, and `KernelObject` hands that one over
+    // ready-masked -- so using it here is the natural thing to do and is wrong: the `Device`
+    // object type's `SecurityProcedure` is `nt!IopGetSetSecurityObject`, which keeps the
+    // descriptor in the device object, leaving the header's empty. `crate::device`'s module docs
+    // carry the measurement. Reading the header's reports every device on such a build as
+    // carrying no descriptor, which is the most permissive answer there is.
+    //
+    // Three outcomes, kept apart for the reason [`device::Security`] gives: a device with no
+    // descriptor and a descriptor that would not read are different facts about who may open it.
+    let security = match fields.security_descriptor {
         None => device::Security::Absent,
         Some(at) => match sd::read_descriptor(at, memory) {
             Ok(descriptor) => device::Security::Read { at, descriptor },
@@ -6861,13 +6875,21 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         }
     };
     let mut links = Vec::new();
+    let mut links_unnamed = 0usize;
     let mut links_unread = 0usize;
     let mut examined = None;
     let mut halted = None;
     let mut search = structured::LinkSearch::Unavailable;
-    if let Ok(entries) = namespace.objects_in(LINK_DIRECTORY) {
+    if let Ok(listing) = namespace.objects_in(LINK_DIRECTORY) {
+        // **Counted apart from the links whose target would not read, because the two sit in
+        // different denominators.** An entry the namespace could not name never reaches the loop
+        // below, so it is not among `examined`; a link whose target will not read is examined and
+        // then fails. Adding them into one figure made `examined + unchecked` exceed what the
+        // directory holds, which the live-kernel differential caught as an off-by-one against
+        // `!object` -- a number that satisfies no identity cannot be checked against anything.
+        links_unnamed = listing.skipped();
         let mut seen = 0usize;
-        for entry in &entries {
+        for entry in &listing.objects {
             if let Some(why) = stop() {
                 halted = Some(why);
                 break;
@@ -6908,6 +6930,7 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         links,
         link_search: search,
         links_examined: examined,
+        links_unnamed,
         links_unread,
         stopped: halted,
     };
@@ -7868,6 +7891,21 @@ fn ",
                 rest: "Deeper".into(),
             }),
             argument
+        );
+
+        // **And this one, which reads like the caller's and is not.** `NotFoundInPart` says the
+        // name is not among the directory entries that could be read *and some could not be*, so
+        // the object asked for may be one of those. Categorising it beside `NotFound` would send
+        // a reader to correct a device name that is very likely right, which is the mistake the
+        // dbgscope variant exists to make impossible.
+        assert_eq!(
+            category(&ObjectError::NotFoundInPart {
+                directory: "Device".into(),
+                component: "Nope".into(),
+                skipped: 2,
+            }),
+            target,
+            "an absence this cannot vouch for is the target's failure, not the argument's"
         );
 
         // And the rest, which are the target's: nothing the caller types changes them.
