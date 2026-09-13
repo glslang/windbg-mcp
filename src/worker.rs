@@ -6988,68 +6988,70 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     // kernel's stub for a major this driver does not handle, or a filter forwarding into the
     // driver below it; mapping either would report another image's control codes as this
     // driver's.
-    let ioctl = match attribution_stop(e, deadline) {
-        Some(halt) => structured::IoctlSection {
+    let ioctl = if let Some(halt) = attribution_stop(e, deadline) {
+        structured::IoctlSection {
             status: structured::SectionStatus::Error,
             note: Some(not_started("IOCTL", halt)),
             map: None,
-        },
-        None => match dispatch.device_control.as_ref().map(|at| &at.address) {
-        None => structured::IoctlSection {
-            status: structured::SectionStatus::Unavailable,
-            note: Some(
-                "this driver's `MajorFunction[0x0e]` is null, so it has no IOCTL dispatch routine \
-                 to map."
-                    .to_string(),
-            ),
-            map: None,
-        },
-        Some(address) => match fields.device_control().filter(|at| fields.owns(*at)) {
+        }
+    } else {
+        match dispatch.device_control.as_ref().map(|at| &at.address) {
             None => structured::IoctlSection {
                 status: structured::SectionStatus::Unavailable,
-                note: Some(format!(
-                    "this driver's IOCTL handler is at {address}, which is outside its own image \
-                     -- the kernel's stub for a major function it does not handle, or a filter \
-                     forwarding to the driver below it. Mapping it would report another image's \
-                     control codes as this driver's. `ioctl_map` takes that address directly if \
-                     it is wanted anyway."
-                )),
+                note: Some(
+                    "this driver's `MajorFunction[0x0e]` is null, so it has no IOCTL dispatch routine \
+                     to map."
+                        .to_string(),
+                ),
                 map: None,
             },
-            Some(at) => match ioctl_map_of(e, &structured::addr(at), deadline) {
-                Ok(map) => structured::IoctlSection {
-                    // A map that stopped early says so in its own `stopped`/`cap_hit`/`unsettled`
-                    // fields, which are richer than this one -- so the section is `partial` and
-                    // points at them rather than restating them worse.
-                    status: match map.stopped.is_some() || map.cap_hit || map.unsettled {
-                        true => structured::SectionStatus::Partial,
-                        false => structured::SectionStatus::Ok,
-                    },
-                    note: (map.stopped.is_some() || map.cap_hit || map.unsettled).then(|| {
-                        "the map did not run to completion; its own `stopped`, `cap_hit` and \
-                         `unsettled` fields say which, and what each one costs the answer."
-                            .to_string()
-                    }),
-                    map: Some(map),
-                },
-                Err(why) => structured::IoctlSection {
-                    status: structured::SectionStatus::Error,
-                    note: Some(why.message.clone()),
+            Some(address) => match fields.device_control().filter(|at| fields.owns(*at)) {
+                None => structured::IoctlSection {
+                    status: structured::SectionStatus::Unavailable,
+                    note: Some(format!(
+                        "this driver's IOCTL handler is at {address}, which is outside its own image \
+                         -- the kernel's stub for a major function it does not handle, or a filter \
+                         forwarding to the driver below it. Mapping it would report another image's \
+                         control codes as this driver's. `ioctl_map` takes that address directly if \
+                         it is wanted anyway."
+                    )),
                     map: None,
                 },
+                Some(at) => match ioctl_map_of(e, &structured::addr(at), deadline) {
+                    Ok(map) => structured::IoctlSection {
+                        // A map that stopped early says so in its own `stopped`/`cap_hit`/`unsettled`
+                        // fields, which are richer than this one -- so the section is `partial` and
+                        // points at them rather than restating them worse.
+                        status: match map.stopped.is_some() || map.cap_hit || map.unsettled {
+                            true => structured::SectionStatus::Partial,
+                            false => structured::SectionStatus::Ok,
+                        },
+                        note: (map.stopped.is_some() || map.cap_hit || map.unsettled).then(|| {
+                            "the map did not run to completion; its own `stopped`, `cap_hit` and \
+                             `unsettled` fields say which, and what each one costs the answer."
+                                .to_string()
+                        }),
+                        map: Some(map),
+                    },
+                    Err(why) => structured::IoctlSection {
+                        status: structured::SectionStatus::Error,
+                        note: Some(why.message.clone()),
+                        map: None,
+                    },
+                },
             },
-        },
-        },
+            }
     };
 
     // ---- and what the image can do ---------------------------------------
-    let hazards = match attribution_stop(e, deadline) {
-        Some(halt) => structured::HazardsSection {
+    let hazards = if let Some(halt) = attribution_stop(e, deadline) {
+        structured::HazardsSection {
             status: structured::SectionStatus::Error,
             note: Some(not_started("hazard", halt)),
             hazards: None,
-        },
-        None => match &module {
+        }
+    } else {
+        match &module {
             None => unattributed_image(
                 attribution_halted.get(),
                 image_at.attribution_failed,
@@ -7063,7 +7065,7 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                     },
                     note: scan.stopped.is_some().then(|| {
                         "the scan stopped early; its own `stopped` field says why, and its \
-                     `unreadable` list says which ranges went unscanned."
+                         `unreadable` list says which ranges went unscanned."
                             .to_string()
                     }),
                     hazards: Some(scan),
@@ -7074,7 +7076,7 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                     hazards: None,
                 },
             },
-        },
+        }
     };
 
     let report = structured::DriverSurface {
