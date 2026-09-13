@@ -423,6 +423,101 @@ pub(crate) fn device_chain(
     Chain { devices, stopped }
 }
 
+/// The major functions, as `wdm.h` names them, index `0x00` through `IRP_MJ_MAXIMUM_FUNCTION`.
+///
+/// **Published and used as published**, the judgement [`IRP_MJ_DEVICE_CONTROL`] records. These are
+/// labels for a reader, never something this indexes *by*: how many entries a table has is read
+/// off the target, and a table longer than this list is reported with the extra entries numbered
+/// rather than dropped. The two cannot fall out of step and hide it, because the length that
+/// matters comes from somewhere else entirely.
+const MAJOR_NAMES: [&str; 28] = [
+    "IRP_MJ_CREATE",
+    "IRP_MJ_CREATE_NAMED_PIPE",
+    "IRP_MJ_CLOSE",
+    "IRP_MJ_READ",
+    "IRP_MJ_WRITE",
+    "IRP_MJ_QUERY_INFORMATION",
+    "IRP_MJ_SET_INFORMATION",
+    "IRP_MJ_QUERY_EA",
+    "IRP_MJ_SET_EA",
+    "IRP_MJ_FLUSH_BUFFERS",
+    "IRP_MJ_QUERY_VOLUME_INFORMATION",
+    "IRP_MJ_SET_VOLUME_INFORMATION",
+    "IRP_MJ_DIRECTORY_CONTROL",
+    "IRP_MJ_FILE_SYSTEM_CONTROL",
+    "IRP_MJ_DEVICE_CONTROL",
+    "IRP_MJ_INTERNAL_DEVICE_CONTROL",
+    "IRP_MJ_SHUTDOWN",
+    "IRP_MJ_LOCK_CONTROL",
+    "IRP_MJ_CLEANUP",
+    "IRP_MJ_CREATE_MAILSLOT",
+    "IRP_MJ_QUERY_SECURITY",
+    "IRP_MJ_SET_SECURITY",
+    "IRP_MJ_POWER",
+    "IRP_MJ_SYSTEM_CONTROL",
+    "IRP_MJ_DEVICE_CHANGE",
+    "IRP_MJ_QUERY_QUOTA",
+    "IRP_MJ_SET_QUOTA",
+    "IRP_MJ_PNP",
+];
+
+/// One major function as `0x0e IRP_MJ_DEVICE_CONTROL`.
+///
+/// An index past [`MAJOR_NAMES`] is numbered and **not** named, rather than being dropped or
+/// given a neighbour's name: a build with a longer table is a thing to notice, and a made-up label
+/// on the entry that would say so is the one answer worse than no label.
+fn major_label(index: usize) -> String {
+    match MAJOR_NAMES.get(index) {
+        Some(name) => format!("{index:#04x} {name}"),
+        None => format!("{index:#04x}"),
+    }
+}
+
+/// The dispatch table as a report, grouped by the routine each major function reaches.
+///
+/// `locate` turns an address into a coordinate; in the worker it is the module attributor, and in
+/// a test it is whatever the test wants, which is what keeps this engine-free.
+///
+/// **Every entry is accounted for, including the null ones.** The I/O manager fills an unhandled
+/// major with its own stub rather than leaving it empty, so a null entry is a driver object that
+/// has been written to -- exactly the thing not to quietly drop.
+pub(crate) fn dispatch_section(
+    driver: &Driver,
+    mut locate: impl FnMut(u64) -> crate::structured::CodeLocation,
+) -> crate::structured::DispatchSection {
+    // Grouped in the order each handler is **first** reached, so the table reads top-down the way
+    // the driver object holds it. A map keyed by address would order by hash, which for a report
+    // whose whole value is its shape is no order at all.
+    let mut groups: Vec<(u64, Vec<usize>)> = Vec::new();
+    for (index, &handler) in driver.major_function.iter().enumerate() {
+        match groups.iter_mut().find(|(at, _)| *at == handler) {
+            Some((_, majors)) => majors.push(index),
+            None => groups.push((handler, vec![index])),
+        }
+    }
+    let handlers = groups
+        .into_iter()
+        .map(|(at, majors)| crate::structured::DispatchHandler {
+            location: locate(at),
+            majors: majors.into_iter().map(major_label).collect(),
+            owned: driver.owns(at),
+        })
+        .collect();
+    crate::structured::DispatchSection {
+        // The table is read as part of the driver object, so having one at all means it read.
+        status: crate::structured::SectionStatus::Ok,
+        note: None,
+        handlers,
+        major_count: driver.major_function.len(),
+        // **Absent for a null entry rather than a coordinate at zero.** `device_control` is what a
+        // caller feeds to `ioctl_map`, and an address of zero is not something to feed anything.
+        device_control: driver
+            .device_control()
+            .filter(|at| *at != 0)
+            .map(&mut locate),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

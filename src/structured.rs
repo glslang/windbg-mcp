@@ -2895,6 +2895,209 @@ pub struct DeviceSecurity {
     pub stopped: Option<WalkHalt>,
 }
 
+// ---- the whole of a driver's surface --------------------------------------
+
+/// How much of one section of a [`DriverSurface`] came back.
+///
+/// **Four answers rather than a flag, because a caller does something different about each.**
+/// `Partial` has something in it and is missing something; `Unavailable` is a section this target
+/// cannot answer at all, which is not a fault; `Error` is one that should have answered and did
+/// not. Folding the last two together is the tempting mistake -- it would report a kernel minidump
+/// having no object namespace as a failure of this call, and send a reader to debug the server.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SectionStatus {
+    /// Everything this section reports was read.
+    Ok,
+    /// Some of it was. What is here is real; what is missing is named in the section's `note`.
+    Partial,
+    /// This target cannot answer it -- a dump with no namespace, a driver with no devices to read.
+    /// **Not a failure**, and the `note` says which.
+    Unavailable,
+    /// It should have answered and did not.
+    Error,
+}
+
+/// One distinct dispatch routine, and every major function that reaches it.
+///
+/// **Grouped by handler rather than listed per major**, which is not only compression: a driver
+/// object has 28 entries and most point at one stub, so a flat list buries the two or three
+/// addresses that are this driver's in twenty-odd repetitions of a kernel address. Grouping makes
+/// the shape of the table the thing you read -- and it invents no judgement about which entry is
+/// "the stub", because no entry is dropped.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DispatchHandler {
+    /// Where the handler is.
+    pub location: CodeLocation,
+    /// The major functions reaching it, as `0x0e IRP_MJ_DEVICE_CONTROL`. The names are `wdm.h`'s
+    /// and are used as published, a major function's index being driver ABI.
+    pub majors: Vec<String>,
+    /// Whether this address is inside **this driver's own image**.
+    ///
+    /// The half a reader acts on. A handler outside the image is the kernel's stub for a major
+    /// this driver does not handle, or a filter forwarding into the driver below it; either way
+    /// it is not code `driver_hazards` scanned or `ioctl_map` can map.
+    pub owned: bool,
+}
+
+/// A driver's dispatch table.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DispatchSection {
+    pub status: SectionStatus,
+    /// What is missing or why, when anything is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The distinct handlers, in the order their lowest major function appears.
+    pub handlers: Vec<DispatchHandler>,
+    /// How many major functions the table holds on this target -- **derived from the target**,
+    /// not the 28 `wdm.h` has said for decades. See `crate::surface::Layout::majors`.
+    pub major_count: usize,
+    /// `MajorFunction[0x0e]`, the IOCTL handler, which is what `ioctl_map` takes.
+    ///
+    /// Absent where the entry is null. Present and `owned: false` on the matching handler is the
+    /// ordinary shape of a driver that does not handle IOCTLs at all.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub device_control: Option<CodeLocation>,
+}
+
+/// One device on a driver's chain, with the gate that decides who may open it.
+///
+/// **The same fields `device_security` answers with, minus the symbolic-link search**, and that
+/// omission is a decision rather than a shortfall: the search lists a whole directory per device,
+/// so running it down a chain would multiply the most expensive part of this by the device count.
+/// `device_security` on one path is where the links are.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SurfaceDevice {
+    /// The `_DEVICE_OBJECT` itself, which is what `device_object` takes.
+    pub address: String,
+    /// Its path, where the searched directory holds it under one.
+    ///
+    /// **Absent covers two different things and does not distinguish them**, which is why
+    /// [`DevicesSection::named_in`] says what was searched: a device the object manager filed
+    /// under no name at all, and one filed in some *other* directory. Both are common -- 66 of the
+    /// 231 devices on a measured 26100 guest carry no name -- and telling them apart needs the
+    /// object header rather than a directory listing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// `DeviceType`, as the number it is. `decode_ioctl` names the same field of a control code.
+    pub device_type: String,
+    /// `Characteristics`, whole.
+    pub characteristics: String,
+    /// `FILE_DEVICE_SECURE_OPEN`, the one characteristic that changes who may open this.
+    pub secure_open: bool,
+    /// `Flags`, whole.
+    pub flags: String,
+    /// `DO_EXCLUSIVE`: only one handle to this device may be open at a time.
+    pub exclusive: bool,
+    /// Who may open it, when the descriptor could be read.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security: Option<SecurityDescriptor>,
+    /// Why there is no descriptor above, when there is none. Carries the two outcomes
+    /// [`DeviceSecurity::security_absent`] does, told apart the same way: by the reason string,
+    /// never by the field being present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub security_absent: Option<String>,
+}
+
+/// Every device a driver created.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DevicesSection {
+    pub status: SectionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// The chain, head first, in the order the driver object holds it.
+    pub devices: Vec<SurfaceDevice>,
+    /// How many were found, exact however many are listed.
+    pub device_count: usize,
+    /// The directory searched to give the devices above a path.
+    ///
+    /// Here rather than implied, for the reason [`DeviceSecurity::link_directory`] is named: a
+    /// device with no `path` is one *this directory* does not hold, and a reader cannot tell what
+    /// that rules out without knowing what was looked in.
+    pub named_in: String,
+    /// How many devices that search gave no path.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub unnamed: usize,
+}
+
+/// The control codes the driver's IOCTL handler accepts.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct IoctlSection {
+    pub status: SectionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// `ioctl_map`'s own answer, whole and unaltered.
+    ///
+    /// **Embedded rather than digested.** A summary here would be a second shape saying what the
+    /// map already says, kept in step by hand -- and the point of a composite is that one call
+    /// answers, which a digest sending the caller back for the detail does not.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub map: Option<IoctlMap>,
+}
+
+/// What the driver's image can do.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct HazardsSection {
+    pub status: SectionStatus,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
+    /// `driver_hazards`'s own answer, whole and unaltered, for the reason
+    /// [`IoctlSection::map`] gives.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hazards: Option<DriverHazards>,
+}
+
+/// Everything this server can say about one driver, from its driver object outward.
+///
+/// # Why the sections answer separately
+///
+/// The four are read from **different things** -- a dispatch table and a device chain out of pool,
+/// a control-code map out of the driver's code, an import table out of its image -- and they fail
+/// independently. A dispatch routine that will not disassemble says nothing about whether the
+/// import table read, and a device whose descriptor is paged out says nothing about either.
+///
+/// So there is no overall "did this work". Each section carries its own [`SectionStatus`], and the
+/// rule that shape exists to enforce is that **a failed dispatch recovery must not discard import
+/// or security evidence**: the expensive, fragile analysis is the code one, and the two that most
+/// often still answer are the two a reader most often wants.
+///
+/// # What it needs
+///
+/// A **live kernel target**. A driver object is in pool and is reached by walking the object
+/// namespace, and a kernel minidump captures neither -- the same boundary `device_security` has,
+/// and for the same reason. `driver_hazards` and `ioctl_map` read the *image* and do answer on a
+/// dump; this is the tool that joins them to the object, and the object is what is missing there.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DriverSurface {
+    /// Every image the locations below name, with the identity they are joined in. The same split
+    /// [`Reachability`] and [`IoctlMap`] make, and for the same reason.
+    pub images: Vec<ImageRef>,
+    /// The object path this answers about, after a bare name was resolved.
+    pub driver: String,
+    /// The `_DRIVER_OBJECT` itself, which is what `driver_object` takes.
+    pub address: String,
+    /// `DriverName` as the object carries it, which need not match the path it was found under.
+    ///
+    /// Worth comparing with [`Self::driver`] rather than assuming they agree: the name is what the
+    /// driver told the I/O manager, and the path is where the object manager filed it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// The image this driver object was built for, from its own `DriverStart`/`DriverSize` --
+    /// **not** a module matched by name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub module: Option<String>,
+    pub image_base: String,
+    pub image_size: String,
+    /// `DriverUnload`, where the driver supplied one. Absent is the ordinary state of a driver
+    /// that cannot be unloaded, and is not a failure to read it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unload: Option<CodeLocation>,
+    pub dispatch: DispatchSection,
+    pub devices: DevicesSection,
+    pub ioctl: IoctlSection,
+    pub hazards: HazardsSection,
+}
+
 /// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.
 ///
 /// Every field is `!analyze`'s own, extracted from its summary block. They are here because they
