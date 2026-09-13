@@ -6724,7 +6724,13 @@ fn object_failure(what: &str, why: &dbgscope::object::ObjectError) -> Failed {
         | ObjectError::Unavailable { .. } => {
             " A kernel minidump carries no object namespace -- its root directory, the type table \
              and the header cookie all read as unavailable -- so this tool needs a live kernel \
-             target. `driver_object` and `device_object` work on a dump."
+             target. `driver_object` and `device_object` resolve their argument through that \
+             same namespace and do not answer there either -- and `!drvobj` given a name it \
+             cannot resolve evaluates it as an expression instead, so a module name comes back \
+             as that module's base, reported as not being a driver object. What a minidump does \
+             still serve is the **image**: `driver_hazards` scans one, `ioctl_map` maps a \
+             dispatch routine given its address, and `modules` and `read_memory` are \
+             unaffected."
         }
         _ => "",
     };
@@ -7640,6 +7646,58 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    /// **A refusal must not offer a fallback that fails for the reason it just gave.**
+    ///
+    /// `object_failure`'s advice ended `"`driver_object` and `device_object` work on a dump."`
+    /// until 2026-09-13. Measured against the checked-in `docs/samples/081226-2187-01.dmp`, both
+    /// fail there, and fail *identically* to the tool they were offered as an escape from:
+    /// `Unable to get value of ObpRootDirectoryObject`, because both resolve their argument
+    /// through the very namespace the refusal is about. So a caller told a device query needs a
+    /// live kernel was sent to two more tools that need one, with nothing saying so.
+    ///
+    /// The second half is worse than a refusal. `!drvobj mountmgr 7`, given a name it cannot
+    /// resolve, evaluates it as an **expression** instead -- so it answered with mountmgr's image
+    /// base (`fffff8055ebf0000`, whose first bytes are `MZ`) reported as `is not a driver
+    /// object`. That is a wrong answer wearing a refusal's clothes, and the advice was what sent
+    /// a reader to it.
+    ///
+    /// **What is pinned here is the rule, not that sentence** -- the lesson of
+    /// `a-regression-test-written-from-the-last-mistake`, where pinning the wording a reviewer
+    /// objected to passed the next variant of the same error. The rule is that a namespace-
+    /// resolving tool may be *named* in this advice, since saying "not that one either" is useful,
+    /// but never offered as something that answers. The check below is the closest mechanical
+    /// form of that: the two measured tools appear only alongside the clause that rules them out,
+    /// and at least one tool that does answer on a dump is named.
+    #[test]
+    fn the_dump_advice_offers_no_tool_that_fails_for_the_reason_just_given() {
+        let advice = super::object_failure(
+            "\\Device\\MountPointManager",
+            &dbgscope::object::ObjectError::Unreadable { at: 0, len: 8 },
+        )
+        .message;
+
+        // Named as things that answer here, and measured doing so on that sample.
+        for works in ["driver_hazards", "ioctl_map"] {
+            assert!(
+                advice.contains(works),
+                "the advice must name something that does answer on a dump, and `{works}` was \
+                 measured doing so: {advice}"
+            );
+        }
+
+        // And the two that do not must arrive with the clause that says they do not. Without it
+        // this is the sentence that shipped.
+        for fails in ["driver_object", "device_object"] {
+            if advice.contains(fails) {
+                assert!(
+                    advice.contains("do not answer there either"),
+                    "`{fails}` resolves through the same namespace, so naming it without saying \
+                     it fails here sends a caller to a second copy of this refusal: {advice}"
+                );
+            }
+        }
+    }
+
     use dbgscope::pool::WalkStalls;
 
     use super::*;
