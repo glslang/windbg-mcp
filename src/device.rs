@@ -261,14 +261,22 @@ pub(crate) enum Security {
     Absent,
     /// It carries one at this address and those bytes would not read.
     Failed { at: u64, why: crate::sd::SdError },
-    /// Nobody looked: the call that would have read it stopped first.
+    /// It carries one at this address and nobody read those bytes: the call stopped first.
     ///
     /// **A fourth outcome, and it belongs here rather than in a field of its own** -- unlike "the
     /// device object would not read", which is about the object and has one, this is about the
     /// descriptor, which is what [`security_absent`] answers for. `device_security` cannot reach
     /// it: that tool reads one device and always attempts it. `driver_surface` can, its gate pass
     /// being a second walk over a chain on the caller's clock.
-    Unattempted(crate::walk::Halt),
+    ///
+    /// **It carries `at`, and that is the property the whole enum now has**: every variant holds
+    /// everything known at the moment it was built. This one held only the halt for one round, and
+    /// its sentence therefore said whether the device carries a descriptor was unanswered -- when
+    /// the chain pass had already read the field and knew both that it does and where. Four
+    /// consecutive review rounds landed on this seam, each one a different fact the gate pass
+    /// still had and the report gave away; with `at` here there is no known fact left for a
+    /// variant to drop, which is the class closed rather than the fourth instance patched.
+    Unattempted { at: u64, why: crate::walk::Halt },
 }
 
 /// Everything an answer about one device is made of, before it is a report.
@@ -588,12 +596,14 @@ pub(crate) fn security_absent(security: &Security) -> Option<String> {
         Security::Failed { at, why } => Some(format!(
             "the descriptor at {at:#018x} could not be read: {why}"
         )),
-        // **Not "this device has no descriptor".** Nothing was read either way, and the remedy is
-        // this call's clock rather than anything about the device.
-        Security::Unattempted(halt) => Some(format!(
-            "this survey {} before this device's descriptor was read, so whether it carries one \
-             is not something this answered",
-            halt.phrase()
+        // **Presence and address are known; only the bytes are not.** The previous wording said
+        // "whether it carries one is not something this answered", which gives away two facts the
+        // chain pass had already established -- and reads as the permissive case, an object with
+        // no descriptor, rather than as a guarded one this call ran out of time to decode.
+        Security::Unattempted { at, why } => Some(format!(
+            "the descriptor at {at:#018x} was not read: this survey {} first. The device does \
+             carry one -- what it grants is what went unanswered",
+            why.phrase()
         )),
     }
 }
