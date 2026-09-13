@@ -1931,14 +1931,18 @@ const MODEL_VISIBLE_CEILING: usize = 91_000;
 /// than a product. It is the larger of the two driver schemas because a case carries a decoded
 /// code, two coordinates and its evidence. The new figure leaves 5,194 B, which is 2.2%.
 ///
-/// **236,000 -> 242,000 for `device_security`** (2026-09-12), the third of those three. The payload
-/// went 231,336 -> 236,578, a difference of 5,242: the tool is 5,241 B of wire and the remaining
-/// byte is the array's own comma. **Nothing else moved at all** -- not one other tool changed by a
-/// byte, which is the cleanest this arithmetic has ever come out and is itself the answer to the
-/// question this ceiling exists to force. It shares no output type with the two driver schemas
-/// beside it: a device's gate is a descriptor, an access list and a symbolic link, none of which
-/// appear anywhere else in this surface, so there was nothing available to multiply. 3,715 B of the
-/// 5,241 is `outputSchema`, which no model reads. The new figure leaves 5,422 B, which is 2.3%.
+/// **236,000 -> 242,000 for `device_security`** (2026-09-13). The payload went 231,336 -> 236,641,
+/// a difference of 5,305: the tool is 5,304 B of wire and the remaining byte is the array's own
+/// comma. **Nothing else moved at all** -- not one other tool changed by a byte, which is the
+/// cleanest this arithmetic has ever come out and is itself the answer to the question this
+/// ceiling exists to force. It shares no output type with the two driver schemas beside it: a
+/// device's gate is a descriptor, an access list and a symbolic link, none of which appear
+/// anywhere else in this surface, so there was nothing available to multiply. 3,778 B of the
+/// 5,304 is `outputSchema`, which no model reads. The new figure leaves 5,359 B, which is 2.2%.
+///
+/// (5,241 and 236,578 while this paragraph was first written; splitting one misleading count into
+/// `links_unnamed` and `links_unread` added 63 B of schema, which is the ordinary way this figure
+/// moves and the reason the instruction is to re-derive it rather than quote it.)
 const WIRE_CEILING: usize = 242_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
@@ -13893,37 +13897,54 @@ fn kernel_scratch(server: &mut Server, session: &str) -> Option<KernelScratch> {
     Some(scratch)
 }
 
-/// **`device_security` against a device whose gate is published**, which is what makes this an
-/// oracle rather than a demonstration.
+/// **`device_security` against a live kernel, checked against the debugger's own view of the same
+/// device.**
 ///
-/// `\Device\MountPointManager` is on every Windows kernel, and
-/// [`driver-ioctl-walkthrough.md`](../docs/driver-ioctl-walkthrough.md) recovered its four-ACE DACL
-/// by hand -- `dt nt!_SECURITY_DESCRIPTOR_RELATIVE`, `dt nt!_ACL` and `db`, parsed by eye -- before
-/// there was a tool. Every figure below is from that document rather than from this code, so a
-/// change to the descriptor reader that agrees with itself still fails here.
+/// `\Device\MountPointManager` is on every Windows kernel, so this needs no fixture deployed.
+/// Three oracles, none of them this code:
 ///
-/// The assertion the rest exists for is the **last** one: Everyone's mask carries neither
-/// `FILE_READ_DATA` nor `FILE_WRITE_DATA`, which is the whole of why a standard user must open this
-/// device with `DesiredAccess = 0`. It is checked as the two booleans rather than by matching the
-/// hex, because those are what a caller joining this to an IOCTL map reads, and a mask quoted
-/// correctly into fields nobody computed would pass a test that looked only at the text.
+/// * `!devobj`, a debugger extension written by somebody else, reports the device object, its
+///   driver, its characteristics and **its security descriptor**. Every one of those is asserted
+///   to be the value this tool answered with. That last one is the assertion this test exists for:
+///   the descriptor a device uses is the one in `_DEVICE_OBJECT`, and the object header's -- where
+///   every other object keeps it, and which the namespace walk hands over ready-masked -- is
+///   **null** for a device. Reading the header's is the natural mistake, it is the mistake this
+///   tool shipped with, and nothing in a unit test could have caught it.
+/// * `!object` on `\GLOBAL??` lists the directory. Its entry count has to equal what the link
+///   search examined plus what it could not read, which is what says the search saw the whole
+///   directory rather than the part that happened to be resident. The target is broken in
+///   throughout, so the two readings are of one state.
+/// * The four-ACE DACL published in [`driver-ioctl-walkthrough.md`](../docs/driver-ioctl-walkthrough.md),
+///   recovered by hand there before there was a tool.
+///
+/// **The ACEs are asserted as a set rather than in order, deliberately.** The walkthrough's table
+/// is in presentation order and the ACL's own order is Everyone, SYSTEM, Administrators,
+/// RESTRICTED -- measured 2026-09-13 by hand-parsing the bytes. Order decides a DACL's meaning
+/// only when a deny follows an allow, and all four of these are allows, so pinning the kernel's
+/// construction order would be pinning something neither document promises.
+///
+/// The assertion the rest exists for is the last: Everyone's mask carries neither
+/// `FILE_READ_DATA` nor `FILE_WRITE_DATA`, which is the whole of why a standard user must open
+/// this device with `DesiredAccess = 0`. It is checked as the two booleans rather than by matching
+/// the hex, because those are what a caller joining this to an IOCTL map reads, and a mask quoted
+/// correctly into fields nobody computed would pass a text match.
 ///
 /// Live-kernel only: this needs the object namespace, which a dump does not carry --
-/// `a_device_query_against_a_dump_says_the_dump_has_no_namespace` is the other half.
+/// `a_device_query_against_a_dump_is_refused_about_the_target_not_the_name` is the other half.
 #[test]
 #[ignore = "live kernel tier: needs WINDBG_MCP_SMOKE_KERNEL"]
-fn a_device_security_query_on_a_live_kernel_reproduces_the_published_gate() {
+fn a_device_security_query_on_a_live_kernel_agrees_with_the_debugger() {
     let Some(connection) = kernel_tier() else {
         return;
     };
-    let mut server = Server::started();
+    let mut server = Server::spawn();
+    server.initialize(SUPPORTED_REVISIONS[0]);
     with_live_kernel_session(&mut server, &connection, |server, session| {
+        const DEVICE: &str = r"\Device\MountPointManager";
+
         let response = server.call_tool(
             "device_security",
-            json!({
-                "session_id": session,
-                "device": r"\Device\MountPointManager",
-            }),
+            json!({ "session_id": session, "device": DEVICE }),
             TARGET_STEP,
         );
         assert_no_error(&response, "device_security");
@@ -13932,73 +13953,98 @@ fn a_device_security_query_on_a_live_kernel_reproduces_the_published_gate() {
             "the device is on every Windows kernel: {}",
             text_of(&response["result"])
         );
-        let data = &response["result"]["structuredContent"]["data"];
+        // `Outcome` is internally tagged, so the payload's own fields sit beside `status` rather
+        // than under a wrapper. Asserted rather than assumed: the first version of this test read
+        // a `data` key that does not exist and compared `None` against every expectation below.
+        let data = &response["result"]["structuredContent"];
+        assert_eq!(data["status"], "ok", "{data}");
 
-        assert_eq!(
-            (
-                data["secure_open"].as_bool(),
-                data["characteristics"].as_str()
-            ),
-            (Some(true), Some("0x00000100")),
-            "FILE_DEVICE_SECURE_OPEN is the published characteristic: {data}"
+        // ---- against `!devobj` -------------------------------------------------------------
+        let devobj = server.tool_text(
+            "device_object",
+            json!({ "session_id": session, "device": DEVICE }),
+            TARGET_STEP,
         );
-        assert_eq!(
-            data["type_confirmed"].as_bool(),
-            Some(true),
-            "and the namespace typed it as a device rather than assuming it: {data}"
-        );
-
-        let entries = data["security"]["dacl"]["entries"]
-            .as_array()
-            .unwrap_or_else(|| panic!("the DACL comes back as entries: {data}"));
-        let gate: Vec<(String, String, String)> = entries
-            .iter()
-            .map(|entry| {
-                (
-                    entry["kind"].as_str().unwrap_or_default().to_string(),
-                    entry["sid"].as_str().unwrap_or_default().to_string(),
-                    entry["mask"].as_str().unwrap_or_default().to_string(),
-                )
-            })
-            .collect();
-        let published = [
-            ("allow", "S-1-1-0", "0x001200a0"),
-            ("allow", "S-1-5-12", "0x001200a0"),
-            ("allow", "S-1-5-18", "0x001f01ff"),
-            ("allow", "S-1-5-32-544", "0x001f01ff"),
-        ];
-        assert_eq!(
-            gate.len(),
-            published.len(),
-            "the walkthrough recovered four ACEs: {data}"
-        );
-        for (found, (kind, sid, mask)) in gate.iter().zip(published) {
-            assert_eq!(
-                (found.0.as_str(), found.1.as_str(), found.2.as_str()),
-                (kind, sid, mask),
-                "and in this order, since a DACL is walked in order and a deny after an allow may \
-                 never be reached: {data}"
+        // `!devobj` prints bare hex; this tool prints it `0x`-prefixed and zero-padded. Compared
+        // as the numbers they are, since the two renderings are both correct and neither is an
+        // identifier.
+        let printed = |field: &str| -> String {
+            let value = data[field].as_str().unwrap_or_default();
+            value
+                .trim_start_matches("0x")
+                .trim_start_matches('0')
+                .to_lowercase()
+        };
+        for (field, what) in [
+            ("address", "the device object"),
+            ("driver", "the driver object"),
+        ] {
+            let hex = printed(field);
+            assert!(
+                !hex.is_empty() && devobj.to_lowercase().contains(&hex),
+                "`!devobj` does not name {what} this answered with ({hex}):\n{devobj}"
             );
         }
-        let everyone = &entries[0];
-        assert_eq!(
-            everyone["account"].as_str(),
-            Some("Everyone"),
-            "the well-known SID reads as the account it is: {data}"
-        );
-        assert_eq!(
-            (everyone["reads"].as_bool(), everyone["writes"].as_bool()),
-            (Some(false), Some(false)),
-            "and 0x1200a0 grants neither FILE_READ_DATA nor FILE_WRITE_DATA, which is why a \
-             standard user must open this device with DesiredAccess = 0: {data}"
+        assert!(
+            devobj.contains("FILE_DEVICE_SECURE_OPEN") == data["secure_open"].as_bool().unwrap(),
+            "the two disagree about FILE_DEVICE_SECURE_OPEN:\n{devobj}\n{data}"
         );
 
-        // The namespace half. A link is what makes the device reachable as `\\.\Name`, and the
-        // search verdict is what makes an empty list mean anything.
+        // **The descriptor, which is the whole point.** `!devobj` reads `_DEVICE_OBJECT`'s own
+        // field; a tool reading the object header's would answer `security_absent` here, on a
+        // device that plainly has one.
+        let descriptor = data["security"]["address"]
+            .as_str()
+            .unwrap_or_else(|| panic!("no security descriptor was read: {data}"))
+            .trim_start_matches("0x")
+            .trim_start_matches('0')
+            .to_lowercase();
+        assert!(
+            devobj.to_lowercase().contains(&descriptor),
+            "`!devobj` reports a different security descriptor from this one \
+             ({descriptor}):\n{devobj}"
+        );
+
+        // ---- against `!object` -------------------------------------------------------------
+        let listing = server.tool_text(
+            "execute",
+            json!({ "session_id": session, "command": r"!object \GLOBAL??" }),
+            TARGET_STEP,
+        );
+        // Every row under the table header carries a 16-hex-digit address; the lines above it
+        // (`Object:`, `ObjectHeader:`, `Directory Object:`) carry one too, which is why the count
+        // starts only after the rule.
+        let entries = listing
+            .split_once("---- -------")
+            .map(|(_, rows)| {
+                rows.lines()
+                    .filter(|row| {
+                        row.split_whitespace().any(|token| {
+                            token.len() == 16 && token.chars().all(|c| c.is_ascii_hexdigit())
+                        })
+                    })
+                    .count()
+            })
+            .unwrap_or_else(|| panic!("`!object` printed no table:\n{listing}"));
+        // **The identity the two counts have to satisfy.** An entry the namespace could not name
+        // was never examined; a link whose target would not read was. So what the directory holds
+        // is `examined + unnamed`, and `unread` is a share of `examined` rather than a third term.
+        // Summing all three is what the first version of this did, and it overshot `!object` by
+        // exactly the one link whose target failed -- which is how the double count was found.
+        let count = |field: &str| data[field].as_u64().unwrap_or_default() as usize;
+        assert_eq!(
+            count("links_examined") + count("links_unnamed"),
+            entries,
+            "the walk saw a different number of entries than `!object` did, so one of them is              not seeing the whole directory: {data}"
+        );
+        assert!(
+            count("links_unread") <= count("links_examined"),
+            "a link whose target would not read is one that was examined: {data}"
+        );
         assert_eq!(
             data["link_search"].as_str(),
             Some("complete"),
-            "the directory was listed in full, so its links are all of them: {data}"
+            "and it says it saw all of them: {data}"
         );
         let links: Vec<&str> = data["links"]
             .as_array()
@@ -14011,7 +14057,52 @@ fn a_device_security_query_on_a_live_kernel_reproduces_the_published_gate() {
             .unwrap_or_default();
         assert!(
             links.contains(&r"\GLOBAL??\MountPointManager"),
-            "and the published global link is among them: {data}"
+            "and the link `!object` lists is among the ones it matched: {data}"
+        );
+
+        // ---- against the published DACL ------------------------------------------------------
+        let entries = data["security"]["dacl"]["entries"]
+            .as_array()
+            .unwrap_or_else(|| panic!("the DACL comes back as entries: {data}"));
+        let mut gate: Vec<(String, String)> = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry["sid"].as_str().unwrap_or_default().to_string(),
+                    entry["mask"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect();
+        gate.sort();
+        assert_eq!(
+            gate,
+            vec![
+                ("S-1-1-0".to_string(), "0x001200a0".to_string()),
+                ("S-1-5-12".to_string(), "0x001200a0".to_string()),
+                ("S-1-5-18".to_string(), "0x001f01ff".to_string()),
+                ("S-1-5-32-544".to_string(), "0x001f01ff".to_string()),
+            ],
+            "the four published ACEs, whatever order the kernel built them in: {data}"
+        );
+        assert!(
+            entries.iter().all(|entry| entry["kind"] == "allow"),
+            "all four are allows, which is why order is not pinned above: {data}"
+        );
+
+        let everyone = entries
+            .iter()
+            .find(|entry| entry["sid"] == "S-1-1-0")
+            .expect("Everyone is one of the four");
+        assert_eq!(
+            everyone["account"].as_str(),
+            Some("Everyone"),
+            "the well-known SID reads as the account it is: {data}"
+        );
+        assert_eq!(
+            (everyone["reads"].as_bool(), everyone["writes"].as_bool()),
+            (Some(false), Some(false)),
+            "and 0x1200a0 grants neither FILE_READ_DATA nor FILE_WRITE_DATA, which is why a \
+             standard user must open this device with DesiredAccess = 0: {data}"
         );
     });
 }

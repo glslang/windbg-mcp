@@ -22,6 +22,29 @@
 //! * [`FILE_DEVICE_SECURE_OPEN`] is a **published** `wdm.h` constant rather than an internal one,
 //!   so it is used as published. The distinction matters: guessing an undocumented bit from the
 //!   one that sounds right is how a walk comes to read a sandbox flag as a callback flag.
+//!
+//! # Which security descriptor a device has
+//!
+//! **The one in `_DEVICE_OBJECT` itself, not the one in its `_OBJECT_HEADER`** -- and that is a
+//! measurement rather than a preference, because the header's is where every other object keeps
+//! it and reading it here is the natural mistake. Measured on a live Windows Server 26100 guest,
+//! 2026-09-13:
+//!
+//! * `\Device\MountPointManager`'s object header has `SecurityDescriptor` **null**, while
+//!   `!devobj` reports one at `ffffe506857f53a0` -- which parses as a self-relative descriptor
+//!   whose DACL is the four published ACEs.
+//! * The reason is the object type's own security method: `_OBJECT_TYPE` for `Device` carries
+//!   `TypeInfo.SecurityProcedure = nt!IopGetSetSecurityObject` rather than the object manager's
+//!   default, and that routine keeps the descriptor in the device object's field. So for a device
+//!   the header's is not merely a second copy -- it is empty.
+//!
+//! Reading the header's would therefore report every device on that machine as carrying no
+//! descriptor at all, which is the most permissive answer there is and the exact opposite of the
+//! truth. The offset comes from type information like every other one here.
+//!
+//! The field is a **plain pointer**, not the `_EX_FAST_REF` the object header's is: the value
+//! measured above is already aligned and parses at its unmasked address, so nothing is masked out
+//! of it.
 
 /// Why a device object could not be read.
 ///
@@ -82,6 +105,9 @@ pub(crate) struct Layout {
     pub(crate) characteristics: u32,
     pub(crate) flags: u32,
     pub(crate) driver: u32,
+    /// `_DEVICE_OBJECT::SecurityDescriptor` -- the device's own, which for this object type is
+    /// the only one there is. See the module docs for why the object header's is not it.
+    pub(crate) security: u32,
 }
 
 impl Layout {
@@ -108,8 +134,12 @@ impl Layout {
         {
             return bad("a field sits outside the device object");
         }
-        if (self.driver as usize).saturating_add(self.pointer) > size {
-            return bad("the driver pointer sits outside the device object");
+        let pointers = [self.driver, self.security];
+        if pointers
+            .iter()
+            .any(|offset| (*offset as usize).saturating_add(self.pointer) > size)
+        {
+            return bad("a pointer field sits outside the device object");
         }
         Ok(())
     }
@@ -130,6 +160,12 @@ pub(crate) struct Device {
     pub(crate) flags: u32,
     /// The `_DRIVER_OBJECT` behind it, so a caller can join this to `driver_object`.
     pub(crate) driver: u64,
+    /// The device's own security descriptor, or `None` where the field is empty.
+    ///
+    /// `None` is the honest answer for a device the I/O manager never gave one, and is **not**
+    /// what an unreadable device answers -- that is [`DeviceError::Unreadable`] for the whole
+    /// structure, because this is read as one of its fields rather than on its own.
+    pub(crate) security_descriptor: Option<u64>,
 }
 
 /// Reads a device object's fields.
@@ -153,8 +189,8 @@ pub(crate) fn read_device(
     };
     let characteristics = dword(layout.characteristics);
     let flags = dword(layout.flags);
-    let driver = {
-        let at = layout.driver as usize;
+    let pointer = |offset: u32| -> u64 {
+        let at = offset as usize;
         match layout.pointer {
             4 => u64::from(u32::from_le_bytes(
                 bytes[at..at + 4].try_into().unwrap_or_default(),
@@ -162,13 +198,15 @@ pub(crate) fn read_device(
             _ => u64::from_le_bytes(bytes[at..at + 8].try_into().unwrap_or_default()),
         }
     };
+    let security = pointer(layout.security);
     Ok(Device {
         device_type: dword(layout.device_type),
         characteristics,
         secure_open: characteristics & FILE_DEVICE_SECURE_OPEN != 0,
         exclusive: flags & DO_EXCLUSIVE != 0,
         flags,
-        driver,
+        driver: pointer(layout.driver),
+        security_descriptor: (security != 0).then_some(security),
     })
 }
 
@@ -224,6 +262,9 @@ pub(crate) struct Found {
     pub(crate) links: Vec<Link>,
     pub(crate) link_search: crate::structured::LinkSearch,
     pub(crate) links_examined: Option<usize>,
+    /// Entries the namespace could not name, which are **not** among those examined.
+    pub(crate) links_unnamed: usize,
+    /// Examined links whose target would not read, which **are**.
     pub(crate) links_unread: usize,
     pub(crate) stopped: Option<crate::walk::Halt>,
 }
@@ -300,7 +341,8 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
     let security_absent = match &found.security {
         Security::Read { .. } => None,
         Security::Absent => Some(
-            "this object carries no security descriptor, so the object manager checks the              directory holding it rather than the object"
+            "this object carries no security descriptor, so the object manager checks the \
+             directory holding it rather than the object"
                 .to_string(),
         ),
         Security::Failed { at, why } => Some(format!(
@@ -331,6 +373,7 @@ pub(crate) fn structured_report(found: &Found) -> crate::structured::DeviceSecur
             .collect(),
         link_search: found.link_search,
         links_examined: found.links_examined,
+        links_unnamed: found.links_unnamed,
         links_unread: found.links_unread,
         stopped: found.stopped.map(|halt| match halt {
             crate::walk::Halt::Deadline => crate::structured::WalkHalt::Deadline,
@@ -373,7 +416,9 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
     if !report.secure_open {
         let _ = writeln!(
             out,
-            "  [!] no FILE_DEVICE_SECURE_OPEN: the descriptor below is checked when this device              is opened by name, and not when a path beneath it is opened -- so a driver that              parses its own paths can be reached by a caller the descriptor would refuse"
+            "  [!] no FILE_DEVICE_SECURE_OPEN: the descriptor below is checked when this device \
+             is opened by name, and not when a path beneath it is opened -- so a driver that \
+             parses its own paths can be reached by a caller the descriptor would refuse"
         );
     }
 
@@ -407,7 +452,8 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
                 (None, true) => {
                     let _ = writeln!(
                         out,
-                        "    [!] a DACL is present and this could not read it, so who may open                          this device is unanswered"
+                        "    [!] a DACL is present and this could not read it, so who may open \
+                         this device is unanswered"
                     );
                 }
                 (Some(dacl), true) => render_acl(&mut out, "DACL", dacl),
@@ -430,7 +476,8 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
         crate::structured::LinkSearch::Unavailable => {
             let _ = writeln!(
                 out,
-                "  [!] {} could not be listed, so nothing here says whether this device is                  reachable from user mode",
+                "  [!] {} could not be listed, so nothing here says whether this device is \
+                 reachable from user mode",
                 report.link_directory
             );
         }
@@ -447,18 +494,20 @@ pub(crate) fn render(report: &crate::structured::DeviceSecurity) -> String {
                     let _ = writeln!(out, "    {}  -> {}", link.path, link.target);
                 }
             }
-            if report.links_unread > 0 {
+            let unchecked = report.links_unnamed + report.links_unread;
+            if unchecked > 0 {
                 let _ = writeln!(
                     out,
-                    "  [!] {} link(s) in {} could not be read, so any of them may reach this \
-                     device",
-                    report.links_unread, report.link_directory
+                    "  [!] {unchecked} of {}'s entries could not be checked ({} this could not \
+                     name, {} whose target would not read), so any of them may reach this device",
+                    report.link_directory, report.links_unnamed, report.links_unread
                 );
             }
             if matches!(search, crate::structured::LinkSearch::Partial) {
                 let _ = writeln!(
                     out,
-                    "  [!] the search of {} stopped part-way, so this is some of the links rather                      than all of them",
+                    "  [!] the search of {} stopped part-way, so this is some of the links rather \
+                     than all of them",
                     report.link_directory
                 );
             }
@@ -515,16 +564,25 @@ mod tests {
             characteristics: 0x34,
             flags: 0x30,
             driver: 0x08,
+            security: 0x110,
         }
     }
 
-    /// A device object as `IoCreateDevice` would have left it.
+    /// A device object as `IoCreateDevice` would have left it, with no descriptor.
     fn device(device_type: u32, characteristics: u32, flags: u32, driver: u64) -> Vec<u8> {
         let mut bytes = vec![0u8; 0x150];
         bytes[0x08..0x10].copy_from_slice(&driver.to_le_bytes());
         bytes[0x30..0x34].copy_from_slice(&flags.to_le_bytes());
         bytes[0x34..0x38].copy_from_slice(&characteristics.to_le_bytes());
         bytes[0x48..0x4c].copy_from_slice(&device_type.to_le_bytes());
+        bytes
+    }
+
+    /// The same, with a descriptor at `+0x110` -- the measured offset, written out rather than
+    /// taken from `layout()`, for the reason `layout()` itself gives.
+    fn guarded(driver: u64, descriptor: u64) -> Vec<u8> {
+        let mut bytes = device(0x12, FILE_DEVICE_SECURE_OPEN, 0, driver);
+        bytes[0x110..0x118].copy_from_slice(&descriptor.to_le_bytes());
         bytes
     }
 
@@ -589,6 +647,43 @@ mod tests {
         );
     }
 
+    /// **The descriptor comes from the device object's own field, and is not the driver
+    /// pointer.**
+    ///
+    /// The two are the only pointers this reads and they are 0x108 bytes apart, so an offset
+    /// taken from the wrong one of them yields a plausible kernel address either way -- and a
+    /// driver object parsed as a security descriptor is refused by `crate::sd` for its revision
+    /// byte, which would report a guarded device as one whose descriptor will not read.
+    ///
+    /// A zero field is `None` and means the device carries none, which is a real state and a
+    /// different one from a device that would not read at all.
+    #[test]
+    fn the_descriptor_is_the_devices_own_field_and_not_its_driver() {
+        let guarded = read_device(
+            AT,
+            layout(),
+            serving(guarded(0xffff_b000_0000_0000, 0xffff_8680_fc69_12a0)),
+        )
+        .expect("the device reads");
+        assert_eq!(
+            (guarded.driver, guarded.security_descriptor),
+            (0xffff_b000_0000_0000, Some(0xffff_8680_fc69_12a0)),
+            "each pointer comes from its own field"
+        );
+
+        let bare = read_device(
+            AT,
+            layout(),
+            serving(device(0x12, 0, 0, 0xffff_b000_0000_0000)),
+        )
+        .expect("the device reads");
+        assert_eq!(
+            (bare.driver, bare.security_descriptor),
+            (0xffff_b000_0000_0000, None),
+            "and an empty descriptor field is None rather than the driver read twice"
+        );
+    }
+
     /// Memory that will not read is **unreadable**, naming the address — not a device with every
     /// field zero, which would report a device type nobody has and a gate nothing guards.
     #[test]
@@ -619,6 +714,7 @@ mod tests {
                 exclusive: false,
                 flags: 0x40,
                 driver: 0xffff_b000_0000_0000,
+                security_descriptor: Some(0xffff_8680_fc69_12a0),
             },
             security: Security::Read {
                 at: 0xffff_8680_fc69_12a0,
@@ -636,6 +732,7 @@ mod tests {
             }],
             link_search: crate::structured::LinkSearch::Complete,
             links_examined: Some(400),
+            links_unnamed: 0,
             links_unread: 0,
             stopped: None,
         }
@@ -874,12 +971,35 @@ mod tests {
             "a directory nobody listed says nothing about links: {unavailable}"
         );
 
-        let unread = render(&structured_report(&Found {
+        // **The two unchecked counts are not one number**, and the identity is what says so:
+        // an entry the namespace could not name was never examined, while a link whose target
+        // would not read was. Summing them into one figure made `examined + unchecked` overshoot
+        // what the directory holds, which the live-kernel differential caught against `!object`.
+        let unchecked = render(&structured_report(&Found {
             links: vec![],
+            links_examined: Some(400),
+            links_unnamed: 2,
             links_unread: 3,
             ..found()
         }));
-        assert!(unread.contains("3 link(s)"), "{unread}");
+        assert!(
+            unchecked.contains("5 of") && unchecked.contains("2 this could not name"),
+            "both are reported, and apart: {unchecked}"
+        );
+        let report = structured_report(&Found {
+            links_unnamed: 2,
+            links_unread: 3,
+            ..found()
+        });
+        assert_eq!(
+            (
+                report.links_examined,
+                report.links_unnamed,
+                report.links_unread
+            ),
+            (Some(400), 2, 3),
+            "and each keeps its own denominator: what the directory held is examined + unnamed"
+        );
     }
 
     /// The one line a reader is most likely to act on is said where it is true, rather than left
@@ -926,12 +1046,21 @@ mod tests {
             }),
             "a field sits outside the device object"
         );
-        assert_eq!(
-            refused(Layout {
+        for outside in [
+            Layout {
                 driver: 0x14c,
                 ..layout()
-            }),
-            "the driver pointer sits outside the device object"
-        );
+            },
+            Layout {
+                security: 0x14c,
+                ..layout()
+            },
+        ] {
+            assert_eq!(
+                refused(outside),
+                "a pointer field sits outside the device object",
+                "every pointer field is bounded, not just the first one written"
+            );
+        }
     }
 }

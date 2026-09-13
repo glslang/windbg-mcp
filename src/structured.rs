@@ -2820,10 +2820,18 @@ pub struct DeviceSecurity {
     /// Whether that search saw the whole directory. See [`LinkSearch`].
     pub link_search: LinkSearch,
     /// How many of the directory's entries were examined. Under [`LinkSearch::Complete`] that
-    /// is every one of them.
+    /// is every one this walk could name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub links_examined: Option<usize>,
-    /// Links in the directory whose target could not be read.
+    /// Entries the namespace could not name at all, so they were never examined.
+    ///
+    /// **Outside [`Self::links_examined`], where [`Self::links_unread`] is inside it** -- which is
+    /// the whole reason these are two fields rather than one. Added together with the examined
+    /// count they give what the directory holds, and that identity is what a reader can check;
+    /// one combined figure satisfies no identity at all and silently double-counts.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub links_unnamed: usize,
+    /// Of the entries examined, the links whose **target** could not be read.
     ///
     /// Each is a place this device could be reachable from and was not checked, which is what
     /// stops an empty [`Self::links`] beside a non-zero count here from reading as "nothing
