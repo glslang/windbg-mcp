@@ -576,6 +576,23 @@ pub(crate) fn label_policy(mask: u32) -> Vec<&'static str> {
 /// `FILE_READ_DATA` and `FILE_WRITE_DATA` are what the I/O manager checks a control code's
 /// `RequiredAccess` against, which is the join between this answer and an IOCTL map: a code
 /// requiring `FILE_WRITE_DATA` is unreachable through a handle whose ACE grants neither.
+///
+/// **A `GENERIC_*` bit is read as itself and not expanded through the device's generic mapping,
+/// because the kernel does not expand one here either.** `nt!RtlMapGenericMask` runs where a
+/// descriptor is *assigned* -- `SeAssignSecurity`, `SeSetSecurityDescriptorInfo` -- and it ends
+/// `and eax,0FFFFFFFh`, clearing the generic nibble it has just expanded into specific rights. The
+/// access check never runs it: `nt!SeAccessCheckWithHint` is 1,192 instructions on 26100 and not
+/// one of them reads a generic bit or the mapping. So an effective ACE reaching this function has
+/// already been mapped, and one that still carries a generic bit arrived without an assignment, in
+/// which case the check accumulates those raw bits and they satisfy no specific request --
+/// `(false, false)` is that outcome rather than a gap in this table.
+///
+/// Measured rather than reasoned, across every distinct descriptor behind every device in
+/// `\Device` on that build: 41 descriptors, 149 ACEs, of which 7 carry generic bits and **all 7
+/// are `INHERIT_ONLY_ACE`** -- templates for children of types whose mappings differ, which is the
+/// one place a generic bit is supposed to survive. None of the other 141 carries one. Those 7 are
+/// already reported as granting nothing, by the separate inherit-only rule in
+/// [`crate::device`]'s `access_entry`, so the two rules agree on the only ACEs where both apply.
 pub(crate) fn data_access(mask: u32) -> (bool, bool) {
     (mask & 0x0001 != 0, mask & 0x0002 != 0)
 }
@@ -583,6 +600,29 @@ pub(crate) fn data_access(mask: u32) -> (bool, bool) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **A generic bit is not a data right, and mapping it here would invent access.**
+    ///
+    /// Raised in review as a missing generic mapping, and declined on a measurement: the kernel
+    /// maps at assignment and not at the check, so a generic bit surviving in a mask is one no
+    /// access check will expand either. Pinned because the suggestion will come back, and because
+    /// the mask is still *named* by [`rights`] -- so a reader seeing `GENERIC_ALL` beside
+    /// `reads: false` should find the reason here rather than take it for a defect.
+    #[test]
+    fn a_generic_bit_is_not_read_as_the_rights_it_would_map_to() {
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const GENERIC_READ: u32 = 0x8000_0000;
+        assert_eq!(data_access(GENERIC_ALL), (false, false));
+        assert_eq!(data_access(GENERIC_READ), (false, false));
+        assert!(
+            rights(GENERIC_ALL).contains(&"GENERIC_ALL"),
+            "while the bit is still named, which is how a reader tells this from an empty mask"
+        );
+        // And the mapped form of the same grant -- what an assignment would have left behind --
+        // does answer, which is what makes the pair above a statement about the bits rather than
+        // about the rights they stand for.
+        assert_eq!(data_access(0x001f_01ff), (true, true));
+    }
 
     const AT: u64 = 0xffff_8680_fc69_12a0;
 
