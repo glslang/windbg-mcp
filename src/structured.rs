@@ -2667,6 +2667,13 @@ pub struct AccessEntry {
     /// this is the reading, and a reading is not an identifier.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub account: Option<String>,
+    /// True when this entry applies only if a condition holds.
+    ///
+    /// A callback ACE carries an expression the kernel evaluates against the caller's token, and
+    /// this reader does not evaluate it. So `kind: "allow"` with this set means the mask is
+    /// granted **if** that expression is true, which is a weaker claim than the kind alone.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub conditional: bool,
     /// True when this entry's type carries a principal and the bytes that should have held one
     /// did not parse.
     ///
@@ -2852,7 +2859,9 @@ pub struct DeviceSecurity {
     /// one combined figure satisfies no identity at all and silently double-counts.
     #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub links_unnamed: usize,
-    /// Of the entries examined, the links whose **target** could not be read.
+    /// Of the entries examined, the ones this could not check: a link whose **target** would
+    /// not read, and an entry whose **type** would not, which may be a link and cannot be ruled
+    /// out as one.
     ///
     /// Each is a place this device could be reachable from and was not checked, which is what
     /// stops an empty [`Self::links`] beside a non-zero count here from reading as "nothing

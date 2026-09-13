@@ -6695,9 +6695,6 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
 /// reason.
 const LINK_DIRECTORY: &str = "\\GLOBAL??";
 
-/// The object type name a symbolic link carries.
-const SYMBOLIC_LINK: &str = "SymbolicLink";
-
 /// The object type name a device carries.
 const DEVICE: &str = "Device";
 
@@ -6799,7 +6796,7 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         .object_at(&path)
         .map_err(|why| object_failure(&path, &why))?;
     let mut followed_link = None;
-    if object.type_name.as_deref() == Some(SYMBOLIC_LINK) {
+    if object.type_name.as_deref() == Some(device::SYMBOLIC_LINK) {
         let target = namespace
             .link_target(object.address)
             .map_err(|why| object_failure(&path, &why))?;
@@ -6895,8 +6892,16 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
                 break;
             }
             seen += 1;
-            if entry.type_name.as_deref() != Some(SYMBOLIC_LINK) {
-                continue;
+            match device::candidate(entry.type_name.as_deref()) {
+                device::Candidate::Link => {}
+                // **A type this could not read is not a type that is not a link**, which is the
+                // rule `device::candidate` is a named function for -- it needs no engine, and a
+                // rule only a live kernel can exercise is one no test here reaches.
+                device::Candidate::Unknown => {
+                    links_unread += 1;
+                    continue;
+                }
+                device::Candidate::Other => continue,
             }
             let Ok(target) = namespace.link_target(entry.address) else {
                 // Counted rather than skipped. Each is a place this device could be reachable
