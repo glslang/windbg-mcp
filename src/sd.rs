@@ -161,13 +161,23 @@ pub(crate) struct Ace {
     pub(crate) flags: u8,
     /// The access mask, as encoded.
     pub(crate) mask: u32,
-    /// Whether this entry applies **conditionally**.
+    /// Whether this entry carries a **conditional expression**, which the kernel evaluates
+    /// against the caller's token before the entry decides anything.
     ///
-    /// A callback ACE carries an expression after its SID that the kernel evaluates against the
-    /// caller's token; the entry decides nothing until that is true. This reader does not evaluate
-    /// it, so an entry with this set grants or denies its mask *if the condition holds* -- which
-    /// is not the same claim as the [`Self::kind`] beside it makes on its own.
+    /// Implies [`Self::callback`], and is the narrower of the two: a conditional ACE is a callback
+    /// ACE whose application data opens with the `artx` signature MS-DTYP fixes for it. This
+    /// reader does not evaluate the expression, so an entry with this set grants or denies its
+    /// mask *if the condition holds* -- a weaker claim than the [`Self::kind`] beside it makes on
+    /// its own.
     pub(crate) conditional: bool,
+    /// Whether this entry is a **callback** ACE, whose application data decides whether it
+    /// applies.
+    ///
+    /// Set for every callback type; [`Self::conditional`] says whether that data is the one form
+    /// of it this can recognise. The gap between them is an application-defined blob, which this
+    /// neither decodes nor pretends is an expression -- and which must still not be reported as an
+    /// entry that simply applies.
+    pub(crate) callback: bool,
     /// The principal, when the ACE carries one where this can find it.
     ///
     /// **Absent means two different things, and [`AceKind::carries_sid`] is what tells them
@@ -338,8 +348,16 @@ fn read_acl(at: u64, read: &mut dyn FnMut(u64, usize) -> Option<Vec<u8>>) -> Res
     })
 }
 
+/// The four bytes a conditional ACE's application data opens with, per MS-DTYP. A callback ACE
+/// without them carries something application-defined instead.
+const CONDITIONAL_ACE_SIGNATURE: &[u8] = b"artx";
+
 /// Decodes one ACE from its own bytes.
 fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
+    // The callback types whose principal sits where this reads one. `0x0b`/`0x0c`/`0x0e` are also
+    // callback ACEs and are deliberately not here: they carry an object GUID first, so they decode
+    // as `Other` and have no SID for the application data to follow.
+    let callback = matches!(ace_type, 0x09 | 0x0a | 0x0d);
     let kind = match ace_type {
         // ACCESS_ALLOWED and its callback variant.
         0x00 | 0x09 => AceKind::Allow,
@@ -388,13 +406,26 @@ fn read_ace(ace_type: u8, flags: u8, body: &[u8]) -> Result<Ace, SdError> {
         flags,
         mask,
         sid,
-        // **A callback ACE decides at evaluation time, and this reads bytes.** The application
-        // data after the SID is a conditional expression the kernel evaluates against the caller's
-        // token, so the entry applies only when that expression is true. Reporting it as a plain
-        // allow says the principal has the mask, which is one branch of a question this cannot
-        // answer -- and the expression is not decoded here, so the honest thing is to say the
-        // decision is conditional rather than to guess which way.
-        conditional: matches!(ace_type, 0x09 | 0x0a | 0x0d),
+        // **A callback ACE decides at evaluation time, and this reads bytes.** Reporting one as a
+        // plain allow says the principal has the mask, which is one branch of a question this
+        // cannot answer, so the honest thing is to say the decision is not this entry's alone.
+        //
+        // **But the type alone does not make it a *conditional* ACE**, and saying so rendered an
+        // arbitrary application callback as an `[if]` expression. MS-DTYP builds a conditional ACE
+        // as a callback ACE whose application data opens with the `artx` signature; without it the
+        // data is application-defined, which this does not decode and will not name. The data
+        // starts after the header, the mask and the SID, whose length its own sub-authority count
+        // gives -- and `body` is the ACE's own bytes, cut to its `AceSize`, so a blob running past
+        // the entry reads as absent rather than into the next one. Only the three types below are
+        // asked: the object-callback types put a GUID where this expects the SID, and they decode
+        // as `Other` for that reason.
+        callback,
+        conditional: callback
+            && body
+                .get(9)
+                .map(|count| 16 + 4 * usize::from(*count))
+                .and_then(|at| body.get(at..at.saturating_add(4)))
+                .is_some_and(|signature| signature == CONDITIONAL_ACE_SIGNATURE),
     })
 }
 
@@ -746,32 +777,71 @@ mod tests {
         );
     }
 
-    /// **A callback ACE decides at evaluation time, and this says so.**
+    /// **A callback ACE decides at evaluation time, and only some of them decide by expression.**
     ///
-    /// `ACCESS_ALLOWED_CALLBACK_ACE` carries a conditional expression after its SID which the
-    /// kernel evaluates against the caller's token; the entry grants nothing until that is true.
-    /// Reported as a plain allow it claims the principal simply has the mask, which is one branch
-    /// of a question this reader cannot answer.
+    /// This test used to assert the opposite of half of itself: every callback type was reported
+    /// `conditional`, on the type alone, while the bytes after the SID were thrown away. An
+    /// application-defined callback therefore rendered as an `[if]`, which is a claim about a
+    /// blob nobody had looked at. MS-DTYP builds a conditional ACE as a callback ACE whose
+    /// application data opens with `artx`, so that is what is asked, and the two states are
+    /// distinguished rather than merged.
     #[test]
-    fn a_callback_ace_is_an_allow_that_has_not_been_decided_yet() {
+    fn a_callback_ace_is_conditional_only_when_it_carries_a_condition() {
         let plain = read_ace(0x00, 0, &ace(0x00, 0, 0x1f01ff, &sid(1, &[0]))).expect("decodes");
-        assert!(!plain.conditional, "an ordinary allow decides on its own");
+        assert_eq!(
+            (plain.conditional, plain.callback),
+            (false, false),
+            "an ordinary allow decides on its own: {plain:?}"
+        );
 
-        for conditional_type in [0x09u8, 0x0a, 0x0d] {
+        for callback_type in [0x09u8, 0x0a, 0x0d] {
+            // With the signature, and an expression this does not decode behind it.
+            let mut carrying = sid(1, &[0]);
+            carrying.extend_from_slice(CONDITIONAL_ACE_SIGNATURE);
+            carrying.extend_from_slice(&[0xde, 0xad, 0xbe, 0xef]);
             let decoded = read_ace(
-                conditional_type,
+                callback_type,
                 0,
-                &ace(conditional_type, 0, 0x1f01ff, &sid(1, &[0])),
+                &ace(callback_type, 0, 0x1f01ff, &carrying),
             )
             .expect("decodes");
-            assert!(
-                decoded.conditional,
-                "type {conditional_type:#04x} carries a condition: {decoded:?}"
+            assert_eq!(
+                (decoded.conditional, decoded.callback),
+                (true, true),
+                "type {callback_type:#04x} with `artx` carries a condition: {decoded:?}"
             );
             assert_eq!(
                 decoded.sid.as_ref().map(|sid| sid.text.as_str()),
                 Some("S-1-1-0"),
                 "and its principal is still where an ordinary one is"
+            );
+
+            // Without it: still a callback, and still not something to call an expression. The
+            // blob is deliberately four bytes, so what distinguishes this from the case above is
+            // the signature and not the presence of data.
+            let mut opaque = sid(1, &[0]);
+            opaque.extend_from_slice(&[0x00, 0x01, 0x02, 0x03]);
+            let decoded = read_ace(callback_type, 0, &ace(callback_type, 0, 0x1f01ff, &opaque))
+                .expect("decodes");
+            assert_eq!(
+                (decoded.conditional, decoded.callback),
+                (false, true),
+                "type {callback_type:#04x} without `artx` decides elsewhere, not by a condition \
+                 this can name: {decoded:?}"
+            );
+
+            // And a callback ACE carrying nothing at all is not conditional either, which is the
+            // shape the old assertion was actually built on.
+            let bare = read_ace(
+                callback_type,
+                0,
+                &ace(callback_type, 0, 0x1f01ff, &sid(1, &[0])),
+            )
+            .expect("decodes");
+            assert_eq!(
+                (bare.conditional, bare.callback),
+                (false, true),
+                "an empty blob is not an expression: {bare:?}"
             );
         }
     }

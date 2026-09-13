@@ -404,6 +404,7 @@ fn access_entry(ace: &crate::sd::Ace) -> crate::structured::AccessEntry {
             .and_then(|sid| sid.name)
             .map(str::to_string),
         conditional: ace.conditional,
+        callback: ace.callback,
         inherit_only,
         principal_unreadable: ace.kind.carries_sid() && ace.sid.is_none(),
         mask: format!("{:#010x}", ace.mask),
@@ -695,10 +696,15 @@ fn render_acl(out: &mut String, what: &str, acl: &crate::structured::AccessContr
             entry.mask,
             {
                 let rights = entry.rights.join(" ");
-                match (entry.conditional, entry.inherit_only) {
-                    (_, true) => format!("[inherit-only] {rights}"),
-                    (true, false) => format!("[if] {rights}"),
-                    (false, false) => rights,
+                // `[if]` is a claim that there *is* an expression, so it is kept for the
+                // entries that carry one. A callback ACE without the signature gets a word that
+                // says a decision is made elsewhere without saying what it is -- where plain
+                // rights would read as an entry that simply applies.
+                match (entry.conditional, entry.callback, entry.inherit_only) {
+                    (_, _, true) => format!("[inherit-only] {rights}"),
+                    (true, _, false) => format!("[if] {rights}"),
+                    (false, true, false) => format!("[callback] {rights}"),
+                    (false, false, false) => rights,
                 }
             }
         );
@@ -909,6 +915,7 @@ mod tests {
             flags: 0,
             mask,
             conditional: false,
+            callback: false,
             sid: Some(crate::sd::Sid {
                 text: sid.to_string(),
                 name,
@@ -1237,6 +1244,63 @@ mod tests {
         assert!(
             !same_object_path("\\Device\\\u{00b5}", "\\Device\\\u{039c}"),
             "a fold the kernel does not reach for is not one to make here"
+        );
+    }
+
+    /// **What the rendering claims about an entry, which is the half a client reads.**
+    ///
+    /// None of the four markers had a test, and the round that added the fourth is the round that
+    /// found the third was wrong: every callback ACE was printed `[if]`, which says a conditional
+    /// *expression* is there, on nothing but the ACE type. Pinned here rather than only at the
+    /// decode, because a correct field rendered under the wrong word is the same wrong answer.
+    #[test]
+    fn the_markers_say_what_decides_an_entry_and_do_not_overstate_it() {
+        let marked = |conditional: bool, callback: bool, inherit_only: bool| {
+            let mut entry = access_entry(&ace(
+                crate::sd::AceKind::Allow,
+                "S-1-1-0",
+                Some("Everyone"),
+                0x0012_00a0,
+            ));
+            entry.conditional = conditional;
+            entry.callback = callback;
+            entry.inherit_only = inherit_only;
+            let acl = crate::structured::AccessControlList {
+                revision: 2,
+                ace_count: 1,
+                entries: vec![entry],
+            };
+            let mut out = String::new();
+            render_acl(&mut out, "DACL", &acl);
+            out
+        };
+
+        let plain = marked(false, false, false);
+        assert!(
+            !plain.contains('['),
+            "an entry that simply applies is marked with nothing: {plain}"
+        );
+
+        let conditional = marked(true, true, false);
+        assert!(
+            conditional.contains("[if]"),
+            "an expression the kernel evaluates is the one thing `[if]` is for: {conditional}"
+        );
+
+        // The finding this round: without the `artx` signature there is no expression, so `[if]`
+        // would be inventing one -- and plain rights would read as an entry that simply applies,
+        // which it does not.
+        let opaque = marked(false, true, false);
+        assert!(
+            opaque.contains("[callback]") && !opaque.contains("[if]"),
+            "an application-defined callback is not an expression, and is not nothing: {opaque}"
+        );
+
+        // And inheritance wins over both, because neither says anything about *this* device.
+        let inherited = marked(true, true, true);
+        assert!(
+            inherited.contains("[inherit-only]") && !inherited.contains("[if]"),
+            "an entry not applied to this device is not a condition on opening it: {inherited}"
         );
     }
 

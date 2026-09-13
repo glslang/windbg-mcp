@@ -306,8 +306,14 @@ pub enum EngineOp {
         /// filled in by the supervisor's pump.
         patience_ms: u32,
     },
-    /// What decides who may open a device: its object header's security descriptor, the two
-    /// words of device flags that qualify it, and the symbolic links that reach it.
+    /// What decides who may open a device: the `_DEVICE_OBJECT`'s **own** security descriptor,
+    /// the two words of device flags that qualify it, and the symbolic links that reach it.
+    ///
+    /// **Its own, and not its object header's**, which for a device is null. The `Device` object
+    /// type carries `TypeInfo.SecurityProcedure = nt!IopGetSetSecurityObject`, so the kernel keeps
+    /// the descriptor in the body and checks it there. Reading the header's field instead reports
+    /// every guarded device as having none at all -- which is what this sentence used to describe,
+    /// and what a live target caught the implementation doing.
     ///
     /// One indivisible job for the reason [`Self::Reachability`] is, and more plainly than any of
     /// them: it walks the object namespace, reads a descriptor out of pool, and lists a directory

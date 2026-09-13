@@ -2675,13 +2675,22 @@ pub struct AccessEntry {
     /// which is what a child would be given.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub inherit_only: bool,
-    /// True when this entry applies only if a condition holds.
+    /// True when this entry carries a conditional expression, which the kernel evaluates against
+    /// the caller's token before the entry decides anything.
     ///
-    /// A callback ACE carries an expression the kernel evaluates against the caller's token, and
-    /// this reader does not evaluate it. So `kind: "allow"` with this set means the mask is
-    /// granted **if** that expression is true, which is a weaker claim than the kind alone.
+    /// Implies [`Self::callback`] and is the narrower of the two: a conditional ACE is a callback
+    /// ACE whose application data opens with the `artx` signature. This reader does not evaluate
+    /// the expression, so `kind: "allow"` with this set means the mask is granted **if** that
+    /// expression is true -- a weaker claim than the kind alone.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub conditional: bool,
+    /// True when this entry is a callback ACE, whose application data decides whether it applies.
+    ///
+    /// Set whenever [`Self::conditional`] is, and also for a callback ACE carrying an
+    /// application-defined blob this cannot recognise. Joined to `kind` it says the entry does not
+    /// simply apply, without claiming to know what decides it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub callback: bool,
     /// True when this entry's type carries a principal and the bytes that should have held one
     /// did not parse.
     ///
