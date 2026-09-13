@@ -6841,10 +6841,10 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                 Some(found) => found,
                 None => {
                     let chosen = worst_refusal(&failures);
-                    let (candidate, why) = failures
-                        .into_iter()
-                        .nth(chosen)
-                        .expect("at least one directory was tried");
+                    let (candidate, why) = failures.into_iter().nth(chosen).expect(
+                        "every directory that failed pushed an entry, and this is reached \
+                         only when they all did",
+                    );
                     return Err(match why {
                         dbgscope::object::ObjectError::NotFound { .. } => Failed::categorised(
                             structured::ErrorCategory::InvalidArgument,
@@ -7096,19 +7096,17 @@ fn driver_devices(
     let gates = surface::device_gates(
         &chain.devices,
         |at| paths.get(&at).cloned(),
-        |at| {
-            let fields = read.get(&at)?.clone();
-            let security = match fields.security_descriptor {
-                None => device::Security::Absent,
-                Some(at) => match sd::read_descriptor(at, memory) {
-                    Ok(descriptor) => device::Security::Read { at, descriptor },
-                    Err(why) => device::Security::Failed { at, why },
-                },
-            };
-            Some((fields, security))
+        |at| read.get(&at).cloned(),
+        |fields| match fields.security_descriptor {
+            None => device::Security::Absent,
+            Some(at) => match sd::read_descriptor(at, memory) {
+                Ok(descriptor) => device::Security::Read { at, descriptor },
+                Err(why) => device::Security::Failed { at, why },
+            },
         },
         halt,
     );
+    let gates_summary = gates.clone();
     let devices = gates.devices;
     let gates_unread = gates.unread_gates;
     let fields_unread = gates.unread_devices;
@@ -7120,11 +7118,8 @@ fn driver_devices(
     // then means nothing; and a descriptor that would not read is a gate this section did not
     // answer, which is the case the first version reported as `ok` -- misstating security coverage
     // in exactly the place a reader is relying on it.
-    let whole = chain.stopped.is_none()
-        && gates_stopped.is_none()
-        && named_completely
-        && fields_unread == 0
-        && gates_unread == 0;
+    let named_where_it_matters = devices.is_empty() || named_completely;
+    let whole = devices_are_whole(&chain, &gates_summary, named_completely);
     let status = match whole {
         true => structured::SectionStatus::Ok,
         false => structured::SectionStatus::Partial,
@@ -7157,7 +7152,7 @@ fn driver_devices(
                     ),
                 });
             }
-            if !named_completely {
+            if !named_where_it_matters {
                 why.push(format!(
                     "{DEVICE_DIRECTORY} could not be listed in full, so a device with no path \
                      here may simply be one this did not reach"
@@ -7251,6 +7246,30 @@ fn unattributed_image(
     }
 }
 
+/// Whether the device section read everything it set out to.
+///
+/// **A chain that ended at a null `DeviceObject` is complete, and the directory is then beside the
+/// point.** Requiring the listing anyway turns a driver *known* to have created no devices into a
+/// `partial` section whenever `\Device` will not list in full -- and the renderer then says no
+/// devices were read, which is the opposite of what the chain established. The listing matters only
+/// when there are devices for it to give paths to.
+///
+/// The other four are the ways this section can be short: the chain stopped before its end, the
+/// gate pass stopped before its end, a device object would not read, or a descriptor would not. A
+/// device carrying *no* descriptor is not among them -- that is an answer, not a failure.
+fn devices_are_whole(
+    chain: &surface::Chain,
+    gates: &surface::Gates,
+    named_completely: bool,
+) -> bool {
+    let named_where_it_matters = gates.devices.is_empty() || named_completely;
+    chain.stopped.is_none()
+        && gates.stopped.is_none()
+        && named_where_it_matters
+        && gates.unread_devices == 0
+        && gates.unread_gates == 0
+}
+
 /// Which of several failed lookups to report, when a bare name was tried in each directory.
 ///
 /// **A target-side failure outranks a "not found", whichever directory it came from.** Keeping the
@@ -7260,8 +7279,12 @@ fn unattributed_image(
 /// that function makes, applied one level up: by whose fault it is, not by which directory came
 /// first.
 ///
-/// Returns an index into `failures`, which is never empty at any call site; an empty one answers
-/// zero rather than panicking, and the caller's `nth` then yields `None` for it.
+/// Returns an index into `failures`. **It must not be empty**, and the one call site guarantees
+/// that three lines above rather than defending it here: `DRIVER_DIRECTORIES` is a non-empty
+/// const, the loop pushes one entry per directory that failed, and this is reached only when
+/// every one of them did. An earlier draft of this sentence claimed an empty input answered zero
+/// gracefully; the caller `expect`s the element, so it would have panicked, and a panic in a
+/// worker costs the session.
 fn worst_refusal(failures: &[(String, dbgscope::object::ObjectError)]) -> usize {
     use dbgscope::object::ObjectError;
     failures
@@ -8239,6 +8262,92 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    /// **A driver the chain proved has no devices is a complete section, whatever the directory
+    /// did.**
+    ///
+    /// The listing exists to give devices a path. With no devices there is nothing for it to name,
+    /// so a listing that fell short says nothing about this answer -- and requiring it anyway made
+    /// the renderer say "no devices were read" about a chain that had established the opposite.
+    #[test]
+    fn a_chain_that_ended_at_a_null_device_is_complete_whatever_the_directory_did() {
+        let empty_chain = crate::surface::Chain {
+            devices: Vec::new(),
+            stopped: None,
+        };
+        let no_gates = crate::surface::Gates {
+            devices: Vec::new(),
+            unread_gates: 0,
+            unread_devices: 0,
+            stopped: None,
+        };
+
+        assert!(
+            super::devices_are_whole(&empty_chain, &no_gates, false),
+            "a directory that would not list in full cannot make a driver with no devices partial"
+        );
+        assert!(super::devices_are_whole(&empty_chain, &no_gates, true));
+
+        // And with a device present the listing matters again, because that device has a path to
+        // be missing.
+        let one = crate::device::unread_device(structured::addr(0x100), None, "x".to_string());
+        let with_device = crate::surface::Gates {
+            devices: vec![one],
+            unread_gates: 0,
+            // Its object did not read, which is itself a reason this section is not whole.
+            unread_devices: 1,
+            stopped: None,
+        };
+        assert!(!super::devices_are_whole(&empty_chain, &with_device, false));
+
+        // Each of the four other shortfalls on its own.
+        let good = |devices: Vec<structured::SurfaceDevice>| crate::surface::Gates {
+            devices,
+            unread_gates: 0,
+            unread_devices: 0,
+            stopped: None,
+        };
+        let listed = || {
+            vec![crate::device::surface_device(
+                structured::addr(0x100),
+                Some("\\Device\\x".to_string()),
+                &crate::device::Device {
+                    device_type: 0x22,
+                    characteristics: 0,
+                    secure_open: false,
+                    exclusive: false,
+                    flags: 0,
+                    driver: 0,
+                    next: 0,
+                    security_descriptor: None,
+                },
+                &crate::device::Security::Absent,
+            )]
+        };
+        assert!(
+            super::devices_are_whole(&empty_chain, &good(listed()), true),
+            "a device that read, with a gate that answered, in a directory that listed"
+        );
+        assert!(
+            !super::devices_are_whole(&empty_chain, &good(listed()), false),
+            "...but not when the directory fell short and there was a device to name"
+        );
+        let stopped_chain = crate::surface::Chain {
+            devices: Vec::new(),
+            stopped: Some(crate::surface::ChainHalt::Cycle),
+        };
+        assert!(!super::devices_are_whole(
+            &stopped_chain,
+            &good(listed()),
+            true
+        ));
+        let mut halted = good(listed());
+        halted.stopped = Some(walk::Halt::Deadline);
+        assert!(!super::devices_are_whole(&empty_chain, &halted, true));
+        let mut bad_gate = good(listed());
+        bad_gate.unread_gates = 1;
+        assert!(!super::devices_are_whole(&empty_chain, &bad_gate, true));
+    }
+
     /// **An image the clock never asked about is not an image in no module.**
     ///
     /// `unavailable` is the target having no such module and is a fact about the target;

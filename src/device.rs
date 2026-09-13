@@ -261,6 +261,14 @@ pub(crate) enum Security {
     Absent,
     /// It carries one at this address and those bytes would not read.
     Failed { at: u64, why: crate::sd::SdError },
+    /// Nobody looked: the call that would have read it stopped first.
+    ///
+    /// **A fourth outcome, and it belongs here rather than in a field of its own** -- unlike "the
+    /// device object would not read", which is about the object and has one, this is about the
+    /// descriptor, which is what [`security_absent`] answers for. `device_security` cannot reach
+    /// it: that tool reads one device and always attempts it. `driver_surface` can, its gate pass
+    /// being a second walk over a chain on the caller's clock.
+    Unattempted(crate::walk::Halt),
 }
 
 /// Everything an answer about one device is made of, before it is a report.
@@ -579,6 +587,13 @@ pub(crate) fn security_absent(security: &Security) -> Option<String> {
         ),
         Security::Failed { at, why } => Some(format!(
             "the descriptor at {at:#018x} could not be read: {why}"
+        )),
+        // **Not "this device has no descriptor".** Nothing was read either way, and the remedy is
+        // this call's clock rather than anything about the device.
+        Security::Unattempted(halt) => Some(format!(
+            "this survey {} before this device's descriptor was read, so whether it carries one \
+             is not something this answered",
+            halt.phrase()
         )),
     }
 }
