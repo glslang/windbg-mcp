@@ -123,6 +123,24 @@ against the mutation it is for**, one at a time, and treat "the whole suite stil
 thing to be suspicious of. Two of that PR's own commits shipped a fix whose test passed with the fix
 backed out, until exactly that was done.
 
+**And "the rule is pinned" is a claim about a *site*, not about a function**, which is the half of
+that discipline it is easiest to leave out. A bug can live in an **argument**:
+`e.modules().map(|loaded| loaded.len()).unwrap_or_default()` hands a failed enumeration on as a
+count of zero, and zero was the arm reporting a fresh kernel attach — so a debugger call that did
+not answer came back as evidence about the target. The fix makes the callee take `Option<usize>`,
+and the natural test drives that callee with explicit arguments. It passes, it is a real rule, and
+it says nothing whatever about the expression that carried the bug: mutating the **call site** back
+to `unwrap_or_default()` came back **MISSED** — correctly. The MISSED *was* the finding. Two ways
+out and the second is better: write the test through the caller, or extract the argument into
+something with a name (`inventory_size(listed: Result<Vec<T>, E>) -> Option<usize>`) so that site
+becomes testable on its own. Either way, **mutate the line the bug was on** — a mutation applied to
+the function the bug was *in* is a different experiment, and it is the one that passes.
+
+So read a MISSED as "no test fails when I change this **here**" before reading it as a gap. A rule
+can be firmly pinned at one site and unpinned at the one that shipped the defect, and the two are
+indistinguishable from the report alone. What settles it is cheap: name the test you expect to
+fail, then check it calls the code you mutated.
+
 A corollary for the other direction, which is the one you are in more often: **when you are about to
 tell a reviewer their scenario is unreachable, measure it first.** Round nine of that PR said two
 live attaches on one pid could starve each other, and the reply forming in my head was that they
