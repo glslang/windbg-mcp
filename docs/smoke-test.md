@@ -546,10 +546,14 @@ here.
 **`ioctl_map` against a real driver, and against one this build cannot decode.** The x64 driver
 crash carries `mountmgr`, whose control codes
 [`driver-ioctl-walkthrough.md`](driver-ioctl-walkthrough.md) recovered by hand before there was a
-tool — so the map has a published oracle: 45 case records over 23 codes, every one
+tool — so the map has a published oracle: 48 case records over 24 codes, every one
 `METHOD_BUFFERED` and device type `0x6d`, two 81-entry switch tables followed to 13 codes each, and
 nothing left unresolved. A code compared in two places is two records, which is why there are more
-of the first figure than the second. Each of those numbers moves in a direction a reader would
+of the first figure than the second. **That oracle was 45 over 23 and was wrong**, because the
+walkthrough it comes from is my own hand recovery of the same driver: both missed `0x6dc000`
+and agreed with each other about it. What found it was Ghidra and Driver Buddy Revolutions,
+run over the same cached image — a second opinion from an implementation that is not this one,
+which is the thing a fixture derived from my own reading cannot be. Each of those numbers moves in a direction a reader would
 believe if the recovery breaks — a table read at a guessed length gives *more* codes, a chain that
 loses its `sub` rebase gives different ones, a graph missing an edge gives fewer — which is what
 makes this the oracle for any change to the walk rather than a demonstration of it. **A kernel
