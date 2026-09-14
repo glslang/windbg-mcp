@@ -352,7 +352,19 @@ NUMERIC = re.compile(r"^(0x)?[0-9a-f]+$")
 # A separator *between* hex digits is how a reader is helped, not part of the value: WinDbg
 # writes `fffff801`3c65bca8` and the control row wrote `0xfffff801_3c65bca8`. Both name the
 # address the key holds, and the second was scored a miss until this existed.
-SEPARATOR = re.compile(r"(?<=[0-9a-f])[_`](?=[0-9a-f])")
+#
+# **The apostrophe is the third spelling, and it cost a control row a task** (2026-09-13): Opus
+# answered `arm64_pc` with `0xfffff801'3c65bca8` on `lean` and `` 0xfffff801`3c65bca8 `` on `min`
+# - the same address, graded `n` and `Y`. Which is the third time the control has found a grader
+# defect rather than a model one, and the argument for having a frontier row restated.
+#
+# The class is exactly the three, and which characters are *not* in it is the half worth
+# recording: scanning every answer on disk for a non-hex character between two hex runs finds
+# `` ` `` 45 times, `'` 19 and `_` 18 - and also `-` 23 times and `,` 14, which are a sample's
+# file name (`052126-34312`) and a decimal thousands separator (`139,264`). Stripping either
+# would merge digits that belong to different values, so this widens by a glyph the evidence
+# names and not by a category anyone reasoned to.
+SEPARATOR = re.compile(r"(?<=[0-9a-f])['_`](?=[0-9a-f])")
 
 
 def normalise(answer):
