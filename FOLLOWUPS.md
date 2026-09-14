@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-one clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -39,7 +39,10 @@ item an earlier round of it had produced (2026-09-13), and item 71 from `driver_
 fourth driver tool, whose specification included a dispatch-to-sink traversal that did not land
 with it, and item 72 from running that tool's live-kernel tier, where a fresh attach turns out to
 leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
-against (2026-09-13).
+against (2026-09-13), and items 73–75 from checking the four driver tools against Ghidra and Driver
+Buddy Revolutions over `mountmgr` and HEVD: an import directory the loader may have freed, the one
+section of the ported program with no counterpart here, and the read side of the decoder's
+register lists (2026-09-14).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1277,3 +1280,31 @@ its own code, which is what makes the walk worth starting.
 
 **Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
 these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
+
+## 75. [dbgscope] An instruction's operands are not every register it reads
+
+**Repo:** `dbgscope` (consumed by `windbg-mcp`).
+
+`Instruction::writes` exists because inferring a destination from the first operand is right for
+the shapes a compiler usually emits and wrong for two it also emits -- a second explicit
+destination (`xchg eax,r13d`) and an implicit one (`mul ecx`). **The read side has the same gap and
+no equivalent.** `ioctl_map`'s loss check asks whether a flag-writing instruction reads the control
+code, and asks it of `operands`, which names the explicit reads only: `mul ecx` reads `eax` and
+names it nowhere, `cmpxchg` reads `rax`, and the string instructions read `rsi`/`rdi`/`rcx`.
+
+- **Why deferred:** it is a `dbgscope` change and therefore a stacked PR, while the consuming half
+  here is one clause. Nothing currently reads short because of it -- the operand answer covers
+  every shape measured on `mountmgr` and HEVD, and the gap is in shapes neither driver has -- so
+  this is a boundary to close deliberately rather than a defect to chase.
+- **What would close it:** `Instruction::reads: Vec<RegisterOperand>` beside `writes`, from the
+  same `InstructionInfoFactory::used_registers()` call with the `OpAccess` filter mirrored
+  (`Read`, `CondRead`, `ReadWrite`, `ReadCondWrite`), under the same two contracts that field
+  states: a register named as the **read** reaches it, and empty meaning "not decoded" rather than
+  "reads nothing". Then `note_loss` asks `reads` in place of `operands`, and keeps the memory probe
+  for the control-code field, which is not a register on either list.
+- **How it was found:** review round nine of
+  [#318](https://github.com/glslang/windbg-mcp/pull/318) -- `and eax,ecx` with the mask in `eax`,
+  where the flags are computed from the code and the code never moves (2026-09-14).
+
+**Where it picks up.** `note_loss` in `src/ioctl.rs`, which is the one caller, and `written_from`
+in `dbgscope`'s `src/dbgeng.rs`, which is the filter to mirror.
