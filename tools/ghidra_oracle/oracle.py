@@ -387,6 +387,27 @@ def main() -> None:
             print(f"    codes `ioctl_map` took that ghidra does not label here: {stray or 'none'}")
             print(f"    codes routed somewhere ghidra does not: {misrouted or 'none'}")
 
+        # **And the switches Ghidra did not find at all.** Iterating its tables alone meant a
+        # switch `ioctl_map` resolved and Ghidra missed had none of its cases checked -- the
+        # promised same-switch comparison skipped in silence rather than reported. Which of the two
+        # is right is not this loop's to say; that it has only one opinion is.
+        theirs = {switch for switch, _ in tables}
+        ours = {
+            case["at"].get("rva")
+            for case in tool["cases"]
+            if case.get("recovered") == "jump_table"
+        }
+        unseen = sorted(
+            site
+            for site in ours
+            if site and not any(int(site, 16) == int(one, 16) for one in theirs)
+        )
+        if unseen:
+            print()
+            print(f"  switches `ioctl_map` resolved that ghidra did not recover: {unseen}")
+            print("    -- their cases were not cross-checked, because there is nothing to check")
+            print("    them against. Read the decompiled C at those RVAs.")
+
         if missing:
             print()
             print("  Every line above is a candidate rather than a finding: neither implementation")
