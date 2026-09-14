@@ -1,0 +1,95 @@
+{
+  "run": "2026-09-14 reasoning A/B, arm B: think on",
+  "note": "The same twelve local cells as the `nothink` plan with `think: true`, which is the first run on this bench to turn reasoning on. Thinking was excluded from every earlier run deliberately rather than by oversight: `docs/local-model.md` had measured a thinking turn outliving the listener's 390s lease grace (440s), so leaving it on would have confounded every timing with sessions vanishing mid-task. The driver's keepalive removed that, which is what makes the axis affordable now. The budget is doubled because the whole point of the arm is that turns get longer. No Claude rows: their reasoning is the client's and this bench cannot set it, so there is no `off` row to pair one against. Verify the arm from the log rather than from this file - every turn records `thinking_chars`, and an `on` cell that recorded none did not think, whatever the request asked for. EXTENDED 2026-09-14: five draws of every `min` cell, the other half of the paired question - whether reasoning recovers `arm64_pc` at a rate or did it once. Same resume, same one-draw `full`/`lean` cells.",
+  "tasks": "tools/eval_tasks.json",
+  "url": "http://127.0.0.1:8766/",
+  "out": "eval-out/2026-09-14-think.jsonl",
+  "logs": "eval-out/logs-2026-09-14-think",
+  "max_steps": 6,
+  "keep_alive": "10m",
+  "surfaces": [
+    {
+      "client": "full",
+      "spec": "all",
+      "tools": 61
+    },
+    {
+      "client": "lean",
+      "spec": "session,inspect,crash",
+      "tools": 23
+    },
+    {
+      "client": "min",
+      "spec": "crash",
+      "tools": 13
+    }
+  ],
+  "cells": [
+    {
+      "backend": "ollama",
+      "models": [
+        "qwen3.8:27b-mlx",
+        "gemma4:31b-mlx",
+        "nemotron-3.5-lightning:30b-mlx"
+      ],
+      "contexts": [
+        262144
+      ],
+      "surfaces": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "think": true,
+      "budget_s": 4800
+    },
+    {
+      "backend": "ollama",
+      "models": [
+        "muse-glimmer:30b-mlx"
+      ],
+      "contexts": [
+        131072
+      ],
+      "surfaces": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "think": true,
+      "budget_s": 4800
+    },
+    {
+      "backend": "ollama",
+      "models": [
+        "qwen3.8:27b-mlx",
+        "gemma4:31b-mlx",
+        "nemotron-3.5-lightning:30b-mlx"
+      ],
+      "contexts": [
+        262144
+      ],
+      "surfaces": [
+        "min"
+      ],
+      "draws": 5,
+      "think": true,
+      "budget_s": 4800
+    },
+    {
+      "backend": "ollama",
+      "models": [
+        "muse-glimmer:30b-mlx"
+      ],
+      "contexts": [
+        131072
+      ],
+      "surfaces": [
+        "min"
+      ],
+      "draws": 5,
+      "think": true,
+      "budget_s": 4800
+    }
+  ]
+}
