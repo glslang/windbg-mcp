@@ -41,9 +41,12 @@
 //! blocks one after another, so reading the listing straight through carries register facts across
 //! seams control flow never crosses -- a shared epilogue's `pop r13`, the block after a `ret` that
 //! is entered from a branch elsewhere. [`crate::cfg`] recovers the blocks and the edges from the
-//! flow the decoder already answers, and the facts here travel along those edges: what a block
-//! knows is what **every** path into it agrees on, a bounds check holds on the path it admits and
-//! not on the one it rejects, and a case block is read with the facts of the path that reaches it.
+//! flow the decoder already answers, and the facts here travel along those edges: a bounds check
+//! holds on the path it admits and not on the one it rejects, and a case block is read with the
+//! facts of the path that reaches it. What a block **knows** is what every path into it agrees on;
+//! what a block's branches can **decide** is whatever any path into it left them -- a comparison
+//! and a lost code are claims about the path that made them, so they are unioned where a register's
+//! value is intersected.
 //!
 //! That is a rewrite of an earlier straight-line pass ([#306](https://github.com/glslang/windbg-mcp/issues/306)),
 //! and the reason for it is worth keeping: thirteen review findings across four rounds were all one
@@ -359,12 +362,23 @@ struct Facts {
     /// blind instruction, nothing in the answer saying a code had gone. Measured on `mountmgr`,
     /// where it cost `0x6dc000` outright and one of `0x6d4020`'s two sites.
     ///
-    /// **Which edges carry it is the whole rule**, and it is narrow deliberately: the fall-through
-    /// of a branch that is not `je`/`jne`, and nothing else. Past `ja K` *taken* the code is above
-    /// `K`, so an equality against that same compare cannot hold and a case built there would be
-    /// invented; past `je K` not taken it is not `K`; and past `jne K` not taken the case is
-    /// already recorded by the branch itself.
-    pending: Option<Compared>,
+    /// **Which edges carry it is the whole rule**, and [`equality_survives`] is that rule: an
+    /// edge carries the compare exactly where an equality against it is still possible. Past
+    /// `ja K` *taken* the code is above `K`, so a case built there would be invented; past `je K`
+    /// not taken it is not `K`; and past `jne K` not taken the case is already recorded by the
+    /// branch itself. A terminator that asks no question -- a fall-through, a call, an
+    /// unconditional jump -- rules nothing out and so carries it everywhere it goes.
+    ///
+    /// **A set, because it is a fact about the path that left it rather than about this block.**
+    /// A register's value has to hold *here*, so a join keeps only what every path agrees on. A
+    /// comparison says what a branch below decides **on the path that made it**, and an execution
+    /// taking that path reaches the case whatever the others did -- so the paths are unioned, not
+    /// intersected. Intersecting cost `cmp code,K` / `jb other` / `je handler` its case outright
+    /// whenever anything else reached that `je`, with no `untracked` either, because nothing had
+    /// been lost. Bounded by the number of comparison sites that reach the block, each appearing
+    /// once: a flag-writing instruction replaces the whole set with the one it leaves, so within a
+    /// block there is never more than one.
+    pending: Vec<Compared>,
     /// An instruction that took the control code somewhere unmodelled, whose flags are still live.
     ///
     /// Carried for the reason [`Self::pending`] is, and it is the same gap: `and ecx,mask` / `ja
@@ -389,11 +403,16 @@ struct Facts {
 }
 
 impl Facts {
-    /// What two paths into one block agree on.
+    /// What two paths into one block leave it holding.
     ///
-    /// A fact that is not on every edge is not a fact at the join: a register holding the control
-    /// code on one path and something else on another holds neither here. Dropping it is what
-    /// makes the answer sound; keeping it is what a straight-line pass does by accident.
+    /// **Two kinds of fact, joined in opposite directions**, and reading them as one kind is the
+    /// mistake this has now been on both sides of. A register's value, a bounds check and a
+    /// refusal's status must hold *here*, so a fact that is not on every edge is not a fact at the
+    /// join -- a register holding the control code on one path and something else on another holds
+    /// neither. A live comparison and a lost code are claims about the **path that made them**: an
+    /// execution taking that path reaches what they decide whatever the other edges did, so they
+    /// are unioned. Intersecting those dropped real cases with nothing in the answer saying so,
+    /// which is the failure the whole of this walk is arranged against.
     fn join(&mut self, other: &Facts) -> bool {
         let mut changed = false;
         self.registers.retain(|register, value| {
@@ -405,20 +424,25 @@ impl Facts {
             changed |= self.bound.is_some();
             self.bound = None;
         }
-        // A compare is live at a join only where **every** path into the block left the same one.
-        // Two paths whose flags say different things say nothing here, which is the rule the
-        // registers and the bound are already under.
-        if self.pending != other.pending {
-            changed |= self.pending.is_some();
-            self.pending = None;
+        // **A compare is not the same kind of fact as a register's value, which is what the
+        // rule above gets right and this one got wrong by copying it.** A register has to hold
+        // its value *here*, so a join keeps what every path agrees on. A comparison says what the
+        // branch below decides **on the path that made it** -- and an execution taking that path
+        // reaches the case whatever the other edges did. So they are unioned. Intersecting them
+        // dropped a real case with nothing saying so: no `untracked`, because nothing was lost.
+        // Sorted by where the comparison is, so the order does not depend on which edge the walk
+        // took first.
+        for was in &other.pending {
+            if !self.pending.contains(was) {
+                self.pending.push(was.clone());
+                changed = true;
+            }
         }
-        // **The opposite rule, and deliberately.** `pending` asserts a *fact* -- this
-        // comparison is live -- so every path into the block has to agree on it. A loss asserts
-        // *doubt*, and doubt on any path in is doubt here: a branch below is code-dependent on
-        // that path whatever the others did. Dropping unless the paths agreed cleared the loss
-        // whenever two arms lost the code at different instructions, which is the silent short
-        // list this field exists to prevent. The lower address is kept when both have one, so the
-        // answer does not depend on which edge the walk took first.
+        self.pending.sort_by_key(|was| (was.at, was.code));
+        // The same rule, for the same reason. A loss asserts *doubt*, and doubt on any path in is
+        // doubt here: a branch below is code-dependent on that path whatever the others did. The
+        // lower address is kept when both have one, so the answer does not depend on which edge
+        // the walk took first.
         let joined = match (self.lost, other.lost) {
             (Some(ours), Some(theirs)) => Some(ours.min(theirs)),
             (ours, theirs) => ours.or(theirs),
@@ -955,7 +979,7 @@ fn simulate(
     let mut facts = entry;
     // **The compare this block was entered with**, taken rather than copied: it belongs to the
     // edge that arrived, and what leaves is decided per outgoing edge below.
-    let mut compared: Option<Compared> = facts.pending.take();
+    let mut compared: Vec<Compared> = std::mem::take(&mut facts.pending);
     let mut lost: Option<u64> = facts.lost.take();
     let mut traced = false;
     let mut untracked = Vec::new();
@@ -990,10 +1014,12 @@ fn simulate(
         // it. Attributing it to that compare fabricates a case out of two unrelated
         // instructions.
         if matches!(instruction.flow, Flow::Call(_)) {
-            compared = None;
+            compared.clear();
             lost = None;
         } else if instruction.writes_flags {
-            compared = next;
+            // A flag write replaces the whole set with the one comparison it leaves: every live
+            // compare was about the flags this just overwrote.
+            compared = next.into_iter().collect();
             lost = just_lost.take();
         }
     }
@@ -1016,7 +1042,13 @@ fn simulate(
                 {
                     untracked.push(at);
                 }
-                if let (Some(was), Some(condition)) = (compared.as_ref(), last.condition) {
+                // **Every compare live here, because each belongs to a path that reaches
+                // this branch.** Two paths meeting at one `je` make two cases, at two `case_rva`s,
+                // which is the same "a case per site" rule the rest of this module keeps.
+                for (was, condition) in compared
+                    .iter()
+                    .filter_map(|was| Some((was, last.condition?)))
+                {
                     match (condition, was.code) {
                         (Condition::Equal, Some(code)) => {
                             if let Some(target) = target {
@@ -1077,10 +1109,10 @@ fn simulate(
                 // an `untracked` entry for a branch reading a callee's flags.
                 let next = update(&mut facts, last, layout, &mut traced, &mut just_lost);
                 if matches!(last.flow, Flow::Call(_)) {
-                    compared = None;
+                    compared.clear();
                     lost = None;
                 } else if last.writes_flags {
-                    compared = next;
+                    compared = next.into_iter().collect();
                     lost = just_lost.take();
                 }
             }
@@ -1096,7 +1128,7 @@ fn simulate(
         .and_then(|&at| graph.holding(at));
     let mut carried = facts.clone();
     carried.bound = None;
-    carried.pending = None;
+    carried.pending = Vec::new();
     carried.lost = None;
     // **A compare outlives the branch that reads it, on whichever edges that branch has not ruled
     // equality out on.** See [`equality_survives`]: `ja` leaves it live where it falls through and
@@ -1107,15 +1139,22 @@ fn simulate(
         last.and_then(|last| last.condition),
     ) {
         (Some(Flow::Branch(_)), Some(condition)) => {
-            // The flags an equality here would leave are the comparison's own fact.
-            let flags = compared
-                .as_ref()
-                .map_or(Equality::SUBTRACTIVE, |was| was.equality);
-            let (taken, fallen) = equality_survives(condition, flags);
-            (
-                taken.then(|| compared.clone()).flatten(),
-                fallen.then(|| compared.clone()).flatten(),
-            )
+            // **Asked of each compare separately**, because the flags an equality would leave are
+            // that comparison's own fact: one reached by a `sub` and one by an `add` answer `jae`
+            // differently, and a set decided by whichever arrived first would be right about one
+            // of them by luck.
+            let mut taken = Vec::new();
+            let mut fallen = Vec::new();
+            for was in &compared {
+                let (on_taken, on_fallen) = equality_survives(condition, was.equality);
+                if on_taken {
+                    taken.push(was.clone());
+                }
+                if on_fallen {
+                    fallen.push(was.clone());
+                }
+            }
+            (taken, fallen)
         }
         // **A terminator that decides no equality rules nothing out**, so the compare goes down
         // every edge the block has. `equality_survives` answers per edge precisely because a
@@ -1124,42 +1163,61 @@ fn simulate(
         // dropped the compare at every block boundary a compiler's label happened to fall on.
         _ => (compared.clone(), compared.clone()),
     };
-    if let (Some(last), Some(was)) = (last, compared.as_ref())
-        && let (Flow::Branch(target), Some(condition)) = (last.flow, last.condition)
-        && matches!(
-            condition,
-            Condition::UnsignedAbove | Condition::UnsignedAboveOrEqual
-        )
-        && let (Some((register, offset, shift)), Some(limit)) = (was.index.clone(), was.bound)
-        // **A bound is about the register's value from here on, so the register has to still hold
-        // what was compared.** The pending compare deliberately outlives a flag-neutral
-        // instruction between the `cmp` and its branch -- that is where a compiler puts the case's
-        // setup -- but `cmp eax,2` / `mov eax,ecx` / `ja default` leaves a bound describing a value
-        // `eax` no longer has, and a table indexed by `eax` is then read to a limit nothing
-        // checked. The *case* built from the same compare needs no such thing: a comparison that
-        // already happened is what the branch reads, whatever the register holds by then.
-        && facts.registers.get(&register)
-            == Some(&Value::Code {
-                offset,
-                shift,
-                proved: was.proved,
+    // **The compare that makes a bounds check, asked of each in turn.** A bound is a claim
+    // about one register, so the compare that supplies it is the one whose index that register
+    // still holds -- not whichever of them the join happened to put first.
+    let bounding = match (
+        last.map(|last| last.flow),
+        last.and_then(|last| last.condition),
+    ) {
+        (Some(Flow::Branch(target)), Some(condition))
+            if matches!(
+                condition,
+                Condition::UnsignedAbove | Condition::UnsignedAboveOrEqual
+            ) =>
+        {
+            compared.iter().find_map(|was| {
+                let (register, offset, shift) = was.index.clone()?;
+                let limit = was.bound?;
+                // **A bound is about the register's value from here on, so the register has to
+                // still hold what was compared.** The pending compare deliberately outlives a
+                // flag-neutral instruction between the `cmp` and its branch -- that is where a
+                // compiler puts the case's setup -- but `cmp eax,2` / `mov eax,ecx` / `ja default`
+                // leaves a bound describing a value `eax` no longer has, and a table indexed by
+                // `eax` is then read to a limit nothing checked. The *case* built from the same
+                // compare needs no such thing: a comparison that already happened is what the
+                // branch reads, whatever the register holds by then.
+                if facts.registers.get(&register)
+                    != Some(&Value::Code {
+                        offset,
+                        shift,
+                        proved: was.proved,
+                    })
+                {
+                    return None;
+                }
+                let limit = match condition {
+                    Condition::UnsignedAbove => limit,
+                    _ => limit.checked_sub(1)?,
+                };
+                Some(Bound {
+                    register,
+                    offset,
+                    shift,
+                    limit,
+                    // An index past the bound goes where this branch goes, and so does every slot
+                    // of the table the compiler had no case for.
+                    default: target,
+                    proved: was.proved,
+                })
             })
-        && let Some(limit) = match condition {
-            Condition::UnsignedAbove => Some(limit),
-            _ => limit.checked_sub(1),
         }
-    {
+        _ => None,
+    };
+    if let Some(bound) = bounding {
+        let target = bound.default;
         let mut bounded = carried.clone();
-        bounded.bound = Some(Bound {
-            register,
-            offset,
-            shift,
-            limit,
-            // An index past the bound goes where this branch goes, and so does every slot of the
-            // table the compiler had no case for.
-            default: target,
-            proved: was.proved,
-        });
+        bounded.bound = Some(bound);
         if let Some(fall_through) = fall_through {
             bounded.pending = onward_fallen.clone();
             bounded.lost = lost;
@@ -3727,20 +3785,21 @@ mod tests {
         );
     }
 
-    /// **A compare is live at a join only where every path into the block left the same one.**
+    /// **A compare one path into the block left is a case that path reaches.**
     ///
-    /// With this rule at most one predecessor can carry a pending compare -- only a fall-through
-    /// edge does, and a block has one fall-through predecessor -- so a join is always `(Some,
-    /// None)` rather than two disagreeing compares. The construction that makes it visible is a
-    /// **back edge**: a block whose fall-through predecessor left a compare, re-entered from
-    /// somewhere whose flags say nothing. In reverse post-order the compare arrives first, so a
-    /// join that failed to drop it would keep it and the `je` would report a case no execution
-    /// reaches.
+    /// This asserted the opposite until 2026-09-14, on the argument that a comparison is a fact
+    /// like a register's value and so belongs to the block only where every path agrees. They are
+    /// not the same kind of fact. A register has to hold its value *here*; a comparison says what
+    /// the branch below decides **on the path that made it**, and an execution taking that path
+    /// reaches the case whatever the other edges did.
     ///
-    /// A single chain has no joins at all, which is why the first version of this rule was
-    /// unpinned and the mutation for it came back MISSED -- correctly.
+    /// Read against this fixture the old claim -- "a case no execution reaches" -- is plainly
+    /// false: falling through `jb 6DC000h` means the code is **not** below it, the `je` below
+    /// still reads that same comparison, and an IRP carrying `0x6dc000` takes it. The other path
+    /// in compares something else and contributes nothing, which is the point: it takes nothing
+    /// away either.
     #[test]
-    fn a_compare_does_not_survive_a_join_with_a_path_that_has_none() {
+    fn a_compare_one_path_left_is_a_case_that_path_reaches() {
         let mut block = prologue(DISPATCH);
         block.extend([
             insn(
@@ -3756,7 +3815,7 @@ mod tests {
                 Flow::Branch(Some(DISPATCH + 0x20)),
             ),
             // Reached by falling through with the compare live, and again from below with
-            // nothing.
+            // a comparison of its own.
             insn(DISPATCH + 0x14, "je", Vec::new(), Flow::Branch(Some(0x900))),
             insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
             // The other path in: its own flags, then back to the `je`.
@@ -3775,9 +3834,164 @@ mod tests {
         ]);
 
         let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
-        assert!(
-            found.cases.is_empty(),
-            "a compare one path into the block left is not a compare the block can read: {:?}",
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.site))
+                .collect::<Vec<_>>(),
+            vec![(0x6dc000, 0x900, DISPATCH + 8)],
+            "the fall-through path reaches this case, and the other path says nothing about it"
+        );
+    }
+
+    /// **Two paths meeting at one branch are two cases, at their own two sites.**
+    ///
+    /// Which is what makes the live compares a **set** rather than "whichever of the two the join
+    /// saw first": `jbe` carries its comparison on the edge it **branches** to, so a block can be
+    /// entered by two edges each holding a different one. Keeping one would report a real case and
+    /// drop a real case, and nothing in the answer would say which.
+    ///
+    /// The second code is above the first deliberately. Falling through `jbe 6DC000h` means the
+    /// code is greater than `0x6dc000`, so a compare against `0x6dc004` there is a case an
+    /// execution reaches; one against a lower value would be a fixture asserting a path that
+    /// cannot happen, and this walk does not track ranges to notice.
+    #[test]
+    fn two_paths_meeting_at_one_branch_are_two_cases() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x6dc000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "jbe",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x30)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "cmp",
+                vec![reg("r13d"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x30)),
+            ),
+            insn(DISPATCH + 0x30, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x36, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.site))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x6dc000, 0x900, DISPATCH + 8),
+                (0x6dc004, 0x900, DISPATCH + 0x14),
+            ],
+            "{:?}",
+            found.cases
+        );
+    }
+
+    /// **Each live compare answers `equality_survives` with its own flags.**
+    ///
+    /// Which only has consequences once there can be two: a `sub` reaching zero leaves `CF=0` and
+    /// an `add` reaching zero leaves `CF=1`, so one and the same `jb` below them admits the
+    /// equality on opposite edges. Asking once -- with whichever comparison the join happened to
+    /// put first -- would send both the same way and be right about one of them by luck.
+    #[test]
+    fn each_compare_answers_the_branch_with_its_own_flags() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            // A flag write of its own, so neither arm starts with the other's comparison.
+            insn(
+                DISPATCH + 0xb,
+                "test",
+                vec![reg("rax"), reg("rax")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x30)),
+            ),
+            // The subtractive arm.
+            insn(
+                DISPATCH + 0x17,
+                "sub",
+                vec![reg("ecx"), imm(0x6dc000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1d,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x50)),
+            ),
+            // And the one that carries.
+            insn(
+                DISPATCH + 0x30,
+                "add",
+                vec![reg("ecx"), imm(0x6dc000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x36,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x50)),
+            ),
+            // Both meet here, and this branch reads the carry.
+            insn(
+                DISPATCH + 0x50,
+                "jb",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x60)),
+            ),
+            insn(DISPATCH + 0x56, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x5c, "ret", Vec::new(), Flow::Return),
+            insn(DISPATCH + 0x60, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(DISPATCH + 0x66, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let mut recovered: Vec<_> = found
+            .cases
+            .iter()
+            .map(|case| (case.site, case.code, case.lands))
+            .collect();
+        // Keyed by where the comparison is rather than by the order the walk reached them, so the
+        // assertion is about which edge each one took and not about the sweep order.
+        recovered.sort();
+        assert_eq!(
+            recovered,
+            vec![
+                // `sub` leaves `CF=0`, so `jb` is **not** taken on the equality: the case is on
+                // the fall-through.
+                (DISPATCH + 0x17, 0x6dc000, 0x900),
+                // `add` leaves `CF=1`, so the same `jb` **is** taken on it. The code is the value
+                // that makes `ecx + 6DC000h` zero, which is `2^32 - 6DC000h`.
+                (DISPATCH + 0x30, 0xff92_4000, 0x980),
+            ],
+            "{:?}",
             found.cases
         );
     }
