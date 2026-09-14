@@ -1237,6 +1237,23 @@ def records(log_path):
     of it, and both count. Deduplicating on (cell, task) alone - which is what this did - meant n
     draws of a cell collapsed to the last one, so repeating a cell measured nothing.
     """
+    # **Refused here, because here is the only place every reader passes through.** Three rounds
+    # of review found this one class at three different readers - `--grade`, `--series`, then
+    # `--matrix` and the `--compare` built on it - and each fix was the same check bolted to
+    # another caller, which is a count that only goes up. A log holding both reasoning arms for a
+    # cell has no honest reading: the deduplication below keeps whichever arm was appended later,
+    # so every reader would show one arm's numbers under a run identity naming both. One gate ends
+    # the class; `already_done` is deliberately not behind it, since resume tells the arms apart
+    # by key and appending to such a log is how it would be repaired.
+    pooled = sorted(cell for cell, arms in reasoning_arms(log_path).items() if len(arms) > 1)
+    if pooled:
+        raise SystemExit(
+            f"{os.path.basename(log_path)} holds both reasoning arms for {len(pooled)} cell(s) - "
+            f"{cell_label(pooled[0])}"
+            + (f" and {len(pooled) - 1} more" if len(pooled) > 1 else "")
+            + ". Deduplication keeps whichever arm was written later, so every reading of this "
+              "log would report one arm's scores under a run that names both. Grade each arm's "
+              "log on its own and read them with `--compare`.")
     latest, seen_at = {}, {}
     for at, line in enumerate(open(log_path, encoding="utf-8")):
         line = line.strip()
@@ -1266,6 +1283,9 @@ def records(log_path):
     return list(latest.values())
 
 
+_ARMS_CACHE = {}
+
+
 def reasoning_arms(log_path):
     """Which reasoning arms each cell has records for, read **before** the deduplication.
 
@@ -1281,9 +1301,15 @@ def reasoning_arms(log_path):
     silently reporting its numbers, and the two mechanisms cannot disagree about what such a log
     holds.
     """
-    arms = {}
     if not os.path.exists(log_path):
-        return arms
+        return {}
+    # Keyed by what a rewrite would change, since `records()` asks on every call and a grade makes
+    # several of those over the same file.
+    stat = os.stat(log_path)
+    stamp = (os.path.abspath(log_path), stat.st_mtime_ns, stat.st_size)
+    if stamp in _ARMS_CACHE:
+        return _ARMS_CACHE[stamp]
+    arms = {}
     with open(log_path, encoding="utf-8") as f:
         for line in f:
             line = line.strip()
@@ -1299,6 +1325,7 @@ def reasoning_arms(log_path):
             cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                        surface.get("client"))
             arms.setdefault(cell_id, set()).add(arm_of(record))
+    _ARMS_CACHE[stamp] = arms
     return arms
 
 
@@ -1312,7 +1339,6 @@ def summarise(log_path, tasks_file):
     per-task distribution lives.
     """
     key = {t["id"]: t for t in load(tasks_file)["tasks"]}
-    arms = reasoning_arms(log_path)
     cells = {}
     for record in records(log_path):
         surface = (record.get("surface") or {})
@@ -1362,9 +1388,6 @@ def summarise(log_path, tasks_file):
     for cell in cells.values():
         graded = cell["tasks"]
         cell["draws"] = len(cell.pop("draw_ids"))
-        # Sorted rather than a set, because this travels into the graded JSON.
-        cell["arms"] = sorted(arms.get((cell["backend"], cell["model"], cell["num_ctx"],
-                                        cell["surface"]), ()))
         cell["n"] = len(graded)
         cell["possible"] = sum(1 for g in graded if g["possible"])
         cell["correct"] = sum(1 for g in graded if g["correct"])
@@ -1454,21 +1477,6 @@ def print_taught(cells):
     this whole item came out of: the scan that reported a clean result had compared nothing. So
     this line prints either the offenders or the sentence that says there were none.
     """
-    # **Before the `taught` line and on every path**, because it is a caveat about the table as a
-    # whole rather than a variant of that line. Printing it inside one branch would have hidden it
-    # from exactly the run that has offenders to read.
-    pooled = [c for c in cells if len(c.get("arms") or []) > 1]
-    if pooled:
-        # Not a warning about tidiness: a pooled cell's `ok/possible` is one number over two
-        # conditions, so its row is not a measurement of either arm.
-        print(f"\n{len(pooled)} cell(s) hold records from both reasoning arms - "
-              + ", ".join(f"{cell_label((c['backend'], c['model'], c['num_ctx'], c['surface']))}"
-                          f" ({'+'.join(c['arms'])})" for c in pooled[:3])
-              + (" …" if len(pooled) > 3 else "")
-              + "\n  Deduplication keeps the last record of each (cell, draw, task), so those "
-                "rows are whichever arm\n  was appended later - not both, and not an average. "
-                "The identity line above names only\n  the survivor. Grade each arm's log on "
-                "its own and read them with `--compare`.")
     offenders = [(cell, task, tool) for cell in cells
                  for task, tool in cell.get("taught_detail", [])]
     if not offenders:
@@ -2058,21 +2066,6 @@ def series(log_paths, tasks_file, out_path):
     """
     rows = []
     for log_path in log_paths:
-        # **A pooled log is refused here, not annotated.** `--grade` prints a table a reader is
-        # looking at and can warn beside it; a series row is published history that outlives the
-        # terminal it was made in, and `records()` has already reduced each coordinate to whichever
-        # arm was appended later - so the row would carry one arm's scores under a run identity
-        # naming both, with nothing in the file to say so. There is no honest projection of a log
-        # that holds two arms, so the export stops rather than inventing one.
-        pooled = sorted(cell for cell, arms in reasoning_arms(log_path).items() if len(arms) > 1)
-        if pooled:
-            raise SystemExit(
-                f"{os.path.basename(log_path)} holds both reasoning arms for "
-                f"{len(pooled)} cell(s) - {cell_label(pooled[0])}"
-                + (f" and {len(pooled) - 1} more" if len(pooled) > 1 else "")
-                + ". Deduplication keeps whichever arm was written later, so a series row for it "
-                  "would publish one arm's scores under a run that names both. Export each arm's "
-                  "log separately.")
         suite = suite_for(log_path, tasks_file)
         cells = summarise(log_path, suite)
         log_records = records(log_path)
