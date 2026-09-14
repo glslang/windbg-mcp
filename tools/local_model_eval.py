@@ -220,7 +220,7 @@ def release_sessions(env, why):
 
 
 def run_cell(plan, tokens, backend, model, context, surface, draw, subset, planned, budget_s,
-             log_path, logs_dir):
+             log_path, logs_dir, think=False):
     """One (backend, model, context, surface, draw) cell: a driver process over the task list.
 
     `planned` is the ids this draw was asked to run, and it exists to travel into the cell-level
@@ -255,6 +255,10 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
         # Residency for the length of a cell, then eviction: the next cell is either the same
         # model at another surface (keep it) or a different window, which reloads regardless.
         env["OLLAMA_KEEP_ALIVE"] = plan.get("keep_alive", "10m")
+        # **The reasoning axis, set per cell group.** Only the ollama rows have it: a Claude row's
+        # reasoning is the client's to decide and this bench does not own that knob, which is the
+        # same reason those rows carry no `model_digest`.
+        env["OLLAMA_THINK"] = "true" if think else "false"
         argv = [sys.executable, "-u", DRIVER, plan["tasks"]]
     elif backend == "claude-code":
         env["CLAUDE_MODEL"] = model
@@ -1528,7 +1532,8 @@ def identity(log_records):
         value = record[name]
         return render(value) if value else UNAVAILABLE
 
-    fields = {"run": set(), "suite": set(), "server": set(), "harness": set()}
+    fields = {"run": set(), "suite": set(), "server": set(), "harness": set(),
+              "reasoning": set()}
     weights = {}
     for record in log_records:
         if record.get("task") is None:
@@ -1545,6 +1550,13 @@ def identity(log_records):
                                     lambda s: f"{s.get('name')} {s.get('version')}"))
         if record.get("backend") == "claude-code":
             fields["harness"].add(stated(record, "harness_version"))
+        else:
+            # **Only the rows that have the knob.** Folding the Claude rows in here would report
+            # every mixed run as reasoning both ways, which is exactly the false "something moved"
+            # this block exists to prevent - their reasoning is the client's and unrecordable.
+            fields["reasoning"].add(
+                UNRECORDED if "think" not in record
+                else ("on" if record["think"] else "off"))
         model = record.get("model")
         if model:
             weights.setdefault(model, set()).add(stated(record, "model_digest"))
@@ -1562,17 +1574,19 @@ def print_identity(ident, indent="  ", header=True):
     if header:
         print("\nrun identity — the uncontrolled variables, which are not the question or the "
               "surface:")
-    for name in ("run", "suite", "server", "harness"):
+    for name in ("run", "suite", "server", "harness", "reasoning"):
         if ident[name]:
-            print(f"{indent}{name:<8} {', '.join(ident[name])}")
+            # Nine, which is `reasoning` - the longest label here and the one that made the
+            # column ragged when it was added against a width of eight.
+            print(f"{indent}{name:<9} {', '.join(ident[name])}")
     for model, digests in ident["weights"].items():
         # A model answering under two digests inside one log is a re-pull mid-run, which is worth
         # seeing loudly: the cells before it and the cells after it are different models.
         # Twelve characters, which is what `ollama list` prints in its `ID` column — so a digest
         # here can be matched against the machine's own listing by eye, and the full value is in
         # the record for anything that needs to be exact.
-        print(f"{indent}{'weights':<8} {model} {' '.join(d[:12] for d in digests)}")
-    if any(UNRECORDED in ident[name] for name in ("suite", "server", "harness")) or \
+        print(f"{indent}{'weights':<9} {model} {' '.join(d[:12] for d in digests)}")
+    if any(UNRECORDED in ident[name] for name in ("suite", "server", "harness", "reasoning")) or \
             any(UNRECORDED in d for d in ident["weights"].values()):
         print(f"{indent}({UNRECORDED} is a log written before a field existed — it cannot be "
               f"filled in afterwards; {UNAVAILABLE} is a row that has no such answer to give)")
@@ -1761,7 +1775,7 @@ def print_compare(order, rows, identities, surfaces, old_path, new_path):
     print("\nrun identity — the uncontrolled variables, which are not the question or the surface:")
     print_identity(old_ident, indent="  old  ", header=False)
     print_identity(new_ident, indent="  new  ", header=False)
-    moved = [name for name in ("suite", "server", "harness")
+    moved = [name for name in ("suite", "server", "harness", "reasoning")
              if old_ident[name] != new_ident[name]]
     if old_ident["weights"] != new_ident["weights"]:
         moved.append("weights")
@@ -1975,7 +1989,7 @@ def main():
                             continue
                         run_cell(plan, tokens, backend, model, context, surface, draw, subset,
                                  [t["id"] for t in wanted], group.get("budget_s", 1800),
-                                 log_path, logs_dir)
+                                 log_path, logs_dir, think=bool(group.get("think", False)))
                         done = already_done(log_path, suite)
                 if backend == "ollama":
                     # **Evicted between contexts, not only between models** - and this is the

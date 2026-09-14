@@ -37,6 +37,9 @@ Configuration:
     OLLAMA_KEEP_ALIVE   how long the runtime keeps the model resident after a request
                         (default `10m`); `0` evicts it, which is what frees the box
                         between one model's cells and the next
+    OLLAMA_THINK        whether the model reasons before answering (`think` on the request);
+                        default off, which is what every run before 2026-09-14 measured. It is
+                        an axis rather than a setting — see `THINK`
     WINDBG_MCP_EVAL_OUT a file to append one JSON record per task to, for
                         `local_model_eval.py` to grade. Without it this script prints
                         and keeps nothing, which is what it did before the eval existed
@@ -439,7 +442,7 @@ class ChatFailed(Exception):
 
 def chat(messages, tools):
     body = {"model": MODEL, "messages": messages, "tools": tools, "stream": False,
-            "think": False, "keep_alive": KEEP_ALIVE}
+            "think": THINK, "keep_alive": KEEP_ALIVE}
     options = {}
     if NUM_CTX:
         # **The window is a property of the runtime, not of the model.** `ollama show` reports
@@ -578,6 +581,13 @@ def run(task, tools, transcript=None):
             "prompt_tokens": out.get("prompt_eval_count"),
             "eval_tokens": out.get("eval_count"),
             "load_ms": round((out.get("load_duration") or 0) / 1e6),
+            # **What the runtime actually did, beside what the request asked for.** `think: true`
+            # is a request, and this bench already learned once what happens when you record the
+            # ask instead of the answer: five cells asking for an 8,192 window were served 32,768
+            # and looked healthy. A runtime that ignores `think` would leave both arms of a
+            # reasoning A/B identical and the log unable to say so, so the evidence travels per
+            # turn - a model that reasoned has a `thinking` block, and one that did not has none.
+            "thinking_chars": len(message.get("thinking") or ""),
         })
         if first_prompt_tokens is None:
             first_prompt_tokens = out.get("prompt_eval_count")
@@ -905,6 +915,11 @@ def main():
             "num_ctx": NUM_CTX or None,
             "draw": DRAW,
             "seed": SEED,
+            # **The reasoning axis, on every record rather than in the plan alone.** A log is
+            # what survives; a plan is a file beside it that may not. Two logs differing only
+            # here are an A/B, and two that do not say which arm they are cannot be read
+            # against each other at all.
+            "think": THINK,
             # The two identity fields that are constant for a cell: which build was asked, and
             # which task list it was asked from. The third - which weights answered - is read per
             # task, since it is a property of the instance the runtime happened to have loaded.
