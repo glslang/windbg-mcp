@@ -2002,11 +2002,24 @@ def suite_for(log_path, fallback):
     Logs written before that field fall back to what the caller passed, which is what keeps the
     published v1 logs grading exactly as they did.
     """
-    for record in records(log_path):
-        named = (record.get("suite") or {}).get("file")
-        if named:
-            return os.path.join(HERE, named)
-    return fallback
+    named = next((s for s in ((r.get("suite") or {}).get("file") for r in records(log_path)) if s),
+                 None)
+    if not named:
+        return fallback
+    # **The caller's own path wins when it is the suite the log names.** A log records the suite's
+    # *basename* - a machine-specific path would be the wrong thing to publish - and the CLI takes
+    # an arbitrary tasks file, so rebuilding that basename under `tools/` would break a run graded
+    # against a suite kept anywhere else: `FileNotFoundError` at best, and at worst a same-named
+    # stranger under `tools/` silently standing in for it.
+    if os.path.basename(fallback) == named:
+        return fallback
+    beside = os.path.join(HERE, named)
+    if os.path.exists(beside):
+        return beside
+    raise SystemExit(
+        f"{os.path.basename(log_path)} was graded against `{named}`, which is neither the suite "
+        f"passed on this command line (`{os.path.basename(fallback)}`) nor a file in tools/. "
+        f"Pass that suite's path, so the row says what it was actually graded against.")
 
 
 def series(log_paths, tasks_file, out_path):
