@@ -14266,36 +14266,28 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
             );
         }
 
-        // **3. And the differential proper, which needs both calls to be talking about the same
-        // thing.** They are two calls with two clocks. The survey shares one deadline across its
-        // sections and says so when one ran out before a section began (`not_started`), while this
-        // standalone call gets a fresh one -- so a composite section that never started is not a
-        // disagreement with a standalone that succeeded, and its note is its own clock's rather
-        // than the scan's. Equally, two scans that both *ran* but were bounded can stop at
-        // different points; every other reason a scan is short -- a byte cap, a page that will not
-        // read, a bound import -- is a property of the image and falls the same way on both, which
-        // is why those do not gate anything.
-        // What each comparison needs, as a precondition rather than an inference. Both were
-        // inferred before, and both inferences were wrong in the same direction -- they described
-        // the composite from the outside.
+        // **3. And the differential proper, which is the payloads and only the payloads.**
         //
-        // **`not_started` names the first section the survey did not reach, and `hazards` is the
-        // last of them.** So *any* name means this section never started, where matching only
-        // `"hazards"` missed a clock that ran out before `devices` or `ioctl` -- and that is the
-        // case where the composite has no payload at all while this standalone call, on a fresh
-        // deadline, answers for itself.
-        let unstarted = !survey["not_started"].is_null();
-        // **And the payload comparison asks whether there is a payload**, which needs no ordering
-        // and no clock: there is nothing to compare a null against, whatever made it null.
+        // These are two calls with two clocks, and the previous versions of this block kept
+        // reaching for claims that do not survive that. The last was the failure side: "the
+        // section carries that failure's own reason, not a second account of it" -- true, and
+        // unprovable here, because the survey can spend its shared clock inside the scan and fail
+        // with a timeout while this standalone call, on a fresh deadline, reaches mountmgr's
+        // non-resident import directory and fails as unreadable. Both are right and the messages
+        // differ. That property belongs to the arm that builds the section and is pinned there, by
+        // `worker::tests::a_refused_section_carries_the_failures_own_message`.
+        //
+        // What is left needs no clock and no section ordering: compare the payloads when there is
+        // one on each side, unless a *deadline* stopped one of them -- two bounded scans can
+        // legitimately stop at different points, where every other reason a scan is short (a byte
+        // cap, a page that will not read, a bound import) is a property of the image and falls the
+        // same way on both.
         let answered = !ran.is_null();
         let scan_answered = scan["status"].as_str() == Some("ok");
-        // Two calls, two clocks: bounded scans can legitimately stop at different points. Every
-        // other reason a scan is short -- a byte cap, a page that will not read, a bound import --
-        // is a property of the image and falls the same way on both, so those gate nothing.
         let bounded = !ran["stopped"].is_null() || !scan["stopped"].is_null();
 
-        match (answered, scan_answered) {
-            (true, true) if !bounded => {
+        match answered && scan_answered && !bounded {
+            true => {
                 assert_eq!(
                     ran["sinks"], scan["sinks"],
                     "the composite's hazard section is not `driver_hazards`' answer"
@@ -14305,27 +14297,13 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
                     "nor its privileged instructions"
                 );
             }
-            // The branch this bench actually takes, and the one that proves composition on the
-            // failure side: the section carries that failure's **own** reason rather than a second
-            // account of it. Gated on the survey having got as far as asking -- a section it never
-            // started carries its own clock's message, which is a different true sentence.
-            (false, false) if !unstarted => {
-                assert_eq!(
-                    section["status"], "error",
-                    "the scan failed, so the section carrying it must say so: {survey}"
-                );
-                assert_eq!(
-                    section["note"], scan["error"]["message"],
-                    "and it must carry that failure's own reason, not a second account of it"
-                );
-            }
-            // Printed rather than passed over in silence: these are the branches that assert
-            // nothing, and a tier that always took one would be a differential comparing nothing
-            // while staying green. Claims 1 and 2 above ran either way.
-            _ => println!(
-                "[differential] not compared -- composite answered: {answered}, scan answered: \
-                 {scan_answered}, a deadline stopped one of them: {bounded}, the survey never \
-                 started this section: {unstarted}"
+            // Printed rather than passed over in silence, and this is the branch **this bench
+            // takes**: mountmgr's import directory is pageable and not resident, so the scan
+            // cannot succeed here however healthy the tool is. Claims 1 and 2 above ran anyway,
+            // and the composition claim on the failure side is a unit test now.
+            false => println!(
+                "[differential] payloads not compared -- composite answered: {answered}, scan \
+                 answered: {scan_answered}, a deadline stopped one of them: {bounded}"
             ),
         }
 
