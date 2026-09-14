@@ -14213,15 +14213,59 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
         // composing as faithfully as one that returns its success, so both directions are checked.
         match scan["status"].as_str() {
             Some("ok") => {
+                // **Two facts share the word `ok`, and this asserted the wrong one.** The
+                // envelope's `Outcome::Ok` says the *call answered*; a section's
+                // `SectionStatus::Ok` says the *answer is whole*. A scan that reached its deadline
+                // is both `Outcome::Ok` and `stopped` -- it answered, with part of the image
+                // undecoded -- and the composite maps that to `partial`. Demanding `ok` of every
+                // successful call therefore fails on a valid bounded result, and the more so on a
+                // slow transport, which is where a bounded result is likeliest.
+                //
+                // So the expected status is derived from the scan, by the rule
+                // `DriverHazards::shortfall` states: every way a scan can be short of the image.
+                let ran = &survey["hazards"]["hazards"];
+                let short = |scan: &Value| {
+                    let listed =
+                        |field: &str| scan[field].as_array().is_some_and(|rows| !rows.is_empty());
+                    !scan["stopped"].is_null()
+                        || scan["cap_hit"].as_bool().unwrap_or(false)
+                        || listed("unreadable")
+                        || listed("unnamed_libraries")
+                };
                 assert_eq!(
-                    survey["hazards"]["hazards"]["sinks"], scan["sinks"],
-                    "the composite's hazard section is not `driver_hazards`' answer"
+                    survey["hazards"]["status"],
+                    match short(ran) {
+                        true => "partial",
+                        false => "ok",
+                    },
+                    "a section is complete when its own scan covered the image and partial when \
+                     it did not -- not whenever the call it came from returned: {survey}"
                 );
-                assert_eq!(
-                    survey["hazards"]["hazards"]["privileged"], scan["privileged"],
-                    "nor its privileged instructions"
-                );
-                assert_eq!(survey["hazards"]["status"], "ok");
+
+                // **And the payloads are comparable unless a *clock* stopped one of them.** These
+                // are two calls with two deadlines, so two bounded scans can legitimately stop at
+                // different points; every other reason a scan is short here -- a byte cap, a page
+                // that will not read, a bound import -- is a property of the image and falls the
+                // same way on both, which is why they do not gate the comparison.
+                match ran["stopped"].is_null() && scan["stopped"].is_null() {
+                    true => {
+                        assert_eq!(
+                            ran["sinks"], scan["sinks"],
+                            "the composite's hazard section is not `driver_hazards`' answer"
+                        );
+                        assert_eq!(
+                            ran["privileged"], scan["privileged"],
+                            "nor its privileged instructions"
+                        );
+                    }
+                    // Printed rather than passed over in silence: this is the one branch that
+                    // asserts nothing, and a tier that always took it would be a differential
+                    // comparing nothing while staying green.
+                    false => println!(
+                        "[differential] a deadline stopped one of the two scans, so their \
+                         payloads are not required to agree; the section's status was checked"
+                    ),
+                }
             }
             _ => {
                 assert_eq!(
