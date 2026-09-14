@@ -877,23 +877,32 @@ fn record(
 /// case; one carried where equality is impossible **invents** one -- a `je` there can never be
 /// taken, so the case is reported and never reached, which is worse because nothing about it says
 /// so.
-fn equality_survives(condition: Condition) -> (bool, bool) {
+fn equality_survives(condition: Condition, carry: Carry) -> (bool, bool) {
     match condition {
         // The branch *is* the case, and the other edge knows the equality is false. Both are
         // already recorded where the terminator is read, so neither edge carries it on.
         Condition::Equal | Condition::NotEqual => (false, false),
         // `ZF=1` with `CF=0`, `SF=0`, `OF=0`: the strict forms exclude equality where they branch.
+        // `ja` needs `CF=0` **and** `ZF=0`, so an equality never takes it whatever the carry.
         Condition::UnsignedAbove
-        | Condition::UnsignedBelow
         | Condition::SignedGreater
         | Condition::SignedLess
         | Condition::Negative
         | Condition::Overflow
         | Condition::NotParity => (false, true),
+        // The two that read carry alone, and the only two this distinction reaches.
+        Condition::UnsignedBelow => match carry {
+            Carry::Clear => (false, true),
+            Carry::Set => (true, false),
+        },
+        Condition::UnsignedAboveOrEqual => match carry {
+            Carry::Clear => (true, false),
+            Carry::Set => (false, true),
+        },
         // And the inclusive forms admit it there, `PF=1` putting `jp` in this half rather than the
         // other one.
-        Condition::UnsignedAboveOrEqual
-        | Condition::UnsignedBelowOrEqual
+        // `jbe` is `CF=1 || ZF=1`, so an equality takes it either way.
+        Condition::UnsignedBelowOrEqual
         | Condition::SignedGreaterOrEqual
         | Condition::SignedLessOrEqual
         | Condition::NotNegative
@@ -1063,7 +1072,9 @@ fn simulate(
         last.and_then(|last| last.condition),
     ) {
         (Some(Flow::Branch(_)), Some(condition)) => {
-            let (taken, fallen) = equality_survives(condition);
+            // The carry an equality here would leave is the comparison's own fact.
+            let carry = compared.as_ref().map_or(Carry::Clear, |was| was.carry);
+            let (taken, fallen) = equality_survives(condition, carry);
             (
                 taken.then(|| compared.clone()).flatten(),
                 fallen.then(|| compared.clone()).flatten(),
@@ -1283,9 +1294,28 @@ fn scalar_of(facts: &Facts, operand: Option<&Operand>) -> Option<u64> {
     }
 }
 
+/// The flag state an **equality** against a comparison would leave.
+///
+/// Zero is zero however it is reached, so `ZF`, `SF` and `PF` agree -- but the carry does not. A
+/// subtraction reaching zero borrowed nothing (`CF=0`); an addition reaching zero summed to exactly
+/// 2^32 and carried out of it (`CF=1`). `jae` and `jb` read carry alone, so they are the two
+/// conditions whose feasible edge depends on which this was.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Carry {
+    /// From `cmp` or `sub`, or an `add` of nothing: equal values do not borrow.
+    Clear,
+    /// From an `add` that wrapped to zero: the operands summed to 2^32 and carried out.
+    Set,
+}
+
 /// The state one compare leaves for the branch that reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Compared {
+    /// What an equality here would leave in the carry flag. Carried **with** the comparison rather
+    /// than assumed by whoever reads it, for the reason `proved` travels with `Value::Code`: how a
+    /// value was arrived at is a fact about that value, and a rule that guesses it is wrong for
+    /// every shape nobody thought of.
+    carry: Carry,
     /// The control code the compare is about, when it is about one.
     code: Option<u64>,
     /// Whether the value compared was traced from the IRP rather than taken from a displacement.
@@ -1494,6 +1524,8 @@ fn update(
                     }),
                 );
                 return Some(Compared {
+                    // A `sub` reaching zero borrowed nothing.
+                    carry: Carry::Clear,
                     code: (shift == 0).then_some(offset as u64),
                     proved,
                     index: Some((destination, offset, shift)),
@@ -1527,6 +1559,14 @@ fn update(
                     }),
                 );
                 return Some(Compared {
+                    // **An `add` reaching zero carried out of the field.** For the
+                    // result to be zero the operands summed to exactly 2^32, so `CF=1`
+                    // -- unless nothing was added, which leaves the value and its
+                    // flags alone.
+                    carry: match immediate {
+                        0 => Carry::Clear,
+                        _ => Carry::Set,
+                    },
                     code: (shift == 0).then_some(offset as u64),
                     proved,
                     index: Some((destination, offset, shift)),
@@ -1733,6 +1773,7 @@ fn compare(
             && shift == 0
         {
             return Some(Compared {
+                carry: Carry::Clear,
                 code: bound.map(|value| value.wrapping_add(offset as u64)),
                 proved,
                 index: None,
@@ -1760,6 +1801,8 @@ fn compare(
             shift,
             proved,
         } => Some(Compared {
+            // A `cmp`: equal values borrow nothing.
+            carry: Carry::Clear,
             // A shifted register is an index into a table, not a code: the low bits the shift
             // dropped are not this compare's to claim. The compare is still reported, because it
             // is the bounds check a jump table needs.
@@ -3390,6 +3433,78 @@ mod tests {
             found.cases.is_empty(),
             "above the compare, an equality against it cannot hold: {:?}",
             found.cases
+        );
+    }
+
+    /// **An `add` reaching zero carried; a `cmp` reaching zero did not.**
+    ///
+    /// `equality_survives` is derived from the flags an equality leaves, and I derived them from a
+    /// *subtraction*. For `add ecx,K` to be zero the operands must sum to exactly 2^32, so `CF=1`
+    /// where a `cmp` leaves `CF=0` -- and `jae`/`jb` read carry alone, so their feasible edge
+    /// flips. `add ...; jae t; je h` put the case at `t`, where it cannot be, and lost the one on
+    /// the fall-through, where it is.
+    ///
+    /// The carry travels with the comparison rather than being assumed by whoever reads it, which
+    /// is why a rule derived from one instruction's flags stopped being wrong about another's.
+    #[test]
+    fn an_add_that_wrapped_to_zero_carried_and_a_compare_did_not() {
+        let chain = |mnemonic: &str, step: u64| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("ecx"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    mnemonic,
+                    vec![reg("ecx"), imm(step)],
+                    Flow::Fallthrough,
+                ),
+                // Reads the carry alone, so which edge the equality is on turns on it.
+                insn(
+                    DISPATCH + 0x11,
+                    "jae",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x100)),
+                ),
+                insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x100,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(0x980)),
+                ),
+                insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        // A subtraction leaves `CF=0`, so `jae` is taken and the case is at its target.
+        assert_eq!(
+            chain("sub", 0x6dc004)
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x6dc004, 0x980)],
+            "equal values borrow nothing, so the branch reading `CF=0` is taken"
+        );
+
+        // An addition that reached zero left `CF=1`, so `jae` is **not** taken and the case is on
+        // the fall-through.
+        assert_eq!(
+            chain("add", 0x6dc004)
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            // `0 - 0x6dc004` in the field's width, which is the code the `je` there tests.
+            vec![(0xff92_3ffc, 0x900)],
+            "an add reaching zero carried out of the field, so that branch is not taken"
         );
     }
 

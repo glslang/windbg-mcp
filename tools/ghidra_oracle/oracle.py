@@ -34,7 +34,7 @@ SERVER = REPO / "target" / "debug" / "windbg-mcp.exe"
 # ---- the tool ----------------------------------------------------------------------------
 
 
-def ask_the_tool(dump: pathlib.Path, dispatch: str) -> dict:
+def ask_the_tool(dump: pathlib.Path, dispatch: str, profile: str | None = None) -> dict:
     """`ioctl_map`'s own answer, over stdio, so this needs no running server.
 
     stderr goes to `DEVNULL` rather than a pipe, deliberately: a pipe nobody drains fills once
@@ -85,10 +85,20 @@ def ask_the_tool(dump: pathlib.Path, dispatch: str) -> dict:
         },
     )
     call("notifications/initialized", {}, notify=True)
-    opened = tool("open_dump", {"path": str(dump)})
+    # **A live kernel by profile, never by connection string**, which is how the rest of this
+    # repo reaches one: the debug key stays out of the argument and out of anything this prints.
+    opened = (
+        tool("attach_kernel", {"profile": profile, "timeout_ms": 120000})
+        if profile
+        else tool("open_dump", {"path": str(dump)})
+    )
     if opened.get("status") != "ok":
-        raise SystemExit("the dump did not open: " + json.dumps(opened)[:400])
+        raise SystemExit("the target did not open: " + json.dumps(opened)[:400])
     session = opened["session_id"]
+    if profile:
+        # A fresh attach's module inventory holds `nt` and little else, and a driver loaded before
+        # it is then absent from the inventory rather than from the target.
+        tool("modules", {"session_id": session, "refresh": True, "limit": 1})
     try:
         # Asked of another tool first: a routine whose pages are missing disassembles as `???`,
         # and an empty map for want of code is not an answer to compare against anything.
@@ -236,6 +246,12 @@ def ghidra_tables(report: dict) -> list:
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--dump", type=pathlib.Path, default=DUMP)
+    parser.add_argument(
+        "--profile",
+        help="attach this kernel connection profile instead of opening --dump, for a driver that "
+        "is only on a live target. By name, never a connection string, so no debug key reaches "
+        "an argument or a transcript",
+    )
     parser.add_argument("--image", type=pathlib.Path, default=IMAGE)
     parser.add_argument("--dispatch", default=DISPATCH)
     parser.add_argument(
@@ -245,16 +261,19 @@ def main() -> None:
     )
     args = parser.parse_args()
 
-    for needed in (args.dump, args.image, SERVER, DBR):
-        if not needed.exists():
-            raise SystemExit(f"not found: {needed}")
+    needed = [args.image, SERVER, DBR]
+    if not args.profile:
+        needed.append(args.dump)
+    for path in needed:
+        if not path.exists():
+            raise SystemExit(f"not found: {path}")
 
     device = int(args.device_type, 16)
     with tempfile.TemporaryDirectory(prefix="ioctl-oracle-") as tmp:
         work = pathlib.Path(tmp)
 
         print("asking `ioctl_map` ...", flush=True)
-        tool = ask_the_tool(args.dump, args.dispatch)
+        tool = ask_the_tool(args.dump, args.dispatch, args.profile)
         rva = tool["dispatch"].get("rva") or "0x0"
         tool_codes = {norm(case["code"]) for case in tool["cases"]}
         print(
