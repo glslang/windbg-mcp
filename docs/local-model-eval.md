@@ -75,8 +75,11 @@ rather than a recommendation: the two runs in `local-model.md` had already found
 turn can outlive the listener's lease grace, which is a real cost with its own follow-up
 (`FOLLOWUPS.md` item 33) and would have confounded every timing here. The driver's keepalive
 removed that cost, so the axis became affordable and was run as an A/B — the sixth run below. It is
-an axis now, set per cell group with `think` and recorded per record; everything above still holds
-`think: false` and says so in its identity block.
+an axis now, set per cell group with `think` and recorded per record. Everything above ran with
+`think: false` — provably, since the driver sent it unconditionally until the axis landed — but
+their logs **do not say so**: written before the field existed, they carry no `think` at all and
+their identity blocks read `reasoning unrecorded`. That is deliberate, and the distinction matters
+twice over, since resume reads the same absence as `off` while the identity block refuses to.
 
 **The tools themselves.** The harness executes read-only tools and reports anything else back to
 the model as refused, so a wrong pick is *measured* rather than performed. `launch`, `execute` and
@@ -84,7 +87,8 @@ the model as refused, so a wrong pick is *measured* rather than performed. `laun
 unattended what a model does with them.
 
 **Which tools those are is the server's answer, not a list kept in the harness** (from 2026-09-14).
-The **first five** runs on this page predate it and ran behind a hand-kept list of sixteen names;
+The **first five** runs on this page predate it and ran behind a hand-kept list of thirteen
+names;
 the sixth — the reasoning A/B — is the first measured behind this one, and re-measured its own
 baseline arm precisely because the change reaches those cells. Each tool
 declares `readOnlyHint` in its `tools/list` annotations — 61 of 61, checked on the wire — and
@@ -1101,7 +1105,7 @@ for having a frontier row restated rather than a new one.
 **The read-only allow-list in `local_model_drive.py` had gone stale, and a narrowed surface is
 where that shows.** (The list is no longer there — this is what the run met, and the reason it
 went.) `crash` grew from one tool to three; two of the new ones are `read_only_hint = true` on the
-server and neither was among the sixteen names the harness then kept, so a `min` cell reaching for
+server and neither was among the thirteen names the harness then kept, so a `min` cell reaching for
 `decode_error_reporting` met *"not permitted in this harness"* 19 times and `exception_triage`
 twice — this script's refusal, worded like the server's and counted as `refused` rather than as
 anything about the surface. It did not cost a graded answer: every `min` miss is `arm64_pc`, which
@@ -1112,7 +1116,7 @@ until the next group grew; the fence now comes from each tool's own `readOnlyHin
 under *What is deliberately not an axis*. It lands **after** this run, so these logs are graded
 behind the fence as it was — and the next run's conditions differ by more than the stale names,
 because the derived fence is also *wider*: on `full` it runs 37 of 61 served tools where the list
-ran 16, so the pool, heap, driver and TTD read-only families are available to a model for the first
+ran 13, so the pool, heap, driver and TTD read-only families are available to a model for the first
 time. Tool-choice figures across that boundary are not comparable.
 
 The other 41 refusals are the fence working as intended (`execute`, `attach_*`, `interrupt`), and
@@ -1146,7 +1150,7 @@ keepalive removed that, so the axis became affordable and this run is it — the
 cells run twice, once each way.
 
 **It is two runs rather than one, and reusing the 2026-09-13 log as the baseline would have been
-wrong.** The read-only fence stopped being a hand-kept list of sixteen names between those runs,
+wrong.** The read-only fence stopped being a hand-kept list of thirteen names between those runs,
 and that change *reaches these cells*: 24 calls the September 13 log recorded as `refused` — 19
 `decode_error_reporting`, 3 `current_location`, 2 `exception_triage` — now execute and return real
 output. Pairing an `on` arm against that log would have varied reasoning and the fence together.

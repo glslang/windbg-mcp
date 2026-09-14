@@ -169,9 +169,20 @@ def one_arm_per_log(plan, log_path):
     """
     seen = {}
     for group in plan["cells"]:
-        # Only the ollama rows have the knob; a Claude row's reasoning is its client's, so it can
-        # neither be set nor collide.
+        # **A Claude group asking for an arm is refused, not ignored.** Only the ollama rows have
+        # the knob - a Claude row's reasoning belongs to a client this bench does not drive - and
+        # `run_cell` does not propagate `think` to that backend, so its records carry none and
+        # `arm_of` reads them as `off`. A plan setting `think: true` there would look for an `on`
+        # arm that can never be written: every invocation would re-run the whole cell, and the
+        # plan would go on claiming an arm nobody measured. Silently keying it as `off` would fix
+        # the re-run and keep the false claim, which is the worse half.
         if group.get("backend") != "ollama":
+            if "think" in group:
+                raise SystemExit(
+                    f"the `{group['backend']}` group in this plan sets `think`, which this bench "
+                    f"cannot honour: reasoning on that backend belongs to the client, not to the "
+                    f"run. Remove it - and if the arm matters for those rows, it is not a thing "
+                    f"this harness can vary.")
             continue
         think = bool(group.get("think", False))
         for model in group["models"]:
@@ -2002,10 +2013,25 @@ def suite_for(log_path, fallback):
     Logs written before that field fall back to what the caller passed, which is what keeps the
     published v1 logs grading exactly as they did.
     """
-    named = next((s for s in ((r.get("suite") or {}).get("file") for r in records(log_path)) if s),
-                 None)
+    # **Every record is asked, not the first one.** Rewording a task and resuming is a documented
+    # workflow - `usable()` drops the answers to the old question and the table says how many - and
+    # a log resumed across a *renamed* suite therefore holds records naming both. Taking the first
+    # meant taking whichever the insertion order happened to put there, which for an append-only
+    # log is the older one: every re-run record would then be graded against the question it was
+    # deliberately re-run to escape, and the row would publish that denominator under the old
+    # suite's name.
+    named = {s for s in ((r.get("suite") or {}).get("file") for r in records(log_path)) if s}
     if not named:
         return fallback
+    if len(named) > 1:
+        # Only the operator knows which of them this row is meant to be, so the argument decides
+        # and the run says that it did rather than picking one quietly.
+        print(f"  {os.path.basename(log_path)} holds records from {len(named)} suites "
+              f"({', '.join(sorted(named))}); grading it against the one passed "
+              f"(`{os.path.basename(fallback)}`) and counting the rest as answers to a question "
+              f"it no longer asks")
+        return fallback
+    named = named.pop()
     # **The caller's own path wins when it is the suite the log names.** A log records the suite's
     # *basename* - a machine-specific path would be the wrong thing to publish - and the CLI takes
     # an arbitrary tasks file, so rebuilding that basename under `tools/` would break a run graded
