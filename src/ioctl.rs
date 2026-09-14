@@ -856,37 +856,49 @@ fn record(
 
 /// The edges a pending compare survives on: `(taken, fall-through)`.
 ///
-/// **Which is a question about the condition, not about the mnemonic family.** `cmp code,K` / `ja`
-/// leaves equality possible where it falls through (`code <= K`); `jbe` leaves it possible where it
-/// **branches** (`code <= K` again, reached the other way). Carrying the compare down the wrong one
-/// costs a case at the edge that admits equality and invents one at the edge that forbids it -- a
-/// `je` there can never be taken, so the case is reported and never reached.
+/// **Derived from the flags an equality leaves, not from a list of families.** `cmp a,b` with
+/// `a == b` computes zero, and zero fixes every flag a conditional branch reads:
 ///
-/// The decoder names strict and inclusive apart, so this needs no guessing. Two families are worth
-/// saying out loud: `js`/`jns` behave like a strict/inclusive pair, because a difference that is
-/// negative cannot be zero and one that is not negative may be; and `jo`/`jp` and their negations
-/// constrain equality on **neither** edge, so the compare is still live on both.
+/// | flag | value | why |
+/// |---|---|---|
+/// | `ZF` | 1 | the result is zero |
+/// | `CF` | 0 | equal values do not borrow |
+/// | `OF` | 0 | nor overflow |
+/// | `SF` | 0 | zero is not negative |
+/// | `PF` | 1 | the low byte is `0x00`, an even number of set bits |
+///
+/// So equality is possible on an edge exactly when that edge's flag requirement agrees with this
+/// row, and every condition the decoder has gets an answer rather than a shrug. Two of them were
+/// wrong when this was a list: `jo`/`jp` and their negations were given both edges on the grounds
+/// that they "say nothing about equality", when `OF=0` and `PF=1` say precisely which edge each of
+/// them admits.
+///
+/// Getting an edge wrong costs both ways. A compare not carried where equality is possible loses a
+/// case; one carried where equality is impossible **invents** one -- a `je` there can never be
+/// taken, so the case is reported and never reached, which is worse because nothing about it says
+/// so.
 fn equality_survives(condition: Condition) -> (bool, bool) {
     match condition {
         // The branch *is* the case, and the other edge knows the equality is false. Both are
         // already recorded where the terminator is read, so neither edge carries it on.
         Condition::Equal | Condition::NotEqual => (false, false),
-        // Strict: taken rules equality out, fall-through leaves it open.
+        // `ZF=1` with `CF=0`, `SF=0`, `OF=0`: the strict forms exclude equality where they branch.
         Condition::UnsignedAbove
         | Condition::UnsignedBelow
         | Condition::SignedGreater
         | Condition::SignedLess
-        | Condition::Negative => (false, true),
-        // Inclusive: the other way round.
+        | Condition::Negative
+        | Condition::Overflow
+        | Condition::NotParity => (false, true),
+        // And the inclusive forms admit it there, `PF=1` putting `jp` in this half rather than the
+        // other one.
         Condition::UnsignedAboveOrEqual
         | Condition::UnsignedBelowOrEqual
         | Condition::SignedGreaterOrEqual
         | Condition::SignedLessOrEqual
-        | Condition::NotNegative => (true, false),
-        // These say nothing about equality either way, so neither edge has ruled it out.
-        Condition::Overflow | Condition::NotOverflow | Condition::Parity | Condition::NotParity => {
-            (true, true)
-        }
+        | Condition::NotNegative
+        | Condition::NotOverflow
+        | Condition::Parity => (true, false),
     }
 }
 
@@ -2788,6 +2800,16 @@ mod tests {
             "jge" | "jnl" => Some(Condition::SignedGreaterOrEqual),
             "jl" | "jnge" => Some(Condition::SignedLess),
             "jle" | "jng" => Some(Condition::SignedLessOrEqual),
+            // The flag-only branches, which the walk now has an answer for: an equality
+            // leaves `SF=0`, `OF=0` and `PF=1`, so each of these admits it on one edge.
+            // Absent here, a fixture using one silently became an unconditional branch
+            // with no condition at all -- which is a fixture agreeing with any rule.
+            "js" => Some(Condition::Negative),
+            "jns" => Some(Condition::NotNegative),
+            "jo" => Some(Condition::Overflow),
+            "jno" => Some(Condition::NotOverflow),
+            "jp" | "jpe" => Some(Condition::Parity),
+            "jnp" | "jpo" => Some(Condition::NotParity),
             _ => None,
         };
         // **Which registers the instruction writes**, as the decoder would answer: the first
@@ -3334,6 +3356,61 @@ mod tests {
             found.cases.is_empty(),
             "above the compare, an equality against it cannot hold: {:?}",
             found.cases
+        );
+    }
+
+    /// **Parity and overflow are decidable too, and were the two arms that had it wrong.**
+    ///
+    /// `cmp a,b` with `a == b` computes zero, which fixes `OF=0` and `PF=1` -- the low byte `0x00`
+    /// has an even number of set bits. So `jp` admits equality where it **branches** and `jo`
+    /// excludes it there, exactly as the inclusive and strict relational forms do. They were given
+    /// both edges on the grounds that they say nothing about equality, which is what a rule written
+    /// as a list of families rather than derived from the flags lets you believe.
+    ///
+    /// Neither shape occurs in a dispatch chain, which is the point: an edge nobody reaches is
+    /// where a fabricated case would sit unnoticed.
+    #[test]
+    fn parity_and_overflow_admit_equality_on_opposite_edges() {
+        let chain = |mnemonic: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "cmp",
+                    vec![reg("r13d"), imm(0x6dc000)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xe,
+                    mnemonic,
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x100)),
+                ),
+                insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x100,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(0x900)),
+                ),
+                insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert_eq!(
+            chain("jp")
+                .cases
+                .iter()
+                .map(|case| case.code)
+                .collect::<Vec<_>>(),
+            vec![0x6dc000],
+            "an equality sets the parity flag, so the branch it takes can still be equal"
+        );
+        assert!(
+            chain("jo").cases.is_empty(),
+            "and clears overflow, so the branch it takes cannot be: {:?}",
+            chain("jo").cases
         );
     }
 
