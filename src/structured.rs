@@ -2619,6 +2619,49 @@ pub struct IoctlMap {
     pub blind: usize,
 }
 
+impl IoctlMap {
+    /// Why this map is short of the routine, or `None` where it is the whole of it.
+    ///
+    /// **Beside the fields rather than at the caller**, because the caller had to list which of
+    /// them mean "incomplete" and the list went stale: `driver_surface` named `stopped`, `cap_hit`
+    /// and `unsettled`, and [`Self::blind`] -- documented one field below them as making the map
+    /// "incomplete in a way no other field says" -- was not in it, so a routine with instructions
+    /// that could not be decoded reported a *complete* section for as long as that field existed.
+    ///
+    /// **Destructured exhaustively so that adding a field is a compile error right here**, which
+    /// is the only arrangement that asks the question where it is answered. A count of the fields
+    /// would do it too, and would be one more number to keep in step -- the shape that produced
+    /// the miss in the first place.
+    ///
+    /// [`Self::unproved`] is the one field that looks like it belongs and does not: those cases
+    /// **were** read and are reported, each carrying its own `proved: false`. Weaker evidence
+    /// about what is here is not the same fact as something missing, and [`SectionStatus::Partial`]
+    /// is about the second.
+    pub fn shortfall(&self) -> Option<&'static str> {
+        let Self {
+            images: _,
+            dispatch: _,
+            code_proved: _,
+            cases: _,
+            case_count: _,
+            tables: _,
+            unproved: _,
+            unresolved,
+            stopped,
+            cap_hit,
+            unsettled,
+            blind,
+        } = self;
+        let short =
+            stopped.is_some() || *cap_hit || *unsettled || *blind > 0 || !unresolved.is_empty();
+        short.then_some(
+            "the map did not run to completion, so its cases are a lower bound rather than the \
+             set this routine accepts. Its own `stopped`, `cap_hit`, `unsettled`, `blind` and \
+             `unresolved` fields say which, and what each one costs the answer.",
+        )
+    }
+}
+
 fn usize_is_zero(value: &usize) -> bool {
     *value == 0
 }
@@ -2730,6 +2773,46 @@ pub struct DriverHazards {
     /// answer either way, and this says the remedy is a narrower question rather than more time.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub cap_hit: bool,
+}
+
+impl DriverHazards {
+    /// Why this scan is short of the driver's code, or `None` where it covered all of it.
+    ///
+    /// The counterpart of [`IoctlMap::shortfall`], and it exists for the same miss in a worse
+    /// form: `driver_surface` read [`Self::stopped`] alone, so a scan its byte cap ended *and* a
+    /// scan whose pages would not read both reported a complete section -- while this module's own
+    /// renderer printed INCOMPLETE for each of them. [`SectionStatus::Ok`] says everything the
+    /// section reports was read, and [`Self::unreadable`] is precisely the field saying some of it
+    /// was not.
+    /// Exhaustively destructured for the reason [`IoctlMap::shortfall`] gives, and naming every
+    /// field made the same point twice: [`Self::unnamed_libraries`] is imports whose names were
+    /// never read, so `sinks` is a lower bound whenever it is non-empty -- a fact about the scan's
+    /// coverage that had been sitting one field away from the ones being checked.
+    pub fn shortfall(&self) -> Option<&'static str> {
+        let Self {
+            module: _,
+            base: _,
+            sink_list_version: _,
+            sinks: _,
+            privileged: _,
+            privileged_count: _,
+            scanned: _,
+            other_imports: _,
+            unreadable,
+            unnamed_libraries,
+            stopped,
+            cap_hit,
+        } = self;
+        let short = stopped.is_some()
+            || *cap_hit
+            || !unreadable.is_empty()
+            || !unnamed_libraries.is_empty();
+        short.then_some(
+            "this scan did not cover the whole image, so a short `sinks` or an empty `privileged` \
+             is what was found rather than what is there. Its own `stopped`, `cap_hit`, \
+             `unreadable` and `unnamed_libraries` fields say which part was missed, and why.",
+        )
+    }
 }
 
 /// One access control entry, as the bits say and as a person reads it.
@@ -4343,5 +4426,184 @@ mod tests {
         assert_eq!(wire(PoolChunkState::ReusableFree), "reusable_free");
         assert_eq!(wire(PoolChunkState::CachedFree), "cached_free");
         assert_eq!(wire(PoolChunkState::Unreadable), "unreadable");
+    }
+
+    /// A scan with nothing missing from it, as the base the cases below vary one field of.
+    fn whole_scan() -> DriverHazards {
+        DriverHazards {
+            module: "mountmgr".into(),
+            base: addr(0xfffff803_1ab10000),
+            sink_list_version: "1".into(),
+            sinks: Vec::new(),
+            privileged: Vec::new(),
+            privileged_count: 0,
+            scanned: vec![ScannedRange {
+                section: ".text".into(),
+                start: addr(0xfffff803_1ab11000),
+                bytes: 0x8000,
+            }],
+            unreadable: Vec::new(),
+            other_imports: 40,
+            unnamed_libraries: Vec::new(),
+            stopped: None,
+            cap_hit: false,
+        }
+    }
+
+    /// **Each field that can shorten a hazard scan reaches its `shortfall`**, set one at a time.
+    ///
+    /// One at a time is the whole method: a case setting all three passes on any one of them, and
+    /// two of these three were missing from the composite's hand-written list -- so a scan its own
+    /// byte cap ended, and one over pages that would not read, were reported as *complete*
+    /// sections. The second is the ordinary case on a dump, where an absent page would have read
+    /// as a driver with no privileged instructions.
+    #[test]
+    fn every_field_that_shortens_a_scan_reaches_its_shortfall() {
+        assert_eq!(
+            whole_scan().shortfall(),
+            None,
+            "a scan that read every executable byte is not short of anything"
+        );
+
+        let ran_out = DriverHazards {
+            stopped: Some(WalkHalt::Deadline),
+            ..whole_scan()
+        };
+        assert!(
+            ran_out.shortfall().is_some(),
+            "a scan the clock stopped did not cover the image"
+        );
+
+        let capped = DriverHazards {
+            cap_hit: true,
+            ..whole_scan()
+        };
+        assert!(
+            capped.shortfall().is_some(),
+            "nor did one its own byte cap ended -- a different remedy, the same shortfall"
+        );
+
+        let absent = DriverHazards {
+            unreadable: vec![ScannedRange {
+                section: ".text".into(),
+                start: addr(0xfffff803_1ab19000),
+                bytes: 0x1000,
+            }],
+            ..whole_scan()
+        };
+        assert!(
+            absent.shortfall().is_some(),
+            "nor did one that ran to the end over code it could not read, which is the case that \
+             turns a missing page into a driver with no privileged instructions"
+        );
+
+        let unnamed = DriverHazards {
+            unnamed_libraries: vec!["FLTMGR.SYS".into()],
+            ..whole_scan()
+        };
+        assert!(
+            unnamed.shortfall().is_some(),
+            "and nor did one whose bound imports were never named -- every sink in that library \
+             is one `sinks` does not have"
+        );
+    }
+
+    /// A map with nothing missing from it, as the base the cases below vary one field of.
+    fn whole_map() -> IoctlMap {
+        IoctlMap {
+            images: Vec::new(),
+            dispatch: CodeLocation {
+                address: addr(0xfffff803_1ab12340),
+                module: Some("mountmgr".into()),
+                rva: Some("0x2340".into()),
+                attribution_failed: false,
+            },
+            code_proved: true,
+            cases: Vec::new(),
+            case_count: 0,
+            tables: Vec::new(),
+            unresolved: Vec::new(),
+            stopped: None,
+            unproved: 0,
+            cap_hit: false,
+            unsettled: false,
+            blind: 0,
+        }
+    }
+
+    /// **Each field that can shorten an IOCTL map reaches its `shortfall`**, set one at a time.
+    ///
+    /// `blind` is the one this test is really for: it was added documented as making the map
+    /// "incomplete in a way no other field says", and the composite's list of fields to check did
+    /// not grow with it.
+    #[test]
+    fn every_field_that_shortens_a_map_reaches_its_shortfall() {
+        assert_eq!(
+            whole_map().shortfall(),
+            None,
+            "a map that settled over a routine it read entirely is the whole of it"
+        );
+
+        for (what, map) in [
+            (
+                "one the clock stopped",
+                IoctlMap {
+                    stopped: Some(WalkHalt::Deadline),
+                    ..whole_map()
+                },
+            ),
+            (
+                "one a bound ended",
+                IoctlMap {
+                    cap_hit: true,
+                    ..whole_map()
+                },
+            ),
+            (
+                "one whose beliefs never settled, where everything resting on a fact was discarded",
+                IoctlMap {
+                    unsettled: true,
+                    ..whole_map()
+                },
+            ),
+            (
+                "one with instructions that would not decode, each a place a compare may be",
+                IoctlMap {
+                    blind: 3,
+                    ..whole_map()
+                },
+            ),
+            (
+                "and one with an indirect transfer nobody followed, which the renderer already \
+                 calls a lower bound rather than the set",
+                IoctlMap {
+                    unresolved: vec![CodeLocation {
+                        address: addr(0xfffff803_1ab12380),
+                        module: Some("mountmgr".into()),
+                        rva: Some("0x2380".into()),
+                        attribution_failed: false,
+                    }],
+                    ..whole_map()
+                },
+            ),
+        ] {
+            assert!(
+                map.shortfall().is_some(),
+                "a map is short of its routine when it is {what}"
+            );
+        }
+
+        // **And `unproved` is not one of them**, which is the distinction this predicate is at
+        // risk of losing next: those cases were read and are reported, each saying of itself that
+        // it is unproved. Weaker evidence about what is here is not something missing.
+        let unproved = IoctlMap {
+            unproved: 4,
+            ..whole_map()
+        };
+        assert_eq!(
+            unproved.shortfall(),
+            None,
+            "a map whose cases are unproved is the whole of the routine, less certainly"
+        );
     }
 }
