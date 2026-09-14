@@ -7047,7 +7047,9 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                         Some(_) => structured::SectionStatus::Partial,
                         None => structured::SectionStatus::Ok,
                     },
-                    note: scan.shortfall().map(str::to_string),
+                    // Cause-specific: a gap in the imports and a gap in the decoded code
+                    // qualify different halves of this scan, and one note said both.
+                    note: scan.shortfall().map(|why| why.note().to_string()),
                     hazards: Some(scan),
                 },
                 Err(why) => structured::HazardsSection {

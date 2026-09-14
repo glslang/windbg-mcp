@@ -2775,20 +2775,70 @@ pub struct DriverHazards {
     pub cap_hit: bool,
 }
 
+/// Which half of a hazard scan came up short, since the two are read from different things.
+///
+/// **A value rather than a sentence**, because the sentence is the part that was wrong: one shared
+/// note said a scan "did not cover the whole image" and qualified `sinks` and `privileged`
+/// together, whichever field had actually fallen short. They do not travel together. The sink
+/// **set** is built from the import table before any code is decoded, and the code walk only adds
+/// each sink's call sites -- so a gap on one side leaves the other side exact, and saying
+/// otherwise sends a reader to re-run a scan that already answered their question.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Shortfall {
+    /// Imports that could not be named, so the set of `sinks` is a lower bound. The decoded code
+    /// is untouched by it.
+    Imports,
+    /// Code that was not decoded, so `privileged` and each sink's `call_sites` are lower bounds.
+    /// Which `sinks` were imported is untouched by it.
+    Code,
+    /// Both, each for its own reason.
+    Both,
+}
+
+impl Shortfall {
+    /// What to tell a reader: the fields this cause is about, and no others.
+    pub fn note(self) -> &'static str {
+        match self {
+            Self::Imports => {
+                "some of this driver's imports could not be named -- `unnamed_libraries` says \
+                 which libraries, a bound import's names living only in a table this deliberately \
+                 never reads -- so `sinks` is a lower bound: a sensitive import in one of them is \
+                 not in this list. The code was decoded in full, so `privileged` is not qualified \
+                 by this."
+            }
+            Self::Code => {
+                "part of this driver's code was not decoded; its own `stopped`, `cap_hit` and \
+                 `unreadable` fields say which part and why. So `privileged`, and each sink's \
+                 `call_sites`, are what was found rather than what is there. Which `sinks` are \
+                 imported is read from the import table before any of this, and is not qualified \
+                 by it."
+            }
+            Self::Both => {
+                "this scan is short on both sides, and each field says which it is about: \
+                 `unnamed_libraries` makes the set of `sinks` a lower bound, while `stopped`, \
+                 `cap_hit` and `unreadable` make `privileged` and the sinks' `call_sites` lower \
+                 bounds."
+            }
+        }
+    }
+}
+
 impl DriverHazards {
-    /// Why this scan is short of the driver's code, or `None` where it covered all of it.
+    /// Which side of this scan is short of its subject, or `None` where neither is.
     ///
-    /// The counterpart of [`IoctlMap::shortfall`], and it exists for the same miss in a worse
-    /// form: `driver_surface` read [`Self::stopped`] alone, so a scan its byte cap ended *and* a
-    /// scan whose pages would not read both reported a complete section -- while this module's own
-    /// renderer printed INCOMPLETE for each of them. [`SectionStatus::Ok`] says everything the
-    /// section reports was read, and [`Self::unreadable`] is precisely the field saying some of it
-    /// was not.
-    /// Exhaustively destructured for the reason [`IoctlMap::shortfall`] gives, and naming every
-    /// field made the same point twice: [`Self::unnamed_libraries`] is imports whose names were
-    /// never read, so `sinks` is a lower bound whenever it is non-empty -- a fact about the scan's
-    /// coverage that had been sitting one field away from the ones being checked.
-    pub fn shortfall(&self) -> Option<&'static str> {
+    /// Two halves of one miss. `driver_surface` read [`Self::stopped`] alone, so a scan its byte
+    /// cap ended *and* a scan whose pages would not read both reported a complete section --
+    /// while this module's own renderer printed INCOMPLETE for each. [`SectionStatus::Ok`] says
+    /// everything the section reports was read, and [`Self::unreadable`] is precisely the field
+    /// saying some of it was not. Naming every field then turned up
+    /// [`Self::unnamed_libraries`] as well.
+    ///
+    /// And **which** field is short decides what is qualified, which one note could not say: see
+    /// [`Shortfall`]. Typed where [`IoctlMap::shortfall`] is prose, because that map is read from
+    /// one thing and this scan from two.
+    ///
+    /// Exhaustively destructured for the reason [`IoctlMap::shortfall`] gives.
+    pub fn shortfall(&self) -> Option<Shortfall> {
         let Self {
             module: _,
             base: _,
@@ -2803,15 +2853,16 @@ impl DriverHazards {
             stopped,
             cap_hit,
         } = self;
-        let short = stopped.is_some()
-            || *cap_hit
-            || !unreadable.is_empty()
-            || !unnamed_libraries.is_empty();
-        short.then_some(
-            "this scan did not cover the whole image, so a short `sinks` or an empty `privileged` \
-             is what was found rather than what is there. Its own `stopped`, `cap_hit`, \
-             `unreadable` and `unnamed_libraries` fields say which part was missed, and why.",
-        )
+        // The import walk refuses rather than truncates, so a scan that exists at all has a whole
+        // import table behind it -- a clock or a cap can only have cut the **code** short.
+        let code = stopped.is_some() || *cap_hit || !unreadable.is_empty();
+        let imports = !unnamed_libraries.is_empty();
+        match (imports, code) {
+            (false, false) => None,
+            (true, false) => Some(Shortfall::Imports),
+            (false, true) => Some(Shortfall::Code),
+            (true, true) => Some(Shortfall::Both),
+        }
     }
 }
 
@@ -4511,49 +4562,84 @@ mod tests {
         assert_eq!(
             whole_scan().shortfall(),
             None,
-            "a scan that read every executable byte is not short of anything"
+            "a scan that read every executable byte, over an import table it could name, is not \
+             short of anything"
         );
 
-        let ran_out = DriverHazards {
-            stopped: Some(WalkHalt::Deadline),
-            ..whole_scan()
-        };
-        assert!(
-            ran_out.shortfall().is_some(),
-            "a scan the clock stopped did not cover the image"
-        );
-
-        let capped = DriverHazards {
-            cap_hit: true,
-            ..whole_scan()
-        };
-        assert!(
-            capped.shortfall().is_some(),
-            "nor did one its own byte cap ended -- a different remedy, the same shortfall"
-        );
-
-        let absent = DriverHazards {
-            unreadable: vec![ScannedRange {
-                section: ".text".into(),
-                start: addr(0xfffff803_1ab19000),
-                bytes: 0x1000,
-            }],
-            ..whole_scan()
-        };
-        assert!(
-            absent.shortfall().is_some(),
-            "nor did one that ran to the end over code it could not read, which is the case that \
-             turns a missing page into a driver with no privileged instructions"
-        );
+        // **Which side**, not merely that there is one. `is_some()` per field was the assertion
+        // that let one shared note qualify `sinks` and `privileged` together whichever had
+        // actually fallen short: it is true of every cause, so it could not see the note claiming
+        // the wrong one.
+        let code_side = [
+            (
+                "the clock stopped it",
+                DriverHazards {
+                    stopped: Some(WalkHalt::Deadline),
+                    ..whole_scan()
+                },
+            ),
+            (
+                "its own byte cap ended it -- a different remedy, the same side",
+                DriverHazards {
+                    cap_hit: true,
+                    ..whole_scan()
+                },
+            ),
+            (
+                "it ran to the end over code it could not read, which is the case that turns a \
+                 missing page into a driver with no privileged instructions",
+                DriverHazards {
+                    unreadable: vec![ScannedRange {
+                        section: ".text".into(),
+                        start: addr(0xfffff803_1ab19000),
+                        bytes: 0x1000,
+                    }],
+                    ..whole_scan()
+                },
+            ),
+        ];
+        for (why, scan) in code_side {
+            assert_eq!(
+                scan.shortfall(),
+                Some(Shortfall::Code),
+                "a scan is short of the **code** when {why} -- and the import table was read \
+                 whole, so which sinks are imported is not in doubt"
+            );
+        }
 
         let unnamed = DriverHazards {
             unnamed_libraries: vec!["FLTMGR.SYS".into()],
             ..whole_scan()
         };
+        assert_eq!(
+            unnamed.shortfall(),
+            Some(Shortfall::Imports),
+            "and short of the **imports** when a bound library's names were never read -- every \
+             sink in it is one `sinks` does not have, while the code was decoded in full"
+        );
+
+        let both = DriverHazards {
+            unnamed_libraries: vec!["FLTMGR.SYS".into()],
+            cap_hit: true,
+            ..whole_scan()
+        };
+        assert_eq!(both.shortfall(), Some(Shortfall::Both));
+
+        // **And each note qualifies its own side and says the other is not in doubt.** The
+        // sentence is the part that was wrong, so it is asserted rather than left to read well.
+        let imports = Shortfall::Imports.note();
         assert!(
-            unnamed.shortfall().is_some(),
-            "and nor did one whose bound imports were never named -- every sink in that library \
-             is one `sinks` does not have"
+            imports.contains("`sinks` is a lower bound") && imports.contains("`privileged` is not"),
+            "the import-side note qualifies `sinks` and clears `privileged`: {imports}"
+        );
+        let code = Shortfall::Code.note();
+        assert!(
+            code.contains("`privileged`") && code.contains("is not qualified by it"),
+            "the code-side note qualifies `privileged` and clears the sink set: {code}"
+        );
+        assert!(
+            Shortfall::Both.note().contains("both sides"),
+            "and the third says so rather than picking one"
         );
     }
 
