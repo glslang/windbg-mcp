@@ -1278,21 +1278,64 @@ fn simulate(
     }
 }
 
-/// Records a control code this instruction took somewhere the pass cannot follow.
+/// Whether a branch reading the flags this instruction wrote would be reading the control code.
 ///
-/// Asked against the **snapshot** taken before the instruction ran, so it sees a register written
-/// implicitly and one clipped by a narrow write as readily as the named destination. Flag-writing
-/// only, which is what keeps it from being noise: the question is not "was a value forgotten" --
-/// copies lose values all the time and nothing branches on them -- but "is a branch about to read
-/// flags from something it cannot attribute to a code".
-fn note_loss(facts: &Facts, carried: &[String], instruction: &Instruction, lost: &mut Option<u64>) {
+/// **Two ways it can be, and the second is the general one.** A register that *carried* the code
+/// and no longer does -- asked against the snapshot taken before the instruction ran, so it sees a
+/// register written implicitly (`mul ecx`) and one clipped by a narrow write (`sub cx,1`) as
+/// readily as the named destination. And an operand that **reads** the code, because flags are
+/// computed from it without it moving anywhere: `and eax,ecx` with the mask in `eax` leaves `ecx`
+/// holding the code, and the `je` below is about a bit of it.
+///
+/// The second subsumes every shape the first was widened for one at a time -- a `test` of a
+/// register holding the code, a `test` of the field itself, an `or`, a `mul`, a `bt` -- because it
+/// is one question over what the decoder printed rather than a clause per mnemonic. That
+/// distinction is the whole point: a clause answers for the shapes somebody thought of, and
+/// answers *nothing* for the rest, which is a case list that is short with nothing saying so.
+///
+/// Flag-writing only, which is what keeps it from being noise. The question is not "was a value
+/// forgotten" -- copies lose values all the time and nothing branches on them -- but "is a branch
+/// about to read flags this pass cannot attribute to a code". And it is recorded as **pending**
+/// rather than as a finding: what makes it matter is decided by what reads those flags, so an
+/// `and ecx,3` no branch ever looks at costs the answer nothing.
+///
+/// **An operand list is not every read, and that is the limit of what can be asked here.**
+/// `mul ecx` reads `eax` and names it nowhere, `cmpxchg` reads `rax`, and the string instructions
+/// read `rsi`/`rdi`/`rcx` -- exactly the gap on the read side that `Instruction::writes` was added
+/// to close on the write side, and the same argument applies. `FOLLOWUPS.md` item 75.
+fn note_loss(
+    facts: &Facts,
+    carried: &[String],
+    instruction: &Instruction,
+    lost: &mut Option<u64>,
+    layout: Layout,
+    traced: &mut bool,
+) {
     if !instruction.writes_flags {
         return;
     }
     let gone = carried
         .iter()
         .any(|register| !matches!(facts.registers.get(register), Some(Value::Code { .. })));
-    *lost = gone.then_some(instruction.address);
+    let read = instruction.operands.iter().any(|operand| {
+        // The register half is asked of the **snapshot**, not of the facts as they stand: by the
+        // time this runs the instruction has been applied, and a destination that consumed the
+        // code no longer says it ever held one.
+        register_full(operand).is_some_and(|register| carried.contains(&register)) || {
+            // **Where `source_value` looks is operand one**, so the operand this cares about
+            // has to be put there; `compare` builds the same probe for the same reason.
+            // Passing the instruction whole resolves whatever is in that position instead,
+            // which is a clause that can never match.
+            let mut probe = instruction.clone();
+            probe.operands = vec![Operand::Immediate(0), operand.clone()];
+            probe.effect = Effect::Move;
+            matches!(
+                source_value(facts, &probe, layout, traced),
+                Some(Value::Code { .. })
+            )
+        }
+    });
+    *lost = (gone || read).then_some(instruction.address);
 }
 
 /// Records a case, keeping the count exact once the list stops growing.
@@ -1565,33 +1608,12 @@ fn update(
     // takes a path this cannot name a code for, and returning here left neither a case nor a sign
     // of one. Recorded as a pending loss, which the branch that reads these flags commits.
     if matches!(instruction.effect, Effect::Test | Effect::Push) {
-        if instruction.effect == Effect::Test {
-            // **The field itself counts, not only a register holding it.** A driver that writes
-            // `test dword ptr [stack_location+18h],3` is testing the control code directly, and a
-            // check that looks only at registers reads that as a test of something else entirely
-            // -- which is how a code-dependent path came to produce neither a case nor a sign of
-            // one. `source_value` is what the `cmp` path already uses for the same operand.
-            let about_the_code = instruction
-                .operands
-                .first()
-                .and_then(register_full)
-                .and_then(|register| facts.registers.get(&register))
-                .is_some_and(|value| matches!(value, Value::Code { .. }))
-                || instruction.operands.first().is_some_and(|operand| {
-                    // **Where `source_value` looks is operand one**, so the operand this cares
-                    // about has to be put there: `compare` builds the same probe for the same
-                    // reason. Passing the instruction whole resolved the immediate instead, which
-                    // is a clause that reads a `Literal` and can never match.
-                    let mut probe = instruction.clone();
-                    probe.operands = vec![Operand::Immediate(0), operand.clone()];
-                    probe.effect = Effect::Move;
-                    matches!(
-                        source_value(facts, &probe, layout, traced),
-                        Some(Value::Code { .. })
-                    )
-                });
-            *lost = about_the_code.then_some(instruction.address);
-        }
+        // **A `test` of the control code is still a branch about it**: `test ecx,3` / `je` takes a
+        // path this cannot name a code for, and returning here left neither a case nor a sign of
+        // one. It needs no clause of its own, though -- `note_loss` asks the general question, and
+        // a `test` is a flag write whose operands read the code. A `push` writes no flags and is
+        // answered by the same call returning at once.
+        note_loss(facts, &carried_the_code, instruction, lost, layout, traced);
         return None;
     }
     let operands = &instruction.operands;
@@ -1599,7 +1621,7 @@ fn update(
         // Writes memory, or nothing this models. A store through a register does not change what
         // the register holds, so the facts stand -- but the `writes` loop above may have cleared
         // one that did.
-        note_loss(facts, &carried_the_code, instruction, lost);
+        note_loss(facts, &carried_the_code, instruction, lost, layout, traced);
         return None;
     };
     let destination = written.full.clone();
@@ -1620,7 +1642,7 @@ fn update(
         }
         // A code clipped to sixteen bits is a code this can no longer follow, and the `je` after
         // it is a statement about those bits -- which is a loss like any other.
-        note_loss(facts, &carried_the_code, instruction, lost);
+        note_loss(facts, &carried_the_code, instruction, lost, layout, traced);
         return None;
     }
     let held = facts.registers.get(&destination).cloned();
@@ -1766,12 +1788,7 @@ fn update(
     // register nobody watched, a multiply, an `and` -- whatever it was, the branch about to read
     // these flags is a test on the control code that this cannot attribute, and a map that says
     // nothing about it reads as the whole set.
-    // **Recorded as pending, not as a finding.** Whether this matters is decided by what reads
-    // the flags it wrote: a branch makes it a case nobody could name, and an instruction that
-    // merely computes with the result makes it nothing at all. Appending here marked a complete
-    // map `partial` for an `and ecx,3` no branch ever looked at -- the conservative direction, and
-    // still noise in the one signal that exists to be quiet.
-    note_loss(facts, &carried_the_code, instruction, lost);
+    note_loss(facts, &carried_the_code, instruction, lost, layout, traced);
     None
 }
 
@@ -4407,6 +4424,82 @@ mod tests {
 
         let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
         assert!(found.untracked.is_empty(), "{:?}", found.untracked);
+    }
+
+    /// **Flags computed from the code, with the code still where it was.**
+    #[test]
+    fn a_flag_write_that_reads_the_code_without_taking_it_is_still_a_loss() {
+        let about = |mnemonic: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("ecx"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "mov",
+                    vec![reg("eax"), imm(3)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    mnemonic,
+                    vec![reg("eax"), reg("ecx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+        let about_with_the_code_first = |mnemonic: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("ecx"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "mov",
+                    vec![reg("eax"), imm(3)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    mnemonic,
+                    vec![reg("ecx"), reg("eax")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+        };
+
+        assert_eq!(
+            about("and").untracked,
+            vec![DISPATCH + 0x11],
+            "the mask is the destination and the code is the source, so nothing stopped carrying it"
+        );
+        assert_eq!(
+            about("test").untracked,
+            vec![DISPATCH + 0x11],
+            "and a `test` reads both its operands, not only the first"
+        );
+        // **The shape the deleted clause covered.** Generalising a rule has to keep what the
+        // special case bought, and the only way to know is to assert it here rather than trust
+        // that a wider question contains a narrower one.
+        assert_eq!(
+            about_with_the_code_first("test").untracked,
+            vec![DISPATCH + 0x11],
+            "the code in operand zero is what the clause this replaced asked about"
+        );
     }
 
     /// **A `test` of the control code is a branch about it, and cannot be named.**
