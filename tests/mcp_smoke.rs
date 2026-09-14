@@ -1890,7 +1890,8 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// a note is appended to the tool it is `tool:` for. So the arithmetic stays a single term even
 /// though the count of moving parts went up.
 ///
-/// The 10,035 B `outputSchema` is on the wire and not here, and is by far the largest of any tool
+/// The `outputSchema` -- 10,035 B when this was raised, and the largest of any tool by some way --
+/// is on the wire and not here,
 /// -- which is the whole reason these two ceilings are separate numbers, a composite's cost being
 /// almost entirely a schema no model is served. The new figure leaves 1,726 B, which is 1.9%, and
 /// is the tightest headroom any of these raises has left. That is deliberate: this is the last
@@ -1986,7 +1987,9 @@ const MODEL_VISIBLE_CEILING: usize = 92_000;
 /// second shape restating what the map already says, kept in step by hand, and a composite whose
 /// caller must go back for the detail has not composed anything.
 ///
-/// The new figure leaves 5,318 B, which is 2.1% -- the same headroom the last three raises left.
+/// The new figure left 5,318 B at the raise, 2.1% -- the same headroom the last three raises did.
+/// Past tense on purpose: the payload moves under a ceiling that does not, and the golden is what
+/// says where it is today.
 const WIRE_CEILING: usize = 254_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
@@ -14205,82 +14208,108 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
         assert_no_error(&standalone, "driver_hazards");
         let scan = &standalone["result"]["structuredContent"];
 
-        // **Whatever it answered, the composite answered the same.** Demanding `ok` here tested
+        // **Whatever it answered, the composite answered the same** -- and saying *when* that is
+        // a claim these two calls can be held to is most of the work here. Demanding success tested
         // this target's paging state rather than the composition: mountmgr's import directory is
         // in a pageable section, and on a live kernel it is often simply not resident -- measured
         // on this bench, 512 bytes at `0xfffff80237249fae` unreadable, so the scan cannot succeed
         // however healthy the tool is. A composite that returns the tool's *failure* unchanged is
         // composing as faithfully as one that returns its success, so both directions are checked.
-        match scan["status"].as_str() {
-            Some("ok") => {
-                // **Two facts share the word `ok`, and this asserted the wrong one.** The
-                // envelope's `Outcome::Ok` says the *call answered*; a section's
-                // `SectionStatus::Ok` says the *answer is whole*. A scan that reached its deadline
-                // is both `Outcome::Ok` and `stopped` -- it answered, with part of the image
-                // undecoded -- and the composite maps that to `partial`. Demanding `ok` of every
-                // successful call therefore fails on a valid bounded result, and the more so on a
-                // slow transport, which is where a bounded result is likeliest.
-                //
-                // So the expected status is derived from the scan, by the rule
-                // `DriverHazards::shortfall` states: every way a scan can be short of the image.
-                let ran = &survey["hazards"]["hazards"];
-                let short = |scan: &Value| {
-                    let listed =
-                        |field: &str| scan[field].as_array().is_some_and(|rows| !rows.is_empty());
-                    !scan["stopped"].is_null()
-                        || scan["cap_hit"].as_bool().unwrap_or(false)
-                        || listed("unreadable")
-                        || listed("unnamed_libraries")
-                };
-                assert_eq!(
-                    survey["hazards"]["status"],
-                    match short(ran) {
-                        true => "partial",
-                        false => "ok",
-                    },
-                    "a section is complete when its own scan covered the image and partial when \
-                     it did not -- not whenever the call it came from returned: {survey}"
-                );
+        //
+        // **Three review rounds landed on the block this replaces, and all three were one mistake:
+        // it branched on the standalone call's outcome and then asserted about the composite,
+        // whose state its own clock decides.** So a state the branch had not allowed for was a
+        // valid run failing the tier -- a scan that answered but was bounded, then a section the
+        // survey's shared deadline never reached. What is here separates the claims instead. The
+        // first two are about the composite alone and hold whatever either clock did; only the
+        // third compares the two calls, and it says when it is not comparing.
+        let section = &survey["hazards"];
+        let ran = &section["hazards"];
 
-                // **And the payloads are comparable unless a *clock* stopped one of them.** These
-                // are two calls with two deadlines, so two bounded scans can legitimately stop at
-                // different points; every other reason a scan is short here -- a byte cap, a page
-                // that will not read, a bound import -- is a property of the image and falls the
-                // same way on both, which is why they do not gate the comparison.
-                match ran["stopped"].is_null() && scan["stopped"].is_null() {
-                    true => {
-                        assert_eq!(
-                            ran["sinks"], scan["sinks"],
-                            "the composite's hazard section is not `driver_hazards`' answer"
-                        );
-                        assert_eq!(
-                            ran["privileged"], scan["privileged"],
-                            "nor its privileged instructions"
-                        );
-                    }
-                    // Printed rather than passed over in silence: this is the one branch that
-                    // asserts nothing, and a tier that always took it would be a differential
-                    // comparing nothing while staying green.
-                    false => println!(
-                        "[differential] a deadline stopped one of the two scans, so their \
-                         payloads are not required to agree; the section's status was checked"
-                    ),
-                }
-            }
-            _ => {
+        // **1. A section with no scan under it says why.** The rule the whole tool exists for:
+        // an emptiness must never read as a finding, so `hazards: null` is never `ok` and never
+        // silent. This is the assertion that covers every way the composite can fail, including
+        // the ones no round has thought of yet.
+        if ran.is_null() {
+            assert!(
+                matches!(section["status"].as_str(), Some("error" | "unavailable")),
+                "a hazard section carrying no scan must say so rather than read as a driver with \
+                 no sensitive imports: {survey}"
+            );
+            assert!(
+                section["note"].as_str().is_some_and(|why| !why.is_empty()),
+                "and it must carry the reason: {survey}"
+            );
+        }
+
+        // **2. A section with a scan under it is complete exactly when that scan covered the
+        // image.** `DriverHazards::shortfall`'s rule, read off the payload the section carries --
+        // not off whether the call it came from returned. Those are two different facts sharing
+        // the word `ok`: the envelope's says the *call answered*, a section's says the *answer is
+        // whole*, and a scan that reached its deadline is both `Outcome::Ok` and `stopped`.
+        let short = |scan: &Value| {
+            let listed = |field: &str| scan[field].as_array().is_some_and(|rows| !rows.is_empty());
+            !scan["stopped"].is_null()
+                || scan["cap_hit"].as_bool().unwrap_or(false)
+                || listed("unreadable")
+                || listed("unnamed_libraries")
+        };
+        if !ran.is_null() {
+            assert_eq!(
+                section["status"],
+                match short(ran) {
+                    true => "partial",
+                    false => "ok",
+                },
+                "a section is complete when its own scan covered the image and partial when it \
+                 did not: {survey}"
+            );
+        }
+
+        // **3. And the differential proper, which needs both calls to be talking about the same
+        // thing.** They are two calls with two clocks. The survey shares one deadline across its
+        // sections and says so when one ran out before a section began (`not_started`), while this
+        // standalone call gets a fresh one -- so a composite section that never started is not a
+        // disagreement with a standalone that succeeded, and its note is its own clock's rather
+        // than the scan's. Equally, two scans that both *ran* but were bounded can stop at
+        // different points; every other reason a scan is short -- a byte cap, a page that will not
+        // read, a bound import -- is a property of the image and falls the same way on both, which
+        // is why those do not gate anything.
+        let unstarted = survey["not_started"]["section"].as_str() == Some("hazards");
+        let bounded = !ran["stopped"].is_null() || !scan["stopped"].is_null();
+        match (unstarted, bounded, scan["status"].as_str()) {
+            (true, _, _) => println!(
+                "[differential] the survey's clock ran out before its hazard section began, so \
+                 its answer is about this call's budget rather than about `driver_hazards`; the \
+                 section was still checked for saying so"
+            ),
+            (false, true, _) => println!(
+                "[differential] a deadline stopped one of the two scans, so their payloads are \
+                 not required to agree; the section's status was still checked"
+            ),
+            (false, false, Some("ok")) => {
                 assert_eq!(
-                    survey["hazards"]["status"], "error",
-                    "the scan failed, so the section carrying it must say so rather than reading \
-                     as a driver with no sensitive imports: {survey}"
+                    ran["sinks"], scan["sinks"],
+                    "the composite's hazard section is not `driver_hazards`' answer"
                 );
                 assert_eq!(
-                    survey["hazards"]["note"], scan["error"]["message"],
+                    ran["privileged"], scan["privileged"],
+                    "nor its privileged instructions"
+                );
+            }
+            // The branch this bench actually takes, and the one that proves composition on the
+            // failure side: the section carries that failure's **own** reason rather than a
+            // second account of it.
+            (false, false, _) => {
+                assert_eq!(
+                    section["status"], "error",
+                    "the scan failed, so the section carrying it must say so: {survey}"
+                );
+                assert_eq!(
+                    section["note"], scan["error"]["message"],
                     "and it must carry that failure's own reason, not a second account of it"
                 );
-                assert!(
-                    survey["hazards"]["hazards"].is_null(),
-                    "with no findings beside it: {survey}"
-                );
+                assert!(ran.is_null(), "with no findings beside it: {survey}");
             }
         }
 
