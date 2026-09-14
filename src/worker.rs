@@ -6914,20 +6914,22 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     // **`error` rather than `partial`**, deliberately: nothing in such a section was read, and
     // `partial` invites a caller to read what is there -- which for `hazards: null` is "scanned,
     // found nothing". The whole of this tool is about not letting an emptiness read as a finding.
-    let not_started = |what: &str, halt: structured::WalkHalt| {
-        format!(
-            "this survey {} before the {what} section was started, so none of it was read. Raise \
-             the server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue this when the \
-             session is idle.",
-            halt.phrase()
-        )
-    };
+    //
+    // **And a section that never started says so as a value, not only in that prose.** `error`
+    // otherwise covers two facts with opposite remedies -- a section that tried and failed is
+    // about the driver, one that never began is about this call's budget -- and a caller
+    // branching on `status` could tell them apart only by reading the note.
+    let mut unstarted: Option<structured::UnstartedSection> = None;
 
     // ---- the devices -----------------------------------------------------
     let devices = match attribution_stop(e, deadline) {
         Some(halt) => structured::DevicesSection {
             status: structured::SectionStatus::Error,
-            note: Some(not_started("device", halt)),
+            note: Some(not_started(
+                &mut unstarted,
+                structured::SurveySection::Devices,
+                halt,
+            )),
             devices: Vec::new(),
             device_count: 0,
             named_in: DEVICE_DIRECTORY.to_string(),
@@ -6954,7 +6956,11 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     let ioctl = if let Some(halt) = attribution_stop(e, deadline) {
         structured::IoctlSection {
             status: structured::SectionStatus::Error,
-            note: Some(not_started("IOCTL", halt)),
+            note: Some(not_started(
+                &mut unstarted,
+                structured::SurveySection::Ioctl,
+                halt,
+            )),
             map: None,
         }
     } else {
@@ -7012,7 +7018,11 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     let hazards = if let Some(halt) = attribution_stop(e, deadline) {
         structured::HazardsSection {
             status: structured::SectionStatus::Error,
-            note: Some(not_started("hazard", halt)),
+            note: Some(not_started(
+                &mut unstarted,
+                structured::SurveySection::Hazards,
+                halt,
+            )),
             hazards: None,
         }
     } else {
@@ -7062,10 +7072,36 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         devices,
         ioctl,
         hazards,
+        not_started: unstarted,
     };
     // Fenced once, at the top: the composite embeds `ioctl::render` and `hazards::render`,
     // and a fence inside a fence closes the outer one early.
     Ok(Output::typed(fenced(&surface::render(&report)), report))
+}
+
+/// The note for a survey section the clock stopped before it began -- **and** the record of it.
+///
+/// One call does both, because they are two halves of one fact and nothing else would keep them
+/// together: a note written without the record leaves `not_started` null while the prose says a
+/// section never ran, and a record without a note is a section that says nothing. Neither is
+/// reachable from here.
+///
+/// The **first** section stopped is the one kept. The sections run in a fixed order on one shared
+/// clock, so a clock spent before one is spent before every section after it; naming the first is
+/// the whole fact, and overwriting it would report the last instead.
+fn not_started(
+    first: &mut Option<structured::UnstartedSection>,
+    section: structured::SurveySection,
+    why: structured::WalkHalt,
+) -> String {
+    first.get_or_insert(structured::UnstartedSection { section, why });
+    format!(
+        "this survey {} before the {} section was started, so none of it was read. Raise the \
+         server's call timeout (WINDBG_MCP_CALL_TIMEOUT_SECS), or issue this when the session is \
+         idle.",
+        why.phrase(),
+        section.in_prose(),
+    )
 }
 
 /// Every device on a driver's chain, with the gate that decides who may open it.
@@ -8657,6 +8693,94 @@ mod tests {
         assert!(
             !note.contains("is in no module"),
             "and must not say the address is in none, which is the claim it cannot make: {note}"
+        );
+    }
+
+    /// **A section that never started says which one, and the first is the one it says.**
+    ///
+    /// The sections run in order on one shared clock, so a clock spent before one is spent before
+    /// every section after it -- three of them can report "not started" from a single expiry, and
+    /// keeping the **last** would name `hazards` for a survey that in fact stopped before the
+    /// devices. The note's wording and the record are produced by one call for the same reason:
+    /// separately, a note can be written with nothing recorded, and `not_started` reads as null
+    /// while the prose beside it says a section never ran.
+    #[test]
+    fn the_section_a_survey_never_started_is_the_first_one_it_did_not_reach() {
+        let mut first = None;
+        let note = super::not_started(
+            &mut first,
+            structured::SurveySection::Ioctl,
+            structured::WalkHalt::Deadline,
+        );
+        assert_eq!(
+            first,
+            Some(structured::UnstartedSection {
+                section: structured::SurveySection::Ioctl,
+                why: structured::WalkHalt::Deadline,
+            }),
+            "the record rides with the note rather than being left to a second call"
+        );
+        assert!(
+            note.contains("before the IOCTL section was started"),
+            "and the note names the section in the words a sentence wants: {note}"
+        );
+
+        // The hazard section is reached **after** the IOCTL one, so the same expiry stops it too.
+        let after = super::not_started(
+            &mut first,
+            structured::SurveySection::Hazards,
+            structured::WalkHalt::Deadline,
+        );
+        assert_eq!(
+            first,
+            Some(structured::UnstartedSection {
+                section: structured::SurveySection::Ioctl,
+                why: structured::WalkHalt::Deadline,
+            }),
+            "and the survey still stopped before the IOCTL section -- naming the last would \
+             describe a survey that got further than it did"
+        );
+        assert!(
+            after.contains("before the hazard section was started"),
+            "while every section after it still says so for itself: {after}"
+        );
+    }
+
+    /// **A section's field name and the word it is called in a sentence are both wanted.**
+    ///
+    /// The note reads "before the hazard section was started" and the field it points a reader at
+    /// is `hazards`; a caller keys on the second and a person reads the first. They are one
+    /// `match` away from each other so that they cannot drift.
+    #[test]
+    fn a_survey_section_is_named_for_a_caller_and_for_a_reader() {
+        for (section, field, prose) in [
+            (structured::SurveySection::Devices, "devices", "device"),
+            (structured::SurveySection::Ioctl, "ioctl", "IOCTL"),
+            (structured::SurveySection::Hazards, "hazards", "hazard"),
+        ] {
+            assert_eq!(
+                serde_json::to_value(section).expect("serializes"),
+                serde_json::Value::String(field.to_string()),
+                "the wire name is the field a caller then reads"
+            );
+            assert_eq!(section.in_prose(), prose);
+        }
+
+        // **And the pair a caller actually reads**, asserted rather than observed: this bench
+        // cannot produce one. The budget gate refuses a survey with under a second of its caller's
+        // clock left, and `mountmgr`'s survey fits inside a second -- measured at call timeouts of
+        // 4 s through 19 s against `ctf-vm`, which either refused the call outright (`not_run`) or
+        // ran every section. The state is reachable on a slower transport and is what the review
+        // round that added this field was about.
+        let stopped = structured::UnstartedSection {
+            section: structured::SurveySection::Hazards,
+            why: structured::WalkHalt::Deadline,
+        };
+        assert_eq!(
+            serde_json::to_value(&stopped).expect("serializes"),
+            serde_json::json!({ "section": "hazards", "why": "deadline" }),
+            "two values a caller branches on: which section to go and read, and whether the \
+             remedy is more time or somebody's own interrupt"
         );
     }
 

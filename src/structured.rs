@@ -3305,6 +3305,55 @@ pub struct DriverSurface {
     pub devices: DevicesSection,
     pub ioctl: IoctlSection,
     pub hazards: HazardsSection,
+    /// The first section this survey's clock ran out before it could **start**, where there was
+    /// one.
+    ///
+    /// **Without it, `error` is two facts with opposite remedies.** A section that tried and
+    /// failed is about the driver -- an image that would not read, a dispatch routine outside it.
+    /// A section that never began is about this call's budget. Both are `error` with a null
+    /// payload, and until this field the only thing separating them was the wording of a `note`.
+    ///
+    /// One field rather than a flag on each, because the sections run in a fixed order on one
+    /// shared clock: at most one is the *first* not to start, and every section after it is in the
+    /// same state for the same reason. Naming that one is the whole fact.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub not_started: Option<UnstartedSection>,
+}
+
+/// A section of a [`DriverSurface`] whose clock ran out before the section could begin.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct UnstartedSection {
+    /// Which one, named as the field it appears under, so a caller can go straight to it.
+    pub section: SurveySection,
+    /// What stopped the survey: its own deadline, or a caller's interrupt. Different remedies --
+    /// more time against somebody having asked -- which is why this is not a bool.
+    pub why: WalkHalt,
+}
+
+/// The sections of a [`DriverSurface`] that a clock can stop before they start.
+///
+/// `dispatch` is deliberately absent: it is read from the driver object's own fields, before the
+/// first of these checks, and a survey that could not read those has failed as a whole rather than
+/// in a section.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SurveySection {
+    Devices,
+    Ioctl,
+    Hazards,
+}
+
+impl SurveySection {
+    /// The word this section is called by in a sentence, which is **not** its field name: a note
+    /// reads "before the hazard section was started", and the field it points at is `hazards`.
+    /// Both spellings are wanted, and keeping them in one place is what stops them drifting apart.
+    pub fn in_prose(self) -> &'static str {
+        match self {
+            Self::Devices => "device",
+            Self::Ioctl => "IOCTL",
+            Self::Hazards => "hazard",
+        }
+    }
 }
 
 /// What `!analyze -v` concluded, kept separate from the values above because it is a heuristic.
