@@ -89,19 +89,117 @@ REVISION = "2025-06-18"
 DRAW = int(os.environ.get("EVAL_DRAW", "1") or 1)
 SEED = int(os.environ["EVAL_SEED"]) if os.environ.get("EVAL_SEED", "").strip() else None
 
+# **Whether the model reasons before it answers, which is an axis and not a setting.**
+#
+# Every run before 2026-09-14 was `think: false`, deliberately: the two sightings in
+# `docs/local-model.md` had found a thinking turn outliving the listener's 390s lease grace (440s,
+# measured), so leaving it on would have confounded every timing with an intermittently vanishing
+# session. The `keepalive` thread below is what removed that, so the axis is now affordable.
+#
+# It reaches the record, because a run that cannot say whether its models were reasoning cannot be
+# compared with one that did - the same rule as the suite, the server and the weights
+# (`FOLLOWUPS.md` item 46). Two logs differing only here are an A/B; two that do not say are a
+# coincidence.
+THINK = os.environ.get("OLLAMA_THINK", "").strip().lower() in ("1", "true", "yes", "on")
+
 # Tool calls this harness will actually execute. Everything else is reported back
 # to the model as refused, so a wrong pick is *measured* rather than performed —
 # the surface includes `launch` and `execute`, and a debug host is the wrong place
 # to find out what a model does with them unattended.
 #
-# `end_session` is the one destructive member, and it is fenced to sessions this run
-# opened: the rest of the namespace belongs to a run that crashed before its cleanup,
-# or to one running beside this one.
-ALLOWED = {
-    "open_dump", "open_trace", "crash_triage", "backtrace", "modules", "registers",
-    "threads", "session_status", "end_session", "decode_ioctl", "disassemble",
-    "read_memory", "server_log",
+# **The fence is the server's own answer now, not a list of names kept here.** It used to be an
+# enumeration, and it drifted the way every hand-kept copy of another component's vocabulary
+# drifts: the `crash` group grew from one tool to three, and the 2026-09-13 run spent 21 calls
+# being refused `decode_error_reporting` and `exception_triage` by *this script* — a refusal
+# worded like the server's, landing in the log as the model picking badly. Adding the two names
+# was the small fix. Not keeping the list is the one that holds, because the next group to grow
+# will not announce itself either.
+#
+# Every tool this server serves declares `readOnlyHint` in its `tools/list` annotations — 61 of
+# 61, checked on the wire rather than assumed — so "may a bench run this unattended" travels
+# beside the tool instead of being remembered here.
+#
+# Two deliberate exceptions, each for a property the annotation cannot express:
+ALLOW_ANYWAY = {
+    # The harness's own session lifecycle. Opening a target and ending one are not read-only and
+    # the bench cannot work without them; `end_session` additionally carries the per-run fence
+    # below, to sessions this run opened — the rest of the namespace belongs to a run that
+    # crashed before its cleanup, or to one running beside this one.
+    "open_dump", "open_trace", "end_session",
 }
+DENY_ANYWAY = {
+    # Read-only and still wrong to run here: `wait_for_stop` mutates nothing and *blocks*, so a
+    # model picking it on a dump spends the cell's wall-clock budget rather than one of its six
+    # turns. That cost is invisible to `readOnlyHint`, which is a claim about the target and not
+    # about the clock.
+    "wait_for_stop",
+}
+
+# The surface this run was served, learned at handshake time by [`adopt_fence`]. `None` until
+# then, and deliberately not an empty set: "nobody derived the fence" and "the fence permits
+# nothing" are different bugs, and an empty set would quietly refuse every call of an entire run
+# while looking like a very strict bench.
+SERVED = None
+
+
+def adopt_fence(tools):
+    """Take this run's read-only fence from the surface the server just served.
+
+    Called once, on the `tools/list` the run already fetches, so it costs no extra round trip
+    and cannot describe a different surface than the one the model is looking at.
+
+    **A tool with no boolean `readOnlyHint` stops the run rather than being guessed at.** A fence
+    derived from data fails silently in both directions — treat a missing hint as read-only and
+    the bench runs `launch` unattended; treat it as mutating and the run refuses tools it needs
+    and reports it as models picking badly, which is the failure this whole change is about.
+    Neither is discoverable from the log, so neither is allowed to happen.
+    """
+    global SERVED
+    unannotated = sorted(t.get("name") for t in tools
+                         if not isinstance((t.get("annotations") or {}).get("readOnlyHint"), bool))
+    if unannotated:
+        shown = ", ".join(unannotated[:5]) + ("…" if len(unannotated) > 5 else "")
+        raise SystemExit(
+            f"cannot derive the read-only fence: {len(unannotated)} of {len(tools)} served tools "
+            f"carry no boolean `annotations.readOnlyHint` ({shown}). Guessing would either run a "
+            f"mutating tool on a debug host or refuse a read-only one and record it as the model's "
+            f"mistake, so this refuses to guess.")
+    SERVED = {t["name"]: bool(t["annotations"]["readOnlyHint"]) for t in tools}
+    runnable = sorted(n for n in SERVED if permitted(n))
+    print(f"read-only fence: {len(runnable)} of {len(SERVED)} served tools runnable "
+          f"(from the server's own readOnlyHint"
+          + (f", less {', '.join(sorted(DENY_ANYWAY & set(SERVED)))}"
+             if DENY_ANYWAY & set(SERVED) else "") + ")")
+    return runnable
+
+
+def permitted(name):
+    """Whether this harness runs `name` itself, for the surface this run was served.
+
+    Three answers, and the third is what keeps the measurement honest:
+
+    - **served and read-only** — run it.
+    - **served and mutating**, and not the session lifecycle — this harness refuses it, which is
+      the whole point of having a fence on a debug host.
+    - **not served at all** — hand it to the *server*, which refuses it as off-surface.
+
+    That third case is deliberate and load-bearing. `unserved` — the `taught`/`wanted` split this
+    bench exists to report — is counted from calls naming a tool the client was not served, and
+    the five-way call split tells `off_surface` (the server said no) from `refused` (this script
+    said no). A fence that intercepted unserved names first would keep the totals and quietly
+    relabel every one of them as our refusal, so the run would report a server that had stopped
+    advertising when nothing about the server had changed. Nothing is at risk in passing them on:
+    a tool the client is not served is one the server will not run for it.
+    """
+    if SERVED is None:
+        raise RuntimeError("the read-only fence has not been derived; call adopt_fence() on the "
+                           "served tools/list before running a model turn")
+    if name in DENY_ANYWAY:
+        return False
+    if name not in SERVED:
+        return True
+    return SERVED[name] or name in ALLOW_ANYWAY
+
 
 MAX_STEPS = int(os.environ.get("MAX_STEPS", "6"))
 
@@ -387,9 +485,12 @@ def call_tool(name, args):
         return {"name": name, "args": args, "ok": ok, "chars": chars, "verdict": verdict,
                 "took_s": round(time.time() - started, 1), "text": text,
                 "excerpt": text[:300]}
-    if name not in ALLOWED:
-        return record(f"refused: `{name}` is not permitted in this harness",
-                      None, 0, "refused_by_harness")
+    if not permitted(name):
+        # Says *why*, because the model's next move depends on it: "this bench will not run it"
+        # is a dead end to route around, where the server's own "not on the surface" is a
+        # capability this client was not given. The two used to read identically.
+        return record(f"refused: `{name}` changes the target, and this harness only runs "
+                      f"read-only tools", None, 0, "refused_by_harness")
     if name == "end_session" and args.get("session_id") not in OPENED:
         # One rule, and it covers the call that names nothing: without a `session_id`
         # the server ends this credential's *current* session, which may be a
@@ -781,6 +882,10 @@ def main():
         print("MCP revision negotiated:", handshake())
         threading.Thread(target=keepalive, daemon=True).start()
         tools = mcp("tools/list")["result"]["tools"]
+        # Before any turn can run, and from the same answer the model is about to be shown:
+        # the fence and the surface are two readings of one `tools/list`, so they cannot
+        # describe different servers.
+        adopt_fence(tools)
         offered = as_ollama(tools)
         wire = json.dumps(offered, separators=(",", ":"))
         surface = len(wire)
