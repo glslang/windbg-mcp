@@ -7015,11 +7015,12 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         }
     } else {
         match &module {
-            // The inventory size is only asked for on the path that is already failing.
+            // The inventory is only asked for on the path that is already failing, and an
+            // enumeration that fails answers `None` rather than zero -- see [`inventory_size`].
             None => unattributed_image(
                 attribution_halted.get(),
                 image_at.attribution_failed,
-                e.modules().map(|loaded| loaded.len()).unwrap_or_default(),
+                inventory_size(e.modules()),
                 fields.image_base,
             ),
             Some(module) => match scan_of(e, module, fields.image_base, deadline) {
@@ -7309,6 +7310,18 @@ const LINK_DIRECTORY: &str = "\\GLOBAL??";
 /// The object type name a device carries.
 const DEVICE: &str = "Device";
 
+/// How many modules the debugger has, or `None` where the list could not be read.
+///
+/// **A one-line helper because that line is where the bug was.** Written inline it was
+/// `.map(|loaded| loaded.len()).unwrap_or_default()`, which hands a *failed enumeration* on as a
+/// count of zero -- and zero is the arm that reports a fresh kernel attach and recommends a
+/// refresh, so a debugger call that did not answer came back as evidence about the target. The
+/// difference between "no modules" and "no answer" is the whole subject of the function this
+/// feeds, and it was being erased on the way in.
+fn inventory_size<T, E>(listed: Result<Vec<T>, E>) -> Option<usize> {
+    listed.ok().map(|loaded| loaded.len())
+}
+
 /// The hazard section for a driver whose image base named no module.
 ///
 /// **Two answers, and which one turns on whether this call stopped asking.** A lookup cut short by
@@ -7320,7 +7333,7 @@ const DEVICE: &str = "Device";
 fn unattributed_image(
     halted: Option<structured::WalkHalt>,
     lookup_failed: bool,
-    inventory: usize,
+    inventory: Option<usize>,
     base: u64,
 ) -> structured::HazardsSection {
     match halted {
@@ -7362,9 +7375,28 @@ fn unattributed_image(
         None => structured::HazardsSection {
             status: structured::SectionStatus::Unavailable,
             note: Some(match inventory {
-                0..=8 => format!(
+                // **A list that would not read is not a list of nothing.** `unwrap_or_default` put
+                // a failed enumeration here as `0`, which is the arm below, so a debugger call
+                // that did not answer came back as "this looks like a fresh attach, refresh it" --
+                // evidence about an inventory nobody read. Exactly the misdiagnosis the
+                // `lookup_failed` arm above exists to prevent, one line away from it.
+                None => {
+                    return structured::HazardsSection {
+                        status: structured::SectionStatus::Error,
+                        note: Some(format!(
+                            "no loaded module holds this driver's image base {}, and the \
+                             debugger's module list could not be read either -- so this cannot \
+                             say whether the image is absent from the target or merely from an \
+                             inventory that was never enumerated. `modules` with `refresh: true` \
+                             is what would settle it.",
+                            structured::addr(base)
+                        )),
+                        hazards: None,
+                    };
+                }
+                Some(held @ 0..=8) => format!(
                     "this driver's image base {} is in no module the debugger has -- and its \
-                     inventory holds only {inventory}, which is what a **fresh kernel attach** \
+                     inventory holds only {held}, which is what a **fresh kernel attach** \
                      looks like: the list holds the loads the debugger saw, so a driver loaded \
                      before the attach is absent from it rather than from the target. Run \
                      `modules` with `refresh: true` and ask again. Until then this scan, and any \
@@ -7372,9 +7404,9 @@ fn unattributed_image(
                      resolve against.",
                     structured::addr(base)
                 ),
-                _ => format!(
+                Some(held) => format!(
                     "this driver's image base {} is in no module the engine could name, out of \
-                     the {inventory} it has. `modules` with `refresh: true` resynchronises the \
+                     the {held} it has. `modules` with `refresh: true` resynchronises the \
                      inventory with the target, which is worth trying before concluding the image \
                      is not loaded.",
                     structured::addr(base)
@@ -8571,7 +8603,7 @@ mod tests {
         let base = 0xffff_f805_5ebf_0000;
 
         let never_asked =
-            super::unattributed_image(Some(structured::WalkHalt::Deadline), false, 156, base);
+            super::unattributed_image(Some(structured::WalkHalt::Deadline), false, Some(156), base);
         assert_eq!(never_asked.status, structured::SectionStatus::Partial);
         let note = never_asked.note.unwrap_or_default();
         assert!(note.contains("ran out of time"), "{note}");
@@ -8580,16 +8612,20 @@ mod tests {
             "it must not report this call's clock as a fact about the target: {note}"
         );
 
-        let interrupted =
-            super::unattributed_image(Some(structured::WalkHalt::Interrupted), false, 156, base)
-                .note;
+        let interrupted = super::unattributed_image(
+            Some(structured::WalkHalt::Interrupted),
+            false,
+            Some(156),
+            base,
+        )
+        .note;
         assert!(
             interrupted.unwrap_or_default().contains("was interrupted"),
             "a break and a deadline have different remedies and read differently"
         );
 
         // And the genuine case keeps its own answer.
-        let no_such_module = super::unattributed_image(None, false, 156, base);
+        let no_such_module = super::unattributed_image(None, false, Some(156), base);
         assert_eq!(
             no_such_module.status,
             structured::SectionStatus::Unavailable
@@ -8606,7 +8642,7 @@ mod tests {
         // so without this the case fell into the branch above and reported the target as having no
         // such module -- blaming it for a debugger call that did not answer. Three ways to have no
         // module, three answers, and each sends a reader somewhere different.
-        let lookup_failed = super::unattributed_image(None, true, 156, base);
+        let lookup_failed = super::unattributed_image(None, true, Some(156), base);
         assert_eq!(
             lookup_failed.status,
             structured::SectionStatus::Error,
@@ -8617,6 +8653,34 @@ mod tests {
         assert!(
             !note.contains("is in no module"),
             "and must not say the address is in none, which is the claim it cannot make: {note}"
+        );
+    }
+
+    /// **A module list that would not read is not a module list of nothing.**
+    ///
+    /// This is the argument rather than the function, and it is where the bug was: written
+    /// `.map(|loaded| loaded.len()).unwrap_or_default()`, a failed enumeration arrives as `0`, and
+    /// `0` is the arm that reports a fresh kernel attach and recommends a refresh. The function it
+    /// feeds exists to tell "the target has no such module" from "the debugger did not answer",
+    /// and the conversion on the way in threw that distinction away.
+    #[test]
+    fn a_module_list_that_would_not_read_is_not_a_list_of_nothing() {
+        let listed: Result<Vec<u8>, &str> = Ok(vec![0, 1, 2]);
+        assert_eq!(super::inventory_size(listed), Some(3));
+
+        let empty: Result<Vec<u8>, &str> = Ok(Vec::new());
+        assert_eq!(
+            super::inventory_size(empty),
+            Some(0),
+            "an inventory that read and held nothing is a fact, and keeps its zero"
+        );
+
+        let failed: Result<Vec<u8>, &str> = Err("the engine did not answer");
+        assert_eq!(
+            super::inventory_size(failed),
+            None,
+            "but one that did not read has no size to report, and must not borrow the empty \
+             list's zero to say so"
         );
     }
 
@@ -8637,7 +8701,7 @@ mod tests {
     fn an_empty_module_inventory_is_named_as_the_fresh_attach_it_is() {
         let base = 0xffff_f802_3724_0000;
 
-        let fresh = super::unattributed_image(None, false, 1, base);
+        let fresh = super::unattributed_image(None, false, Some(1), base);
         assert_eq!(fresh.status, structured::SectionStatus::Unavailable);
         let note = fresh.note.unwrap_or_default();
         assert!(
@@ -8656,12 +8720,34 @@ mod tests {
         // A populated inventory is a different answer: the module really is not there. It still
         // mentions `refresh`, because that is cheap and the conclusion is worth one more check --
         // but it does not claim the inventory is empty when it is not.
-        let populated = super::unattributed_image(None, false, 156, base);
+        let populated = super::unattributed_image(None, false, Some(156), base);
         let note = populated.note.unwrap_or_default();
         assert!(note.contains("156"), "{note}");
         assert!(
             !note.contains("fresh kernel attach"),
             "156 modules is not a fresh attach and must not be described as one: {note}"
+        );
+
+        // **And a list that would not read is not a list of nothing.** Passing the count as a bare
+        // `usize` meant a failed enumeration arrived here as `0`, which is the fresh-attach arm --
+        // so a debugger call that did not answer came back as evidence about the target, with a
+        // remedy attached. That is the same misdiagnosis `lookup_failed` exists to prevent, and it
+        // was reintroduced one line away from the fix for it.
+        let unreadable = super::unattributed_image(None, false, None, base);
+        assert_eq!(
+            unreadable.status,
+            structured::SectionStatus::Error,
+            "an inventory that could not be read is a call that did not answer, not a target \
+             with no such module"
+        );
+        let note = unreadable.note.unwrap_or_default();
+        assert!(
+            note.contains("could not be read"),
+            "it says the list is what failed: {note}"
+        );
+        assert!(
+            !note.contains("fresh kernel attach") && !note.contains("holds only"),
+            "and claims nothing about a size it never saw: {note}"
         );
     }
 
