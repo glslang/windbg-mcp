@@ -45,7 +45,7 @@ use crate::walk::Halt;
 /// than a fact about Windows: a result quoted in a report six months from now can be checked
 /// against the list that produced it. Bump it whenever [`SINKS`] changes at all — an addition
 /// changes what a scan finds as surely as a removal does.
-pub const SINK_LIST_VERSION: &str = "1";
+pub const SINK_LIST_VERSION: &str = "2";
 
 /// Why an import is worth reporting.
 ///
@@ -151,6 +151,12 @@ pub const SINKS: &[(&str, SinkKind)] = &[
     ("ZwSetValueKey", SinkKind::Persistence),
     ("ZwCreateKey", SinkKind::Persistence),
     ("IoCreateSymbolicLink", SinkKind::Persistence),
+    // **The numbered variant, which is what a current driver actually imports.** `mountmgr`
+    // on 26100 uses `IoCreateSymbolicLink2` and nothing else, so a list holding only the
+    // original reported that driver as creating no symbolic link at all -- found by running
+    // Driver Buddy Revolutions over the same image and reading its import table directly.
+    // The allocators already carry their numbered forms; this one had been missed.
+    ("IoCreateSymbolicLink2", SinkKind::Persistence),
     // Asking whether any of it is allowed.
     ("SeAccessCheck", SinkKind::AccessCheck),
     ("SePrivilegeCheck", SinkKind::AccessCheck),

@@ -107,6 +107,16 @@ impl Section {
     pub fn executable(&self) -> bool {
         self.characteristics & 0x2000_0000 != 0
     }
+
+    /// `IMAGE_SCN_MEM_DISCARDABLE` -- pages the loader **frees** once the driver has started.
+    ///
+    /// A read into one on a live target does not fail because the bytes are paged out; it fails
+    /// because they are gone, and only the image file still has them. The distinction decides
+    /// what a caller is told to do, and a driver whose import directory is linked into `INIT`
+    /// (HEVD's is) cannot be scanned from memory at all.
+    pub fn discardable(&self) -> bool {
+        self.characteristics & 0x0200_0000 != 0
+    }
 }
 
 /// The image's headers, as much as naming imports and bounding a code scan needs.
@@ -126,6 +136,18 @@ pub struct Image {
 }
 
 impl Image {
+    /// The section holding an RVA, where one does.
+    ///
+    /// For saying **why** a read failed rather than only that it did: a section's own
+    /// characteristics are the difference between bytes that are paged out and bytes the loader
+    /// discarded.
+    pub fn section_at(&self, rva: u32) -> Option<&Section> {
+        self.sections.iter().find(|section| {
+            let end = section.rva.saturating_add(section.virtual_size.max(1));
+            (section.rva..end).contains(&rva)
+        })
+    }
+
     /// The executable sections, which is what a linear code scan is bounded by.
     pub fn code_sections(&self) -> impl Iterator<Item = &Section> {
         self.sections.iter().filter(|section| section.executable())

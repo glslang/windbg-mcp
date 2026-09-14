@@ -6632,7 +6632,9 @@ fn hazards_at(
     let read = |at: u64, len: usize| {
         within_module(base, loaded_size, at, len).then(|| e.read_memory(at, len).ok())?
     };
-    let mut image = pe::read_image(base, read).map_err(|why| pe_failure(module, &why, None))?;
+    // Nothing is parsed yet, so nothing can say which section the address was in.
+    let mut image =
+        pe::read_image(base, read).map_err(|why| pe_failure(module, &why, None, None))?;
     // **The loader's extent wins.** `SizeOfImage` is read out of the image's own header, which on
     // an untrusted driver is memory that driver may have written: advertise a larger one and every
     // bound in `src/pe.rs` — which are all `checked_va` against this number — would accept
@@ -6670,7 +6672,19 @@ fn hazards_at(
         stopped_by.set(halt);
         halt.is_some()
     })
-    .map_err(|why| pe_failure(module, &why, stopped_by.get()))?;
+    .map_err(|why| {
+        // The headers parsed, so this end **can** say where the address was -- and whether the
+        // loader kept it.
+        let discarded = match why {
+            pe::PeError::Unreadable { at, .. } => u32::try_from(at.saturating_sub(base))
+                .ok()
+                .and_then(|rva| image.section_at(rva))
+                .filter(|section| section.discardable())
+                .map(|section| section.name.clone()),
+            _ => None,
+        };
+        pe_failure(module, &why, stopped_by.get(), discarded.as_deref())
+    })?;
 
     let mut scan = hazards::scan(
         &image,
@@ -8118,7 +8132,12 @@ fn smaller_extent(header: u32, loaded: u32) -> u32 {
 /// The two kinds are kept apart because their remedies are: bytes that would not read are an image
 /// the session cannot reach — on a dump, the ordinary answer for anything the capture left out —
 /// while a structure that does not hold together is an image that is not what it claims to be.
-fn pe_failure(module: &str, why: &pe::PeError, stopped_by: Option<walk::Halt>) -> Failed {
+fn pe_failure(
+    module: &str,
+    why: &pe::PeError,
+    stopped_by: Option<walk::Halt>,
+    discarded: Option<&str>,
+) -> Failed {
     let category = match why {
         pe::PeError::Unreadable { .. } => structured::ErrorCategory::Debugger,
         pe::PeError::NotAnImage { .. } | pe::PeError::Malformed { .. } => {
@@ -8142,14 +8161,32 @@ fn pe_failure(module: &str, why: &pe::PeError, stopped_by: Option<walk::Halt>) -
     // Which target this is cannot be asked here: `is_kernel_target` does not separate a live
     // kernel from a kernel dump, and dbgscope's `is_live_kernel` is private. So both are named and
     // the reader picks, rather than one being guessed at.
-    let hint = match why {
-        pe::PeError::Unreadable { .. } => {
-            " On a **dump** the image file is what supplies these bytes: use a symbol path that \
-             serves image binaries, or set an executable image path and `.reload /f`. On a **live \
-             kernel** a driver's pageable sections may simply not be resident, in which case this \
-             is the target's state rather than a missing image and there is nothing to reload."
+    // **A discarded section is a third answer, and the only one with a remedy on a live
+    // kernel.** `IMAGE_SCN_MEM_DISCARDABLE` pages are freed once `DriverEntry` returns, so they
+    // are not paged out and no amount of waiting or touching brings them back -- the image file
+    // has them and nothing else does. Told the pageable story, a reader is sent to give up in the
+    // one case where something would work. Measured on HEVD, whose import directory is linked
+    // into `INIT`.
+    let hint = match (why, discarded) {
+        (pe::PeError::Unreadable { .. }, Some(section)) => {
+            format!(
+                " Those bytes are in `{section}`, a **discardable** section: the loader frees it \
+                 once the driver has started, so on a live target they are gone from the running \
+                 image rather than paged out of it, and no reload brings them back -- measured, \
+                 an executable image path and `.reload /f` leave them unreadable, because the \
+                 engine substitutes a file's bytes where a *capture* has none and a live target's \
+                 freed pages are mapped-and-invalid instead. A driver that links its import \
+                 directory into `{section}` therefore cannot be scanned from memory at all; the \
+                 same driver in a **dump** can, where the image file does supply it."
+            )
         }
-        _ => "",
+        (pe::PeError::Unreadable { .. }, None) => " On a **dump** the image file is what supplies \
+             these bytes: use a symbol path that serves image binaries, or set an executable image \
+             path and `.reload /f`. On a **live kernel** a driver's pageable sections may simply \
+             not be resident, in which case this is the target's state rather than a missing image \
+             and there is nothing to reload."
+            .to_string(),
+        _ => String::new(),
     };
     Failed::categorised(
         category,
@@ -9696,13 +9733,13 @@ mod tests {
                 structured::ErrorCategory::Interrupted,
             ),
         ] {
-            let failure = pe_failure("drv", &stopped, halt);
+            let failure = pe_failure("drv", &stopped, halt, None);
             assert_eq!(failure.category, Some(expected), "{halt:?}: {failure:?}");
         }
 
         // And the other kinds are about the image rather than about a stop, whatever was polled.
         let unreadable = pe::PeError::Unreadable { at: 0x1000, len: 8 };
-        let failure = pe_failure("drv", &unreadable, Some(walk::Halt::Deadline));
+        let failure = pe_failure("drv", &unreadable, Some(walk::Halt::Deadline), None);
         assert_eq!(
             failure.category,
             Some(structured::ErrorCategory::Debugger),
@@ -9712,6 +9749,37 @@ mod tests {
             failure.message.contains("image path"),
             "bytes that would not read name the remedy: {}",
             failure.message
+        );
+
+        // **And bytes the loader discarded are a third answer.** `IMAGE_SCN_MEM_DISCARDABLE`
+        // pages are freed once `DriverEntry` returns, so they are gone from the running image
+        // rather than paged out of it -- and the image **file** still has them, which is a remedy
+        // the pageable story tells a reader they do not have. Measured on HEVD, whose import
+        // directory is linked into `INIT`: the scan cannot answer from memory at all, and saying
+        // "there is nothing to reload" sends a reader to give up in the one case something works.
+        let discarded = pe_failure("drv", &unreadable, None, Some("INIT"));
+        assert!(
+            discarded.message.contains("`INIT`") && discarded.message.contains("discardable"),
+            "it names the section and what is true of it: {}",
+            discarded.message
+        );
+        assert!(
+            discarded.message.contains("in a **dump** can"),
+            "and points at a target where the scan does work: {}",
+            discarded.message
+        );
+        // **The remedy it must not name**, because it was measured and does not work here: an
+        // executable image path plus `.reload /f` leaves a live target's discarded pages
+        // unreadable. Naming an untried remedy is worse than naming none.
+        assert!(
+            !discarded.message.contains("point the symbol path"),
+            "never the dump procedure, which was measured not to work on a live target: {}",
+            discarded.message
+        );
+        assert!(
+            !discarded.message.contains("nothing to reload"),
+            "never the pageable advice, which is false here and tells a reader to stop: {}",
+            discarded.message
         );
     }
 

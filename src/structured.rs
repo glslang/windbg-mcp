@@ -4553,7 +4553,7 @@ mod tests {
         DriverHazards {
             module: "mountmgr".into(),
             base: addr(0xfffff803_1ab10000),
-            sink_list_version: "1".into(),
+            sink_list_version: "2".into(),
             sinks: Vec::new(),
             privileged: Vec::new(),
             privileged_count: 0,

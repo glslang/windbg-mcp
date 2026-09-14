@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-one clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -1210,3 +1210,70 @@ call to make.
 
 **Where it picks up.** `unattributed_image` and `scan_of` in `src/worker.rs`, `modules`'s own
 `refresh` in the same file, and item 54 for the bound it needs.
+
+## 73. [windbg-mcp] A driver's import directory can be in a section the loader freed
+
+**Repo:** `windbg-mcp`.
+
+`driver_hazards` cannot answer for **HEVD** on a live kernel, and the reason is structural rather
+than incidental. Its import directory is at RVA `0x8a4a0`, inside `INIT`, whose characteristics
+carry `IMAGE_SCN_MEM_DISCARDABLE` (`0x62000020`) -- Windows frees those pages once `DriverEntry`
+returns. The bytes are not paged out; they are gone. `mountmgr` keeps its directory in `.idata` and
+is unaffected, which is why every measurement before HEVD was clean.
+
+The tool now says so precisely, and says it having been **measured**: an executable image path plus
+`.reload /f` leaves `dd HEVD+0x8a4a0 L4` reading `????????` on a live target, because the engine
+substitutes an image file's bytes where a *capture* has none and a live target's freed pages are
+mapped-and-invalid instead. The same driver in a **dump** scans fine, where the file does supply it.
+
+What that costs is not small: HEVD imports **six** names on this tool's own sink list --
+`ExAllocatePoolWithTag`, `IoCreateSymbolicLink`, `ProbeForRead`, `ProbeForWrite`, `ZwCreateFile`,
+`ZwWriteFile` -- and Driver Buddy Revolutions, reading the same bytes from the file, reports 20
+`ProbeForRead` and 4 `ProbeForWrite` call sites. The canonical vulnerable driver is the one this
+cannot answer about.
+
+- **Why deferred:** the fix is for the tool to read the image **file** itself rather than asking the
+  engine for bytes nobody has, and that needs a file the *host* can open. The module row carries
+  `\??\C:\HEVD\bin\HEVD.sys`, which is a path on the **target**, and a kernel debugger has no
+  file transport. So this is a new input (an image path argument, or a symbol-store lookup by the
+  module's timestamp and `SizeOfImage`) rather than a change to the parse -- `src/pe.rs` already
+  takes a `read(addr, len)` closure and would need nothing.
+- **What would close it:** `driver_hazards` accepting an image file to read the PE structures from
+  when the target's copy will not answer, with the result saying which source each half came from.
+  The code scan still wants target memory -- relocations and the IAT are applied there and a file's
+  are not -- so this is the *headers and imports* half only, which is exactly the half that fails.
+- **How it was found:** running Driver Buddy Revolutions and Ghidra over the same image as an
+  independent oracle (`tools/ghidra_oracle/`), then tracing the failing read to a section and
+  reading its characteristics (2026-09-14).
+
+**Where it picks up.** `hazards_at` in `src/worker.rs`, `pe_failure` beside it for the message this
+already produces, and `pe::Section::discardable`.
+
+## 74. [windbg-mcp] The driver tools report no pool tags
+
+**Repo:** `windbg-mcp`.
+
+Driver Buddy Revolutions recovers a driver's own pool tags and the functions that pass them --
+`MntA` in forty-four functions and `MntB` in one, for `mountmgr` -- and none of the four driver
+tools reports them at all. It is the one section of the program these were ported from that has no
+counterpart here.
+
+The repo is not without the capability: `pool_find_tag` walks a target's pool for a tag somebody
+already knows. What is missing is the other direction -- which tags *this driver* uses, read from
+its own code, which is what makes the walk worth starting.
+
+- **Why deferred:** it is a genuine addition rather than a correction, and the recovery is a
+  heuristic with a false-positive rate somebody has to choose: a four-byte printable immediate
+  passed to an allocator is a tag, and a four-byte printable immediate is also a magic number, a
+  FourCC and a small string. Driver Buddy's own HEVD run shows the cost of getting that wrong in
+  the neighbouring IOCTL pass, where it reported `0xbad0b0b0` and `0x2ddfa232` as control codes.
+- **What would close it:** tags read from the **call sites of the allocators already on the sink
+  list** rather than from a scan of every immediate -- `ExAllocatePool2`, `ExAllocatePoolWithTag`
+  and their family take the tag as an argument, so the evidence is the call rather than the
+  constant, and a tag recovered that way says which allocation it belongs to. Reported beside
+  `sinks[]`, and joined to `pool_find_tag` by a `TOOL_NOTES` cross-reference.
+- **How it was found:** comparing all four tools against Driver Buddy Revolutions over `mountmgr`
+  and HEVD (2026-09-14).
+
+**Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
+these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
