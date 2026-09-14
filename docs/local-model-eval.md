@@ -1196,7 +1196,8 @@ moves did not". It does not support a rate, and the clustering says why — thre
 nemotron and two are one task of gemma's on two surfaces, so the independent units are nearer four
 than seven. **One draw per cell, and the same rule as every other run on this page: this is a
 direction, not a magnitude.** The experiment that would give it a magnitude is the `min` cells at
-five draws in both arms, which is a four-hour run nobody has done yet.
+five draws in both arms — which had not been run when the paragraph above was written, and was
+run straight afterwards. It is the section below, and it takes part of this one back.
 
 The floor row is also not pure noise — it spans the fence change, since no two think-off runs
 on identical harnesses exist. It is an upper bound on how still this bench sits, which is the
@@ -1276,15 +1277,24 @@ rather than 0-then-1. The direction survives and the individual flips mostly do 
 the caveat was for — and is the fourth time this page has had to take back the correlation it liked
 best. The difference this time is that the retraction came from the bench rather than from review.
 
-### One wart in the comparison, said rather than hidden
+### A wart in the comparison, and then no wart
 
-`--compare` reports `moved: harness, reasoning, weights` between the arms, and two of those three
-are an artefact of composition rather than a change. Arm B has no Claude rows — their reasoning is
-the client's to decide and this bench does not own that knob — so `harness` and the `opus`/`sonnet`
-weight entries are *absent* from arm B rather than different in it. The four local models carry
-byte-identical digests in both arms. The identity block shows this plainly enough to check, and the
-flag is conservative in the right direction, but a reader skimming the one-line summary would
-reasonably conclude the weights had moved. They did not.
+`--compare` first reported `moved: harness, reasoning, weights` between the arms, and two of those
+three were composition rather than change: arm B has no Claude rows — their reasoning is the
+client's to decide and this bench does not own that knob — so `harness` and the `opus`/`sonnet`
+weight entries were *absent* from arm B rather than different in it, while the four local models
+carried byte-identical digests in both arms. The first instinct was to document it, on the grounds
+that the flag erred toward naming too much. Review disagreed and was right: *the weights changed*
+is the one line a reader takes at face value, and it was false.
+
+**Absence is composition, so the comparison now asks only where both runs have an answer** — the
+weights of the models they share, and the harness only when both recorded one. A model dropped
+between two runs still shows, as `(old)` rows in the table below, which is where a composition
+difference belongs. The two arms now report `moved: reasoning`, which is the whole of what did.
+
+Mutation-verified in both directions, because a flag that stops crying wolf can as easily have
+stopped barking: a shared model given a different digest between the arms is still named, and so is
+a harness version bumped on a pair of runs that both carry Claude rows.
 
 ## What this does not cover
 
