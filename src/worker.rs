@@ -7030,12 +7030,13 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         }
     } else {
         match &module {
-            // The inventory is only asked for on the path that is already failing, and an
-            // enumeration that fails answers `None` rather than zero -- see [`inventory_size`].
+            // Passed as a **thunk**, so the enumeration happens only in the arm that reads
+            // it -- see [`unattributed_image`]. And an enumeration that fails answers `None`
+            // rather than zero, which is [`inventory_size`].
             None => unattributed_image(
                 attribution_halted.get(),
                 image_at.attribution_failed,
-                inventory_size(e.modules()),
+                || inventory_size(e.modules()),
                 fields.image_base,
             ),
             Some(module) => match scan_of(e, module, fields.image_base, deadline) {
@@ -7396,10 +7397,21 @@ fn inventory_size<T, E>(listed: Result<Vec<T>, E>) -> Option<usize> {
 /// same one `object_failure` makes by whose fault it is. Reported as `unavailable` it blames the
 /// target for this call's clock and sends a reader to `modules` to look for an image that is
 /// loaded and was simply never asked about.
+/// `inventory` is a **thunk**, and that is the second thing this signature has had to take away
+/// from its caller. Rust evaluates arguments eagerly, so a value here meant the debugger's module
+/// list was enumerated before this function could decide that two of its three arms have no use
+/// for it -- a serialized engine call, on a path that is already reporting a failure, spending a
+/// survey's shared deadline on a number that is then dropped.
+///
+/// Guarding it at the call site would fix that instance and keep the shape. The shape is the
+/// problem: the first finding here was `unwrap_or_default()` flattening a failed enumeration into
+/// a count of zero -- the caller deciding what a failure *means* -- and this one is the caller
+/// deciding *when* the value is wanted. Both are this function's business. A thunk leaves nothing
+/// at the call site to get wrong, and no later edit to these arms can reintroduce an eager call.
 fn unattributed_image(
     halted: Option<structured::WalkHalt>,
     lookup_failed: bool,
-    inventory: Option<usize>,
+    inventory: impl FnOnce() -> Option<usize>,
     base: u64,
 ) -> structured::HazardsSection {
     match halted {
@@ -7440,7 +7452,7 @@ fn unattributed_image(
         // to confirm a conclusion that is wrong.
         None => structured::HazardsSection {
             status: structured::SectionStatus::Unavailable,
-            note: Some(match inventory {
+            note: Some(match inventory() {
                 // **A list that would not read is not a list of nothing.** `unwrap_or_default` put
                 // a failed enumeration here as `0`, which is the arm below, so a debugger call
                 // that did not answer came back as "this looks like a fresh attach, refresh it" --
@@ -8668,8 +8680,21 @@ mod tests {
     fn an_image_this_call_stopped_asking_about_is_not_one_in_no_module() {
         let base = 0xffff_f805_5ebf_0000;
 
+        // **The inventory is a thunk, and every case here counts whether it was called.** Two of
+        // the three arms have no use for the number, and an argument is evaluated before the
+        // function can say so -- which on this path, already reporting a failure, is a serialized
+        // engine call spending a survey's shared deadline on a value that is then dropped. Counted
+        // rather than reasoned about, because `|| Some(156)` compiles and asserts nothing.
+        // Passed by copy at each call: a closure capturing only a shared reference is `Copy`,
+        // and `Cell::set` wants no more than that.
+        let asked = std::cell::Cell::new(0usize);
+        let inventory = || {
+            asked.set(asked.get() + 1);
+            Some(156)
+        };
+
         let never_asked =
-            super::unattributed_image(Some(structured::WalkHalt::Deadline), false, Some(156), base);
+            super::unattributed_image(Some(structured::WalkHalt::Deadline), false, inventory, base);
         assert_eq!(never_asked.status, structured::SectionStatus::Partial);
         let note = never_asked.note.unwrap_or_default();
         assert!(note.contains("ran out of time"), "{note}");
@@ -8677,11 +8702,17 @@ mod tests {
             !note.contains("is in no module"),
             "it must not report this call's clock as a fact about the target: {note}"
         );
+        assert_eq!(
+            asked.get(),
+            0,
+            "a survey whose clock already stopped must not spend what is left of it enumerating \
+             modules for an answer this arm does not read"
+        );
 
         let interrupted = super::unattributed_image(
             Some(structured::WalkHalt::Interrupted),
             false,
-            Some(156),
+            inventory,
             base,
         )
         .note;
@@ -8689,26 +8720,11 @@ mod tests {
             interrupted.unwrap_or_default().contains("was interrupted"),
             "a break and a deadline have different remedies and read differently"
         );
+        assert_eq!(asked.get(), 0, "nor after an interrupt somebody asked for");
 
-        // And the genuine case keeps its own answer.
-        let no_such_module = super::unattributed_image(None, false, Some(156), base);
-        assert_eq!(
-            no_such_module.status,
-            structured::SectionStatus::Unavailable
-        );
-        assert!(
-            no_such_module
-                .note
-                .unwrap_or_default()
-                .contains("is in no module")
-        );
-
-        // **A third answer, for a lookup that errored rather than answering.** `Attributor::locate`
-        // sets `attribution_failed` when `module_at` itself fails and leaves the halt cell alone,
-        // so without this the case fell into the branch above and reported the target as having no
-        // such module -- blaming it for a debugger call that did not answer. Three ways to have no
-        // module, three answers, and each sends a reader somewhere different.
-        let lookup_failed = super::unattributed_image(None, true, Some(156), base);
+        // **Nor when the lookup itself errored**, which is the case the review round was about:
+        // this arm discards the inventory too, and the call site could not know that.
+        let lookup_failed = super::unattributed_image(None, true, inventory, base);
         assert_eq!(
             lookup_failed.status,
             structured::SectionStatus::Error,
@@ -8719,6 +8735,30 @@ mod tests {
         assert!(
             !note.contains("is in no module"),
             "and must not say the address is in none, which is the claim it cannot make: {note}"
+        );
+        assert_eq!(
+            asked.get(),
+            0,
+            "a module lookup that failed is not a reason to enumerate every module"
+        );
+
+        // And the genuine case keeps its own answer -- and is the one arm that does ask.
+        let no_such_module = super::unattributed_image(None, false, inventory, base);
+        assert_eq!(
+            no_such_module.status,
+            structured::SectionStatus::Unavailable
+        );
+        assert!(
+            no_such_module
+                .note
+                .unwrap_or_default()
+                .contains("is in no module")
+        );
+        assert_eq!(
+            asked.get(),
+            1,
+            "the arm that diagnoses from the inventory's size is the one that reads it, and it \
+             reads it exactly once"
         );
     }
 
@@ -8883,7 +8923,7 @@ mod tests {
     fn an_empty_module_inventory_is_named_as_the_fresh_attach_it_is() {
         let base = 0xffff_f802_3724_0000;
 
-        let fresh = super::unattributed_image(None, false, Some(1), base);
+        let fresh = super::unattributed_image(None, false, || Some(1), base);
         assert_eq!(fresh.status, structured::SectionStatus::Unavailable);
         let note = fresh.note.unwrap_or_default();
         assert!(
@@ -8902,7 +8942,7 @@ mod tests {
         // A populated inventory is a different answer: the module really is not there. It still
         // mentions `refresh`, because that is cheap and the conclusion is worth one more check --
         // but it does not claim the inventory is empty when it is not.
-        let populated = super::unattributed_image(None, false, Some(156), base);
+        let populated = super::unattributed_image(None, false, || Some(156), base);
         let note = populated.note.unwrap_or_default();
         assert!(note.contains("156"), "{note}");
         assert!(
@@ -8915,7 +8955,7 @@ mod tests {
         // so a debugger call that did not answer came back as evidence about the target, with a
         // remedy attached. That is the same misdiagnosis `lookup_failed` exists to prevent, and it
         // was reintroduced one line away from the fix for it.
-        let unreadable = super::unattributed_image(None, false, None, base);
+        let unreadable = super::unattributed_image(None, false, || None, base);
         assert_eq!(
             unreadable.status,
             structured::SectionStatus::Error,
