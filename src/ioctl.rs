@@ -195,6 +195,15 @@ pub(crate) struct Map {
     /// what stops a short case list reading as a complete one. Up to [`MAX_UNRESOLVED`], past
     /// which [`Map::cap_hit`] carries the same warning the list does.
     pub(crate) unresolved: Vec<u64>,
+    /// Where the control code stopped being followable, by address.
+    ///
+    /// An instruction that carried it into something this pass does not model, with a branch
+    /// reading the flags it wrote -- so the test after it is about the code and could not be
+    /// attributed to one. **The other way a case list is a lower bound**, and until HEVD it was
+    /// the invisible one: that driver steps its chain with `sub ecx,eax`, so the walk followed the
+    /// first code and silently lost twenty-four, reporting four with `unresolved` empty and
+    /// nothing else set. Bounded like [`Self::unresolved`], and by the same cap.
+    pub(crate) untracked: Vec<u64>,
     /// Why the walk stopped early, when it did.
     pub(crate) halted: Option<Halt>,
     /// True when a bound above ended something early.
@@ -528,6 +537,7 @@ fn map_within(
     let mut unproved = 0usize;
     let mut tables: Vec<Table> = Vec::new();
     let mut unresolved: Vec<u64> = Vec::new();
+    let mut untracked: Vec<u64> = Vec::new();
     let mut traced = false;
     let mut blind = 0usize;
     let mut examined = 0usize;
@@ -568,6 +578,7 @@ fn map_within(
                 &mut cap_hit,
                 &mut tables,
                 &mut unresolved,
+                &mut untracked,
                 &mut traced,
                 &mut blind,
                 &mut examined,
@@ -592,6 +603,7 @@ fn map_within(
             &mut cap_hit,
             &mut tables,
             &mut unresolved,
+            &mut untracked,
             &mut traced,
             &mut blind,
             &mut examined,
@@ -728,6 +740,7 @@ fn map_within(
         case_count,
         tables,
         unresolved,
+        untracked,
         halted,
         cap_hit,
         unsettled,
@@ -761,6 +774,9 @@ struct Run {
     capped: bool,
     /// Whether a control code was traced from the IRP anywhere in this block.
     traced: bool,
+    /// Instructions that carried the control code into something this pass cannot model, with a
+    /// branch reading their flags. See [`lost_the_code`].
+    untracked: Vec<u64>,
     blind: usize,
     examined: usize,
 }
@@ -775,6 +791,7 @@ fn record(
     cap_hit: &mut bool,
     tables: &mut Vec<Table>,
     unresolved: &mut Vec<u64>,
+    untracked: &mut Vec<u64>,
     traced: &mut bool,
     blind: &mut usize,
     examined: &mut usize,
@@ -818,6 +835,16 @@ fn record(
             *cap_hit = true;
         }
     }
+    // Bounded by the same cap and for the same reason: a routine that loses the code in a
+    // thousand places is one nobody reads a list of, and `cap_hit` carries the warning the list
+    // would have.
+    for at in run.untracked {
+        if untracked.len() < MAX_UNRESOLVED {
+            untracked.push(at);
+        } else {
+            *cap_hit = true;
+        }
+    }
     if let Some(at) = run.unresolved {
         if unresolved.len() < MAX_UNRESOLVED {
             unresolved.push(at);
@@ -857,6 +884,7 @@ fn simulate(
     // edge that arrived, and what leaves is decided per outgoing edge below.
     let mut compared: Option<Compared> = facts.pending.take();
     let mut traced = false;
+    let mut untracked = Vec::new();
     let mut blind = 0usize;
     let mut cases = Vec::new();
     let mut table = None;
@@ -872,7 +900,7 @@ fn simulate(
         if position == terminator {
             break;
         }
-        let next = update(&mut facts, instruction, layout, &mut traced);
+        let next = update(&mut facts, instruction, layout, &mut traced, &mut untracked);
         // **A compare survives anything that does not write the flags.** A compiler puts the
         // setup for the case block between the compare and its branch -- `cmp r13d,N` /
         // `mov rbx,rcx` / `je handler` -- and dropping the pending compare there loses the case
@@ -909,6 +937,14 @@ fn simulate(
                                 cases.push((code, next.address, was.at, was.proved));
                             }
                         }
+                        // **A test on the control code that could not be attributed to one.**
+                        // `index` says the register held the code; `code` is `None` because the
+                        // value it was compared against was not resolvable. That is a case this
+                        // walk cannot name, and saying nothing about it is what let a map of four
+                        // codes out of twenty-eight report itself complete.
+                        (Condition::Equal | Condition::NotEqual, None) if was.index.is_some() => {
+                            untracked.push(was.at);
+                        }
                         _ => {}
                     }
                 }
@@ -936,7 +972,7 @@ fn simulate(
                 // A call at the end of a block is ordinary: the block continues after it, and the
                 // callee is not this function's edge. Its effect on the registers is the one thing
                 // that matters here.
-                compared = update(&mut facts, last, layout, &mut traced);
+                compared = update(&mut facts, last, layout, &mut traced, &mut untracked);
             }
         }
     }
@@ -1035,9 +1071,23 @@ fn simulate(
         unresolved,
         capped,
         traced,
+        untracked,
         blind,
         examined: instructions.len(),
     }
+}
+
+/// Whether this instruction took the control code somewhere this pass cannot follow it.
+///
+/// **Flag-writing only, which is what keeps it from being noise.** The question is not "was a
+/// value forgotten" -- copies lose values all the time and nothing branches on them -- but "is the
+/// branch about to read these flags a test on the code that nobody can attribute". That is the
+/// shape a stepped chain has, and it was the shape that reported 4 of HEVD's 28 codes as a
+/// complete map.
+fn lost_the_code(instruction: &Instruction, carried: bool, facts: &Facts, register: &str) -> bool {
+    carried
+        && instruction.writes_flags
+        && !matches!(facts.registers.get(register), Some(Value::Code { .. }))
 }
 
 /// Records a case, keeping the count exact once the list stops growing.
@@ -1102,6 +1152,29 @@ fn immediate_of(operand: &Operand) -> Option<u64> {
     }
 }
 
+/// The constant an operand stands for: an immediate, or a register this pass watched a literal
+/// move into.
+///
+/// **The second is what a stepped chain needs.** HEVD's dispatch is `sub ecx,222003h` / `je` /
+/// `sub ecx,eax` / `je` / ... twenty-four more times, with `eax` holding 4 -- so a pass reading
+/// only immediates follows the first step and loses every one after it. Measured on the live
+/// driver: 4 codes of the 28 its own header defines.
+///
+/// The width guard is the one the copy rule already applies: a literal in `al` says nothing about
+/// what `sub ecx,eax` did to a `ULONG`.
+fn scalar_of(facts: &Facts, operand: Option<&Operand>) -> Option<u64> {
+    match operand? {
+        Operand::Immediate(value) => Some(*value),
+        Operand::Register(register) if register.width >= FIELD_WIDTH => {
+            match facts.registers.get(&register.full) {
+                Some(Value::Literal(value)) => Some(u64::from(*value)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
 /// The state one compare leaves for the branch that reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Compared {
@@ -1141,6 +1214,7 @@ fn update(
     instruction: &Instruction,
     layout: Layout,
     traced: &mut bool,
+    untracked: &mut Vec<u64>,
 ) -> Option<Compared> {
     // Where the status stands after this instruction, asked **before** it is applied because a
     // store reads its base as it stands. A compare writes neither a register nor a status, so this
@@ -1229,6 +1303,8 @@ fn update(
         return None;
     }
     let held = facts.registers.get(&destination).cloned();
+    // Kept because the arms below consume `held`, and what this answers is asked after them.
+    let carried_the_code = matches!(held, Some(Value::Code { .. }));
     // The bound goes with the register it was about, unless this is the load that carries it.
     if facts.bound.as_ref().is_some_and(|bound| {
         bound.register == destination && !keeps_a_bound(instruction, &bound.register)
@@ -1277,7 +1353,7 @@ fn update(
         }
         // `sub eax, 6D0034h` rebases the code: the register now holds `code - (offset + K)`, and
         // the `je` that follows is a case for that value rather than for zero.
-        Effect::Subtract => match (held, operands.get(1).and_then(immediate_of)) {
+        Effect::Subtract => match (held, scalar_of(facts, operands.get(1))) {
             (
                 Some(Value::Code {
                     offset,
@@ -1309,7 +1385,7 @@ fn update(
             }
             _ => set(facts, &destination, None),
         },
-        Effect::Add => match (held, operands.get(1).and_then(immediate_of)) {
+        Effect::Add => match (held, scalar_of(facts, operands.get(1))) {
             (
                 Some(Value::Code {
                     offset,
@@ -1350,6 +1426,13 @@ fn update(
             _ => set(facts, &destination, None),
         },
         _ => set(facts, &destination, None),
+    }
+    // **Asked after every arm, because every arm can be the one that drops it.** A `sub` against a
+    // register nobody watched, a multiply, an `and` -- whatever it was, the branch about to read
+    // these flags is a test on the control code that this cannot attribute, and a map that says
+    // nothing about it reads as the whole set.
+    if lost_the_code(instruction, carried_the_code, facts, &destination) {
+        untracked.push(instruction.address);
     }
     None
 }
@@ -1495,7 +1578,9 @@ fn compare(
     traced: &mut bool,
 ) -> Option<Compared> {
     let left = instruction.operands.first()?;
-    let bound = instruction.operands.get(1).and_then(immediate_of);
+    // The constant, whether it is written here or carried in a register: a stepped chain
+    // ends each group with `cmp ecx,eax`, and reading only immediates loses that code.
+    let bound = scalar_of(facts, instruction.operands.get(1));
 
     // `cmp dword ptr [rdx+18h], 222003h` -- the code compared where it lives, with no register in
     // between, which is what a compiler emits for a small switch.
@@ -1630,7 +1715,15 @@ fn follow_table(
         let mut replay = arrived.clone();
         let mut traced = false;
         for instruction in instructions.iter().take(position) {
-            update(&mut replay, instruction, layout, &mut traced);
+            // A replay to recover a table's base, not a walk that reports: what it loses about the
+            // control code is recorded by the pass that walks these same instructions.
+            update(
+                &mut replay,
+                instruction,
+                layout,
+                &mut traced,
+                &mut Vec::new(),
+            );
         }
         replay
     };
@@ -1914,7 +2007,13 @@ fn error_status(
     let mut facts = arrived.clone();
     let mut traced = false;
     for instruction in instructions {
-        update(&mut facts, instruction, layout, &mut traced);
+        update(
+            &mut facts,
+            instruction,
+            layout,
+            &mut traced,
+            &mut Vec::new(),
+        );
         // **A tail jump out of the routine hands the request on exactly as a call does**, and what
         // the routine returns is then the callee's. A dispatcher that loads a default error before
         // its compare chain and reaches a case through `jmp handler` accepts that code, and
@@ -2110,7 +2209,13 @@ fn failure_block(
         // What the block has established **so far**, which is what says whether the call it is
         // about to make is a completion on the way out or a block doing something else. Kept by
         // `update` with everything else, so what arrived on the edge is already in it.
-        update(&mut facts, instruction, layout, &mut traced);
+        update(
+            &mut facts,
+            instruction,
+            layout,
+            &mut traced,
+            &mut Vec::new(),
+        );
         let status = facts.status;
         match instruction.flow {
             Flow::Return => {
@@ -2315,7 +2420,13 @@ fn sizes_in(
         // Everything else updates the facts, which is what retires a base the block overwrites.
         // The pending compare survives anything that writes no flags, for the reason the block
         // walk's does -- and not a call, for the reason it does not there either.
-        update(&mut facts, instruction, layout, &mut traced);
+        update(
+            &mut facts,
+            instruction,
+            layout,
+            &mut traced,
+            &mut Vec::new(),
+        );
         if instruction.writes_flags || matches!(instruction.flow, Flow::Call(_)) {
             pending = None;
         }
@@ -2416,6 +2527,7 @@ pub(crate) fn structured_report(
             })
             .collect(),
         unresolved: found.unresolved.iter().map(|at| locate(*at)).collect(),
+        untracked: found.untracked.iter().map(|at| locate(*at)).collect(),
         stopped: found.halted.map(|halt| match halt {
             Halt::Deadline => crate::structured::WalkHalt::Deadline,
             Halt::Interrupted => crate::structured::WalkHalt::Interrupted,
@@ -2529,6 +2641,20 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
              and is unproved. This is a routine no answer was settled about rather than one with \
              no control codes\n",
         );
+    }
+    if !report.untracked.is_empty() {
+        out.push_str(&format!(
+            "  [!] the control code stopped being followable at {} place(s), so a compare \
+             after each was a test on it that could not be attributed -- the case list is a \
+             lower bound rather than the set: {}\n",
+            report.untracked.len(),
+            report
+                .untracked
+                .iter()
+                .map(where_)
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
     }
     if report.blind > 0 {
         out.push_str(&format!(
@@ -3122,6 +3248,198 @@ mod tests {
             found.cases.is_empty(),
             "a compare one path into the block left is not a compare the block can read: {:?}",
             found.cases
+        );
+    }
+
+    /// **A chain that steps by a register is still a chain.**
+    ///
+    /// HEVD's dispatch is `sub ecx,222003h` / `je` / `sub ecx,eax` / `je` / ... with `eax` holding
+    /// 4, and each group ends `cmp ecx,eax` / `jne default`. Reading only immediates followed the
+    /// first code and lost the rest: **4 of the 28** its own header defines, measured on the live
+    /// driver.
+    #[test]
+    fn a_chain_that_steps_by_a_register_is_followed_like_one_that_steps_by_an_immediate() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            // The step, put in a register once and used throughout -- which is why a pass that
+            // reads only immediates sees one `sub` it understands and two it does not.
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), imm(4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xd,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "sub",
+                vec![reg("ecx"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x16, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(
+                DISPATCH + 0x1c,
+                "sub",
+                vec![reg("ecx"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1e, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(
+                DISPATCH + 0x24,
+                "sub",
+                vec![reg("ecx"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x26, "je", Vec::new(), Flow::Branch(Some(0xa00))),
+            // The group's last code is a compare rather than a subtract, against the same
+            // register -- which is the other half of the same shape.
+            insn(
+                DISPATCH + 0x2c,
+                "cmp",
+                vec![reg("ecx"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2e, "je", Vec::new(), Flow::Branch(Some(0xa80))),
+            insn(DISPATCH + 0x34, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x222003, 0x900),
+                (0x222007, 0x980),
+                (0x22200b, 0xa00),
+                (0x22200f, 0xa80),
+            ],
+            "each step is four, whether four is written down or carried in `eax`: {:?}",
+            found.cases
+        );
+        assert!(
+            found.untracked.is_empty(),
+            "and nothing was lost, so nothing says it was: {:?}",
+            found.untracked
+        );
+    }
+
+    /// **A literal is only the step if the operand carries all of it.**
+    ///
+    /// `mov eax,104h` / `sub ecx,al` subtracts **four**, not 0x104: the byte register is the low
+    /// eighth of the value this pass watched arrive. Reading the register's full contents would
+    /// rebase the chain by 0x104 and report a case for a code nothing compared -- the same rule
+    /// the copy path already applies, which a fixture stepping by `eax` cannot see because `eax`
+    /// is the whole field.
+    #[test]
+    fn a_narrow_operand_does_not_carry_the_whole_literal() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), imm(0x104)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xd,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "sub",
+                vec![reg("ecx"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x16, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(
+                DISPATCH + 0x1c,
+                "sub",
+                vec![reg("ecx"), reg("al")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1e, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(
+            found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
+            vec![0x222003],
+            "the first step is written down; the second is a byte of a register and is not \
+             followed: {:?}",
+            found.cases
+        );
+        // **And the one it did not follow says so**, which is the other half: a chain abandoned
+        // here is a case list that is a lower bound.
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x1c],
+            "the instruction that took the code somewhere unfollowable is named"
+        );
+    }
+
+    /// **A test on the control code this pass cannot attribute is in the answer.**
+    ///
+    /// The half that makes a short list readable. Until HEVD, `unresolved` fired only for an
+    /// indirect *jump*, so a chain the walk could not follow produced neither cases nor any sign
+    /// of them: the live driver reported 4 codes of 28 with `unresolved` empty, nothing stopped,
+    /// nothing capped and `code_proved: true`, which `driver_surface` then called a complete
+    /// section. Nothing about four codes said they were four of twenty-eight.
+    ///
+    /// Constructed, because after the fix both measured drivers report this empty -- correctly,
+    /// which is exactly why only a fixture can show it fires.
+    #[test]
+    fn a_test_on_the_code_that_cannot_be_attributed_is_reported() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            // `eax` holds nothing this pass watched arrive, so the compare is about the control
+            // code against a value it cannot name.
+            insn(
+                DISPATCH + 0xb,
+                "cmp",
+                vec![reg("ecx"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xd, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x13, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert!(
+            found.cases.is_empty(),
+            "it cannot name the code, so it invents no case: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0xb],
+            "but it says where it stopped being able to, which is what stops a short list \
+             reading as a complete one"
+        );
+        assert!(
+            found.unresolved.is_empty(),
+            "and not in `unresolved`, which is the indirect transfers: different fact, different \
+             remedy: {:?}",
+            found.unresolved
         );
     }
 

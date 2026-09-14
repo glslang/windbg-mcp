@@ -61,4 +61,36 @@ and prints a table of every code with a column per implementation. What to read:
   `< 0x6d4021` bracket the switch. It emits every comparison constant deliberately, so that what
   is excluded is a decision made here rather than one made silently in the script.
 
+## A second driver, and what it showed
+
+`mountmgr` is one compiler's output of one shape: immediate compares and two dense jump tables. Run
+the lane over **HEVD** as well -- it is a different shape, and it is the one with a published
+answer:
+
+```console
+python tools/ghidra_oracle/oracle.py --image <HEVD.sys> --dispatch <its MajorFunction[0x0e]> \
+    --device-type 0x22
+```
+
+HEVD's own header defines its codes (`IOCTL(0x800)` through `IOCTL(0x81B)`, each
+`CTL_CODE(FILE_DEVICE_UNKNOWN, Function, METHOD_NEITHER, FILE_ANY_ACCESS)`), so for once the right
+answer is known rather than agreed: **28**, `0x222003`-`0x22206F`. Measured 2026-09-14 against the
+driver running on the KDNET target, with the image and the header taken off the guest:
+
+| | codes | false positives |
+|---|---:|---|
+| source (ground truth) | 28 | -- |
+| `ioctl_map` **before** | 4 | none |
+| `ioctl_map` after | **28** | none |
+| Ghidra | 28 | 3 binary-search bounds, which this script emits by design |
+| Driver Buddy Revolutions | 24 | 2 (`0xbad0b0b0`, `0x2ddfa232` -- magic constants) |
+
+The four that `ioctl_map` did find were the binary search's pivots; the other twenty-four are a
+chain stepped by a register, which the walk read only as immediates. It also reported the map
+**complete**, which was the more serious half and is what `untracked[]` now prevents.
+
+`driver_hazards` cannot answer for HEVD on a live kernel: its dispatch is in `PAGE`, and the hazard
+scan's header reads fail against sections that are not resident. That is the target's state rather
+than a defect, and the section says so.
+
 [dbr]: https://github.com/jsacco/driverbuddyrevolutions

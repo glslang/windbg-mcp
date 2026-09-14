@@ -2581,6 +2581,21 @@ pub struct IoctlMap {
     /// driver accepts rather than the set.
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<CodeLocation>,
+    /// Where the control code stopped being followable.
+    ///
+    /// An instruction carried it into something the walk does not model -- arithmetic
+    /// against a register nobody watched, a multiply -- and a branch read the flags it
+    /// wrote, so the test after it is about the code and could not be attributed to one.
+    ///
+    /// **The second way this list is a lower bound**, and the one that used to be invisible.
+    /// A driver stepping its chain with `sub ecx,eax` had the walk follow the first code and
+    /// lose the rest: HEVD reported 4 of the 28 its own header defines, with
+    /// [`Self::unresolved`] empty and nothing else set, which reads as the whole set.
+    ///
+    /// Separate from `unresolved` because the remedies are: that one is a transfer whose
+    /// destination is not a constant, this one is arithmetic this pass cannot represent.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub untracked: Vec<CodeLocation>,
     /// Why the walk stopped early, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<WalkHalt>,
@@ -2647,17 +2662,22 @@ impl IoctlMap {
             tables: _,
             unproved: _,
             unresolved,
+            untracked,
             stopped,
             cap_hit,
             unsettled,
             blind,
         } = self;
-        let short =
-            stopped.is_some() || *cap_hit || *unsettled || *blind > 0 || !unresolved.is_empty();
+        let short = stopped.is_some()
+            || *cap_hit
+            || *unsettled
+            || *blind > 0
+            || !unresolved.is_empty()
+            || !untracked.is_empty();
         short.then_some(
             "the map did not run to completion, so its cases are a lower bound rather than the \
              set this routine accepts. Its own `stopped`, `cap_hit`, `unsettled`, `blind` and \
-             `unresolved` fields say which, and what each one costs the answer.",
+             `unresolved` and `untracked` fields say which, and what each one costs the answer.",
         )
     }
 }
@@ -4658,6 +4678,7 @@ mod tests {
             case_count: 0,
             tables: Vec::new(),
             unresolved: Vec::new(),
+            untracked: Vec::new(),
             stopped: None,
             unproved: 0,
             cap_hit: false,
@@ -4705,6 +4726,19 @@ mod tests {
                 "one with instructions that would not decode, each a place a compare may be",
                 IoctlMap {
                     blind: 3,
+                    ..whole_map()
+                },
+            ),
+            (
+                "one where the control code stopped being followable, so a compare after it was \
+                 a test on the code that could not be attributed",
+                IoctlMap {
+                    untracked: vec![CodeLocation {
+                        address: addr(0xfffff803_1ab123a0),
+                        module: Some("mountmgr".into()),
+                        rva: Some("0x23a0".into()),
+                        attribution_failed: false,
+                    }],
                     ..whole_map()
                 },
             ),
