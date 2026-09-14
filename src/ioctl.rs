@@ -4558,6 +4558,80 @@ mod tests {
         );
     }
 
+    /// **A register an instruction reads without naming is still a register it reads.**
+    ///
+    /// The operand list names the reads an instruction was *written* with, and that is not every
+    /// read: a memory operand reads the registers that form its address, `mul` reads the
+    /// accumulator, `cmpxchg` reads `rax`. Asked of the operand list, `test dword ptr [rcx+8],3`
+    /// with the code in `rcx` reads nothing at all -- `register_full` answers `None` for a memory
+    /// operand, the probe beside it asks about the *slot* rather than the base, and `test` writes
+    /// no register so nothing had stopped carrying the code either. Three clauses, and a branch on
+    /// flags this pass cannot attribute went unrecorded.
+    ///
+    /// **Measured rather than assumed, and the measurement moved the argument.** Over every
+    /// flag-writing instruction iced decodes in 64-bit mode, the registers `reads` names that
+    /// neither the operand list nor `writes` do are -- for every mnemonic a compiler emits -- the
+    /// registers that form a memory address. `mul`, `cmpxchg` and the string instructions read
+    /// registers they do not name, but they **write** them too, so the loss was already caught by
+    /// the carried-and-gone half. So this is the shape that discriminates, and it is the one
+    /// asserted.
+    ///
+    /// That it is conservative is deliberate: the flags here are computed from a *load* at an
+    /// address derived from the code rather than from the code. But a pass that believes a control
+    /// code is being dereferenced has lost the value, whichever of the two is wrong -- and the
+    /// direction to be wrong in is the one that stops claiming.
+    #[test]
+    fn a_register_read_only_to_address_memory_is_still_a_read_of_the_code() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "test",
+                vec![mem("rcx", 8), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        // The premise, asserted rather than described: the decoder says this instruction reads the
+        // register the code is in, and its operand list names no register at all. A fixture that
+        // stopped being true of one of those would leave the assertion below passing for a reason
+        // that is not this rule.
+        let flag_write = &block[3];
+        assert_eq!(
+            flag_write
+                .reads
+                .iter()
+                .map(|register| register.full.as_str())
+                .collect::<Vec<_>>(),
+            vec!["rcx"],
+            "{flag_write:?}"
+        );
+        assert!(
+            flag_write
+                .operands
+                .iter()
+                .all(|operand| !matches!(operand, dbgscope::dbgeng::Operand::Register(_))),
+            "the operand list names no register, which is the whole point: {flag_write:?}"
+        );
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0xb],
+            "the branch reads flags computed through the code, and the map says so rather than \
+             answering with an empty case list: {:?}",
+            found.cases
+        );
+    }
+
     /// **A `test` of the control code is a branch about it, and cannot be named.**
     ///
     /// `test ecx,3` / `je` takes a path whose codes this walk cannot enumerate -- and `update`
