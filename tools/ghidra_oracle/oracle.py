@@ -165,6 +165,16 @@ def ask_driver_buddy(image: pathlib.Path, work: pathlib.Path) -> str:
         capture_output=True,
         text=True,
     )
+    # **A crash is not an empty code set.** Read regardless of the exit code, a PyGhidra that died
+    # -- a missing companion GDT, an analysis fault -- comes back as "Driver Buddy found nothing",
+    # which is a comparison against an oracle that never ran and looks exactly like a real result.
+    if done.returncode != 0:
+        tail = (done.stdout + done.stderr).strip().splitlines()[-8:]
+        raise SystemExit(
+            "Driver Buddy Revolutions exited "
+            + f"{done.returncode}; its answer is not usable:\n  "
+            + "\n  ".join(tail)
+        )
     return done.stdout + done.stderr
 
 
@@ -175,22 +185,37 @@ def norm(code) -> str:
     return f"0x{int(str(code), 16):08x}"
 
 
-def ghidra_codes(report: dict) -> tuple[set, set]:
-    """Codes Ghidra reaches, split from the raw compare constants it also emits.
+def ghidra_equalities(report: dict) -> set:
+    """The constants Ghidra compares the control code against **for equality**.
 
-    A dense switch covers its whole index range and sends every slot it has no case for to one
-    place, so the default is the block the most slots reach and the rest are codes.
+    Its `compare_values` holds every constant in any comparison, relational bounds included: a
+    dense switch is bracketed by `INT_LESS` against one past each end, so `0x6dc001` and `0x6d4021`
+    are in `mountmgr`'s list and are not codes. Promoting them made the diff report known
+    non-codes as missing from `ioctl_map` -- an oracle contradicting its own README.
     """
-    reached = set()
+    return {
+        norm(compare["value"])
+        for compare in report["compares"]
+        if compare["op"] in ("INT_EQUAL", "INT_NOTEQUAL")
+    }
+
+
+def ghidra_tables(report: dict) -> list:
+    """Each switch, as labels grouped by the block they reach.
+
+    **The default is not inferred.** Taking the most frequent destination works on `mountmgr`,
+    where 68 of 81 slots go to one place, and fails on a switch whose labels legitimately share a
+    handler or whose destinations are all distinct -- the first discards real labels, the second
+    drops one at random. Ghidra's own metadata does not expose which arm is the default, so this
+    reports the grouping and leaves the reading to whoever is looking.
+    """
+    grouped = []
     for table in report["tables"]:
-        seen = collections.Counter(pair["dest_rva"] for pair in table["pairs"])
-        if not seen:
-            continue
-        default = seen.most_common(1)[0][0]
-        reached |= {
-            norm(pair["label"]) for pair in table["pairs"] if pair["dest_rva"] != default
-        }
-    return reached, {norm(v) for v in report["compare_values"]}
+        by_dest = collections.defaultdict(list)
+        for pair in table["pairs"]:
+            by_dest[pair["dest_rva"]].append(norm(pair["label"]))
+        grouped.append((table["switch_rva"], by_dest))
+    return grouped
 
 
 def main() -> None:
@@ -223,9 +248,13 @@ def main() -> None:
 
         print("asking Ghidra ...", flush=True)
         gh = ask_ghidra(args.image, rva, work)
-        reached, compared = ghidra_codes(gh)
-        gh_codes = reached | {c for c in compared if (int(c, 16) >> 16) == device}
-        print(f"  dispatch {gh['dispatch']['rva']}, {len(gh_codes)} codes", flush=True)
+        # **Equality compares only.** A relational bound is not a code, and the switch half is
+        # reported rather than diffed, because naming a table's default needs metadata
+        # Ghidra does not give.
+        gh_codes = {c for c in ghidra_equalities(gh) if (int(c, 16) >> 16) == device}
+        tables = ghidra_tables(gh)
+        print(f"  dispatch {gh['dispatch']['rva']}, {len(gh_codes)} codes compared for equality, "
+              f"{len(tables)} switch table(s)", flush=True)
 
         print("asking Driver Buddy Revolutions ...", flush=True)
         dbr_text = ask_driver_buddy(args.image, work)
@@ -254,11 +283,40 @@ def main() -> None:
         print(f"  missing from `ioctl_map`        : {missing}")
         print(f"  `ioctl_map` has, Driver Buddy   : {sorted(tool_codes - dbr_codes)}")
         print(f"  Driver Buddy, other device type : {sorted(dbr_all - dbr_codes)}")
+
+        # **The switch half, as a subset question rather than a default-guessing one.** Every code
+        # the tool recovered from a jump table has to be a label Ghidra put on the same switch, at
+        # the same destination. That needs no opinion about which arm is the default -- which is
+        # good, because Ghidra's metadata does not say.
+        by_switch = {rva.lstrip("0").rjust(3, "0"): groups for rva, groups in tables}
+        for switch, groups in tables:
+            short = "0x" + switch[2:].lstrip("0")
+            labelled = {
+                label: dest for dest, labels in groups.items() for label in labels
+            }
+            from_table = [
+                case
+                for case in tool["cases"]
+                if case.get("recovered") == "jump_table" and case["at"].get("rva") == short
+            ]
+            print()
+            print(f"  switch {short}: ghidra {sum(len(v) for v in groups.values())} labels over "
+                  f"{len(groups)} destination(s); `ioctl_map` took {len(from_table)}")
+            for dest, labels in sorted(groups.items(), key=lambda kv: -len(kv[1])):
+                taken = sum(1 for case in from_table if norm(case["code"]) in labels)
+                print(f"    -> {dest}  {len(labels):>3} label(s), {taken} of them cases")
+            stray = [
+                norm(case["code"])
+                for case in from_table
+                if norm(case["code"]) not in labelled
+            ]
+            print(f"    codes `ioctl_map` took that ghidra does not label here: {stray or 'none'}")
+
         if missing:
             print()
             print("  A code only `ioctl_map` lacks is a finding until it is explained. Read the")
-            print("  decompiled C beside the JSON: a range bound is `INT_LESS`, a case is a")
-            print("  handler with a name string.")
+            print("  decompiled C beside the JSON: only equality compares are codes here, so a")
+            print("  name in this list is one Ghidra tested the control code against.")
 
 
 if __name__ == "__main__":
