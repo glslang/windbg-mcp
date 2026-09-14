@@ -6982,18 +6982,20 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                 },
                 Some(at) => match ioctl_map_of(e, &structured::addr(at), deadline) {
                     Ok(map) => structured::IoctlSection {
-                        // A map that stopped early says so in its own `stopped`/`cap_hit`/`unsettled`
-                        // fields, which are richer than this one -- so the section is `partial` and
-                        // points at them rather than restating them worse.
-                        status: match map.stopped.is_some() || map.cap_hit || map.unsettled {
-                            true => structured::SectionStatus::Partial,
-                            false => structured::SectionStatus::Ok,
+                        // A map short of its routine says so in its own fields, which are richer
+                        // than this one -- so the section is `partial` and points at them rather
+                        // than restating them worse.
+                        //
+                        // **Which fields those are is the map's question, not this one's.** Asked
+                        // here, it was a list -- `stopped`, `cap_hit`, `unsettled` -- and `blind`
+                        // was added after it, documented as making a map "incomplete in a way no
+                        // other field says", so a routine with undecodable instructions came back
+                        // as a complete section.
+                        status: match map.shortfall() {
+                            Some(_) => structured::SectionStatus::Partial,
+                            None => structured::SectionStatus::Ok,
                         },
-                        note: (map.stopped.is_some() || map.cap_hit || map.unsettled).then(|| {
-                            "the map did not run to completion; its own `stopped`, `cap_hit` and \
-                             `unsettled` fields say which, and what each one costs the answer."
-                                .to_string()
-                        }),
+                        note: map.shortfall().map(str::to_string),
                         map: Some(map),
                     },
                     Err(why) => structured::IoctlSection {
@@ -7025,15 +7027,17 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
             ),
             Some(module) => match scan_of(e, module, fields.image_base, deadline) {
                 Ok(scan) => structured::HazardsSection {
-                    status: match scan.stopped.is_some() {
-                        true => structured::SectionStatus::Partial,
-                        false => structured::SectionStatus::Ok,
+                    // **The same question as the IOCTL section's, asked of the scan.** This end of
+                    // it read `stopped` alone, and named `unreadable` in its own note while not
+                    // counting it -- so a scan over pages that would not read reported a
+                    // **complete** section whose short `sinks` and empty `privileged` were what
+                    // was found rather than what is there. A byte cap was the same. Both are what
+                    // `shortfall` weighs, beside the fields, where an added one is visible.
+                    status: match scan.shortfall() {
+                        Some(_) => structured::SectionStatus::Partial,
+                        None => structured::SectionStatus::Ok,
                     },
-                    note: scan.stopped.is_some().then(|| {
-                        "the scan stopped early; its own `stopped` field says why, and its \
-                         `unreadable` list says which ranges went unscanned."
-                            .to_string()
-                    }),
+                    note: scan.shortfall().map(str::to_string),
                     hazards: Some(scan),
                 },
                 Err(why) => structured::HazardsSection {
