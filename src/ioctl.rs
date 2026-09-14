@@ -1242,13 +1242,22 @@ fn immediate_of(operand: &Operand) -> Option<u64> {
 /// drops a code that does not fit one **silently**, with nothing in the answer saying a case went.
 /// The immediate path had the same hole; carrying the step in a register is what made it
 /// reachable.
-fn stepped(offset: i64, by: u64, forward: bool) -> i64 {
-    let base = offset as u32;
-    let step = by as u32;
-    i64::from(match forward {
-        true => base.wrapping_add(step),
-        false => base.wrapping_sub(step),
-    })
+fn stepped(offset: i64, by: u64, forward: bool, width: u32) -> i64 {
+    // **At the destination's width, not at the field's.** A control code is a `ULONG` and the
+    // ordinary chain steps a 32-bit register, but `sub rcx,rax` executes modulo 2^64 -- and a model
+    // that wraps at 32 can bring an offset back to zero where the machine does not, so a following
+    // `je` reports code `0`, a case no execution reaches. Sixty-four-bit arithmetic on a code is
+    // not a shape this follows usefully; what matters is that it does not invent one.
+    match width {
+        FIELD_WIDTH => i64::from(match forward {
+            true => (offset as u32).wrapping_add(by as u32),
+            false => (offset as u32).wrapping_sub(by as u32),
+        }),
+        _ => match forward {
+            true => (offset as u64).wrapping_add(by) as i64,
+            false => (offset as u64).wrapping_sub(by) as i64,
+        },
+    }
 }
 
 /// The constant an operand stands for: an immediate, or a register this pass watched a literal
@@ -1374,7 +1383,20 @@ fn update(
     }
     // Neither of these writes a register this pass tracks, and `test` is the other thing that
     // writes only flags.
+    //
+    // **A `test` of the control code is still a branch about it**, though: `test ecx,3` / `je`
+    // takes a path this cannot name a code for, and returning here left neither a case nor a sign
+    // of one. Recorded as a pending loss, which the branch that reads these flags commits.
     if matches!(instruction.effect, Effect::Test | Effect::Push) {
+        if instruction.effect == Effect::Test {
+            let about_the_code = instruction
+                .operands
+                .first()
+                .and_then(register_full)
+                .and_then(|register| facts.registers.get(&register))
+                .is_some_and(|value| matches!(value, Value::Code { .. }));
+            *lost = about_the_code.then_some(instruction.address);
+        }
         return None;
     }
     let operands = &instruction.operands;
@@ -1461,7 +1483,7 @@ fn update(
                 }),
                 Some(immediate),
             ) => {
-                let offset = stepped(offset, immediate, true);
+                let offset = stepped(offset, immediate, true, written.width);
                 set(
                     facts,
                     &destination,
@@ -1490,15 +1512,27 @@ fn update(
                 }),
                 Some(immediate),
             ) => {
+                // **And it leaves a comparison, exactly as the `sub` does.** `add ecx,K` /
+                // `je` is a subtraction of a negative written the other way round, and returning
+                // nothing here lost the case **silently**: `simulate` cleared the pending compare,
+                // and the loss went unrecorded because the register still held a code.
+                let offset = stepped(offset, immediate, false, written.width);
                 set(
                     facts,
                     &destination,
                     Some(Value::Code {
-                        offset: stepped(offset, immediate, false),
+                        offset,
                         shift,
                         proved,
                     }),
                 );
+                return Some(Compared {
+                    code: (shift == 0).then_some(offset as u64),
+                    proved,
+                    index: Some((destination, offset, shift)),
+                    bound: Some(0),
+                    at: instruction.address,
+                });
             }
             // An `add` of anything else -- a table entry to its base, most often -- leaves a value
             // this does not model.
@@ -3546,6 +3580,114 @@ mod tests {
         assert!(
             found.untracked.is_empty(),
             "and nothing was lost, so nothing says it was: {:?}",
+            found.untracked
+        );
+    }
+
+    /// **`add` is a subtraction written the other way round, and leaves a case like one.**
+    ///
+    /// `add ecx,K` / `je` rebased the value and returned no comparison fact, so `simulate` cleared
+    /// the pending compare -- and the loss went unrecorded too, because the register still held a
+    /// code and nothing had destroyed it. No case, no `untracked`, nothing in the answer at all.
+    /// A compiler writes a subtraction of a negative this way, so it is an ordinary dispatch shape
+    /// rather than an adversarial one.
+    #[test]
+    fn an_add_leaves_a_case_the_way_a_subtract_does() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("ecx"), imm(0x6dc004)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            // `add ecx,4` walks the chain **back**: the register now holds `code - 0x6dc000`.
+            insn(
+                DISPATCH + 0x17,
+                "add",
+                vec![reg("ecx"), imm(4)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1a, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x6dc004, 0x900), (0x6dc000, 0x980)],
+            "the `add` moves the chain back four and its `je` is a case for the code there: {:?}",
+            found.cases
+        );
+    }
+
+    /// **A `test` of the control code is a branch about it, and cannot be named.**
+    ///
+    /// `test ecx,3` / `je` takes a path whose codes this walk cannot enumerate -- and `update`
+    /// returned early for a test, so it produced neither a case nor a record. Silence, which is
+    /// the one thing the map is not allowed to answer with when it is short.
+    #[test]
+    fn a_test_of_the_control_code_is_a_branch_this_cannot_name() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "test",
+                vec![reg("ecx"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert!(
+            found.cases.is_empty(),
+            "a mask test names no single code, so it invents none: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0xb],
+            "but the branch reading it is a path the case list does not account for"
+        );
+
+        // And a `test` of something else is not about the control code at all.
+        let mut other = prologue(DISPATCH);
+        other.extend([
+            insn(
+                DISPATCH + 8,
+                "test",
+                vec![reg("eax"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xa, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x10, "ret", Vec::new(), Flow::Return),
+        ]);
+        let found = map(DISPATCH, &other, Layout::X64, unreadable, in_image, never);
+        assert!(
+            found.untracked.is_empty(),
+            "every dispatch routine tests something; only the code's own tests are short lists: \
+             {:?}",
             found.untracked
         );
     }

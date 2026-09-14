@@ -263,6 +263,15 @@ def main() -> None:
 
         print("asking Ghidra ...", flush=True)
         gh = ask_ghidra(args.image, rva, work)
+        # **A decompilation that did not happen is not an empty answer.** The Java side says so
+        # deliberately, and consuming the empty lists beside it reports Ghidra as finding no codes
+        # -- a failed oracle wearing the face of a real result, which is the same shape as reading
+        # Driver Buddy's output past a non-zero exit.
+        if not gh.get("decompiled"):
+            raise SystemExit(
+                "Ghidra could not decompile the dispatch routine, so its half of this comparison "
+                "never ran. Check the RVA names a function in this image."
+            )
         # **Equality compares only.** A relational bound is not a code, and the switch half is
         # reported rather than diffed, because naming a table's default needs metadata
         # Ghidra does not give.
@@ -296,9 +305,19 @@ def main() -> None:
             )
 
         print()
-        missing = sorted((gh_codes | dbr_codes) - tool_codes)
+        # **What one oracle alone says is a candidate, not a finding.** Ghidra's provenance check
+        # establishes that a compared value came from memory -- a length, a status and a structure
+        # member are loads too -- and tracing it to the IRP's control-code field specifically would
+        # be this lane adopting the assumption of the pass it exists to check. So a code is
+        # reported as missing when **both** other implementations have it, and listed as a
+        # candidate when only one does. Every real miss so far was corroborated: `0x6dc000` was in
+        # both.
+        corroborated = sorted((gh_codes & dbr_codes) - tool_codes)
+        candidates = sorted((gh_codes ^ dbr_codes) - tool_codes)
         print(f"  agreed by all three             : {len(tool_codes & gh_codes & dbr_codes)}")
-        print(f"  missing from `ioctl_map`        : {missing}")
+        print(f"  missing from `ioctl_map`        : {corroborated}")
+        print(f"  candidates (one oracle only)    : {candidates}")
+        missing = corroborated
         print(f"  `ioctl_map` has, Driver Buddy   : {sorted(tool_codes - dbr_codes)}")
         print(f"  Driver Buddy, other device type : {sorted(dbr_all - dbr_codes)}")
         if gh_untraced:
