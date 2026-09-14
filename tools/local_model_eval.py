@@ -426,7 +426,7 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
             killed = True
             note = {"run": plan["run"], "backend": backend, "model": model,
                     "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
-                    "task": None, "planned": planned,
+                    "task": None, "planned": planned, "think": think,
                     "error": f"cell exceeded its {budget_s}s budget"}
             with open(log_path, "a", encoding="utf-8") as log:
                 log.write(json.dumps(note) + "\n")
@@ -445,7 +445,7 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
         # reading as a finished one. The note gives the cell a row that says what happened.
         note = {"run": plan["run"], "backend": backend, "model": model,
                 "num_ctx": context or None, "surface": {"client": surface}, "draw": draw,
-                "task": None, "planned": planned,
+                "task": None, "planned": planned, "think": think,
                 "error": f"driver exited {proc.returncode}; see {os.path.basename(stdout_path)}"}
         with open(log_path, "a", encoding="utf-8") as log:
             log.write(json.dumps(note) + "\n")
@@ -1319,7 +1319,20 @@ def reasoning_arms(log_path):
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("task") is None:
+            # **A cell-failure note counts, when it says which arm it was.** A note is the only
+            # trace a cell that timed out or died leaves behind, so skipping notes let an off-arm
+            # cell fail, leave nothing this could see, and a plan for the other arm then append
+            # task records beside it.
+            #
+            # **But a note carrying no `think` is skipped rather than read as `off`**, which is
+            # the opposite of the rule [`arm_of`] applies to a task record - and the asymmetry is
+            # the point. A task record's silence is evidence: the driver sent `think: false`
+            # unconditionally until the axis landed, so a record without the field cannot have
+            # reasoned. A note's silence is evidence of nothing - the runner never wrote the
+            # field, in either arm - and reading it as `off` would let one note from an older
+            # runner condemn a whole `on` log as holding two arms, which is a refusal no amount
+            # of appending could repair.
+            if record.get("task") is None and "think" not in record:
                 continue
             surface = record.get("surface") or {}
             cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
