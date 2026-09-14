@@ -83,8 +83,10 @@ the model as refused, so a wrong pick is *measured* rather than performed. `laun
 `debug_batch` are on the surface and are never run: a debug host is the wrong place to discover
 unattended what a model does with them.
 
-**Which tools those are is the server's answer, not a list kept in the harness** (from 2026-09-14;
-every run on this page predates it and ran behind a hand-kept list of sixteen names). Each tool
+**Which tools those are is the server's answer, not a list kept in the harness** (from 2026-09-14).
+The **first five** runs on this page predate it and ran behind a hand-kept list of sixteen names;
+the sixth — the reasoning A/B — is the first measured behind this one, and re-measured its own
+baseline arm precisely because the change reaches those cells. Each tool
 declares `readOnlyHint` in its `tools/list` annotations — 61 of 61, checked on the wire — and
 `adopt_fence` reads it once per cell, off the same `tools/list` the model is shown. Two exceptions
 carry properties the annotation cannot express: `open_dump`, `open_trace` and `end_session` are
