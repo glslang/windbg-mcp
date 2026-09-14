@@ -196,7 +196,22 @@ def ghidra_equalities(report: dict) -> set:
     return {
         norm(compare["value"])
         for compare in report["compares"]
-        if compare["op"] in ("INT_EQUAL", "INT_NOTEQUAL")
+        if compare["op"] in ("INT_EQUAL", "INT_NOTEQUAL") and compare.get("traced", True)
+    }
+
+
+def ghidra_untraced(report: dict) -> set:
+    """Equality constants whose other side never came from memory.
+
+    A device type is sixteen bits of a constant, so a status, a length or a magic number can wear
+    one. The control code arrives from a load; these did not, and calling them codes `ioctl_map`
+    missed would be this lane inventing findings. Reported apart rather than dropped, because
+    Ghidra's reach here is bounded and "did not trace" is not "is not a code".
+    """
+    return {
+        norm(compare["value"])
+        for compare in report["compares"]
+        if compare["op"] in ("INT_EQUAL", "INT_NOTEQUAL") and not compare.get("traced", True)
     }
 
 
@@ -252,6 +267,9 @@ def main() -> None:
         # reported rather than diffed, because naming a table's default needs metadata
         # Ghidra does not give.
         gh_codes = {c for c in ghidra_equalities(gh) if (int(c, 16) >> 16) == device}
+        gh_untraced = {
+            c for c in ghidra_untraced(gh) if (int(c, 16) >> 16) == device
+        } - gh_codes
         tables = ghidra_tables(gh)
         print(f"  dispatch {gh['dispatch']['rva']}, {len(gh_codes)} codes compared for equality, "
               f"{len(tables)} switch table(s)", flush=True)
@@ -283,6 +301,9 @@ def main() -> None:
         print(f"  missing from `ioctl_map`        : {missing}")
         print(f"  `ioctl_map` has, Driver Buddy   : {sorted(tool_codes - dbr_codes)}")
         print(f"  Driver Buddy, other device type : {sorted(dbr_all - dbr_codes)}")
+        if gh_untraced:
+            print(f"  ghidra equalities not traced to a load: {sorted(gh_untraced)}")
+            print("    -- the right device type and no provenance, so not counted as codes here")
 
         # **The switch half, as a subset question rather than a default-guessing one.** Every code
         # the tool recovered from a jump table has to be a label Ghidra put on the same switch, at
@@ -305,12 +326,25 @@ def main() -> None:
             for dest, labels in sorted(groups.items(), key=lambda kv: -len(kv[1])):
                 taken = sum(1 for case in from_table if norm(case["code"]) in labels)
                 print(f"    -> {dest}  {len(labels):>3} label(s), {taken} of them cases")
-            stray = [
-                norm(case["code"])
-                for case in from_table
-                if norm(case["code"]) not in labelled
-            ]
+
+            # **And where each one lands, which is the half this used to only claim.** Counting a
+            # code's membership among the labels says the table was read; comparing the block it
+            # routes to says it was read *correctly*. A map that recovers the right label and sends
+            # it to the wrong handler passed the old check clean.
+            stray, misrouted = [], []
+            for case in from_table:
+                code = norm(case["code"])
+                if code not in labelled:
+                    stray.append(code)
+                    continue
+                theirs = labelled[code]
+                ours = case.get("case_rva")
+                if ours is None:
+                    continue
+                if int(ours, 16) != int(theirs, 16):
+                    misrouted.append(f"{code} -> {ours} (ghidra {theirs})")
             print(f"    codes `ioctl_map` took that ghidra does not label here: {stray or 'none'}")
+            print(f"    codes routed somewhere ghidra does not: {misrouted or 'none'}")
 
         if missing:
             print()

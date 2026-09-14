@@ -95,8 +95,21 @@ public class IoctlOracle extends GhidraScript {
                     }
                     long value = in.getOffset();
                     Address at = op.getSeqnum().getTarget();
+                    // **Where the other side came from**, so a constant is not taken for a control
+                    // code on the strength of its top sixteen bits alone. A status, a length and a
+                    // magic number can all share a device type; only one of them arrives from
+                    // memory. Reported rather than filtered on -- deciding that a particular
+                    // displacement is the code would be this oracle adopting the assumption of the
+                    // pass it exists to check.
+                    boolean traced = false;
+                    for (Varnode other : op.getInputs()) {
+                        if (other != null && !other.isConstant() && reachesALoad(other, 12)) {
+                            traced = true;
+                        }
+                    }
                     compares.add("{\"value\": \"" + hex(value) + "\", \"rva\": \"" + hex(rva(at))
-                            + "\", \"op\": \"" + op.getMnemonic() + "\"}");
+                            + "\", \"op\": \"" + op.getMnemonic() + "\""
+                            + ", \"traced\": " + traced + "}");
                     compareValues.add(value & 0xFFFFFFFFL);
                 }
             }
@@ -232,6 +245,31 @@ public class IoctlOracle extends GhidraScript {
             }
         }
         println("IoctlOracle: wrote " + outPath);
+    }
+
+    /// Whether a varnode's definition chain reaches a `LOAD` within `depth` steps.
+    ///
+    /// The control code arrives from memory -- `[[Irp+0xb8]+0x18]` -- so a compare against
+    /// something that never came from a load is not a compare against it. Bounded rather than
+    /// exhaustive: this is a second opinion, not a solver, and an unbounded walk over a decompiled
+    /// function is a way to hang a manual lane.
+    private boolean reachesALoad(Varnode start, int depth) {
+        if (depth <= 0 || start == null) {
+            return false;
+        }
+        PcodeOp def = start.getDef();
+        if (def == null) {
+            return false;
+        }
+        if (def.getOpcode() == PcodeOp.LOAD) {
+            return true;
+        }
+        for (Varnode in : def.getInputs()) {
+            if (in != null && !in.isConstant() && reachesALoad(in, depth - 1)) {
+                return true;
+            }
+        }
+        return false;
     }
 
     private static String joinHex(TreeSet<Long> values) {
