@@ -94,8 +94,12 @@ turns. A served tool with no boolean hint **stops the run** rather than being gu
 either runs a mutating tool on a debug host or refuses a read-only one and files it as the model's
 mistake, and neither is visible in the log afterwards.
 
-**A tool the client is not served is handed to the server anyway**, which is load-bearing rather
-than an oversight. `unserved` — the `taught`/`wanted` split below — counts calls naming a tool the
+**A tool the client is not served is handed to the server anyway**, and that test comes *first* —
+before the two exceptions, not after. `wait_for_stop` lives in the `exec` group, which neither
+`lean` nor `min` is served, so denying it ahead of the membership check would have refused it here
+and recorded `refused_by_harness` where the server should have recorded `off_surface`: the same
+corruption, reintroduced two lines under the thing that prevents it. The passthrough is
+load-bearing rather than an oversight. `unserved` — the `taught`/`wanted` split below — counts calls naming a tool the
 client was not given, and the five-way split distinguishes `off_surface` (the *server* said no)
 from `refused` (the harness said no). A fence that intercepted those names first would keep every
 total identical and quietly relabel them as our refusal, so the bench would report a server that

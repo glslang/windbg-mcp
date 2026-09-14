@@ -197,10 +197,18 @@ def permitted(name):
     if SERVED is None:
         raise RuntimeError("the read-only fence has not been derived; call adopt_fence() on the "
                            "served tools/list before running a model turn")
-    if name in DENY_ANYWAY:
-        return False
     if name not in SERVED:
         return True
+    # **After the membership check, never before it.** `DENY_ANYWAY` is a statement about tools
+    # this client *has*, and `wait_for_stop` is in the `exec` group - which neither `lean` nor
+    # `min` is served. Denying it first meant a model naming it on those surfaces was refused
+    # here and recorded `refused_by_harness`, where it should reach the server and be recorded
+    # `off_surface`: the same corruption of the `unserved`/`taught`/`wanted` split that the
+    # unserved passthrough above exists to prevent, reintroduced two lines under it. No log on
+    # disk is affected - nothing has ever called it - which is exactly why the ordering survived
+    # a green run.
+    if name in DENY_ANYWAY:
+        return False
     return SERVED[name] or name in ALLOW_ANYWAY
 
 
