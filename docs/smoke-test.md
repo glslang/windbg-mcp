@@ -517,12 +517,7 @@ have. The test is therefore a differential: `driver_surface` on `\Driver\mountmg
 dispatch routine, the image and the device are, with the embedded answers compared as values.
 Because those arguments come from the survey's own report, the driver object is first checked
 against `!drvobj` -- somebody else's extension -- so a survey of the wrong driver cannot compare a
-wrong answer against a wrong oracle and pass. The hazard halves are compared **whichever way they answered**, not only on success:
-mountmgr's import directory is in a pageable section and is often not resident on a live kernel, so
-`driver_hazards` there cannot succeed however healthy it is — measured, 512 bytes at
-`0xfffff80237249fae` unreadable. Requiring `ok` would have tested the target's paging state rather
-than the composition, and a composite that returns the tool's *failure* unchanged is composing as
-faithfully as one that returns its success. It also asserts the link search is **absent** from
+wrong answer against a wrong oracle and pass. What it asserts about the hazard section is in three parts, and **only the third compares the two calls** -- because they are two calls with two clocks. A section carrying no scan must say why (never `ok`, never silent), a section carrying one must be complete exactly when that scan covered its subject, and the payloads are compared when there is one on each side and no deadline stopped either. Four review rounds went on trying to compare more than that: mountmgr's import directory is in a pageable section and is often not resident on a live kernel, so `driver_hazards` there cannot succeed however healthy it is — measured, 512 bytes at `0xfffff80237249fae` unreadable — and requiring `ok` tested the target's paging state rather than the composition. But the failure side cannot be compared either: the survey can spend its shared clock inside the scan and fail with a timeout while the standalone call, on a fresh deadline, reaches that unreadable page, and both are right. That the section carries the failure's **own** message rather than a second account of it is therefore pinned at the arm that builds it, by `worker::tests::a_refused_section_carries_the_failures_own_message`, where no clock can reach it. The branch that does not compare **prints why**, so a run where the payloads were never compared says so rather than passing quietly. It also asserts the link search is **absent** from
 the composite's devices, so that adding it later is a visible change rather than a silent one that
 would make the `TOOL_NOTES` pointer at `device_security` wrong.
 

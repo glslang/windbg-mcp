@@ -7004,11 +7004,14 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                         note: map.shortfall().map(str::to_string),
                         map: Some(map),
                     },
-                    Err(why) => structured::IoctlSection {
-                        status: structured::SectionStatus::Error,
-                        note: Some(why.message.clone()),
-                        map: None,
-                    },
+                    Err(why) => {
+                        let (status, note) = refused(&why);
+                        structured::IoctlSection {
+                            status,
+                            note,
+                            map: None,
+                        }
+                    }
                 },
             },
             }
@@ -7052,11 +7055,14 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                     note: scan.shortfall().map(|why| why.note().to_string()),
                     hazards: Some(scan),
                 },
-                Err(why) => structured::HazardsSection {
-                    status: structured::SectionStatus::Error,
-                    note: Some(why.message.clone()),
-                    hazards: None,
-                },
+                Err(why) => {
+                    let (status, note) = refused(&why);
+                    structured::HazardsSection {
+                        status,
+                        note,
+                        hazards: None,
+                    }
+                }
             },
         }
     };
@@ -7079,6 +7085,24 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
     // Fenced once, at the top: the composite embeds `ioctl::render` and `hazards::render`,
     // and a fence inside a fence closes the outer one early.
     Ok(Output::typed(fenced(&surface::render(&report)), report))
+}
+
+/// What a section that asked and was refused reports: the failure's **own** message, unchanged.
+///
+/// One place because the rule is one sentence and was written at each arm, and -- the half that
+/// matters more -- because this is the site the rule is about. It used to be pinned from a
+/// distance, by the live differential comparing this note with a standalone `driver_hazards`'
+/// error message. **Two independently clocked calls cannot hold that property.** The survey can
+/// spend its shared clock inside the scan and fail with a `Timeout`, while the standalone gets a
+/// fresh deadline, reaches mountmgr's non-resident import directory and fails as `Unreadable`;
+/// both are right and the messages differ. Two review rounds came out of that one assertion before
+/// the property was moved to where it can actually be held.
+///
+/// A caller is never told a second account of a failure, which is the whole of it: `error` plus
+/// the message the tool itself would have given, so `driver_surface`'s section and `driver_hazards`
+/// called directly send a reader to the same place.
+fn refused(why: &Failed) -> (structured::SectionStatus, Option<String>) {
+    (structured::SectionStatus::Error, Some(why.message.clone()))
 }
 
 /// The note for a survey section the clock stopped before it began -- **and** the record of it.
@@ -8695,6 +8719,34 @@ mod tests {
         assert!(
             !note.contains("is in no module"),
             "and must not say the address is in none, which is the claim it cannot make: {note}"
+        );
+    }
+
+    /// **A refused section carries the failure's own message, not a second account of it.**
+    ///
+    /// The rule a composite is most likely to break: it has a failure in hand and a section to
+    /// describe, and summarising is the natural thing to do -- which leaves a reader with two
+    /// differently-worded accounts of one fact and no way to tell whether they are the same fact.
+    ///
+    /// Pinned here rather than in the live differential, where it lived for two review rounds and
+    /// could not hold: that test compared this note against a standalone `driver_hazards`' message,
+    /// and two calls with two clocks can fail for different reasons and both be right -- a survey
+    /// that spends its shared clock inside the scan reports a timeout where a standalone call, on a
+    /// fresh deadline, reports the unreadable page it got as far as.
+    #[test]
+    fn a_refused_section_carries_the_failures_own_message() {
+        let why = Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            "`mountmgr`'s PE structures could not be read: 512 bytes at 0xfffff80237249fae could \
+             not be read.",
+        );
+        let (status, note) = super::refused(&why);
+        assert_eq!(status, structured::SectionStatus::Error);
+        assert_eq!(
+            note.as_deref(),
+            Some(why.message.as_str()),
+            "verbatim: a section that rewords the failure it was handed leaves a reader comparing \
+             two accounts of one fact"
         );
     }
 
