@@ -182,10 +182,11 @@ def one_arm_per_log(plan, log_path):
                         raise SystemExit(
                             f"this plan asks for both reasoning arms of {model} at "
                             f"ctx={context or 'default'} on `{surface}`, into one log "
-                            f"(`{plan.get('out')}`). A cell is not keyed by `think`, so the "
-                            f"second arm would be skipped as already done and the run would "
-                            f"measure one arm while saying two. Put each arm in a plan and a log "
-                            f"of its own and read them with `--compare`.")
+                            f"(`{plan.get('out')}`). Both would run - resume tells the arms "
+                            f"apart - but grading cannot tell them apart afterwards: a cell is "
+                            f"summarised over every record it has, and deduplication keeps the "
+                            f"later of two that share a (cell, draw, task). Put each arm in a "
+                            f"plan and a log of its own and read them with `--compare`.")
 
     # **And the same question asked of the log**, because the plan is only half of what decides
     # what runs. Copying a plan, flipping `think` and leaving `out` alone is the ordinary way to
@@ -205,9 +206,30 @@ def one_arm_per_log(plan, log_path):
             raise SystemExit(
                 f"`{log_path}` already holds reasoning {'/'.join(sorted(held))} records for "
                 f"{model} at ctx={num_ctx or 'default'} on `{surface}`, and this plan asks for "
-                f"reasoning {'on' if asked else 'off'}. A cell is not keyed by `think`, so those "
-                f"records would count as this arm's and the run would skip every task it was "
-                f"asked for. Give this arm a log of its own and read the two with `--compare`.")
+                f"reasoning {'on' if asked else 'off'}. This arm would run and be appended beside "
+                f"the other one, leaving a log that grades as whichever arm was written later "
+                f"with no way to recover either. Give this arm a log of its own and read the two "
+                f"with `--compare`. A record written before the axis existed carries no "
+                f"`think` and counts as `off` here, because the driver sent `think: false` "
+                f"unconditionally until the axis landed.")
+
+
+def arm_of(record):
+    """The reasoning arm a record ran under, for deciding whether its work is done.
+
+    **Absence is `off`, and that is a different judgement from the one `identity()` makes.**
+    A log written before the axis existed carries no `think`, and the identity block reports that
+    as `unrecorded` rather than `off` because a published row must not assert more than its source
+    says. Resume is not publishing a claim - it is answering "has this work been done" - and there
+    the absence has a provable meaning: `chat()` sent `think: False` unconditionally until the axis
+    landed, so a record without the field was produced by a driver that could not have reasoned.
+
+    Reading it the other way is what makes the two safe. A legacy record answers for the `off` arm,
+    so re-running a pre-axis plan still skips what it already has; it answers for nothing else, so
+    a plan asking `think: true` re-runs those cells instead of quietly reporting the legacy numbers
+    as the reasoning arm's.
+    """
+    return "on" if record.get("think") else "off"
 
 
 def already_done(log_path, tasks):
@@ -244,8 +266,16 @@ def already_done(log_path, tasks):
             # **Keyed by backend too.** Two groups can name the same model - an ollama tag
             # aliased `sonnet` beside the Claude Code row - and without this the first one's
             # records make the second's whole cell look finished.
+            # **The arm is part of the identity resume uses, and only resume.** Four review
+            # findings landed on this one seam - a plan mixing arms, a plan pointed at the other
+            # arm's log, a plan against a pre-axis log - and each was a guard bolted onto a key
+            # that could not tell two arms apart. The key can tell them apart now, which ends the
+            # class rather than catching the next member of it. It stays out of the *cell* identity
+            # that `summarise`, `matrix` and `compare` share, because that is what pairs arm A's
+            # cells with arm B's: putting it there would leave the A/B with nothing to compare.
             seen.add((r.get("backend"), r.get("model"), r.get("num_ctx"),
-                      (r.get("surface") or {}).get("client"), draw_of(r), r.get("task")))
+                      (r.get("surface") or {}).get("client"), draw_of(r), r.get("task"),
+                      arm_of(r)))
     if stale:
         print(f"  {stale} record(s) in the log no longer measure what this plan asks "
               f"(a changed prompt, or a window that was not the one requested); they will run again")
@@ -1235,8 +1265,10 @@ def reasoning_arms(log_path):
     a table that silently dropped half its input. Counted after the dedup, this could never see
     it: every cell had exactly one arm left by then.
 
-    A record written before the axis existed carries no `think` and contributes nothing, which is
-    not the same as contributing `off`.
+    A record written before the axis existed counts as `off`, through the same [`arm_of`] resume
+    uses - so a plan asking for the reasoning arm is refused against a pre-axis log rather than
+    silently reporting its numbers, and the two mechanisms cannot disagree about what such a log
+    holds.
     """
     arms = {}
     if not os.path.exists(log_path):
@@ -1250,12 +1282,12 @@ def reasoning_arms(log_path):
                 record = json.loads(line)
             except json.JSONDecodeError:
                 continue
-            if record.get("task") is None or "think" not in record:
+            if record.get("task") is None:
                 continue
             surface = record.get("surface") or {}
             cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
                        surface.get("client"))
-            arms.setdefault(cell_id, set()).add("on" if record["think"] else "off")
+            arms.setdefault(cell_id, set()).add(arm_of(record))
     return arms
 
 
@@ -1987,6 +2019,21 @@ def series(log_paths, tasks_file, out_path):
     """
     rows = []
     for log_path in log_paths:
+        # **A pooled log is refused here, not annotated.** `--grade` prints a table a reader is
+        # looking at and can warn beside it; a series row is published history that outlives the
+        # terminal it was made in, and `records()` has already reduced each coordinate to whichever
+        # arm was appended later - so the row would carry one arm's scores under a run identity
+        # naming both, with nothing in the file to say so. There is no honest projection of a log
+        # that holds two arms, so the export stops rather than inventing one.
+        pooled = sorted(cell for cell, arms in reasoning_arms(log_path).items() if len(arms) > 1)
+        if pooled:
+            raise SystemExit(
+                f"{os.path.basename(log_path)} holds both reasoning arms for "
+                f"{len(pooled)} cell(s) - {cell_label(pooled[0])}"
+                + (f" and {len(pooled) - 1} more" if len(pooled) > 1 else "")
+                + ". Deduplication keeps whichever arm was written later, so a series row for it "
+                  "would publish one arm's scores under a run that names both. Export each arm's "
+                  "log separately.")
         suite = suite_for(log_path, tasks_file)
         cells = summarise(log_path, suite)
         log_records = records(log_path)
@@ -2124,8 +2171,9 @@ def main():
                     subset = group.get("subset")
                     wanted = cell_tasks(plan["tasks"], subset)
                     for draw in range(1, draws + 1):
+                        arm = "on" if group.get("think", False) else "off"
                         outstanding = [t for t in wanted
-                                       if (backend, model, context, surface, draw, t["id"])
+                                       if (backend, model, context, surface, draw, t["id"], arm)
                                        not in done]
                         if not outstanding:
                             print(f"  skipping {backend}:{model} ctx={context} {surface}"

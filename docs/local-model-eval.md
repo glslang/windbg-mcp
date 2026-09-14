@@ -1243,11 +1243,19 @@ not the variable.**
 | `arm64_pc` | 3/20 | 8/20 |
 | **total** | **60/80** | **68/80** |
 
-One-sided Fisher on the total is **p = 0.083**, and on `arm64_pc` alone **p = 0.078**. Restricting
-to the two models that ever answer `arm64_pc` gives 3/10 → 8/10 and p = 0.035 — which is quoted
-here only to be disowned, because choosing those two *after* seeing which moved is selecting on the
-outcome. The defensible statement is the one that does not clear the conventional bar:
-**reasoning moves this suite in the right direction, consistently, at p ≈ 0.08.**
+**No p-value is quoted for that table, and the reason is the design rather than modesty.** An
+earlier draft ran a one-sided Fisher on the totals and reported p ≈ 0.08. That test treats 80
+outcomes per arm as 80 independent trials, and they are not: they are four tasks by four models by
+five draws, so every draw shares a model effect with four others and a task effect with fifteen.
+Pseudoreplication of that shape makes a p-value anti-conservative — it answers a question about
+independent trials nobody ran. Review caught it, and the honest fix is to stop quoting one rather
+than to hedge it.
+
+What the design *can* support is the block it was built from, which is the per-model table above:
+of four models, **two moved and two did not**, and the two that moved went 2/5 → 5/5 and 1/5 → 3/5.
+That is a direction observed in every block that could move, at a sample size that will not carry a
+calibrated interval. The same caution applies to every ratio below: read them as rates measured,
+not as tests passed.
 
 **The cleanest single effect is not on `arm64_pc` at all.** It is gemma decoding the IOCTL with no
 `decode_ioctl` to call — the trap task, pure `CTL_CODE` arithmetic:
@@ -1259,9 +1267,11 @@ outcome. The defensible statement is the one that does not clear the conventiona
 | nemotron-3.5:30b | 0/5 | 0/5 |
 | qwen3.8:27b | 0/5 | 0/5 |
 
-gemma goes 0/5 to 5/5, p = 0.004 — the only result here that clears any bar comfortably, and it is
-exactly the shape you would predict: reasoning buys arithmetic a model could always have done and
-otherwise does not attempt.
+gemma goes 0/5 to 5/5 — the sharpest single movement on the page, and exactly the shape you would
+predict: reasoning buys arithmetic a model could always have done and otherwise does not attempt.
+Five draws to five is not five independent trials either, for the same reason as above, so it is
+reported as what it is: every draw of that cell changed answer when reasoning was turned on, and
+none changed back.
 
 **And muse-glimmer goes 5/5 to 3/5 on the same task, which is the row that keeps this honest.**
 Reasoning is not uniformly good. One model gains a capability on this task and another loses ground
