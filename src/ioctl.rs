@@ -365,6 +365,16 @@ struct Facts {
     /// invented; past `je K` not taken it is not `K`; and past `jne K` not taken the case is
     /// already recorded by the branch itself.
     pending: Option<Compared>,
+    /// An instruction that took the control code somewhere unmodelled, whose flags are still live.
+    ///
+    /// Carried for the reason [`Self::pending`] is, and it is the same gap: `and ecx,mask` / `ja
+    /// next` / `je handler` puts the loss in one block and the branch that makes it matter in the
+    /// next, and a loss that stops at a block boundary is a short case list with nothing saying so.
+    ///
+    /// **It survives on both edges**, where a compare does not. `equality_survives` can rule an
+    /// edge out because a comparison's flags are known; nothing is known about what an unmodelled
+    /// operation did, so neither edge of a branch reading it has ruled anything out.
+    lost: Option<u64>,
     /// Where a refusal's status stands, which is a fact about the path like the rest of these.
     ///
     /// **It used to be computed inside whichever block was being read for a refusal**, which made
@@ -401,6 +411,11 @@ impl Facts {
         if self.pending != other.pending {
             changed |= self.pending.is_some();
             self.pending = None;
+        }
+        // Same rule: a loss one path into the block left is not a loss the block can report.
+        if self.lost != other.lost {
+            changed |= self.lost.is_some();
+            self.lost = None;
         }
         // A status only where **every** path into the block has one, for the reason a register's
         // value is: a refusal one path establishes is not one the block makes.
@@ -940,12 +955,12 @@ fn simulate(
     // **The compare this block was entered with**, taken rather than copied: it belongs to the
     // edge that arrived, and what leaves is decided per outgoing edge below.
     let mut compared: Option<Compared> = facts.pending.take();
+    let mut lost: Option<u64> = facts.lost.take();
     let mut traced = false;
     let mut untracked = Vec::new();
     // The loss the last flag-writing instruction left, carried exactly as `compared` is: whether
     // it matters is decided by what reads those flags, which is the terminator's business.
     let mut just_lost: Option<u64> = None;
-    let mut lost: Option<u64> = None;
     let mut blind = 0usize;
     let mut cases = Vec::new();
     let mut table = None;
@@ -1063,6 +1078,7 @@ fn simulate(
     let mut carried = facts.clone();
     carried.bound = None;
     carried.pending = None;
+    carried.lost = None;
     // **A compare outlives the branch that reads it, on whichever edges that branch has not ruled
     // equality out on.** See [`equality_survives`]: `ja` leaves it live where it falls through and
     // `jbe` where it branches, and getting that backwards loses a case on one edge and invents one
@@ -1120,6 +1136,7 @@ fn simulate(
         });
         if let Some(fall_through) = fall_through {
             bounded.pending = onward_fallen.clone();
+            bounded.lost = lost;
             to.push((fall_through, bounded));
         }
         if let Some(taken) = target
@@ -1128,6 +1145,7 @@ fn simulate(
         {
             let mut edge = carried.clone();
             edge.pending = onward_taken.clone();
+            edge.lost = lost;
             to.push((taken, edge));
         }
     } else {
@@ -1153,6 +1171,9 @@ fn simulate(
                 (_, true) => onward_taken.clone(),
                 _ => None,
             };
+            // No edge of a branch reading an unmodelled result has ruled anything out, so the loss
+            // goes down both of them.
+            edge.lost = lost;
             to.push((successor, edge));
         }
     }
@@ -1170,17 +1191,21 @@ fn simulate(
     }
 }
 
-/// Whether this instruction took the control code somewhere this pass cannot follow it.
+/// Records a control code this instruction took somewhere the pass cannot follow.
 ///
-/// **Flag-writing only, which is what keeps it from being noise.** The question is not "was a
-/// value forgotten" -- copies lose values all the time and nothing branches on them -- but "is the
-/// branch about to read these flags a test on the code that nobody can attribute". That is the
-/// shape a stepped chain has, and it was the shape that reported 4 of HEVD's 28 codes as a
-/// complete map.
-fn lost_the_code(instruction: &Instruction, carried: bool, facts: &Facts, register: &str) -> bool {
-    carried
-        && instruction.writes_flags
-        && !matches!(facts.registers.get(register), Some(Value::Code { .. }))
+/// Asked against the **snapshot** taken before the instruction ran, so it sees a register written
+/// implicitly and one clipped by a narrow write as readily as the named destination. Flag-writing
+/// only, which is what keeps it from being noise: the question is not "was a value forgotten" --
+/// copies lose values all the time and nothing branches on them -- but "is a branch about to read
+/// flags from something it cannot attribute to a code".
+fn note_loss(facts: &Facts, carried: &[String], instruction: &Instruction, lost: &mut Option<u64>) {
+    if !instruction.writes_flags {
+        return;
+    }
+    let gone = carried
+        .iter()
+        .any(|register| !matches!(facts.registers.get(register), Some(Value::Code { .. })));
+    *lost = gone.then_some(instruction.address);
 }
 
 /// Records a case, keeping the count exact once the list stops growing.
@@ -1354,6 +1379,17 @@ fn update(
     traced: &mut bool,
     lost: &mut Option<u64>,
 ) -> Option<Compared> {
+    // **Which registers carry the control code as this begins**, snapshotted because the loss
+    // check cannot be asked afterwards from one operand. An instruction writes registers it does
+    // not name (`xadd`, `mul`), a narrow write returns before any arm runs, and by the time the
+    // arms have finished the evidence is gone. Asked here, where nothing has happened yet, it
+    // covers all of them with one question.
+    let carried_the_code: Vec<String> = facts
+        .registers
+        .iter()
+        .filter(|(_, value)| matches!(value, Value::Code { .. }))
+        .map(|(register, _)| register.clone())
+        .collect();
     // Where the status stands after this instruction, asked **before** it is applied because a
     // store reads its base as it stands. A compare writes neither a register nor a status, so this
     // is above the early return for one and the answer is the same either way.
@@ -1419,12 +1455,30 @@ fn update(
     // of one. Recorded as a pending loss, which the branch that reads these flags commits.
     if matches!(instruction.effect, Effect::Test | Effect::Push) {
         if instruction.effect == Effect::Test {
+            // **The field itself counts, not only a register holding it.** A driver that writes
+            // `test dword ptr [stack_location+18h],3` is testing the control code directly, and a
+            // check that looks only at registers reads that as a test of something else entirely
+            // -- which is how a code-dependent path came to produce neither a case nor a sign of
+            // one. `source_value` is what the `cmp` path already uses for the same operand.
             let about_the_code = instruction
                 .operands
                 .first()
                 .and_then(register_full)
                 .and_then(|register| facts.registers.get(&register))
-                .is_some_and(|value| matches!(value, Value::Code { .. }));
+                .is_some_and(|value| matches!(value, Value::Code { .. }))
+                || instruction.operands.first().is_some_and(|operand| {
+                    // **Where `source_value` looks is operand one**, so the operand this cares
+                    // about has to be put there: `compare` builds the same probe for the same
+                    // reason. Passing the instruction whole resolved the immediate instead, which
+                    // is a clause that reads a `Literal` and can never match.
+                    let mut probe = instruction.clone();
+                    probe.operands = vec![Operand::Immediate(0), operand.clone()];
+                    probe.effect = Effect::Move;
+                    matches!(
+                        source_value(facts, &probe, layout, traced),
+                        Some(Value::Code { .. })
+                    )
+                });
             *lost = about_the_code.then_some(instruction.address);
         }
         return None;
@@ -1432,7 +1486,9 @@ fn update(
     let operands = &instruction.operands;
     let Some(Operand::Register(written)) = operands.first() else {
         // Writes memory, or nothing this models. A store through a register does not change what
-        // the register holds, so the facts stand.
+        // the register holds, so the facts stand -- but the `writes` loop above may have cleared
+        // one that did.
+        note_loss(facts, &carried_the_code, instruction, lost);
         return None;
     };
     let destination = written.full.clone();
@@ -1451,11 +1507,12 @@ fn update(
         {
             facts.bound = None;
         }
+        // A code clipped to sixteen bits is a code this can no longer follow, and the `je` after
+        // it is a statement about those bits -- which is a loss like any other.
+        note_loss(facts, &carried_the_code, instruction, lost);
         return None;
     }
     let held = facts.registers.get(&destination).cloned();
-    // Kept because the arms below consume `held`, and what this answers is asked after them.
-    let carried_the_code = matches!(held, Some(Value::Code { .. }));
     // The bound goes with the register it was about, unless this is the load that carries it.
     if facts.bound.as_ref().is_some_and(|bound| {
         bound.register == destination && !keeps_a_bound(instruction, &bound.register)
@@ -1607,10 +1664,7 @@ fn update(
     // merely computes with the result makes it nothing at all. Appending here marked a complete
     // map `partial` for an `and ecx,3` no branch ever looked at -- the conservative direction, and
     // still noise in the one signal that exists to be quiet.
-    if instruction.writes_flags {
-        *lost = lost_the_code(instruction, carried_the_code, facts, &destination)
-            .then_some(instruction.address);
-    }
+    note_loss(facts, &carried_the_code, instruction, lost);
     None
 }
 
@@ -3748,6 +3802,150 @@ mod tests {
         );
     }
 
+    /// **A loss crosses a block boundary, because the branch that makes it matter may not be
+    /// in the block that made it.**
+    ///
+    /// `and ecx,mask` / `ja next` / `next: je handler`. The `ja` is not an equality, so it commits
+    /// nothing; the loss lived only in the block that made it, and the `je` in the next block
+    /// found neither a compare nor a loss. The map read as complete. That is the gap
+    /// `Facts::pending` was added to close, one field along -- and a loss survives on **both**
+    /// edges where a compare does not, because nothing is known about what the operation did and
+    /// so no edge has ruled anything out.
+    #[test]
+    fn a_loss_reaches_the_branch_that_reads_it_in_a_later_block() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "and",
+                vec![reg("ecx"), imm(0xffff)],
+                Flow::Fallthrough,
+            ),
+            // Reads the flags and decides nothing this can name, so it ends the block without
+            // committing anything.
+            insn(
+                DISPATCH + 0x11,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x100)),
+            ),
+            insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+            insn(DISPATCH + 0x100, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0xb],
+            "the `je` two blocks on is still reading the `and`'s flags, and still cannot name a \
+             code for the path it takes"
+        );
+    }
+
+    /// **A register the instruction writes without naming it loses the code too.**
+    ///
+    /// The check asked one question of the **first operand**, at the end, after the instruction's
+    /// other writes had been cleared and after the narrow-write return. So `xadd eax,ecx` with the
+    /// code in `ecx`, and `sub cx,1` with it in `rcx`, both lost it in silence. It is a snapshot
+    /// now -- which registers carried the code before anything ran, against what they hold after.
+    #[test]
+    fn a_code_lost_through_a_register_the_operand_does_not_name_is_still_lost() {
+        // `sub cx,1`: a narrow write over a register holding the code, which returns before any
+        // arm and used to return before the check as well.
+        let mut narrow = prologue(DISPATCH);
+        narrow.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("rcx"), reg("r13")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("cx"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xf, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x15, "ret", Vec::new(), Flow::Return),
+        ]);
+        let found = map(DISPATCH, &narrow, Layout::X64, unreadable, in_image, never);
+        assert!(
+            found.cases.is_empty(),
+            "sixteen bits of a `ULONG` is not the code: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0xb],
+            "and the `je` reading it is a path with no code this can name"
+        );
+    }
+
+    /// **A loss is live at a join only where every path into the block left the same one.**
+    ///
+    /// It crosses both edges of a branch, so a merge can see one path that lost the code and one
+    /// that never had it -- and a block reporting a loss no path into it made is a case claimed
+    /// missing from a path that never happened. The same rule the pending compare is under, for
+    /// the same reason, and needing the same construction to see: a **back edge**, since in
+    /// reverse post-order the loss arrives first and a join that failed to drop it would keep it.
+    #[test]
+    fn a_loss_does_not_survive_a_join_with_a_path_that_has_none() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "and",
+                vec![reg("ecx"), imm(0xffff)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "jb",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x30)),
+            ),
+            // Reached by falling through with the loss live, and again from below with nothing.
+            insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+            // The other path in: its own flags, from a register that never held the code.
+            insn(
+                DISPATCH + 0x30,
+                "cmp",
+                vec![reg("rax"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x34,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x17)),
+            ),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        assert!(
+            found.untracked.is_empty(),
+            "a loss one path into the block made is not a loss the block can report: {:?}",
+            found.untracked
+        );
+    }
+
     /// **A `test` of the control code is a branch about it, and cannot be named.**
     ///
     /// `test ecx,3` / `je` takes a path whose codes this walk cannot enumerate -- and `update`
@@ -3784,6 +3982,33 @@ mod tests {
             found.untracked,
             vec![DISPATCH + 0xb],
             "but the branch reading it is a path the case list does not account for"
+        );
+
+        // **The field itself, not a register holding it.** A driver that writes
+        // `test dword ptr [stack_location+18h],3` is testing the control code directly, and a
+        // check that looks only at registers reads it as a test of something else.
+        let mut direct = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg("rax"), pointer("rdx", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "test",
+                vec![mem("rax", 0x18), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 8, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0xe, "ret", Vec::new(), Flow::Return),
+        ];
+        direct.dedup_by_key(|one| one.address);
+        let found = map(DISPATCH, &direct, Layout::X64, unreadable, in_image, never);
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 4],
+            "a test of the stack location's control-code field is a test of the code"
         );
 
         // And a `test` of something else is not about the control code at all.

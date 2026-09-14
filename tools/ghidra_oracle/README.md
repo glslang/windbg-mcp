@@ -50,12 +50,15 @@ python tools/ghidra_oracle/oracle.py
 It captures `ioctl_map`'s answer from the checked-in dump, runs both oracles over the cached image,
 and prints a table of every code with a column per implementation. What to read:
 
-- **A code only `ioctl_map` lacks, that both other implementations have**, is the
-  interesting one, and is what found the bug above. One that only *one* of them has is a
-  **candidate**: Ghidra's provenance check says a compared value came from memory, not
-  that it came from the IRP's control-code field, and tracing it to that field would be
-  this lane adopting the assumption of the pass it exists to check. So the diff reports
-  the two lists apart and neither is silently promoted.
+- **A code only `ioctl_map` lacks is a candidate, never a finding** — including one both
+  other implementations have. Ghidra admits a value because it came from memory and Driver
+  Buddy because it looks like a control code, so an unrelated loaded field compared against
+  a device-type-matching constant satisfies both: their agreement is two opinions rather
+  than provenance. Tracing the IRP's control-code field here would be this lane adopting
+  the assumption of the pass it exists to check, so the diff ranks candidates by how many
+  implementations saw them and leaves the deciding to the decompiled C beside the JSON.
+  That is how `0x6dc000` was settled: the lane pointed at it, and a handler with the name
+  string `IOCTL_MOUNTMGR_CREATE_POINT` is what made it a bug rather than a candidate.
 - **A code only Driver Buddy lacks** is the native tool being better, which is worth knowing but
   is not a defect here: it missed `0x6d4008` and `0x6d4028` on `mountmgr`.
 - **Constants that are not the driver's device type** are Driver Buddy's false positives — it
