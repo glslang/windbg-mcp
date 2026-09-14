@@ -324,19 +324,22 @@ def main() -> None:
             )
 
         print()
-        # **What one oracle alone says is a candidate, not a finding.** Ghidra's provenance check
-        # establishes that a compared value came from memory -- a length, a status and a structure
-        # member are loads too -- and tracing it to the IRP's control-code field specifically would
-        # be this lane adopting the assumption of the pass it exists to check. So a code is
-        # reported as missing when **both** other implementations have it, and listed as a
-        # candidate when only one does. Every real miss so far was corroborated: `0x6dc000` was in
-        # both.
-        corroborated = sorted((gh_codes & dbr_codes) - tool_codes)
-        candidates = sorted((gh_codes ^ dbr_codes) - tool_codes)
+        # **Nothing here is a finding, and two heuristics agreeing does not make one.** Ghidra
+        # admits a value because it came from memory; Driver Buddy because it looks like a control
+        # code. An unrelated loaded field compared against a device-type-matching constant
+        # satisfies both, so their intersection is two opinions rather than provenance -- and
+        # neither traces the IRP's control-code field, which is the only thing that would settle
+        # it. Tracing it here would be this lane adopting the assumption of the pass it exists to
+        # check, so the answer is not a better filter but a weaker claim: these are candidates,
+        # ranked by how many implementations saw them, and the decompiled C decides. That is how
+        # `0x6dc000` was settled -- the lane pointed, and a handler with a name string is what made
+        # it a finding.
+        both = sorted((gh_codes & dbr_codes) - tool_codes)
+        either = sorted((gh_codes ^ dbr_codes) - tool_codes)
         print(f"  agreed by all three             : {len(tool_codes & gh_codes & dbr_codes)}")
-        print(f"  missing from `ioctl_map`        : {corroborated}")
-        print(f"  candidates (one oracle only)    : {candidates}")
-        missing = corroborated
+        print(f"  candidates, both implementations: {both}")
+        print(f"  candidates, one implementation  : {either}")
+        missing = both + either
         print(f"  `ioctl_map` has, Driver Buddy   : {sorted(tool_codes - dbr_codes)}")
         print(f"  Driver Buddy, other device type : {sorted(dbr_all - dbr_codes)}")
         if gh_untraced:
@@ -386,9 +389,12 @@ def main() -> None:
 
         if missing:
             print()
-            print("  A code only `ioctl_map` lacks is a finding until it is explained. Read the")
-            print("  decompiled C beside the JSON: only equality compares are codes here, so a")
-            print("  name in this list is one Ghidra tested the control code against.")
+            print("  Every line above is a candidate rather than a finding: neither implementation")
+            print("  traces the IRP's control-code field, so a constant with the right device type")
+            print("  and memory provenance may still be a length, a status or a magic number that")
+            print("  `ioctl_map` was right to exclude. What settles it is the decompiled C beside")
+            print("  the JSON -- a case is a handler, usually with a name string; a bound is a")
+            print("  comparison the switch is bracketed by.")
 
 
 if __name__ == "__main__":
