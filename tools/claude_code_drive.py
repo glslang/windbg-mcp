@@ -43,7 +43,15 @@ SERVER = "windbg"
 # The same read-only fence the local harness applies, in Claude Code's naming. Anything else -
 # `launch`, `execute`, `debug_batch` - is simply not allowed, so a wrong pick is refused rather
 # than performed, and the refusal is recorded.
-ALLOWED = [f"mcp__{SERVER}__{name}" for name in sorted(drive.ALLOWED)]
+#
+# **A function, because the fence is no longer known at import time.** It is derived from the
+# served `tools/list` (`drive.adopt_fence`), which happens after the handshake - so the list this
+# used to build as a module constant would have frozen whatever the fence was *before* the run
+# knew its surface. Read per call instead, which cannot go stale.
+def allowlist():
+    return [f"mcp__{SERVER}__{name}"
+            for name in sorted(drive.SERVED or {}) if drive.permitted(name)]
+
 
 # Everything the harness itself brings. A frontier model with `Bash` can answer "what bug check
 # is in that dump" by grepping this repo, which measures the repository rather than the server.
@@ -97,7 +105,7 @@ def one_task(task, config_path):
         "claude", "-p", prompt,
         "--model", MODEL,
         "--mcp-config", config_path, "--strict-mcp-config",
-        "--allowedTools", ",".join(ALLOWED),
+        "--allowedTools", ",".join(allowlist()),
         "--disallowedTools", ",".join(DISALLOWED),
         "--system-prompt", SYSTEM,
         "--max-turns", str(MAX_TURNS),
@@ -264,6 +272,10 @@ def main():
         # losing the exception it was raised on.
         print("MCP revision negotiated:", drive.handshake())
         tools = drive.mcp("tools/list")["result"]["tools"]
+        # Same fence as the local rows, derived from the same place - so `--allowedTools` below
+        # describes the surface this cell was actually served rather than a list written months
+        # ago. `allowlist()` reads it per task, after this has run.
+        drive.adopt_fence(tools)
         offered = drive.as_ollama(tools)
         wire = json.dumps(offered, separators=(",", ":"))
         surface_bytes = len(wire)
