@@ -1445,6 +1445,8 @@ mod tests {
         use crate::structured as s;
         render(&s::DriverSurface {
             images: Vec::new(),
+            // Nothing was stopped, which is what every fixture here is about.
+            not_started: None,
             driver: "\\Driver\\mydriver".to_string(),
             address: s::addr(0x9000),
             name: Some("\\Driver\\mydriver".to_string()),
@@ -1895,6 +1897,7 @@ mod tests {
         let report = |name: &str, module: &str| {
             render(&s::DriverSurface {
                 images: Vec::new(),
+                not_started: None,
                 driver: name.to_string(),
                 address: s::addr(0x9000),
                 name: Some(name.to_string()),
