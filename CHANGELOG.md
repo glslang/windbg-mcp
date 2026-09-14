@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.17.0] - 2026-09-14
+
 ### Fixed
 
 - **Flags computed from the control code, with the code still where it was.** The loss check asked whether a register that *carried* the code had stopped carrying it, and the `test` clause beside it asked about operand **zero** -- two shape questions, each answering for the shapes somebody enumerated and answering *nothing* for the rest. `and eax,ecx` with the mask in `eax` leaves `ecx` holding the code and the `je` below reading a bit of it, and `test eax,ecx` is the same gap one operand along: no case, no `untracked`, a map reported complete. It is one question now -- does this flag write read the code, asked of every operand against the snapshot taken before the instruction ran -- which subsumes the `test` clause outright and with it every shape that clause was widened for. Its own boundary is stated rather than papered over: an operand list is not every *read* (`mul ecx` reads `eax` and names it nowhere), which is `FOLLOWUPS.md` item 75 and the same argument `Instruction::writes` was added under.
@@ -59,6 +61,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   A pending compare is now a fact that crosses edges, joined at merges the way a register's value and a bounds check already are. **Which edges it crosses is the rule and it is narrow**: the fall-through of a branch that is not `je`/`jne`, and nothing else. Past `ja K` *taken* the code is above `K` so an equality against that compare cannot hold, past `je K` not taken it is not `K`, and a case built on either would be invented -- worse than a missing one, because nothing about a fabricated case says it is fabricated.
 
 ### Added
+
+- **A second shipped skill, and this is the release that delivers it** (`skills/msrc-patch-diff/`). The plugin has shipped one skill until now, and `skills/` reaches a machine only when the plugin version moves -- so a skill merged to `main` is not yet a skill anybody has. It turns a CVE number or an MSRC URL into a reproducible comparison: the CVRF record retrieved and kept as evidence, an explicit current-and-previous-stable release pair, verified downloads, paginated similarity results from Binary Ninja Personal driving an external BinDiff, and a report that separates observed changes from CVE attribution. What it refuses to infer is written into the skill rather than left to whoever runs it -- a blank JavaScript page is not evidence that a CVE is absent, file-version ordering and PE timestamps do not establish release order, MSRC's `Supercedence` is a candidate predecessor rather than proof of adjacency, and the changes in a cumulative update do not by themselves identify the fix. `scripts/evidence.py` is pinned by `scripts/test_evidence.py` rather than by having been run once.
+
+- **The BN6 similarity work, recorded where its decisions can be audited** (`docs/binja6-similarity-plan.md`, with five investigation and acceptance notes beside it). The implementation is the companion's rather than this repo's -- `binja-windbg-mcp` PR #4, 2026-09-12 -- and what lands here is the plan it was built to and the evidence it was accepted on: a GUI export driving an external BinDiff across synthetic identical, relocated and changed PE fixtures, with the changed fixture's extra function reported unmatched and names, types, comments, bytes, generations, identities and modification flags all unchanged; and a live ARM64 handoff passing runtime-byte comparison, run-to, breakpoint and wrong-build refusal. **Native similarity needs Ultimate and is unvalidated**, which is stated rather than left to be discovered later: Ultimate was not bought, so Personal is the only path with evidence behind it. The investigations still open are `FOLLOWUPS.md` items 61-65.
 
 - **A second opinion on the driver tools** (`tools/ghidra_oracle/`), which is what found the above. The four driver tools are a native port of Driver Buddy Revolutions, and until now everything checking them came from my own reading of the same drivers: the dump-tier oracle is derived from `docs/driver-ioctl-walkthrough.md`, a hand recovery, and `src/ioctl/tests/differential.rs` runs an interpreter over fixtures written beside the pass it checks. Both are worth having and neither is independent -- a model wrong the same way twice agrees with itself, which is exactly what happened: the walkthrough's published figure had the same miss, so the assertion derived from it passed. The lane runs Ghidra's own decompiler and Driver Buddy itself over the same cached image and diffs by code. Manual, about a minute per driver, and it needs Ghidra on the host; `tools/ghidra_oracle/README.md` has the bench requirements and the three traps.
 
@@ -3745,7 +3751,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.16.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.17.0...HEAD
+[0.17.0]: https://github.com/glslang/windbg-mcp/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/glslang/windbg-mcp/compare/v0.15.0...v0.16.0
 [0.15.0]: https://github.com/glslang/windbg-mcp/compare/v0.14.0...v0.15.0
 [0.14.0]: https://github.com/glslang/windbg-mcp/compare/v0.13.2...v0.14.0
