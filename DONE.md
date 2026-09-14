@@ -96,6 +96,8 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 55](#55-windbg-mcp-a-retired-handle-cannot-release-its-own-session--done-2026-08-31) — [windbg-mcp] A retired handle cannot release its own session — done (2026-08-31)
 - [Item 57](#57-windbg-mcp-ioctl_trace-installs-a-breakpoint-and-reports-nothing-about-it--done-2026-09-02) — [windbg-mcp] `ioctl_trace` installs a breakpoint and reports nothing about it — done (2026-09-02)
 - [Item 60](#60-windbg-mcp-structured-dispatch-reachability-paths-for-the-binary-ninja-bridge--done-2026-09-10) — [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge — done (2026-09-10)
+- [Item 70](#70-dbgscope-a-path-component-is-matched-by-folding-ascii--done-2026-09-14) — [dbgscope] A path component is matched by folding ASCII — done (2026-09-14)
+- [Item 75](#75-dbgscope--windbg-mcp-an-instructions-operands-are-not-every-register-it-reads--done-2026-09-14) — [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — done (2026-09-14)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3303,3 +3305,88 @@ everything that bounded the walk.
   `src/server.rs` (the schema and the typed refusals), `docs/structured-results.md`,
   `docs/coordinates.md`.
 
+## 70. [dbgscope] A path component is matched by folding ASCII — **done** (2026-09-14)
+
+**Repo:** `dbgscope` ([#161](https://github.com/glslang/dbgscope/pull/161)), with the consumer in
+`windbg-mcp`.
+
+`Namespace::object_at` resolved each component with `object.name.eq_ignore_ascii_case(component)`.
+The object manager compares through the system's uppercase table, not through the twenty-six
+letters of ASCII, so a name differing only outside ASCII -- `K` `U+00E4` `se` against `K` `U+00C4`
+`SE`, one object to the kernel -- came back
+`ObjectError::NotFound`, which is the answer a caller acts on.
+
+**The settled shape was copied rather than re-derived, and that was the whole of the entry's
+advice.** `nt!ObpLookupDirectoryEntry` on 26100 folds one `WCHAR` at a time in three bands: `a`-`z`
+inline, nothing below `U+00C0`, and the 8-4-4 `UnicodeUpcaseTable844` trie above it. Rust's
+`to_uppercase` is the *full* Unicode mapping and is wrong in both directions -- it expands
+(`U+0130` against `i` `U+0307`, two objects made one) and it is contextual (either sigma, one
+object made two). Where a host cannot show the kernel's one-unit mapping the fold answers
+`NameMatch::Undecided`, and `object_at` does not return `NotFound` for it.
+
+**`NotFoundInPart` gained a third count rather than a fourth variant, and that is the part worth
+carrying.** The obvious shape is a variant of its own -- the message's framing is about entries
+that could not be *read*, and an undecided fold is about a comparison. It does not compose: a
+directory can have both an unreadable entry and an undecidable name at once, and two variants then
+need a third for the pair. One variant with three counts kept apart extends by one figure. They
+stay apart for the reason the first two do, plus one: a page that was out will be back, an entry
+the object manager cannot have written will not, and a name this crate could not fold is a limit of
+*this crate* -- so summing them would tell a reader to retry the one thing retrying cannot fix.
+
+**The fold is public, and `windbg-mcp`'s copy is deleted.** The entry proposed copying, and copying
+a three-band reproduction of a kernel routine into a second repository is a second thing to keep in
+step. `same_object_name` takes `&str` and folds per code unit, so `device::same_object_path` hands
+it a whole path and keeps only what is about a *path* -- the trailing separator, and the refusal to
+match a prefix -- plus the three-answer `Match` its link search is written in terms of, mapped in
+one `match`. Sixty lines of measurement against `nt!ObpLookupDirectoryEntry` exist once.
+
+**What the entry did not say is that the three-way answer is over-broad in its new caller**, which
+the tests found rather than the reading did: the fold compares whole sequences, so one directory
+entry with an undecidable name makes every *miss* in that directory `NotFoundInPart`, including
+lookups with no bearing on it. That is `FOLLOWUPS.md` item 76 -- deliberately not fixed here,
+because it changes an expectation two repositories pin with a review-settled reason.
+
+**Verified by mutation, not by a green run.** Folding `upcase` back to ASCII-only fails exactly the
+three new `object.rs` tests and nothing else; the eleven fold comparisons were also run standalone
+on the host, lifted verbatim from the committed source.
+
+## 75. [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — **done** (2026-09-14)
+
+**Repo:** `dbgscope` ([#161](https://github.com/glslang/dbgscope/pull/161)) and `windbg-mcp`.
+
+`Instruction::writes` exists because inferring a destination from the first operand is right for
+the shapes a compiler usually emits and wrong for two it also emits. The read side had the same gap
+and no equivalent, so `ioctl_map`'s loss check asked `operands` -- which names the explicit reads.
+`Instruction::reads` is the same answer in the other direction, from the same `used_registers()`
+call with the `OpAccess` filter mirrored, under the two contracts `writes` states: a register named
+as the read reaches it, and empty meaning "not decoded" rather than "reads nothing". Both halves
+now come from **one** factory call, since `used_registers()` is one list carrying every access.
+
+**The entry's own account of the gap was wrong, and finding a test is what exposed it.** Swapping
+`note_loss` to `reads` passed the whole suite, and so did putting it back -- so the clause was
+unexercised, which is the same as untested. Finding a shape that discriminates meant measuring what
+`reads` actually adds: over every flag-writing instruction iced decodes in 64-bit mode, the
+registers `reads` names that neither the operand list nor `writes` do are, for every mnemonic a
+compiler emits, the registers that form a **memory address**. The three shapes the entry named --
+`mul` reading `eax`, `cmpxchg` reading `rax`, the string instructions reading `rsi`/`rdi`/`rcx` --
+do go unnamed by the operand list, and every one of them also **writes** the register, so the
+carried-and-gone half had them already. The entry's premise held about `operands` and not about
+what the pass had.
+
+**So the shape that discriminates is `test dword ptr [rcx+8],3` with the code in `rcx`**, where all
+three clauses answer no: a memory operand has no register for `register_full`, the probe beside it
+asks about the slot rather than the base, and `test` writes no register. That is the test, and it
+asserts its own premise -- the decoder names `rcx` as a read, the operand list names no register at
+all -- so a fixture drifting off that shape fails rather than passing for a reason that is not this
+rule.
+
+**And it is conservative rather than exact, stated rather than papered over.** The flags there are
+computed from a load at an address derived from the code, not from the code. A pass that believes a
+control code is being dereferenced has lost the value whichever half is wrong, and the direction to
+be wrong in is the one that stops claiming -- which is the direction the whole of `ioctl_map` is
+already in.
+
+**What this bought is the shape of the question rather than a case that was reading short**, which
+is what the entry predicted and is worth recording as confirmed: the pass now asks the decoder
+which registers an instruction reads instead of which ones its spelling names, so the next shape
+that matters needs no clause.

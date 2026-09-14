@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-one clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -33,16 +33,17 @@ upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09
 rounds that were one default — a backwards walk refusing what it trips over rather than recognising
 what a compiler emits — and then, from the differential oracle those rounds produced, the walk
 reporting a code down the dead edge of a branch whose condition is a constant (2026-09-12), and items
-68–70 from `device_security` ([#311](https://github.com/glslang/windbg-mcp/pull/311)), where
+68–69 from `device_security` ([#311](https://github.com/glslang/windbg-mcp/pull/311)), where
 eleven rounds of review on one tool ended with its own live-kernel measurement contradicting the
 item an earlier round of it had produced (2026-09-13), and item 71 from `driver_surface`, the
 fourth driver tool, whose specification included a dispatch-to-sink traversal that did not land
 with it, and item 72 from running that tool's live-kernel tier, where a fresh attach turns out to
 leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
-against (2026-09-13), and items 73–75 from checking the four driver tools against Ghidra and Driver
-Buddy Revolutions over `mountmgr` and HEVD: an import directory the loader may have freed, the one
-section of the ported program with no counterpart here, and the read side of the decoder's
-register lists (2026-09-14).
+against (2026-09-13), items 73–74 from checking the four driver tools against Ghidra and Driver
+Buddy Revolutions over `mountmgr` and HEVD — an import directory the loader may have freed, and the
+one section of the ported program with no counterpart here (2026-09-14) — and item 76 from landing
+item 70, where the fold copied down into `dbgscope` declines a whole comparison over one code unit
+it could not decide (2026-09-14).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1122,32 +1123,6 @@ Not one callback ACE of any kind, let alone an object-callback one.
 
 **Where it picks up.** `AceKind::mask_is_access` and `read_ace` in `src/sd.rs`, and that test.
 
-## 70. [dbgscope] A path component is matched by folding ASCII
-
-**Repo:** `dbgscope`.
-
-`Namespace::object_at` resolves each component with
-`object.name.eq_ignore_ascii_case(component)`. The object manager compares through the system's
-uppercase table, not through the twenty-six letters of ASCII -- which is the same defect
-`windbg-mcp`'s `device::same_object_path` took three review rounds to settle, one repository over
-and in a function that has never been looked at for it.
-
-The settled shape is in `src/device.rs` there, and it is worth copying rather than re-deriving:
-`nt!ObpLookupDirectoryEntry` folds one `WCHAR` at a time in three bands -- `a`-`z` inline,
-nothing below `U+00C0`, and the 8-4-4 `UnicodeUpcaseTable844` trie above it -- and a comparison the
-stand-in cannot make is reported as undecided rather than as a mismatch, so a lookup never reports
-absence it has not established.
-
-- **Why deferred:** pre-existing, untouched by the PR that found it, and the maintainer called it a
-  follow-up rather than something to expand an eight-round branch into.
-- **What would close it:** the three-band fold and its `Match`-style third answer, and
-  `ObjectError::NotFound` not being returned where the fold could not decide -- `NotFoundInPart`
-  already exists for the neighbouring case and is the shape to follow.
-- **How it was found:** reading `object_at` while fixing the halt it accepts a found component
-  through (2026-09-13).
-
-**Where it picks up.** `Namespace::object_at` in `dbgscope`'s `src/object.rs`.
-
 ## 71. [windbg-mcp] `driver_surface` does not say which control code reaches which sink
 
 **Repo:** `windbg-mcp`.
@@ -1281,30 +1256,38 @@ its own code, which is what makes the walk worth starting.
 **Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
 these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
 
-## 75. [dbgscope] An instruction's operands are not every register it reads
+## 76. [dbgscope] A fold that cannot decide one code unit declines the whole comparison
 
-**Repo:** `dbgscope` (consumed by `windbg-mcp`).
+**Repo:** `dbgscope` (and, through it, `windbg-mcp`).
 
-`Instruction::writes` exists because inferring a destination from the first operand is right for
-the shapes a compiler usually emits and wrong for two it also emits -- a second explicit
-destination (`xchg eax,r13d`) and an implicit one (`mul ecx`). **The read side has the same gap and
-no equivalent.** `ioctl_map`'s loss check asks whether a flag-writing instruction reads the control
-code, and asks it of `operands`, which names the explicit reads only: `mul ecx` reads `eax` and
-names it nowhere, `cmpxchg` reads `rax`, and the string instructions read `rsi`/`rdi`/`rcx`.
+`same_object_name` folds both names and compares the two sequences whole, so *any* mismatch where
+either side carried a code unit the fold could not decide comes back `NameMatch::Undecided` --
+including a mismatch that has nothing to do with that unit. `U+00DF` against `Nothing` is
+`Undecided`, where `Different` is provable.
 
-- **Why deferred:** it is a `dbgscope` change and therefore a stacked PR, while the consuming half
-  here is one clause. Nothing currently reads short because of it -- the operand answer covers
-  every shape measured on `mountmgr` and HEVD, and the gap is in shapes neither driver has -- so
-  this is a boundary to close deliberately rather than a defect to chase.
-- **What would close it:** `Instruction::reads: Vec<RegisterOperand>` beside `writes`, from the
-  same `InstructionInfoFactory::used_registers()` call with the `OpAccess` filter mirrored
-  (`Read`, `CondRead`, `ReadWrite`, `ReadCondWrite`), under the same two contracts that field
-  states: a register named as the **read** reaches it, and empty meaning "not decoded" rather than
-  "reads nothing". Then `note_loss` asks `reads` in place of `operands`, and keeps the memory probe
-  for the control-code field, which is not a register on either list.
-- **How it was found:** review round nine of
-  [#318](https://github.com/glslang/windbg-mcp/pull/318) -- `and eax,ecx` with the mask in `eax`,
-  where the flags are computed from the code and the code never moves (2026-09-14).
+That is inherited rather than introduced: it is the shape `windbg-mcp`'s `device::same_object_path`
+settled on over three rounds, where the cost is one entry of a link search marked unknown. In
+`Namespace::object_at` the cost is larger and of a different kind -- the count is per **directory
+entry**, so one object whose name the fold cannot decide makes every *miss* in that directory
+`NotFoundInPart` rather than `NotFound`, for lookups that have no bearing on it.
 
-**Where it picks up.** `note_loss` in `src/ioctl.rs`, which is the one caller, and `written_from`
-in `dbgscope`'s `src/dbgeng.rs`, which is the filter to mirror.
+Two refinements would close it, both following from the fold's own one-to-one contract rather than
+from a new assumption. **Unequal lengths are `Different`, certainly**: a fold that maps one `WCHAR`
+to one cannot make sequences of different lengths equal, which settles `U+00DF` against `SS` --
+currently `Undecided`, and deliberately so, by an argument that predates this one. And **equal
+lengths are compared pairwise**, so the first differing pair that both sides folded with certainty
+is `Different` whatever else in the name was undecided.
+
+- **Why deferred:** item 70 was a defect to correct and this is a precision to improve, and mixing
+  them would have put a judgement call inside a copy. It also **changes a pinned expectation** --
+  `a_name_is_folded_one_code_unit_at_a_time_as_the_object_manager_folds_it` asserts `Undecided` for
+  `U+00DF` against `SS` in both repositories, with a review-settled reason -- so it is a decision to
+  take deliberately rather than a tidy-up to slip in.
+- **What would close it:** the two refinements above in `same_object_name`, the length argument
+  stated against the one-to-one contract it rests on, and both tests moved to `Different` with the
+  reason recorded. `windbg-mcp`'s `device.rs` picks it up for free, being a delegation.
+- **How it was found:** writing the `object_at` tests for item 70 and asking what a directory
+  holding one undecidable name does to every other lookup in it (2026-09-14).
+
+**Where it picks up.** `same_object_name` and `upcase` in `dbgscope`'s `src/object.rs`, and
+`device::same_object_path` in this repo for the caller that is settled around the current answer.
