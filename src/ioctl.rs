@@ -1283,13 +1283,13 @@ fn simulate(
 /// **Two ways it can be, and the second is the general one.** A register that *carried* the code
 /// and no longer does -- asked against the snapshot taken before the instruction ran, so it sees a
 /// register written implicitly (`mul ecx`) and one clipped by a narrow write (`sub cx,1`) as
-/// readily as the named destination. And an operand that **reads** the code, because flags are
+/// readily as the named destination. And an instruction that **reads** the code, because flags are
 /// computed from it without it moving anywhere: `and eax,ecx` with the mask in `eax` leaves `ecx`
 /// holding the code, and the `je` below is about a bit of it.
 ///
 /// The second subsumes every shape the first was widened for one at a time -- a `test` of a
 /// register holding the code, a `test` of the field itself, an `or`, a `mul`, a `bt` -- because it
-/// is one question over what the decoder printed rather than a clause per mnemonic. That
+/// is one question over what the decoder decoded rather than a clause per mnemonic. That
 /// distinction is the whole point: a clause answers for the shapes somebody thought of, and
 /// answers *nothing* for the rest, which is a case list that is short with nothing saying so.
 ///
@@ -1299,10 +1299,14 @@ fn simulate(
 /// rather than as a finding: what makes it matter is decided by what reads those flags, so an
 /// `and ecx,3` no branch ever looks at costs the answer nothing.
 ///
-/// **An operand list is not every read, and that is the limit of what can be asked here.**
-/// `mul ecx` reads `eax` and names it nowhere, `cmpxchg` reads `rax`, and the string instructions
-/// read `rsi`/`rdi`/`rcx` -- exactly the gap on the read side that `Instruction::writes` was added
-/// to close on the write side, and the same argument applies. `FOLLOWUPS.md` item 75.
+/// **And "reads" is the decoder's answer rather than the operand list's**, which is the same
+/// distinction one level down: an operand list names the reads an instruction was *written* with,
+/// so `mul ecx` reads `eax` and names it nowhere, `cmpxchg` reads `rax`, the string instructions
+/// read `rsi`/`rdi`/`rcx`, and `cmp dword ptr [rcx+8],5` names `rcx` only inside a memory operand.
+/// `Instruction::reads` is the gap `Instruction::writes` closed on the other side, so the register
+/// half asks that. The memory half stays a probe over the operands, because a memory operand is
+/// not a register on either list and only this pass's own view of memory can say what is in the
+/// slot it names.
 fn note_loss(
     facts: &Facts,
     carried: &[String],
@@ -1317,11 +1321,20 @@ fn note_loss(
     let gone = carried
         .iter()
         .any(|register| !matches!(facts.registers.get(register), Some(Value::Code { .. })));
-    let read = instruction.operands.iter().any(|operand| {
-        // The register half is asked of the **snapshot**, not of the facts as they stand: by the
-        // time this runs the instruction has been applied, and a destination that consumed the
-        // code no longer says it ever held one.
-        register_full(operand).is_some_and(|register| carried.contains(&register)) || {
+    // Asked of the **snapshot**, not of the facts as they stand: by the time this runs the
+    // instruction has been applied, and a destination that consumed the code no longer says it
+    // ever held one.
+    //
+    // **A register read to form an address is a read, and it is counted.** `cmp [rcx+8],5` with
+    // the code in `rcx` compares a loaded value rather than the code, so this is conservative
+    // rather than exact -- and conservative in the direction the whole pass is: what it costs is
+    // a branch reported as reading flags nobody can attribute, and what the alternative costs is a
+    // control code published because the instruction that consumed it went unmodelled.
+    let read = instruction
+        .reads
+        .iter()
+        .any(|register| carried.contains(&register.full))
+        || instruction.operands.iter().any(|operand| {
             // **Where `source_value` looks is operand one**, so the operand this cares about
             // has to be put there; `compare` builds the same probe for the same reason.
             // Passing the instruction whole resolves whatever is in that position instead,
@@ -1333,8 +1346,7 @@ fn note_loss(
                 source_value(facts, &probe, layout, traced),
                 Some(Value::Code { .. })
             )
-        }
-    });
+        });
     *lost = (gone || read).then_some(instruction.address);
 }
 
@@ -3092,6 +3104,49 @@ mod tests {
                 _ => Vec::new(),
             },
         };
+        // **Which registers the instruction reads**, as the decoder would answer -- and it is not
+        // the operand list, which is the whole reason `Instruction::reads` exists. Three
+        // departures, each measured against iced rather than reasoned about: a copy reads its
+        // source and **not** its destination; `mul`/`div` read the accumulator and name it
+        // nowhere, as `push`/`pop`/`ret` read the stack pointer; and a memory operand reads the
+        // registers that form its address wherever it appears, destination included -- writing to
+        // `[rcx+8]` reads `rcx`.
+        //
+        // Spelled out here for the reason `writes` is above: a fixture deriving this from the
+        // effect the walk branches on agrees with the code under test about a wrong answer.
+        let reads: Vec<RegisterOperand> = {
+            let mut reads: Vec<RegisterOperand> = match mnemonic {
+                "mul" | "div" => vec![named("rax")],
+                "push" | "pop" | "ret" => vec![named("rsp")],
+                _ => Vec::new(),
+            };
+            // A destination that is only written: the copies, and `pop`. Everything else here
+            // either reads its first operand as well (the arithmetic, the compares, `xchg`,
+            // `cmovcc`) or has no register destination at all.
+            let written_only = matches!(
+                effect,
+                Effect::Move | Effect::MoveSigned | Effect::LoadAddress | Effect::Pop
+            );
+            for (index, operand) in operands.iter().enumerate() {
+                let addressed_only = index == 0 && written_only;
+                let named: Vec<RegisterOperand> = match operand {
+                    Operand::Register(register) if !addressed_only => vec![register.clone()],
+                    Operand::Memory(memory) => memory
+                        .base
+                        .iter()
+                        .chain(memory.index.iter())
+                        .cloned()
+                        .collect(),
+                    _ => Vec::new(),
+                };
+                for register in named {
+                    if !reads.iter().any(|seen| seen.name == register.name) {
+                        reads.push(register);
+                    }
+                }
+            }
+            reads
+        };
         Instruction {
             address,
             bytes: String::new(),
@@ -3103,6 +3158,7 @@ mod tests {
             effect,
             condition,
             writes,
+            reads,
             // **A multiply writes the flags too**, and it is filed here under `Other` -- so a
             // fixture deriving this from the effect alone says the opposite of what the decoder
             // says (`rflags_written()`, which for `mul` is the carry and the overflow). A test

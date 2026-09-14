@@ -351,29 +351,41 @@ pub(crate) const SYMBOLIC_LINK: &str = "SymbolicLink";
 /// of a name. Neither is true of a *prefix*: a link to `\Device\HarddiskVolume1\dir` is not a
 /// link to `\Device\HarddiskVolume1`, and matching it as one would report a volume as reachable
 /// under a name that opens a file on it.
+///
+/// **The fold itself is `dbgscope`'s**, and there is one of it: the same question is asked one
+/// layer down by `Namespace::object_at`, which resolves a path component against a directory's
+/// entries, and a second copy of a three-band reproduction of `nt!ObpLookupDirectoryEntry` is a
+/// second thing to get wrong. What stays here is what is about a **path** rather than a name --
+/// the trailing separator, and the refusal to match a prefix. `dbgscope::object::same_object_name`
+/// folds one UTF-16 code unit at a time, so handing it a whole path answers as comparing the
+/// components pairwise would.
 pub(crate) fn same_object_path(one: &str, other: &str) -> Match {
-    let (one, one_sure) = upcase(one.trim_end_matches('\\'));
-    let (other, other_sure) = upcase(other.trim_end_matches('\\'));
-    match (one == other, one_sure && other_sure) {
-        // **Equal needs no certainty.** Equal sequences of code units fold to equal sequences
-        // under any per-unit table, whatever this could not say about the units themselves -- so
-        // a match is a match even where the fold is guessing.
-        (true, _) => Match::Same,
-        (false, true) => Match::Different,
-        (false, false) => Match::Unknown,
+    use dbgscope::object::NameMatch;
+    match dbgscope::object::same_object_name(
+        one.trim_end_matches('\\'),
+        other.trim_end_matches('\\'),
+    ) {
+        NameMatch::Same => Match::Same,
+        NameMatch::Different => Match::Different,
+        NameMatch::Undecided => Match::Unknown,
     }
 }
 
 /// What a fold is entitled to say about two object paths.
 ///
 /// **Three answers because two produced three rounds of review findings.** Folding is an
-/// approximation of the kernel's table -- see [`upcase`] -- and each round found a character the
-/// approximation got wrong, every one of them reported as *not a match* and so as a link that does
-/// not reach the device, while the search still called itself `Complete`. The bug was never the
-/// imperfect fold; it was a perfect claim made on top of one. A comparison that turns on a code
-/// unit this cannot fold the way the kernel does is now `Unknown`, and an `Unknown` in the search
-/// is what stops `Complete` being claimed. No character can make this answer *wrongly* any more,
-/// only vaguely.
+/// approximation of the kernel's table -- see [`dbgscope::object::same_object_name`] -- and each
+/// round found a character the approximation got wrong, every one of them reported as *not a
+/// match* and so as a link that does not reach the device, while the search still called itself
+/// `Complete`. The bug was never the imperfect fold; it was a perfect claim made on top of one. A
+/// comparison that turns on a code unit the fold cannot make the way the kernel does is now
+/// `Unknown`, and an `Unknown` in the search is what stops `Complete` being claimed. No character
+/// can make this answer *wrongly* any more, only vaguely.
+///
+/// Kept as a type of this crate's own rather than re-exported, because the three answers are named
+/// for what a **link search** does with them and the variant this module calls `Unknown` is
+/// `dbgscope`'s `Undecided`: the mapping is one `match`, and it is the only place the two
+/// vocabularies meet.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Match {
     /// One object.
@@ -382,84 +394,6 @@ pub(crate) enum Match {
     Different,
     /// They differ only where this fold cannot speak for the kernel's table.
     Unknown,
-}
-
-/// A name folded the way the object manager folds one: **one UTF-16 code unit in, one out.**
-///
-/// Read out of `nt!ObpLookupDirectoryEntry` on 26100 rather than assumed, because the first two
-/// goes at this were assumed and both were wrong. It compares a name one `WCHAR` at a time, in
-/// three bands: `U+0061`..`U+007A` gets `0x20` subtracted inline; **anything else below `U+00C0`
-/// is not folded at all**, no table being consulted for it; and at or above `U+00C0` the code unit
-/// indexes `UnicodeUpcaseTable844`, an 8-4-4 trie -- high byte, then middle nibble, then low
-/// nibble -- whose leaf is a delta added to the code unit. One unit in, one out, no expansion, no
-/// context. Case-insensitively, because `nt!ObpCaseInsensitive` is 1 on that build.
-///
-/// **Rust's `to_lowercase` is the *full* Unicode mapping, and it is wrong in both directions**,
-/// which is how two consecutive rounds of review arrived here. It **expands**: `U+0130` lowercases
-/// to `i` followed by `U+0307`, so that name and the two-code-unit spelling of it -- two objects to
-/// the kernel -- compared equal, and a link to one would be reported as reaching the other. And it
-/// is **contextual**: a sigma at the end of a word lowercases to the final form and elsewhere to
-/// the medial one, so two spellings the kernel folds together compared unequal, dropping a link
-/// that does reach the device while the search still called itself complete.
-///
-/// So the bands above are reproduced, and each earns its place. Keeping only single-code-unit
-/// results is what makes this one-to-one, and it is why `U+00DF` stays put instead of becoming
-/// `SS`. The `U+00C0` floor is why `U+00B5` stays put too, its Unicode uppercase being a Greek
-/// capital mu and so a change of script the kernel's table does not make. A surrogate is left alone
-/// because a `WCHAR` fold is handed half a character at a time and cannot fold a non-BMP letter, so
-/// two spellings of one Deseret name are genuinely two objects and folding over scalar values would
-/// merge them.
-///
-/// **What this is not is the target's own table.** That is
-/// `PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`, which is per-silo and
-/// wants a debugger -- and this module deliberately has none, so that every pass here is testable
-/// without one. What the substitution leaves is the Unicode version behind each table, for code
-/// units at or above `U+00C0`: the silo's is frozen at the target's build and this one moves with
-/// the toolchain.
-fn upcase(name: &str) -> (Vec<u16>, bool) {
-    let mut sure = true;
-    let folded = name
-        .encode_utf16()
-        .map(|unit| match unit {
-            // The comparison's own fast path, written the way it writes it.
-            0x61..=0x7a => unit - 0x20,
-            // Below the floor the kernel reaches for no table, so neither does this -- and that
-            // is knowledge rather than a guess, so certainty survives it.
-            0..=0xbf => unit,
-            _ => {
-                // A surrogate is not a scalar value, so this is also the non-BMP case: the half
-                // goes through unfolded, as the kernel's per-`WCHAR` fold leaves it. Certain for
-                // the same reason -- a `WCHAR` fold cannot reach it either.
-                let Some(one) = char::from_u32(u32::from(unit)) else {
-                    return unit;
-                };
-                let mut upper = one.to_uppercase();
-                match (upper.next(), upper.next()) {
-                    (Some(only), None) => match u16::try_from(u32::from(only)) {
-                        Ok(folded) => folded,
-                        // A BMP unit folding out of the BMP is not something this can express as
-                        // one unit, and not something to claim the kernel does either.
-                        Err(_) => {
-                            sure = false;
-                            unit
-                        }
-                    },
-                    // **The expansion case, and the one this cannot answer.** Rust offers the
-                    // *full* mapping only, so a unit whose full uppercase is several units hides
-                    // whatever its one-unit simple mapping is -- `U+1F80` expands to `U+1F08`
-                    // `U+0399` here while the kernel's table maps it to `U+1F88`, one unit, and
-                    // `U+00DF` expands to `SS` where the table leaves it alone. Both look
-                    // identical from inside this `match`, so the unit is left as it is and the
-                    // fold stops claiming to know.
-                    _ => {
-                        sure = false;
-                        unit
-                    }
-                }
-            }
-        })
-        .collect();
-    (folded, sure)
 }
 
 /// Whether an empty [`Found::links`] is a fact about the device or an absence in the search.

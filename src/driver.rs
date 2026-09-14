@@ -195,6 +195,7 @@ pub(crate) fn in_listing_order(
                 condition: None,
                 writes_flags: false,
                 writes: Vec::new(),
+                reads: Vec::new(),
             })
         })
         .collect()
@@ -1223,6 +1224,7 @@ mod tests {
             // The walk reads the flow and nothing else the decoder answers, which the test below
             // says in as many words.
             writes: Vec::new(),
+            reads: Vec::new(),
         }
     }
 

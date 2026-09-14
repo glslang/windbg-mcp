@@ -950,8 +950,9 @@ mod tests {
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
-            // are not, and neither is the register set an instruction writes.
+            // are not, and neither is either register set an instruction touches.
             writes: Vec::new(),
+            reads: Vec::new(),
         }
     }
 

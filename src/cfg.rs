@@ -231,8 +231,9 @@ mod tests {
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
-            // and nothing this fixture is about reads which registers were written.
+            // and nothing this fixture is about reads which registers were touched, either way.
             writes: Vec::new(),
+            reads: Vec::new(),
         }
     }
 

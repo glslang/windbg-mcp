@@ -9497,19 +9497,36 @@ mod tests {
         );
 
         // **And this one, which reads like the caller's and is not.** `NotFoundInPart` says the
-        // name is not among the directory entries that could be read *and some could not be*, so
-        // the object asked for may be one of those. Categorising it beside `NotFound` would send
-        // a reader to correct a device name that is very likely right, which is the mistake the
-        // dbgscope variant exists to make impossible.
+        // name is not among the directory entries this walk could compare it against *and some it
+        // could not*, so the object asked for may be one of those. Categorising it beside
+        // `NotFound` would send a reader to correct a device name that is very likely right, which
+        // is the mistake the dbgscope variant exists to make impossible.
         assert_eq!(
             category(&ObjectError::NotFoundInPart {
                 directory: "Device".into(),
                 component: "Nope".into(),
                 unreadable: 1,
                 malformed: 1,
+                undecided: 0,
             }),
             target,
             "an absence this cannot vouch for is the target's failure, not the argument's"
+        );
+
+        // **Including when the only thing it could not do is its own fold.** A name this crate
+        // cannot fold the way the object manager folds one is not a name the caller got wrong --
+        // the directory read in full, and the comparison is what fell short -- so the category has
+        // to be the same whichever of the three counts is the non-zero one.
+        assert_eq!(
+            category(&ObjectError::NotFoundInPart {
+                directory: "Device".into(),
+                component: "Nope".into(),
+                unreadable: 0,
+                malformed: 0,
+                undecided: 1,
+            }),
+            target,
+            "a fold that could not decide is this server's shortfall, not the caller's"
         );
 
         // And the rest, which are the target's: nothing the caller types changes them.
