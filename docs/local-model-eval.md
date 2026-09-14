@@ -1312,6 +1312,15 @@ Mutation-verified in both directions, because a flag that stops crying wolf can 
 stopped barking: a shared model given a different digest between the arms is still named, and so is
 a harness version bumped on a pair of runs that both carry Claude rows.
 
+**A log holding both arms is refused by every reader, from one gate.** Concatenating two arms does
+not average them — `records()` keeps the last record of each (cell, draw, task), so the later arm
+replaces the earlier cell for cell, and a reading of such a log reports one arm's scores under a
+run identity naming both. Review found that same class at three separate readers in three
+consecutive rounds — `--grade`, then `--series`, then `--matrix` and the `--compare` built on it —
+and each fix was the same check bolted to another caller. The check lives in `records()` now, which
+is the one function every reader passes through; resume is deliberately outside it, since resume
+tells the arms apart by key and appending is how such a log would be repaired.
+
 ## What this does not cover
 
 The same list `local-model.md` carries, minus what this closed. Still open: a long investigation
