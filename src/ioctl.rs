@@ -412,11 +412,19 @@ impl Facts {
             changed |= self.pending.is_some();
             self.pending = None;
         }
-        // Same rule: a loss one path into the block left is not a loss the block can report.
-        if self.lost != other.lost {
-            changed |= self.lost.is_some();
-            self.lost = None;
-        }
+        // **The opposite rule, and deliberately.** `pending` asserts a *fact* -- this
+        // comparison is live -- so every path into the block has to agree on it. A loss asserts
+        // *doubt*, and doubt on any path in is doubt here: a branch below is code-dependent on
+        // that path whatever the others did. Dropping unless the paths agreed cleared the loss
+        // whenever two arms lost the code at different instructions, which is the silent short
+        // list this field exists to prevent. The lower address is kept when both have one, so the
+        // answer does not depend on which edge the walk took first.
+        let joined = match (self.lost, other.lost) {
+            (Some(ours), Some(theirs)) => Some(ours.min(theirs)),
+            (ours, theirs) => ours.or(theirs),
+        };
+        changed |= joined != self.lost;
+        self.lost = joined;
         // A status only where **every** path into the block has one, for the reason a register's
         // value is: a refusal one path establishes is not one the block makes.
         let status = Status {
@@ -892,37 +900,30 @@ fn record(
 /// case; one carried where equality is impossible **invents** one -- a `je` there can never be
 /// taken, so the case is reported and never reached, which is worse because nothing about it says
 /// so.
-fn equality_survives(condition: Condition, carry: Carry) -> (bool, bool) {
+fn equality_survives(condition: Condition, flags: Equality) -> (bool, bool) {
     match condition {
         // The branch *is* the case, and the other edge knows the equality is false. Both are
         // already recorded where the terminator is read, so neither edge carries it on.
         Condition::Equal | Condition::NotEqual => (false, false),
-        // `ZF=1` with `CF=0`, `SF=0`, `OF=0`: the strict forms exclude equality where they branch.
-        // `ja` needs `CF=0` **and** `ZF=0`, so an equality never takes it whatever the carry.
-        Condition::UnsignedAbove
-        | Condition::SignedGreater
-        | Condition::SignedLess
-        | Condition::Negative
-        | Condition::Overflow
-        | Condition::NotParity => (false, true),
-        // The two that read carry alone, and the only two this distinction reaches.
-        Condition::UnsignedBelow => match carry {
-            Carry::Clear => (false, true),
-            Carry::Set => (true, false),
-        },
-        Condition::UnsignedAboveOrEqual => match carry {
-            Carry::Clear => (true, false),
-            Carry::Set => (false, true),
-        },
-        // And the inclusive forms admit it there, `PF=1` putting `jp` in this half rather than the
-        // other one.
-        // `jbe` is `CF=1 || ZF=1`, so an equality takes it either way.
-        Condition::UnsignedBelowOrEqual
-        | Condition::SignedGreaterOrEqual
-        | Condition::SignedLessOrEqual
-        | Condition::NotNegative
-        | Condition::NotOverflow
-        | Condition::Parity => (true, false),
+        // `ZF=1` rules these out wherever they branch, whatever else the flags hold: `ja` and `jg`
+        // both need `ZF=0`, and `js` needs the `SF=1` a zero does not leave.
+        Condition::UnsignedAbove | Condition::SignedGreater | Condition::Negative => (false, true),
+        // And `ZF=1` alone takes these, for the mirrored reason.
+        Condition::UnsignedBelowOrEqual | Condition::SignedLessOrEqual | Condition::NotNegative => {
+            (true, false)
+        }
+        // `PF=1`, always: the low byte of a zero has an even number of set bits.
+        Condition::Parity => (true, false),
+        Condition::NotParity => (false, true),
+        // Carry, which a subtraction clears and an addition reaching zero sets.
+        Condition::UnsignedBelow => (flags.carry, !flags.carry),
+        Condition::UnsignedAboveOrEqual => (!flags.carry, flags.carry),
+        // Overflow, which only an `add` of the sign bit alone sets -- and `jge`/`jl` read it
+        // against the `SF=0` a zero leaves, so they follow it exactly.
+        Condition::Overflow | Condition::SignedLess => (flags.overflow, !flags.overflow),
+        Condition::NotOverflow | Condition::SignedGreaterOrEqual => {
+            (!flags.overflow, flags.overflow)
+        }
     }
 }
 
@@ -1088,9 +1089,11 @@ fn simulate(
         last.and_then(|last| last.condition),
     ) {
         (Some(Flow::Branch(_)), Some(condition)) => {
-            // The carry an equality here would leave is the comparison's own fact.
-            let carry = compared.as_ref().map_or(Carry::Clear, |was| was.carry);
-            let (taken, fallen) = equality_survives(condition, carry);
+            // The flags an equality here would leave are the comparison's own fact.
+            let flags = compared
+                .as_ref()
+                .map_or(Equality::SUBTRACTIVE, |was| was.equality);
+            let (taken, fallen) = equality_survives(condition, flags);
             (
                 taken.then(|| compared.clone()).flatten(),
                 fallen.then(|| compared.clone()).flatten(),
@@ -1319,28 +1322,52 @@ fn scalar_of(facts: &Facts, operand: Option<&Operand>) -> Option<u64> {
     }
 }
 
-/// The flag state an **equality** against a comparison would leave.
+/// The flags an **equality** against a comparison would leave.
 ///
-/// Zero is zero however it is reached, so `ZF`, `SF` and `PF` agree -- but the carry does not. A
-/// subtraction reaching zero borrowed nothing (`CF=0`); an addition reaching zero summed to exactly
-/// 2^32 and carried out of it (`CF=1`). `jae` and `jb` read carry alone, so they are the two
-/// conditions whose feasible edge depends on which this was.
+/// Zero is zero however it is reached, so `ZF=1`, `SF=0` and `PF=1` hold whatever produced it. The
+/// other two depend on how:
+///
+/// | reached by | `CF` | `OF` |
+/// |---|---|---|
+/// | `cmp`/`sub`, or an `add` of nothing | 0 | 0 |
+/// | `add K` | 1 -- the operands summed to 2^32 | 1 only when `K` is the sign bit alone, where both are `INT_MIN` |
+///
+/// **Carried with the comparison rather than assumed by whoever reads it**, which is the
+/// arrangement `proved` has with [`Value::Code`] and for the same reason: how a value was arrived
+/// at is a fact about that value. Modelled as one flag first, and that was wrong twice over --
+/// carry alone leaves `jno`, `jge` and `jl` reading a state nobody recorded.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Carry {
-    /// From `cmp` or `sub`, or an `add` of nothing: equal values do not borrow.
-    Clear,
-    /// From an `add` that wrapped to zero: the operands summed to 2^32 and carried out.
-    Set,
+struct Equality {
+    carry: bool,
+    overflow: bool,
+}
+
+impl Equality {
+    /// What a `cmp` or a `sub` leaves: equal values neither borrow nor overflow.
+    const SUBTRACTIVE: Self = Self {
+        carry: false,
+        overflow: false,
+    };
+
+    /// What an `add` of `by` leaves, at a destination `width` bytes wide.
+    fn after_add(by: u64, width: u32) -> Self {
+        match by {
+            0 => Self::SUBTRACTIVE,
+            _ => Self {
+                carry: true,
+                // Signed overflow needs both operands negative and the result not, which for a sum
+                // of exactly 2^n happens only when each is the sign bit alone.
+                overflow: by == 1u64 << (width * 8 - 1),
+            },
+        }
+    }
 }
 
 /// The state one compare leaves for the branch that reads it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Compared {
-    /// What an equality here would leave in the carry flag. Carried **with** the comparison rather
-    /// than assumed by whoever reads it, for the reason `proved` travels with `Value::Code`: how a
-    /// value was arrived at is a fact about that value, and a rule that guesses it is wrong for
-    /// every shape nobody thought of.
-    carry: Carry,
+    /// The flags an equality here would leave. See [`Equality`].
+    equality: Equality,
     /// The control code the compare is about, when it is about one.
     code: Option<u64>,
     /// Whether the value compared was traced from the IRP rather than taken from a displacement.
@@ -1581,8 +1608,8 @@ fn update(
                     }),
                 );
                 return Some(Compared {
-                    // A `sub` reaching zero borrowed nothing.
-                    carry: Carry::Clear,
+                    // A `sub` reaching zero borrowed nothing and overflowed nothing.
+                    equality: Equality::SUBTRACTIVE,
                     code: (shift == 0).then_some(offset as u64),
                     proved,
                     index: Some((destination, offset, shift)),
@@ -1616,14 +1643,10 @@ fn update(
                     }),
                 );
                 return Some(Compared {
-                    // **An `add` reaching zero carried out of the field.** For the
-                    // result to be zero the operands summed to exactly 2^32, so `CF=1`
-                    // -- unless nothing was added, which leaves the value and its
-                    // flags alone.
-                    carry: match immediate {
-                        0 => Carry::Clear,
-                        _ => Carry::Set,
-                    },
+                    // **An `add` reaching zero carried out of the field**, and overflowed
+                    // as well when what was added was the sign bit alone -- the one case where
+                    // both operands are `INT_MIN` and the sum is not negative.
+                    equality: Equality::after_add(immediate, written.width),
                     code: (shift == 0).then_some(offset as u64),
                     proved,
                     index: Some((destination, offset, shift)),
@@ -1827,7 +1850,7 @@ fn compare(
             && shift == 0
         {
             return Some(Compared {
-                carry: Carry::Clear,
+                equality: Equality::SUBTRACTIVE,
                 code: bound.map(|value| value.wrapping_add(offset as u64)),
                 proved,
                 index: None,
@@ -1855,8 +1878,8 @@ fn compare(
             shift,
             proved,
         } => Some(Compared {
-            // A `cmp`: equal values borrow nothing.
-            carry: Carry::Clear,
+            // A `cmp`: equal values borrow nothing and overflow nothing.
+            equality: Equality::SUBTRACTIVE,
             // A shifted register is an index into a table, not a code: the low bits the shift
             // dropped are not this compare's to claim. The compare is still reported, because it
             // is the bounds check a jump table needs.
@@ -3562,6 +3585,67 @@ mod tests {
         );
     }
 
+    /// **An `add` of the sign bit alone overflows as well as carrying.**
+    ///
+    /// `0x80000000 + 0x80000000` is zero with `CF=1` **and** `OF=1`: both operands are `INT_MIN`
+    /// and the sum is not negative, which is the one addition where that happens. `jno`, `jge` and
+    /// `jl` read overflow, so they flip too -- and modelling the carry alone left them reading a
+    /// state nobody had recorded, which is what "carry the flags" was supposed to have fixed the
+    /// round before.
+    #[test]
+    fn an_add_of_the_sign_bit_overflows_as_well_as_carrying() {
+        let after = |step: u64, mnemonic: &str| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("ecx"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "add",
+                    vec![reg("ecx"), imm(step)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x11,
+                    mnemonic,
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x100)),
+                ),
+                insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
+                insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+                insn(
+                    DISPATCH + 0x100,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(0x980)),
+                ),
+                insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
+            ]);
+            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+                .cases
+                .iter()
+                .map(|case| case.lands)
+                .collect::<Vec<_>>()
+        };
+
+        // `jno` after an ordinary `add`: no overflow, so it is taken and the case is at its target.
+        assert_eq!(
+            after(4, "jno"),
+            vec![0x980],
+            "an add of four does not overflow, so the branch reading `OF=0` is taken"
+        );
+        // And after an `add` of the sign bit: overflow, so it is not, and the case falls through.
+        assert_eq!(
+            after(0x8000_0000, "jno"),
+            vec![0x900],
+            "two `INT_MIN`s summing to zero overflowed, so that branch is not taken"
+        );
+    }
+
     /// **Parity and overflow are decidable too, and were the two arms that had it wrong.**
     ///
     /// `cmp a,b` with `a == b` computes zero, which fixes `OF=0` and `PF=1` -- the low byte `0x00`
@@ -3891,15 +3975,19 @@ mod tests {
         );
     }
 
-    /// **A loss is live at a join only where every path into the block left the same one.**
+    /// **A loss survives a join that any path into the block made, which is the opposite of the
+    /// rule the pending compare is under.**
     ///
-    /// It crosses both edges of a branch, so a merge can see one path that lost the code and one
-    /// that never had it -- and a block reporting a loss no path into it made is a case claimed
-    /// missing from a path that never happened. The same rule the pending compare is under, for
-    /// the same reason, and needing the same construction to see: a **back edge**, since in
-    /// reverse post-order the loss arrives first and a join that failed to drop it would keep it.
+    /// `pending` asserts a **fact** -- this comparison is live -- so every path has to agree on it,
+    /// and one that disagrees takes it away. A loss asserts **doubt**, and doubt on any path in is
+    /// doubt here: the branch below is code-dependent on that path whatever the others did.
+    ///
+    /// This test asserted the opposite until 2026-09-14, on reasoning that does not survive being
+    /// read back -- "a loss no path into the block made" describes a thing that did not happen,
+    /// because the loss *was* made on one of them. Two arms losing the code at different
+    /// instructions then cleared it entirely, and the map read as complete.
     #[test]
-    fn a_loss_does_not_survive_a_join_with_a_path_that_has_none() {
+    fn a_loss_any_path_made_is_a_loss_the_join_keeps() {
         let mut block = prologue(DISPATCH);
         block.extend([
             insn(
@@ -3920,10 +4008,10 @@ mod tests {
                 Vec::new(),
                 Flow::Branch(Some(DISPATCH + 0x30)),
             ),
-            // Reached by falling through with the loss live, and again from below with nothing.
+            // Reached by falling through with the loss live, and again from below with a path
+            // that never held the code.
             insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
             insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
-            // The other path in: its own flags, from a register that never held the code.
             insn(
                 DISPATCH + 0x30,
                 "cmp",
@@ -3939,11 +4027,13 @@ mod tests {
         ]);
 
         let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
-        assert!(
-            found.untracked.is_empty(),
-            "a loss one path into the block made is not a loss the block can report: {:?}",
-            found.untracked
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0xb],
+            "one path into that `je` cannot name a code for it, which makes the case list a lower \
+             bound whatever the other path did"
         );
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
     }
 
     /// **A `test` of the control code is a branch about it, and cannot be named.**
