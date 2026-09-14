@@ -3333,22 +3333,46 @@ stay apart for the reason the first two do, plus one: a page that was out will b
 the object manager cannot have written will not, and a name this crate could not fold is a limit of
 *this crate* -- so summing them would tell a reader to retry the one thing retrying cannot fix.
 
-**The fold is public, and `windbg-mcp`'s copy is deleted.** The entry proposed copying, and copying
-a three-band reproduction of a kernel routine into a second repository is a second thing to keep in
-step. `same_object_name` takes `&str` and folds per code unit, so `device::same_object_path` hands
-it a whole path and keeps only what is about a *path* -- the trailing separator, and the refusal to
-match a prefix -- plus the three-answer `Match` its link search is written in terms of, mapped in
-one `match`. Sixty lines of measurement against `nt!ObpLookupDirectoryEntry` exist once.
+**The fold is public, and `windbg-mcp`'s copy is deleted.** The entry proposed copying, and
+copying a three-band reproduction of a kernel routine into a second repository is a second thing to
+keep in step. `same_object_name` takes `&str` and folds per code unit, so `device::same_object_path`
+hands it a whole path and keeps only what is about a *path* -- the trailing separator, and the
+refusal to match a prefix.
 
-**What the entry did not say is that the three-way answer is over-broad in its new caller**, which
-the tests found rather than the reading did: the fold compares whole sequences, so one directory
-entry with an undecidable name makes every *miss* in that directory `NotFoundInPart`, including
-lookups with no bearing on it. That is `FOLLOWUPS.md` item 76 -- deliberately not fixed here,
-because it changes an expectation two repositories pin with a review-settled reason.
+**And then the reproduction itself turned out to be the bug, which no part of this entry
+predicted.** The fold was `char::to_uppercase`, and `std` exposes only the **full** Unicode case
+mapping -- so 102 code units had no one-unit answer and the fold declined to speak for them. That
+was the known limit, and it drove a three-way `NameMatch` with an `Undecided` arm. Checked against
+a live 26100 kernel's own `RtlNlsState.UnicodeUpcaseTable844`, dumped over KD and walked as an
+8-4-4 trie, there were **224 further code units where the fold was confident and wrong** -- folding
+where Windows does not, so two objects compared equal. `U+0131`'s Unicode simple uppercase is `I`
+and the system's table leaves it alone, so `\Device\ı` and `\Device\I` were one object. Windows'
+table is not Unicode's: it declines mappings that would break round-tripping (`U+0131`, `U+017F`,
+the titlecase digraphs) and predates the `U+A7xx` additions.
 
-**Verified by mutation, not by a green run.** Folding `upcase` back to ASCII-only fails exactly the
-three new `object.rs` tests and nothing else; the eleven fold comparisons were also run standalone
-on the host, lifted verbatim from the committed source.
+**So the fold is performed rather than reproduced**, by calling the `RtlUpcaseUnicodeChar` that
+`nt!ObpLookupDirectoryEntry` calls -- established by disassembling it on that target, where it has
+two `bl` sites to that function and inlines the same trie against the same table pointer. The two
+bands that read no table (`a`-`z` inline, and the `U+00C0` floor) stay reproduced, because those
+are knowledge rather than guesses.
+
+**Which deleted the three-way answer rather than fixing it.** `NameMatch::Undecided`,
+`Match::Unknown`, `NotFoundInPart`'s `undecided` count and `device_security`'s `links_unfolded`
+all existed because a stand-in could not speak for the table; performing the fold leaves no
+comparison undecided, so every one of them lost its producer. `FOLLOWUPS.md` item 76 -- filed
+during this work, about the stickiness of that third answer -- was deleted unbuilt for the same
+reason. **The general lesson is the one the `device.rs` comment had inverted**: it said no
+character could make the fold answer *wrongly* any more, only vaguely, and the opposite was true.
+Three rounds of review had hardened the *reporting* of an approximation nobody had checked against
+the thing it approximated.
+
+**What is left is one assumption, and it is `FOLLOWUPS.md` item 77**: the call reads the debugger
+host's NLS table rather than the target's. Measured identical across all 65,536 units on this
+bench, and nothing detects a host and target of different vintages.
+
+**Verified by mutation, not by a green run.** Restoring the `char::to_uppercase` reproduction fails
+exactly the two tests that are about the table and nothing else; folding `upcase` back to
+ASCII-only fails the three `object.rs` fold tests.
 
 ## 75. [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — **done** (2026-09-14)
 
