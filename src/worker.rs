@@ -8025,13 +8025,26 @@ fn ioctl_map_of(
 /// be true in one moment, and reporting a deadline for a break somebody just asked for sends them
 /// to the timeout setting instead of to their own request.
 fn attribution_stop(e: &DebugEngine, deadline: Instant) -> Option<structured::WalkHalt> {
-    if matches!(e.interrupted(), Ok(true)) {
-        Some(structured::WalkHalt::Interrupted)
-    } else if Instant::now() >= deadline {
-        Some(structured::WalkHalt::Deadline)
-    } else {
-        None
+    match e.interrupted() {
+        Ok(true) => Some(structured::WalkHalt::Interrupted),
+        _ => clock_stopped(deadline, Instant::now()).then_some(structured::WalkHalt::Deadline),
     }
+}
+
+/// Whether this call's clock leaves enough to be worth starting something with.
+///
+/// **The same predicate the children use, and it has to be**, which is what this function exists
+/// to guarantee. The composite gate asked `now >= deadline`; every child asks [`remaining`], which
+/// is [`walk_budget_ms`] and answers `None` as soon as the remainder rounds down to **zero
+/// milliseconds**. Between the two sat a sub-millisecond band where the composite started a
+/// section and its child refused at once having read nothing -- reported as an ordinary `error`
+/// with `not_started` absent, which is the ambiguity that field was added to remove.
+///
+/// The other way round was considered and is worse: flooring the child at 1ms so it runs anyway
+/// would hand `execute_command_bounded` a budget of zero, which arms no watchdog at all --
+/// [`walk_budget_ms`] says why. So the outer gate adopts the inner definition, not the reverse.
+fn clock_stopped(deadline: Instant, now: Instant) -> bool {
+    walk_budget_ms(deadline, now).is_none()
 }
 
 /// Attribution that stops asking the engine once the caller's clock has run out.
@@ -8760,6 +8773,53 @@ mod tests {
             "the arm that diagnoses from the inventory's size is the one that reads it, and it \
              reads it exactly once"
         );
+    }
+
+    /// **A section is not started with a budget its own child will refuse.**
+    ///
+    /// The composite gate and every child's preflight have to mean the same thing by "no time
+    /// left", and for a while they did not: this asked `now >= deadline` while `remaining` --
+    /// which is `walk_budget_ms` -- refuses as soon as the remainder rounds down to zero
+    /// milliseconds. In the band between them the survey started a section, its child refused at
+    /// once having read nothing, and that came back as an ordinary `error` with `not_started`
+    /// absent: a section that did not run because of this call's budget, reported without the one
+    /// field that says so.
+    ///
+    /// Asserted at the boundary rather than by checking the two call the same function, which is
+    /// true by construction and pins nothing. Half a millisecond is the case that was wrong.
+    #[test]
+    fn a_section_is_not_started_with_a_budget_its_child_would_refuse() {
+        let now = std::time::Instant::now();
+        let stopped = |micros: u64| super::clock_stopped(now + Duration::from_micros(micros), now);
+
+        assert!(
+            stopped(0),
+            "a deadline already reached leaves nothing to spend"
+        );
+        assert!(
+            stopped(500),
+            "and neither does half a millisecond: `walk_budget_ms` rounds it to a budget of zero, \
+             which arms no watchdog, so the child refuses -- the survey must not have started a \
+             section on it"
+        );
+        assert!(stopped(999), "nor 999us, for the same arithmetic");
+        assert!(
+            !stopped(1_000),
+            "a whole millisecond is a budget the child accepts, so the section starts"
+        );
+        assert!(!stopped(60_000));
+
+        // The other half of the same fact: what this gate refuses is exactly what `remaining`
+        // refuses. Checked through `walk_budget_ms`, which is the definition both sides read.
+        for micros in [0u64, 1, 500, 999, 1_000, 1_500, 60_000] {
+            let deadline = now + Duration::from_micros(micros);
+            assert_eq!(
+                super::clock_stopped(deadline, now),
+                super::walk_budget_ms(deadline, now).is_none(),
+                "the gate before a section and the budget inside it are one predicate, or the \
+                 band between them is a section started to be refused: {micros}us"
+            );
+        }
     }
 
     /// **A refused section carries the failure's own message, not a second account of it.**
