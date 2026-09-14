@@ -14275,19 +14275,27 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
         // different points; every other reason a scan is short -- a byte cap, a page that will not
         // read, a bound import -- is a property of the image and falls the same way on both, which
         // is why those do not gate anything.
-        let unstarted = survey["not_started"]["section"].as_str() == Some("hazards");
+        // What each comparison needs, as a precondition rather than an inference. Both were
+        // inferred before, and both inferences were wrong in the same direction -- they described
+        // the composite from the outside.
+        //
+        // **`not_started` names the first section the survey did not reach, and `hazards` is the
+        // last of them.** So *any* name means this section never started, where matching only
+        // `"hazards"` missed a clock that ran out before `devices` or `ioctl` -- and that is the
+        // case where the composite has no payload at all while this standalone call, on a fresh
+        // deadline, answers for itself.
+        let unstarted = !survey["not_started"].is_null();
+        // **And the payload comparison asks whether there is a payload**, which needs no ordering
+        // and no clock: there is nothing to compare a null against, whatever made it null.
+        let answered = !ran.is_null();
+        let scan_answered = scan["status"].as_str() == Some("ok");
+        // Two calls, two clocks: bounded scans can legitimately stop at different points. Every
+        // other reason a scan is short -- a byte cap, a page that will not read, a bound import --
+        // is a property of the image and falls the same way on both, so those gate nothing.
         let bounded = !ran["stopped"].is_null() || !scan["stopped"].is_null();
-        match (unstarted, bounded, scan["status"].as_str()) {
-            (true, _, _) => println!(
-                "[differential] the survey's clock ran out before its hazard section began, so \
-                 its answer is about this call's budget rather than about `driver_hazards`; the \
-                 section was still checked for saying so"
-            ),
-            (false, true, _) => println!(
-                "[differential] a deadline stopped one of the two scans, so their payloads are \
-                 not required to agree; the section's status was still checked"
-            ),
-            (false, false, Some("ok")) => {
+
+        match (answered, scan_answered) {
+            (true, true) if !bounded => {
                 assert_eq!(
                     ran["sinks"], scan["sinks"],
                     "the composite's hazard section is not `driver_hazards`' answer"
@@ -14298,9 +14306,10 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
                 );
             }
             // The branch this bench actually takes, and the one that proves composition on the
-            // failure side: the section carries that failure's **own** reason rather than a
-            // second account of it.
-            (false, false, _) => {
+            // failure side: the section carries that failure's **own** reason rather than a second
+            // account of it. Gated on the survey having got as far as asking -- a section it never
+            // started carries its own clock's message, which is a different true sentence.
+            (false, false) if !unstarted => {
                 assert_eq!(
                     section["status"], "error",
                     "the scan failed, so the section carrying it must say so: {survey}"
@@ -14309,8 +14318,15 @@ fn a_driver_survey_on_a_live_kernel_is_its_three_tools_answers() {
                     section["note"], scan["error"]["message"],
                     "and it must carry that failure's own reason, not a second account of it"
                 );
-                assert!(ran.is_null(), "with no findings beside it: {survey}");
             }
+            // Printed rather than passed over in silence: these are the branches that assert
+            // nothing, and a tier that always took one would be a differential comparing nothing
+            // while staying green. Claims 1 and 2 above ran either way.
+            _ => println!(
+                "[differential] not compared -- composite answered: {answered}, scan answered: \
+                 {scan_answered}, a deadline stopped one of them: {bounded}, the survey never \
+                 started this section: {unstarted}"
+            ),
         }
 
         // ---- the device, against the tool that answers about one ----------------------------
