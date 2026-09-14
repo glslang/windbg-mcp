@@ -974,8 +974,8 @@ where an instruction nobody anticipated falls out rather than falls through.
 - **What would close it:** `follow_table` replaced by a small set of named idioms — the one-table
   `lea`/`mov`/`add`/`jmp` form, the two-table dense switch, and the 32-bit `jmp [table+idx*4]` —
   each matched forwards over the block with its own test, and the refusals that exist today deleted
-  rather than kept beside them. `mountmgr` in the checked-in dump is the oracle: 45 case records
-  over 23 codes with both 81-entry tables followed, asserted by
+  rather than kept beside them. `mountmgr` in the checked-in dump is the oracle: 48 case records
+  over 24 codes with both 81-entry tables followed, asserted by
   `an_ioctl_map_of_a_driver_in_a_dump_is_its_chain_and_both_its_tables`.
 - **What it costs meanwhile:** nothing a measured driver shows. Every refusal added on #305 left
   that oracle unmoved, which is the evidence that these shapes are adversarial rather than

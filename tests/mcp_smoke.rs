@@ -9699,10 +9699,23 @@ fn an_ioctl_map_of_a_driver_in_a_dump_is_its_chain_and_both_its_tables() {
         .collect();
     assert_eq!(
         (cases.len(), codes.len()),
-        (45, 23),
-        "45 records over 23 codes is what the walkthrough publishes: {codes:?}"
+        (48, 24),
+        "48 records over 24 codes: {codes:?}"
     );
-    for tier in ["0x006d0008", "0x006d4020", "0x006dc004", "0x006dc054"] {
+    // **`0x6dc000` is here because two independent tools said so and this one did not.** It was
+    // `45` over `23` until 2026-09-14, taken from the walkthrough beside it -- which is my own
+    // hand recovery of this driver, so the assertion and the prose it came from encoded the same
+    // miss and agreed with each other about it. Ghidra's decompiler
+    // (`if (uVar4 == 0x6dc000) { "IOCTL_MOUNTMGR_CREATE_POINT"; ... }`) and Driver Buddy
+    // Revolutions both report it, at the same site. See
+    // `ioctl::tests::a_compare_read_by_a_second_branch_is_still_the_same_compare`.
+    for tier in [
+        "0x006d0008",
+        "0x006d4020",
+        "0x006dc000",
+        "0x006dc004",
+        "0x006dc054",
+    ] {
         assert!(
             codes.contains(tier),
             "the walkthrough's own example codes are in the map: {codes:?}"
