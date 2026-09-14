@@ -854,6 +854,42 @@ fn record(
     }
 }
 
+/// The edges a pending compare survives on: `(taken, fall-through)`.
+///
+/// **Which is a question about the condition, not about the mnemonic family.** `cmp code,K` / `ja`
+/// leaves equality possible where it falls through (`code <= K`); `jbe` leaves it possible where it
+/// **branches** (`code <= K` again, reached the other way). Carrying the compare down the wrong one
+/// costs a case at the edge that admits equality and invents one at the edge that forbids it -- a
+/// `je` there can never be taken, so the case is reported and never reached.
+///
+/// The decoder names strict and inclusive apart, so this needs no guessing. Two families are worth
+/// saying out loud: `js`/`jns` behave like a strict/inclusive pair, because a difference that is
+/// negative cannot be zero and one that is not negative may be; and `jo`/`jp` and their negations
+/// constrain equality on **neither** edge, so the compare is still live on both.
+fn equality_survives(condition: Condition) -> (bool, bool) {
+    match condition {
+        // The branch *is* the case, and the other edge knows the equality is false. Both are
+        // already recorded where the terminator is read, so neither edge carries it on.
+        Condition::Equal | Condition::NotEqual => (false, false),
+        // Strict: taken rules equality out, fall-through leaves it open.
+        Condition::UnsignedAbove
+        | Condition::UnsignedBelow
+        | Condition::SignedGreater
+        | Condition::SignedLess
+        | Condition::Negative => (false, true),
+        // Inclusive: the other way round.
+        Condition::UnsignedAboveOrEqual
+        | Condition::UnsignedBelowOrEqual
+        | Condition::SignedGreaterOrEqual
+        | Condition::SignedLessOrEqual
+        | Condition::NotNegative => (true, false),
+        // These say nothing about equality either way, so neither edge has ruled it out.
+        Condition::Overflow | Condition::NotOverflow | Condition::Parity | Condition::NotParity => {
+            (true, true)
+        }
+    }
+}
+
 /// Walks one block: what its instructions do to the facts, and what its terminator recognises.
 ///
 /// `reader` is `Some` only on the pass that records, so a table is read once however many times the
@@ -885,6 +921,10 @@ fn simulate(
     let mut compared: Option<Compared> = facts.pending.take();
     let mut traced = false;
     let mut untracked = Vec::new();
+    // The loss the last flag-writing instruction left, carried exactly as `compared` is: whether
+    // it matters is decided by what reads those flags, which is the terminator's business.
+    let mut just_lost: Option<u64> = None;
+    let mut lost: Option<u64> = None;
     let mut blind = 0usize;
     let mut cases = Vec::new();
     let mut table = None;
@@ -900,7 +940,7 @@ fn simulate(
         if position == terminator {
             break;
         }
-        let next = update(&mut facts, instruction, layout, &mut traced, &mut untracked);
+        let next = update(&mut facts, instruction, layout, &mut traced, &mut just_lost);
         // **A compare survives anything that does not write the flags.** A compiler puts the
         // setup for the case block between the compare and its branch -- `cmp r13d,N` /
         // `mov rbx,rcx` / `je handler` -- and dropping the pending compare there loses the case
@@ -914,8 +954,10 @@ fn simulate(
         // instructions.
         if matches!(instruction.flow, Flow::Call(_)) {
             compared = None;
+            lost = None;
         } else if instruction.writes_flags {
             compared = next;
+            lost = just_lost.take();
         }
     }
 
@@ -924,6 +966,19 @@ fn simulate(
     if let Some(last) = last {
         match last.flow {
             Flow::Branch(target) => {
+                // **A branch reading flags an unmodelled instruction wrote.** The compare is gone,
+                // so there is a test on the control code here that cannot be named -- which is the
+                // case the list would otherwise be short of with nothing saying so. Committed here
+                // rather than where the value was lost, because an instruction nothing branches on
+                // costs the answer nothing.
+                // `compared` is deliberately not consulted: a flag-writing instruction
+                // either leaves a compare or loses the code, never both, so `lost` being set
+                // already means there is no compare here. Asserting it as well was dead.
+                if let Some(at) = lost
+                    && matches!(last.condition, Some(Condition::Equal | Condition::NotEqual))
+                {
+                    untracked.push(at);
+                }
                 if let (Some(was), Some(condition)) = (compared.as_ref(), last.condition) {
                     match (condition, was.code) {
                         (Condition::Equal, Some(code)) => {
@@ -972,7 +1027,7 @@ fn simulate(
                 // A call at the end of a block is ordinary: the block continues after it, and the
                 // callee is not this function's edge. Its effect on the registers is the one thing
                 // that matters here.
-                compared = update(&mut facts, last, layout, &mut traced, &mut untracked);
+                compared = update(&mut facts, last, layout, &mut traced, &mut just_lost);
             }
         }
     }
@@ -987,19 +1042,22 @@ fn simulate(
     let mut carried = facts.clone();
     carried.bound = None;
     carried.pending = None;
-    // **A compare outlives the branch that reads it, on the edge where its flags still mean
-    // something.** See [`Facts::pending`] for why this is the fall-through of a branch that is
-    // neither `je` nor `jne` and nothing else.
-    let onward = match (
+    // **A compare outlives the branch that reads it, on whichever edges that branch has not ruled
+    // equality out on.** See [`equality_survives`]: `ja` leaves it live where it falls through and
+    // `jbe` where it branches, and getting that backwards loses a case on one edge and invents one
+    // on the other.
+    let (onward_taken, onward_fallen) = match (
         last.map(|last| last.flow),
         last.and_then(|last| last.condition),
     ) {
-        (Some(Flow::Branch(_)), Some(condition))
-            if !matches!(condition, Condition::Equal | Condition::NotEqual) =>
-        {
-            compared.clone()
+        (Some(Flow::Branch(_)), Some(condition)) => {
+            let (taken, fallen) = equality_survives(condition);
+            (
+                taken.then(|| compared.clone()).flatten(),
+                fallen.then(|| compared.clone()).flatten(),
+            )
         }
-        _ => None,
+        _ => (None, None),
     };
     if let (Some(last), Some(was)) = (last, compared.as_ref())
         && let (Flow::Branch(target), Some(condition)) = (last.flow, last.condition)
@@ -1038,14 +1096,16 @@ fn simulate(
             proved: was.proved,
         });
         if let Some(fall_through) = fall_through {
-            bounded.pending = onward.clone();
+            bounded.pending = onward_fallen.clone();
             to.push((fall_through, bounded));
         }
         if let Some(taken) = target
             .and_then(|target| index_of.get(&target))
             .and_then(|&at| graph.holding(at))
         {
-            to.push((taken, carried.clone()));
+            let mut edge = carried.clone();
+            edge.pending = onward_taken.clone();
+            to.push((taken, edge));
         }
     } else {
         // **A bound survives a branch that is about something else.** It is a claim about one
@@ -1054,11 +1114,21 @@ fn simulate(
         // never had it. Clearing it here as well would mean a bounds check only ever reaches the
         // block immediately after it, so a compiler that puts an unrelated test in between leaves
         // a switch unresolved -- an answer reported as a lower bound for no reason in the code.
+        // The taken edge is the branch's own target; every other successor of a block that
+        // does not branch carries nothing, which is what `equality_survives` answers `(false,
+        // false)` for.
+        let taken = match last.map(|last| last.flow) {
+            Some(Flow::Branch(Some(target))) => {
+                index_of.get(&target).and_then(|&at| graph.holding(at))
+            }
+            _ => None,
+        };
         for &successor in &graph.blocks[index].successors {
             let mut edge = facts.clone();
-            edge.pending = match Some(successor) == fall_through {
-                true => onward.clone(),
-                false => None,
+            edge.pending = match (Some(successor) == fall_through, Some(successor) == taken) {
+                (true, _) => onward_fallen.clone(),
+                (_, true) => onward_taken.clone(),
+                _ => None,
             };
             to.push((successor, edge));
         }
@@ -1152,6 +1222,23 @@ fn immediate_of(operand: &Operand) -> Option<u64> {
     }
 }
 
+/// One step of the dispatch arithmetic, in the width the value actually has.
+///
+/// A control code is a `ULONG`: the machine computes `code - offset` modulo 2^32, so the offset
+/// this pass carries has to move the same way. Widened to `i64` and added, a step of `0xfffffffc`
+/// -- which is how a register carries `-4` -- leaves an offset past `u32::MAX`, and `push_case`
+/// drops a code that does not fit one **silently**, with nothing in the answer saying a case went.
+/// The immediate path had the same hole; carrying the step in a register is what made it
+/// reachable.
+fn stepped(offset: i64, by: u64, forward: bool) -> i64 {
+    let base = offset as u32;
+    let step = by as u32;
+    i64::from(match forward {
+        true => base.wrapping_add(step),
+        false => base.wrapping_sub(step),
+    })
+}
+
 /// The constant an operand stands for: an immediate, or a register this pass watched a literal
 /// move into.
 ///
@@ -1214,7 +1301,7 @@ fn update(
     instruction: &Instruction,
     layout: Layout,
     traced: &mut bool,
-    untracked: &mut Vec<u64>,
+    lost: &mut Option<u64>,
 ) -> Option<Compared> {
     // Where the status stands after this instruction, asked **before** it is applied because a
     // store reads its base as it stands. A compare writes neither a register nor a status, so this
@@ -1362,10 +1449,7 @@ fn update(
                 }),
                 Some(immediate),
             ) => {
-                let Some(offset) = offset.checked_add(immediate as i64) else {
-                    set(facts, &destination, None);
-                    return None;
-                };
+                let offset = stepped(offset, immediate, true);
                 set(
                     facts,
                     &destination,
@@ -1394,14 +1478,15 @@ fn update(
                 }),
                 Some(immediate),
             ) => {
-                let value = offset
-                    .checked_sub(immediate as i64)
-                    .map(|offset| Value::Code {
-                        offset,
+                set(
+                    facts,
+                    &destination,
+                    Some(Value::Code {
+                        offset: stepped(offset, immediate, false),
                         shift,
                         proved,
-                    });
-                set(facts, &destination, value);
+                    }),
+                );
             }
             // An `add` of anything else -- a table entry to its base, most often -- leaves a value
             // this does not model.
@@ -1431,8 +1516,14 @@ fn update(
     // register nobody watched, a multiply, an `and` -- whatever it was, the branch about to read
     // these flags is a test on the control code that this cannot attribute, and a map that says
     // nothing about it reads as the whole set.
-    if lost_the_code(instruction, carried_the_code, facts, &destination) {
-        untracked.push(instruction.address);
+    // **Recorded as pending, not as a finding.** Whether this matters is decided by what reads
+    // the flags it wrote: a branch makes it a case nobody could name, and an instruction that
+    // merely computes with the result makes it nothing at all. Appending here marked a complete
+    // map `partial` for an `and ecx,3` no branch ever looked at -- the conservative direction, and
+    // still noise in the one signal that exists to be quiet.
+    if instruction.writes_flags {
+        *lost = lost_the_code(instruction, carried_the_code, facts, &destination)
+            .then_some(instruction.address);
     }
     None
 }
@@ -1717,13 +1808,7 @@ fn follow_table(
         for instruction in instructions.iter().take(position) {
             // A replay to recover a table's base, not a walk that reports: what it loses about the
             // control code is recorded by the pass that walks these same instructions.
-            update(
-                &mut replay,
-                instruction,
-                layout,
-                &mut traced,
-                &mut Vec::new(),
-            );
+            update(&mut replay, instruction, layout, &mut traced, &mut None);
         }
         replay
     };
@@ -2007,13 +2092,7 @@ fn error_status(
     let mut facts = arrived.clone();
     let mut traced = false;
     for instruction in instructions {
-        update(
-            &mut facts,
-            instruction,
-            layout,
-            &mut traced,
-            &mut Vec::new(),
-        );
+        update(&mut facts, instruction, layout, &mut traced, &mut None);
         // **A tail jump out of the routine hands the request on exactly as a call does**, and what
         // the routine returns is then the callee's. A dispatcher that loads a default error before
         // its compare chain and reaches a case through `jmp handler` accepts that code, and
@@ -2209,13 +2288,7 @@ fn failure_block(
         // What the block has established **so far**, which is what says whether the call it is
         // about to make is a completion on the way out or a block doing something else. Kept by
         // `update` with everything else, so what arrived on the edge is already in it.
-        update(
-            &mut facts,
-            instruction,
-            layout,
-            &mut traced,
-            &mut Vec::new(),
-        );
+        update(&mut facts, instruction, layout, &mut traced, &mut None);
         let status = facts.status;
         match instruction.flow {
             Flow::Return => {
@@ -2420,13 +2493,7 @@ fn sizes_in(
         // Everything else updates the facts, which is what retires a base the block overwrites.
         // The pending compare survives anything that writes no flags, for the reason the block
         // walk's does -- and not a call, for the reason it does not there either.
-        update(
-            &mut facts,
-            instruction,
-            layout,
-            &mut traced,
-            &mut Vec::new(),
-        );
+        update(&mut facts, instruction, layout, &mut traced, &mut None);
         if instruction.writes_flags || matches!(instruction.flow, Flow::Call(_)) {
             pending = None;
         }
@@ -3196,6 +3263,80 @@ mod tests {
         );
     }
 
+    /// **An inclusive branch leaves equality possible where it *branches*, not where it falls.**
+    ///
+    /// `cmp code,K` / `jbe handler_side` admits `code == K` on the taken edge and forbids it on the
+    /// fall-through, where `code > K`. `ja` is the mirror, which is the shape the other tests here
+    /// are built from -- so a rule with the two backwards agrees with those fixtures exactly as
+    /// well as the right one does, and only an inclusive condition can tell them apart.
+    ///
+    /// Both halves are asserted, because the two failures are opposite: the wrong edge **loses** a
+    /// case where equality holds, and **invents** one where it cannot.
+    #[test]
+    fn an_inclusive_branch_carries_its_compare_to_the_edge_it_branches_to() {
+        // `jbe` taken: `code <= K`, so the `je` there is a real case.
+        let mut taken = prologue(DISPATCH);
+        taken.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x6dc000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "jbe",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x100)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            insn(
+                DISPATCH + 0x100,
+                "je",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
+        ]);
+        let found = map(DISPATCH, &taken, Layout::X64, unreadable, in_image, never);
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x6dc000, 0x900)],
+            "below-or-equal includes equal, so the compare is still live where it branched: {:?}",
+            found.cases
+        );
+
+        // And the fall-through of the same branch is `code > K`, where it cannot be.
+        let mut fallen = prologue(DISPATCH);
+        fallen.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x6dc000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "jbe",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x100)),
+            ),
+            insn(DISPATCH + 0x14, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
+            insn(DISPATCH + 0x100, "ret", Vec::new(), Flow::Return),
+        ]);
+        let found = map(DISPATCH, &fallen, Layout::X64, unreadable, in_image, never);
+        assert!(
+            found.cases.is_empty(),
+            "above the compare, an equality against it cannot hold: {:?}",
+            found.cases
+        );
+    }
+
     /// **A compare is live at a join only where every path into the block left the same one.**
     ///
     /// With this rule at most one predecessor can carry a pending compare -- only a fall-through
@@ -3332,6 +3473,68 @@ mod tests {
         );
     }
 
+    /// **A step a register carries is a `ULONG`, and wraps like one.**
+    ///
+    /// `mov eax,0FFFFFFFCh` is how a compiler puts `-4` in a register, and `sub ecx,eax` then
+    /// steps the chain *backwards*. Widened to `i64` the offset becomes 4,297,203,711, which is
+    /// past `u32::MAX` -- and `push_case` drops a code that does not fit one **silently**, so the
+    /// case disappears with nothing in the answer saying it did. The machine computes this modulo
+    /// 2^32 and so must this.
+    ///
+    /// A fixture stepping by `4` cannot see it: wrapping and widening agree on every positive
+    /// step, which is why the mutation for this rule came back MISSED against the chain test.
+    #[test]
+    fn a_step_a_register_carries_wraps_at_the_field_width() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), imm(0xffff_fffc)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xd,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "sub",
+                vec![reg("ecx"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x16, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(
+                DISPATCH + 0x1c,
+                "sub",
+                vec![reg("ecx"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1e, "je", Vec::new(), Flow::Branch(Some(0x980))),
+            insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, 0x900), (0x221fff, 0x980)],
+            "subtracting `-4` steps back by four, and the second code is below the first: {:?}",
+            found.cases
+        );
+        assert!(
+            found.untracked.is_empty(),
+            "nothing was lost, so nothing claims it was: {:?}",
+            found.untracked
+        );
+    }
+
     /// **A literal is only the step if the operand carries all of it.**
     ///
     /// `mov eax,104h` / `sub ecx,al` subtracts **four**, not 0x104: the byte register is the low
@@ -3388,6 +3591,52 @@ mod tests {
             vec![DISPATCH + 0x1c],
             "the instruction that took the code somewhere unfollowable is named"
         );
+    }
+
+    /// **An instruction nothing branches on loses nothing.**
+    ///
+    /// `untracked` was appended the moment a flag-writing instruction destroyed a tracked code,
+    /// whether or not anything read those flags -- so `and ecx,3` followed by a use with no branch
+    /// marked an otherwise complete map `partial` and claimed a missing case. The conservative
+    /// direction, and still wrong: this is the one signal whose value is that it is quiet, and a
+    /// map that is `partial` for nothing teaches a reader to ignore it.
+    ///
+    /// The loss is pending state now, committed only where a branch consumes the flags.
+    #[test]
+    fn a_value_lost_with_no_branch_reading_it_is_not_a_missing_case() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            // Writes flags and takes the code somewhere this does not model -- and nothing reads
+            // the flags, so nothing was lost that anybody was going to use.
+            insn(
+                DISPATCH + 0xb,
+                "and",
+                vec![reg("ecx"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "mov",
+                vec![mem("rsp", 0x20), reg("ecx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x12, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+
+        assert!(
+            found.untracked.is_empty(),
+            "no branch read those flags, so no case went missing here: {:?}",
+            found.untracked
+        );
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
     }
 
     /// **A test on the control code this pass cannot attribute is in the answer.**

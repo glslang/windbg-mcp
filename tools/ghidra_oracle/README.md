@@ -57,9 +57,18 @@ and prints a table of every code with a column per implementation. What to read:
   reported `0x80000005`, `0x8000002d` and `0xc0000004`, which are NTSTATUS values, because its
   heuristic accepts any plausible-looking constant. `ioctl_map` does not, because it traces the
   value from the IRP and says so in `code_proved`.
-- **`INT_LESS` constants from the Java script** are range bounds, not codes: `< 0x6dc001` and
-  `< 0x6d4021` bracket the switch. It emits every comparison constant deliberately, so that what
-  is excluded is a decision made here rather than one made silently in the script.
+- **Only equality compares are codes.** The Java script emits every comparison constant it finds,
+  with the p-code operator beside each, so what is excluded is visible rather than decided silently
+  inside it — and the diff then keeps the `INT_EQUAL`/`INT_NOTEQUAL` ones. `< 0x6dc001` and
+  `< 0x6d4021` bracket `mountmgr`'s switch and are not codes; reporting them as missing from
+  `ioctl_map` was an oracle contradicting this file.
+- **A switch's default is not inferred, and the tables are checked as a subset.** Taking the most
+  frequent destination works on `mountmgr` — 68 of 81 slots — and fails on a switch whose real
+  labels share a handler or whose destinations are all distinct. Ghidra's metadata does not name
+  the default arm, so the lane reports every label grouped by the block it reaches and asks the one
+  question that needs no default: is every code `ioctl_map` took from a table a label Ghidra put on
+  the same switch? The grouping is worth reading on its own — a destination with many labels and no
+  cases is a default, and that is an observation rather than an assumption.
 
 ## A second driver, and what it showed
 
