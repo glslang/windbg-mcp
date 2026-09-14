@@ -17,6 +17,11 @@ Two kinds of entry are *not* here. An item that is **measured and declined** sta
 item 35 leaves a judgement call open. So does an item that has **half** landed (50) — the entry is
 narrowed to the half that is left rather than split in two.
 
+A third kind *is* here and is neither: an item **deleted unbuilt** (76), where the thing it
+described stopped existing before anyone built it. It keeps its number and its entry because the
+number was committed and cited before that happened, and because why a filed item evaporated is
+worth as much as why one landed.
+
 ## Why each of these is worth reading after it landed
 
 **Item 10** (process-per-session, 2026-08-02) is here because items 8 and 9 were both written
@@ -98,6 +103,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 60](#60-windbg-mcp-structured-dispatch-reachability-paths-for-the-binary-ninja-bridge--done-2026-09-10) — [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge — done (2026-09-10)
 - [Item 70](#70-dbgscope-a-path-component-is-matched-by-folding-ascii--done-2026-09-14) — [dbgscope] A path component is matched by folding ASCII — done (2026-09-14)
 - [Item 75](#75-dbgscope--windbg-mcp-an-instructions-operands-are-not-every-register-it-reads--done-2026-09-14) — [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — done (2026-09-14)
+- [Item 76](#76-dbgscope-a-fold-that-cannot-decide-one-code-unit-declines-the-whole-comparison--deleted-unbuilt-2026-09-14) — [dbgscope] A fold that cannot decide one code unit declines the whole comparison — deleted unbuilt (2026-09-14)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3414,3 +3420,32 @@ already in.
 is what the entry predicted and is worth recording as confirmed: the pass now asks the decoder
 which registers an instruction reads instead of which ones its spelling names, so the next shape
 that matters needs no clause.
+
+## 76. [dbgscope] A fold that cannot decide one code unit declines the whole comparison — **deleted unbuilt** (2026-09-14)
+
+**Repo:** `dbgscope`. Filed and deleted the same day, and here rather than gone because the number
+was committed and cited in between.
+
+It was a real defect in what item 70 had just landed. `same_object_name` folded both names and
+compared the sequences whole, so *any* mismatch where either side carried a code unit the fold
+could not decide came back `NameMatch::Undecided` — including a mismatch with nothing to do with
+that unit. Because `object_at` counted per **directory entry**, one object named `Straße` would
+make every unrelated miss in that directory `NotFoundInPart` rather than `NotFound`, indefinitely.
+The fix was to be two refinements resting on the fold's own one-to-one contract: unequal lengths
+are `Different` certainly, and equal lengths compare pairwise so a certain-certain mismatch
+anywhere proves `Different`.
+
+**None of that was built, because `Undecided` stopped existing.** The reason the fold declined 102
+code units was that it *reproduced* the object manager's table out of `char::to_uppercase`, and
+`std` exposes only the full Unicode mapping. Verifying that reproduction against a live kernel's
+own table found it also **confidently wrong about 224 other code units** — so the answer was to
+call `RtlUpcaseUnicodeChar` rather than to refine an approximation of it, and a fold that performs
+the real thing has no comparison it declines to make. `NameMatch` collapsed to a predicate and this
+item's subject went with it.
+
+**Worth reading for the ordering.** This was filed as the careful thing to do: a precision
+improvement, deliberately not slipped into a copy because it would flip an expectation two
+repositories pinned with a review-settled reason. That instinct was right and the analysis was
+aimed one level too high. The pinned expectation was not a considered trade-off to be respected —
+it was a symptom, and measuring the thing underneath it deleted the trade-off rather than resolving
+it. Item 70's entry has what the measurement said.
