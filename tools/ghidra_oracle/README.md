@@ -85,9 +85,16 @@ the lane over **HEVD** as well -- it is a different shape, and it is the one wit
 answer:
 
 ```console
-python tools/ghidra_oracle/oracle.py --image <HEVD.sys> --dispatch <its MajorFunction[0x0e]> \
-    --device-type 0x22
+python tools/ghidra_oracle/oracle.py --image <HEVD.sys> --profile <kernel profile> \
+    --dispatch <its MajorFunction[0x0e]> --device-type 0x22
 ```
+
+`--profile` is what makes that command real: the tool half of this lane opens `--dump` by default,
+and HEVD is not in the checked-in one — pointing an HEVD dispatch at `mountmgr`'s crash resolves
+nothing and the run ends before either oracle is asked. A profile attaches the live kernel instead,
+by name rather than by connection string, so no debug key reaches an argument. Take the dispatch
+address from `driver_surface`'s `dispatch.device_control`, and take `HEVD.sys` itself off the
+target: the image is what the disassemblers read, and a kernel debugger has no file transport.
 
 HEVD's own header defines its codes (`IOCTL(0x800)` through `IOCTL(0x81B)`, each
 `CTL_CODE(FILE_DEVICE_UNKNOWN, Function, METHOD_NEITHER, FILE_ANY_ACCESS)`), so for once the right
