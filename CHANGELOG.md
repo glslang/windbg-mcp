@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- **The flags a branch reads can be computed from a register nothing named.** The loss check in `ioctl_map` asked an *operand list* which registers an instruction reads, and an operand list names the reads an instruction was written with: `cmp dword ptr [rcx+8],5` names `rcx` only inside a memory operand, `mul ecx` reads `eax`, `cmpxchg` reads `rax`. It asks `Instruction::reads` now -- the decoder's own answer, added upstream beside `writes` under the same two contracts -- and keeps the memory probe for the control-code field, which is a register on neither list. Measured rather than assumed, and the measurement moved the argument: over every flag-writing instruction the decoder handles in 64-bit mode, what `reads` adds over the operand list *and* `writes` together is, for every mnemonic a compiler emits, the registers that form a memory address. The shapes `FOLLOWUPS.md` item 75 named are read without being named and are also **written**, so the carried-and-gone half had them already. Conservative in the one direction that is safe: a pass that believes a control code is being dereferenced has lost the value either way, and the answer to give then is a case list that says it is short.
+
+- **A kernel object path was resolved by folding ASCII.** Upstream, `Namespace::object_at` matched each component with `eq_ignore_ascii_case`, so a device whose name differs from the one asked for only outside ASCII -- one object to the object manager, which folds through the system's uppercase table -- was reported as not found. It folds the way `nt!ObpLookupDirectoryEntry` does now, and where a host cannot show the kernel's one-unit mapping it reports the comparison as *undecided* rather than as a mismatch, so a lookup never claims an absence it has not established. This server's `device_security` had that fold already, arrived at over three review rounds; it is one copy now, in `dbgscope`, with only the path-shaped half -- the trailing separator and the refusal to match a prefix -- left here.
+
 ## [0.17.0] - 2026-09-14
 
 ### Fixed
