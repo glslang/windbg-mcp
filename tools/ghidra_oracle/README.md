@@ -50,7 +50,12 @@ python tools/ghidra_oracle/oracle.py
 It captures `ioctl_map`'s answer from the checked-in dump, runs both oracles over the cached image,
 and prints a table of every code with a column per implementation. What to read:
 
-- **A code only `ioctl_map` lacks** is the interesting one, and is what found the bug above.
+- **A code only `ioctl_map` lacks, that both other implementations have**, is the
+  interesting one, and is what found the bug above. One that only *one* of them has is a
+  **candidate**: Ghidra's provenance check says a compared value came from memory, not
+  that it came from the IRP's control-code field, and tracing it to that field would be
+  this lane adopting the assumption of the pass it exists to check. So the diff reports
+  the two lists apart and neither is silently promoted.
 - **A code only Driver Buddy lacks** is the native tool being better, which is worth knowing but
   is not a defect here: it missed `0x6d4008` and `0x6d4028` on `mountmgr`.
 - **Constants that are not the driver's device type** are Driver Buddy's false positives — it
@@ -67,8 +72,11 @@ and prints a table of every code with a column per implementation. What to read:
   labels share a handler or whose destinations are all distinct. Ghidra's metadata does not name
   the default arm, so the lane reports every label grouped by the block it reaches and asks the one
   question that needs no default: is every code `ioctl_map` took from a table a label Ghidra put on
-  the same switch? The grouping is worth reading on its own — a destination with many labels and no
-  cases is a default, and that is an observation rather than an assumption.
+  the same switch? The grouping is worth reading on its own, but read it as a question: a destination with
+  many labels and no recovered cases is a **candidate** for the default — or a group of
+  labels `ioctl_map` did not take, which is the other thing it could be and the one worth
+  chasing. Which of the two it is needs the decompiled C beside the JSON; the grouping
+  poses that question rather than answering it.
 
 ## A second driver, and what it showed
 
