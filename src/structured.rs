@@ -3120,16 +3120,6 @@ pub struct DeviceSecurity {
     /// reaches this device".
     #[serde(default, skip_serializing_if = "usize_is_zero")]
     pub links_unread: usize,
-    /// Entries whose name differs from this device's **only where the fold is guessing**, so
-    /// whether they reach it was not decided either way.
-    ///
-    /// An object name is compared through the kernel's own uppercase table, which this reader
-    /// approximates without a debugger; where Rust's Unicode casing cannot stand in for that table
-    /// the comparison is counted here instead of being answered. Like the two above it, a non-zero
-    /// count means [`LinkSearch::Complete`] is not claimed -- which is the whole point of the
-    /// count, since the alternative is a link silently reported as not reaching the device.
-    #[serde(default, skip_serializing_if = "usize_is_zero")]
-    pub links_unfolded: usize,
     /// Why the link search stopped early, when it did.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped: Option<WalkHalt>,

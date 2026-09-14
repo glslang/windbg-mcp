@@ -7791,7 +7791,6 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
     let mut links = Vec::new();
     let mut links_unnamed = 0usize;
     let mut links_unread = 0usize;
-    let mut links_unfolded = 0usize;
     let mut examined = None;
     let mut halted = None;
     let mut search = structured::LinkSearch::Unavailable;
@@ -7839,29 +7838,19 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
                 links_unread += 1;
                 continue;
             };
-            match device::same_object_path(&target, &path) {
-                device::Match::Same => links.push(device::Link {
+            // The fold is the object manager's own, so this is a match or it is not -- there is
+            // no third answer to count any more. `device::same_object_path` records what the
+            // stand-in that needed one cost.
+            if device::same_object_path(&target, &path) {
+                links.push(device::Link {
                     path: format!("{LINK_DIRECTORY}\\{}", entry.name),
                     target,
-                }),
-                // **A comparison the fold cannot make is not a link that does not match.** The
-                // kernel compares object names through its own uppercase table, which
-                // `device::upcase` stands in for without a debugger; where the stand-in cannot
-                // speak the answer is unknown, and calling it `Different` is what let three
-                // rounds of review each find a character reported as unreachable under a search
-                // still calling itself `Complete`.
-                device::Match::Unknown => links_unfolded += 1,
-                device::Match::Different => {}
+                });
             }
         }
         examined = Some(seen);
         // The rule itself is [`device::link_search`], which needs no engine and so has a test.
-        search = device::link_search(
-            halted.is_some(),
-            links_unnamed,
-            links_unread,
-            links_unfolded,
-        );
+        search = device::link_search(halted.is_some(), links_unnamed, links_unread);
     }
 
     let found = device::Found {
@@ -7876,7 +7865,6 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
         links_examined: examined,
         links_unnamed,
         links_unread,
-        links_unfolded,
         stopped: halted,
     };
     let report = device::structured_report(&found);
@@ -9497,36 +9485,19 @@ mod tests {
         );
 
         // **And this one, which reads like the caller's and is not.** `NotFoundInPart` says the
-        // name is not among the directory entries this walk could compare it against *and some it
-        // could not*, so the object asked for may be one of those. Categorising it beside
-        // `NotFound` would send a reader to correct a device name that is very likely right, which
-        // is the mistake the dbgscope variant exists to make impossible.
+        // name is not among the directory entries that could be read *and some could not be*, so
+        // the object asked for may be one of those. Categorising it beside `NotFound` would send
+        // a reader to correct a device name that is very likely right, which is the mistake the
+        // dbgscope variant exists to make impossible.
         assert_eq!(
             category(&ObjectError::NotFoundInPart {
                 directory: "Device".into(),
                 component: "Nope".into(),
                 unreadable: 1,
                 malformed: 1,
-                undecided: 0,
             }),
             target,
             "an absence this cannot vouch for is the target's failure, not the argument's"
-        );
-
-        // **Including when the only thing it could not do is its own fold.** A name this crate
-        // cannot fold the way the object manager folds one is not a name the caller got wrong --
-        // the directory read in full, and the comparison is what fell short -- so the category has
-        // to be the same whichever of the three counts is the non-zero one.
-        assert_eq!(
-            category(&ObjectError::NotFoundInPart {
-                directory: "Device".into(),
-                component: "Nope".into(),
-                unreadable: 0,
-                malformed: 0,
-                undecided: 1,
-            }),
-            target,
-            "a fold that could not decide is this server's shortfall, not the caller's"
         );
 
         // And the rest, which are the target's: nothing the caller types changes them.
