@@ -1064,7 +1064,25 @@ fn simulate(
                 // A call at the end of a block is ordinary: the block continues after it, and the
                 // callee is not this function's edge. Its effect on the registers is the one thing
                 // that matters here.
-                compared = update(&mut facts, last, layout, &mut traced, &mut just_lost);
+                //
+                // **And so is the rest of the loop's rule.** A block ends where the next address
+                // is a branch target, which is a fact about the compiler's labels rather than
+                // about the instruction -- so the same `cmp`, `and` or `call` is stepped by the
+                // loop above in one routine and by this arm in the next. A transition written in
+                // only one of them is a rule that holds until a label lands one instruction
+                // later, and it was written in only one, three ways over: a compare here left no
+                // pending compare for the `je` below, a loss here left no `untracked`, and a loss
+                // from earlier in the block outlived a call that had overwritten the flags it was
+                // about. The first two are short case lists with nothing saying so; the third is
+                // an `untracked` entry for a branch reading a callee's flags.
+                let next = update(&mut facts, last, layout, &mut traced, &mut just_lost);
+                if matches!(last.flow, Flow::Call(_)) {
+                    compared = None;
+                    lost = None;
+                } else if last.writes_flags {
+                    compared = next;
+                    lost = just_lost.take();
+                }
             }
         }
     }
@@ -1099,7 +1117,12 @@ fn simulate(
                 fallen.then(|| compared.clone()).flatten(),
             )
         }
-        _ => (None, None),
+        // **A terminator that decides no equality rules nothing out**, so the compare goes down
+        // every edge the block has. `equality_survives` answers per edge precisely because a
+        // condition is what lets one edge know the equality is false; a fall-through, a call or an
+        // unconditional jump asks nothing and so takes nothing away. Answering `(None, None)` here
+        // dropped the compare at every block boundary a compiler's label happened to fall on.
+        _ => (compared.clone(), compared.clone()),
     };
     if let (Some(last), Some(was)) = (last, compared.as_ref())
         && let (Flow::Branch(target), Some(condition)) = (last.flow, last.condition)
@@ -1172,7 +1195,10 @@ fn simulate(
             edge.pending = match (Some(successor) == fall_through, Some(successor) == taken) {
                 (true, _) => onward_fallen.clone(),
                 (_, true) => onward_taken.clone(),
-                _ => None,
+                // An unconditional jump's destination is neither: the instruction after the block
+                // is not a successor of one. The two values are the same wherever this is reached,
+                // since only a conditional branch tells its edges apart.
+                _ => onward_taken.clone(),
             };
             // No edge of a branch reading an unmodelled result has ruled anything out, so the loss
             // goes down both of them.
@@ -4034,6 +4060,139 @@ mod tests {
              bound whatever the other path did"
         );
         assert!(found.cases.is_empty(), "{:?}", found.cases);
+    }
+
+    /// **A compare that ends a block still reaches the branch in the next one.**
+    #[test]
+    fn a_compare_that_ends_a_block_reaches_the_branch_below_it() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            insn(
+                DISPATCH + 0x20,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0xe)),
+            ),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        assert_eq!(
+            found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
+            vec![0x222003],
+            "{:?}",
+            found.cases
+        );
+    }
+
+    /// **A compare survives an unconditional jump to the branch that reads it.**
+    #[test]
+    fn a_compare_reaches_the_branch_an_unconditional_jump_leads_to() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(0x222003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xe,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x20)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            insn(DISPATCH + 0x20, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x26, "ret", Vec::new(), Flow::Return),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, 0x900)],
+            "{:?}",
+            found.cases
+        );
+    }
+
+    /// **A loss that ends a block still reaches the branch in the next one.**
+    #[test]
+    fn a_loss_that_ends_a_block_reaches_the_branch_below_it() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "and",
+                vec![reg("ecx"), imm(0xffff)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
+            insn(
+                DISPATCH + 0x20,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x11)),
+            ),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        assert_eq!(found.untracked, vec![DISPATCH + 0xb], "{:?}", found.cases);
+    }
+
+    /// **A call that ends a block takes the loss with it, as one inside a block does.**
+    #[test]
+    fn a_call_that_ends_a_block_takes_the_loss_with_it() {
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("ecx"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "and",
+                vec![reg("ecx"), imm(0xffff)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "call",
+                Vec::new(),
+                Flow::Call(Some(DISPATCH + 0x800)),
+            ),
+            insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
+            insn(
+                DISPATCH + 0x30,
+                "jmp",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x17)),
+            ),
+        ]);
+
+        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        assert!(found.untracked.is_empty(), "{:?}", found.untracked);
     }
 
     /// **A `test` of the control code is a branch about it, and cannot be named.**

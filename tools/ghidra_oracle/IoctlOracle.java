@@ -63,6 +63,23 @@ public class IoctlOracle extends GhidraScript {
         if (f == null) {
             throw new Exception("no function at RVA " + hex(wantRva));
         }
+        // **The function has to start where the dispatch pointer points.**
+        // `getFunctionContaining` answers with whatever body covers the address, so a
+        // `MajorFunction[0x0e]` landing inside a function Ghidra has already defined -- a shared
+        // interior entry, or an `--image` that is a different build from the one on the target --
+        // is answered for the *enclosing* routine. `ioctl_map` starts exactly at the pointer, so
+        // everything below would then be read from code it never walks and reported as a
+        // disagreement between two implementations rather than as two implementations reading two
+        // functions. There is no quiet repair: creating one at `entry` means clearing a body
+        // Ghidra's analysis decided on, which is a judgement about the binary and not this lane's
+        // to make.
+        if (!f.getEntryPoint().equals(entry)) {
+            throw new Exception("the dispatch RVA " + hex(wantRva) + " is inside " + f.getName()
+                    + ", which starts at " + hex(rva(f.getEntryPoint()))
+                    + ". Ghidra would answer for that function while `ioctl_map` starts at the"
+                    + " pointer. Check that --image is the build running on the target and that"
+                    + " --dispatch is its MajorFunction[0x0e].");
+        }
 
         // ---- the decompiler's view -------------------------------------------------------
         DecompInterface ifc = new DecompInterface();

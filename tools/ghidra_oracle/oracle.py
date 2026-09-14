@@ -129,7 +129,7 @@ def ask_ghidra(image: pathlib.Path, rva: str, work: pathlib.Path) -> dict:
     # Headless aborts rather than creating one: "Directory not found".
     (work / "proj").mkdir(exist_ok=True)
     env = dict(os.environ, JAVA_HOME=JAVA_HOME)
-    subprocess.run(
+    done = subprocess.run(
         [
             str(GHIDRA / "support" / "analyzeHeadless.bat"),
             str(work / "proj"),
@@ -144,11 +144,29 @@ def ask_ghidra(image: pathlib.Path, rva: str, work: pathlib.Path) -> dict:
             str(out),
             "-deleteProject",
         ],
-        check=True,
+        check=False,
         env=env,
         capture_output=True,
-        text=True,
+        encoding="utf-8",
+        errors="replace",
     )
+    # **A post-script that threw leaves headless reporting success.** It logs the exception and
+    # exits 0, so the only sign here is the file that was never written -- and `check=True` sees
+    # nothing to raise on, leaving a bare `FileNotFoundError` naming neither the script nor what it
+    # refused. The refusal the script *does* raise (a dispatch RVA inside another function) is
+    # worth reading, so Ghidra's own last words are what this reports.
+    if not out.exists():
+        said = [
+            line
+            for line in (done.stdout + done.stderr).splitlines()
+            if "ERROR" in line or "Exception" in line
+        ]
+        raise SystemExit(
+            "ghidra wrote no answer (exit "
+            + str(done.returncode)
+            + "):\n"
+            + ("\n".join(said[-12:]) or (done.stdout + done.stderr)[-2000:])
+        )
     return json.loads(out.read_text(encoding="utf-8"))
 
 
