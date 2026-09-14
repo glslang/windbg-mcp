@@ -151,6 +151,43 @@ def draw_of(record):
     return record.get("draw") or 1
 
 
+def one_arm_per_log(plan):
+    """Refuse a plan that asks for two reasoning arms into one log.
+
+    **`think` is deliberately not part of a cell's identity, and this is the guard that buys.**
+    A cell is keyed by `(backend, model, num_ctx, surface)` everywhere - resume, the matrix, the
+    summary and the pairing `--compare` does - because the reasoning arm is a property of the
+    *run*, like the server build and the weights, and lives in `identity()` beside them. Putting
+    it in the key instead would mean arm A's cells and arm B's share no key at all, so a
+    comparison between them would pair nothing and print every row as `(old)`/`(new)`: the A/B
+    the axis exists for could not be read.
+
+    The cost of keeping it out is this: two groups differing only by `think`, writing to one log,
+    would have the second skipped entirely by `already_done` and the run would quietly measure one
+    arm while the plan said two. So the arms go in separate logs - the checked-in plans are a pair
+    - and a plan that mixes them is refused here rather than silently half-run.
+    """
+    seen = {}
+    for group in plan["cells"]:
+        # Only the ollama rows have the knob; a Claude row's reasoning is its client's, so it can
+        # neither be set nor collide.
+        if group.get("backend") != "ollama":
+            continue
+        think = bool(group.get("think", False))
+        for model in group["models"]:
+            for context in group.get("contexts", [None]):
+                for surface in group["surfaces"]:
+                    coord = (model, context, surface)
+                    if seen.setdefault(coord, think) != think:
+                        raise SystemExit(
+                            f"this plan asks for both reasoning arms of {model} at "
+                            f"ctx={context or 'default'} on `{surface}`, into one log "
+                            f"(`{plan.get('out')}`). A cell is not keyed by `think`, so the "
+                            f"second arm would be skipped as already done and the run would "
+                            f"measure one arm while saying two. Put each arm in a plan and a log "
+                            f"of its own and read them with `--compare`.")
+
+
 def already_done(log_path, tasks):
     """Which (backend, model, context, surface, draw, task) the log already holds, so a re-run
     resumes.
@@ -1166,6 +1203,40 @@ def records(log_path):
     return list(latest.values())
 
 
+def reasoning_arms(log_path):
+    """Which reasoning arms each cell has records for, read **before** the deduplication.
+
+    It has to be the raw log, and finding that out was the correction: `records()` keeps the last
+    record per (cell, draw, task), so two arms concatenated do not average - the later one
+    *replaces* the earlier, cell for cell. A concatenated A/B therefore grades identically to arm
+    B alone and its identity block reads `reasoning on`, both of which are true statements about
+    a table that silently dropped half its input. Counted after the dedup, this could never see
+    it: every cell had exactly one arm left by then.
+
+    A record written before the axis existed carries no `think` and contributes nothing, which is
+    not the same as contributing `off`.
+    """
+    arms = {}
+    if not os.path.exists(log_path):
+        return arms
+    with open(log_path, encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if record.get("task") is None or "think" not in record:
+                continue
+            surface = record.get("surface") or {}
+            cell_id = (record.get("backend"), record.get("model"), record.get("num_ctx"),
+                       surface.get("client"))
+            arms.setdefault(cell_id, set()).add("on" if record["think"] else "off")
+    return arms
+
+
 def summarise(log_path, tasks_file):
     """Grade the whole log and reduce it to one row per cell, **over every draw of it**.
 
@@ -1176,6 +1247,7 @@ def summarise(log_path, tasks_file):
     per-task distribution lives.
     """
     key = {t["id"]: t for t in load(tasks_file)["tasks"]}
+    arms = reasoning_arms(log_path)
     cells = {}
     for record in records(log_path):
         surface = (record.get("surface") or {})
@@ -1225,6 +1297,9 @@ def summarise(log_path, tasks_file):
     for cell in cells.values():
         graded = cell["tasks"]
         cell["draws"] = len(cell.pop("draw_ids"))
+        # Sorted rather than a set, because this travels into the graded JSON.
+        cell["arms"] = sorted(arms.get((cell["backend"], cell["model"], cell["num_ctx"],
+                                        cell["surface"]), ()))
         cell["n"] = len(graded)
         cell["possible"] = sum(1 for g in graded if g["possible"])
         cell["correct"] = sum(1 for g in graded if g["correct"])
@@ -1314,6 +1389,21 @@ def print_taught(cells):
     this whole item came out of: the scan that reported a clean result had compared nothing. So
     this line prints either the offenders or the sentence that says there were none.
     """
+    # **Before the `taught` line and on every path**, because it is a caveat about the table as a
+    # whole rather than a variant of that line. Printing it inside one branch would have hidden it
+    # from exactly the run that has offenders to read.
+    pooled = [c for c in cells if len(c.get("arms") or []) > 1]
+    if pooled:
+        # Not a warning about tidiness: a pooled cell's `ok/possible` is one number over two
+        # conditions, so its row is not a measurement of either arm.
+        print(f"\n{len(pooled)} cell(s) hold records from both reasoning arms - "
+              + ", ".join(f"{cell_label((c['backend'], c['model'], c['num_ctx'], c['surface']))}"
+                          f" ({'+'.join(c['arms'])})" for c in pooled[:3])
+              + (" …" if len(pooled) > 3 else "")
+              + "\n  Deduplication keeps the last record of each (cell, draw, task), so those "
+                "rows are whichever arm\n  was appended later - not both, and not an average. "
+                "The identity line above names only\n  the survivor. Grade each arm's log on "
+                "its own and read them with `--compare`.")
     offenders = [(cell, task, tool) for cell in cells
                  for task, tool in cell.get("taught_detail", [])]
     if not offenders:
@@ -1962,6 +2052,7 @@ def main():
     tokens = tokens_for(plan)
     log_path = plan["out"]
     logs_dir = plan.get("logs", os.path.join(os.path.dirname(log_path), "logs"))
+    one_arm_per_log(plan)
     suite = cell_tasks(plan["tasks"], None)
     done = already_done(log_path, suite)
     print(f"plan {plan['run']}: {len(done)} task records already in {log_path}")
