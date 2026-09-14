@@ -150,8 +150,8 @@
       "inputSchema": 623,
       "modelVisible": 1706,
       "name": "driver_surface",
-      "outputSchema": 10342,
-      "wire": 12197
+      "outputSchema": 10411,
+      "wire": 12266
     },
     {
       "annotations": 130,
@@ -276,8 +276,8 @@
       "inputSchema": 563,
       "modelVisible": 1368,
       "name": "ioctl_map",
-      "outputSchema": 4049,
-      "wire": 5537
+      "outputSchema": 4118,
+      "wire": 5606
     },
     {
       "annotations": 124,
@@ -556,10 +556,10 @@
     "inputSchema": 52398,
     "instructions": 1983,
     "modelVisible": 90274,
-    "outputSchema": 150551,
-    "payload": 248989,
+    "outputSchema": 150689,
+    "payload": 249127,
     "tools": 61,
-    "wire": 248917,
+    "wire": 249055,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
