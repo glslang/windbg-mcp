@@ -1,0 +1,43 @@
+{
+  "run": "2026-09-13 four local models on the 61-tool server",
+  "note": "Adds a fourth local model (muse-glimmer:30b-mlx) and re-measures the three already on the bench, whose tags were re-pulled since the grid ran. This is a new baseline rather than a controlled re-run of any earlier log: the server moved 311 commits (0.11.0-era to 0.16.0+g57a47e9c) and its surface grew 51 -> 61 tools, so full/lean/min are 61/23/13 here where the published grid measured 51/20/11, and ollama went 0.32.15 -> 0.34.0. The suite is the current v2 wording, so `arm64_pc` records against the reworded question (item 44) and does not pair with the v1 logs on that task. muse-glimmer's card tops out at 131072, not 262144, so it gets a context group of its own and the run records what was served rather than what the other three ask for. Draws are on `min` only, five of them, matching the after-217 plan's shape so the new model gets a distribution rather than a single draw; the Claude control rows run breadth at one draw each.",
+  "tasks": "tools/eval_tasks.json",
+  "url": "http://127.0.0.1:8766/",
+  "out": "eval-out/2026-09-13.jsonl",
+  "logs": "eval-out/logs-2026-09-13",
+  "max_steps": 6,
+  "keep_alive": "10m",
+  "surfaces": [
+    { "client": "full", "spec": "all",                   "tools": 61 },
+    { "client": "lean", "spec": "session,inspect,crash", "tools": 23 },
+    { "client": "min",  "spec": "crash",                 "tools": 13 }
+  ],
+  "cells": [
+    { "backend": "ollama",
+      "models": ["qwen3.8:27b-mlx", "gemma4:31b-mlx", "nemotron-3.5-lightning:30b-mlx"],
+      "contexts": [262144],
+      "surfaces": ["full", "lean", "min"],
+      "budget_s": 2400 },
+    { "backend": "ollama",
+      "models": ["muse-glimmer:30b-mlx"],
+      "contexts": [131072],
+      "surfaces": ["full", "lean", "min"],
+      "budget_s": 2400 },
+    { "backend": "claude-code",
+      "models": ["opus", "sonnet"],
+      "surfaces": ["full", "lean", "min"],
+      "budget_s": 1200 },
+    { "backend": "ollama",
+      "models": ["qwen3.8:27b-mlx", "gemma4:31b-mlx", "nemotron-3.5-lightning:30b-mlx"],
+      "contexts": [262144],
+      "surfaces": ["min"],
+      "draws": 5,
+      "budget_s": 2400 },
+    { "backend": "ollama",
+      "models": ["muse-glimmer:30b-mlx"],
+      "contexts": [131072],
+      "surfaces": ["min"],
+      "draws": 5,
+      "budget_s": 2400 }
+  ]
+}

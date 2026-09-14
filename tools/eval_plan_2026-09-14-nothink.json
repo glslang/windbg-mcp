@@ -1,0 +1,120 @@
+{
+  "run": "2026-09-14 reasoning A/B, arm A: think off",
+  "note": "The baseline half of the reasoning A/B. It re-measures what 2026-09-13 measured, and it is a re-run rather than a reuse of that log for one reason: the harness's read-only fence stopped being a hand-kept list of 16 names and became each tool's own `readOnlyHint`, which on `full` runs 37 of 61 served tools. That change *reaches these cells* - 24 calls the 2026-09-13 run recorded as refused (19 `decode_error_reporting`, 3 `current_location`, 2 `exception_triage`) would now execute and return real output - so pairing an `on` arm against that log would vary reasoning and the fence together. Same cells, same suite, same server, same weights, one draw; the only thing that differs from the `think` plan beside it is `think`. The Claude control rows run here and only here: their reasoning is the client's to decide, this bench does not own that knob, and running them twice would measure the same conditions twice. EXTENDED 2026-09-14: five draws of every `min` cell, added as groups of their own so the `full`/`lean` cells stay at one draw. Resume is per (cell, draw), so re-running this plan runs draws 2-5 and repeats nothing. The Claude rows get draws here too - not because the reasoning axis touches them, but because the previous run's sharpest claim (`arm64_pc` is 0 of 20 for local models against 2 of 2 for the controls) had its frontier side at one draw apiece, which is the weakness of that comparison rather than of the local arm.",
+  "tasks": "tools/eval_tasks.json",
+  "url": "http://127.0.0.1:8766/",
+  "out": "eval-out/2026-09-14-nothink.jsonl",
+  "logs": "eval-out/logs-2026-09-14-nothink",
+  "max_steps": 6,
+  "keep_alive": "10m",
+  "surfaces": [
+    {
+      "client": "full",
+      "spec": "all",
+      "tools": 61
+    },
+    {
+      "client": "lean",
+      "spec": "session,inspect,crash",
+      "tools": 23
+    },
+    {
+      "client": "min",
+      "spec": "crash",
+      "tools": 13
+    }
+  ],
+  "cells": [
+    {
+      "backend": "ollama",
+      "models": [
+        "qwen3.8:27b-mlx",
+        "gemma4:31b-mlx",
+        "nemotron-3.5-lightning:30b-mlx"
+      ],
+      "contexts": [
+        262144
+      ],
+      "surfaces": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "think": false,
+      "budget_s": 2400
+    },
+    {
+      "backend": "ollama",
+      "models": [
+        "muse-glimmer:30b-mlx"
+      ],
+      "contexts": [
+        131072
+      ],
+      "surfaces": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "think": false,
+      "budget_s": 2400
+    },
+    {
+      "backend": "claude-code",
+      "models": [
+        "opus",
+        "sonnet"
+      ],
+      "surfaces": [
+        "full",
+        "lean",
+        "min"
+      ],
+      "budget_s": 1200
+    },
+    {
+      "backend": "ollama",
+      "models": [
+        "qwen3.8:27b-mlx",
+        "gemma4:31b-mlx",
+        "nemotron-3.5-lightning:30b-mlx"
+      ],
+      "contexts": [
+        262144
+      ],
+      "surfaces": [
+        "min"
+      ],
+      "draws": 5,
+      "think": false,
+      "budget_s": 2400
+    },
+    {
+      "backend": "ollama",
+      "models": [
+        "muse-glimmer:30b-mlx"
+      ],
+      "contexts": [
+        131072
+      ],
+      "surfaces": [
+        "min"
+      ],
+      "draws": 5,
+      "think": false,
+      "budget_s": 2400
+    },
+    {
+      "backend": "claude-code",
+      "models": [
+        "opus",
+        "sonnet"
+      ],
+      "surfaces": [
+        "min"
+      ],
+      "draws": 5,
+      "budget_s": 1200
+    }
+  ]
+}

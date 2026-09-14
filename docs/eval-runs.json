@@ -1,323 +1,1221 @@
 [
-  {
-    "log": "after-206.jsonl",
-    "identity": {
-      "run": [
-        "2026-08-24-after-206"
-      ],
-      "suite": [
-        "unrecorded"
-      ],
-      "server": [
-        "unrecorded"
-      ],
-      "harness": [
-        "unrecorded"
-      ],
-      "weights": {
-        "gemma4:31b-mlx": [
-          "unrecorded"
-        ],
-        "nemotron-3.5-lightning:30b-mlx": [
-          "unrecorded"
-        ],
-        "opus": [
-          "unrecorded"
-        ],
-        "qwen3.8:27b-mlx": [
-          "unrecorded"
-        ],
-        "sonnet": [
-          "unrecorded"
-        ]
-      }
-    },
-    "graded_against": "eval_tasks_v1.json",
-    "cells": [
-      {
-        "backend": "claude-code",
-        "model": "opus",
-        "num_ctx": null,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 3,
-        "served_context": null,
-        "surface_digest": []
-      },
-      {
-        "backend": "claude-code",
-        "model": "sonnet",
-        "num_ctx": null,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 1,
-        "served_context": null,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "gemma4:31b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 4,
-        "wanted": 5,
-        "served_context": 262144,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "nemotron-3.5-lightning:30b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 1,
-        "served_context": 262144,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "qwen3.8:27b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 2,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 0,
-        "served_context": 262144,
-        "surface_digest": []
-      }
+ {
+  "log": "after-206.jsonl",
+  "identity": {
+   "run": [
+    "2026-08-24-after-206"
+   ],
+   "suite": [
+    "unrecorded"
+   ],
+   "server": [
+    "unrecorded"
+   ],
+   "harness": [
+    "unrecorded"
+   ],
+   "reasoning": [
+    "unrecorded"
+   ],
+   "weights": {
+    "gemma4:31b-mlx": [
+     "unrecorded"
+    ],
+    "nemotron-3.5-lightning:30b-mlx": [
+     "unrecorded"
+    ],
+    "opus": [
+     "unrecorded"
+    ],
+    "qwen3.8:27b-mlx": [
+     "unrecorded"
+    ],
+    "sonnet": [
+     "unrecorded"
     ]
+   }
   },
-  {
-    "log": "after-210.jsonl",
-    "identity": {
-      "run": [
-        "2026-08-24-after-210"
-      ],
-      "suite": [
-        "unrecorded"
-      ],
-      "server": [
-        "unrecorded"
-      ],
-      "harness": [
-        "unrecorded"
-      ],
-      "weights": {
-        "gemma4:31b-mlx": [
-          "unrecorded"
-        ],
-        "nemotron-3.5-lightning:30b-mlx": [
-          "unrecorded"
-        ],
-        "opus": [
-          "unrecorded"
-        ],
-        "qwen3.8:27b-mlx": [
-          "unrecorded"
-        ],
-        "sonnet": [
-          "unrecorded"
-        ]
-      }
-    },
-    "graded_against": "eval_tasks_v1.json",
-    "cells": [
-      {
-        "backend": "claude-code",
-        "model": "opus",
-        "num_ctx": null,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 1,
-        "served_context": null,
-        "surface_digest": []
-      },
-      {
-        "backend": "claude-code",
-        "model": "sonnet",
-        "num_ctx": null,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 0,
-        "served_context": null,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "gemma4:31b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 4,
-        "served_context": 262144,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "nemotron-3.5-lightning:30b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 2,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 0,
-        "served_context": 262144,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "qwen3.8:27b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 1,
-        "correct_of_possible": 3,
-        "possible": 4,
-        "taught": 0,
-        "wanted": 1,
-        "served_context": 262144,
-        "surface_digest": []
-      }
+  "graded_against": "eval_tasks_v1.json",
+  "cells": [
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 3,
+    "served_context": null,
+    "surface_digest": []
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 1,
+    "served_context": null,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 4,
+    "wanted": 5,
+    "served_context": 262144,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 1,
+    "served_context": 262144,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 2,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": []
+   }
+  ]
+ },
+ {
+  "log": "after-210.jsonl",
+  "identity": {
+   "run": [
+    "2026-08-24-after-210"
+   ],
+   "suite": [
+    "unrecorded"
+   ],
+   "server": [
+    "unrecorded"
+   ],
+   "harness": [
+    "unrecorded"
+   ],
+   "reasoning": [
+    "unrecorded"
+   ],
+   "weights": {
+    "gemma4:31b-mlx": [
+     "unrecorded"
+    ],
+    "nemotron-3.5-lightning:30b-mlx": [
+     "unrecorded"
+    ],
+    "opus": [
+     "unrecorded"
+    ],
+    "qwen3.8:27b-mlx": [
+     "unrecorded"
+    ],
+    "sonnet": [
+     "unrecorded"
     ]
+   }
   },
-  {
-    "log": "after-217.jsonl",
-    "identity": {
-      "run": [
-        "2026-08-25 after #217: the five min cells, five draws each"
-      ],
-      "suite": [
-        "unrecorded"
-      ],
-      "server": [
-        "unrecorded"
-      ],
-      "harness": [
-        "unrecorded"
-      ],
-      "weights": {
-        "gemma4:31b-mlx": [
-          "unrecorded"
-        ],
-        "nemotron-3.5-lightning:30b-mlx": [
-          "unrecorded"
-        ],
-        "opus": [
-          "unrecorded"
-        ],
-        "qwen3.8:27b-mlx": [
-          "unrecorded"
-        ],
-        "sonnet": [
-          "unrecorded"
-        ]
-      }
-    },
-    "graded_against": "eval_tasks_v1.json",
-    "cells": [
-      {
-        "backend": "claude-code",
-        "model": "opus",
-        "num_ctx": null,
-        "surface": "min",
-        "tools": 11,
-        "draws": 5,
-        "correct_of_possible": 14,
-        "possible": 20,
-        "taught": 0,
-        "wanted": 1,
-        "served_context": null,
-        "surface_digest": []
-      },
-      {
-        "backend": "claude-code",
-        "model": "sonnet",
-        "num_ctx": null,
-        "surface": "min",
-        "tools": 11,
-        "draws": 5,
-        "correct_of_possible": 15,
-        "possible": 20,
-        "taught": 0,
-        "wanted": 0,
-        "served_context": null,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "gemma4:31b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 5,
-        "correct_of_possible": 15,
-        "possible": 20,
-        "taught": 0,
-        "wanted": 15,
-        "served_context": 262144,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "nemotron-3.5-lightning:30b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 5,
-        "correct_of_possible": 13,
-        "possible": 20,
-        "taught": 0,
-        "wanted": 0,
-        "served_context": 262144,
-        "surface_digest": []
-      },
-      {
-        "backend": "ollama",
-        "model": "qwen3.8:27b-mlx",
-        "num_ctx": 262144,
-        "surface": "min",
-        "tools": 11,
-        "draws": 5,
-        "correct_of_possible": 14,
-        "possible": 20,
-        "taught": 0,
-        "wanted": 0,
-        "served_context": 262144,
-        "surface_digest": []
-      }
+  "graded_against": "eval_tasks_v1.json",
+  "cells": [
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 1,
+    "served_context": null,
+    "surface_digest": []
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 4,
+    "served_context": 262144,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 2,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 1,
+    "served_context": 262144,
+    "surface_digest": []
+   }
+  ]
+ },
+ {
+  "log": "after-217.jsonl",
+  "identity": {
+   "run": [
+    "2026-08-25 after #217: the five min cells, five draws each"
+   ],
+   "suite": [
+    "unrecorded"
+   ],
+   "server": [
+    "unrecorded"
+   ],
+   "harness": [
+    "unrecorded"
+   ],
+   "reasoning": [
+    "unrecorded"
+   ],
+   "weights": {
+    "gemma4:31b-mlx": [
+     "unrecorded"
+    ],
+    "nemotron-3.5-lightning:30b-mlx": [
+     "unrecorded"
+    ],
+    "opus": [
+     "unrecorded"
+    ],
+    "qwen3.8:27b-mlx": [
+     "unrecorded"
+    ],
+    "sonnet": [
+     "unrecorded"
     ]
-  }
+   }
+  },
+  "graded_against": "eval_tasks_v1.json",
+  "cells": [
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 11,
+    "draws": 5,
+    "correct_of_possible": 14,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 1,
+    "served_context": null,
+    "surface_digest": []
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 11,
+    "draws": 5,
+    "correct_of_possible": 15,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 5,
+    "correct_of_possible": 15,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 15,
+    "served_context": 262144,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 5,
+    "correct_of_possible": 13,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": []
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 11,
+    "draws": 5,
+    "correct_of_possible": 14,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": []
+   }
+  ]
+ },
+ {
+  "log": "2026-09-13.jsonl",
+  "identity": {
+   "run": [
+    "2026-09-13 four local models on the 61-tool server"
+   ],
+   "suite": [
+    "windbg-mcp local-model eval v2 (eval_tasks.json)"
+   ],
+   "server": [
+    "windbg-mcp 0.16.0+g57a47e9c"
+   ],
+   "harness": [
+    "2.1.270 (Claude Code)"
+   ],
+   "reasoning": [
+    "unrecorded"
+   ],
+   "weights": {
+    "gemma4:31b-mlx": [
+     "a22a363052da770302019d5afab29bd967f9318e4377bddd297421189ea09d7d"
+    ],
+    "muse-glimmer:30b-mlx": [
+     "015fa21845bead56096c2f8773aff7a2047063507fe82897e662ad544c5b2fa6"
+    ],
+    "nemotron-3.5-lightning:30b-mlx": [
+     "8b1474be6e54dc19eb7aa08bebfb9bda147c4b9ef9796a726131ad29ad15645a"
+    ],
+    "opus": [
+     "unavailable"
+    ],
+    "qwen3.8:27b-mlx": [
+     "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e"
+    ],
+    "sonnet": [
+     "unavailable"
+    ]
+   }
+  },
+  "graded_against": "eval_tasks.json",
+  "cells": [
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 13,
+    "draws": 1,
+    "correct_of_possible": 4,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 13,
+    "draws": 1,
+    "correct_of_possible": 4,
+    "possible": 4,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 15,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 15,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 4,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 3,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 14,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 14,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   }
+  ]
+ },
+ {
+  "log": "2026-09-14-nothink.jsonl",
+  "identity": {
+   "run": [
+    "2026-09-14 reasoning A/B, arm A: think off"
+   ],
+   "suite": [
+    "windbg-mcp local-model eval v2 (eval_tasks.json)"
+   ],
+   "server": [
+    "windbg-mcp 0.16.0+g57a47e9c"
+   ],
+   "harness": [
+    "2.1.270 (Claude Code)"
+   ],
+   "reasoning": [
+    "off"
+   ],
+   "weights": {
+    "gemma4:31b-mlx": [
+     "a22a363052da770302019d5afab29bd967f9318e4377bddd297421189ea09d7d"
+    ],
+    "muse-glimmer:30b-mlx": [
+     "015fa21845bead56096c2f8773aff7a2047063507fe82897e662ad544c5b2fa6"
+    ],
+    "nemotron-3.5-lightning:30b-mlx": [
+     "8b1474be6e54dc19eb7aa08bebfb9bda147c4b9ef9796a726131ad29ad15645a"
+    ],
+    "opus": [
+     "unavailable"
+    ],
+    "qwen3.8:27b-mlx": [
+     "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e"
+    ],
+    "sonnet": [
+     "unavailable"
+    ]
+   }
+  },
+  "graded_against": "eval_tasks.json",
+  "cells": [
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "opus",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 19,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 1,
+    "served_context": null,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "claude-code",
+    "model": "sonnet",
+    "num_ctx": null,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 17,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": null,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 15,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 17,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 4,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 2,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 14,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 14,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   }
+  ]
+ },
+ {
+  "log": "2026-09-14-think.jsonl",
+  "identity": {
+   "run": [
+    "2026-09-14 reasoning A/B, arm B: think on"
+   ],
+   "suite": [
+    "windbg-mcp local-model eval v2 (eval_tasks.json)"
+   ],
+   "server": [
+    "windbg-mcp 0.16.0+g57a47e9c"
+   ],
+   "harness": [],
+   "reasoning": [
+    "on"
+   ],
+   "weights": {
+    "gemma4:31b-mlx": [
+     "a22a363052da770302019d5afab29bd967f9318e4377bddd297421189ea09d7d"
+    ],
+    "muse-glimmer:30b-mlx": [
+     "015fa21845bead56096c2f8773aff7a2047063507fe82897e662ad544c5b2fa6"
+    ],
+    "nemotron-3.5-lightning:30b-mlx": [
+     "8b1474be6e54dc19eb7aa08bebfb9bda147c4b9ef9796a726131ad29ad15645a"
+    ],
+    "qwen3.8:27b-mlx": [
+     "5642e97495e1a088883805981563dcdc4a040c2f53388b7a41d1f24d3622cf7e"
+    ]
+   }
+  },
+  "graded_against": "eval_tasks.json",
+  "cells": [
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "gemma4:31b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 15,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 2,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "muse-glimmer:30b-mlx",
+    "num_ctx": 131072,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 20,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 131072,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 4,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "nemotron-3.5-lightning:30b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 15,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "full",
+    "tools": 61,
+    "draws": 1,
+    "correct_of_possible": 6,
+    "possible": 6,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "9a4e13e5348c"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "lean",
+    "tools": 23,
+    "draws": 1,
+    "correct_of_possible": 5,
+    "possible": 5,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "d6bdf3b7a25b"
+    ]
+   },
+   {
+    "backend": "ollama",
+    "model": "qwen3.8:27b-mlx",
+    "num_ctx": 262144,
+    "surface": "min",
+    "tools": 13,
+    "draws": 5,
+    "correct_of_possible": 18,
+    "possible": 20,
+    "taught": 0,
+    "wanted": 0,
+    "served_context": 262144,
+    "surface_digest": [
+     "4a4c1a029b14"
+    ]
+   }
+  ]
+ }
 ]

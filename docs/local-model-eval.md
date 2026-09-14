@@ -3,7 +3,9 @@
 [`local-model.md`](./local-model.md) is the runbook for pointing a local model at this server, and
 it records two runs of one model on one surface. This page is the **grid** those two runs argued
 for: three local models, three tool surfaces and three context windows, scored against an answer
-key, with a frontier model in the same harness as the control.
+key, with a frontier model in the same harness as the control. A fourth local model joined it on
+2026-09-13, on a server ten tools wider — the last section, and the run every figure above it
+predates.
 
 It exists because the two sightings could not settle the question they raised. One model picking
 nine tools correctly says a 51-tool surface is drivable *by that model, at that window*; it says
@@ -67,15 +69,38 @@ Call one tool at a time and use its result. Be concise.
 Nothing is tuned per model. A model that needs a bespoke prompt to drive this surface is a finding,
 not a cell to fix.
 
-**Thinking.** Every local model here can think, and every cell runs with `think: false`. That is a
-controlled variable rather than a recommendation — the two runs in `local-model.md` had already
-found that a thinking turn can outlive the listener's lease grace, which is a real cost with its
-own follow-up (`FOLLOWUPS.md` item 33) and would have confounded every timing here.
+**Thinking — until 2026-09-14, when it became one.** Every local model here can think, and every
+cell on this page above the sixth run ran with `think: false`. That was a controlled variable
+rather than a recommendation: the two runs in `local-model.md` had already found that a thinking
+turn can outlive the listener's lease grace, which is a real cost with its own follow-up
+(`FOLLOWUPS.md` item 33) and would have confounded every timing here. The driver's keepalive
+removed that cost, so the axis became affordable and was run as an A/B — the sixth run below. It is
+an axis now, set per cell group with `think` and recorded per record; everything above still holds
+`think: false` and says so in its identity block.
 
-**The tools themselves.** The harness executes a read-only allow-list and reports anything else
-back to the model as refused, so a wrong pick is *measured* rather than performed. `launch`,
-`execute` and `debug_batch` are on the surface and are never run: a debug host is the wrong place
-to discover unattended what a model does with them.
+**The tools themselves.** The harness executes read-only tools and reports anything else back to
+the model as refused, so a wrong pick is *measured* rather than performed. `launch`, `execute` and
+`debug_batch` are on the surface and are never run: a debug host is the wrong place to discover
+unattended what a model does with them.
+
+**Which tools those are is the server's answer, not a list kept in the harness** (from 2026-09-14;
+every run on this page predates it and ran behind a hand-kept list of sixteen names). Each tool
+declares `readOnlyHint` in its `tools/list` annotations — 61 of 61, checked on the wire — and
+`adopt_fence` reads it once per cell, off the same `tools/list` the model is shown. Two exceptions
+carry properties the annotation cannot express: `open_dump`, `open_trace` and `end_session` are
+mutating and are the harness's own session lifecycle, and `wait_for_stop` is read-only and
+*blocks*, so a model picking it on a dump spends the cell's wall clock rather than one of its six
+turns. A served tool with no boolean hint **stops the run** rather than being guessed at — guessing
+either runs a mutating tool on a debug host or refuses a read-only one and files it as the model's
+mistake, and neither is visible in the log afterwards.
+
+**A tool the client is not served is handed to the server anyway**, which is load-bearing rather
+than an oversight. `unserved` — the `taught`/`wanted` split below — counts calls naming a tool the
+client was not given, and the five-way split distinguishes `off_surface` (the *server* said no)
+from `refused` (the harness said no). A fence that intercepted those names first would keep every
+total identical and quietly relabel them as our refusal, so the bench would report a server that
+had stopped advertising when nothing about the server had changed. Nothing is risked by passing
+them on: a tool a client is not served is one the server will not run for it.
 
 ## The tasks, and why these six
 
@@ -968,6 +993,294 @@ rate; it is the sentence above about fifteen draws. Note also that gemma's twelv
   frame `crash_triage` calls `faulting_frame` — and 33 of its 35 recorded runs give the key, the
   other two being an empty answer and a closed session. A wording defect shows up as *agreement
   on a different answer*, and only this task has one.
+
+## Fifth run: a fourth model, on a server ten tools wider (2026-09-13)
+
+The whole grid again — three surfaces, four local models, both control rows, then five draws of
+each local `min` cell. 34 cell-draws, 204 task records, 145 minutes of cell time, written to
+`eval-out/2026-09-13.jsonl` beside the earlier logs rather than over them.
+
+**This one is a new baseline and not a controlled re-run**, which the identity block says before
+the table does. Three uncontrolled variables moved together since the fourth run: the server
+(`0.16.0+g57a47e9c`, 311 commits on), its surface (51 → **61 tools**, and `crash` from one tool to
+three, so `min` is 13 rather than 11), and the runtime (ollama 0.32.15 → 0.34.0) with all three
+existing tags re-pulled. `--compare` names every one of them above the table and refuses to pair
+`arm64_pc` at all, the question having been reworded since. Nothing here is evidence that a
+*change* caused anything; it is what this stack scores today.
+
+**The fourth model is `muse-glimmer:30b-mlx`** — 32.3B, nvfp4, tools and vision and thinking — and
+the one thing that makes it a different cell shape is its card: **131,072 context, not 262,144**.
+It gets a context group of its own rather than being asked for a window it cannot serve, and the
+run records what was served.
+
+### Scores
+
+Draw 1 of each surface, which is the total the earlier runs are quoted at:
+
+| Model | full · 61 | lean · 23 | min · 13 | Total | Prompt tokens, full |
+| --- | --- | --- | --- | --- | --- |
+| Opus *(control)* | 6/6 | 5/5 +1 | 4/4 +1 | **15/15** | 57,986 |
+| Sonnet *(control)* | 6/6 | 5/5 +1 | 4/4 +1 | **15/15** | 58,153 |
+| qwen3.8:27b | 6/6 | 5/5 | 3/4 | 14/15 | 22,735 |
+| gemma4:31b | 6/6 | 5/5 +1 | 3/4 | 14/15 | 19,055 |
+| **muse-glimmer:30b** | 6/6 | 5/5 | 3/4 | **14/15** | 22,845 |
+| nemotron-3.5:30b | 4/6 | 3/5 | 3/4 | 10/15 | 24,262 |
+
+**The new model arrives level with the best local rows**, cell for cell identical to qwen across
+all three surfaces, and it does it inside a window half the size. On the 13-tool surface it also
+decodes the IOCTL from its own knowledge in **four draws of five** (`4o1-`) — a thing only gemma
+had managed before, once.
+
+**Nothing reached off-surface.** 426 tool calls, **zero** naming a tool the client was not served:
+`taught` 0 and `wanted` 0 in every cell, where the fourth run still had `wanted` on
+`unloaded_driver`. The three advertising channels closed by items 40, 41 and #217 are still closed
+on a server ten tools wider than the one they were closed on.
+
+**The tokenizer spread survived the surface growing.** The same 92,559 bytes cost gemma 19,055
+tokens and nemotron 24,262 — 27%, which is the spread the original grid measured at 51 tools and
+69,552 bytes. It is a per-model constant, not a property of the surface.
+
+### `arm64_pc` on `min`, with a denominator under it
+
+| | draws | correct |
+| --- | --- | --- |
+| four local models, `min` | 20 | **0** |
+| Opus and Sonnet, `min` | 1 each | 2 |
+
+Every local model is `5n`. Both controls get it, deriving the register from `crash_triage` frame 0
+exactly as the task's `possible_on: min` requires. This is the first time the bench can say the
+split is not a draw artefact on the local side — though the control side is still one draw each,
+so the sentence is "none of twenty against two of two", not a rate against a rate.
+
+> **Both halves of that read wrong, and the sixth run's draws are what showed it.** The same four
+> models, same weights, same reasoning setting, five draws again: **3 of 20**, not 0 — muse-glimmer
+> alone answers it twice. And the control side at five draws apiece is **6 of 10** (Opus 4/5,
+> Sonnet 2/5), not two of two. So `0/20` was a true count of an unlucky sample rather than a floor,
+> `2/2` was the small number it looked like, and "not a draw artefact" was precisely the claim the
+> data could not support. The gap between local and frontier on this task is real and it is
+> *narrower* than this table makes it look. Corrected in the sixth run below; left standing here
+> because what a run measured is not editable after the fact.
+
+It is also the reworded question (item 44) doing what the rewording was for: on `full` and `lean`,
+where `registers` is served, five of six rows answer it. The task now separates *reading a
+register* from *deriving one*, and that is the whole of what `min` fails at.
+
+### The control found a third grader defect, and it is the same kind as the other two
+
+Opus answered `arm64_pc` with the right address three times and was graded wrong once:
+
+```text
+full:  0xfffff8013c65bca8    Y
+lean:  0xfffff801'3c65bca8   n     <- apostrophe
+min:   0xfffff801`3c65bca8   Y     <- backtick
+```
+
+`SEPARATOR` stripped `` ` `` and `_` between hex digits and not `'`. Widened, and the class is
+exactly those three because the evidence says so rather than because anyone reasoned to it:
+scanning every answer on disk for a non-hex character between two hex runs finds `` ` `` 45 times,
+`'` 19 and `_` 18 — and also `-` 23 and `,` 14, which are a sample's file name (`052126-34312`)
+and a decimal thousands separator (`139,264`). Stripping either of those would merge digits
+belonging to different values, so they stay out.
+
+Re-grading every log on disk both ways flips **exactly two verdicts**, both in this run, both
+control rows, both wrong→right: Opus on `lean` and Sonnet on `min`. The three published logs come
+back byte-identical, so no history was re-graded — the fix is why both control rows read 15/15
+above. This does not add a fourth rule; it is the **third rule corrected a second time**, and by
+the same row that produced it — two of the grader's three rules came from reading the control's
+answers, and the separator rule has now been widened by the control twice. Which is the argument
+for having a frontier row restated rather than a new one.
+
+### What the run measured about the harness rather than the models
+
+**The read-only allow-list in `local_model_drive.py` had gone stale, and a narrowed surface is
+where that shows.** (The list is no longer there — this is what the run met, and the reason it
+went.) `crash` grew from one tool to three; two of the new ones are `read_only_hint = true` on the
+server and neither was among the sixteen names the harness then kept, so a `min` cell reaching for
+`decode_error_reporting` met *"not permitted in this harness"* 19 times and `exception_triage`
+twice — this script's refusal, worded like the server's and counted as `refused` rather than as
+anything about the surface. It did not cost a graded answer: every `min` miss is `arm64_pc`, which
+neither tool answers.
+
+**The list is gone rather than corrected** (2026-09-14). Adding the two names would have bought
+until the next group grew; the fence now comes from each tool's own `readOnlyHint`, as described
+under *What is deliberately not an axis*. It lands **after** this run, so these logs are graded
+behind the fence as it was — and the next run's conditions differ by more than the stale names,
+because the derived fence is also *wider*: on `full` it runs 37 of 61 served tools where the list
+ran 16, so the pool, heap, driver and TTD read-only families are available to a model for the first
+time. Tool-choice figures across that boundary are not comparable.
+
+The other 41 refusals are the fence working as intended (`execute`, `attach_*`, `interrupt`), and
+13 errors are the server saying no — 11 of them nemotron calling `crash_triage` on a session it had
+already ended.
+
+### What it costs
+
+Six tasks, one draw, the 61-tool surface:
+
+| Model | Wall clock | Tool output taken | Score |
+| --- | --- | --- | --- |
+| nemotron-3.5:30b | 84 s | 27,159 ch | 4/6 |
+| Sonnet *(control)* | 85 s | 21,215 ch | 6/6 |
+| Opus *(control)* | 94 s | 21,799 ch | 6/6 |
+| gemma4:31b | 368 s | 31,735 ch | 6/6 |
+| qwen3.8:27b | 371 s | 32,326 ch | 6/6 |
+| muse-glimmer:30b | 427 s | 31,735 ch | 6/6 |
+
+**Fast is still not a proxy for good, and the new model is the far end of it.** nemotron is the
+quickest row and the only one below 6/6; muse-glimmer is the slowest local row at every surface —
+five draws of `min` took it 2,615 s against qwen's 1,248 — and scores with the best. On this bench
+the correctness columns and the wall-clock column are close to unrelated.
+
+## Sixth run: the reasoning axis, as an A/B (2026-09-14)
+
+Every run above this line had `think: false`, and the section on what is *deliberately not an axis*
+said why: a thinking turn had been measured outliving the listener's 390s lease grace, so leaving
+reasoning on would have confounded every timing with sessions vanishing mid-task. The driver's
+keepalive removed that, so the axis became affordable and this run is it — the same twelve local
+cells run twice, once each way.
+
+**It is two runs rather than one, and reusing the 2026-09-13 log as the baseline would have been
+wrong.** The read-only fence stopped being a hand-kept list of sixteen names between those runs,
+and that change *reaches these cells*: 24 calls the September 13 log recorded as `refused` — 19
+`decode_error_reporting`, 3 `current_location`, 2 `exception_triage` — now execute and return real
+output. Pairing an `on` arm against that log would have varied reasoning and the fence together.
+So arm A re-measures the baseline on today's harness and the two plans differ by one field.
+
+**The arm is recorded, not merely requested.** `think: true` is an ask, and this bench has been
+caught by that shape before — five cells once asked for an 8,192-token window and were *served*
+32,768. So every turn records `thinking_chars`: arm A's cells recorded `0` throughout, arm B's
+306,839 characters in total, and a cell that claimed `on` while thinking nothing would be visible
+as data rather than taken on trust. The identity block carries `reasoning on`/`off` and `--compare`
+names it as moved, so the two arms cannot be silently pooled. Logs written before the axis existed
+read `unrecorded` — not back-filled to `off`, which would be inventing a record.
+
+### What reasoning bought
+
+| | arm A · think off | arm B · think on |
+| --- | --- | --- |
+| correct, of possible | 50/60 | **55/60** |
+| answered without the tool | 2 | 4 |
+| tool calls | 143 | **116** |
+| model turns | 209 | **186** |
+| wall clock, 12 cells | 53 min | **90 min** |
+| reasoning produced | 0 ch | 306,839 ch |
+
+**This table is draw 1 of each cell**, which is what it measured when it was written; the `min`
+cells have since been run to five draws and the rates are below. The totals here are unchanged by
+that — the grader keys on the draw index, so the extra draws accumulated beside draw 1 rather than
+replacing it.
+
+**Fewer calls and fewer turns, for more right answers, at +70% wall clock.** That is the shape
+worth keeping: reasoning did not buy more tool use, it bought *less*. On this suite a thinking
+model substitutes deliberation for flailing rather than adding a planning step on top of the same
+behaviour.
+
+### Reading it against the noise floor, which is the only way to read it
+
+Seven cell-tasks moved between the arms, all seven in the improving direction. That is not a lot of
+movement — and the reason it means anything is that the same comparison run with the axis *held
+still* moves about as often, in both directions:
+
+| | cell-tasks moved | better | worse |
+| --- | --- | --- | --- |
+| 13 Sep (off) → arm A (off) — reasoning unchanged | 4 | 1 | 3 |
+| arm A (off) → arm B (on) — reasoning the only difference | 7 | **7** | **0** |
+
+So the *count* of moves is barely above the floor and the *direction* is not: the control pair
+moves 1:3, the axis pair 7:0. What that supports is "every move went one way, where a re-run's
+moves did not". It does not support a rate, and the clustering says why — three of the seven are
+nemotron and two are one task of gemma's on two surfaces, so the independent units are nearer four
+than seven. **One draw per cell, and the same rule as every other run on this page: this is a
+direction, not a magnitude.** The experiment that would give it a magnitude is the `min` cells at
+five draws in both arms, which is a four-hour run nobody has done yet.
+
+The floor row is also not pure noise — it spans the fence change, since no two think-off runs
+on identical harnesses exist. It is an upper bound on how still this bench sits, which is the
+conservative direction for the comparison beneath it.
+
+### Then the draws ran, and took the best sentence back
+
+The section above ended by saying the experiment that would turn a direction into a magnitude was
+the `min` cells at five draws in both arms. That ran: 240 task runs, 4h of wall clock, arm A
+recording 0 characters of reasoning across its 120 and arm B 999,210 across its 120.
+
+**It overturned the claim this page liked most.** At one draw, muse-glimmer answered `arm64_pc` on
+`min` with reasoning on and had missed it with reasoning off, and the write-up called that *the
+task that had never been answered, answered*. At five draws:
+
+| `arm64_pc` on `min` | think off | think on |
+| --- | --- | --- |
+| gemma4:31b | 0/5 | 0/5 |
+| muse-glimmer:30b | **2/5** | 5/5 |
+| nemotron-3.5:30b | 0/5 | 0/5 |
+| qwen3.8:27b | 1/5 | 3/5 |
+| **local total** | **3/20** | **8/20** |
+| Opus and Sonnet (off) | 6/10 | — |
+
+muse-glimmer answers it **two times in five with reasoning off**, so the single flip that carried
+that sentence sits inside the no-reasoning distribution. The previous run's `0/20` was a true count
+of an unlucky sample, not a floor; the controls' `2/2` is really `6/10`.
+
+**What the successful draws called is the finding underneath.** Every one of them — every draw of
+every model, correct and incorrect alike — calls `open_dump` then `crash_triage` and stops. Neither
+of the two tools the widened fence newly permits appears in a single success. So the variance is
+not in tool choice at all: the models see identical bytes and differ only in whether they read
+frame 0 as the `pc`. **On this task the bench is measuring interpretation, and the tool surface is
+not the variable.**
+
+### What reasoning does, with a denominator
+
+| `min`, five draws, local models pooled | think off | think on |
+| --- | --- | --- |
+| `bugcheck` | 19/20 | 20/20 |
+| `driver_blame` | 20/20 | 20/20 |
+| `module_count` | 18/20 | 20/20 |
+| `arm64_pc` | 3/20 | 8/20 |
+| **total** | **60/80** | **68/80** |
+
+One-sided Fisher on the total is **p = 0.083**, and on `arm64_pc` alone **p = 0.078**. Restricting
+to the two models that ever answer `arm64_pc` gives 3/10 → 8/10 and p = 0.035 — which is quoted
+here only to be disowned, because choosing those two *after* seeing which moved is selecting on the
+outcome. The defensible statement is the one that does not clear the conventional bar:
+**reasoning moves this suite in the right direction, consistently, at p ≈ 0.08.**
+
+**The cleanest single effect is not on `arm64_pc` at all.** It is gemma decoding the IOCTL with no
+`decode_ioctl` to call — the trap task, pure `CTL_CODE` arithmetic:
+
+| `ioctl_decode` on `min`, answered with no tool | think off | think on |
+| --- | --- | --- |
+| gemma4:31b | **0/5** | **5/5** |
+| muse-glimmer:30b | 5/5 | **3/5** |
+| nemotron-3.5:30b | 0/5 | 0/5 |
+| qwen3.8:27b | 0/5 | 0/5 |
+
+gemma goes 0/5 to 5/5, p = 0.004 — the only result here that clears any bar comfortably, and it is
+exactly the shape you would predict: reasoning buys arithmetic a model could always have done and
+otherwise does not attempt.
+
+**And muse-glimmer goes 5/5 to 3/5 on the same task, which is the row that keeps this honest.**
+Reasoning is not uniformly good. One model gains a capability on this task and another loses ground
+on it, in the same run, under the same change — so "turn thinking on" is not a recommendation this
+bench can make, and the aggregate hides a real regression.
+
+### What the draws did to the seven flips
+
+The one-draw comparison found seven cell-tasks moved, all seven for the better, and called it a
+direction rather than a magnitude. With five draws on the `min` half, two of those flips are
+visibly draw noise: qwen's `bugcheck` is 4/5 against 5/5, and muse's `arm64_pc` is 2/5 against 5/5
+rather than 0-then-1. The direction survives and the individual flips mostly do not, which is what
+the caveat was for — and is the fourth time this page has had to take back the correlation it liked
+best. The difference this time is that the retraction came from the bench rather than from review.
+
+### One wart in the comparison, said rather than hidden
+
+`--compare` reports `moved: harness, reasoning, weights` between the arms, and two of those three
+are an artefact of composition rather than a change. Arm B has no Claude rows — their reasoning is
+the client's to decide and this bench does not own that knob — so `harness` and the `opus`/`sonnet`
+weight entries are *absent* from arm B rather than different in it. The four local models carry
+byte-identical digests in both arms. The identity block shows this plainly enough to check, and the
+flag is conservative in the right direction, but a reader skimming the one-line summary would
+reasonably conclude the weights had moved. They did not.
 
 ## What this does not cover
 
