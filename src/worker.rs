@@ -7841,7 +7841,12 @@ fn device_security(e: &DebugEngine, device: &str, deadline: Instant) -> Result<O
             // The fold is the object manager's own, so this is a match or it is not -- there is
             // no third answer to count any more. `device::same_object_path` records what the
             // stand-in that needed one cost.
-            if device::same_object_path(&target, &path) {
+            //
+            // **Folded on the walk's own table, which is the target's where it resolved one.**
+            // This compares a link target the *namespace* read against the path the namespace
+            // resolved, so asking it on a different machine's NLS data would answer a question
+            // neither name came from.
+            if device::same_object_path(namespace.upcase(), &target, &path) {
                 links.push(device::Link {
                     path: format!("{LINK_DIRECTORY}\\{}", entry.name),
                     target,
