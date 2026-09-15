@@ -901,6 +901,7 @@ mod tests {
             bitness: pe::Bitness::Bits64,
             machine: 0x8664,
             size_of_image: 0x4000,
+            section_alignment: 0x1000,
             sections: vec![
                 pe::Section {
                     name: ".text".to_string(),
