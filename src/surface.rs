@@ -23,7 +23,7 @@
 //!
 //! # Engine-free
 //!
-//! Like [`crate::device`], [`crate::sd`], [`crate::pe`] and [`crate::hazards`], everything here
+//! Like [`crate::device`], [`crate::sd`], [`dbgscope::pe`] and [`crate::hazards`], everything here
 //! takes a `read(addr, len)` closure rather than a `DebugEngine`, so a driver object is tested
 //! against literal bytes with no debugger anywhere near it. The worker supplies the one closure
 //! that touches DbgEng, and resolves the layout from the target's own type information.

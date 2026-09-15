@@ -25,7 +25,6 @@ mod ioctl;
 mod kdconn;
 mod listen;
 mod logbridge;
-mod pe;
 mod progress;
 mod proto;
 mod record;
