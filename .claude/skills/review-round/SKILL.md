@@ -149,3 +149,48 @@ second with `0xD0000048 STATUS_PORT_ALREADY_SET` — but it was worth nothing un
 and the probe is what could be put in the code beside the rule for the next round to find. A
 dismissal you have not measured is indistinguishable, to you, from one you have.
 
+## A class fix closes the class only if it can express the whole rule
+
+The rule above says to delete the choice generating a run of findings rather than fix them one at a
+time. **The failure mode of doing that is centralising the mistake instead of fixing it**, and it is
+not visible from inside: every caller now goes through one helper, the commit message says so, and
+the next round lands on the helper.
+
+[dbgscope#164](https://github.com/glslang/dbgscope/pull/164) (2026-09-15) produced **17 findings over
+11 rounds** on one 1,300-line PE parser, and **three were against the previous round's own fix**:
+
+- Round 3 routed every base-plus-offset through one `va(base, offset)` and said "every addition of an
+  offset to a base in this module goes through here". True — and `va` took no length, so it could
+  only check where a read *starts*. Round 8 found the header reader handing the reader a span running
+  off the end of the address space. The fix was a **signature change**, `va(base, offset, len)`,
+  after which the half-version cannot be written. The mutation is what proves the difference: with
+  the length inside the helper, one edit fails *both* call sites' tests; before it, each site had its
+  own rule and only one test moved.
+- Round 9 added `SectionAlignment` rounding with a fallback when the alignment was not a power of
+  two. Round 10 pointed out the fallback reproduced the exact under-reporting the rounding was for.
+
+**The tell is a commit message containing "every X now goes through Y".** Ask what Y *cannot*
+express. If the rule you just learned does not fit in Y's parameters, Y is the next finding.
+
+## Do the enumeration yourself, at round three
+
+Those eleven rounds were eleven *fields* of an attacker-controlled structure found one at a time —
+each locally real, each cheap to fix, and each making the next one look like bad luck rather than a
+queue. What ended it was enumerating all 21 field reads in one pass, fixing the two that were left,
+and writing the contract into the module doc: what constrains every field, **and the two that are
+deliberately unconstrained with why**. A reviewer enumerating a structure's fields is a machine doing
+something you can do faster and more completely.
+
+So when a second finding lands on the same *kind* of thing — not the same line — stop answering and
+go count. The audit is the deliverable; the remaining fixes fall out of it.
+
+## Their rule can be right and their reproduction wrong
+
+Round 11 asked for ordinal thunks with reserved bits set to be refused. Correct. Its worked example
+was a thunk of `0x2110` with the ordinal flag set — which fits the low sixteen bits and is a
+perfectly ordinary ordinal import for ordinal 8464. Implementing the example would have refused a
+valid thunk: **a new defect, shipped on a true finding.** The test now sets a genuinely reserved bit
+*and* pins the reviewer's value as one that must still read.
+
+The first attempt used their example and failed, which is how it was caught — so write the test from
+the rule, run it, and read a failure as a question about which of the two is wrong.
