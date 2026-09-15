@@ -186,9 +186,12 @@ And **do not read `worker_terminated` as the tell**: it is `!matches!(outcome, A
 so it is `true` after an ordinary successful release too. An earlier draft of this note said the
 opposite, and `DONE.md`'s own entry on `DEBUG_END_PASSIVE` had already said it correctly.
 
-So after ending a live-kernel session, **check the uptime rather than the status field** -- it is the
-only thing that distinguishes ran-on, re-broke, and never-resumed, and the three look identical from
-the result.
+So after ending a live-kernel session there are two questions, and the result answers one of them.
+**A resume that failed is now in the result**: `target_left_running` is `false` and the text names
+`qd`, and a supervisor teardown with no caller logs the same at `error!`. What the result cannot
+separate is ran-on from resumed-and-re-broke -- both are `true`, because both resumed, and only the
+guest's **uptime across the gap** tells them apart. A guest found at almost the uptime it was left
+at resumed and stopped again; one found seconds later ran on.
 
 **KDNET attach is a blocking wait, by design.** A live kernel needs `WaitForEvent(INFINITE)` (a finite
 timeout returns `E_NOTIMPL` and never drives the link). So if the target isn't reachable, the

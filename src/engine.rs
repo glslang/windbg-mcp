@@ -2719,12 +2719,14 @@ impl Sessions {
             // The supervisor's own teardown rather than a caller's call, so it runs past the gate
             // the claim just closed — and orderly, because a live kernel that is merely killed is
             // left halted.
-            self.release(
-                &session.clone(),
-                Call::supervisor(EngineOp::EndSession),
-                END_SESSION_TIMEOUT,
-            )
-            .await;
+            let outcome = self
+                .release(
+                    &session.clone(),
+                    Call::supervisor(EngineOp::EndSession),
+                    END_SESSION_TIMEOUT,
+                )
+                .await;
+            note_release("idle reclamation", session, &outcome);
         }
         claimed.len()
     }
@@ -2792,46 +2794,7 @@ impl Sessions {
                         SHUTDOWN_RELEASE_TIMEOUT,
                     )
                     .await;
-                let note = shutdown_note(&outcome, session.released.load(Ordering::SeqCst));
-                // `end_session` renders this for its caller. Shutdown has no caller — the client
-                // has already gone — so the log is the only place it can land, and it is exactly
-                // where an operator looks after finding a guest that did not come back.
-                match note {
-                    ShutdownNote::Released => {
-                        tracing::info!("{label}: session {} released its target", session.id)
-                    }
-                    // `error!`, not `info!`: the session ended correctly, and the guest did not
-                    // come back. This is the line the note above promises an operator will find.
-                    ShutdownNote::ReleasedHalted => tracing::error!(
-                        "{label}: session {} released its target, but the live kernel could not be \
-                         told to run before it was detached -- it is probably still halted at a \
-                         break with one processor stopped. Attaching again and running `qd` \
-                         resumes and releases it",
-                        session.id
-                    ),
-                    ShutdownNote::ReleasedElsewhere => tracing::info!(
-                        "{label}: session {}'s target was released by a teardown already in flight",
-                        session.id
-                    ),
-                    ShutdownNote::Refused(why) => tracing::warn!(
-                        "{label}: session {} reported an error releasing its target ({why}); \
-                         its worker (pid {}) was terminated anyway — and terminating a debugger \
-                         does not resume and detach for it, so a live kernel target may be left \
-                         halted",
-                        session.id,
-                        session.pid
-                    ),
-                    ShutdownNote::Unreleased(what) => tracing::warn!(
-                        "{label}: session {} (pid {}) {what}, and no teardown reported \
-                         releasing its target — so a live kernel target may be left halted",
-                        session.id,
-                        session.pid
-                    ),
-                    ShutdownNote::Settled(why) => tracing::info!(
-                        "{label}: session {} was already settled ({why})",
-                        session.id
-                    ),
-                }
+                note_release(label, &session, &outcome);
             }));
         }
         for task in releasing {
@@ -2960,13 +2923,18 @@ impl Sessions {
                 // Released the same way `end_session` releases one, so a live debuggee is let go
                 // cleanly rather than dying with its debugger. As the supervisor's own teardown
                 // rather than a caller's call, it runs past the gate the claim already closed.
-                sessions
+                let outcome = sessions
                     .release(
                         &victim,
                         Call::supervisor(EngineOp::EndSession),
                         END_SESSION_TIMEOUT,
                     )
                     .await;
+                // Reported for the same reason the comment above releases carefully: this path
+                // reclaims a live kernel too, and a guest left at a break has no other way to be
+                // heard from here -- the client that would have been told is still holding the
+                // session it kept.
+                note_release("capacity reclamation", &victim, &outcome);
             }
         });
     }
@@ -3327,6 +3295,58 @@ enum ShutdownNote<'a> {
     Unreleased(&'static str),
     /// There was nothing to tear down.
     Settled(&'a str),
+}
+
+/// Logs what a **supervisor-initiated** teardown did to one session's target.
+///
+/// `end_session` renders this for its caller. A shutdown, a lease expiry, an idle reclamation and a
+/// capacity reclamation have no caller — the client has already gone, or never asked — so the log is
+/// the only place it can land, and it is exactly where an operator looks after finding a guest that
+/// did not come back.
+///
+/// **Shared by all four, which it was not.** Only the shutdown path rendered this; `release_idle`
+/// and the capacity task in `reconcile_capacity` awaited `release(..)` and dropped the `Release` on
+/// the floor. So a live-kernel session reclaimed for idleness or for capacity, whose resume failed,
+/// left `released: true` in the transcript and nothing anywhere about a guest still at a break —
+/// the one outcome this classification exists to surface. A function rather than three call sites
+/// of the same `match`, so the next path that reclaims a session cannot quietly answer differently.
+fn note_release(label: &str, session: &Arc<Session>, outcome: &Release) {
+    match shutdown_note(outcome, session.released.load(Ordering::SeqCst)) {
+        ShutdownNote::Released => {
+            tracing::info!("{label}: session {} released its target", session.id)
+        }
+        // `error!`, not `info!`: the session ended correctly, and the guest did not
+        // come back. This is the line the note above promises an operator will find.
+        ShutdownNote::ReleasedHalted => tracing::error!(
+            "{label}: session {} released its target, but the live kernel could not be \
+                 told to run before it was detached -- it is probably still halted at a \
+                 break with one processor stopped. Attaching again and running `qd` \
+                 resumes and releases it",
+            session.id
+        ),
+        ShutdownNote::ReleasedElsewhere => tracing::info!(
+            "{label}: session {}'s target was released by a teardown already in flight",
+            session.id
+        ),
+        ShutdownNote::Refused(why) => tracing::warn!(
+            "{label}: session {} reported an error releasing its target ({why}); \
+                 its worker (pid {}) was terminated anyway — and terminating a debugger \
+                 does not resume and detach for it, so a live kernel target may be left \
+                 halted",
+            session.id,
+            session.pid
+        ),
+        ShutdownNote::Unreleased(what) => tracing::warn!(
+            "{label}: session {} (pid {}) {what}, and no teardown reported \
+                 releasing its target — so a live kernel target may be left halted",
+            session.id,
+            session.pid
+        ),
+        ShutdownNote::Settled(why) => tracing::info!(
+            "{label}: session {} was already settled ({why})",
+            session.id
+        ),
+    }
 }
 
 /// Reads one session's teardown, given what its own attempt returned and whether *any* teardown
@@ -7195,6 +7215,56 @@ mod tests {
         assert_eq!(
             shutdown_note(&nothing_to_keep, false),
             ShutdownNote::Released
+        );
+    }
+
+    /// **Every supervisor teardown reports what it did to the target**, and this is pinned at the
+    /// call sites rather than in the renderer.
+    ///
+    /// The finding that produced it: `ReleasedHalted` was reached only from `release_workers_of`.
+    /// `release_idle` and the capacity task in `reconcile_capacity` awaited `release(..)` and
+    /// dropped the `Release`, so a live-kernel session reclaimed for idleness or for capacity --
+    /// whose resume failed -- left `released: true` behind and said nothing about a guest still at
+    /// a break. Routing them through one `note_release` fixed it; nothing stopped the next such
+    /// path from being written the old way, and a renderer test cannot see a caller that never
+    /// calls it.
+    ///
+    /// So this reads the source. `Sessions::end` is the exception and is named as one: it renders
+    /// the disposition for the caller that asked, which is the whole of `end_session`'s reply.
+    #[test]
+    fn every_supervisor_release_reports_what_it_did_to_the_target() {
+        // Everything before this file's first test module -- the same trick `worker.rs` uses, and
+        // the same reason: the tests below are full of the words being counted.
+        let code = include_str!("engine.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("engine.rs has a test module")
+            .0;
+
+        // `.release(` is the supervisor's own teardown call. Each one either hands its outcome to
+        // `note_release` within the next few lines, or is `end`, which answers a caller instead.
+        let mut unaccounted = Vec::new();
+        for (index, _) in code.match_indices(".release(") {
+            let line = code[..index].matches('\n').count() + 1;
+            // From a little *before* the call as well as after it: what marks the caller-facing
+            // one is the binding on its left, which a window starting at the match cannot see.
+            let after = &code[index.saturating_sub(120)..];
+            let window: String = after.lines().take(16).collect::<Vec<_>>().join("\n");
+            if window.contains("note_release(") {
+                continue;
+            }
+            // The caller-facing one: `end` builds a `SessionEnded` and a rendered message instead.
+            if window.contains("let outcome = self.release(session, call, END_SESSION_TIMEOUT)") {
+                continue;
+            }
+            unaccounted.push(line);
+        }
+
+        assert!(
+            unaccounted.is_empty(),
+            "a supervisor `release(..)` at line(s) {unaccounted:?} does not pass its outcome to \
+             `note_release`, so a live kernel it left halted would be released in silence. Route \
+             it through the same classification, or -- if it answers a caller the way `end` does \
+             -- say so here."
         );
     }
 
