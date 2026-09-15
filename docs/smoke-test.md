@@ -31,7 +31,7 @@ taken a second covered no debugger claim at all.
 | Tier | Gate | Needs | Catches |
 | --- | --- | --- | --- |
 | **Protocol** | always | no debugger, no target, and no network off this machine — it does bind a loopback port for the listener | transport, revision negotiation, tool-surface drift, and the listener's lease up to the point a session is opened |
-| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the nine that want one — `cmd.exe` for the eight that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
+| **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the eleven that want one — `cmd.exe` for the ten that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
@@ -1157,6 +1157,35 @@ cannot is a regression rather than a documented detour.
 of it, and the second launch in it is the test rather than scenery: with one session open the
 retired one is still current, so an un-handled `end_session` reaches it and the defect is
 invisible. That is why the fuzz found this on its round teardown and no single-session test did.
+
+## Which VS shape a target is decoded with
+
+Windows has shipped three layouts for the Segment Heap's variable-size allocator, and all three are
+live at once: the free tree inside `_HEAP_VS_CONTEXT`, the tree in per-affinity slots that name
+their context by **address**, and the same slots naming it by **displacement**
+(`_HEAP_VS_AFFINITY_SLOT::VsContextOffset`, 26100.33438 and 26200 onwards). `dbgscope` picks by the
+fields the target's own PDB carries and never by a build number — `10.0.26100.1742` is still the
+inline shape while later 26100s are not — so the tier's job is to prove that selection works on
+more than one build.
+
+Two tests, because one bench is one Windows:
+
+- **`a_user_mode_heap_query_names_the_vs_shape_it_decoded_with`** rides the debugger tier, on the
+  `cmd.exe` it already launches. `heap::list` resolves the schema *before* it enumerates heaps, so
+  a target with no Segment Heap at all still exercises the whole of what the rename broke. It
+  asserts that *a* shape was named, never which one — pinning this host's answer would fail on a
+  machine that is merely older. It stands down, loudly, when `ntdll` has no private PDB.
+- **`an_older_builds_allocator_schema_still_resolves`** is `#[ignore]`d, because it needs `nt`
+  PDBs from a symbol server that CI is not asked for. It opens the two checked-in **x64** dumps,
+  whose `nt` carries the address-bearing shape that predates the rename, and asserts the walk gets
+  *past* the schema — positively, by the failure it then reaches. A kernel minidump carries no pool
+  pages, so the walk cannot succeed and is not meant to; what is being measured is where it stops.
+  Asserting the absence of the layout refusal instead would pass on a host with no symbols at all.
+
+The other two dumps are ARM64, and the pool walker decodes x64 only — but they are worth knowing
+about, because between them the four span every shape: `121524-4703-01` has no
+`_HEAP_VS_AFFINITY_SLOT` at all (inline), and `082126-7015-01` already carries `VsContextOffset`.
+Read them with `dt nt!_HEAP_VS_AFFINITY_SLOT` rather than through the pool tools.
 
 ## The bounded-command tier
 

@@ -1387,11 +1387,19 @@ pub struct AllocatorModuleInfo {
     pub symbols: SymbolState,
 }
 
+/// Which VS representation the walk behind an answer actually decoded.
+///
+/// Three, not two, and all three are live at once: a target is decoded by whichever shape its own
+/// PDB completes, never by its build number. The two affinity variants differ in how a slot names
+/// the context it belongs to — by address, or by displacement from it — which is a different
+/// check rather than a different spelling, so they are reported apart. A caller comparing two
+/// targets reads this before concluding anything from their chunk counts.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum AllocatorSemanticFamily {
     InlineVs,
     AffinitySlotVs,
+    AffinitySlotVsOffset,
 }
 
 impl From<&dbgscope::allocator::LayoutProvenance> for AllocatorLayoutInfo {
@@ -1413,6 +1421,9 @@ impl From<&dbgscope::allocator::LayoutProvenance> for AllocatorLayoutInfo {
             semantic_family: match layout.semantic_family {
                 VsSemanticFamily::Inline => AllocatorSemanticFamily::InlineVs,
                 VsSemanticFamily::AffinitySlots => AllocatorSemanticFamily::AffinitySlotVs,
+                VsSemanticFamily::AffinitySlotsSelfRelative => {
+                    AllocatorSemanticFamily::AffinitySlotVsOffset
+                }
             },
         }
     }

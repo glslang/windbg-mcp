@@ -213,8 +213,8 @@
       "inputSchema": 1153,
       "modelVisible": 1430,
       "name": "heap_allocations",
-      "outputSchema": 5556,
-      "wire": 7145
+      "outputSchema": 5582,
+      "wire": 7171
     },
     {
       "annotations": 124,
@@ -222,8 +222,8 @@
       "inputSchema": 618,
       "modelVisible": 864,
       "name": "heap_census",
-      "outputSchema": 5390,
-      "wire": 6409
+      "outputSchema": 5416,
+      "wire": 6435
     },
     {
       "annotations": 126,
@@ -231,8 +231,8 @@
       "inputSchema": 493,
       "modelVisible": 900,
       "name": "heap_chunk",
-      "outputSchema": 5746,
-      "wire": 6803
+      "outputSchema": 5772,
+      "wire": 6829
     },
     {
       "annotations": 130,
@@ -240,8 +240,8 @@
       "inputSchema": 762,
       "modelVisible": 1078,
       "name": "heap_diagnostics",
-      "outputSchema": 5222,
-      "wire": 6461
+      "outputSchema": 5248,
+      "wire": 6487
     },
     {
       "annotations": 119,
@@ -249,8 +249,8 @@
       "inputSchema": 465,
       "modelVisible": 821,
       "name": "heap_list",
-      "outputSchema": 5086,
-      "wire": 6057
+      "outputSchema": 5112,
+      "wire": 6083
     },
     {
       "annotations": 120,
@@ -339,8 +339,8 @@
       "inputSchema": 602,
       "modelVisible": 1029,
       "name": "pool_census",
-      "outputSchema": 4863,
-      "wire": 6046
+      "outputSchema": 4889,
+      "wire": 6072
     },
     {
       "annotations": 129,
@@ -348,8 +348,8 @@
       "inputSchema": 760,
       "modelVisible": 1752,
       "name": "pool_chunk",
-      "outputSchema": 5631,
-      "wire": 7543
+      "outputSchema": 5657,
+      "wire": 7569
     },
     {
       "annotations": 127,
@@ -357,8 +357,8 @@
       "inputSchema": 831,
       "modelVisible": 1983,
       "name": "pool_diagnostics",
-      "outputSchema": 4800,
-      "wire": 6941
+      "outputSchema": 4826,
+      "wire": 6967
     },
     {
       "annotations": 122,
@@ -366,8 +366,8 @@
       "inputSchema": 1795,
       "modelVisible": 2520,
       "name": "pool_find_tag",
-      "outputSchema": 5683,
-      "wire": 8356
+      "outputSchema": 5709,
+      "wire": 8382
     },
     {
       "annotations": 90,
@@ -556,10 +556,10 @@
     "inputSchema": 52398,
     "instructions": 1983,
     "modelVisible": 90274,
-    "outputSchema": 150625,
-    "payload": 249063,
+    "outputSchema": 150859,
+    "payload": 249297,
     "tools": 61,
-    "wire": 248991,
+    "wire": 249225,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
