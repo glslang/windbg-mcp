@@ -69,10 +69,11 @@ The general shape, which is the part worth carrying: **a proc macro's expansion 
 edge, and no amount of reading the source shows it.** A dependency is unused when the compiler says
 so, not when a grep does.
 
-**And "the compiler says so" means every target, not `cargo build`.** A bare build compiles the lib
-and the binaries and nothing else, so a dependency whose only consumer is a test, an example or a
-feature is certified unused by a command that never compiled its consumer. This repo has two entries
-that would fall for exactly that: `windows-sys` appears twice, the second a dev-dependency taking
+**And "the compiler says so" means every target, not `cargo build`.** A bare build selects this
+package's library and binary targets — not its tests, examples or benches — so a dependency whose
+only consumer is one of those, or a feature, is certified unused by a command that never compiled
+its consumer. This repo has two entries that would fall for exactly that: `windows-sys` appears
+twice, the second a dev-dependency taking
 `Win32_Storage_FileSystem` and `Win32_System_Console` so `mcp_smoke` can read a PE version resource
 and check a worker's console; and `tokio` appears twice, the second a dev-dependency taking
 `test-util` for `src/progress.rs`'s heartbeat assertions. Delete either dev entry and `cargo build`
