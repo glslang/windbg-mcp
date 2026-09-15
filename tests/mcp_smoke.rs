@@ -12068,6 +12068,154 @@ fn a_pool_query_with_no_time_to_walk_is_refused_rather_than_run() {
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
 }
 
+/// An allocator query says **which VS shape it decoded the target with**, on whatever build this
+/// host happens to be.
+///
+/// The regression it exists for refused a whole build outright: `_HEAP_VS_AFFINITY_SLOT`'s
+/// back-reference was renamed `VsContext` → `VsContextOffset`, it sat in a *required* field list,
+/// and the type it took down with it carried the rest of the family — so every pool and heap query
+/// on a current Windows answered `unsupported allocator layout … no recognized VS structural
+/// family is complete` (`FOLLOWUPS.md` item 78). A user-mode target reaches that code on the
+/// cheapest possible target, because `heap::list` resolves the schema *before* it enumerates
+/// heaps: `cmd.exe` has no Segment Heap at all and still exercises the whole of what broke.
+///
+/// **It asserts that a family is named, never which one.** Three shapes ship and all three are
+/// live — this bench reports `affinity_slot_vs_offset`, a 2026 x64 build reports
+/// `affinity_slot_vs`, an older one `inline_vs` — and a test that pinned this host's answer would
+/// fail on a colleague's machine for being right. Selection is by the fields the target's own PDB
+/// carries and never by a build number, so "some shape resolved" is the property; which one is the
+/// target's business.
+///
+/// Stands down loudly rather than quietly when `ntdll` has no private PDB, since that failure is a
+/// *different* one and an assertion phrased as "did not fail the old way" would pass for it
+/// without ever resolving a layout.
+#[test]
+fn a_user_mode_heap_query_names_the_vs_shape_it_decoded_with() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    let answer = server.call_tool("heap_list", json!({ "session_id": &session }), TARGET_STEP);
+    let report = text_of(&answer["result"]);
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+
+    assert_no_error(&answer, "heap_list on a live user-mode target");
+    if is_tool_error(&answer) {
+        // The two stand-downs are separated because they need opposite responses, and folding
+        // them together is what would make this test pass without asserting anything.
+        if report.contains("private PDB type information") || report.contains("missing allocator") {
+            skip("this host has no private `ntdll` PDB, so no layout can be resolved at all");
+            return;
+        }
+        if report.contains("x64") {
+            skip("the heap walker decodes x64 targets only");
+            return;
+        }
+        panic!(
+            "the heap query failed. If this names an unsupported allocator layout, this host's \
+             `ntdll` carries a VS shape the walker does not recognise — which is the whole of \
+             item 78, arriving again on a newer build:\n{report}"
+        );
+    }
+
+    let family = answer["result"]["structuredContent"]["layout"]["semantic_family"]
+        .as_str()
+        .unwrap_or_else(|| {
+            panic!("the answer carries no decoded VS shape at all:\n{report}");
+        });
+    // Read against the served schema rather than a literal, so a family added here without a
+    // variant — or spelled differently on the wire — fails rather than passing as a string.
+    assert!(
+        ["inline_vs", "affinity_slot_vs", "affinity_slot_vs_offset"].contains(&family),
+        "`{family}` is not a VS shape this server can report; a shape added to `dbgscope` needs \
+         its `AllocatorSemanticFamily` variant here too:\n{report}"
+    );
+    ran(&format!("a live user-mode target decoded as {family}"));
+}
+
+/// An **older** build's allocator schema still resolves, read from that build's own PDB.
+///
+/// The counterpart to the test above, and the half a bench cannot otherwise reach: this host runs
+/// one Windows, so every live assertion here is about one VS shape. The checked-in dumps are other
+/// builds — [`SAMPLE_DUMP`] and [`BUGCHECK_DUMP`] are x64 26100 captures from 2026 whose `nt`
+/// carries `_HEAP_VS_AFFINITY_SLOT::VsContext`, the **address**-bearing shape that predates the
+/// rename. Nothing else in the suite pins that shape against real type information.
+///
+/// What it asserts is narrow on purpose. A kernel **minidump carries no pool pages**, so the walk
+/// itself cannot succeed and does not here — it fails reading a sparse range. The question is
+/// *where* it fails: past the schema, or at it. Asserting the walk-stage failure positively, rather
+/// than asserting the absence of the layout refusal, is what stops a missing symbol store from
+/// satisfying this test without a layout ever having been resolved.
+///
+/// `#[ignore]`d because it needs `nt` PDBs from a symbol server, which the debugger tier
+/// deliberately does not require of a CI machine.
+#[test]
+#[ignore = "needs nt PDBs from a symbol server; run manually"]
+fn an_older_builds_allocator_schema_still_resolves() {
+    if !launch_tier() {
+        return;
+    }
+    for dump in [SAMPLE_DUMP, DRIVER_CRASH_DUMP] {
+        if !std::path::Path::new(dump).exists() {
+            skip(&format!("sample dump not found at {dump}"));
+            continue;
+        }
+        let mut server = Server::started();
+        let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+        server.call_tool(
+            "set_symbol_path",
+            json!({
+                "path": symbol_path(),
+                "reload": "/f nt",
+                "session_id": &session,
+            }),
+            TARGET_STEP,
+        );
+
+        let walk = server.call_tool(
+            "pool_census",
+            json!({ "session_id": &session, "refresh": true, "limit": 1 }),
+            POOL_CALL_BUDGET,
+        );
+        let report = text_of(&walk["result"]);
+        server.tool_text(
+            "end_session",
+            json!({ "session_id": &session }),
+            TARGET_STEP,
+        );
+
+        assert_no_error(&walk, "pool_census on an older build's dump");
+        assert!(
+            !report.contains("unsupported allocator layout"),
+            "{dump}'s `nt` carries the address-bearing affinity-slot shape, and the walker no \
+             longer recognises it — so support for an older build has been withdrawn rather than \
+             extended:\n{report}"
+        );
+        if report.contains("missing allocator symbols") || report.contains("symbol") {
+            skip(&format!(
+                "{dump}: no `nt` PDB on this host, so no schema was resolved"
+            ));
+            continue;
+        }
+        assert!(
+            report.contains("walking the pool failed"),
+            "the schema resolved and the walk should then fail on a minidump's absent pool pages. \
+             Another failure here means this is no longer measuring what it claims:\n{report}"
+        );
+        ran(&format!("{dump} resolved an older build's VS shape"));
+    }
+}
+
 /// The interrupt, end to end: a command that would run for hours is stopped **on request**, the
 /// call that started it gets its partial output back as a result, and the session takes the next
 /// call at once.
@@ -13292,6 +13440,21 @@ const LOADED_MODULE_PROBE: &str = "lm m nt";
 /// mixed separators.
 const SYMBOL_CACHE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "\\target\\release\\sym");
 
+/// Where to look for PDBs: whatever the operator set, else the Microsoft store cached locally.
+///
+/// Shared by every test that needs symbols, so that "this bench's symbol path" is one answer. Two
+/// of them are about builds *other than this host's*, which is the case a second copy of this
+/// expression would quietly get wrong.
+fn symbol_path() -> String {
+    std::env::var(SYMBOLS_ENV)
+        .ok()
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| {
+            format!("srv*{SYMBOL_CACHE}*https://msdl.microsoft.com/download/symbols")
+        })
+}
+
 /// The debugging engine a debugger process needs *beside its own exe*.
 ///
 /// `dbgeng.dll` exists in System32, so a binary without these still opens targets, runs commands
@@ -13381,13 +13544,7 @@ fn load_kernel_symbols(server: &mut Server, session: &str) -> KernelSymbols {
     // DbgHelp will create the store, but only once it has decided to use it; making it first
     // removes one way for a symbol-server element to be quietly unusable.
     let _ = std::fs::create_dir_all(SYMBOL_CACHE);
-    let path = std::env::var(SYMBOLS_ENV)
-        .ok()
-        .map(|value| value.trim().to_string())
-        .filter(|value| !value.is_empty())
-        .unwrap_or_else(|| {
-            format!("srv*{SYMBOL_CACHE}*https://msdl.microsoft.com/download/symbols")
-        });
+    let path = symbol_path();
 
     // The typed tool, not `.sympath+` through `execute`: it goes through DbgEng's
     // Append/SetSymbolPath, so it cannot fall foul of `.sympath` swallowing the rest of the

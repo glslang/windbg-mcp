@@ -105,6 +105,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 75](#75-dbgscope--windbg-mcp-an-instructions-operands-are-not-every-register-it-reads--done-2026-09-14) — [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — done (2026-09-14)
 - [Item 76](#76-dbgscope-a-fold-that-cannot-decide-one-code-unit-declines-the-whole-comparison--deleted-unbuilt-2026-09-14) — [dbgscope] A fold that cannot decide one code unit declines the whole comparison — deleted unbuilt (2026-09-14)
 - [Item 77](#77-dbgscope-the-fold-is-the-hosts-upcase-table-not-the-targets--done-2026-09-15-dbgscope162) — [dbgscope] The fold is the *host's* upcase table, not the target's — done (2026-09-15, dbgscope#162)
+- [Item 78](#78-dbgscope-the-vs-allocator-layout-moved-again-and-the-pool-walker-refuses-the-build--done-2026-09-15-dbgscope167) — [dbgscope] The VS allocator layout moved again, and the pool walker refuses the build — done (2026-09-15, dbgscope#167)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3537,3 +3538,72 @@ with the walk -- 973 of them move, and the test asserts that count so a fixture 
 could not pass vacuously. Six mutations were each caught: the walk site reverted to
 `same_object_name`, the leaf substituted rather than added, level two indexed relative to level
 one, an index read as a byte offset, the null check removed, and the cache removed.
+
+## 78. [dbgscope] The VS allocator layout moved again, and the pool walker refuses the build — **done** (2026-09-15, dbgscope#167)
+
+**Repo:** `dbgscope` ([#167](https://github.com/glslang/dbgscope/pull/167)), surfaced by
+`windbg-mcp`'s live-kernel tier.
+
+Two tests in that tier failed against the CTF guest on
+`26100.33438.amd64fre.lt_release_svc_prod1.260904-1524`, both refusing the build:
+
+```text
+resolving pool layout failed (unsupported allocator layout fnv1a64:77069ff603c2356c:
+no recognized VS structural family is complete); run `.reload /f nt` and retry
+```
+
+`_HEAP_VS_AFFINITY_SLOT::VsContext` is spelled **`VsContextOffset`** on that build. Because the old
+name sat in a *required* field list, `resolve_type` dropped the whole type — taking `FreeChunkTree`
+and `DelayFreeContext` with it — so one renamed field refused the build entirely.
+
+**What the entry got right.** That it is a shape and not a spelling, and that the alias was the
+tempting wrong fix: read as an address, a displacement matches no context and every slot is
+rejected — a walker that reports the older family's name while walking no VS evidence. Confirmed
+live, with the old rule in place: `VS affinity slot 0x1b146000d40 claims context 0xa80, not
+0x1b1460002c0; skipped`. It was also right that the semantics had to be measured first.
+
+**What it measured.** `VsContextOffset` is `slot - context`, unscaled bytes.
+`ntdll!RtlpHpVsSlotCreate` stores exactly that (`mov rax,rbx; sub rax,rdi; mov [rbx],rax`, `rdi`
+being the context the slot was created for), and a live slot held `0xa80`, which was both
+`slot - context` and `SlotRef << 6`. `RtlpHpVsContextGetSlotInfo` is **unchanged**, so the slot-map
+arithmetic the walker already had needed no edit at all.
+
+**What it got wrong, and it is the useful half.** The item scoped this to the *pool* walker on a
+*kernel* target. `src/heap.rs` shares `provenance()` and `vs_roots()` with it, and `heap::list`
+resolves the schema *before* it enumerates heaps — so all five user-mode heap tools were down too,
+on **any** current Windows. That made the whole thing reproducible on the debugger host itself, with
+no VM: `heap_list` against a local process refused with the same message and a different fingerprint
+(`fnv1a64:ebf529c63c266d4a`). The measurement that unblocked the item was then taken in user mode
+against `ntdll`, not over KD — [[ntdll-mirrors-kernel-rtl-structures]] as a working method rather
+than a note.
+
+**And the fingerprint it asked to pin could not be pinned.** The item says to keep
+`fnv1a64:77069ff603c2356c` "in the test that pins it". That digest is over every resolved fact, and
+the fix resolves one field more — so it identifies the *pre-fix* reading of that build and is a
+value the fixed code never produces. The guest now reads `fnv1a64:bbc9a6daae9ff7a2`. What is pinned
+instead is the thing actually at risk: the schemas of the two **older** shapes, against digests
+recorded before the change, so a future edit that withdraws support for them fails rather than
+passes.
+
+**What landed.** A third `VsSemanticFamily` — `AffinitySlotsSelfRelative` (`affinity_slot_vs_offset`)
+— beside `Inline` and `AffinitySlots`, because the two affinity shapes are *checked* differently
+rather than spelled differently. `AllocatorSchema::vs_shape` is now the one place that judges the
+family, consumed by both `provenance()` and `vs_roots()`; they previously reached the same
+conclusion independently from two copies of the field list. A PDB carrying both spellings is refused
+as ambiguous rather than resolved by precedence. And the refusal names what each family wanted and
+what was missing — the old message said only that no family was complete, which reads as a symbol
+problem and is why the first diagnosis of this went to `.reload /f nt` before anyone compared a
+field name.
+
+**Three builds, not a migration.** Selection stays structural — the fields a target's own PDB
+carries, never a build number. The repo's own checked-in dumps turn out to span all three:
+`121524-4703-01` has no `_HEAP_VS_AFFINITY_SLOT` at all (inline), `052126-34312-01` and
+`081226-2187-01` carry `VsContext` (address), and `082126-7015-01` already carries
+`VsContextOffset`. The last is ARM64 and the walker is x64-only, so two of the four are reachable
+through the tools; `an_older_builds_allocator_schema_still_resolves` uses that pair to pin the
+older shape against **real** type information rather than synthetic offsets.
+
+**Verified.** 299 dbgscope unit tests; both wrong fixes mutation-checked (the alias, and the two
+back-reference rules swapped in each direction). Live `ntdll` on 26200: 8,878 chunks where it
+previously refused. Live kernel, the guest this item was filed from: 326,098 chunks, and the
+tier passes 10/10 including the two tests named above.

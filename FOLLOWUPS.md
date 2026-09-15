@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-one clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -41,9 +41,7 @@ with it, and item 72 from running that tool's live-kernel tier, where a fresh at
 leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
 against (2026-09-13), and items 73–74 from checking the four driver tools against Ghidra and
 Driver Buddy Revolutions over `mountmgr` and HEVD — an import directory the loader may have
-freed, and the one section of the ported program with no counterpart here (2026-09-14) — and item
-78 from running the live-kernel tier against a rebuilt CTF guest, where the pool walker no longer
-recognises the segment-heap VS layout that build ships (2026-09-15).
+freed, and the one section of the ported program with no counterpart here (2026-09-14).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1255,56 +1253,3 @@ its own code, which is what makes the walk worth starting.
 
 **Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
 these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
-
-## 78. [dbgscope] The VS allocator layout moved again, and the pool walker refuses the build
-
-**Repo:** `dbgscope` (surfaced by `windbg-mcp`'s live-kernel tier).
-
-Two tests in the live-kernel tier fail against the CTF guest on
-`26100.33438.amd64fre.lt_release_svc_prod1.260904-1524`, both with the same refusal:
-
-```text
-resolving pool layout failed (unsupported allocator layout fnv1a64:77069ff603c2356c:
-no recognized VS structural family is complete); run `.reload /f nt` and retry
-```
-
-`a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` and
-`a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer`. **It is not a symbol problem**,
-which is the reading the message invites and the first thing checked: `nt` loads `pdb` symbols on
-that session and `x nt!ExPoolState` resolves. The tier's other eight tests pass.
-
-**What actually changed**, read off that guest with symbols loaded. `layout.rs` decides between two
-VS families by whether every field of one is present, and on this build neither is:
-
-- `Inline` wants `_HEAP_VS_CONTEXT::DelayFreeContext`, which is **absent** — expected, since this
-  build is an affinity-slots one.
-- `AffinitySlots` wants `_HEAP_VS_AFFINITY_SLOT::VsContext`, and the field is now called
-  **`VsContextOffset`** (`Uint8B`, at `+0x000`). Its four siblings are all still there
-  (`_HEAP_VS_CONTEXT::SlotMapRef`, `::AffinityMask`, `_HEAP_VS_AFFINITY_SLOT::FreeChunkTree`,
-  `::DelayFreeContext`, `_HEAP_VS_SLOT_MAP::SlotRef`), so **one renamed field refuses the whole
-  build**.
-
-`_HEAP_VS_CONTEXT` also gained `AffinityMgr : _HEAP_AFFINITY_MGR` (`MapInProgress`,
-`ContentionCount`, `ContentionCountLimit`, `ConservativeAffinity`, `LastContentionTime`) and
-`_HEAP_VS_SLOT_MAP` gained `ContentionRemapCount`, neither of which the walker reads.
-
-- **Why deferred:** it is a `dbgscope` change and therefore a stacked PR, and the fix is not the
-  one-line alias it looks like. `layout.rs` already carries an alias list per field
-  (`("VsContext", &["VsContext"])` at two sites), so the *name* has somewhere to go — but the new
-  name says **offset** where the old one was used as an address:
-  `snapshot.rs` computes `slot = VsContext + (SlotRef << 6)`. Whether `VsContextOffset` is that same
-  base under a new name, or a displacement something else has to be added to, is the thing to
-  measure before writing either, and guessing it wrong gives a walker that reads plausible garbage
-  rather than one that refuses — which is the failure the refusal exists to prevent.
-- **What would close it:** the semantics of `VsContextOffset` measured on a live target of this
-  build — walk one slot both ways and check the chunks against `!pool` — then the alias or a third
-  `VsSemanticFamily` beside `Inline` and `AffinitySlots`, whichever the measurement says. The
-  fingerprint `fnv1a64:77069ff603c2356c` identifies the layout and is worth keeping in the test that
-  pins it.
-- **How it was found:** running the live-kernel tier for the first time against a guest rebuilt on a
-  September 2026 image, after item 77's work (2026-09-15). The tier had last passed against an
-  older 26100.
-
-**Where it picks up.** `vs_semantic_family` in `dbgscope`'s `src/pool/layout.rs` (the two
-completeness lists and the alias tables above them), and the affinity-slot arithmetic in
-`src/pool/snapshot.rs` that consumes the field.
