@@ -104,6 +104,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 70](#70-dbgscope-a-path-component-is-matched-by-folding-ascii--done-2026-09-14) — [dbgscope] A path component is matched by folding ASCII — done (2026-09-14)
 - [Item 75](#75-dbgscope--windbg-mcp-an-instructions-operands-are-not-every-register-it-reads--done-2026-09-14) — [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — done (2026-09-14)
 - [Item 76](#76-dbgscope-a-fold-that-cannot-decide-one-code-unit-declines-the-whole-comparison--deleted-unbuilt-2026-09-14) — [dbgscope] A fold that cannot decide one code unit declines the whole comparison — deleted unbuilt (2026-09-14)
+- [Item 77](#77-dbgscope-the-fold-is-the-hosts-upcase-table-not-the-targets--done-2026-09-15-dbgscope162) — [dbgscope] The fold is the *host's* upcase table, not the target's — done (2026-09-15, dbgscope#162)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3449,3 +3450,76 @@ repositories pinned with a review-settled reason. That instinct was right and th
 aimed one level too high. The pinned expectation was not a considered trade-off to be respected —
 it was a symptom, and measuring the thing underneath it deleted the trade-off rather than resolving
 it. Item 70's entry has what the measurement said.
+
+## 77. [dbgscope] The fold is the *host's* upcase table, not the target's — **done** (2026-09-15, dbgscope#162)
+
+**Repo:** `dbgscope` (and, through it, `windbg-mcp`).
+
+`object::upcase_unit` calls `RtlUpcaseUnicodeChar`, which reads **this machine's** NLS upcase
+table. The object manager reads the target's, at
+`PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`. On the bench where this was
+settled the two agreed on **all 65,536** code units -- the target's table was dumped over KD and
+walked, and the host's `RtlUpcaseUnicodeChar` matched it everywhere -- but both machines are
+26100-era ARM64 Windows, which is the easy case rather than the general one.
+
+Nothing detects a disagreement. A debugger host several Windows versions older or newer than its
+target could differ exactly as Unicode's table differs from Windows': the `U+A7xx` additions are
+the ones that moved most recently, and they are 40 of the 224 code units the previous fold was
+wrong about. The failure would be silent and would look like item 70's: two objects reported as one,
+or one as two.
+
+- **Why deferred:** the substitution is measurably right on this bench and the alternative is a
+  target read inside what is deliberately a free function -- `same_object_name` takes `&str` and
+  needs no [`Namespace`], which is what lets the walk's rules be tested without a target at all.
+  That is a design change rather than a correction, and item 70 was the correction.
+- **What would close it:** the table read from the target and folded against, with the host's call
+  as the fallback when it cannot be. `Globals` is the shape to follow -- it already carries
+  optional symbol offsets and `ObjectError::Unavailable` already says "this target does not resolve
+  what this operation reads", so a missing `nt!PspHostSiloGlobals` has an answer that exists. The
+  walk is the 8-4-4 trie `nt!RtlUpcaseUnicodeChar` performs: high byte, middle nibble, low nibble,
+  leaf added as a delta, with the `a`-`z` and `U+00C0` bands read before the table as they are now.
+  A comparison the target's table could not be read for is the one case that would want an answer
+  meaning "undecided" again — which is what `NameMatch` was, removed when its last producer went.
+- **How it was found:** verifying item 70's replacement fold against the target's own table on a
+  live 26100 ARM64 kernel, which established the agreement and, with it, that nothing checks for
+  it (2026-09-14).
+
+**Where it picks up.** `upcase_unit` and `same_object_name` in `dbgscope`'s `src/object.rs`, and
+`Globals`/`object_globals` in the same file for where a target symbol is already resolved.
+
+**What landed.** `Upcase` walks the target's own table -- the 8-4-4 trie transcribed instruction
+for instruction from `RtlUpcaseUnicodeChar`, whose disassembly is in its doc comment -- and falls
+back to the host's call when the target will not say where its table is, with `source()` reporting
+which answered so a fallback no longer reads as a measurement. `Globals::upcase` carries the three
+coordinates, resolved by symbol and type the way `Layout` is. `Namespace::upcase()` is the walk's
+own fold, and `device::same_object_path` here now takes one rather than reaching for the host's.
+
+**What the entry got right.** `Globals` was the shape to follow, the walk is the 8-4-4 trie, the
+two ASCII bands stay ahead of the table, and a missing `nt!PspHostSiloGlobals` needed an answer
+that already existed. The design change it warned about did not materialise: `same_object_name`
+still takes two `&str` and needs no `Namespace`, because the fold became a *value* rather than a
+method, so the walk's rules are still testable with no target at all.
+
+**And what it got wrong, which is the part worth keeping.** It expected the fallback to want an
+answer meaning "undecided" -- `NameMatch` again. It does not, and the reason is a distinction the
+entry did not have: a table that will not **read** and a table pointer that reads as **null** are
+opposite facts. The first says nothing about the target, so the host's table stands in. The second
+is the target's own answer -- `RtlUpcaseUnicodeChar` tests that pointer and returns the code unit
+unchanged -- so answering it from the host's table would fold where the target does not, which is
+exactly the failure item 70 fixed. Two answers, both determinate; nothing left for a third.
+
+**What is not measured.** The read itself against a live kernel. This bench had no reachable kernel
+target and no full dump, and a minidump's `PspHostSiloGlobals` page reads `????????` -- which
+exercises the fallback and only the fallback. The symbol and both offsets are confirmed against a
+real 26100 x64 kernel PDB (`RtlNlsState` +0x408, `UnicodeUpcaseTable844` +0xa8, summing to the
++0x4b0 measured on 26100 ARM64), and `PsGetCurrentServerSiloGlobals` was disassembled to confirm it
+returns `&PspHostSiloGlobals` outside a server silo. That the pointer at that address is the table
+on a live target is inference from the disassembly rather than an observation, and the first live
+kernel this touches is where to check it.
+
+**What made it verifiable without one.** The trie walk reproduces `RtlUpcaseUnicodeChar` on all
+65,536 code units against a table built from real Windows NLS data by an encoder sharing no code
+with the walk -- 973 of them move, and the test asserts that count so a fixture where none moved
+could not pass vacuously. Six mutations were each caught: the walk site reverted to
+`same_object_name`, the leaf substituted rather than added, level two indexed relative to level
+one, an index read as a byte offset, the null check removed, and the cache removed.

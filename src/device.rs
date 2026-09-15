@@ -363,8 +363,20 @@ pub(crate) const SYMBOLIC_LINK: &str = "SymbolicLink";
 /// **confidently wrong about 224 more**, folding where the system does not, which reported two
 /// objects as one. Performing the fold rather than approximating it removes the wrong answers and
 /// the uncertain ones together, so there is no third answer left to give.
-pub(crate) fn same_object_path(one: &str, other: &str) -> bool {
-    dbgscope::object::same_object_name(one.trim_end_matches('\\'), other.trim_end_matches('\\'))
+///
+/// **The fold is passed in rather than reached for, because there are two of them and they
+/// are not interchangeable.** [`dbgscope::object::Upcase`] folds through the *target's* own
+/// upcase table where the target says where it is, and through this host's
+/// `RtlUpcaseUnicodeChar` where it does not -- and only the first is the object manager's
+/// answer. A caller holding a namespace passes `Namespace::upcase()`; `Upcase::of_host()` is
+/// the honest name for what this reached for by itself before, and is what a caller with no
+/// target has.
+pub(crate) fn same_object_path(
+    upcase: &dbgscope::object::Upcase<'_>,
+    one: &str,
+    other: &str,
+) -> bool {
+    upcase.same_name(one.trim_end_matches('\\'), other.trim_end_matches('\\'))
 }
 
 /// Whether an empty [`Found::links`] is a fact about the device or an absence in the search.
@@ -877,6 +889,19 @@ fn render_acl(
 mod tests {
     use super::*;
 
+    /// The fold these tests compare through, and the reason it is named.
+    ///
+    /// **They have no target, so this is the host's table** -- which is sound for what they pin:
+    /// every expectation below was read off a live 26100 kernel's own
+    /// `RtlNlsState.UnicodeUpcaseTable844`, and this host's `RtlUpcaseUnicodeChar` agreed with it
+    /// on all 65,536 code units. What they therefore do **not** cover is a host and a target whose
+    /// NLS data differ; that is `Upcase`'s business, tested in `dbgscope` against a table built to
+    /// disagree, and it reaches here through `Namespace::upcase()` at the one call site that has a
+    /// namespace to ask.
+    fn host() -> dbgscope::object::Upcase<'static> {
+        dbgscope::object::Upcase::of_host()
+    }
+
     /// The offsets measured on Windows 26100 x64, written out rather than derived from the builder
     /// that lays the bytes down: a fixture sharing its arithmetic with the code under test agrees
     /// with it about a wrong offset, which is the one thing a layout test cannot afford.
@@ -1127,15 +1152,18 @@ mod tests {
     #[test]
     fn a_link_target_matches_the_device_it_names_and_not_the_one_it_is_inside() {
         assert!(same_object_path(
+            &host(),
             "\\Device\\MountPointManager",
             "\\DEVICE\\MOUNTPOINTMANAGER"
         ));
         assert!(same_object_path(
+            &host(),
             "\\Device\\MountPointManager\\",
             "\\Device\\MountPointManager"
         ));
         assert!(
             !same_object_path(
+                &host(),
                 "\\Device\\MountPointManager\\sub",
                 "\\Device\\MountPointManager"
             ),
@@ -1143,6 +1171,7 @@ mod tests {
         );
         assert!(
             !same_object_path(
+                &host(),
                 "\\Device\\MountPointManagerExtra",
                 "\\Device\\MountPointManager"
             ),
@@ -1154,7 +1183,7 @@ mod tests {
         // leaves two spellings of one object unequal, drops the link that reaches it, and lets
         // the search call itself complete having missed it.
         assert!(
-            same_object_path("\\Device\\Käse", "\\Device\\KÄSE"),
+            same_object_path(&host(), "\\Device\\Käse", "\\Device\\KÄSE"),
             "a name differing only in the case of a non-ASCII letter is the same object"
         );
     }
@@ -1384,11 +1413,15 @@ mod tests {
         // takes the final form, so two spellings the table folds together compared unequal,
         // dropping a link that does reach the device.
         assert!(
-            !same_object_path("\\Device\\\u{0130}", "\\Device\\i\u{0307}"),
+            !same_object_path(&host(), "\\Device\\\u{0130}", "\\Device\\i\u{0307}"),
             "a fold that expands would make one object out of two"
         );
         assert!(
-            same_object_path("\\Device\\\u{0391}\u{03A3}", "\\Device\\\u{0391}\u{03C3}"),
+            same_object_path(
+                &host(),
+                "\\Device\\\u{0391}\u{03A3}",
+                "\\Device\\\u{0391}\u{03C3}"
+            ),
             "one object spelt with either sigma is still one object"
         );
 
@@ -1398,11 +1431,11 @@ mod tests {
         // single `U+1F88`. Answering `Unknown` for both was the honest thing to do without the
         // table, and having it these are simply two answers.
         assert!(
-            !same_object_path("\\Device\\\u{00df}", "\\Device\\SS"),
+            !same_object_path(&host(), "\\Device\\\u{00df}", "\\Device\\SS"),
             "the table leaves U+00DF alone, so it is not SS"
         );
         assert!(
-            same_object_path("\\Device\\\u{1f80}", "\\Device\\\u{1f88}"),
+            same_object_path(&host(), "\\Device\\\u{1f80}", "\\Device\\\u{1f88}"),
             "and maps U+1F80 to U+1F88, one unit, which is one object"
         );
 
@@ -1412,18 +1445,18 @@ mod tests {
         // manager -- a link reported as reaching a device it does not reach, which is the failure
         // the three answers existed to prevent and which the fold itself was causing.
         assert!(
-            !same_object_path("\\Device\\\u{0131}", "\\Device\\I"),
+            !same_object_path(&host(), "\\Device\\\u{0131}", "\\Device\\I"),
             "dotless i is not I to the object manager"
         );
         assert!(
-            !same_object_path("\\Device\\\u{017f}", "\\Device\\S"),
+            !same_object_path(&host(), "\\Device\\\u{017f}", "\\Device\\S"),
             "nor is a long s an S"
         );
 
         // **A surrogate pair is not a letter to a `WCHAR` fold.** The table moves no unit in
         // `D800..DFFF`, so two spellings of one Deseret name are genuinely two objects.
         assert!(
-            !same_object_path("\\Device\\\u{10400}", "\\Device\\\u{10428}"),
+            !same_object_path(&host(), "\\Device\\\u{10400}", "\\Device\\\u{10428}"),
             "what the kernel cannot fold, this does not fold either"
         );
 
@@ -1431,7 +1464,7 @@ mod tests {
         // leaves it alone -- where Unicode would fold it to `U+039C`, a Greek capital mu,
         // changing its script on the way. Two objects.
         assert!(
-            !same_object_path("\\Device\\\u{00b5}", "\\Device\\\u{039c}"),
+            !same_object_path(&host(), "\\Device\\\u{00b5}", "\\Device\\\u{039c}"),
             "a fold the kernel does not reach for is not one to make here"
         );
     }
