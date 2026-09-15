@@ -599,8 +599,17 @@ pub struct SessionEnded {
     /// `true` for a process this server **attached** to: it was detached and left running.
     /// `false` for one this server **launched** — a launch does not outlive its session — and for
     /// either where the session had to be terminated still holding its target, since terminating
-    /// a debugger is not a detach and the kernel takes the debuggee. Absent where the session
-    /// never had a process to keep: a dump, a trace, or a kernel target.
+    /// a debugger is not a detach and the kernel takes the debuggee.
+    ///
+    /// **A live kernel answers this too**, and used to be absent from it. `true` where it was
+    /// resumed and actively detached; `false` where the resume did not take, which leaves it
+    /// halted at a break with one processor stopped and the rest spinning — the text says so and
+    /// names `qd` as the way out. The old reading was that a kernel is not a process and so has
+    /// nothing to report, which is true of the word and wrong about the question: running or
+    /// halted is exactly what this field asks, and for a kernel it is the only fact about a
+    /// teardown worth acting on.
+    ///
+    /// Absent where the session had nothing that outlives it: a dump or a trace.
     ///
     /// **It answers what the caller has to act on, not what caused it.** A launched process that
     /// had already run to completion reads `false` like one the teardown took, because both mean
