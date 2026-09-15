@@ -3453,39 +3453,23 @@ it. Item 70's entry has what the measurement said.
 
 ## 77. [dbgscope] The fold is the *host's* upcase table, not the target's — **done** (2026-09-15, dbgscope#162)
 
-**Repo:** `dbgscope` (and, through it, `windbg-mcp`).
+**Repo:** `dbgscope` ([#162](https://github.com/glslang/dbgscope/pull/162)) and, through it,
+`windbg-mcp` ([#323](https://github.com/glslang/windbg-mcp/pull/323)).
 
-`object::upcase_unit` calls `RtlUpcaseUnicodeChar`, which reads **this machine's** NLS upcase
+`object::upcase_unit` called `RtlUpcaseUnicodeChar`, which reads **this machine's** NLS upcase
 table. The object manager reads the target's, at
-`PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`. On the bench where this was
+`PsGetCurrentServerSiloGlobals()->RtlNlsState.UnicodeUpcaseTable844`. On the bench where that was
 settled the two agreed on **all 65,536** code units -- the target's table was dumped over KD and
-walked, and the host's `RtlUpcaseUnicodeChar` matched it everywhere -- but both machines are
+walked, and the host's `RtlUpcaseUnicodeChar` matched it everywhere -- but both machines were
 26100-era ARM64 Windows, which is the easy case rather than the general one.
 
-Nothing detects a disagreement. A debugger host several Windows versions older or newer than its
+Nothing detected a disagreement. A debugger host several Windows versions older or newer than its
 target could differ exactly as Unicode's table differs from Windows': the `U+A7xx` additions are
 the ones that moved most recently, and they are 40 of the 224 code units the previous fold was
-wrong about. The failure would be silent and would look like item 70's: two objects reported as one,
-or one as two.
-
-- **Why deferred:** the substitution is measurably right on this bench and the alternative is a
-  target read inside what is deliberately a free function -- `same_object_name` takes `&str` and
-  needs no [`Namespace`], which is what lets the walk's rules be tested without a target at all.
-  That is a design change rather than a correction, and item 70 was the correction.
-- **What would close it:** the table read from the target and folded against, with the host's call
-  as the fallback when it cannot be. `Globals` is the shape to follow -- it already carries
-  optional symbol offsets and `ObjectError::Unavailable` already says "this target does not resolve
-  what this operation reads", so a missing `nt!PspHostSiloGlobals` has an answer that exists. The
-  walk is the 8-4-4 trie `nt!RtlUpcaseUnicodeChar` performs: high byte, middle nibble, low nibble,
-  leaf added as a delta, with the `a`-`z` and `U+00C0` bands read before the table as they are now.
-  A comparison the target's table could not be read for is the one case that would want an answer
-  meaning "undecided" again — which is what `NameMatch` was, removed when its last producer went.
-- **How it was found:** verifying item 70's replacement fold against the target's own table on a
-  live 26100 ARM64 kernel, which established the agreement and, with it, that nothing checks for
-  it (2026-09-14).
-
-**Where it picks up.** `upcase_unit` and `same_object_name` in `dbgscope`'s `src/object.rs`, and
-`Globals`/`object_globals` in the same file for where a target symbol is already resolved.
+wrong about. The failure would have been silent and would have looked like item 70's -- two objects
+reported as one, or one as two. It was found verifying item 70's replacement fold against the
+target's own table on a live 26100 ARM64 kernel, which established the agreement and, with it, that
+nothing checked for it (2026-09-14).
 
 **What landed.** `Upcase` walks the target's own table -- the 8-4-4 trie transcribed instruction
 for instruction from `RtlUpcaseUnicodeChar`, whose disassembly is in its doc comment -- and falls
