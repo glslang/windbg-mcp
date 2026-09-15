@@ -1,0 +1,559 @@
+{
+  "upstream_revision": "905a5a98d769bb832ba85674b004fec7ac5a224e",
+  "corpus_sha256": "54b25d800c93d01e895b99ba48034e3bdc7e393104f63590b644387336a71b7f",
+  "corpus_count": 42639,
+  "changed": [],
+  "clrbhb": {
+    "before": {
+      "decode": -9,
+      "format": null,
+      "text": ""
+    },
+    "after": {
+      "decode": 0,
+      "format": 0,
+      "text": "clrbhb"
+    }
+  },
+  "upstream_suite": {
+    "before": "failed",
+    "after": "failed",
+    "same_first_failure": "D50049BF: actual msr pstate_spsel, #0x9; expected msr spsel, #0x9 at line 22420/46060"
+  },
+  "validation_scope": "Standalone decoder only; IL proposal not compiled or loaded in Binary Ninja.",
+  "corpus_comparison": {
+    "schema_version": 1,
+    "corpus_count": 42639,
+    "corpus_sha256": "54b25d800c93d01e895b99ba48034e3bdc7e393104f63590b644387336a71b7f",
+    "before_sha256": "d264ecce8d9c74e899b5c8b5f2b26e59e397c86d247977f0b601d665459fb36b",
+    "after_sha256": "c15d78807b17d6f2480140010634299ca2d5bbe2e2eb09f6e6e6103b13966747",
+    "changed": [],
+    "clrbhb": {
+      "before": {
+        "decode": -9,
+        "format": null,
+        "text": ""
+      },
+      "after": {
+        "decode": 0,
+        "format": 0,
+        "text": "clrbhb"
+      }
+    }
+  },
+  "schema_version": 1,
+  "source_url": "https://github.com/Vector35/binaryninja-api/tree/905a5a98d769bb832ba85674b004fec7ac5a224e",
+  "patch_sha256": "06019a7e2a1e0b70a54eba577149a64697d3b84f31393eb04dfa59a2bccb6587",
+  "regression_sha256": "e08c6add03d712c5ee3ee6d7f84ecb60bdebaa30409e1777ec44a2cb616f9713",
+  "fallback_regression": "passed; existing companion clrbhb_test.cpp compiled and executed",
+  "gui": {
+    "schema_version": 1,
+    "case": "decode",
+    "captured_at": "2026-09-15T19:15:43.783886+00:00",
+    "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+    "probe_sha256": "826b2eb2e611c1a2462957336b4e2154290c1158eee71003e4023e2bf4155988",
+    "launcher_sha256": "88fcb2efd1eeedcf17c4d81c44c709354f23dfe8aace15a3f0d5d396f2f6cf3a",
+    "status": "failed",
+    "returncode": 0,
+    "forced": false,
+    "normal_exit": true,
+    "crash_reports": [],
+    "capture": {
+      "schema_version": 1,
+      "case": "decode",
+      "ok": false,
+      "captured_at": "2026-09-15T19:15:46.966209+00:00",
+      "bn_version": "6.0.10601 Personal",
+      "edition": "User",
+      "native_capabilities": {
+        "available": false,
+        "requires": "Binary Ninja 6 Ultimate",
+        "providers": {
+          "Google BinDiff": false,
+          "WARP": false
+        },
+        "version": "6.0.10601 Personal",
+        "edition": "User"
+      },
+      "synthetic_instruction": {
+        "address": "0x1000",
+        "bytes": "df2203d5",
+        "length": null,
+        "branches": null,
+        "text": "",
+        "text_length": 0
+      },
+      "synthetic_function": {
+        "address": "0x0",
+        "found": true,
+        "name": "sub_0",
+        "bounds": [
+          [
+            "0x0",
+            "0x4"
+          ]
+        ],
+        "instructions": [],
+        "instructions_truncated": false,
+        "llil": [
+          "undefined"
+        ]
+      },
+      "native_decode_passed": false,
+      "synthetic_analysis_passed": false,
+      "endpoints": [
+        {
+          "address": "0x14010fc00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10fc00",
+          "function": {
+            "address": "0x14010fc00",
+            "found": true,
+            "name": "FrontendBhbClrKiUserExceptionHandler",
+            "bounds": [
+              [
+                "0x14010fc00",
+                "0x14010fc04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14010fc80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10fc80",
+          "function": {
+            "address": "0x14010fc80",
+            "found": true,
+            "name": "FrontendBhbClrKiUserInterruptHandler",
+            "bounds": [
+              [
+                "0x14010fc80",
+                "0x14010fc84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14010fd00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10fd00",
+          "function": {
+            "address": "0x14010fd00",
+            "found": true,
+            "name": "FrontendBhbClrKiUserFiqHandler",
+            "bounds": [
+              [
+                "0x14010fd00",
+                "0x14010fd04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14010fd80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10fd80",
+          "function": {
+            "address": "0x14010fd80",
+            "found": true,
+            "name": "FrontendBhbClrKiUserSystemErrorHandler",
+            "bounds": [
+              [
+                "0x14010fd80",
+                "0x14010fd84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14010fe00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10fe00",
+          "function": {
+            "address": "0x14010fe00",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32ExceptionHandler",
+            "bounds": [
+              [
+                "0x14010fe00",
+                "0x14010fe04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14010fe80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10fe80",
+          "function": {
+            "address": "0x14010fe80",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32InterruptHandler",
+            "bounds": [
+              [
+                "0x14010fe80",
+                "0x14010fe84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14010ff00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10ff00",
+          "function": {
+            "address": "0x14010ff00",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32FiqHandler",
+            "bounds": [
+              [
+                "0x14010ff00",
+                "0x14010ff04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14010ff80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "reference",
+          "rva": "0x10ff80",
+          "function": {
+            "address": "0x14010ff80",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32SystemErrorHandler",
+            "bounds": [
+              [
+                "0x14010ff80",
+                "0x14010ff84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011ac00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11ac00",
+          "function": {
+            "address": "0x14011ac00",
+            "found": true,
+            "name": "FrontendBhbClrKiUserExceptionHandler",
+            "bounds": [
+              [
+                "0x14011ac00",
+                "0x14011ac04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011ac80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11ac80",
+          "function": {
+            "address": "0x14011ac80",
+            "found": true,
+            "name": "FrontendBhbClrKiUserInterruptHandler",
+            "bounds": [
+              [
+                "0x14011ac80",
+                "0x14011ac84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011ad00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11ad00",
+          "function": {
+            "address": "0x14011ad00",
+            "found": true,
+            "name": "FrontendBhbClrKiUserFiqHandler",
+            "bounds": [
+              [
+                "0x14011ad00",
+                "0x14011ad04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011ad80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11ad80",
+          "function": {
+            "address": "0x14011ad80",
+            "found": true,
+            "name": "FrontendBhbClrKiUserSystemErrorHandler",
+            "bounds": [
+              [
+                "0x14011ad80",
+                "0x14011ad84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011ae00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11ae00",
+          "function": {
+            "address": "0x14011ae00",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32ExceptionHandler",
+            "bounds": [
+              [
+                "0x14011ae00",
+                "0x14011ae04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011ae80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11ae80",
+          "function": {
+            "address": "0x14011ae80",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32InterruptHandler",
+            "bounds": [
+              [
+                "0x14011ae80",
+                "0x14011ae84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011af00",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11af00",
+          "function": {
+            "address": "0x14011af00",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32FiqHandler",
+            "bounds": [
+              [
+                "0x14011af00",
+                "0x14011af04"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        },
+        {
+          "address": "0x14011af80",
+          "bytes": "df2203d5",
+          "length": null,
+          "branches": null,
+          "text": "",
+          "text_length": 0,
+          "side": "target",
+          "rva": "0x11af80",
+          "function": {
+            "address": "0x14011af80",
+            "found": true,
+            "name": "FrontendBhbClrKiUser32SystemErrorHandler",
+            "bounds": [
+              [
+                "0x14011af80",
+                "0x14011af84"
+              ]
+            ],
+            "instructions": [],
+            "instructions_truncated": false,
+            "llil": [
+              "undefined"
+            ]
+          }
+        }
+      ],
+      "inputs": {
+        "reference": {
+          "sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+          "architecture": "aarch64",
+          "identity": {
+            "timestamp": 3350698326,
+            "size": 1245184,
+            "pdb": {
+              "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+              "age": 1
+            }
+          }
+        },
+        "target": {
+          "sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+          "architecture": "aarch64",
+          "identity": {
+            "timestamp": 1188430604,
+            "size": 1290240,
+            "pdb": {
+              "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+              "age": 1
+            }
+          }
+        }
+      },
+      "endpoint_decoding_passed": false,
+      "endpoint_analysis_passed": false,
+      "comparison": {
+        "status": "not_run",
+        "reason": "native decoding/analysis prerequisite not met"
+      },
+      "about_to_quit": true
+    }
+  },
+  "companion_revision": "22cd24fbce81014402be32e490e39206c741440e",
+  "item_63_closed": false
+}
