@@ -2800,6 +2800,15 @@ impl Sessions {
                     ShutdownNote::Released => {
                         tracing::info!("{label}: session {} released its target", session.id)
                     }
+                    // `error!`, not `info!`: the session ended correctly, and the guest did not
+                    // come back. This is the line the note above promises an operator will find.
+                    ShutdownNote::ReleasedHalted => tracing::error!(
+                        "{label}: session {} released its target, but the live kernel could not be \
+                         told to run before it was detached -- it is probably still halted at a \
+                         break with one processor stopped. Attaching again and running `qd` \
+                         resumes and releases it",
+                        session.id
+                    ),
                     ShutdownNote::ReleasedElsewhere => tracing::info!(
                         "{label}: session {}'s target was released by a teardown already in flight",
                         session.id
@@ -3298,6 +3307,15 @@ impl Teardown {
 enum ShutdownNote<'a> {
     /// This attempt released the target.
     Released,
+    /// This attempt released the target and the target is a live kernel that is **still halted**:
+    /// the engine could not tell it to run before detaching.
+    ///
+    /// **A success that still needs an operator**, which is why it is not [`Self::Released`]. The
+    /// session is gone and nothing holds the guest, so every other reading of this teardown is
+    /// "fine" -- and the guest is sitting at a break with one processor stopped and no debugger
+    /// left on it. `end_session` renders this for its caller; a lease expiry, a disconnect and a
+    /// shutdown have no caller, so the log is the only place it can land.
+    ReleasedHalted,
     /// Another teardown released it first; this attempt's failure is a consequence, not news.
     ReleasedElsewhere,
     /// The engine answered and refused. The worker went anyway — which for a live kernel leaves
@@ -3328,6 +3346,17 @@ enum ShutdownNote<'a> {
 /// not, because the next real one gets ignored.
 fn shutdown_note(outcome: &Release, released: bool) -> ShutdownNote<'_> {
     match outcome {
+        // **Read out of the reply rather than discarded with it.** `Release::Released` carries the
+        // worker's `Output`, and `target_left_running` is where the disposition now is -- this arm
+        // matched `Released(_)` and threw it away, so a live kernel left halted logged "released
+        // its target" like any other teardown. `Some(false)` from a *worker* is the halted kernel
+        // and nothing else: `worker::ending` answers `Some(true)`, `None` or that, and a launch --
+        // the other thing that does not outlive its session -- is `None` here and only becomes
+        // `false` in `end`, which is the one place that can tell a launch from a dump. There is a
+        // test on `ending` pinning that, because this arm is wrong the moment it stops holding.
+        Release::Released(out) if out.target_left_running == Some(false) => {
+            ShutdownNote::ReleasedHalted
+        }
         Release::Released(_) => ShutdownNote::Released,
         Release::Stale(why) => ShutdownNote::Settled(why),
         _ if released => ShutdownNote::ReleasedElsewhere,
@@ -7137,6 +7166,35 @@ mod tests {
         assert_eq!(
             shutdown_note(&Release::Refused("bad handle".to_string()), false),
             ShutdownNote::Refused("bad handle")
+        );
+    }
+
+    /// A released live kernel that is **still halted** is a different note from a released one.
+    ///
+    /// The case this exists for is a teardown with no caller -- a lease expiry, a client
+    /// disconnect, a shutdown. `end_session` renders the disposition for whoever asked; those
+    /// three have nobody to tell, so the log is the only place it lands, and this arm is what puts
+    /// it there. Before it, `Release::Released(_)` matched and discarded the reply, so a guest
+    /// left at a break logged "released its target" like any other teardown.
+    ///
+    /// **It also pins the coupling**, which is the fragile half: `Some(false)` out of a *worker*
+    /// is the halted kernel and nothing else. `worker::ending` answers `Some(true)`, `None`, or
+    /// that; a launch is the other thing that does not outlive its session and is `None` here,
+    /// only becoming `false` in `end`, which is the one place that can tell a launch from a dump.
+    /// The two negatives below are what fails if that ever stops holding.
+    #[test]
+    fn a_released_kernel_that_is_still_halted_reads_as_its_own_note() {
+        let halted = Release::Released(Box::new(Output::released("halted", Some(false))));
+        // The flag says another teardown got there first; it does not make this one less halted.
+        assert_eq!(shutdown_note(&halted, true), ShutdownNote::ReleasedHalted);
+        assert_eq!(shutdown_note(&halted, false), ShutdownNote::ReleasedHalted);
+
+        let running = Release::Released(Box::new(Output::released("running", Some(true))));
+        assert_eq!(shutdown_note(&running, false), ShutdownNote::Released);
+        let nothing_to_keep = Release::Released(Box::new(Output::released("dump", None)));
+        assert_eq!(
+            shutdown_note(&nothing_to_keep, false),
+            ShutdownNote::Released
         );
     }
 

@@ -148,30 +148,47 @@ A worker process does **not** inherit `WINDBG_MCP_PROFILE_*` (`engine::spawn_wor
 it is told the one connection it is opening over its private pipe, and a `launch`ed debuggee would
 otherwise inherit every configured key on the host.
 
-**`end_session` can leave a live kernel halted, and nothing in its result says which happened.**
-Measured 2026-09-15 on the CTF guest. `end_session` answered `released: true`, which is the *clean*
-path -- and the guest was still frozen: re-attaching found it at the same
-`System Uptime: 0 days 0:00:00.453` it had been left at, which is how to confirm a freeze rather than
-guess one. `execute { "command": "qd" }` from a fresh attach is what released it.
+**A live kernel detached in the first second of boot stops again, and it is not `end_session`'s
+fault.** Measured 2026-09-15 on the CTF guest, and worth reading closely because the first three
+readings of it here were wrong.
 
-**Do not read `worker_terminated` as the tell.** It is
-`!matches!(outcome, AlreadyGone | Stale)`, so it is `true` after an ordinary successful release as
-well -- the worker process is shut down either way. A first draft of this note said the opposite and
-was wrong.
+What happened: a session attached at `System Uptime: 0 days 0:00:00.437` with **one** processor up,
+worked while the guest sat at that break, and ended cleanly (`released: true`). Re-attaching found
+`0:00:00.453`. That looks like a freeze and is not one -- **the guest ran for 16 milliseconds and
+stopped again.** A resume that failed advances zero. Sixteen milliseconds is the guest resuming,
+reaching the *next* KD break-in, and halting there with no debugger left to continue it: the
+`kdnic.sys` settling break-ins described above, which is why that paragraph says to `go` through
+them until boot proceeds.
 
-What the result cannot tell you is the thing that matters. `dbgscope::end_session` does resume and
-actively detach a live kernel on purpose -- its own comment says a passively detached kernel "stays
-FROZEN, one CPU halted, the rest spinning" -- and a *failure* there propagates as an error. But on
-**success** the worker reports `target_left_running` from `attached_to_a_live_process()`, which reads
-the attached-*process* table and is false for a kernel, so a resumed kernel and a closed dump both
-come back `None`. `target_left_running`'s own doc says it is "absent ... for a kernel target", which
-is true of a dump or a trace and is the one case where a live kernel has exactly the state a caller
-needs.
+**It does not reproduce once the guest is up.** Thirteen teardowns at `~6s`, `16s`, `17.9s`, `24s`,
+`31s`, `38.9s` and 42 minutes of uptime all left it running, with uptime advancing across the gap
+each time -- and eleven runs of the live-kernel tier's attach/detach test reported *"resumed and
+detached, and is running"* eleven times out of eleven, never the halted disposition. So the window
+is **sub-second**, not "early boot", and reproducing it needs an attach already parked when the
+guest dials in rather than one that finds it already connected.
 
-So: after ending a live-kernel session, **verify rather than assume** -- and if the guest is halted,
-re-attach and `qd`. Whether the freeze above was a failed resume or the guest re-breaking at an
-early-boot `kdnic.sys` stop was not determined; both are consistent with what was seen, and the
-uptime check is what distinguishes them from a guest that simply booted on.
+The remedy is therefore not in the teardown. Either `go` through the settling break-ins before
+ending the session, or accept that a guest detached inside that window waits for the next debugger
+-- and a fresh attach plus `qd` releases it.
+
+**Two things the incident is still good for.**
+
+`end_session` genuinely could not say which happened, and now can. `dbgscope::end_session` resumes
+and actively detaches a live kernel on purpose -- its comment is explicit that a passively detached
+one "stays FROZEN, one CPU halted, the rest spinning" -- but it discarded the resume's answer, and
+the worker filled `target_left_running` from `attached_to_a_live_process()`, which reads the
+attached-*process* table and is false for a kernel. A resumed kernel and a closed dump therefore
+gave the same answer. Both are fixed; a kernel now reports `true` or `false` and says `qd` when it
+is the latter. **That defect is real and was never what this incident showed** -- the resume here
+succeeded.
+
+And **do not read `worker_terminated` as the tell**: it is `!matches!(outcome, AlreadyGone | Stale)`,
+so it is `true` after an ordinary successful release too. An earlier draft of this note said the
+opposite, and `DONE.md`'s own entry on `DEBUG_END_PASSIVE` had already said it correctly.
+
+So after ending a live-kernel session, **check the uptime rather than the status field** -- it is the
+only thing that distinguishes ran-on, re-broke, and never-resumed, and the three look identical from
+the result.
 
 **KDNET attach is a blocking wait, by design.** A live kernel needs `WaitForEvent(INFINITE)` (a finite
 timeout returns `E_NOTIMPL` and never drives the link). So if the target isn't reachable, the
