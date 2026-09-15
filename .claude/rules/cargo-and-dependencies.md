@@ -54,3 +54,27 @@ PR still needs `gh pr merge --admin`. In this harness that call is refused by th
 classifier — so **the human merges**, and an agent's job ends at "green and waiting". Plan the two
 PRs around that: dbgscope first, then repoint and re-verify.
 
+## A dependency a grep cannot see, and an "outdated" that is not one
+
+**`dbgscope`'s `windows-core` is required by a macro expansion, not by any source path.** Nothing in
+that crate writes `windows_core::` — every use is `windows::core::`, the re-export — so searching for
+the crate name finds nothing and the dependency reads as dead. It is not: the
+`#[windows::core::implement(..)]` attribute on the two callback objects in `dbgscope/src/dbgeng.rs`
+expands to **absolute `::windows_core::` paths**. Remove the dependency and the build fails with
+*"could not find `windows_core` in the list of imported crates"*, which is the giveaway — `::name`
+resolves against extern crates only, so a `use windows::core as windows_core;` alias does not satisfy
+it either. Both were tried on 2026-09-15; both fail.
+
+The general shape, which is the part worth carrying: **a proc macro's expansion is a dependency
+edge, and no amount of reading the source shows it.** Before concluding a dependency is unused,
+delete it and build — the compiler is the only thing that sees what a macro emits.
+
+**And its version is pinned to `windows`, not stale.** `windows 0.62.2` requires
+`windows-core ^0.62.2`, while crates.io's latest `windows-core` is **0.100.0** (2026-09-15) — the
+sub-crate is versioned independently and has raced far ahead of the umbrella. A dependency check will
+flag 0.62.2 as outdated. Taking 0.100 is not an upgrade but a **second copy in the graph**: the macro
+then emits paths into 0.100 while the interfaces still come from `windows`'s 0.62.2, and the build
+fails with `the trait bound IDebugOutputCallbacks: windows_core::Interface is not satisfied`. It also
+wants Rust 1.95 against that crate's 1.88 floor. Move it only when `windows` moves, and keep the two
+in step. The reasoning is written beside the dependency in `dbgscope`'s own `Cargo.toml`, which is
+where someone about to bump it is looking.
