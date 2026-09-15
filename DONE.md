@@ -3492,14 +3492,44 @@ is the target's own answer -- `RtlUpcaseUnicodeChar` tests that pointer and retu
 unchanged -- so answering it from the host's table would fold where the target does not, which is
 exactly the failure item 70 fixed. Two answers, both determinate; nothing left for a third.
 
-**What is not measured.** The read itself against a live kernel. This bench had no reachable kernel
-target and no full dump, and a minidump's `PspHostSiloGlobals` page reads `????????` -- which
-exercises the fallback and only the fallback. The symbol and both offsets are confirmed against a
-real 26100 x64 kernel PDB (`RtlNlsState` +0x408, `UnicodeUpcaseTable844` +0xa8, summing to the
-+0x4b0 measured on 26100 ARM64), and `PsGetCurrentServerSiloGlobals` was disassembled to confirm it
-returns `&PspHostSiloGlobals` outside a server silo. That the pointer at that address is the table
-on a live target is inference from the disassembly rather than an observation, and the first live
-kernel this touches is where to check it.
+**Measured on a live kernel (2026-09-15), which is what this entry shipped without.** It shipped
+saying the read itself was inference: the bench had no reachable kernel and no full dump, a
+minidump's `PspHostSiloGlobals` page reads `????????` -- exercising the fallback and only the
+fallback -- so the symbol and both offsets were confirmed against a 26100 x64 kernel PDB and
+`PsGetCurrentServerSiloGlobals` was disassembled, but *that the pointer at that address is the
+table* was not observed. It is now, against a rebooted CTF guest over KDNET:
+
+| | |
+|---|---|
+| target | 26100 x64, `26100.33438.amd64fre.lt_release_svc_prod1.260904-1524` |
+| `nt!PspHostSiloGlobals` | `fffff802ed9ce940` |
+| `_ESERVERSILO_GLOBALS::RtlNlsState` | `+0x408` |
+| `_RTL_NLS_STATE::UnicodeUpcaseTable844` | `+0xa8`, so the pointer is at `+0x4b0` |
+| the pointer there | `fffff8027f670004` -- a table, `u16`-aligned inside a larger NLS block |
+| the table | 10,240 bytes, 5,120 `u16` elements; the walk reaches element 2,543 at most |
+| walked against this host's `RtlUpcaseUnicodeChar` | **0 mismatches over all 65,536 code units** |
+
+So `+0x4b0` is the live coordinate, not a PDB's arithmetic, and the 8-4-4 walk in `Upcase` is the
+walk that table wants.
+
+**And the two builds' tables are byte-identical** -- this host's `ntdll` copy on 26200 x64 and the
+guest kernel's on 26100 x64 are both 10,240 bytes with sha256
+`0721d3e6aea68087e5f59bfd239029c5087f4ed2d2c42cd1c81c1cc661767133`. That is the *premise* of this
+item holding again on a second pair, and it is worth reading the right way round: agreement between
+nearby builds is cheap, which is why it was never evidence that calling the host's routine was safe.
+The fold reads the target's table because two builds agreeing says nothing about two that do not.
+
+**An attribution in this entry is unverified, and is now known to be wrong in one of its two
+places.** It recorded `+0x4b0` as "measured on 26100 ARM64". The guest measured above is 26100
+**x64**, so that half is wrong, and the ARM64 wording came from notes about the bench rather than
+from a reading taken on one.
+
+The same attribution is in the *how it was found* paragraph higher up, where it describes item 70's
+verification on 2026-09-14. That is left standing because it is a claim about a session this one
+cannot check -- there may well have been an ARM64 target that day -- and rewriting it to match
+today's guest would replace an unverified claim with a different unverified claim. Treat it as
+**unconfirmed** rather than as a second reading: the only architecture these offsets have actually
+been observed on is x64, on both 26100 and 26200.
 
 **What made it verifiable without one.** The trie walk reproduces `RtlUpcaseUnicodeChar` on all
 65,536 code units against a table built from real Windows NLS data by an encoder sharing no code
