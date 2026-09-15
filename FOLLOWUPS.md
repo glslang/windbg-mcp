@@ -888,6 +888,13 @@ Personal comparison and export coverage are complete, but the Windows component 
 remain candidates: MSRC did not identify an affected file, and cumulative-update differences
 do not establish which change fixes the CVE.
 
+**2026-09-15 implementation:** [the attribution investigation](docs/cve-2026-83498-attribution.md)
+refreshes CVRF and all eight ARM64 artifacts, reviews the complete retained comparisons,
+and verifies a concrete stale-pointer cleanup fix with a hash-gated instruction checker.
+The competing CVE-2026-69501 fits that change more closely. A Windows 10 ARM64
+discriminating pair was identified, but its exact files collide on a symbol-server key
+serving a third hash. Attribution to CVE-2026-83498 remains unresolved.
+
 - **Why deferred:** the user requested delivery and tracking, rather than further investigation,
   on 2026-09-12. This does not gate Personal delivery.
 - **What would close it:** evidence tying a specific component and changed behavior across the
@@ -904,6 +911,12 @@ The benign ARM64 fixture closes generic similarity-to-WinDbg acceptance. It does
 a live securekernel handoff. Existing evidence identifies no disposable, paused session with
 the exact selected securekernel build already loaded.
 
+**2026-09-15 implementation:** the maintained
+[read-only probe and offline checks](docs/securekernel-handoff-acceptance.md) are implemented.
+Authenticated discovery found no sessions on the existing WinDbg listener; live handoff
+remains `not_run`. The probe leaves supplied sessions open and restricts debugger calls
+to inspection, including a fixed `bl` command for breakpoint comparison.
+
 - **Why deferred:** the user requested tracking on 2026-09-12. Acquiring a PE or comparing it
   does not authorize loading a driver, resuming a target, or creating a vulnerability trigger.
 - **What would close it:** identify an existing suitable session and loaded-module identity,
@@ -914,25 +927,17 @@ the exact selected securekernel build already loaded.
   [securekernel capture](docs/securekernel-export-followup.md), and the skill's live-handoff
   preconditions. This is an optional CVE-specific extension, not a Personal release gate.
 
-## 63. [Binary Ninja upstream] Decode AArch64 CLRBHB in instruction text and analysis
-
-BN 6.0.10601 exposes the affected entries as four-byte functions without instruction text.
-The companion's exact-encoding export fallback supplies flow-graph bytes without changing
-Binary Ninja's decoder, IL, or function boundaries.
-
-- **Why deferred:** exporter acceptance is complete; correcting native analysis is separate
-  upstream work. Textual similarity for these entries remains limited by the decoder.
-- **What would close it:** verify an upstream version decodes `df2203d5` as CLRBHB and provides
-  instruction text, then check the affected function analysis and comparison output. Keep the
-  fallback for older supported versions unless their support is explicitly dropped.
-- **Where it picks up:** [diagnosis and retained graph evidence](docs/securekernel-export-followup.md).
-  Check upstream decoder status before proposing or removing a workaround.
-
 ## 64. [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix
 
 [Vector35/binaryninja-api#8549](https://github.com/Vector35/binaryninja-api/issues/8549) tracks
 the macOS application Quit path attempting to delete a stack-allocated first-run wizard.
 The guarded capture workflow avoids that trigger; it does not fix Binary Ninja itself.
+
+**2026-09-15 implementation:** the maintained
+[isolated launcher and shutdown captures](docs/followups-validation.md#shutdown-observations)
+reproduce the wizard's SIGABRT on 6.0.10601 and pass wizard-disabled, modal-guard,
+active-export and active-matching controls. The upstream issue is still open with no
+fixed build identified. No installed application was patched.
 
 - **Why deferred:** the upstream issue remained open at the 2026-09-12 delivery check.
 - **What would close it:** an upstream fix and an isolated reproduction showing normal exit
@@ -945,6 +950,11 @@ The guarded capture workflow avoids that trigger; it does not fix Binary Ninja i
 
 Ultimate is unavailable and prohibitively expensive for the user. Purchasing it is not a
 requirement, and its absence does not gate Personal/external BinDiff delivery.
+
+**2026-09-15 implementation:** real GUI provider discovery confirms native BinDiff and
+WARP are unavailable in the installed Personal edition. The
+[conditional acceptance checklist](docs/followups-validation.md#conditional-ultimate-checklist)
+is ready; no native comparison execution is claimed.
 
 - **Why deferred:** explicitly excluded from further work by the user on 2026-09-12.
 - **What would reopen it:** access to an appropriate Ultimate installation without requiring

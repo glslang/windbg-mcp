@@ -101,6 +101,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 55](#55-windbg-mcp-a-retired-handle-cannot-release-its-own-session--done-2026-08-31) — [windbg-mcp] A retired handle cannot release its own session — done (2026-08-31)
 - [Item 57](#57-windbg-mcp-ioctl_trace-installs-a-breakpoint-and-reports-nothing-about-it--done-2026-09-02) — [windbg-mcp] `ioctl_trace` installs a breakpoint and reports nothing about it — done (2026-09-02)
 - [Item 60](#60-windbg-mcp-structured-dispatch-reachability-paths-for-the-binary-ninja-bridge--done-2026-09-10) — [windbg-mcp] Structured dispatch reachability paths for the Binary Ninja bridge — done (2026-09-10)
+- [Item 63](#63-binja-windbg-mcp-decode-aarch64-clrbhb-in-instruction-text-and-analysis--done-locally-2026-09-15) — [binja-windbg-mcp] Native CLRBHB decoding and analysis — done locally (2026-09-15)
 - [Item 70](#70-dbgscope-a-path-component-is-matched-by-folding-ascii--done-2026-09-14) — [dbgscope] A path component is matched by folding ASCII — done (2026-09-14)
 - [Item 75](#75-dbgscope--windbg-mcp-an-instructions-operands-are-not-every-register-it-reads--done-2026-09-14) — [dbgscope + windbg-mcp] An instruction's operands are not every register it reads — done (2026-09-14)
 - [Item 76](#76-dbgscope-a-fold-that-cannot-decide-one-code-unit-declines-the-whole-comparison--deleted-unbuilt-2026-09-14) — [dbgscope] A fold that cannot decide one code unit declines the whole comparison — deleted unbuilt (2026-09-14)
@@ -3312,6 +3313,47 @@ everything that bounded the walk.
   enums beside them), `src/driver.rs` (`structured_report`), `src/worker.rs` (`Attributor`),
   `src/server.rs` (the schema and the typed refusals), `docs/structured-results.md`,
   `docs/coordinates.md`.
+
+## 63. [binja-windbg-mcp] Decode AArch64 CLRBHB in instruction text and analysis — **done locally** (2026-09-15)
+
+**Original report and first investigation (retained):**
+
+BN 6.0.10601 exposes the affected entries as four-byte functions without instruction text.
+The companion's exact-encoding export fallback supplies flow-graph bytes without changing
+Binary Ninja's decoder, IL, or function boundaries.
+
+**2026-09-15 implementation:** [native validation](docs/clrbhb-native-validation.md)
+reproduces the failure on all sixteen endpoints and identifies a missing operand-conversion
+case in current upstream source. A proposed patch fixes standalone decoding and adds a
+proposed IL intrinsic. The new C regression passes after the decoder correction and
+42,639 existing corpus entries are unchanged. The IL/plugin build and upstream GUI
+analysis/comparison acceptance remain unvalidated; the older-version fallback stays.
+
+- **Why deferred:** exporter acceptance is complete; correcting native analysis is separate
+  upstream work. Textual similarity for these entries remains limited by the decoder.
+- **What would close it:** verify an upstream version decodes `df2203d5` as CLRBHB and provides
+  instruction text, then check the affected function analysis and comparison output. Keep the
+  fallback for older supported versions unless their support is explicitly dropped.
+- **Where it picks up:** [diagnosis and retained graph evidence](docs/securekernel-export-followup.md).
+  Check upstream decoder status before proposing or removing a workaround.
+
+**Closure — 2026-09-15:** the user chose a companion-maintained native replacement
+so this item no longer depends on waiting for an upstream release. The patch,
+version-pinned builder, reversible installer, and disposable GUI capture now live
+in `binja-windbg-mcp/native/arm64` and its `tools` directory. The package is pinned
+to Binary Ninja 6.0.10601 / SDK ABI 187 on Apple Silicon; an upstream PR draft is
+prepared locally for later submission.
+
+The [replacement acceptance](docs/clrbhb-native-validation.md#companion-maintained-replacement--accepted)
+proves the user-profile native library loaded with the bundled architecture disabled.
+All sixteen endpoints now decode and analyze as three-instruction, 12-byte functions
+with `SystemHintOp_CLRBHB` IL. External BinDiff completed with 3,101 matches, zero
+omitted functions and all eight complete endpoint diffs. Input bytes, analysis and
+generations were unchanged; the GUI exited zero without a new crash report.
+The companion's 197 tests pass, including ten new package tests. The app bundle and
+normal profile were not modified. Older-build exporter fallback remains in place.
+Upstream submission and eventual removal of the replacement are subsequent work;
+items 61, 62, 64 and 65 retain their separate closure conditions.
 
 ## 70. [dbgscope] A path component is matched by folding ASCII — **done** (2026-09-14)
 

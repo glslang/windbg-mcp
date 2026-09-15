@@ -1,0 +1,43 @@
+--- a/arch/arm64/disassembler/decode_scratchpad.c
++++ b/arch/arm64/disassembler/decode_scratchpad.c
+@@ -1595,6 +1595,7 @@
+ 	case ENC_AUTIBZ_HI_HINTS:
+ 	case ENC_AXFLAG_M_PSTATE:
+ 	case ENC_CFINV_M_PSTATE:
++	case ENC_CLRBHB_HI_HINTS:
+ 	case ENC_CSDB_HI_HINTS:
+ 	case ENC_DGH_HI_HINTS:
+ 	case ENC_DRPS_64E_BRANCH_REG:
+--- a/arch/arm64/il.h
++++ b/arch/arm64/il.h
+@@ -118,6 +118,7 @@
+ 	ARM64_INTRIN_AUTIB2,
+ 	ARM64_INTRIN_PACIA2,
+ 	ARM64_INTRIN_PACIB2,
++	ARM64_INTRIN_HINT_CLRBHB,
+ 	ARM64_INTRIN_NORMAL_END, /* needed so intrinsics can be extended by other lists, like neon
+ 	                            intrinsics */
+ 	ARM64_INTRIN_INVALID = 0xFFFFFFFF,
+--- a/arch/arm64/il.cpp
++++ b/arch/arm64/il.cpp
+@@ -4265,6 +4265,9 @@
+ 	case ARM64_TSB:
+ 		il.AddInstruction(il.Intrinsic({}, ARM64_INTRIN_HINT_TSB, {}));
+ 		break;
++	case ARM64_CLRBHB:
++		il.AddInstruction(il.Intrinsic({}, ARM64_INTRIN_HINT_CLRBHB, {}));
++		break;
+ 	case ARM64_CSDB:
+ 		il.AddInstruction(il.Intrinsic({}, ARM64_INTRIN_HINT_CSDB, {}));
+ 		break;
+--- a/arch/arm64/arch_arm64.cpp
++++ b/arch/arm64/arch_arm64.cpp
+@@ -1046,6 +1046,8 @@
+ 			return "SystemHintOp_PSB";
+ 		case ARM64_INTRIN_HINT_TSB:
+ 			return "SystemHintOp_TSB";
++		case ARM64_INTRIN_HINT_CLRBHB:
++			return "SystemHintOp_CLRBHB";
+ 		case ARM64_INTRIN_HINT_CSDB:
+ 			return "SystemHintOp_CSDB";
+ 		case ARM64_INTRIN_HINT_BTI:

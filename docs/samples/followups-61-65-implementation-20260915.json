@@ -1,0 +1,118 @@
+{
+  "schema_version": 1,
+  "captured_at": "2026-09-15T19:24:28.621414+00:00",
+  "host": {
+    "system": "Darwin",
+    "machine": "arm64"
+  },
+  "sources": [
+    {
+      "path": "tools/securekernel_handoff_probe.py",
+      "sha256": "de03570c4b1e2d1cf6589d0e1720bb930b68c17cbb7228c9b2cb762d18b7b1e4"
+    },
+    {
+      "path": "tools/bn_followup_probe.py",
+      "sha256": "88fcb2efd1eeedcf17c4d81c44c709354f23dfe8aace15a3f0d5d396f2f6cf3a"
+    },
+    {
+      "path": "tools/bn_followup_gui.py",
+      "sha256": "826b2eb2e611c1a2462957336b4e2154290c1158eee71003e4023e2bf4155988"
+    },
+    {
+      "path": "tools/clrbhb_decoder_compare.py",
+      "sha256": "b01f99a8fd0613704b26c18c3744a7089e0dc1dea82b2b2eb1c72e796277ee5f"
+    },
+    {
+      "path": "tools/test_followup_probes.py",
+      "sha256": "faef6e084fed7e679373fd066ae462fcf2c635b87e7ae7514373be6dc12b3f37"
+    },
+    {
+      "path": "docs/samples/cve-2026-83498-section-diff.py",
+      "sha256": "dc253011cfb511cbabfdb5cb5a951ce7865a634f416ee5f9fcd08bb4d5e3fbcd"
+    },
+    {
+      "path": "docs/samples/cve-2026-83498-stale-pointer-check.py",
+      "sha256": "c0c1c5c8735f9c79c0cc55f5a9175dd124cc930beaf3b31853c4603d13336d9d"
+    },
+    {
+      "path": "docs/samples/clrbhb-native-regression.c",
+      "sha256": "e08c6add03d712c5ee3ee6d7f84ecb60bdebaa30409e1777ec44a2cb616f9713"
+    },
+    {
+      "path": "docs/samples/clrbhb-upstream-proposed.patch",
+      "sha256": "06019a7e2a1e0b70a54eba577149a64697d3b84f31393eb04dfa59a2bccb6587"
+    }
+  ],
+  "captures": [
+    {
+      "path": "docs/samples/cve-2026-83498-attribution-20260915.json",
+      "sha256": "8730ed13dd4504d00a8d66fea77179a50c69d3c15aacebf611d03bba09cb94b8"
+    },
+    {
+      "path": "docs/samples/securekernel-handoff-discovery-20260915.json",
+      "sha256": "4916ab574ea02d7528d45f9fd00ad684b2fb0de2e62f1a02b2c79c1fe5e9f8af"
+    },
+    {
+      "path": "docs/samples/clrbhb-native-validation-20260915.json",
+      "sha256": "4dd4fdb7f2b82e610466b01f2e62220439b967e4c45ad26feb267e75a9a32d02"
+    },
+    {
+      "path": "docs/samples/bn-shutdown-validation-20260915.json",
+      "sha256": "5e65d1e295d964706f1c2d496bad0e1c8a075a4af44c6a2ea8ed224a0ddb45f7"
+    }
+  ],
+  "checks": [
+    {
+      "item": 61,
+      "status": "tentative",
+      "reason": "Real cleanup fix verified; competing CVE and symbol-server key collision prevent requested attribution."
+    },
+    {
+      "item": 62,
+      "status": "not_run",
+      "reason": "Live discovery passed with zero sessions; probe and offline preservation checks implemented."
+    },
+    {
+      "item": 63,
+      "status": "failed",
+      "reason": "Installed native decoder still fails; proposed standalone correction passes, IL/plugin integration unvalidated."
+    },
+    {
+      "item": 64,
+      "status": "failed",
+      "reason": "Original wizard scenario aborts; control and active-work shutdown checks pass."
+    },
+    {
+      "item": 65,
+      "status": "not_run",
+      "reason": "Real native provider discovery reports both providers unavailable in Personal."
+    }
+  ],
+  "verification": {
+    "new_offline_tests": {
+      "passed": 16,
+      "failed": 0
+    },
+    "existing_probe_cleanup_tests": {
+      "passed": 11,
+      "failed": 0
+    },
+    "ruff": "passed",
+    "cargo_fmt": "passed",
+    "changed_documentation_lint": "passed",
+    "hash_gated_stale_pointer_checker": "passed on both exact ARM64 PEs",
+    "native_decoder_regression": "failed before patch; passed after patch; NOP and CSDB controls pass",
+    "corpus_comparison": {
+      "entries": 42639,
+      "unexpected_changes": 0
+    },
+    "upstream_decoder_suite": "same existing MSR formatting mismatch before and after",
+    "rust_tests": "not_run; no Rust changes",
+    "windows_debugger_tiers": "not_run; no suitable session"
+  },
+  "cleanup": {
+    "owned_ssh_tunnel_closed": true,
+    "no_binaryninja_or_bindiff_processes_remaining": true
+  },
+  "all_followups_closed": false
+}
