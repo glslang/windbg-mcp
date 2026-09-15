@@ -28,7 +28,7 @@
 //!
 //! # Engine-free
 //!
-//! Like [`crate::pe`] and [`crate::driver`], every entry point takes closures rather than a
+//! Like [`dbgscope::pe`] and [`crate::driver`], every entry point takes closures rather than a
 //! `DebugEngine`: one to decode a range of instructions, one to ask whether to stop. The worker
 //! supplies the two that touch DbgEng; the tests supply fixtures.
 
@@ -36,8 +36,8 @@ use std::collections::BTreeMap;
 
 use dbgscope::dbgeng::{Flow, Instruction, Operand};
 
-use crate::pe;
 use crate::walk::Halt;
+use dbgscope::pe;
 
 /// The version of the sink list a scan was taken with.
 ///
@@ -901,6 +901,7 @@ mod tests {
             bitness: pe::Bitness::Bits64,
             machine: 0x8664,
             size_of_image: 0x4000,
+            section_alignment: 0x1000,
             sections: vec![
                 pe::Section {
                     name: ".text".to_string(),

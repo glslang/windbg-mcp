@@ -64,7 +64,6 @@ use crate::driver::{
 use crate::fault;
 use crate::hazards;
 use crate::ioctl;
-use crate::pe;
 use crate::proto::{
     EngineOp, Failed, HeapBackendFilter, HeapOp, HeapStateFilter, Interrupted, MAX_MODULE_ROWS,
     Output, PoolOp, ReachabilityOp, SymbolPathSetting, TargetOrigin, WorkerMessage, WorkerRequest,
@@ -78,6 +77,7 @@ use crate::surface;
 use crate::target::{Arch, Opening};
 use crate::triage::{self, Analysis, AttributedFrame, Attribution};
 use crate::walk;
+use dbgscope::pe;
 
 /// The argument that turns this executable into a worker. Not a documented CLI: the supervisor
 /// re-executes itself with it, and nothing else should.

@@ -23,7 +23,7 @@
 //!
 //! # Engine-free
 //!
-//! Like [`crate::pe`], [`crate::ioctl`], [`crate::hazards`] and [`crate::driver`], the entry point
+//! Like [`dbgscope::pe`], [`crate::ioctl`], [`crate::hazards`] and [`crate::driver`], the entry point
 //! takes a `read(addr, len)` closure rather than a `DebugEngine`, so every structure below is
 //! tested against literal bytes with no debugger anywhere near it. The layouts are pinned with
 //! **byte fixtures**, never with the constants the parser also reads.

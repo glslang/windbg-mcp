@@ -58,7 +58,7 @@
 //!
 //! # Engine-free
 //!
-//! Like [`crate::pe`], [`crate::hazards`] and [`crate::driver`], every entry point takes closures
+//! Like [`dbgscope::pe`], [`crate::hazards`] and [`crate::driver`], every entry point takes closures
 //! rather than a `DebugEngine`: a decoded function, a reader for the image's own bytes, and a
 //! halt poll. So every case below is unit-tested against a hand-built instruction list with no
 //! debugger anywhere near it.
