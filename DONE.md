@@ -3541,8 +3541,9 @@ one, an index read as a byte offset, the null check removed, and the cache remov
 
 ## 78. [dbgscope] The VS allocator layout moved again, and the pool walker refuses the build — **done** (2026-09-15, dbgscope#167)
 
-**Repo:** `dbgscope` ([#167](https://github.com/glslang/dbgscope/pull/167)), surfaced by
-`windbg-mcp`'s live-kernel tier.
+**Repo:** `dbgscope` ([#167](https://github.com/glslang/dbgscope/pull/167)) and, through it,
+`windbg-mcp` ([#329](https://github.com/glslang/windbg-mcp/pull/329)). Surfaced by `windbg-mcp`'s
+live-kernel tier.
 
 Two tests in that tier failed against the CTF guest on
 `26100.33438.amd64fre.lt_release_svc_prod1.260904-1524`, both refusing the build:
