@@ -1050,7 +1050,14 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                 // "finished trying", not "succeeded" — what the main thread waits for is
                 // permission to stop waiting.
                 match catch_unwind(AssertUnwindSafe(|| engine.end_session())) {
-                    Ok(Ok(_)) => tracing::info!("worker: target released"),
+                    // The disposition, not just "released": on this path there is no reply to put
+                    // it on, so the log is the only place a halted kernel can be said at all.
+                    Ok(Ok(dbgscope::dbgeng::TargetLeft::KernelHalted)) => tracing::error!(
+                        "worker: the live kernel could not be told to run before it was detached, \
+                         so it is probably still halted; attaching again and running `qd` \
+                         releases it"
+                    ),
+                    Ok(Ok(left)) => tracing::info!("worker: target released ({left:?})"),
                     Ok(Err(e)) => tracing::error!(
                         "worker: the debugger refused to release the target ({}); a live kernel \
                          target may be left halted, and a process this session attached to may \
@@ -1979,7 +1986,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             let detaching = e.attached_to_a_live_process();
             let ended = e
                 .end_session()
-                .map(|_| {
+                .map(|left| {
                     // Both halves of the result, from one read of one fact. A structured-aware
                     // client forwards `structuredContent` and drops the text, so a disposition on
                     // the text alone is a disposition half the clients never see — the rule
@@ -1987,20 +1994,56 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                     // that ends a session on purpose. `None` where there was no live process to
                     // keep, which the supervisor turns into `false` for a session that takes its
                     // target: only it knows a launch from a dump.
-                    Output::released(
-                        if detaching {
-                            "Session ended. The process this session attached to was detached and \
-                             left running."
-                        } else {
-                            "session ended"
-                        },
-                        detaching.then_some(true),
-                    )
+                    let (text, left_running) = ending(left, detaching);
+                    Output::released(text, left_running)
                 })
                 .map_err(failed);
             query::invalidate_allocator_caches();
             ended
         }
+    }
+}
+
+/// What a caller is told became of the target, from what the engine reported plus whether a live
+/// process was attached.
+///
+/// **A named rule rather than a formatting step, and it needs no engine** -- which is the only way
+/// it gets a test, since every path that produces a real [`TargetLeft::KernelRunning`] needs a live
+/// kernel. The two inputs are the whole question: the engine knows what it did to a kernel, and
+/// only this side knows whether a user-mode process was attached, because ending the session is
+/// what clears that.
+///
+/// **A live kernel now answers `target_left_running` instead of leaving it absent.** The field used
+/// to be `None` for every kernel target on the grounds that a kernel is not a process -- true, and
+/// beside the point: a live kernel is *running or halted*, which is exactly what the field asks and
+/// the one fact a caller has to act on after a teardown. A dump and a trace still answer `None`,
+/// having nothing that outlives the session.
+///
+/// The message names no tool, per `FOLLOWUPS.md` item 43: this is built in the worker, which has
+/// never heard of the client's surface. `qd` is a debugger command, not a tool.
+fn ending(left: dbgscope::dbgeng::TargetLeft, detaching: bool) -> (&'static str, Option<bool>) {
+    use dbgscope::dbgeng::TargetLeft;
+    match left {
+        TargetLeft::KernelRunning => (
+            "Session ended. The live kernel was resumed and detached, and is running.",
+            Some(true),
+        ),
+        // Reported rather than raised: the session *did* end, and a caller told only that
+        // something failed has no reason to go and look at the guest -- which is the one useful
+        // thing to do about a kernel sitting at a break with no debugger left on it.
+        TargetLeft::KernelHalted => (
+            "Session ended, but the live kernel could not be told to run before it was detached, \
+             so it is probably still halted at a break with one processor stopped. Attaching again \
+             and running `qd` resumes and releases it.",
+            Some(false),
+        ),
+        TargetLeft::Unspoken if detaching => (
+            "Session ended. The process this session attached to was detached and left running.",
+            Some(true),
+        ),
+        // A dump, a trace, or a launch. The supervisor turns the launch into `false`, being the
+        // only side that can tell one from a dump.
+        TargetLeft::Unspoken => ("session ended", None),
     }
 }
 
@@ -8590,6 +8633,82 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    use dbgscope::dbgeng::TargetLeft;
+
+    /// A live kernel says which of the two states it was left in, and both are sayable.
+    ///
+    /// The case this exists for: `KernelHalted` used to be unreachable *as a report*. The engine
+    /// discarded the resume's answer, so a kernel that was never told to run arrived here as a
+    /// clean release and left `target_left_running` absent -- indistinguishable from a closed dump.
+    #[test]
+    fn a_live_kernel_reports_whether_it_is_running() {
+        let (text, running) = super::ending(TargetLeft::KernelRunning, false);
+        assert_eq!(running, Some(true));
+        assert!(text.contains("running"), "{text}");
+
+        let (text, running) = super::ending(TargetLeft::KernelHalted, false);
+        assert_eq!(running, Some(false));
+        assert!(text.contains("halted"), "{text}");
+        // The remedy, because a caller who cannot act on this is being told a fact for nothing.
+        assert!(text.contains("qd"), "{text}");
+    }
+
+    /// A kernel's disposition is the engine's answer, not this side's guess from the process table.
+    ///
+    /// `attached_to_a_live_process` reads the attached-*process* table and is false for a kernel,
+    /// which is exactly how a resumed kernel used to come back as `None`. So the kernel arms must
+    /// not consult it, and this pins that by passing the value that would have decided it.
+    #[test]
+    fn a_kernels_answer_does_not_depend_on_the_process_table() {
+        for detaching in [false, true] {
+            assert_eq!(
+                super::ending(TargetLeft::KernelRunning, detaching).1,
+                Some(true)
+            );
+            assert_eq!(
+                super::ending(TargetLeft::KernelHalted, detaching).1,
+                Some(false)
+            );
+        }
+    }
+
+    /// Everything else answers as it did: an attached process left running, and nothing at all for
+    /// a target with nothing outliving the session.
+    #[test]
+    fn a_process_and_a_dump_answer_as_before() {
+        let (text, running) = super::ending(TargetLeft::Unspoken, true);
+        assert_eq!(running, Some(true));
+        assert!(text.contains("attached to was detached"), "{text}");
+
+        assert_eq!(
+            super::ending(TargetLeft::Unspoken, false),
+            ("session ended", None)
+        );
+    }
+
+    /// **The worker names no tool**, per `FOLLOWUPS.md` item 43: it is built where the client's
+    /// surface is unknown. `qd` is a debugger command and is fine; a tool name would not be.
+    #[test]
+    fn no_ending_message_names_a_tool() {
+        for left in [
+            TargetLeft::KernelRunning,
+            TargetLeft::KernelHalted,
+            TargetLeft::Unspoken,
+        ] {
+            for detaching in [false, true] {
+                let (text, _) = super::ending(left, detaching);
+                for tool in [
+                    "end_session",
+                    "attach_kernel",
+                    "execute {",
+                    "session_status",
+                ] {
+                    assert!(!text.contains(tool), "{text:?} names the {tool} tool");
+                }
+            }
+        }
+    }
+
     /// The bodies of the named functions, concatenated, each one required to exist.
     ///
     /// **The `floor` is the point of this helper.** A guard that scans a function whose body has
