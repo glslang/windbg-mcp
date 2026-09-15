@@ -1,0 +1,1959 @@
+{
+  "schema_version": 1,
+  "case": "decode",
+  "captured_at": "2026-09-15T19:45:55.057452+00:00",
+  "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+  "probe_sha256": "8279d51ad1831c4dfd82b37c4127c79c2fab10ac19006d9b32e85cff8f307a29",
+  "launcher_sha256": "cce5c7f7df2c984d43ad54e284fbf1fc36290c0d8eb718e95871a8bed5f52a8b",
+  "api_revision": "API repository revision https://github.com/Vector35/binaryninja-api/tree/2ddf304b3275aa184e95570404539cbc4beb64c6\n2ddf304b3275aa184e95570404539cbc4beb64c6",
+  "pid": 78770,
+  "status": "passed",
+  "returncode": 0,
+  "forced": false,
+  "normal_exit": true,
+  "crash_reports": [],
+  "capture": {
+    "schema_version": 1,
+    "ok": true,
+    "captured_at": "2026-09-15T19:45:58.528931+00:00",
+    "bn_version": "6.0.10601 Personal",
+    "edition": "User",
+    "replacement": {
+      "path": "<disposable-profile-capture>/profile/plugins/libarch_arm64.dylib",
+      "sha256": "fe26ff7a60a2d6da8c9e569c64c28a8759c673be90bff59c72db328ba2c684be",
+      "bundled_disabled": true,
+      "loaded_arm64_images": [
+        "<disposable-profile-capture>/profile/plugins/libarch_arm64.dylib"
+      ]
+    },
+    "native_capabilities": {
+      "available": false,
+      "requires": "Binary Ninja 6 Ultimate",
+      "providers": {
+        "Google BinDiff": false,
+        "WARP": false
+      },
+      "version": "6.0.10601 Personal",
+      "edition": "User"
+    },
+    "synthetic_instruction": {
+      "address": "0x1000",
+      "bytes": "df2203d5",
+      "length": 4,
+      "branches": [],
+      "text": "clrbhb  ",
+      "text_length": 4
+    },
+    "synthetic_function": {
+      "address": "0x0",
+      "found": true,
+      "name": "sub_0",
+      "bounds": [
+        [
+          "0x0",
+          "0xc"
+        ]
+      ],
+      "instructions": [
+        {
+          "address": "0x0",
+          "length": 4,
+          "text": "clrbhb  "
+        },
+        {
+          "address": "0x4",
+          "length": 4,
+          "text": "add     x0, x0, #0x1"
+        },
+        {
+          "address": "0x8",
+          "length": 4,
+          "text": "ret     "
+        }
+      ],
+      "instructions_truncated": false,
+      "llil": [
+        "SystemHintOp_CLRBHB()",
+        "x0 = x0 + 1",
+        "<return> jump(lr)"
+      ]
+    },
+    "native_decode_passed": true,
+    "synthetic_analysis_passed": true,
+    "endpoints": [
+      {
+        "address": "0x14011ac00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11ac00",
+        "function": {
+          "address": "0x14011ac00",
+          "found": true,
+          "name": "FrontendBhbClrKiUserExceptionHandler",
+          "bounds": [
+            [
+              "0x14011ac00",
+              "0x14011ac0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011ac00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011ac04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011ac08",
+              "length": 4,
+              "text": "b       0x14011fc00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011fc00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14011ac80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11ac80",
+        "function": {
+          "address": "0x14011ac80",
+          "found": true,
+          "name": "FrontendBhbClrKiUserInterruptHandler",
+          "bounds": [
+            [
+              "0x14011ac80",
+              "0x14011ac8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011ac80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011ac84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011ac88",
+              "length": 4,
+              "text": "b       0x14011fc80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011fc80)"
+          ]
+        }
+      },
+      {
+        "address": "0x14011ad00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11ad00",
+        "function": {
+          "address": "0x14011ad00",
+          "found": true,
+          "name": "FrontendBhbClrKiUserFiqHandler",
+          "bounds": [
+            [
+              "0x14011ad00",
+              "0x14011ad0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011ad00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011ad04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011ad08",
+              "length": 4,
+              "text": "b       0x14011fd00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011fd00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14011ad80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11ad80",
+        "function": {
+          "address": "0x14011ad80",
+          "found": true,
+          "name": "FrontendBhbClrKiUserSystemErrorHandler",
+          "bounds": [
+            [
+              "0x14011ad80",
+              "0x14011ad8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011ad80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011ad84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011ad88",
+              "length": 4,
+              "text": "b       0x14011fd80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011fd80)"
+          ]
+        }
+      },
+      {
+        "address": "0x14011ae00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11ae00",
+        "function": {
+          "address": "0x14011ae00",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32ExceptionHandler",
+          "bounds": [
+            [
+              "0x14011ae00",
+              "0x14011ae0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011ae00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011ae04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011ae08",
+              "length": 4,
+              "text": "b       0x14011fe00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011fe00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14011ae80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11ae80",
+        "function": {
+          "address": "0x14011ae80",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32InterruptHandler",
+          "bounds": [
+            [
+              "0x14011ae80",
+              "0x14011ae8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011ae80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011ae84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011ae88",
+              "length": 4,
+              "text": "b       0x14011fe80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011fe80)"
+          ]
+        }
+      },
+      {
+        "address": "0x14011af00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11af00",
+        "function": {
+          "address": "0x14011af00",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32FiqHandler",
+          "bounds": [
+            [
+              "0x14011af00",
+              "0x14011af0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011af00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011af04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011af08",
+              "length": 4,
+              "text": "b       0x14011ff00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011ff00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14011af80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "target",
+        "rva": "0x11af80",
+        "function": {
+          "address": "0x14011af80",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32SystemErrorHandler",
+          "bounds": [
+            [
+              "0x14011af80",
+              "0x14011af8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14011af80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14011af84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14011af88",
+              "length": 4,
+              "text": "b       0x14011ff80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x14011ff80)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010fc00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10fc00",
+        "function": {
+          "address": "0x14010fc00",
+          "found": true,
+          "name": "FrontendBhbClrKiUserExceptionHandler",
+          "bounds": [
+            [
+              "0x14010fc00",
+              "0x14010fc0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010fc00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010fc04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010fc08",
+              "length": 4,
+              "text": "b       0x140114c00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114c00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010fc80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10fc80",
+        "function": {
+          "address": "0x14010fc80",
+          "found": true,
+          "name": "FrontendBhbClrKiUserInterruptHandler",
+          "bounds": [
+            [
+              "0x14010fc80",
+              "0x14010fc8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010fc80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010fc84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010fc88",
+              "length": 4,
+              "text": "b       0x140114c80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114c80)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010fd00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10fd00",
+        "function": {
+          "address": "0x14010fd00",
+          "found": true,
+          "name": "FrontendBhbClrKiUserFiqHandler",
+          "bounds": [
+            [
+              "0x14010fd00",
+              "0x14010fd0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010fd00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010fd04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010fd08",
+              "length": 4,
+              "text": "b       0x140114d00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114d00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010fd80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10fd80",
+        "function": {
+          "address": "0x14010fd80",
+          "found": true,
+          "name": "FrontendBhbClrKiUserSystemErrorHandler",
+          "bounds": [
+            [
+              "0x14010fd80",
+              "0x14010fd8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010fd80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010fd84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010fd88",
+              "length": 4,
+              "text": "b       0x140114d80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114d80)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010fe00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10fe00",
+        "function": {
+          "address": "0x14010fe00",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32ExceptionHandler",
+          "bounds": [
+            [
+              "0x14010fe00",
+              "0x14010fe0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010fe00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010fe04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010fe08",
+              "length": 4,
+              "text": "b       0x140114e00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114e00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010fe80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10fe80",
+        "function": {
+          "address": "0x14010fe80",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32InterruptHandler",
+          "bounds": [
+            [
+              "0x14010fe80",
+              "0x14010fe8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010fe80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010fe84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010fe88",
+              "length": 4,
+              "text": "b       0x140114e80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114e80)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010ff00",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10ff00",
+        "function": {
+          "address": "0x14010ff00",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32FiqHandler",
+          "bounds": [
+            [
+              "0x14010ff00",
+              "0x14010ff0c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010ff00",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010ff04",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010ff08",
+              "length": 4,
+              "text": "b       0x140114f00"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114f00)"
+          ]
+        }
+      },
+      {
+        "address": "0x14010ff80",
+        "bytes": "df2203d5",
+        "length": 4,
+        "branches": [],
+        "text": "clrbhb  ",
+        "text_length": 4,
+        "side": "reference",
+        "rva": "0x10ff80",
+        "function": {
+          "address": "0x14010ff80",
+          "found": true,
+          "name": "FrontendBhbClrKiUser32SystemErrorHandler",
+          "bounds": [
+            [
+              "0x14010ff80",
+              "0x14010ff8c"
+            ]
+          ],
+          "instructions": [
+            {
+              "address": "0x14010ff80",
+              "length": 4,
+              "text": "clrbhb  "
+            },
+            {
+              "address": "0x14010ff84",
+              "length": 4,
+              "text": "isb     "
+            },
+            {
+              "address": "0x14010ff88",
+              "length": 4,
+              "text": "b       0x140114f80"
+            }
+          ],
+          "instructions_truncated": false,
+          "llil": [
+            "SystemHintOp_CLRBHB()",
+            "__isb()",
+            "<return> tailcall(0x140114f80)"
+          ]
+        }
+      }
+    ],
+    "inputs": {
+      "target": {
+        "sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+        "architecture": "aarch64",
+        "identity": {
+          "timestamp": 1188430604,
+          "size": 1290240,
+          "pdb": {
+            "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+            "age": 1
+          }
+        }
+      },
+      "reference": {
+        "sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+        "architecture": "aarch64",
+        "identity": {
+          "timestamp": 3350698326,
+          "size": 1245184,
+          "pdb": {
+            "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+            "age": 1
+          }
+        }
+      }
+    },
+    "endpoint_decoding_passed": true,
+    "endpoint_analysis_passed": true,
+    "comparison": {
+      "status": "passed",
+      "before": [
+        {
+          "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+          "hash_source": "original Raw view",
+          "image_name": "securekernel.exe",
+          "binary_id": "d58805691efa4b0499ff39092bbea628",
+          "path": "<target-input>/securekernel.exe",
+          "display_name": "securekernel.exe",
+          "active": true,
+          "architecture": "aarch64",
+          "analysis_state": "IdleState",
+          "image_base": "0x0000000140000000",
+          "identity": {
+            "timestamp": 1188430604,
+            "size": 1290240,
+            "pdb": {
+              "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+              "age": 1
+            }
+          },
+          "generation": [
+            "d58805691efa4b0499ff39092bbea628",
+            5368709120,
+            14978
+          ],
+          "modified": false
+        },
+        {
+          "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+          "hash_source": "original Raw view",
+          "image_name": "securekernel.exe",
+          "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+          "path": "<reference-input>/securekernel.exe",
+          "display_name": "securekernel.exe",
+          "active": false,
+          "architecture": "aarch64",
+          "analysis_state": "IdleState",
+          "image_base": "0x0000000140000000",
+          "identity": {
+            "timestamp": 3350698326,
+            "size": 1245184,
+            "pdb": {
+              "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+              "age": 1
+            }
+          },
+          "generation": [
+            "0d4e48f157d24958ae38b58bb7f698a7",
+            5368709120,
+            14845
+          ],
+          "modified": false
+        }
+      ],
+      "analysis_before": {
+        "d58805691efa4b0499ff39092bbea628": {
+          "analysis_sha256": "68b9c5b76cfb5e93fe88d372220f4b30107f2b6a0b46f814b8aa923606444331",
+          "bytes_sha256": "96dd8f5f82270dba5fbc257e16980fb1613ae840de0ce6b0a1d5e24cab97b3c1",
+          "function_count": 3127
+        },
+        "0d4e48f157d24958ae38b58bb7f698a7": {
+          "analysis_sha256": "3fcee87750bca9e80a61485e9c53cfbcfefb0dd3866fd356fc6ed192ce2a85be",
+          "bytes_sha256": "9ed34ef6672cfeb745670033fca7b197f191f60b80380d63b8bc39840668069a",
+          "function_count": 3104
+        }
+      },
+      "result": {
+        "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+        "state": "completed",
+        "active": false,
+        "closing": false,
+        "progress": null,
+        "stop_reason": null,
+        "providers": [
+          "Google BinDiff"
+        ],
+        "backend": "external",
+        "stage": "importing",
+        "omitted_functions": {
+          "reference": 0,
+          "target": 0
+        },
+        "binary_ids": {
+          "reference": "0d4e48f157d24958ae38b58bb7f698a7",
+          "target": "d58805691efa4b0499ff39092bbea628"
+        },
+        "snapshots": {
+          "reference": {
+            "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+            "path": "<reference-input>/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": false,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 3350698326,
+              "size": 1245184,
+              "pdb": {
+                "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                "age": 1
+              }
+            },
+            "generation": [
+              "0d4e48f157d24958ae38b58bb7f698a7",
+              5368709120,
+              14845
+            ],
+            "modified": false
+          },
+          "target": {
+            "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+            "hash_source": "original Raw view",
+            "image_name": "securekernel.exe",
+            "binary_id": "d58805691efa4b0499ff39092bbea628",
+            "path": "<target-input>/securekernel.exe",
+            "display_name": "securekernel.exe",
+            "active": true,
+            "architecture": "aarch64",
+            "analysis_state": "IdleState",
+            "image_base": "0x0000000140000000",
+            "identity": {
+              "timestamp": 1188430604,
+              "size": 1290240,
+              "pdb": {
+                "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                "age": 1
+              }
+            },
+            "generation": [
+              "d58805691efa4b0499ff39092bbea628",
+              5368709120,
+              14978
+            ],
+            "modified": false
+          }
+        },
+        "match_count": 3101,
+        "coverage_complete": true,
+        "unresolved_results": 0,
+        "error": null
+      },
+      "diffs": [
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2806",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 248,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9706877692486436,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10fc00"
+              },
+              "address": "0x000000014010fc00",
+              "name": "FrontendBhbClrKiUserExceptionHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11ac00"
+              },
+              "address": "0x000000014011ac00",
+              "name": "FrontendBhbClrKiUserExceptionHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fc00",
+                "rva": "0x10fc00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ac00",
+                "rva": "0x11ac00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fc04",
+                "rva": "0x10fc04",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ac04",
+                "rva": "0x11ac04",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010fc08",
+                "rva": "0x10fc08",
+                "text": "b       0x140114c00",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ac08",
+                "rva": "0x11ac08",
+                "text": "b       0x14011fc00",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2807",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 248,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9706877692486436,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10fc80"
+              },
+              "address": "0x000000014010fc80",
+              "name": "FrontendBhbClrKiUserInterruptHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11ac80"
+              },
+              "address": "0x000000014011ac80",
+              "name": "FrontendBhbClrKiUserInterruptHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fc80",
+                "rva": "0x10fc80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ac80",
+                "rva": "0x11ac80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fc84",
+                "rva": "0x10fc84",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ac84",
+                "rva": "0x11ac84",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010fc88",
+                "rva": "0x10fc88",
+                "text": "b       0x140114c80",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ac88",
+                "rva": "0x11ac88",
+                "text": "b       0x14011fc80",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2808",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 248,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9706877692486436,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10fd00"
+              },
+              "address": "0x000000014010fd00",
+              "name": "FrontendBhbClrKiUserFiqHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11ad00"
+              },
+              "address": "0x000000014011ad00",
+              "name": "FrontendBhbClrKiUserFiqHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fd00",
+                "rva": "0x10fd00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ad00",
+                "rva": "0x11ad00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fd04",
+                "rva": "0x10fd04",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ad04",
+                "rva": "0x11ad04",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010fd08",
+                "rva": "0x10fd08",
+                "text": "b       0x140114d00",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ad08",
+                "rva": "0x11ad08",
+                "text": "b       0x14011fd00",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2809",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 248,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9706877692486436,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10fd80"
+              },
+              "address": "0x000000014010fd80",
+              "name": "FrontendBhbClrKiUserSystemErrorHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11ad80"
+              },
+              "address": "0x000000014011ad80",
+              "name": "FrontendBhbClrKiUserSystemErrorHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fd80",
+                "rva": "0x10fd80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ad80",
+                "rva": "0x11ad80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fd84",
+                "rva": "0x10fd84",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ad84",
+                "rva": "0x11ad84",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010fd88",
+                "rva": "0x10fd88",
+                "text": "b       0x140114d80",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ad88",
+                "rva": "0x11ad88",
+                "text": "b       0x14011fd80",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2810",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 248,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9706877692486436,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10fe00"
+              },
+              "address": "0x000000014010fe00",
+              "name": "FrontendBhbClrKiUser32ExceptionHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11ae00"
+              },
+              "address": "0x000000014011ae00",
+              "name": "FrontendBhbClrKiUser32ExceptionHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fe00",
+                "rva": "0x10fe00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ae00",
+                "rva": "0x11ae00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fe04",
+                "rva": "0x10fe04",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ae04",
+                "rva": "0x11ae04",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010fe08",
+                "rva": "0x10fe08",
+                "text": "b       0x140114e00",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ae08",
+                "rva": "0x11ae08",
+                "text": "b       0x14011fe00",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2811",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 248,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9706877692486436,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10fe80"
+              },
+              "address": "0x000000014010fe80",
+              "name": "FrontendBhbClrKiUser32InterruptHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11ae80"
+              },
+              "address": "0x000000014011ae80",
+              "name": "FrontendBhbClrKiUser32InterruptHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fe80",
+                "rva": "0x10fe80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ae80",
+                "rva": "0x11ae80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010fe84",
+                "rva": "0x10fe84",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ae84",
+                "rva": "0x11ae84",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010fe88",
+                "rva": "0x10fe88",
+                "text": "b       0x140114e80",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011ae88",
+                "rva": "0x11ae88",
+                "text": "b       0x14011fe80",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2812",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 250,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9820137900379085,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10ff00"
+              },
+              "address": "0x000000014010ff00",
+              "name": "FrontendBhbClrKiUser32FiqHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11af00"
+              },
+              "address": "0x000000014011af00",
+              "name": "FrontendBhbClrKiUser32FiqHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010ff00",
+                "rva": "0x10ff00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011af00",
+                "rva": "0x11af00",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010ff04",
+                "rva": "0x10ff04",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011af04",
+                "rva": "0x11af04",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010ff08",
+                "rva": "0x10ff08",
+                "text": "b       0x140114f00",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011af08",
+                "rva": "0x11af08",
+                "text": "b       0x14011ff00",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        },
+        {
+          "comparison_id": "0a1b3b78e55d4c12a53b2dc6034cfd10",
+          "result": {
+            "result_id": "match_2813",
+            "provider": "Google BinDiff",
+            "similarity": 255,
+            "confidence": 248,
+            "raw_similarity": 1.0,
+            "raw_confidence": 0.9706877692486436,
+            "reference": {
+              "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+              "generation": [
+                "0d4e48f157d24958ae38b58bb7f698a7",
+                5368709120,
+                14845
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 3350698326,
+                  "size": 1245184,
+                  "pdb": {
+                    "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                    "age": 1
+                  }
+                },
+                "rva": "0x10ff80"
+              },
+              "address": "0x000000014010ff80",
+              "name": "FrontendBhbClrKiUser32SystemErrorHandler"
+            },
+            "target": {
+              "binary_id": "d58805691efa4b0499ff39092bbea628",
+              "generation": [
+                "d58805691efa4b0499ff39092bbea628",
+                5368709120,
+                14978
+              ],
+              "coordinate": {
+                "module": "securekernel",
+                "image_name": "securekernel.exe",
+                "identity": {
+                  "timestamp": 1188430604,
+                  "size": 1290240,
+                  "pdb": {
+                    "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                    "age": 1
+                  }
+                },
+                "rva": "0x11af80"
+              },
+              "address": "0x000000014011af80",
+              "name": "FrontendBhbClrKiUser32SystemErrorHandler"
+            },
+            "backend": "external"
+          },
+          "comparison_kind": "instruction_text",
+          "instructions_truncated": {
+            "reference": false,
+            "target": false
+          },
+          "items": [
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010ff80",
+                "rva": "0x10ff80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011af80",
+                "rva": "0x11af80",
+                "text": "clrbhb  ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "equal",
+              "reference": {
+                "address": "0x000000014010ff84",
+                "rva": "0x10ff84",
+                "text": "isb     ",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011af84",
+                "rva": "0x11af84",
+                "text": "isb     ",
+                "text_truncated": false
+              }
+            },
+            {
+              "kind": "replace",
+              "reference": {
+                "address": "0x000000014010ff88",
+                "rva": "0x10ff88",
+                "text": "b       0x140114f80",
+                "text_truncated": false
+              },
+              "target": {
+                "address": "0x000000014011af88",
+                "rva": "0x11af88",
+                "text": "b       0x14011ff80",
+                "text_truncated": false
+              }
+            }
+          ],
+          "total": 3,
+          "next_offset": null,
+          "truncated": false
+        }
+      ],
+      "after": [
+        {
+          "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+          "hash_source": "original Raw view",
+          "image_name": "securekernel.exe",
+          "binary_id": "d58805691efa4b0499ff39092bbea628",
+          "path": "<target-input>/securekernel.exe",
+          "display_name": "securekernel.exe",
+          "active": true,
+          "architecture": "aarch64",
+          "analysis_state": "IdleState",
+          "image_base": "0x0000000140000000",
+          "identity": {
+            "timestamp": 1188430604,
+            "size": 1290240,
+            "pdb": {
+              "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+              "age": 1
+            }
+          },
+          "generation": [
+            "d58805691efa4b0499ff39092bbea628",
+            5368709120,
+            14978
+          ],
+          "modified": false
+        },
+        {
+          "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+          "hash_source": "original Raw view",
+          "image_name": "securekernel.exe",
+          "binary_id": "0d4e48f157d24958ae38b58bb7f698a7",
+          "path": "<reference-input>/securekernel.exe",
+          "display_name": "securekernel.exe",
+          "active": false,
+          "architecture": "aarch64",
+          "analysis_state": "IdleState",
+          "image_base": "0x0000000140000000",
+          "identity": {
+            "timestamp": 3350698326,
+            "size": 1245184,
+            "pdb": {
+              "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+              "age": 1
+            }
+          },
+          "generation": [
+            "0d4e48f157d24958ae38b58bb7f698a7",
+            5368709120,
+            14845
+          ],
+          "modified": false
+        }
+      ],
+      "analysis_after": {
+        "d58805691efa4b0499ff39092bbea628": {
+          "analysis_sha256": "68b9c5b76cfb5e93fe88d372220f4b30107f2b6a0b46f814b8aa923606444331",
+          "bytes_sha256": "96dd8f5f82270dba5fbc257e16980fb1613ae840de0ce6b0a1d5e24cab97b3c1",
+          "function_count": 3127
+        },
+        "0d4e48f157d24958ae38b58bb7f698a7": {
+          "analysis_sha256": "3fcee87750bca9e80a61485e9c53cfbcfefb0dd3866fd356fc6ed192ce2a85be",
+          "bytes_sha256": "9ed34ef6672cfeb745670033fca7b197f191f60b80380d63b8bc39840668069a",
+          "function_count": 3104
+        }
+      },
+      "inputs_unchanged": true,
+      "retained_results": {
+        "matches": 3101,
+        "unmatched": {
+          "reference": 3,
+          "target": 26
+        }
+      }
+    }
+  },
+  "full_capture": {
+    "path": "docs/samples/clrbhb-native-acceptance-20260915.json.gz",
+    "sha256": "29a2e412b36f52173e899b68bab613dcfe6a24689edf33c43365e03f064b5660",
+    "redactions": "temporary input/profile directory prefixes only",
+    "repository": "binja-windbg-mcp"
+  },
+  "verification": {
+    "companion_pytest": "197 passed",
+    "new_package_tests": "10 passed",
+    "stable_native_c_regression": "CLRBHB, NOP, CSDB passed",
+    "sdk_revision": "2ddf304b3275aa184e95570404539cbc4beb64c6",
+    "source_patch_sha256": "e33332872046994894923358bd70bf4835346a48fbff514211d4b47407ea9c41"
+  }
+}

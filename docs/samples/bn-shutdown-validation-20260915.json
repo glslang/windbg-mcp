@@ -1,0 +1,358 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-15",
+  "upstream_issue": {
+    "url": "https://github.com/Vector35/binaryninja-api/issues/8549",
+    "state": "open",
+    "comments": 0,
+    "updated_at": "2026-09-11T19:10:13Z"
+  },
+  "companion_revision": "22cd24fbce81014402be32e490e39206c741440e",
+  "cases": {
+    "wizard": {
+      "schema_version": 1,
+      "case": "wizard",
+      "captured_at": "2026-09-15T19:08:04.383339+00:00",
+      "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+      "probe_sha256": "cdd9287225ce5e06f6285a1216e21fa35b2b3e6f4c681ae1d867085d39583759",
+      "launcher_sha256": "8c876dc744e3d8fc824b4778911dc54374672158c40ea5d83a0f6cbbf029027d",
+      "status": "failed",
+      "returncode": -6,
+      "forced": false,
+      "normal_exit": false,
+      "crash_reports": [],
+      "capture": {
+        "schema_version": 1,
+        "case": "wizard",
+        "ok": true,
+        "captured_at": "2026-09-15T19:08:07.566247+00:00",
+        "bn_version": "6.0.10601 Personal",
+        "edition": "User",
+        "modal": "FirstSetupDialog"
+      }
+    },
+    "no_wizard": {
+      "schema_version": 1,
+      "case": "no-wizard",
+      "captured_at": "2026-09-15T19:04:50.330419+00:00",
+      "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+      "probe_sha256": "143e3248f00c02293a8bff511b86493b3b4d71b1f59c4b9e3014b32fc27c7f7a",
+      "launcher_sha256": "832132672b11c25c789f4f7b0c0aca844a23ba220ce63a72a6e7653ae241bb7a",
+      "status": "passed",
+      "returncode": 0,
+      "forced": false,
+      "normal_exit": true,
+      "crash_reports": [],
+      "capture": {
+        "schema_version": 1,
+        "case": "no-wizard",
+        "ok": true,
+        "captured_at": "2026-09-15T19:04:53.533350+00:00",
+        "bn_version": "6.0.10601 Personal",
+        "edition": "User",
+        "modal": null,
+        "about_to_quit": true
+      }
+    },
+    "modal_guard": {
+      "schema_version": 1,
+      "case": "guard",
+      "captured_at": "2026-09-15T19:05:46.587502+00:00",
+      "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+      "probe_sha256": "143e3248f00c02293a8bff511b86493b3b4d71b1f59c4b9e3014b32fc27c7f7a",
+      "launcher_sha256": "832132672b11c25c789f4f7b0c0aca844a23ba220ce63a72a6e7653ae241bb7a",
+      "status": "passed",
+      "returncode": 0,
+      "forced": false,
+      "normal_exit": true,
+      "crash_reports": [],
+      "capture": {
+        "schema_version": 1,
+        "case": "guard",
+        "ok": true,
+        "captured_at": "2026-09-15T19:05:49.919547+00:00",
+        "bn_version": "6.0.10601 Personal",
+        "edition": "User",
+        "modal": null,
+        "guard_refused": true,
+        "about_to_quit": true
+      }
+    },
+    "active_export": {
+      "schema_version": 1,
+      "case": "quit",
+      "captured_at": "2026-09-15T19:13:54.845449+00:00",
+      "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+      "probe_sha256": "4178f664c08d2e130df38e313eda320c2c26774094eb8b62dd5cd02d17536e95",
+      "launcher_sha256": "994e5edd9d72766a6a29dce2744f50585341f58655d0ac01cc70dc95f0a59eb8",
+      "status": "passed",
+      "returncode": 0,
+      "forced": false,
+      "normal_exit": true,
+      "crash_reports": [],
+      "capture": {
+        "schema_version": 1,
+        "case": "quit",
+        "ok": true,
+        "captured_at": "2026-09-15T19:13:57.998909+00:00",
+        "bn_version": "6.0.10601 Personal",
+        "edition": "User",
+        "before_action": {
+          "comparison_id": "dedfc76bab994ecda06982d450606096",
+          "state": "running",
+          "active": true,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "exporting",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "8697fbaec3a04e9991ba31cf5da8f747",
+            "target": "fda68d0738454723a4bd04cb2fa9ffe5"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "8697fbaec3a04e9991ba31cf5da8f747",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "8697fbaec3a04e9991ba31cf5da8f747",
+                5368709120,
+                14926
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "fda68d0738454723a4bd04cb2fa9ffe5",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "fda68d0738454723a4bd04cb2fa9ffe5",
+                5368709120,
+                14979
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "active_resources_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "observed_stage": "exporting",
+        "about_to_quit": true,
+        "job_done": true,
+        "job_reason": "stale",
+        "resources_after": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": false,
+          "process_returncode": null,
+          "output_reader_alive": false
+        },
+        "listener_thread_alive": false
+      }
+    },
+    "active_matching": {
+      "schema_version": 1,
+      "case": "quit_matching",
+      "captured_at": "2026-09-15T19:14:39.508197+00:00",
+      "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+      "probe_sha256": "4178f664c08d2e130df38e313eda320c2c26774094eb8b62dd5cd02d17536e95",
+      "launcher_sha256": "994e5edd9d72766a6a29dce2744f50585341f58655d0ac01cc70dc95f0a59eb8",
+      "status": "passed",
+      "returncode": 0,
+      "forced": false,
+      "normal_exit": true,
+      "crash_reports": [],
+      "capture": {
+        "schema_version": 1,
+        "case": "quit_matching",
+        "ok": true,
+        "captured_at": "2026-09-15T19:14:42.870932+00:00",
+        "bn_version": "6.0.10601 Personal",
+        "edition": "User",
+        "before_action": {
+          "comparison_id": "d3222e1516634118954c2dcc94e36c91",
+          "state": "running",
+          "active": true,
+          "closing": false,
+          "progress": null,
+          "stop_reason": null,
+          "providers": [
+            "Google BinDiff"
+          ],
+          "backend": "external",
+          "stage": "matching",
+          "omitted_functions": {},
+          "binary_ids": {
+            "reference": "f0433d9fb5b7469fb8db259805c69c09",
+            "target": "aec5f085768e4939abc64adc71170834"
+          },
+          "snapshots": {
+            "reference": {
+              "file_sha256": "65a014d83be9d2262e913d020425dc9bf0a301b6403dffa13e6fe7ae5460a57b",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "f0433d9fb5b7469fb8db259805c69c09",
+              "display_name": "securekernel.exe",
+              "active": false,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 3350698326,
+                "size": 1245184,
+                "pdb": {
+                  "guid": "A10DC4DA2F667E4D5B50AA2DDBB5A323",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "f0433d9fb5b7469fb8db259805c69c09",
+                5368709120,
+                14938
+              ],
+              "modified": false
+            },
+            "target": {
+              "file_sha256": "9a2eeb0e4a3d76aa9a6bfaf287540f5f1f7562d814e8ecb3c3f6df6b57a557b6",
+              "hash_source": "original Raw view",
+              "image_name": "securekernel.exe",
+              "binary_id": "aec5f085768e4939abc64adc71170834",
+              "display_name": "securekernel.exe",
+              "active": true,
+              "architecture": "aarch64",
+              "analysis_state": "IdleState",
+              "image_base": "0x0000000140000000",
+              "identity": {
+                "timestamp": 1188430604,
+                "size": 1290240,
+                "pdb": {
+                  "guid": "0A49C8CF92C9F8EC65C6D61180FDAE51",
+                  "age": 1
+                }
+              },
+              "generation": [
+                "aec5f085768e4939abc64adc71170834",
+                5368709120,
+                15055
+              ],
+              "modified": false
+            }
+          },
+          "match_count": 0,
+          "coverage_complete": false,
+          "unresolved_results": 0,
+          "error": null
+        },
+        "active_resources_before": {
+          "export_thread_alive": true,
+          "temporary_directory_exists": true,
+          "process_created": true,
+          "process_returncode": null,
+          "output_reader_alive": true
+        },
+        "observed_stage": "matching",
+        "about_to_quit": true,
+        "job_done": true,
+        "job_reason": "stale",
+        "resources_after": {
+          "export_thread_alive": false,
+          "temporary_directory_exists": false,
+          "process_created": true,
+          "process_returncode": -15,
+          "output_reader_alive": false
+        },
+        "listener_thread_alive": false
+      }
+    },
+    "direct_qt_quit": {
+      "schema_version": 1,
+      "case": "qt-wizard",
+      "captured_at": "2026-09-15T19:18:05.191965+00:00",
+      "executable_sha256": "3f2da87b412d3a273da2866f8dfb6f6d3d90a5e35aff9f3ffd0905f201b09b10",
+      "probe_sha256": "826b2eb2e611c1a2462957336b4e2154290c1158eee71003e4023e2bf4155988",
+      "launcher_sha256": "88fcb2efd1eeedcf17c4d81c44c709354f23dfe8aace15a3f0d5d396f2f6cf3a",
+      "status": "failed",
+      "returncode": 0,
+      "forced": false,
+      "normal_exit": true,
+      "crash_reports": [],
+      "capture": {
+        "schema_version": 1,
+        "case": "qt-wizard",
+        "ok": false,
+        "captured_at": "2026-09-15T19:18:08.465981+00:00",
+        "bn_version": "6.0.10601 Personal",
+        "edition": "User",
+        "modal": "FirstSetupDialog",
+        "alive_after_qt_quit": true,
+        "about_to_quit": true
+      }
+    }
+  },
+  "item_64_closed": false,
+  "harness_failures": [
+    {
+      "case": "decode_first_attempt",
+      "error": "invalid standalone-platform name; corrected to Architecture.standalone_platform",
+      "normal_exit": true
+    },
+    {
+      "case": "active_export_first_attempt",
+      "error": "existing lifecycle probe expected a new output directory",
+      "returncode": -15,
+      "terminated_by_operator": true
+    },
+    {
+      "case": "active_export_second_attempt",
+      "error": "existing lifecycle probe does not implement Quit cases; added dedicated observer",
+      "normal_exit": true
+    }
+  ],
+  "limitations": [
+    "Normal profile and installed application were not modified.",
+    "Active-work jobs were invalidated by view closure during application Quit and report stop reason stale.",
+    "No upstream shutdown fix was available to validate."
+  ]
+}
