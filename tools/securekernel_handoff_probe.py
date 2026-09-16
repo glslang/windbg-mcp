@@ -1,6 +1,6 @@
 """Read-only handoff from an existing comparison to a paused Secure Kernel session.
 
-Requires the companion's Python 3.13 / mcp 2.1.1 environment for the CLI.
+Requires the companion's Python 3.13 / mcp 2.2.0 environment for the CLI.
 The capture core and its tests use only the standard library.
 """
 
@@ -24,22 +24,23 @@ def require(condition, message):
         raise Refused(message)
 
 
-def connection(path):
-    config = json.loads(Path(path).read_text(encoding="utf-8-sig"))
+def validate_connection(config):
+    """Require an authenticated HTTPS endpoint before constructing a bearer client."""
     url = urlsplit(config["url"])
     require(
-        url.scheme in ("http", "https")
+        url.scheme == "https"
         and url.hostname
-        and not any((url.username, url.password, url.query, url.fragment))
-        and (
-            url.scheme == "https" or url.hostname in ("localhost", "127.0.0.1", "::1")
-        ),
-        "connection requires loopback HTTP or HTTPS without URL credentials",
+        and not any((url.username, url.password, url.query, url.fragment)),
+        "connection requires HTTPS without URL credentials",
     )
     require(
         isinstance(config.get("token"), str) and config["token"], "missing bearer token"
     )
     return config
+
+
+def connection(path):
+    return validate_connection(json.loads(Path(path).read_text(encoding="utf-8-sig")))
 
 
 def identity_matches(left, right):
@@ -83,7 +84,11 @@ def session_row(data, session_id):
         state = state.get("state")
     require(state == "open" and row.get("live") is True, "session is not open")
     require(row.get("kind") == "kernel", "session is not a live remote kernel")
-    require(row.get("execution", {}).get("stopped", True), "target is running")
+    execution = row.get("execution")
+    require(
+        isinstance(execution, dict) and execution.get("stopped") is True,
+        "target is running or its execution state is unavailable",
+    )
     return row
 
 
@@ -441,6 +446,7 @@ async def capture(
 
 
 async def connected(stack, config):
+    validate_connection(config)
     import httpx2
     from mcp import Client
     from mcp.client.streamable_http import streamable_http_client

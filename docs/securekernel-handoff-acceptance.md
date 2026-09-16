@@ -25,9 +25,16 @@ Supply a result ID from that comparison. Keep other clients from operating on
 these inputs/session during the capture. The probe compares before/after state;
 it cannot detect another client briefly resuming and returning to the same state.
 
-Use the companion's Python 3.13 environment with `mcp==2.1.1`. Each private
-connection file contains `url` and `token`; HTTP must use loopback, and HTTPS
-verifies certificates. Redirects and environment proxies are disabled.
+Use the companion's Python 3.13 environment with `mcp==2.2.0`. Each private
+connection file contains `url` and `token`. Both endpoints must use HTTPS with
+certificate validation, including on loopback; place a trusted TLS proxy in front
+of HTTP-only listeners. Plain loopback HTTP cannot authenticate a listener before
+sending it the bearer token. The earlier discovery used a temporary SSH tunnel;
+it does not establish acceptance of this stricter connection policy.
+
+Use a trusted account and protect the connection files, certificate trust store,
+and any proxy or tunnel configuration from untrusted local users. Processes under
+the same account must also be trusted. Redirects and environment proxies are disabled.
 
 ```console
 python tools/securekernel_handoff_probe.py \
@@ -45,7 +52,8 @@ copied into the report, and connection exceptions record only their type.
 ## What is checked
 
 - Required input fields and structured outputs are discovered through `tools/list`.
-- The selected session is an open remote kernel, with no outstanding running job.
+- The selected session is an open remote kernel with explicit `execution.stopped: true`
+  evidence. Missing or unknown execution state is refused.
   `current_location` must succeed with a mapped Secure Kernel instruction pointer.
 - The match's target binary, generation, image identity and RVA are checked against
   the companion view. Modified input views, ambiguous/truncated module listings,

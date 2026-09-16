@@ -67,9 +67,14 @@ def main():
     print(f"Compared {len(words)} corpus entries; {len(differences)} changed")
     # A newly decoded CLRBHB may itself be present in a future corpus.
     unexpected = [r for r in differences if r["word"] != "0xd50322df"]
+    baseline = report["clrbhb"]["before"]
     fixed = report["clrbhb"]["after"]
     raise SystemExit(
-        1 if unexpected or fixed != {"decode": 0, "format": 0, "text": "clrbhb"} else 0
+        1
+        if unexpected
+        or baseline != {"decode": -9, "format": None, "text": ""}
+        or fixed != {"decode": 0, "format": 0, "text": "clrbhb"}
+        else 0
     )
 
 

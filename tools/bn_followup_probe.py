@@ -26,18 +26,34 @@ def outcome(returncode, forced, capture, crash_reports):
     }
 
 
+def signal_owned_group(process, sig):
+    """Signal descendants even when the session leader has already exited."""
+    try:
+        os.killpg(process.pid, sig)
+    except ProcessLookupError:
+        pass
+
+
+def cleanup_owned(process):
+    signal_owned_group(process, signal.SIGKILL)
+    process.wait(timeout=5)
+
+
 def wait_owned(process, timeout, *, clock=time.monotonic, sleep=time.sleep):
-    deadline = clock() + timeout
-    while process.poll() is None and clock() < deadline:
-        sleep(0.2)
-    forced = process.poll() is None
-    if forced:
-        os.killpg(process.pid, signal.SIGTERM)
-        try:
-            process.wait(timeout=5)
-        except subprocess.TimeoutExpired:
-            os.killpg(process.pid, signal.SIGKILL)
-    return process.wait(timeout=5), forced
+    try:
+        deadline = clock() + timeout
+        while process.poll() is None and clock() < deadline:
+            sleep(0.2)
+        forced = process.poll() is None
+        if forced:
+            signal_owned_group(process, signal.SIGTERM)
+            try:
+                process.wait(timeout=5)
+            except subprocess.TimeoutExpired:
+                signal_owned_group(process, signal.SIGKILL)
+        return process.wait(timeout=5), forced
+    finally:
+        cleanup_owned(process)
 
 
 def main():
@@ -155,15 +171,15 @@ def main():
                 stderr=subprocess.STDOUT,
                 start_new_session=True,
             )
-        report["pid"] = process.pid
-        (root / "launch.json").write_text(json.dumps(report, indent=2) + "\n")
-        print("Started owned Binary Ninja", args.case, "PID", process.pid, flush=True)
         try:
+            report["pid"] = process.pid
+            (root / "launch.json").write_text(json.dumps(report, indent=2) + "\n")
+            print(
+                "Started owned Binary Ninja", args.case, "PID", process.pid, flush=True
+            )
             returncode, forced = wait_owned(process, args.timeout)
         finally:
-            if process.poll() is None:
-                os.killpg(process.pid, signal.SIGKILL)
-                process.wait(timeout=5)
+            cleanup_owned(process)
         # Crash reports are asynchronous; also use the actual child status, never the launcher status.
         time.sleep(2)
         crashes = sorted(

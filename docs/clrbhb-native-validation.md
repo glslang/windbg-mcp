@@ -18,7 +18,7 @@ exited zero without forced termination or a crash report.
 
 The companion retains the complete compressed capture in
 `docs/samples/clrbhb-native-acceptance-20260915.json.gz`, alongside a readable summary
-and upstream PR draft. Its 197 Python tests pass, including ten new package tests;
+and upstream PR draft. At the initial capture, its 197 Python tests passed, including ten new package tests;
 the pinned stable C decoder regression passes CLRBHB, NOP and CSDB. The replacement
 supports **Binary Ninja 6.0.10601 / SDK ABI 187 on Apple Silicon macOS**. Other builds
 need their own compatibility pin and acceptance. The exporter fallback remains.
@@ -109,6 +109,9 @@ native decoding and analysis succeed, it runs a complete external comparison,
 pages all results and the eight affected diffs, and checks unchanged input state.
 On the tested build those prerequisites fail, so the new comparison is `not_run`.
 
-Closing 63 requires a supported upstream build that passes the real GUI decoder,
-function-analysis and comparison checks. A successful standalone decoder patch
-does not establish those results.
+At the initial stock-build checkpoint, closing 63 through the upstream path
+required a supported build that passed the real GUI decoder, function-analysis
+and comparison checks. A standalone decoder patch did not establish those results.
+The companion-maintained replacement above provides the current local closure;
+[companion PR #9](https://github.com/glslang/binja-windbg-mcp/pull/9) merged on
+2026-09-16 after 286 tests and its CI passed.
