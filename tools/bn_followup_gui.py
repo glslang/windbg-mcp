@@ -42,13 +42,17 @@ def decoded_clrbhb(row):
 def endpoint_analysis_complete(row):
     function = row.get("function", {})
     instructions = function.get("instructions", [])
+    address = int(row["address"], 16)
     return (
         function.get("found") is True
         and not function.get("instructions_truncated")
-        and any(
-            int(i["address"], 16) == int(row["address"], 16) + 4 for i in instructions
-        )
-        and bool(function.get("llil"))
+        and [(int(i["address"], 16), i["length"]) for i in instructions]
+        == [(address + offset, 4) for offset in (0, 4, 8)]
+        and [
+            [int(start, 16), int(end, 16)] for start, end in function.get("bounds", [])
+        ]
+        == [[address, address + 12]]
+        and any("SystemHintOp_CLRBHB" in i for i in (function.get("llil") or []))
     )
 
 
@@ -84,6 +88,48 @@ def function_evidence(view, address):
         if il is not None
         else None,
     }
+
+
+def endpoint_matches(matches):
+    expected = {
+        (0x10FC00 + offset, 0x11AC00 + offset) for offset in range(0, 0x400, 0x80)
+    }
+    targets = {target for _, target in expected}
+    selected = [
+        row for row in matches if int(row["target"]["coordinate"]["rva"], 16) in targets
+    ]
+    actual = {
+        (
+            int(row["reference"]["coordinate"]["rva"], 16),
+            int(row["target"]["coordinate"]["rva"], 16),
+        )
+        for row in selected
+    }
+    if len(selected) != len(expected) or actual != expected:
+        raise ValueError(
+            "comparison must contain each of the eight expected endpoint pairs once"
+        )
+    return selected
+
+
+def endpoint_diff_complete(diff, match):
+    items = diff.get("items", [])
+    if len(items) != 3 or diff.get("truncated") or diff.get("next_offset") is not None:
+        return False
+    for side in ("reference", "target"):
+        if diff.get("instructions_truncated", {}).get(side) is not False:
+            return False
+        base = int(match[side]["coordinate"]["rva"], 16)
+        for index, item in enumerate(items):
+            instruction = item.get(side)
+            if not instruction or instruction.get("text_truncated") is not False:
+                return False
+            if (
+                int(instruction["rva"], 16) != base + 4 * index
+                or not instruction.get("text", "").strip()
+            ):
+                return False
+    return True
 
 
 def compare_endpoints(workspace, config, report, save):
@@ -125,19 +171,18 @@ def compare_endpoints(workspace, config, report, save):
                 raise TimeoutError("comparison deadline exceeded")
             time.sleep(0.1)
         evidence["result"] = status
-        evidence["matches"] = helper.pages(workspace.similarity.results, comparison_id)
-        evidence["unmatched"] = {
+        matches = helper.pages(workspace.similarity.results, comparison_id)
+        unmatched = {
             side: helper.pages(
                 workspace.similarity.results, comparison_id, side=side, kind="unmatched"
             )
             for side in ("reference", "target")
         }
-        selected = [
-            row
-            for row in evidence["matches"]
-            if int(row["target"]["coordinate"]["rva"], 16)
-            in range(0x11AC00, 0x11B000, 0x80)
-        ]
+        evidence["retained_results"] = {
+            "matches": len(matches),
+            "unmatched": {side: len(rows) for side, rows in unmatched.items()},
+        }
+        selected = endpoint_matches(matches)
         evidence["diffs"] = []
         for match in selected:
             diff = workspace.similarity.diff(comparison_id, match["result_id"], limit=1)
@@ -168,8 +213,8 @@ def compare_endpoints(workspace, config, report, save):
         )
         evidence["inputs_unchanged"] = unchanged
         text_complete = len(selected) == 8 and all(
-            d["items"] and not any(d["instructions_truncated"].values())
-            for d in evidence["diffs"]
+            endpoint_diff_complete(diff, match)
+            for diff, match in zip(evidence["diffs"], selected)
         )
         evidence["status"] = (
             "passed"
@@ -208,8 +253,8 @@ def capture_decode(config, report, save):
     finally:
         synthetic.file.close()
     report["native_decode_passed"] = decoded_clrbhb(report["synthetic_instruction"])
-    report["synthetic_analysis_passed"] = (
-        len(report["synthetic_function"].get("instructions", [])) == 3
+    report["synthetic_analysis_passed"] = endpoint_analysis_complete(
+        {"address": "0x0", "function": report["synthetic_function"]}
     )
     save()
     report["endpoints"] = []

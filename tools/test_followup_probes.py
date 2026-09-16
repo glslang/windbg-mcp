@@ -2,14 +2,19 @@
 
 import copy
 import json
+import importlib.util
+import struct
+import subprocess
+import sys
 import tempfile
 import unittest
 from pathlib import Path
 from types import SimpleNamespace
-from unittest.mock import Mock, patch
+from unittest.mock import Mock, call, patch
 
 import bn_followup_gui as gui
 import bn_followup_probe as launcher
+import clrbhb_decoder_compare as decoder
 import securekernel_handoff_probe as handoff
 
 IDENTITY = {"timestamp": 2, "size": 0x200000}
@@ -34,6 +39,7 @@ SESSION = {
     "state": {"state": "open"},
     "live": True,
     "engine_pid": 10,
+    "execution": {"stopped": True},
 }
 LOCATION = {
     "status": "ok",
@@ -189,6 +195,35 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertFalse(any(n == "read_memory" for n, _ in remote.calls))
 
+    async def test_unknown_execution_state_refused_before_read(self):
+        for execution in (
+            None,
+            {},
+            {"stopped": None},
+            {"stopped": 1},
+            {"stopped": "true"},
+        ):
+            with self.subTest(execution=execution):
+                remote = Client("remote")
+                remote.overrides["session_status"] = change(
+                    sessions=[{**SESSION, "execution": execution}]
+                )
+                result = await self.run_capture(remote)
+                self.assertEqual(result["status"], "failed")
+                self.assertFalse(any(n == "read_memory" for n, _ in remote.calls))
+        remote = Client("remote")
+        remote.overrides["session_status"] = change(
+            sessions=[{k: v for k, v in SESSION.items() if k != "execution"}]
+        )
+        self.assertEqual((await self.run_capture(remote))["status"], "failed")
+        self.assertFalse(any(n == "read_memory" for n, _ in remote.calls))
+
+    async def test_connected_revalidates_transport_before_client_creation(self):
+        with self.assertRaises(handoff.Refused):
+            await handoff.connected(
+                None, {"url": "http://localhost/mcp", "token": "secret"}
+            )
+
     async def test_dump_or_non_secure_context_rejected(self):
         for case in ("dump", "nt"):
             with self.subTest(case=case):
@@ -342,6 +377,9 @@ class HelpersTests(unittest.TestCase):
             path = Path(directory) / "connection.json"
             for url in (
                 "http://example.org/mcp",
+                "http://localhost/mcp",
+                "http://127.0.0.1/mcp",
+                "http://[::1]/mcp",
                 "https://user:secret@example.org/mcp",
                 "https://example.org/mcp?token=secret",
                 "ftp://localhost/mcp",
@@ -368,22 +406,55 @@ class HelpersTests(unittest.TestCase):
         ):
             self.assertFalse(gui.decoded_clrbhb({**row, field: value}))
 
-    def test_endpoint_analysis_requires_fallthrough_instruction(self):
-        row = {
-            "address": "0x1000",
-            "function": {
-                "found": True,
-                "instructions": [{"address": "0x1000"}],
-                "instructions_truncated": False,
-                "llil": ["undefined"],
-            },
+    def test_endpoint_analysis_requires_complete_function_and_clrbhb_lift(self):
+        good = function_row()
+        self.assertTrue(gui.endpoint_analysis_complete(good))
+        for field, value in (
+            ("llil", ["undefined", "SystemHintOp_ISB()", "jump"]),
+            ("llil", None),
+            ("instructions", good["function"]["instructions"][:2]),
+            ("bounds", [["0x1000", "0x1008"]]),
+            ("instructions_truncated", True),
+            ("found", False),
+        ):
+            with self.subTest(field=field, value=value):
+                row = copy.deepcopy(good)
+                row["function"][field] = value
+                self.assertFalse(gui.endpoint_analysis_complete(row))
+
+    def test_synthetic_capture_requires_clrbhb_lift(self):
+        # Drive the production call site: complete text with undefined CLRBHB IL.
+        synthetic = Mock()
+        bn = SimpleNamespace(
+            Architecture={"aarch64": Mock()},
+            BinaryView=SimpleNamespace(new=Mock(return_value=synthetic)),
+        )
+        modules = {
+            "binaryninja": bn,
+            "binaryninjaui": SimpleNamespace(UIContext=Mock()),
+            "binja_windbg_mcp": SimpleNamespace(),
+            "binja_windbg_mcp.adapter": SimpleNamespace(
+                Workspace=Mock(), main_thread=Mock()
+            ),
+            "binja_windbg_mcp.similarity_adapter": SimpleNamespace(
+                NativeSimilarity=Mock()
+            ),
         }
-        self.assertFalse(gui.endpoint_analysis_complete(row))
-        row["function"]["instructions"].append({"address": "0x1004"})
-        row["function"]["llil"] = ["SystemHintOp_CLRBHB()", "return"]
-        self.assertTrue(gui.endpoint_analysis_complete(row))
-        row["function"]["instructions_truncated"] = True
-        self.assertFalse(gui.endpoint_analysis_complete(row))
+        for llil, expected in (
+            (["undefined", "add", "ret"], False),
+            (["SystemHintOp_CLRBHB()", "add", "ret"], True),
+        ):
+            function = function_row(0)["function"]
+            function["llil"] = llil
+            report = {}
+            with (
+                patch.dict(sys.modules, modules),
+                patch.object(gui, "decode_instruction"),
+                patch.object(gui, "decoded_clrbhb", return_value=True),
+                patch.object(gui, "function_evidence", return_value=function),
+            ):
+                gui.capture_decode({}, report, lambda: None)
+            self.assertEqual(report["synthetic_analysis_passed"], expected)
 
     def test_exit_alone_does_not_pass_capture(self):
         for rc, forced, capture, crashes in (
@@ -407,7 +478,238 @@ class HelpersTests(unittest.TestCase):
             rc, forced = launcher.wait_owned(process, 1, clock=Mock(side_effect=[0, 2]))
         self.assertTrue(forced)
         self.assertEqual(rc, -15)
-        kill.assert_called_once_with(123, launcher.signal.SIGTERM)
+        self.assertEqual(
+            kill.call_args_list,
+            [call(123, launcher.signal.SIGTERM), call(123, launcher.signal.SIGKILL)],
+        )
+
+    def test_cleanup_signals_group_after_leader_exits(self):
+        process = Mock(pid=123)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(launcher.os, "killpg") as kill:
+            self.assertEqual(launcher.wait_owned(process, 1), (0, False))
+        kill.assert_called_once_with(123, launcher.signal.SIGKILL)
+
+    def test_cleanup_runs_on_wait_exception(self):
+        process = Mock(pid=123)
+        process.poll.side_effect = RuntimeError("poll failed")
+        with patch.object(launcher.os, "killpg") as kill:
+            with self.assertRaisesRegex(RuntimeError, "poll failed"):
+                launcher.wait_owned(process, 1)
+        kill.assert_called_once_with(123, launcher.signal.SIGKILL)
+
+    def test_cleanup_tolerates_already_absent_group(self):
+        process = Mock(pid=123)
+        with patch.object(launcher.os, "killpg", side_effect=ProcessLookupError):
+            launcher.cleanup_owned(process)
+        process.wait.assert_called_once_with(timeout=5)
+
+    def test_timeout_escalates_when_group_ignores_term(self):
+        process = Mock(pid=123)
+        process.poll.return_value = None
+        process.wait.side_effect = [subprocess.TimeoutExpired("gui", 5), -9, -9]
+        with patch.object(launcher.os, "killpg") as kill:
+            self.assertEqual(
+                launcher.wait_owned(process, 1, clock=Mock(side_effect=[0, 2])),
+                (-9, True),
+            )
+        self.assertEqual(kill.call_args_list[0], call(123, launcher.signal.SIGTERM))
+        self.assertIn(call(123, launcher.signal.SIGKILL), kill.call_args_list)
+
+
+def function_row(address=0x1000):
+    return {
+        "address": hex(address),
+        "function": {
+            "found": True,
+            "instructions": [
+                {"address": hex(address + offset), "length": 4} for offset in (0, 4, 8)
+            ],
+            "instructions_truncated": False,
+            "bounds": [[hex(address), hex(address + 12)]],
+            "llil": ["SystemHintOp_CLRBHB()", "SystemHintOp_ISB()", "jump"],
+        },
+    }
+
+
+class DecoderTests(unittest.TestCase):
+    def test_cli_requires_baseline_failure_fixed_decode_and_unchanged_controls(self):
+        bad = {"decode": -9, "format": None, "text": ""}
+        good = {"decode": 0, "format": 0, "text": "clrbhb"}
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            before, after, corpus, output = [
+                root / n for n in ("before", "after", "corpus", "output")
+            ]
+            before.write_bytes(b"before")
+            after.write_bytes(b"after")
+            corpus.write_text("D503201F nop\n")
+            args = [
+                "compare",
+                "--before",
+                str(before),
+                "--after",
+                str(after),
+                "--corpus",
+                str(corpus),
+                "--output",
+                str(output),
+            ]
+            for baseline, fixed, changed, expected in (
+                (bad, good, False, 0),
+                (good, good, False, 1),
+                (bad, bad, False, 1),
+                (bad, good, True, 1),
+            ):
+
+                def decode(lib, word):
+                    if word == 0xD50322DF:
+                        return baseline if lib == before else fixed
+                    return {
+                        "text": "nop" if lib == before or not changed else "changed"
+                    }
+
+                with (
+                    patch.object(sys, "argv", args),
+                    patch.object(decoder, "library", side_effect=lambda p: p),
+                    patch.object(decoder, "decode", side_effect=decode),
+                    patch("builtins.print"),
+                    self.assertRaises(SystemExit) as result,
+                ):
+                    decoder.main()
+                self.assertEqual(result.exception.code, expected)
+
+
+class ComparisonTests(unittest.TestCase):
+    def test_comparison_retains_counts_and_requires_paired_complete_diffs(self):
+        matches = [
+            {
+                "result_id": str(i),
+                "reference": {"coordinate": {"rva": hex(0x10FC00 + i * 0x80)}},
+                "target": {"coordinate": {"rva": hex(0x11AC00 + i * 0x80)}},
+            }
+            for i in range(8)
+        ]
+        for failure in (
+            None,
+            "wrong_pair",
+            "duplicate",
+            "short_diff",
+            "truncated_text",
+        ):
+            rows = copy.deepcopy(matches)
+            if failure == "wrong_pair":
+                rows[0]["reference"] = copy.deepcopy(rows[1]["reference"])
+            if failure == "duplicate":
+                rows[1] = copy.deepcopy(rows[0])
+
+            def diff_items(result_id):
+                match = matches[int(result_id)]
+                items = [
+                    {
+                        side: {
+                            "rva": hex(
+                                int(match[side]["coordinate"]["rva"], 16) + offset
+                            ),
+                            "text": "instruction",
+                            "text_truncated": failure == "truncated_text",
+                        }
+                        for side in ("reference", "target")
+                    }
+                    for offset in (0, 4, 8)
+                ]
+                return items[:2] if failure == "short_diff" else items
+
+            workspace = Mock()
+            workspace.similarity.backend.backends = {"external": Mock()}
+            binaries = [{"binary_id": "reference"}, {"binary_id": "target"}]
+            workspace.list_binaries.return_value = {"binaries": binaries}
+            workspace.acquire.side_effect = lambda key: (
+                None,
+                SimpleNamespace(file=SimpleNamespace(original_filename="/" + key)),
+                None,
+                None,
+            )
+            workspace.similarity.start.return_value = {"comparison_id": "comparison"}
+            workspace.similarity.status.return_value = {"active": False}
+            workspace.similarity.diff.side_effect = lambda *a, **kw: {
+                "instructions_truncated": {"reference": False, "target": False}
+            }
+
+            def pages(method, *args, **kwargs):
+                if method == workspace.similarity.diff:
+                    return diff_items(args[1])
+                return rows if not kwargs else [None, None]
+
+            helper = SimpleNamespace(
+                state=lambda *a: {}, pages=pages, full_acceptance=lambda *a: True
+            )
+            report = {}
+            with (
+                patch.object(gui.importlib.util, "spec_from_file_location") as spec,
+                patch.object(
+                    gui.importlib.util, "module_from_spec", return_value=helper
+                ),
+            ):
+                spec.return_value.loader.exec_module.return_value = None
+                ok = gui.compare_endpoints(
+                    workspace,
+                    {
+                        "bindiff": "/bindiff",
+                        "reference": "/reference",
+                        "target": "/target",
+                    },
+                    report,
+                    lambda: None,
+                )
+            self.assertEqual(ok, failure is None, (failure, report))
+            evidence = report["comparison"]
+            self.assertEqual(
+                evidence["retained_results"],
+                {"matches": 8, "unmatched": {"reference": 2, "target": 2}},
+            )
+            self.assertNotIn("matches", evidence)
+            self.assertNotIn("unmatched", evidence)
+            workspace.similarity.close.assert_called_once_with("comparison")
+
+
+class ObjectAliasTests(unittest.TestCase):
+    def test_output_argument_and_intervening_instructions_are_checked(self):
+        path = (
+            Path(__file__).resolve().parents[1]
+            / "docs/samples/cve-2026-83498-stale-pointer-check.py"
+        )
+        spec = importlib.util.spec_from_file_location("stale_pointer", path)
+        checker = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(checker)
+        for side, call_rva, target in (
+            ("reference", 0x9A4A4, 0xC92D8),
+            ("target", 0x9A4B4, 0xC93A0),
+        ):
+            raw = bytearray.fromhex("e3830091020080d200008052")
+            raw += struct.pack("<I", 0x94000000 | ((target - call_rva) // 4))
+            raw += bytes.fromhex("f31340f9")
+
+            def image(data):
+                return {
+                    "data": data,
+                    "sections": [
+                        {
+                            "rva": call_rva - 12,
+                            "raw_offset": 0,
+                            "raw_size": 20,
+                            "virtual_size": 20,
+                        }
+                    ],
+                }
+
+            checker.object_alias(image(raw), side, call_rva)
+            for offset in (0, 4, 8):
+                changed = bytearray(raw)
+                changed[offset : offset + 4] = bytes.fromhex("1f2003d5")
+                with self.assertRaises(ValueError):
+                    checker.object_alias(image(changed), side, call_rva)
 
 
 if __name__ == "__main__":
