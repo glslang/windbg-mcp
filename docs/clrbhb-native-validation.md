@@ -67,7 +67,9 @@ successful native instruction decoding bypasses the fallback.
 
 The [corpus comparison tool](../tools/clrbhb_decoder_compare.py) compares return
 codes and text from independently built baseline/patched decoder libraries.
-All **42,639** existing corpus entries produce unchanged results. CLRBHB, tested
+The tool requires the pinned corpus SHA-256 and **42,639** entries before loading
+either decoder; empty, truncated or substituted corpora fail. All recorded corpus
+entries produce unchanged results. CLRBHB, tested
 separately, changes from decode failure to successful `clrbhb` text.
 
 The upstream `disasm_test.py` suite is **not green** on either source tree: both
@@ -107,6 +109,9 @@ probe is hash-gated to the recorded ARM64 pair. It records native instruction
 information, synthetic/real function analysis, and provider availability. If
 native decoding and analysis succeed, it runs a complete external comparison,
 pages all results and the eight affected diffs, and checks unchanged input state.
+Diff acceptance requires `CLRBHB; ISB; B` and each recorded branch destination.
+These hash-pinned PE fixtures use their preferred image base `0x140000000`; each
+endpoint branches to its handler at the endpoint RVA plus `0x5000`.
 On the tested build those prerequisites fail, so the new comparison is `not_run`.
 
 At the initial stock-build checkpoint, closing 63 through the upstream path

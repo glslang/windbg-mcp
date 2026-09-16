@@ -7,6 +7,11 @@ import json
 from pathlib import Path
 
 
+# Corpus from upstream revision 905a5a98d769bb832ba85674b004fec7ac5a224e.
+CORPUS_COUNT = 42639
+CORPUS_SHA256 = "54b25d800c93d01e895b99ba48034e3bdc7e393104f63590b644387336a71b7f"
+
+
 def library(path):
     result = ctypes.CDLL(str(path.resolve()))
     result.aarch64_decompose.argtypes = [
@@ -40,12 +45,18 @@ def main():
     for name in ("before", "after", "corpus", "output"):
         parser.add_argument("--" + name, type=Path, required=True)
     args = parser.parse_args()
-    before, after = library(args.before), library(args.after)
+    corpus = args.corpus.read_bytes()
+    corpus_sha256 = hashlib.sha256(corpus).hexdigest()
+    if corpus_sha256 != CORPUS_SHA256:
+        raise SystemExit("corpus SHA-256 does not match the pinned upstream corpus")
     words = [
         int(line[:8], 16)
-        for line in args.corpus.read_text().splitlines()
+        for line in corpus.decode("utf-8").splitlines()
         if line and not line.startswith("//")
     ]
+    if len(words) != CORPUS_COUNT:
+        raise SystemExit("corpus count does not match the pinned upstream corpus")
+    before, after = library(args.before), library(args.after)
     differences = []
     for word in words:
         old, new = decode(before, word), decode(after, word)
@@ -54,7 +65,7 @@ def main():
     report = {
         "schema_version": 1,
         "corpus_count": len(words),
-        "corpus_sha256": hashlib.sha256(args.corpus.read_bytes()).hexdigest(),
+        "corpus_sha256": corpus_sha256,
         "before_sha256": hashlib.sha256(args.before.read_bytes()).hexdigest(),
         "after_sha256": hashlib.sha256(args.after.read_bytes()).hexdigest(),
         "changed": differences,
