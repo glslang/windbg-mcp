@@ -597,6 +597,12 @@ class ComparisonTests(unittest.TestCase):
             "duplicate",
             "short_diff",
             "truncated_text",
+            "wrong_clrbhb_reference",
+            "wrong_clrbhb_target",
+            "wrong_isb",
+            "wrong_branch",
+            "clrbhb_operand",
+            "missing_branch_operand",
         ):
             rows = copy.deepcopy(matches)
             if failure == "wrong_pair":
@@ -612,13 +618,24 @@ class ComparisonTests(unittest.TestCase):
                             "rva": hex(
                                 int(match[side]["coordinate"]["rva"], 16) + offset
                             ),
-                            "text": "instruction",
+                            "text": ("clrbhb", "isb", "b 0x140114c00")[offset // 4],
                             "text_truncated": failure == "truncated_text",
                         }
                         for side in ("reference", "target")
                     }
                     for offset in (0, 4, 8)
                 ]
+                wrong_text = {
+                    "wrong_clrbhb_reference": (0, "reference", "hint #22"),
+                    "wrong_clrbhb_target": (0, "target", "undefined"),
+                    "wrong_isb": (1, "target", "nop"),
+                    "wrong_branch": (2, "reference", "ret"),
+                    "clrbhb_operand": (0, "target", "clrbhb x0"),
+                    "missing_branch_operand": (2, "target", "b"),
+                }
+                if failure in wrong_text:
+                    index, side, text = wrong_text[failure]
+                    items[index][side]["text"] = text
                 return items[:2] if failure == "short_diff" else items
 
             workspace = Mock()

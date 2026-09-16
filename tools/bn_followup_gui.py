@@ -124,10 +124,16 @@ def endpoint_diff_complete(diff, match):
             instruction = item.get(side)
             if not instruction or instruction.get("text_truncated") is not False:
                 return False
-            if (
-                int(instruction["rva"], 16) != base + 4 * index
-                or not instruction.get("text", "").strip()
-            ):
+            text = instruction.get("text", "").strip().casefold().split()
+            if int(instruction["rva"], 16) != base + 4 * index or not text:
+                return False
+            if text[0] != ("clrbhb", "isb", "b")[index]:
+                return False
+            if index == 0 and text != ["clrbhb"]:
+                return False
+            if index == 1 and text not in (["isb"], ["isb", "sy"], ["isb", "#0xf"]):
+                return False
+            if index == 2 and len(text) != 2:
                 return False
     return True
 
