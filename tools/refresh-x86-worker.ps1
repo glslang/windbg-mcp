@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Build the 32-bit worker, put it where the supervisor looks, and refuse a stale one.
+    Build the 32-bit worker, put it where the supervisor looks, and refuse one the tier cannot use.
 
 .DESCRIPTION
     The 32-bit managed-target tier needs `x86\windbg-mcp.exe` beside a 32-bit engine, and
@@ -12,37 +12,41 @@
     be current for it to mean anything - and on a fresh tree there is no supervisor at all, `target`
     being ignored.
 
-    The check is the reason this exists rather than a note in a rule: `build.rs` watches `.git\HEAD`
-    and the branch ref, so a `git commit` re-stamps the supervisor from `<commit>-dirty.<digest>` to
-    a clean `<commit>` while a worker built minutes earlier keeps the old one. The tier then fails
-    saying this host could not give the target a 32-bit worker, which reads as a missing file rather
-    than a stale one.
+    **What "usable" means is two conditions, and they are answered in one place**
+    (`Get-WorkerFaults`), because answering whichever one is in front of you is how this file drew
+    three rounds of review:
 
-    A mismatch is not a runtime hazard: the supervisor turns the worker away and the session falls
-    back to the 64-bit build. Only the tier fails.
+    - The worker's stamp matches the supervisor's. `build.rs` watches `.git\HEAD` and the branch
+      ref, so a `git commit` re-stamps the supervisor from `<commit>-dirty.<digest>` to a clean
+      `<commit>` while a worker built minutes earlier keeps the old one. The supervisor then turns
+      the worker away and the tier fails saying this host could not give the target a 32-bit
+      worker, which reads as a missing file rather than a stale one.
+    - A 32-bit `dbgeng.dll` sits beside the worker. `engine::x86_worker_image` probes for it and
+      returns nothing without it, so the worker is never spawned - and `x86_engine_tier` *skips*
+      in that state rather than failing, reporting `test result: ok. 2 passed` with both tests
+      stood down. Nothing downstream would contradict a success reported here.
 
-    A 32-bit worker with no 32-bit `dbgeng.dll` beside it **is** treated as a failure. The
-    supervisor probes for both before spawning, so a worker without the engine is never used - and
-    the tier stands down rather than failing in that state, so nothing else would say so.
+    Neither is a runtime hazard: the supervisor falls back to the 64-bit build. Only the tier
+    is affected, and in the second case only by quietly covering less than it appears to.
 
 .PARAMETER Profile
     Which profile to refresh, `debug` (the default, what `cargo test` runs) or `release`.
 
 .PARAMETER Check
-    Report whether the worker matches the supervisor and exit; build and copy nothing.
-    Exit code 0 means they agree, 1 means they do not or either binary is absent.
+    Report whether the tier has a worker it can use, and exit; build and copy nothing.
+    Exit code 0 means yes, 1 means no, on exactly the conditions the build path enforces.
 
 .PARAMETER SkipEngine
-    Do not copy engine DLLs. The 32-bit engine must still be present for this to succeed: the
-    switch says where the engine comes from, not whether the worker needs one.
+    Do not copy engine DLLs. An engine must still be present for this to succeed: the switch says
+    where the engine comes from, not whether the worker needs one.
 
 .EXAMPLE
     .\tools\refresh-x86-worker.ps1
-    Build both binaries, place the worker, and confirm the stamps agree.
+    Build both binaries, place the worker, and confirm the tier can use it.
 
 .EXAMPLE
     .\tools\refresh-x86-worker.ps1 -Check
-    Ask whether the tier would fail on a stale worker, without building anything.
+    Ask whether the tier would run for real, without building anything.
 
 .NOTES
     Windows PowerShell 5.1 clean, and deliberately ASCII only: 5.1 decodes a BOM-less UTF-8 file
@@ -69,6 +73,7 @@ $manifest = Join-Path $root 'Cargo.toml'
 $hostExe = Join-Path (Join-Path $root 'target') (Join-Path $Profile 'windbg-mcp.exe')
 $workerDir = Join-Path (Join-Path $root 'target') (Join-Path $Profile 'x86')
 $workerExe = Join-Path $workerDir 'windbg-mcp.exe'
+$workerEngine = Join-Path $workerDir 'dbgeng.dll'
 $builtExe = Join-Path (Join-Path $root 'target') (Join-Path $Triple (Join-Path $Profile 'windbg-mcp.exe'))
 
 # The 64-bit payload this bench keeps beside the release build, and the 32-bit one inside its
@@ -88,57 +93,102 @@ function Get-Stamp {
     return (Get-Item -LiteralPath $Path).VersionInfo.ProductVersion
 }
 
-function Show-Stamps {
+# Everything that makes the 32-bit tier unable to use this worker, in one place and phrased for
+# whoever reads it. One function rather than a check on each path, because the two conditions are
+# independent and every path has to answer both: two review rounds on this file were each one
+# condition enforced where the author was looking and not where the caller was.
+function Get-WorkerFaults {
     param([string] $HostStamp, [string] $WorkerStamp)
 
-    Write-Host ("  supervisor : {0}" -f $HostStamp)
+    $faults = @()
+
+    if ($null -eq $HostStamp) {
+        $faults += ("There is no supervisor at {0}." -f $hostExe)
+    }
+    elseif ($null -eq $WorkerStamp) {
+        $faults += ("There is no worker at {0}." -f $workerExe)
+    }
+    elseif ($WorkerStamp -ne $HostStamp) {
+        $faults += (
+            "The worker's stamp is {0} and the supervisor's is {1}, so the supervisor will turn " +
+            "it away and fall back to the 64-bit build." -f $WorkerStamp, $HostStamp)
+    }
+
+    if (-not (Test-Path -LiteralPath $workerEngine)) {
+        $faults += (
+            ("There is no 32-bit engine at {0}. The supervisor probes for it before spawning a " +
+             "32-bit worker and falls back without one, and the tier stands down rather than " +
+             "failing in that state - it reports two passing tests having run neither. The copy " +
+             "block is in skills\windbg-debugging\setup.md.") -f $workerEngine)
+    }
+
+    # `return ,` so an empty array survives: the pipeline unrolls a bare empty array into nothing,
+    # the caller gets $null, and every `.Count` on it fails under Set-StrictMode.
+    # See .claude\rules\powershell-scripts.md.
+    return , $faults
+}
+
+function Show-Outcome {
+    param([string] $HostStamp, [string] $WorkerStamp)
+
+    Write-Host ("{0} profile:" -f $Profile)
+    if ($null -eq $HostStamp) {
+        Write-Host ("  supervisor : (absent, at {0})" -f $hostExe)
+    }
+    else {
+        Write-Host ("  supervisor : {0}" -f $HostStamp)
+    }
     if ($null -eq $WorkerStamp) {
-        Write-Host "  worker     : (absent)"
+        Write-Host ("  worker     : (absent, at {0})" -f $workerExe)
     }
     else {
         Write-Host ("  worker     : {0}" -f $WorkerStamp)
     }
+    if (Test-Path -LiteralPath $workerEngine) {
+        Write-Host "  engine     : present"
+    }
+    else {
+        Write-Host "  engine     : (absent)"
+    }
+
+    $faults = Get-WorkerFaults -HostStamp $HostStamp -WorkerStamp $WorkerStamp
+    if ($faults.Count -eq 0) {
+        Write-Host "The 32-bit tier has a worker it can use." -ForegroundColor Green
+        return $true
+    }
+    foreach ($fault in $faults) {
+        Write-Host ""
+        Write-Host $fault -ForegroundColor Yellow
+    }
+    return $false
 }
 
 function Copy-Engine {
-    param([string] $From, [string] $To, [string] $What, [switch] $Required)
+    param([string] $From, [string] $To, [string] $What)
 
-    $destination = Join-Path $To 'dbgeng.dll'
-    $present = Test-Path -LiteralPath $destination
-
-    if (-not $present -and -not $SkipEngine -and (Test-Path -LiteralPath (Join-Path $From 'dbgeng.dll'))) {
-        Write-Host ("  {0}: copying the engine from {1}" -f $What, $From)
-        # The payload is the DLLs plus the extension directories; `windbg-mcp.exe` is excluded
-        # because this script writes it itself, and a `.stale` left by a release rebuild must not
-        # be dragged along. `sym` is a symbol cache rather than part of the engine.
-        Get-ChildItem -LiteralPath $From -Filter '*.dll' | ForEach-Object {
-            Copy-Item -LiteralPath $_.FullName -Destination $To -Force
-        }
-        foreach ($directory in @('winext', 'winxp', 'triage', 'ttd')) {
-            $source = Join-Path $From $directory
-            if (Test-Path -LiteralPath $source) {
-                Copy-Item -LiteralPath $source -Destination $To -Recurse -Force
-            }
-        }
-        $present = Test-Path -LiteralPath $destination
+    if ($SkipEngine) {
+        return
+    }
+    if (Test-Path -LiteralPath (Join-Path $To 'dbgeng.dll')) {
+        return
+    }
+    if (-not (Test-Path -LiteralPath (Join-Path $From 'dbgeng.dll'))) {
+        Write-Host ("  {0}: no engine at {1} to copy" -f $What, $From)
+        return
     }
 
-    # Required only of the 32-bit engine. The 64-bit half legitimately falls back to the one in
-    # System32 for basic live and crash-dump work; the 32-bit half has no such fallback, because
-    # `engine::x86_worker_image` probes for `dbgeng.dll` beside the worker and returns nothing
-    # without it. A worker placed into that state is never spawned, and `x86_engine_tier` *skips*
-    # rather than failing, so exiting 0 here would report a capability nothing has.
-    if ($Required -and -not $present) {
-        Write-Host ""
-        Write-Host ("No 32-bit engine at {0}." -f $destination) -ForegroundColor Red
-        if (-not (Test-Path -LiteralPath (Join-Path $From 'dbgeng.dll'))) {
-            Write-Host ("There is none to copy from {0} either." -f $From)
+    Write-Host ("  {0}: copying the engine from {1}" -f $What, $From)
+    # The payload is the DLLs plus the extension directories; `windbg-mcp.exe` is excluded because
+    # this script writes it itself, and a `.stale` left by a release rebuild must not be dragged
+    # along. `sym` is a symbol cache rather than part of the engine.
+    Get-ChildItem -LiteralPath $From -Filter '*.dll' | ForEach-Object {
+        Copy-Item -LiteralPath $_.FullName -Destination $To -Force
+    }
+    foreach ($directory in @('winext', 'winxp', 'triage', 'ttd')) {
+        $source = Join-Path $From $directory
+        if (Test-Path -LiteralPath $source) {
+            Copy-Item -LiteralPath $source -Destination $To -Recurse -Force
         }
-        Write-Host "The supervisor probes for it before spawning a 32-bit worker and falls back to"
-        Write-Host "the 64-bit build without one, so the worker built here would never be used - and"
-        Write-Host "the 32-bit tier stands down rather than failing, so nothing else would say so."
-        Write-Host "The copy block is in skills\windbg-debugging\setup.md."
-        exit 1
     }
 }
 
@@ -153,20 +203,11 @@ function Invoke-Cargo {
 }
 
 if ($Check) {
-    $hostStamp = Get-Stamp -Path $hostExe
-    $workerStamp = Get-Stamp -Path $workerExe
-    Write-Host ("{0} profile:" -f $Profile)
-    if ($null -eq $hostStamp) {
-        Write-Host ("  supervisor : (absent, at {0})" -f $hostExe)
-    }
-    else {
-        Show-Stamps -HostStamp $hostStamp -WorkerStamp $workerStamp
-    }
-    if ($null -ne $hostStamp -and $workerStamp -eq $hostStamp) {
-        Write-Host "The worker matches; the 32-bit tier has a worker to use." -ForegroundColor Green
+    if (Show-Outcome -HostStamp (Get-Stamp -Path $hostExe) -WorkerStamp (Get-Stamp -Path $workerExe)) {
         exit 0
     }
-    Write-Host "Stale, or not built yet. Re-run this script without -Check." -ForegroundColor Yellow
+    Write-Host ""
+    Write-Host ("Re-run this script without -Check to fix what it can: .\tools\refresh-x86-worker.ps1 -Profile {0}" -f $Profile)
     exit 1
 }
 
@@ -207,12 +248,6 @@ if (-not (Invoke-Cargo -CargoArguments $hostArguments -What ("Building the super
     }
 }
 
-$hostStamp = Get-Stamp -Path $hostExe
-if ($null -eq $hostStamp) {
-    Write-Host ("The build reported success but produced no {0}." -f $hostExe) -ForegroundColor Red
-    exit 1
-}
-
 if (-not (Invoke-Cargo -CargoArguments $workerArguments -What ("Building the 32-bit worker ({0}, {1})" -f $Triple, $Profile))) {
     Write-Host "The 32-bit build failed; nothing was copied." -ForegroundColor Red
     exit 1
@@ -229,26 +264,22 @@ if (-not (Test-Path -LiteralPath $workerDir)) {
 if ($Profile -ne 'release') {
     Copy-Engine -From $engineSource -To (Split-Path -Parent $hostExe) -What '64-bit'
 }
-Copy-Engine -From $engineSourceX86 -To $workerDir -What '32-bit' -Required
+Copy-Engine -From $engineSourceX86 -To $workerDir -What '32-bit'
 
 Copy-Item -LiteralPath $builtExe -Destination $workerExe -Force
 
+$hostStamp = Get-Stamp -Path $hostExe
 $workerStamp = Get-Stamp -Path $workerExe
-Write-Host ("{0} profile:" -f $Profile)
-Show-Stamps -HostStamp $hostStamp -WorkerStamp $workerStamp
+if (Show-Outcome -HostStamp $hostStamp -WorkerStamp $workerStamp) {
+    exit 0
+}
 
-if ($workerStamp -ne $hostStamp) {
+if ($null -ne $hostStamp -and $null -ne $workerStamp -and $hostStamp -ne $workerStamp) {
     Write-Host ""
-    Write-Host "The worker still does not match the supervisor." -ForegroundColor Yellow
-    Write-Host "Both were just built, so the likely cause is that one of them declined to build:"
+    Write-Host "Both were just built, so a stamp mismatch here means one of them declined to build:"
     Write-Host "cargo's freshness is mtime-based, and a git checkout or reset --hard can rewrite a"
     Write-Host "source in the same second as the target built from it. Force it and re-run:"
     Write-Host "  (Get-Item build.rs).LastWriteTime = Get-Date"
     Write-Host ("  .\tools\refresh-x86-worker.ps1 -Profile {0}" -f $Profile)
-    Write-Host ""
-    Write-Host "If the supervisor's build failed above, that is the cause instead."
-    exit 1
 }
-
-Write-Host "The worker matches; the 32-bit tier has a worker to use." -ForegroundColor Green
-exit 0
+exit 1
