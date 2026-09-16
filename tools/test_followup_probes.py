@@ -3,6 +3,8 @@
 import copy
 import json
 import hashlib
+import os
+import shutil
 import importlib.util
 import struct
 import subprocess
@@ -196,9 +198,8 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["status"], "failed")
         self.assertFalse(any(n == "read_memory" for n, _ in remote.calls))
 
-    async def test_unknown_execution_state_refused_before_read(self):
+    async def test_malformed_execution_state_refused_before_read(self):
         for execution in (
-            None,
             {},
             {"stopped": None},
             {"stopped": 1},
@@ -216,8 +217,26 @@ class HandoffTests(unittest.IsolatedAsyncioTestCase):
         remote.overrides["session_status"] = change(
             sessions=[{k: v for k, v in SESSION.items() if k != "execution"}]
         )
-        self.assertEqual((await self.run_capture(remote))["status"], "failed")
-        self.assertFalse(any(n == "read_memory" for n, _ in remote.calls))
+        self.assertEqual((await self.run_capture(remote))["status"], "passed")
+        self.assertTrue(any(n == "current_location" for n, _ in remote.calls))
+        self.assertTrue(any(n == "read_memory" for n, _ in remote.calls))
+
+    async def test_no_async_record_still_requires_successful_paused_location(self):
+        for location, expected in (
+            (LOCATION, "passed"),
+            ({"status": "error", "error": {"category": "target_running"}}, "failed"),
+            ({**LOCATION, "location_state": "unmapped"}, "failed"),
+        ):
+            remote = Client("remote")
+            remote.overrides["session_status"] = change(
+                sessions=[{**SESSION, "execution": None}]
+            )
+            remote.overrides["current_location"] = lambda data: location
+            result = await self.run_capture(remote)
+            self.assertEqual(result["status"], expected)
+            self.assertEqual(
+                any(n == "read_memory" for n, _ in remote.calls), expected == "passed"
+            )
 
     async def test_connected_revalidates_transport_before_client_creation(self):
         with self.assertRaises(handoff.Refused):
@@ -489,8 +508,23 @@ class HelpersTests(unittest.TestCase):
         process.poll.return_value = 0
         process.wait.return_value = 0
         with patch.object(launcher.os, "killpg") as kill:
-            self.assertEqual(launcher.wait_owned(process, 1), (0, False))
+            rc, forced = launcher.wait_owned(process, 1)
+        self.assertEqual((rc, forced), (0, True))
+        self.assertEqual(
+            launcher.outcome(rc, forced, {"ok": True}, [])["status"], "failed"
+        )
         kill.assert_called_once_with(123, launcher.signal.SIGKILL)
+
+    def test_clean_exit_without_descendants_passes(self):
+        process = Mock(pid=123)
+        process.poll.return_value = 0
+        process.wait.return_value = 0
+        with patch.object(launcher.os, "killpg", side_effect=ProcessLookupError):
+            rc, forced = launcher.wait_owned(process, 1)
+        self.assertEqual((rc, forced), (0, False))
+        self.assertEqual(
+            launcher.outcome(rc, forced, {"ok": True}, [])["status"], "passed"
+        )
 
     def test_cleanup_runs_on_wait_exception(self):
         process = Mock(pid=123)
@@ -765,6 +799,59 @@ class ComparisonTests(unittest.TestCase):
             self.assertNotIn("matches", evidence)
             self.assertNotIn("unmatched", evidence)
             workspace.similarity.close.assert_called_once_with("comparison")
+
+
+class CRegressionTests(unittest.TestCase):
+    @unittest.skipUnless(shutil.which("cc"), "C regression needs a C compiler")
+    def test_standalone_rejects_extra_operands_for_all_three_instructions(self):
+        source = (
+            Path(__file__).resolve().parents[1]
+            / "docs/samples/clrbhb-native-regression.c"
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            (root / "decode.h").write_text("""#pragma once
+#include <stdint.h>
+enum Operation { ARM64_CLRBHB, ARM64_NOP, ARM64_CSDB };
+typedef struct { enum Operation operation; } Instruction;
+int aarch64_decompose(uint32_t, Instruction*, uint64_t);
+""")
+            (root / "format.h").write_text("""#include <stddef.h>
+#include "decode.h"
+int aarch64_disassemble(Instruction*, char*, size_t);
+""")
+            stub = root / "decoder.c"
+            stub.write_text("""#include <stdio.h>
+#include <stdlib.h>
+#include "format.h"
+int aarch64_decompose(uint32_t word, Instruction* out, uint64_t address) {
+    out->operation = word == 0xd50322df ? ARM64_CLRBHB :
+        word == 0xd503201f ? ARM64_NOP : ARM64_CSDB;
+    return 0;
+}
+int aarch64_disassemble(Instruction* in, char* out, size_t size) {
+    const char* names[] = {"clrbhb", "nop", "csdb"};
+    int inject = atoi(getenv("REGRESSION_BAD_INDEX"));
+    snprintf(out, size, "%s%s", names[in->operation],
+        inject == in->operation ? " unexpected" : "");
+    return 0;
+}
+""")
+            executable = root / "regression"
+            subprocess.run(
+                ["cc", "-I", str(root), str(source), str(stub), "-o", str(executable)],
+                check=True,
+                capture_output=True,
+            )
+            for index in (-1, 0, 1, 2):
+                result = subprocess.run(
+                    [str(executable)],
+                    env={**os.environ, "REGRESSION_BAD_INDEX": str(index)},
+                    capture_output=True,
+                )
+                self.assertEqual(
+                    result.returncode, 0 if index == -1 else 1, result.stdout
+                )
 
 
 class ObjectAliasTests(unittest.TestCase):
