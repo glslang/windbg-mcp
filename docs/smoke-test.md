@@ -1689,7 +1689,6 @@ gate on what they observe rather than on a claim about what CI has.
 ## The 32-bit managed target tier
 
 ```pwsh
-.\tools\refresh-x86-worker.ps1
 cargo test --test mcp_smoke -- --nocapture a_32_bit_managed
 ```
 
@@ -1724,16 +1723,18 @@ passes every check that only asks whether the file is there.
 
 **What the host needs** is `x86\windbg-mcp.exe` and a 32-bit `dbgeng.dll` beside it, in an `x86\`
 directory next to the binary under test — so `target\debug\x86\` for a `cargo test` run.
-[`tools/refresh-x86-worker.ps1`](../tools/refresh-x86-worker.ps1) builds both binaries and places
-the worker. `cargo build` produces no worker at all: the i686 build is a second target triple the
-host build never runs, and it lands in `target\i686-pc-windows-msvc\debug\` rather than in `x86\`.
-It then compares the two binaries' `ProductVersion` stamps and refuses a mismatch, so a stale
-worker is named before the tier runs rather than after (`-Check` asks without building). It also
-**fails when no 32-bit `dbgeng.dll` ends up beside the worker**, because that is the state in which
-this tier stands down instead of failing — `test result: ok. 2 passed` with both tests skipped —
-so a script that exited 0 there would report a capability nothing has. The
-engine payload is the copy block in
-the skill's `setup.md`, and on an x64 host the four DLLs in `SysWOW64` were measured to be enough
+**The tier provides both itself** (`ensure_x86_worker`), so `cargo test` on a tree with no `x86\`
+directory runs it for real. `cargo build` produces no worker at all — the i686 build is a second
+target triple the host build never runs, and it lands in `target\i686-pc-windows-msvc\debug\`
+rather than in `x86\` — and a build script cannot do it either, because cargo holds one lock over
+the whole `target` directory and a nested cargo would wait on the lock its own outer build holds.
+By the time a *test binary* runs that lock is released (measured: a concurrent
+`cargo build --target i686-pc-windows-msvc` finishes in 0.11s), which is what makes this the first
+point it is possible. It compares `ProductVersion` rather than `FileVersion`, the latter being the
+bare release on every build, and rebuilds on a mismatch — which is what keeps a commit or a rebase
+from leaving a stale worker behind, since `build.rs` watches the branch ref and re-stamps the
+supervisor alone. The engine is mirrored from `target\release\x86`, where
+the skill's `setup.md` has the payload put; on an x64 host the four DLLs in `SysWOW64` were measured to be enough
 for this tier, which loads SOS but resolves no PDB. Both halves are checked before the worker is
 spawned, because an image whose engine is missing fails in the *loader*, before any of this
 server's code runs.

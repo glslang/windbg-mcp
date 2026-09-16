@@ -76,36 +76,32 @@ earlier under the digest is refused. Measured on
 the same tier failed on the next run with nothing in `src` changed. A stale 32-bit worker is
 therefore turned away, the session falls back to this build, and the smoke tier fails saying *this
 host could not give the target a 32-bit worker* — which reads as a missing file rather than a stale
-one. After every edit, **after every commit, and after every rebase** — a rebase rewrites each commit, so
-every stamp on the branch moves at once — before running that tier:
+one.
 
-```pwsh
-.\tools\refresh-x86-worker.ps1
-```
+**Nothing to remember: the tier builds its own worker** (`ensure_x86_worker` in `tests/`). It
+compares the worker's `ProductVersion` against the supervisor's, and on a mismatch — or an absent
+worker — runs `cargo build --target i686-pc-windows-msvc` and places the result, mirroring the
+32-bit engine from `target\release\x86` the way `ensure_engine_beside_test_binary` already does for
+the 64-bit side. `cargo test` on a tree with no `x86\` directory at all runs this tier for real.
 
-It builds both binaries and places the worker — `cargo build` produces no worker at all, the i686
-build being a second target triple the host build never runs, landing in
-`target\i686-pc-windows-msvc\debug\` rather than in the `x86\` subdirectory the supervisor looks
-in — and then **compares the two stamps and refuses a mismatch**, which is the part worth having:
-it reads `ProductVersion` off each binary's version resource (`FileVersion` stays the bare release,
-so comparing that one proves nothing), so the answer arrives before the tier runs rather than as a
-failure that reads like a missing file. It builds the supervisor as well because the check is a
-comparison and both halves have to be current for it to mean anything — and on a fresh tree there
-is no supervisor to compare against at all.
+**It has to be the tier, because nothing earlier can do it.** `cargo build` never produces a worker:
+the i686 build is a second target triple the host build does not run, and it lands in that triple's
+directory rather than in the `x86\` subdirectory the loader rule below requires. `build.rs` cannot
+either — cargo holds **one lock over the whole `target` directory, shared across triples**, so a
+nested cargo waits on a lock its own outer build is holding (measured: a second cargo prints
+`Blocking waiting for file lock on build directory`). That lock is released by the time a *test
+binary* runs — measured, a concurrent `cargo build --target i686-pc-windows-msvc` finishes in 0.11s
+while tests execute — which makes the test the first point in the pipeline where it is possible at
+all. It is also where this tier already makes its other fixtures, compiling a C# program with
+`csc.exe` and dumping it.
 
-It also **fails when no 32-bit `dbgeng.dll` ends up beside the worker**, which is not the same kind
-of failure as the rest: `x86_engine_tier` *skips* in that state, so the tier reports
-`test result: ok. 2 passed` with both tests stood down, and a script exiting 0 there would be
-reporting a capability nothing has. `-SkipEngine` says where the engine comes from, not whether the
-worker needs one. `-Profile release` does the same for a release tree, where a build blocked by a
-running server's file lock is reported rather than fatal.
+**Why a documented command was not enough**, having been one until 2026-09-16: the worker goes stale
+on its own, and a step you must remember after every commit is a step that gets forgotten — costing
+a round to the misleading *missing file* reading each time. A **rebase** is the same event wearing a
+different hat, moving every stamp on the branch at once.
 
-**`-Check` asks without building, and cannot see one state: both binaries older than the tree.** It
-compares them to each other, so straight after a commit — before anything is rebuilt — it finds two
-stale binaries that agree and reports green, and then `cargo test` rebuilds the supervisor and not
-the worker. Seeing that would mean reproducing `build.rs`'s stamp in the script, which is the
-second-copy-of-a-rule hazard `x86_engine_tier`'s own comment is written about. So the instruction
-above is unchanged by its existence: after an edit **and after a commit**, run the build path.
+`ProductVersion` and not `FileVersion` is the field to compare: the latter stays the bare release
+and agrees on every build.
 
 **`x86\` is a subdirectory because the loader makes it one.** An executable's own directory is
 searched first, so a 32-bit `dbgeng.dll` dropped beside the 64-bit one would be found by the wrong
