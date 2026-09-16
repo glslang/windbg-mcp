@@ -36,6 +36,14 @@
     Report whether the tier has a worker it can use, and exit; build and copy nothing.
     Exit code 0 means yes, 1 means no, on exactly the conditions the build path enforces.
 
+    It compares the two binaries **as they are on disk**, and there is one state it therefore
+    cannot see: both being older than the tree. Run straight after a commit, before anything is
+    rebuilt, it finds two stale binaries that agree with each other and reports green - and then
+    `cargo test` rebuilds the supervisor and not the worker, and they disagree by the time the
+    tier runs. Seeing that would mean reproducing `build.rs`'s revision stamp here, and a gate
+    that reimplements the rule it is checking is the thing `x86_engine_tier`'s own comment warns
+    against. So: after an edit or a commit, run the build path rather than -Check.
+
 .PARAMETER SkipEngine
     Do not copy engine DLLs. An engine must still be present for this to succeed: the switch says
     where the engine comes from, not whether the worker needs one.
