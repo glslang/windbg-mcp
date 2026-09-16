@@ -85,9 +85,12 @@ def session_row(data, session_id):
     require(state == "open" and row.get("live") is True, "session is not open")
     require(row.get("kind") == "kernel", "session is not a live remote kernel")
     execution = row.get("execution")
+    # session_status omits execution before the first continue_async run.
+    # current_location below must still prove a readable, mapped stop.
     require(
-        isinstance(execution, dict) and execution.get("stopped") is True,
-        "target is running or its execution state is unavailable",
+        execution is None
+        or (isinstance(execution, dict) and execution.get("stopped") is True),
+        "async execution is running or its state is unavailable",
     )
     return row
 

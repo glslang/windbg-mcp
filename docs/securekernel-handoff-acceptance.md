@@ -52,9 +52,11 @@ copied into the report, and connection exceptions record only their type.
 ## What is checked
 
 - Required input fields and structured outputs are discovered through `tools/list`.
-- The selected session is an open remote kernel with explicit `execution.stopped: true`
-  evidence. Missing or unknown execution state is refused.
-  `current_location` must succeed with a mapped Secure Kernel instruction pointer.
+- The selected session is an open remote kernel with no active asynchronous run.
+  An absent/null `execution` means no retained async run; a present record must
+  explicitly report `stopped: true`. Malformed records are refused.
+  `current_location` must then succeed with a mapped Secure Kernel instruction
+  pointer before any memory read, including for newly attached sessions.
 - The match's target binary, generation, image identity and RVA are checked against
   the companion view. Modified input views, ambiguous/truncated module listings,
   wrong PE/PDB identities and ranges outside the image are refused.

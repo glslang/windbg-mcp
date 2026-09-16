@@ -16,7 +16,7 @@ int main(void)
         int decode = aarch64_decompose(words[i], &instruction, 0x1000);
         int format = decode == 0 ? aarch64_disassemble(&instruction, text, sizeof(text)) : -1;
         int passed = decode == 0 && format == 0 && instruction.operation == operations[i]
-            && strncmp(text, names[i], strlen(names[i])) == 0;
+            && strcmp(text, names[i]) == 0;
         printf("{\"word\":\"%08x\",\"decode\":%d,\"format\":%d,\"text\":\"%s\",\"passed\":%s}\n",
                words[i], decode, format, text, passed ? "true" : "false");
         failures += !passed;

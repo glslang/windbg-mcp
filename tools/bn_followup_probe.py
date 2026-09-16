@@ -30,13 +30,15 @@ def signal_owned_group(process, sig):
     """Signal descendants even when the session leader has already exited."""
     try:
         os.killpg(process.pid, sig)
+        return True
     except ProcessLookupError:
-        pass
+        return False
 
 
 def cleanup_owned(process):
-    signal_owned_group(process, signal.SIGKILL)
+    forced = signal_owned_group(process, signal.SIGKILL)
     process.wait(timeout=5)
+    return forced
 
 
 def wait_owned(process, timeout, *, clock=time.monotonic, sleep=time.sleep):
@@ -51,9 +53,10 @@ def wait_owned(process, timeout, *, clock=time.monotonic, sleep=time.sleep):
                 process.wait(timeout=5)
             except subprocess.TimeoutExpired:
                 signal_owned_group(process, signal.SIGKILL)
-        return process.wait(timeout=5), forced
+        returncode = process.wait(timeout=5)
     finally:
-        cleanup_owned(process)
+        forced_cleanup = cleanup_owned(process)
+    return returncode, forced or forced_cleanup
 
 
 def main():
