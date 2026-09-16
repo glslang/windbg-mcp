@@ -14,7 +14,7 @@
 
     **What "usable" means is two conditions, and they are answered in one place**
     (`Get-WorkerFaults`), because answering whichever one is in front of you is how this file drew
-    three rounds of review:
+    four rounds of review:
 
     - The worker's stamp matches the supervisor's. `build.rs` watches `.git\HEAD` and the branch
       ref, so a `git commit` re-stamps the supervisor from `<commit>-dirty.<digest>` to a clean
@@ -106,20 +106,25 @@ function Get-Stamp {
 # independent and every path has to answer both: two review rounds on this file were each one
 # condition enforced where the author was looking and not where the caller was.
 function Get-WorkerFaults {
-    param([string] $HostStamp, [string] $WorkerStamp)
+    # Takes nothing, and reads the paths it is about. A `[string]` parameter coerces `$null` to the
+    # empty string on binding, so an absent binary arrived here as '' with the null branch skipped,
+    # two absent binaries compared equal, and this reported a usable worker when neither existed
+    # (round four on #330). Deriving the values removes the conversion rather than guarding it.
+    $hostStamp = Get-Stamp -Path $hostExe
+    $workerStamp = Get-Stamp -Path $workerExe
 
     $faults = @()
 
-    if ($null -eq $HostStamp) {
+    if ($null -eq $hostStamp) {
         $faults += ("There is no supervisor at {0}." -f $hostExe)
     }
-    elseif ($null -eq $WorkerStamp) {
+    elseif ($null -eq $workerStamp) {
         $faults += ("There is no worker at {0}." -f $workerExe)
     }
-    elseif ($WorkerStamp -ne $HostStamp) {
+    elseif ($workerStamp -ne $hostStamp) {
         $faults += (
             "The worker's stamp is {0} and the supervisor's is {1}, so the supervisor will turn " +
-            "it away and fall back to the 64-bit build." -f $WorkerStamp, $HostStamp)
+            "it away and fall back to the 64-bit build." -f $workerStamp, $hostStamp)
     }
 
     if (-not (Test-Path -LiteralPath $workerEngine)) {
@@ -137,20 +142,23 @@ function Get-WorkerFaults {
 }
 
 function Show-Outcome {
-    param([string] $HostStamp, [string] $WorkerStamp)
+    # Parameterless for the same reason as `Get-WorkerFaults`, and reading the same paths, so what
+    # is printed and what is judged cannot come from two different readings.
+    $hostStamp = Get-Stamp -Path $hostExe
+    $workerStamp = Get-Stamp -Path $workerExe
 
     Write-Host ("{0} profile:" -f $Profile)
-    if ($null -eq $HostStamp) {
+    if ($null -eq $hostStamp) {
         Write-Host ("  supervisor : (absent, at {0})" -f $hostExe)
     }
     else {
-        Write-Host ("  supervisor : {0}" -f $HostStamp)
+        Write-Host ("  supervisor : {0}" -f $hostStamp)
     }
-    if ($null -eq $WorkerStamp) {
+    if ($null -eq $workerStamp) {
         Write-Host ("  worker     : (absent, at {0})" -f $workerExe)
     }
     else {
-        Write-Host ("  worker     : {0}" -f $WorkerStamp)
+        Write-Host ("  worker     : {0}" -f $workerStamp)
     }
     if (Test-Path -LiteralPath $workerEngine) {
         Write-Host "  engine     : present"
@@ -159,7 +167,7 @@ function Show-Outcome {
         Write-Host "  engine     : (absent)"
     }
 
-    $faults = Get-WorkerFaults -HostStamp $HostStamp -WorkerStamp $WorkerStamp
+    $faults = Get-WorkerFaults
     if ($faults.Count -eq 0) {
         Write-Host "The 32-bit tier has a worker it can use." -ForegroundColor Green
         return $true
@@ -211,7 +219,7 @@ function Invoke-Cargo {
 }
 
 if ($Check) {
-    if (Show-Outcome -HostStamp (Get-Stamp -Path $hostExe) -WorkerStamp (Get-Stamp -Path $workerExe)) {
+    if (Show-Outcome) {
         exit 0
     }
     Write-Host ""
@@ -278,7 +286,7 @@ Copy-Item -LiteralPath $builtExe -Destination $workerExe -Force
 
 $hostStamp = Get-Stamp -Path $hostExe
 $workerStamp = Get-Stamp -Path $workerExe
-if (Show-Outcome -HostStamp $hostStamp -WorkerStamp $workerStamp) {
+if (Show-Outcome) {
     exit 0
 }
 
