@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-one clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -41,7 +41,9 @@ with it, and item 72 from running that tool's live-kernel tier, where a fresh at
 leave the debugger's module inventory nearly empty and the driver tools with nothing to resolve
 against (2026-09-13), and items 73–74 from checking the four driver tools against Ghidra and
 Driver Buddy Revolutions over `mountmgr` and HEVD — an import directory the loader may have
-freed, and the one section of the ported program with no counterpart here (2026-09-14).
+freed, and the one section of the ported program with no counterpart here (2026-09-14) — and item
+79 from item 78's own fix, which got the user-mode heap walker past the layout refusal and one step
+into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1253,3 +1255,48 @@ its own code, which is what makes the walk worth starting.
 
 **Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
 these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
+
+## 79. [dbgscope] A heap outside the PEB's `ProcessHeaps` is invisible to the heap tools
+
+**Repo:** `dbgscope` (surfaced by `windbg-mcp`'s heap tools).
+
+`walk_user_segment_heaps` enumerates roots from `_PEB.NumberOfHeaps` / `ProcessHeaps`, and on
+Windows 26200 that array does not list every heap the debugger can see. Measured on `RuntimeBroker`
+(2026-09-15): `NumberOfHeaps` is **1**, `ProcessHeaps[0]` is the segment heap at `0x19a88000000`,
+and `!heap -s` reports **four** segment heaps at `0x19a88000000`, `…400000`, `…600000` and
+`…800000`. The walk of the listed root is healthy — 8,878 chunks, 3,698 allocated — so this is a
+*root discovery* gap rather than a decode one.
+
+**It is not a bad read of the PEB**, which was the first thing checked: `cmd.exe` stopped at its
+initial breakpoint reports `NumberOfHeaps` 1 and genuinely has one heap at that point, so the
+field and its offset are right.
+
+**How it was found.** Running `dbgscope`'s own `examples/user_heap_smoke` after item 78 (2026-09-15).
+It now gets past the layout refusal and fails one step later: its child calls
+`HeapCreate(HEAP_CREATE_SEGMENT_HEAP)`, prints the handle, and the walker lists **one** root — the
+process default heap, `kind: Nt` — with the created heap absent from `ProcessHeaps` entirely. So the
+example cannot reach the Segment Heap it exists to verify, live or over its dump, and the crate's
+one end-to-end user-mode heap check is standing down on every current build.
+`_NO_DEBUG_HEAP=1` changes nothing, so the debugger's debug heap is not the cause.
+
+- **Why deferred:** the severity is not yet known and the measurement that settles it is the work.
+  If the three unlisted heaps are **heap-manager-internal**, `ProcessHeaps` is the correct answer
+  for application heaps and what needs fixing is the example's premise plus a sentence in the tool
+  descriptions. If any of them is **app-visible** — and a `HeapCreate` return value missing from
+  `ProcessHeaps` suggests at least one is — then `heap_list` under-reports on current Windows while
+  saying it listed every root, which is the failure mode this repo has already been bitten by once
+  (a walk that rejected every segment reporting an empty pool rather than an error).
+- **It does not block a release, and the reasoning is worth keeping.** PEB-based enumeration is
+  what every release has shipped, and the tools report `coverage` and name the heaps they walked
+  rather than claiming completeness. What changed in item 78 is only that the layout now resolves,
+  so the tools return a partial answer where they previously returned an error — which is why this
+  became visible then rather than being introduced then.
+- **What would close it:** establish where `!heap -s` gets its segment-heap table — `ntdll`'s own
+  heap-manager globals rather than the PEB — and whether an entry there is app-visible. Then either
+  enumerate from that source beside the PEB, or state the boundary in `heap_list`'s description and
+  fix `user_heap_smoke` to verify a heap it can actually reach. Either way the answer has to say
+  *how many roots it could not see*, not merely how many it walked.
+
+**Where it picks up.** `walk_user_segment_heaps` in `dbgscope`'s `src/pool/snapshot.rs` and the PEB
+read feeding it, `examples/user_heap_smoke.rs`, and `heap_list`'s description in
+`windbg-mcp`'s `src/server.rs`.
