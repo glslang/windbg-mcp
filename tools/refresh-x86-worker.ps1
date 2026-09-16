@@ -18,7 +18,8 @@
 
     - The worker's stamp matches the supervisor's. `build.rs` watches `.git\HEAD` and the branch
       ref, so a `git commit` re-stamps the supervisor from `<commit>-dirty.<digest>` to a clean
-      `<commit>` while a worker built minutes earlier keeps the old one. The supervisor then turns
+      `<commit>` while a worker built minutes earlier keeps the old one - and a rebase moves every
+      stamp on the branch at once, for the same reason. The supervisor then turns
       the worker away and the tier fails saying this host could not give the target a 32-bit
       worker, which reads as a missing file rather than a stale one.
     - A 32-bit `dbgeng.dll` sits beside the worker. `engine::x86_worker_image` probes for it and
