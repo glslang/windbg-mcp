@@ -82,14 +82,22 @@ one. After every edit **and after every commit**, before running that tier:
 .\tools\refresh-x86-worker.ps1
 ```
 
-It does the two steps `cargo build` cannot — the i686 build is a second target triple, which the
-host build never produces, and it lands in `target\i686-pc-windows-msvc\debug\` rather than in the
-`x86\` subdirectory the supervisor looks in — and then **compares the two stamps and refuses a
-mismatch**, which is the part worth having: it reads `ProductVersion` off each binary's version
-resource (`FileVersion` stays the bare release, so comparing that one proves nothing), so the
-answer arrives before the tier runs rather than as a failure that reads like a missing file.
-`-Check` asks without building. `-Profile release` does the same for a release tree; the engine
-mirroring is `-SkipEngine`-able and no-ops when the payload is already there.
+It builds both binaries and places the worker — `cargo build` produces no worker at all, the i686
+build being a second target triple the host build never runs, landing in
+`target\i686-pc-windows-msvc\debug\` rather than in the `x86\` subdirectory the supervisor looks
+in — and then **compares the two stamps and refuses a mismatch**, which is the part worth having:
+it reads `ProductVersion` off each binary's version resource (`FileVersion` stays the bare release,
+so comparing that one proves nothing), so the answer arrives before the tier runs rather than as a
+failure that reads like a missing file. It builds the supervisor as well because the check is a
+comparison and both halves have to be current for it to mean anything — and on a fresh tree there
+is no supervisor to compare against at all.
+
+It also **fails when no 32-bit `dbgeng.dll` ends up beside the worker**, which is not the same kind
+of failure as the rest: `x86_engine_tier` *skips* in that state, so the tier reports
+`test result: ok. 2 passed` with both tests stood down, and a script exiting 0 there would be
+reporting a capability nothing has. `-SkipEngine` says where the engine comes from, not whether the
+worker needs one. `-Check` asks without building; `-Profile release` does the same for a release
+tree, where a build blocked by a running server's file lock is reported rather than fatal.
 
 **`x86\` is a subdirectory because the loader makes it one.** An executable's own directory is
 searched first, so a 32-bit `dbgeng.dll` dropped beside the 64-bit one would be found by the wrong

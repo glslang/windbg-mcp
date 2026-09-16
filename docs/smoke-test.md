@@ -1724,11 +1724,14 @@ passes every check that only asks whether the file is there.
 
 **What the host needs** is `x86\windbg-mcp.exe` and a 32-bit `dbgeng.dll` beside it, in an `x86\`
 directory next to the binary under test — so `target\debug\x86\` for a `cargo test` run.
-[`tools/refresh-x86-worker.ps1`](../tools/refresh-x86-worker.ps1) builds the worker and places it,
-which is two steps because `cargo build` does neither: the i686 build is a second target triple the
-host build never produces, and it lands in `target\i686-pc-windows-msvc\debug\` rather than in
-`x86\`. It then compares the two binaries' `ProductVersion` stamps and refuses a mismatch, so a
-stale worker is named before the tier runs rather than after (`-Check` asks without building). The
+[`tools/refresh-x86-worker.ps1`](../tools/refresh-x86-worker.ps1) builds both binaries and places
+the worker. `cargo build` produces no worker at all: the i686 build is a second target triple the
+host build never runs, and it lands in `target\i686-pc-windows-msvc\debug\` rather than in `x86\`.
+It then compares the two binaries' `ProductVersion` stamps and refuses a mismatch, so a stale
+worker is named before the tier runs rather than after (`-Check` asks without building). It also
+**fails when no 32-bit `dbgeng.dll` ends up beside the worker**, because that is the state in which
+this tier stands down instead of failing — `test result: ok. 2 passed` with both tests skipped —
+so a script that exited 0 there would report a capability nothing has. The
 engine payload is the copy block in
 the skill's `setup.md`, and on an x64 host the four DLLs in `SysWOW64` were measured to be enough
 for this tier, which loads SOS but resolves no PDB. Both halves are checked before the worker is
