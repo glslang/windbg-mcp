@@ -629,7 +629,7 @@ class ComparisonTests(unittest.TestCase):
                     "wrong_clrbhb_reference": (0, "reference", "hint #22"),
                     "wrong_clrbhb_target": (0, "target", "undefined"),
                     "wrong_isb": (1, "target", "nop"),
-                    "wrong_branch": (2, "reference", "ret"),
+                    "wrong_branch": (2, "reference", "bl 0x140114c00"),
                     "clrbhb_operand": (0, "target", "clrbhb x0"),
                     "missing_branch_operand": (2, "target", "b"),
                 }
