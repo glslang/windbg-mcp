@@ -76,7 +76,8 @@ earlier under the digest is refused. Measured on
 the same tier failed on the next run with nothing in `src` changed. A stale 32-bit worker is
 therefore turned away, the session falls back to this build, and the smoke tier fails saying *this
 host could not give the target a 32-bit worker* — which reads as a missing file rather than a stale
-one. After every edit **and after every commit**, before running that tier:
+one. After every edit, **after every commit, and after every rebase** — a rebase rewrites each commit, so
+every stamp on the branch moves at once — before running that tier:
 
 ```pwsh
 .\tools\refresh-x86-worker.ps1
