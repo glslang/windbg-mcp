@@ -245,11 +245,14 @@ jobs:
         env:
           ARCH: ${{ matrix.arch }}
         run: |
+          # The worker itself is not built here. `ensure_x86_worker` in the tier builds and places
+          # it, so leaving it out of this step is what makes every CI run prove that rather than
+          # cover for it. The target still has to be installed for the tier to be able to, and the
+          # engine still has to come from this image: a runner has no `target\release\x86` to
+          # mirror from.
           rustup target add i686-pc-windows-msvc
-          cargo build --target i686-pc-windows-msvc
           $x86 = 'target\debug\x86'
           New-Item $x86 -ItemType Directory -Force | Out-Null
-          Copy-Item 'target\i686-pc-windows-msvc\debug\windbg-mcp.exe' $x86 -Force
           $sources = @(
             'C:\Program Files (x86)\Windows Kits\10\Debuggers\x86',
             "$env:WINDIR\SysWOW64"

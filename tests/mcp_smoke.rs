@@ -16110,28 +16110,11 @@ fn ensure_x86_worker() -> String {
             );
         }
 
-        // `env!("CARGO")` is the cargo that built this test, so a toolchain the caller selected is
-        // the one that builds the worker.
-        let built = std::process::Command::new(env!("CARGO"))
-            .arg("build")
-            .arg("--target")
-            .arg(X86_TRIPLE)
-            .args(if profile == "release" {
-                &["--release"][..]
-            } else {
-                &[][..]
-            })
-            .arg("--manifest-path")
-            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "\\Cargo.toml"))
-            .status();
-        match built {
-            Ok(status) if status.success() => {}
-            Ok(status) => return format!("`cargo build --target {X86_TRIPLE}` exited {status}"),
-            Err(error) => return format!("could not run cargo to build the worker: {error}"),
-        }
-
-        // Beside the *test binary*, so a `CARGO_TARGET_DIR` pointing somewhere else is followed
-        // rather than assumed away.
+        // Beside the *test binary*, so a target directory the caller moved is followed rather than
+        // assumed away — and the nested build is told the same one. `--target-dir` is a CLI option
+        // that cargo does **not** export: measured, a test run under `cargo test --target-dir X`
+        // sees `CARGO_BIN_EXE_*` inside X and `CARGO_TARGET_DIR` unset, so a nested build left to
+        // its own devices writes to the default `target` and the copy below looks somewhere empty.
         let Some(target_root) = dir.parent() else {
             return "cannot locate the target directory".into();
         };
@@ -16139,17 +16122,64 @@ fn ensure_x86_worker() -> String {
             .join(X86_TRIPLE)
             .join(&profile)
             .join("windbg-mcp.exe");
+
+        // `env!("CARGO")` is the cargo that built this test, so a toolchain the caller selected is
+        // the one that builds the worker.
+        let build = || {
+            std::process::Command::new(env!("CARGO"))
+                .arg("build")
+                .arg("--target")
+                .arg(X86_TRIPLE)
+                .args(if profile == "release" {
+                    &["--release"][..]
+                } else {
+                    &[][..]
+                })
+                .arg("--manifest-path")
+                .arg(concat!(env!("CARGO_MANIFEST_DIR"), "\\Cargo.toml"))
+                .arg("--target-dir")
+                .arg(target_root)
+                .status()
+        };
+
         if let Err(error) = std::fs::create_dir_all(&worker_dir) {
             return format!("could not create {}: {error}", worker_dir.display());
         }
-        match std::fs::copy(&fresh, &worker) {
-            Ok(_) => format!("built and placed {}{mirrored}", worker.display()),
-            Err(error) => format!(
-                "built {} but could not copy it to {}: {error}",
-                fresh.display(),
-                worker.display()
-            ),
+
+        // Twice at most. Cargo's freshness is mtime-based, and a `git checkout` or `reset --hard`
+        // can rewrite a source in the same second as the artifact built from it — this repo has
+        // measured cargo answering `Finished in 0.09s` and keeping the stale binary
+        // (`docs/smoke-test.md`). Placing that one and reporting success would hand the tier the
+        // misleading *missing worker* failure this helper exists to delete, so the placed file is
+        // read back, and a stale one is deleted to deny cargo the reuse before asking again.
+        for attempt in 0..2 {
+            match build() {
+                Ok(status) if status.success() => {}
+                Ok(status) => {
+                    return format!("`cargo build --target {X86_TRIPLE}` exited {status}");
+                }
+                Err(error) => return format!("could not run cargo to build the worker: {error}"),
+            }
+            if let Err(error) = std::fs::copy(&fresh, &worker) {
+                return format!(
+                    "built {} but could not copy it to {}: {error}",
+                    fresh.display(),
+                    worker.display()
+                );
+            }
+            if read_version_field(&worker.to_string_lossy(), "ProductVersion") == wanted {
+                return format!("built and placed {}{mirrored}", worker.display());
+            }
+            if attempt == 0 {
+                let _ = std::fs::remove_file(&fresh);
+            }
         }
+        format!(
+            "cargo kept a stale {} even with the artifact removed, so the worker beside {} is not \
+             this build and the tier cannot use it. Touch a source and run again.",
+            fresh.display(),
+            dir.display()
+        )
     })
     .clone()
 }
