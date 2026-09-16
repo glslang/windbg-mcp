@@ -1000,7 +1000,7 @@ fn the_32_bit_worker_carries_the_same_version_resource() {
 ///
 /// Takes the executable rather than reading [`EXE`], because the release ships **two** binaries
 /// that must each carry one — this build and the 32-bit worker beside it.
-fn read_version_field(exe: &str, field: &str) -> String {
+fn try_read_version_field(exe: &str, field: &str) -> Result<String, &'static str> {
     use std::ffi::OsStr;
     use std::os::windows::ffi::OsStrExt;
     use windows_sys::Win32::Storage::FileSystem::{
@@ -1044,46 +1044,55 @@ fn read_version_field(exe: &str, field: &str) -> String {
         })
     }
 
-    let missing = |what: &str| -> ! {
-        panic!(
-            "{exe} carries no `{field}` in a PE version resource ({what}). A Rust binary has none \
-             by default, so this is what a `build.rs` that could not run a resource compiler \
-             leaves behind — the build printed a `cargo::warning` saying why."
-        )
-    };
-
     let path = wide(exe);
     // SAFETY: `path` is NUL-terminated and outlives the call. The handle out-parameter is
     // documented as ignorable, and a null pointer is how that is spelled.
     let size = unsafe { GetFileVersionInfoSizeW(path.as_ptr(), std::ptr::null_mut()) };
     if size == 0 {
-        missing("the file has no version resource at all");
+        return Err("the file has no version resource at all");
     }
     let mut block = vec![0u8; size as usize];
     // SAFETY: `block` is exactly the `size` bytes the call above asked for.
     if unsafe { GetFileVersionInfoW(path.as_ptr(), 0, size, block.as_mut_ptr().cast()) } == 0 {
-        missing("its version resource would not load");
+        return Err("its version resource would not load");
     }
 
     // A value's key is qualified by language and codepage, and the block says which pair it wrote:
     // `winresource` emits the *language-neutral* `000004b0`, so the `040904b0` a hard-coded key
     // would name reads nothing at all.
     let Some(translation) = query(&block, r"\VarFileInfo\Translation", 1) else {
-        missing("its version resource declares no translation");
+        return Err("its version resource declares no translation");
     };
     // A `Translation` value is a run of (language, codepage) pairs; the first is the one to use.
     if translation.len() < 2 {
-        missing("its translation table is shorter than one language/codepage pair");
+        return Err("its translation table is shorter than one language/codepage pair");
     }
     let (language, codepage) = (translation[0], translation[1]);
 
     let key = format!(r"\StringFileInfo\{language:04x}{codepage:04x}\{field}");
     let Some(text) = query(&block, &key, size_of::<u16>() as u32) else {
-        missing("its version resource carries no such field");
+        return Err("its version resource carries no such field");
     };
-    String::from_utf16_lossy(text)
+    Ok(String::from_utf16_lossy(text)
         .trim_end_matches('\0')
-        .to_string()
+        .to_string())
+}
+
+/// The same read, for a caller that has a binary it *must* be able to identify.
+///
+/// Every way this can answer nothing is one failure — no resource was embedded — so a test asking
+/// about a binary this build produced wants the panic rather than an `Option` it would only
+/// `unwrap`. [`ensure_x86_worker`] is the caller that does not: it asks about a file that may be
+/// anything at all, including a worker from before this project embedded a resource, and an
+/// unreadable one there is a reason to *rebuild* rather than to fail the run.
+fn read_version_field(exe: &str, field: &str) -> String {
+    try_read_version_field(exe, field).unwrap_or_else(|what| {
+        panic!(
+            "{exe} carries no `{field}` in a PE version resource ({what}). A Rust binary has none \
+             by default, so this is what a `build.rs` that could not run a resource compiler \
+             leaves behind — the build printed a `cargo::warning` saying why."
+        )
+    })
 }
 
 // ---- tier 1: protocol revisions -----------------------------------------------
@@ -16101,8 +16110,12 @@ fn ensure_x86_worker() -> String {
         let mirrored = mirror_x86_engine(&worker_dir);
 
         let wanted = read_version_field(EXE, "ProductVersion");
+        // `try_` and not the panicking read: this asks about a file that may be anything,
+        // including a worker from before this project embedded a version resource. An
+        // unreadable one is a reason to rebuild, not to fail the run.
         if worker.is_file()
-            && read_version_field(&worker.to_string_lossy(), "ProductVersion") == wanted
+            && try_read_version_field(&worker.to_string_lossy(), "ProductVersion").as_deref()
+                == Ok(wanted.as_str())
         {
             return format!(
                 "the worker beside {} is this build{mirrored}",
@@ -16130,10 +16143,14 @@ fn ensure_x86_worker() -> String {
                 .arg("build")
                 .arg("--target")
                 .arg(X86_TRIPLE)
-                .args(if profile == "release" {
-                    &["--release"][..]
+                // `--profile <name>` rather than `--release`, because a profile directory is
+                // named after the profile that wrote it and `cargo test --profile <custom>`
+                // is a supported way to run this suite. `debug` is the exception: it is what
+                // `dev` (and `test`) write to, and naming a profile `debug` is not a thing.
+                .args(if profile == "debug" {
+                    Vec::new()
                 } else {
-                    &[][..]
+                    vec!["--profile".to_string(), profile.clone()]
                 })
                 .arg("--manifest-path")
                 .arg(concat!(env!("CARGO_MANIFEST_DIR"), "\\Cargo.toml"))
@@ -16167,7 +16184,9 @@ fn ensure_x86_worker() -> String {
                     worker.display()
                 );
             }
-            if read_version_field(&worker.to_string_lossy(), "ProductVersion") == wanted {
+            if try_read_version_field(&worker.to_string_lossy(), "ProductVersion").as_deref()
+                == Ok(wanted.as_str())
+            {
                 return format!("built and placed {}{mirrored}", worker.display());
             }
             if attempt == 0 {

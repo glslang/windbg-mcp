@@ -1723,8 +1723,12 @@ passes every check that only asks whether the file is there.
 
 **What the host needs** is `x86\windbg-mcp.exe` and a 32-bit `dbgeng.dll` beside it, in an `x86\`
 directory next to the binary under test — so `target\debug\x86\` for a `cargo test` run.
-**The tier provides both itself** (`ensure_x86_worker`), so `cargo test` on a tree with no `x86\`
-directory runs it for real. `cargo build` produces no worker at all — the i686 build is a second
+**The tier builds the worker itself** (`ensure_x86_worker`), so `cargo test` on a tree with no
+`x86\` directory runs it for real — *provided a 32-bit engine exists to mirror*. That is the one
+half it cannot derive: the engine comes from a WinDbg package, so it is copied from
+`target\release\x86` if the payload is there and otherwise nothing supplies it and
+`x86_engine_tier` stands the tier down. A first-time setup is therefore still the copy block in the
+skill's `setup.md`; everything after it is automatic. `cargo build` produces no worker at all — the i686 build is a second
 target triple the host build never runs, and it lands in `target\i686-pc-windows-msvc\debug\`
 rather than in `x86\` — and a build script cannot do it either, because cargo holds one lock over
 the whole `target` directory and a nested cargo would wait on the lock its own outer build holds.
@@ -1769,17 +1773,19 @@ wrong answer to find:
 build.** `WorkerMessage::Ready` carries the build identity and the supervisor refuses a mismatch,
 so an `x86\windbg-mcp.exe` from before your last edit is turned away and the session falls back to
 this build — reported as the `limitation` above, which reads as "this host has no 32-bit worker".
-Re-run the two commands at the top of this section after every change, `cargo fmt` included: on a
-dirty tree that identity carries a digest over the uncommitted diff of `build.rs`'s `INPUTS`, so a
-reformat moves it.
+That is what `ensure_x86_worker` exists to delete, and it is why it compares stamps rather than
+checking the file is there: every edit moves the identity, `cargo fmt` included, and on a dirty tree
+it carries a digest over the uncommitted diff of `build.rs`'s `INPUTS`. A commit moves it too, by
+taking that diff to empty — and a rebase moves every commit on the branch at once.
 
-**And check the build actually happened, rather than that you asked for one.** Running
-`cargo build --target i686-pc-windows-msvc` in the same breath as a `git checkout` or
+**A build that succeeded is not a build that happened, which is why the placed file is read back.**
+Running `cargo build --target i686-pc-windows-msvc` in the same breath as a `git checkout` or
 `git reset --hard` has been seen answering `Finished in 0.09s` against files git had just
 rewritten — Cargo's freshness is mtime-based, and a source and a target stamped within the same
-second are not ordered. The failure then names the *target* ("this host could not give the target a
-32-bit worker"), so it reads as a missing engine rather than a build that declined to run.
-`(Get-Item build.rs).LastWriteTime = Get-Date` before the build forces it.
+second are not ordered. Copying that artifact and reporting success would hand back the misleading
+failure above, so `ensure_x86_worker` re-reads the worker's `ProductVersion` after placing it,
+deletes a stale artifact to deny cargo the reuse, and asks once more; a second failure reports
+itself as a stale build rather than as a missing worker.
 
 ## Manual checklist
 
