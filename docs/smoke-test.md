@@ -1689,8 +1689,7 @@ gate on what they observe rather than on a claim about what CI has.
 ## The 32-bit managed target tier
 
 ```pwsh
-cargo build --target i686-pc-windows-msvc
-Copy-Item target\i686-pc-windows-msvc\debug\windbg-mcp.exe target\debug\x86 -Force
+.\tools\refresh-x86-worker.ps1
 cargo test --test mcp_smoke -- --nocapture a_32_bit_managed
 ```
 
@@ -1724,8 +1723,13 @@ The tier **asserts the dump's size, not its existence**, and that is not belt-an
 passes every check that only asks whether the file is there.
 
 **What the host needs** is `x86\windbg-mcp.exe` and a 32-bit `dbgeng.dll` beside it, in an `x86\`
-directory next to the binary under test — so `target\debug\x86\` for a `cargo test` run. Build the
-worker with `cargo build --target i686-pc-windows-msvc`; the engine payload is the copy block in
+directory next to the binary under test — so `target\debug\x86\` for a `cargo test` run.
+[`tools/refresh-x86-worker.ps1`](../tools/refresh-x86-worker.ps1) builds the worker and places it,
+which is two steps because `cargo build` does neither: the i686 build is a second target triple the
+host build never produces, and it lands in `target\i686-pc-windows-msvc\debug\` rather than in
+`x86\`. It then compares the two binaries' `ProductVersion` stamps and refuses a mismatch, so a
+stale worker is named before the tier runs rather than after (`-Check` asks without building). The
+engine payload is the copy block in
 the skill's `setup.md`, and on an x64 host the four DLLs in `SysWOW64` were measured to be enough
 for this tier, which loads SOS but resolves no PDB. Both halves are checked before the worker is
 spawned, because an image whose engine is missing fails in the *loader*, before any of this

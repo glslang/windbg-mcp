@@ -79,9 +79,17 @@ host could not give the target a 32-bit worker* — which reads as a missing fil
 one. After every edit **and after every commit**, before running that tier:
 
 ```pwsh
-cargo build --target i686-pc-windows-msvc
-Copy-Item target\i686-pc-windows-msvc\debug\windbg-mcp.exe target\debug\x86 -Force
+.\tools\refresh-x86-worker.ps1
 ```
+
+It does the two steps `cargo build` cannot — the i686 build is a second target triple, which the
+host build never produces, and it lands in `target\i686-pc-windows-msvc\debug\` rather than in the
+`x86\` subdirectory the supervisor looks in — and then **compares the two stamps and refuses a
+mismatch**, which is the part worth having: it reads `ProductVersion` off each binary's version
+resource (`FileVersion` stays the bare release, so comparing that one proves nothing), so the
+answer arrives before the tier runs rather than as a failure that reads like a missing file.
+`-Check` asks without building. `-Profile release` does the same for a release tree; the engine
+mirroring is `-SkipEngine`-able and no-ops when the payload is already there.
 
 **`x86\` is a subdirectory because the loader makes it one.** An executable's own directory is
 searched first, so a 32-bit `dbgeng.dll` dropped beside the 64-bit one would be found by the wrong
