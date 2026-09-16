@@ -96,8 +96,15 @@ It also **fails when no 32-bit `dbgeng.dll` ends up beside the worker**, which i
 of failure as the rest: `x86_engine_tier` *skips* in that state, so the tier reports
 `test result: ok. 2 passed` with both tests stood down, and a script exiting 0 there would be
 reporting a capability nothing has. `-SkipEngine` says where the engine comes from, not whether the
-worker needs one. `-Check` asks without building; `-Profile release` does the same for a release
-tree, where a build blocked by a running server's file lock is reported rather than fatal.
+worker needs one. `-Profile release` does the same for a release tree, where a build blocked by a
+running server's file lock is reported rather than fatal.
+
+**`-Check` asks without building, and cannot see one state: both binaries older than the tree.** It
+compares them to each other, so straight after a commit — before anything is rebuilt — it finds two
+stale binaries that agree and reports green, and then `cargo test` rebuilds the supervisor and not
+the worker. Seeing that would mean reproducing `build.rs`'s stamp in the script, which is the
+second-copy-of-a-rule hazard `x86_engine_tier`'s own comment is written about. So the instruction
+above is unchanged by its existence: after an edit **and after a commit**, run the build path.
 
 **`x86\` is a subdirectory because the loader makes it one.** An executable's own directory is
 searched first, so a 32-bit `dbgeng.dll` dropped beside the 64-bit one would be found by the wrong
