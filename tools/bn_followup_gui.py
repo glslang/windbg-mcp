@@ -125,7 +125,11 @@ def endpoint_diff_complete(diff, match):
             if not instruction or instruction.get("text_truncated") is not False:
                 return False
             text = instruction.get("text", "").strip().casefold().split()
-            if int(instruction["rva"], 16) != base + 4 * index or not text:
+            if (
+                int(instruction["rva"], 16) != base + 4 * index
+                or int(instruction["address"], 16) != 0x140000000 + base + 4 * index
+                or not text
+            ):
                 return False
             if text[0] != ("clrbhb", "isb", "b")[index]:
                 return False
@@ -133,8 +137,17 @@ def endpoint_diff_complete(diff, match):
                 return False
             if index == 1 and text not in (["isb"], ["isb", "sy"], ["isb", "#0xf"]):
                 return False
-            if index == 2 and len(text) != 2:
-                return False
+            if index == 2:
+                if len(text) != 2:
+                    return False
+                try:
+                    destination = int(text[1], 16)
+                except ValueError:
+                    return False
+                # Both hash-pinned PEs load at this preferred base. Each stub
+                # jumps to the corresponding handler exactly 0x5000 bytes on.
+                if destination != 0x140000000 + base + 0x5000:
+                    return False
     return True
 
 

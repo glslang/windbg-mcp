@@ -2,6 +2,7 @@
 
 import copy
 import json
+import hashlib
 import importlib.util
 import struct
 import subprocess
@@ -573,12 +574,60 @@ class DecoderTests(unittest.TestCase):
                 with (
                     patch.object(sys, "argv", args),
                     patch.object(decoder, "library", side_effect=lambda p: p),
+                    patch.object(decoder, "CORPUS_COUNT", 1),
+                    patch.object(
+                        decoder,
+                        "CORPUS_SHA256",
+                        hashlib.sha256(corpus.read_bytes()).hexdigest(),
+                    ),
                     patch.object(decoder, "decode", side_effect=decode),
                     patch("builtins.print"),
                     self.assertRaises(SystemExit) as result,
                 ):
                     decoder.main()
                 self.assertEqual(result.exception.code, expected)
+
+    def test_cli_rejects_unpinned_corpus_before_loading_libraries(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            corpus = root / "corpus"
+            args = [
+                "compare",
+                "--before",
+                "before",
+                "--after",
+                "after",
+                "--corpus",
+                str(corpus),
+                "--output",
+                str(root / "result"),
+            ]
+            for content in (
+                b"",
+                b"D503201F nop\n",
+                b"D503201F nop\n" * decoder.CORPUS_COUNT,
+            ):
+                corpus.write_bytes(content)
+                with (
+                    patch.object(sys, "argv", args),
+                    patch.object(decoder, "library") as library,
+                    self.assertRaisesRegex(SystemExit, "corpus SHA-256"),
+                ):
+                    decoder.main()
+                library.assert_not_called()
+            # Isolate the count gate from the digest gate, which also rejects
+            # truncation; changing either production check must fail a test.
+            with (
+                patch.object(sys, "argv", args),
+                patch.object(decoder, "library") as library,
+                patch.object(
+                    decoder, "CORPUS_SHA256", hashlib.sha256(content).hexdigest()
+                ),
+                patch.object(decoder, "CORPUS_COUNT", decoder.CORPUS_COUNT + 1),
+                self.assertRaisesRegex(SystemExit, "corpus count"),
+            ):
+                decoder.main()
+            library.assert_not_called()
 
 
 class ComparisonTests(unittest.TestCase):
@@ -603,6 +652,10 @@ class ComparisonTests(unittest.TestCase):
             "wrong_branch",
             "clrbhb_operand",
             "missing_branch_operand",
+            "invalid_branch_operand",
+            "wrong_branch_reference",
+            "wrong_branch_target",
+            "wrong_instruction_address",
         ):
             rows = copy.deepcopy(matches)
             if failure == "wrong_pair":
@@ -615,10 +668,24 @@ class ComparisonTests(unittest.TestCase):
                 items = [
                     {
                         side: {
+                            "address": hex(
+                                0x140000000
+                                + int(match[side]["coordinate"]["rva"], 16)
+                                + offset
+                            ),
                             "rva": hex(
                                 int(match[side]["coordinate"]["rva"], 16) + offset
                             ),
-                            "text": ("clrbhb", "isb", "b 0x140114c00")[offset // 4],
+                            "text": (
+                                "clrbhb",
+                                "isb",
+                                "b "
+                                + hex(
+                                    0x140000000
+                                    + int(match[side]["coordinate"]["rva"], 16)
+                                    + 0x5000
+                                ),
+                            )[offset // 4],
                             "text_truncated": failure == "truncated_text",
                         }
                         for side in ("reference", "target")
@@ -629,10 +696,19 @@ class ComparisonTests(unittest.TestCase):
                     "wrong_clrbhb_reference": (0, "reference", "hint #22"),
                     "wrong_clrbhb_target": (0, "target", "undefined"),
                     "wrong_isb": (1, "target", "nop"),
-                    "wrong_branch": (2, "reference", "bl 0x140114c00"),
+                    "wrong_branch": (
+                        2,
+                        "reference",
+                        items[2]["reference"]["text"].replace("b ", "bl ", 1),
+                    ),
                     "clrbhb_operand": (0, "target", "clrbhb x0"),
                     "missing_branch_operand": (2, "target", "b"),
+                    "invalid_branch_operand": (2, "reference", "b garbage"),
+                    "wrong_branch_reference": (2, "reference", "b 0x140114c04"),
+                    "wrong_branch_target": (2, "target", "b 0x14011fc04"),
                 }
+                if failure == "wrong_instruction_address":
+                    items[0]["target"]["address"] = "0x14011ac04"
                 if failure in wrong_text:
                     index, side, text = wrong_text[failure]
                     items[index][side]["text"] = text
