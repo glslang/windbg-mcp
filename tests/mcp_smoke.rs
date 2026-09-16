@@ -965,6 +965,7 @@ const VERSION_FIELDS: &[&str] = &[
 /// this there for a reason that has nothing to do with what it checks.
 #[test]
 fn the_32_bit_worker_carries_the_same_version_resource() {
+    println!("worker: {}", ensure_x86_worker());
     let Some(worker) = std::path::Path::new(EXE)
         .parent()
         .map(|dir| dir.join("x86").join("windbg-mcp.exe"))
@@ -16051,6 +16052,145 @@ fn x86_fixture() -> Option<&'static std::path::Path> {
         .as_deref()
 }
 
+/// Builds the 32-bit worker and puts it beside the server under test, if the one there is absent
+/// or from another build.
+///
+/// **This tier makes its own fixtures** — it compiles a C# program with `csc.exe` and dumps it,
+/// and [`ensure_engine_beside_test_binary`] mirrors the engine payload — and the worker was the
+/// one fixture still left to whoever remembered. It is the one that goes *stale*, which is what
+/// made leaving it out expensive: `build.rs` watches `.git\HEAD` and the branch ref, so a commit —
+/// or a rebase, which rewrites every commit at once — re-stamps the supervisor while a worker
+/// built minutes earlier keeps the old stamp. The supervisor then refuses it, the session falls
+/// back to the 64-bit build, and this tier fails saying the host could not give the target a
+/// 32-bit worker, which reads as a *missing* file rather than a stale one.
+///
+/// **Why here and not in the build.** `cargo build` never produces it: the i686 build is a second
+/// target triple the host build does not run, and it lands in that triple's directory rather than
+/// in the `x86\` subdirectory the loader rule requires. `build.rs` cannot do it either — cargo
+/// holds one lock over the whole `target` directory, shared across triples, so a nested cargo
+/// would wait on a lock its own outer build is holding and never gets back. That lock is released
+/// by the time a **test binary** runs (measured: a concurrent `cargo build --target
+/// i686-pc-windows-msvc` finishes in 0.11s while tests execute), which makes this the first point
+/// in the pipeline where it is possible at all.
+///
+/// Returns what it did, for the tests to print. It never panics and never fails the run: a host
+/// with no cargo, or a build that will not run, is left to the gate and the assertions below,
+/// which already say what is missing. Done once per test binary, so three tests wanting it cost
+/// one build.
+fn ensure_x86_worker() -> String {
+    static ONCE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ONCE.get_or_init(|| {
+        let Some(dir) = std::path::Path::new(EXE).parent() else {
+            return "cannot locate the test binary's directory".into();
+        };
+        // Derived from the test binary's own path rather than from `debug_assertions`, which says
+        // nothing about which profile directory cargo used.
+        let profile = dir
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .into_owned();
+        let worker_dir = dir.join("x86");
+        let worker = worker_dir.join("windbg-mcp.exe");
+
+        // The 32-bit engine, from where `setup.md` has the payload put — the same source and the
+        // same reason as [`ensure_engine_beside_test_binary`], which does this for the 64-bit side.
+        // Without it a fresh `target\debug` still needs a copy by hand, which is the complaint this
+        // whole helper exists to answer. It cannot be *built*, only found: it comes from a WinDbg
+        // package, so a host with no payload anywhere is left to the gate.
+        let mirrored = mirror_x86_engine(&worker_dir);
+
+        let wanted = read_version_field(EXE, "ProductVersion");
+        if worker.is_file()
+            && read_version_field(&worker.to_string_lossy(), "ProductVersion") == wanted
+        {
+            return format!(
+                "the worker beside {} is this build{mirrored}",
+                dir.display()
+            );
+        }
+
+        // `env!("CARGO")` is the cargo that built this test, so a toolchain the caller selected is
+        // the one that builds the worker.
+        let built = std::process::Command::new(env!("CARGO"))
+            .arg("build")
+            .arg("--target")
+            .arg(X86_TRIPLE)
+            .args(if profile == "release" {
+                &["--release"][..]
+            } else {
+                &[][..]
+            })
+            .arg("--manifest-path")
+            .arg(concat!(env!("CARGO_MANIFEST_DIR"), "\\Cargo.toml"))
+            .status();
+        match built {
+            Ok(status) if status.success() => {}
+            Ok(status) => return format!("`cargo build --target {X86_TRIPLE}` exited {status}"),
+            Err(error) => return format!("could not run cargo to build the worker: {error}"),
+        }
+
+        // Beside the *test binary*, so a `CARGO_TARGET_DIR` pointing somewhere else is followed
+        // rather than assumed away.
+        let Some(target_root) = dir.parent() else {
+            return "cannot locate the target directory".into();
+        };
+        let fresh = target_root
+            .join(X86_TRIPLE)
+            .join(&profile)
+            .join("windbg-mcp.exe");
+        if let Err(error) = std::fs::create_dir_all(&worker_dir) {
+            return format!("could not create {}: {error}", worker_dir.display());
+        }
+        match std::fs::copy(&fresh, &worker) {
+            Ok(_) => format!("built and placed {}{mirrored}", worker.display()),
+            Err(error) => format!(
+                "built {} but could not copy it to {}: {error}",
+                fresh.display(),
+                worker.display()
+            ),
+        }
+    })
+    .clone()
+}
+
+/// Copies a 32-bit engine into `into` from the release tree, for the DLLs that are not there.
+///
+/// Reports as a clause appended to the worker's own line, and never fails: a host with no 32-bit
+/// payload is a host this tier stands down on, which [`x86_engine_tier`] already says. It copies
+/// whatever of [`ENGINE_DLLS`] is missing rather than a shorter list of its own — this tier needs
+/// only an engine that loads SOS, but a second list would be a second thing to keep in step, and
+/// copying more than the minimum costs a few megabytes into a directory `target` already owns.
+fn mirror_x86_engine(into: &std::path::Path) -> String {
+    let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target\\release\\x86");
+    let missing: Vec<&str> = ENGINE_DLLS
+        .iter()
+        .copied()
+        .filter(|dll| !into.join(dll).exists())
+        .collect();
+    if missing.is_empty() {
+        return String::new();
+    }
+    if std::fs::create_dir_all(into).is_err() {
+        return String::new();
+    }
+    let copied: Vec<&str> = missing
+        .into_iter()
+        .filter(|dll| std::fs::copy(source.join(dll), into.join(dll)).is_ok())
+        .collect();
+    if copied.is_empty() {
+        return String::new();
+    }
+    format!(
+        ", and mirrored {} from {}",
+        copied.join(", "),
+        source.display()
+    )
+}
+
+/// The 32-bit target triple, named once so the build above and the prose below cannot disagree.
+const X86_TRIPLE: &str = "i686-pc-windows-msvc";
+
 /// The gate for this tier: **a 32-bit engine beside the server under test**.
 ///
 /// Deliberately the engine and not the worker, and that split is the whole design. A host with no
@@ -16223,6 +16363,7 @@ fn sos_answers_about_managed_threads(server: &mut Server, session: &str) {
 /// see.
 #[test]
 fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
+    println!("worker: {}", ensure_x86_worker());
     if !x86_engine_tier() {
         return;
     }
@@ -16263,6 +16404,7 @@ fn a_32_bit_managed_dump_is_served_by_an_engine_that_can_load_its_sos() {
 /// while the dump test passes is about the routing rather than about the target.
 #[test]
 fn a_32_bit_managed_process_is_attached_by_an_engine_that_can_load_its_sos() {
+    println!("worker: {}", ensure_x86_worker());
     if !x86_engine_tier() {
         return;
     }
