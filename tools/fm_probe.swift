@@ -4,20 +4,22 @@
 // re-running it is how those figures are re-derived rather than recalled. It needs macOS 26+ and
 // Apple Intelligence switched on:
 //
-//     /tmp/fm_probe surface <tools-list.json>   # availability, window, what the surface costs
-//     /tmp/fm_probe drive   <tools-list.json>   # one canned dump-triage task, no Windows host
-//     /tmp/fm_probe tokens  <file> [file ...]   # bytes per token, per kind of content
+//     /tmp/fm_probe surface <capture.json> [more.json ...]   # window, and what each costs
+//     /tmp/fm_probe drive   <capture.json>                   # one canned task, no Windows host
+//     /tmp/fm_probe tokens  <file> [file ...]                # bytes per token, by content kind
 //
 // It compiles together with `fm_schema.swift`, which holds the translation:
 //
 //     swiftc -swift-version 6 -O tools/fm_schema.swift tools/fm_probe.swift -o /tmp/fm_probe
 //
-// `<tools-list.json>` is either an MCP `tools/list` result (`{"tools":[...]}`) or the bare array,
-// with `name`, `description` and `inputSchema` on each entry. **Capture a real one from a Windows
-// host.** The numbers in the doc came from a reconstruction of the surface (descriptions from the
-// doc comments in `src/server.rs`, schemas rebuilt from the `JsonSchema` structs), which lands at
-// 80-83% of the bytes `docs/tool-surface.md` records, and that gap is the one inferred figure in
-// the whole write-up.
+// A capture is an MCP `tools/list` result (`{"tools":[...]}`), the bare array, or ollama's
+// function-calling shape, with `name`, `description` and `inputSchema` on each entry.
+//
+// **One capture per `--tools` spec, each taken from a listener serving that spec.** `surface`
+// measures every capture it is given exactly as given and never subsets one, because a narrowed
+// surface is not the full surface filtered by name: the server drops a tool's cross-references to
+// tools the client cannot see, which is 1,155 B on `crash` alone. An earlier version of this file
+// did subset, and published numbers inflated by that much for all three narrowed surfaces.
 //
 // The translation itself lives in `fm_schema.swift`, shared with `fm_chat.swift` so there is one
 // implementation of it rather than two.
@@ -43,26 +45,12 @@ struct DynamicTool: Tool {
     }
 }
 
-func buildTools(_ surface: [[String: Any]], only: Set<String>?,
+func buildTools(_ surface: [[String: Any]],
                 invoke: @escaping @Sendable (String, String) -> String) -> ([any Tool], [String]) {
-    let (specs, problems) = buildSpecs(surface, only: only)
+    let (specs, problems) = buildSpecs(surface)
     return (specs.map { DynamicTool(name: $0.name, description: $0.description,
                                     parameters: $0.parameters, invoke: invoke) }, problems)
 }
-
-// MARK: - The surfaces, mirroring src/toolset.rs
-
-// Hardcoded rather than derived, because this probe runs on a Mac and `--tools` is resolved inside
-// a binary that only builds on Windows. **If `GROUPS` in `src/toolset.rs` moves, this goes stale
-// silently** - the tool counts printed below are the check: 13 / 23 / 31 against
-// `docs/tool-surface.md`.
-let ALWAYS = ["open_dump", "open_trace", "attach_kernel", "attach_kernel_local", "attach_process",
-              "launch", "end_session", "session_status", "server_log", "interrupt"]
-let INSPECT = ["registers", "current_location", "backtrace", "disassemble", "read_memory",
-               "modules", "threads", "execute", "dx", "set_symbol_path"]
-let EXEC = ["go", "step_over", "step_into", "run_to_address", "set_breakpoint",
-            "continue_async", "wait_for_stop", "break_in"]
-let CRASH = ["crash_triage", "exception_triage", "decode_error_reporting"]
 
 let INSTRUCTIONS = """
 Drive WinDbg/DbgEng for live user-mode, kernel, crash-dump and Time Travel Debugging (TTD) work. \
@@ -114,35 +102,42 @@ func reportWindow(_ model: SystemLanguageModel) async -> Int {
     return 0
 }
 
-func surfaceCommand(_ model: SystemLanguageModel, _ path: String) async throws {
+func surfaceCommand(_ model: SystemLanguageModel, _ paths: [String]) async throws {
     reportAvailability(model)
     let window = await reportWindow(model)
 
-    let surface = try loadSurface(path)
-    let stub: @Sendable (String, String) -> String = { _, _ in "{}" }
-
-    print("\n== what the surface costs ==")
-    print(pad("--tools", 32) + rpad("tools", 6) + rpad("tokens", 9)
+    print("\n== what each surface costs ==")
+    print(pad("capture", 34) + rpad("tools", 6) + rpad("bytes", 9) + rpad("tokens", 9)
           + (window > 0 ? rpad("% window", 10) : ""))
-    let surfaces: [(String, Set<String>?)] = [
-        ("crash", Set(ALWAYS + CRASH)),
-        ("session,inspect,crash", Set(ALWAYS + INSPECT + CRASH)),
-        ("session,inspect,exec,crash", Set(ALWAYS + INSPECT + EXEC + CRASH)),
-        ("(absent) - every tool", nil),
-    ]
-    for (label, only) in surfaces {
-        let (tools, problems) = buildTools(surface, only: only, invoke: stub)
+    var allProblems: [String] = []
+    for path in paths {
+        let surface = try loadSurface(path)
+        let (specs, problems) = buildSpecs(surface)
+        let tools: [any Tool] = specs.map {
+            DynamicTool(name: $0.name, description: $0.description, parameters: $0.parameters,
+                        invoke: { _, _ in "{}" })
+        }
         let tokens = try await model.tokenCount(for: tools)
+        // The same measure `docs/tool-surface.md` calls "model context": name, description and
+        // input schema as MCP serialises them. Not the ollama function-calling shape the driver
+        // measures its `surface.bytes` in, which wraps each entry and runs about 3% larger.
+        let bytes = surface.reduce(0) { total, entry in
+            let name = (entry["name"] as? String) ?? ""
+            let desc = (entry["description"] as? String) ?? ""
+            let schema = entry["inputSchema"].flatMap {
+                try? JSONSerialization.data(withJSONObject: $0, options: [.sortedKeys, .withoutEscapingSlashes])
+            }
+            return total + name.utf8.count + desc.utf8.count + (schema?.count ?? 0)
+        }
         let share = window > 0 ? String(format: "%.0f%%", 100.0 * Double(tokens) / Double(window)) : ""
-        let failed = problems.filter { $0.contains("FAILED TO BUILD") }.count
-        print(pad(label, 32) + rpad("\(tools.count)", 6) + rpad("\(tokens)", 9) + rpad(share, 10)
-              + (failed > 0 ? "  (\(failed) untranslatable)" : ""))
+        print(pad((path as NSString).lastPathComponent, 34) + rpad("\(tools.count)", 6)
+              + rpad("\(bytes)", 9) + rpad("\(tokens)", 9) + rpad(share, 10))
+        allProblems.append(contentsOf: problems)
     }
 
-    let (_, problems) = buildTools(surface, only: nil, invoke: stub)
-    if !problems.isEmpty {
+    if !allProblems.isEmpty {
         print("\n== schema translation ==")
-        for problem in problems { print("  - \(problem)") }
+        for problem in allProblems { print("  - \(problem)") }
     }
 
     print("\ninstructions: \(try await model.tokenCount(for: Instructions(INSTRUCTIONS))) tokens")
@@ -174,7 +169,7 @@ func driveCommand(_ model: SystemLanguageModel, _ path: String) async throws {
     let log = CallLog()
 
     let surface = try loadSurface(path)
-    let (tools, _) = buildTools(surface, only: Set(ALWAYS + CRASH)) { name, arguments in
+    let (tools, _) = buildTools(surface) { name, arguments in
         log.add("\(name) \(arguments)")
         return replies[name] ?? #"{"status":"ok"}"#
     }
@@ -237,7 +232,7 @@ struct FMProbe {
         }
 
         switch arguments[1] {
-        case "surface": try await surfaceCommand(model, arguments[2])
+        case "surface": try await surfaceCommand(model, Array(arguments.dropFirst(2)))
         case "drive":   try await driveCommand(model, arguments[2])
         case "tokens":  try await tokensCommand(model, Array(arguments.dropFirst(2)))
         default:

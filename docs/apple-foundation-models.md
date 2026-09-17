@@ -47,29 +47,36 @@ transcript, every tool result and the answer.
 ## What the surface costs against that window
 
 Token counts are `SystemLanguageModel.tokenCount(for: [any Tool])` — Apple's own tokenizer, not a
-rule of thumb — against a **real `tools/list`**, captured from the listener running on the Windows
-VM and measured with [`tools/fm_probe.swift`](../tools/fm_probe.swift):
+rule of thumb — against **four real `tools/list` captures**, one per `--tools` spec, taken from
+listeners on the Windows VM and measured with [`tools/fm_probe.swift`](../tools/fm_probe.swift):
 
 | `--tools` | Tools | Model-visible bytes | Tokens | Share of the 8,192 window |
 |---|---:|---:|---:|---:|
-| `crash` | 13 | 19,078 | 4,732 | **58%** |
-| `session,inspect,crash` | 23 | 32,322 | 7,793 | **95%** |
-| `session,inspect,exec,crash` | 31 | 43,784 | 10,326 | **126%** |
-| *(absent)* — every tool | 61 | 87,176 | 20,829 | **254%** |
+| `crash` | 13 | 18,396 | 4,456 | **54%** |
+| `session,inspect,crash` | 23 | 31,157 | 7,542 | **92%** |
+| `session,inspect,exec,crash` | 31 | 42,232 | 10,115 | **123%** |
+| *(absent)* — every tool | 61 | 87,248 | 20,829 | **254%** |
+
+Bytes are name + description + input schema as **MCP** serialises them — the measure
+[`tool-surface.md`](tool-surface.md) calls "model context". They are *not* the figure the driver
+prints as `surface.bytes` (19,641 B for the same `crash` surface), which is the minified
+**ollama function-calling** shape the ollama rows are measured in and runs about 3% larger for the
+wrapper. Both are real; mixing them in one sum is the mistake
+[`token-budget.md`](token-budget.md) warns about.
 
 The `instructions` add **95 tokens**, which is the only line here that is cheap.
 
 **Read the last column as a hard fence, not a warning.** Only `--tools crash` leaves usable room.
-`session,inspect,crash` — the bench's `lean` client — spends 95% of the window before the first
+`session,inspect,crash` — the bench's `lean` client — spends 92% of the window before the first
 question is asked, which is not a surface anything can be driven on.
 
-> **These replaced a set of scaled estimates, and the scaling held.** Until the VM was reachable
-> the figures came from a reconstruction of the surface (descriptions from the doc comments in
-> `src/server.rs`, schemas rebuilt from the `JsonSchema` structs) at 80–83% fidelity, scaled by
-> that ratio: 4,795 / 8,164 / 11,007 / 21,012 against the 4,732 / 7,793 / 10,326 / 20,829 measured
-> here. Every one is within 6%, and no claim on this page moved — but
-> `session,inspect,crash` was quoted as "exactly 100%" of the window and is 95%, which is the kind
-> of too-neat number that should have been suspected before it was measured.
+> **One capture per spec, and this is not a formality.** A narrowed surface is not the full one
+> filtered by name: the server drops a tool's cross-references to tools the client cannot see, so
+> `crash` captured from a `--tools crash` listener is **1,155 bytes smaller** than the same
+> thirteen names lifted out of a full capture — against the 1,166 B `src/toolset.rs` documents for
+> that spec, which is the same fact measured three days earlier. An earlier revision of this page
+> subsetted one full capture and published numbers inflated by that much, and `fm_probe` no longer
+> offers the option: it measures each capture exactly as given.
 
 ### The ≈4 B/token rule of thumb does not survive contact with this tokenizer
 
@@ -94,11 +101,11 @@ memory.
 
 ### And then the results have to fit
 
-Surface plus instructions leaves roughly **3,360 tokens** on the `crash` surface, and that is what
+Surface plus instructions leaves roughly **3,640 tokens** on the `crash` surface, and that is what
 the whole investigation gets. Against the result sizes in [`token-budget.md`](token-budget.md),
 converted at the 2.2 B/token measured above:
 
-| Result | Model-visible bytes | ≈ tokens | Against the 3,360 left |
+| Result | Model-visible bytes | ≈ tokens | Against the 3,640 left |
 |---|---:|---:|---|
 | `session_status` | 297 | 135 | fine |
 | `open_dump` | 1,347 | 612 | fine |
@@ -108,7 +115,7 @@ converted at the 2.2 B/token measured above:
 | `modules` (one page) | 12,268 | 5,576 | **over the remainder outright** |
 | `execute` (`lm`) | 19,420 | 8,827 | **larger than the whole window** |
 
-That is a two-call budget, which is exactly what the live drive below spent: `open_dump` plus
+That is a two- or three-call budget, and the live drive below spent two: `open_dump` plus
 `crash_triage` is ~1,455 tokens and leaves room for one or two more.
 
 `modules` and `execute` are both `inspect`, so on a `crash` surface neither is reachable — the
@@ -387,21 +394,24 @@ folded into an aggregate with the ollama cells, which is the misreading
    backend, so a cell asking for `think` or a `num_ctx` is refused rather than silently ignored —
    this model has neither, and a silently ignored axis is how a grid fakes a controlled result.
    `fm_drive.py` refuses both already; this is the runner half. **Not done.**
-4. ~~Re-measure against a real `tools/list`~~ — **done**, and it found a bug rather than just
-   moving numbers: six tools whose `anyOf` the converter was turning into bare strings, and one
-   that would not build at all. The scaled estimates it replaced were all within 6%. Capturing it
-   is two steps, and worth writing down because the second is easy to get wrong:
+4. ~~Re-measure against a real `tools/list`~~ — **done**, and it found two bugs rather than just
+   moving numbers: six tools whose `anyOf` the converter was turning into bare strings, one that
+   would not build at all, and a measurement method that inflated every narrowed surface.
+
+   **Capture one per `--tools` spec, each from a listener serving that spec**, because a narrowed
+   surface is not the full one filtered by name (see the note under the table):
 
    ```console
-   # against a listener serving the whole surface
-   WINDBG_MCP_TOKEN=... WINDBG_MCP_URL=http://127.0.0.1:8767/ python3 -c '...tools/list...'
+   # one listener per spec; --tools all for the full one
+   WINDBG_MCP_TOKEN=... WINDBG_MCP_URL=http://127.0.0.1:8766/ \
+     python3 -c 'import local_model_drive as d; d.handshake(); print(d.mcp("tools/list"))'
+
    swiftc -swift-version 6 -O tools/fm_schema.swift tools/fm_probe.swift -o /tmp/fm_probe
-   /tmp/fm_probe surface tools_list_real.json
+   /tmp/fm_probe surface crash.json lean.json exec.json full.json
    ```
 
-   The capture must come from a **full** surface: `fm_probe` subsets it by name itself, so one
-   capture answers for all four `--tools` specs, but a capture taken through a narrowed client can
-   only ever describe that client.
+   `fm_probe surface` takes any number of captures and measures each exactly as given. It does not
+   subset, and deliberately no longer can.
 
 What is left is step 3, and a graded run: the six tasks on `--tools crash`, several draws, against
 the same answer key — reported as its own row, never folded into an aggregate with the ollama

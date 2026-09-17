@@ -51,6 +51,14 @@ CHAT_TIMEOUT = int(os.environ.get("FM_CHAT_TIMEOUT", "1800"))
 CHAT_BIN = ""
 BUILT_DIR = ""
 
+# **What `fm_chat` reported, per turn, kept where the record can reach it.**
+# `drive.run()` copies a fixed set of ollama fields out of each response into `report["turns"]`,
+# so the `fm` block - whether a count was measured or came from `Response.usage`, how many tools
+# translated, how many were dropped - is dropped on the floor by a loop this backend does not own
+# and should not fork. Collected here and folded into the record in `main()`, which means a run
+# can no longer claim the full served surface when translation served less than it.
+FM_TURNS = []
+
 
 def ensure_binary():
     """Find or build `fm_chat`, and hand back its path.
@@ -100,7 +108,8 @@ def chat(messages, tools):
     except subprocess.TimeoutExpired as e:
         raise drive.ChatFailed(f"fm_chat did not answer within {CHAT_TIMEOUT}s") from e
     if proc.stderr.strip():
-        # Tools that would not translate are named here once per turn; worth seeing, never fatal.
+        # Translation notes, one line each. A tool that would not translate at all does not
+        # arrive here - it comes back as a `tool_translation_failed` result and ends the turn.
         for line in proc.stderr.strip().splitlines()[:4]:
             print(f"    {line}")
     if proc.returncode != 0 or not proc.stdout.strip():
@@ -110,12 +119,18 @@ def chat(messages, tools):
         out = json.loads(proc.stdout)
     except json.JSONDecodeError as e:
         raise drive.ChatFailed(f"fm_chat did not answer with JSON: {proc.stdout[:200]}") from e
+    if isinstance(out.get("fm"), dict):
+        FM_TURNS.append(out["fm"])
     if "error" in out:
         kind = out.get("error_kind", "error")
         if kind == "context_size_exceeded":
             raise drive.ChatFailed(
                 f"context size exceeded: {out.get('token_count')} tokens against a window of "
                 f"{out.get('context_size')}")
+        if kind == "tool_translation_failed":
+            raise drive.ChatFailed(
+                f"{out['error']} (asked for {out.get('tools_requested')}, "
+                f"translated {out.get('tools_translated')})")
         raise drive.ChatFailed(f"{kind}: {out['error']}")
     return out
 
@@ -201,7 +216,11 @@ def main():
         for i, task in enumerate(tasks, 1):
             prompt = task["prompt"] if isinstance(task, dict) else task
             print(f"\n=== task {i}: {prompt[:110]}")
+            FM_TURNS.clear()
             transcript, report = drive.run(task, offered, transcript)
+            # Per task, beside the turns `run()` recorded, so a reader can tell a measured count
+            # from a `Response.usage` one and can see the surface the model was actually built.
+            report["fm"] = {"turns": list(FM_TURNS)}
             drive.write_record(dict(cell, **runtime_identity(), **report))
             if not drive.SCENARIO:
                 transcript = None
