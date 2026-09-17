@@ -78,6 +78,13 @@ const MIN_STEP_BUDGET_MS: u32 = 1_000;
 /// step's action, an assertion inside it, and the state probe, which runs unconditionally — and
 /// dbgscope's watchdog needs a moment beyond that to interrupt and unwind.
 ///
+/// **Which presumes every operation a step starts is armed with something, and one was not.** A
+/// `read_memory` step went straight to `ReadVirtual` with no bound of any kind, so a megabyte over
+/// a slow KD link could carry a batch past this figure however carefully the rest of it was
+/// budgeted — the gap [dbgscope#95](https://github.com/glslang/dbgscope/issues/95) was filed
+/// about, and the reason that presumption is stated here rather than assumed. A read is bounded
+/// now, a page at a time, so the sentence above is true of every step again.
+///
 /// Public because it is the difference between the budget and a bound the worker can actually
 /// *keep*, and something outside is relying on that bound: a teardown is told when the batch will
 /// be done and terminates the worker if it is not. Advertising the bare budget would have it kill
@@ -810,8 +817,17 @@ pub trait Debuggee {
     fn resume(&mut self, command: &str, timeout_ms: u32) -> Result<Ran, String>;
     /// Run to `address` and report a verdict.
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String>;
-    /// Hex-dump `size` bytes at `address`.
-    fn read_memory(&mut self, address: &str, size: u32) -> Result<Ran, String>;
+    /// Hex-dump `size` bytes at `address`, self-aborting after `budget_ms`.
+    ///
+    /// `budget_ms` bounds *a read*, not a command, and it is passed for the reason
+    /// [`Self::pool`]'s is: this is the other step that spends its time inside the engine rather
+    /// than between calls — a megabyte of target memory over a KD wire — and the deadline the
+    /// rollback depends on is what it would spend. Before
+    /// [dbgscope#95](https://github.com/glslang/dbgscope/issues/95) there was no bound to pass, so
+    /// this was the one operation a step could start that could outrun
+    /// [`OVERRUN_ALLOWANCE`]. A read stopped by its budget reports the bytes it reached
+    /// and says so, exactly as a walk reports its coverage.
+    fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, String>;
     /// Answer a pool question — the one capability here that is not a debugger command at all,
     /// but a walk over the allocator's own descriptors.
     ///
@@ -1317,7 +1333,7 @@ fn run_step(
             timeout_ms,
         } => d.run_to(address, wait_ms(*timeout_ms)),
         StepAction::Eval { expr } => d.command(&format!("? {expr}"), budget_ms),
-        StepAction::ReadMemory { address, size } => d.read_memory(address, *size),
+        StepAction::ReadMemory { address, size } => d.read_memory(address, *size, budget_ms),
         // Through the same constructors the pool *tools* use, so a step and a tool cannot drift
         // apart on what a default or a cap means — see [`PoolOp`].
         StepAction::PoolChunk { address, refresh } => {
@@ -2064,8 +2080,11 @@ mod tests {
         fn run_to(&mut self, address: &str, _timeout_ms: u32) -> Result<Ran, String> {
             self.answer_run(&format!("run to {address}"))
         }
-        fn read_memory(&mut self, address: &str, size: u32) -> Result<Ran, String> {
-            self.answer_run(&format!("read {size} at {address}"))
+        fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, String> {
+            // The budget is in the call text for the reason `pool`'s is: a read is bounded now
+            // (dbgscope#95), and a double that swallowed what it was armed with could not tell a
+            // step given the deadline from one given nothing.
+            self.answer_run(&format!("read {size} at {address} within {budget_ms}ms"))
         }
         fn pool(&mut self, query: &PoolOp, budget_ms: u32) -> Result<Ran, String> {
             // The budget is part of the call text, not swallowed: a pool step's whole hazard is
@@ -2653,10 +2672,15 @@ mod tests {
     /// Every kind of step reports a break that reached it — not only the command-shaped ones.
     ///
     /// `run_to`, `read_memory` and the pool steps do not go through `execute_command_bounded`, so
-    /// the engine has no interruption to report for them and the worker's own record is the
-    /// authority. They were wrapped as "finished" at the dispatch, which made a `run_to` cut short
-    /// look like a target that had merely stopped somewhere else — and a pool walk is *genuinely*
-    /// interruptible, since dbgscope's walker polls the same flag.
+    /// for a long time the engine had no interruption to report for any of them and the worker's
+    /// own record was the only authority. They were wrapped as "finished" at the dispatch, which
+    /// made a `run_to` cut short look like a target that had merely stopped somewhere else — and a
+    /// pool walk is *genuinely* interruptible, since dbgscope's walker polls the same flag.
+    ///
+    /// A bounded read now answers for itself as well (dbgscope#95), which does not retire the
+    /// worker's record: a break can land between two of its chunks, or between the read returning
+    /// and the step being assembled. The step reads both, so this case still has to hold for
+    /// `read_memory` with the engine saying nothing.
     #[test]
     fn a_break_is_reported_by_every_shape_of_step() {
         for (action, matching) in [
@@ -3511,6 +3535,45 @@ mod tests {
         // And the defaults are the pool *tools'* defaults, because both come from the same
         // constructor: a census prints 40 rows unless asked otherwise.
         assert!(d.ran("limit: 40"), "{:?}", d.calls);
+    }
+
+    /// A read step is armed with what the *batch* has left, exactly as a pool step is.
+    ///
+    /// The same hazard, reached through the one step that had no bound at all until
+    /// [dbgscope#95](https://github.com/glslang/dbgscope/issues/95): `read_memory` allows a
+    /// megabyte in one call, which over a KD wire is seconds of transfer, and a read that outran
+    /// the steps deadline spent the reserve the rollback lives on — overrunning
+    /// [`OVERRUN_ALLOWANCE`] and with it the bound the worker advertises to a teardown.
+    ///
+    /// Asserted on the budget the step was *armed with* rather than on a clock, because a fast
+    /// local read finishes inside any bound: a test that watched the elapsed time would pass with
+    /// the budget dropped on the floor.
+    #[test]
+    fn a_read_step_is_armed_with_what_the_batch_has_left() {
+        let mut d = stopped()
+            .slow("first", Ok(""), Duration::from_secs(25))
+            .on("read 1048576", Ok("fffff800`00000000  90 90"));
+        let batch = op(
+            vec![
+                cmd("first step"),
+                step(StepAction::ReadMemory {
+                    address: "0xfffff80000000000".to_string(),
+                    size: 1024 * 1024,
+                }),
+            ],
+            vec![],
+        );
+
+        // 60s budget, 30s reserved → the steps have 30s, and the first one spends 25 of them.
+        let report = run(&mut d, &batch, BUDGET);
+
+        assert!(report.committed(), "{}", render(&report));
+        assert!(
+            d.ran("within 5000ms"),
+            "the read must be bounded by what the batch has left; unbounded, a megabyte over a KD \
+             link is the one step that can outrun the bound a teardown is waiting on: {:?}",
+            d.calls
+        );
     }
 
     /// A `{{name}}` is resolved in a pool tag as well as in an address — no field of a step is a

@@ -189,6 +189,16 @@ pub struct MemoryRead {
     pub address: String,
     pub requested_size: u32,
     pub read_size: u32,
+    /// Why the read stopped short of `requested_size`, when it did.
+    ///
+    /// **Present because `read_size` cannot answer it.** A read that ran out of time and one a
+    /// caller interrupted both come back with fewer bytes and nothing else to tell them apart, and
+    /// the next move differs: a deadline says ask for the rest, or for this range with a longer
+    /// call timeout; a request says the caller already knows. Absent means the whole range was
+    /// read — a range the *target* could not answer for is the `error` branch, not a short read
+    /// here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stopped: Option<WalkHalt>,
     pub data: String,
 }
 

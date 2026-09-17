@@ -195,8 +195,16 @@ pub enum EngineOp {
     /// Which cuts the other way too, and is the half that was missed: a typed op that *does* run a
     /// command carries one. [`Self::SetBreakpoint`] is that case, and
     /// `worker::tests::every_unbounded_execute_in_this_worker_is_accounted_for` is what
-    /// stops the next one being an accident. So the absence of a `patience_ms` here is a claim —
-    /// there is no `Execute` in this op — rather than a preference.
+    /// stops the next one being an accident. So the absence of a `patience_ms` here is a claim
+    /// rather than a preference.
+    ///
+    /// **A claim about what can be bounded, though, and not about `Execute`** — which is how it was
+    /// first written, because for a long time the two coincided. They have come apart twice since.
+    /// `SetBreakpoint` kept its patience when its command became a direct engine call, because
+    /// `SetInterrupt` reaches the symbolic resolve inside it. [`Self::ReadMemory`] gained one with
+    /// no command in sight, because a read taken a page at a time can be stopped between pages
+    /// ([dbgscope#95](https://github.com/glslang/dbgscope/issues/95)). The question to ask of a new
+    /// op is therefore whether anything can stop the call underneath it — not whether it runs text.
     Backtrace {
         /// How many frames to walk. Bounded by the supervisor before it gets here.
         frames: u32,
@@ -262,11 +270,30 @@ pub enum EngineOp {
         pass_count: Option<u32>,
         patience_ms: u32,
     },
+    /// A range of target memory, as bytes and as a hex dump.
+    ///
+    /// **It carries a `patience_ms`, and it did not until
+    /// [dbgscope#95](https://github.com/glslang/dbgscope/issues/95).** By the rule
+    /// [`Self::Backtrace`] states, the absence of one is a claim that nothing can bound this op —
+    /// and for a typed read that claim was true while `read_memory` was a single `ReadVirtual`
+    /// with nothing between its start and its return. It is false now: a bounded read takes the
+    /// range a page at a time and checks the deadline before each one, so the bound exists and
+    /// this op has to carry the caller's clock to it. The same move [`Self::SetBreakpoint`] made
+    /// when `set_breakpoint_bounded` appeared, and for the same reason — an op is bounded when the
+    /// call underneath it can be, not when it happens to run a command.
+    ///
+    /// What it buys is the megabyte. `MAX_READ_BYTES` allows 1 MiB in one call, which over a KD
+    /// link is seconds of wire and, on a link that is up but slow, longer than the caller waits —
+    /// leaving this worker inside a read nobody is listening for. The residual is one page, since
+    /// that is the granularity the deadline is observed at; a small read is still a single
+    /// `ReadVirtual` and is bounded in name only, which is honest and costs nothing where such a
+    /// read is one round trip anyway.
     ReadMemory {
         #[serde(default)]
         coordinate: Option<Box<crate::structured::ImageCoordinate>>,
         address: String,
         size: u32,
+        patience_ms: u32,
     },
     /// A structure traversal: a list of addresses, an array, or a pointer chain, with named
     /// fields read out of every node ([`crate::walk`]).
@@ -507,6 +534,7 @@ impl EngineOp {
         match self {
             Self::BoundedCommand { patience_ms, .. }
             | Self::SetBreakpoint { patience_ms, .. }
+            | Self::ReadMemory { patience_ms, .. }
             | Self::Pool { patience_ms, .. }
             | Self::Heap { patience_ms, .. }
             | Self::CrashTriage { patience_ms, .. }
@@ -911,6 +939,12 @@ mod tests {
                 command: None,
                 one_shot: false,
                 pass_count: None,
+                patience_ms: 0,
+            },
+            EngineOp::ReadMemory {
+                coordinate: None,
+                address: "0x1000".into(),
+                size: 1024 * 1024,
                 patience_ms: 0,
             },
             EngineOp::Pool {

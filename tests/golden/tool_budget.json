@@ -384,8 +384,8 @@
       "inputSchema": 1588,
       "modelVisible": 1699,
       "name": "read_memory",
-      "outputSchema": 1309,
-      "wire": 3103
+      "outputSchema": 1438,
+      "wire": 3232
     },
     {
       "annotations": 120,
@@ -556,10 +556,10 @@
     "inputSchema": 52398,
     "instructions": 1983,
     "modelVisible": 90274,
-    "outputSchema": 150859,
-    "payload": 249297,
+    "outputSchema": 150988,
+    "payload": 249426,
     "tools": 61,
-    "wire": 249225,
+    "wire": 249354,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
