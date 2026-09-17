@@ -54,8 +54,34 @@ final class SchemaConverter {
             notes.append("\(path): non-string enum, widened to its base type")
         }
 
-        // `Option<T>` arrives as ["T", "null"]; nullability is carried by the Property's
-        // `isOptional`, not by the type, so the null is dropped here.
+        // **`Option<T>` usually arrives as an `anyOf`, not as a type array.** `schemars` renders
+        // an optional enum or struct as `{"anyOf": [{"$ref": …}, {"type": "null"}]}`, and six of
+        // this server's tools use it - `read_memory`/`set_breakpoint`/`run_to_address`'s
+        // `coordinate`, `server_log`'s `level`, `heap_allocations`'s `backend` and `state`. Left
+        // to the fallthrough these become a bare `string`, which builds and then generates
+        // arguments the server rejects, so the reconstruction this converter was first written
+        // against - which used type arrays - hid the bug entirely.
+        //
+        // Dropping the null branch is right rather than lossy: nullability travels on the
+        // Property's `isOptional`, never on the type.
+        if let branches = (d["anyOf"] ?? d["oneOf"]) as? [[String: Any]] {
+            let concrete = branches.filter { ($0["type"] as? String) != "null" }
+            if concrete.count == 1 {
+                return try convert(concrete[0], name: name, path: path)
+            }
+            if concrete.count > 1 {
+                // A real union. Traversing the branches also *defines* anything they `$ref`,
+                // which is the other half of the bug: an untraversed branch leaves a reference
+                // with no definition and the whole tool fails to build.
+                let converted = try concrete.enumerated().map {
+                    try convert($1, name: "\(name)_\($0)", path: "\(path)|\($0)")
+                }
+                return DynamicGenerationSchema(name: name, description: desc, anyOf: converted)
+            }
+            notes.append("\(path): anyOf with no concrete branch")
+        }
+
+        // `Option<T>` can also arrive as ["T", "null"] in a type array; same reasoning.
         let type = (d["type"] as? String) ?? ((d["type"] as? [String])?.first { $0 != "null" })
 
         switch type {
@@ -95,11 +121,7 @@ final class SchemaConverter {
             // `debug_batch`'s `StepAction` is the real one: an externally-tagged Rust enum rendered
             // by `schemars` as an `anyOf` of single-key objects, which
             // `DynamicGenerationSchema(name:anyOf:)` can express once something walks the branches.
-            if d["anyOf"] != nil || d["oneOf"] != nil {
-                notes.append("\(path): anyOf/oneOf union is not translated yet")
-            } else {
-                notes.append("\(path): untyped, treated as string")
-            }
+            notes.append("\(path): untyped, treated as string")
             return DynamicGenerationSchema(type: String.self)
         }
     }

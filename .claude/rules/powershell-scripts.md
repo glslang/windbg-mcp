@@ -25,3 +25,25 @@ script does anything — `tools/ioctl_harness.ps1` had all three at once:
 `RUST_LOG` widened the server fills the stderr pipe buffer and blocks mid-request, which looks
 exactly like a hung debugger. Leave stderr inherited (it lands in your terminal, interleaved) or
 read it on a second thread.
+
+**A token in one of these scripts is never printed, never an argument, and verified by hash.** All
+three of these have gone wrong here, and the first one twice:
+
+- **Never read a token file to look at it.** `Get-Content …\token` and `cat` both put the value in
+  the transcript, and a transcript is forever. Compare a **SHA-256 prefix** instead — that is how
+  `%ProgramData%\windbg-mcp\token`, the VM's `WINDBG_MCP_LISTEN_TOKEN` and the `Authorization`
+  header in `~/.claude.json` were confirmed to match without any of them being displayed.
+- **An error message will read the file out for you.** `Get-Content …\token | ConvertFrom-Json`
+  against a file that is a bare token — which it is, when the listener has one unnamed client —
+  fails with `Invalid JSON primitive: <the entire token>`. The command that leaked it was a command
+  written to *avoid* printing it, so "I did not ask for the contents" is not the test; assume any
+  command touching the file can echo it on the failure path.
+- **Never pass a token as a command-line argument.** Every process on the box can read a command
+  line. Pipe it over **ssh stdin** into a script that reads one line (`[Console]::In.ReadLine()`),
+  which is how `tools/…` launchers take one, and have the script print a fingerprint rather than
+  the value.
+
+If a token does reach a transcript, it is **rotated, not forgotten**:
+`--rotate-listen-client <name>` keeps that client's sessions where a remove-then-add does not, and
+every consumer of the old value (the guest's environment variable, the `windbg-vm` header) has to
+be re-matched to the new one.
