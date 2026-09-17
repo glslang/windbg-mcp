@@ -43,7 +43,16 @@ three of these have gone wrong here, and the first one twice:
   which is how `tools/…` launchers take one, and have the script print a fingerprint rather than
   the value.
 
-If a token does reach a transcript, it is **rotated, not forgotten**:
-`--rotate-listen-client <name>` keeps that client's sessions where a remove-then-add does not, and
-every consumer of the old value (the guest's environment variable, the `windbg-vm` header) has to
-be re-matched to the new one.
+If a token does reach a transcript, it is **rotated, not forgotten** — and *which* token decides
+how, because the two are rotated by different means and `--rotate-listen-client` only reaches one
+of them:
+
+- **The service's**, in `%ProgramData%\windbg-mcp\token`. `--rotate-listen-client <name>` rewrites
+  that file and the running service picks it up with nothing stopped; it keeps that client's
+  sessions, where a remove-then-add does not. Then re-match every consumer of the old value — the
+  guest's environment variable, the `windbg-vm` header in `~/.claude.json`.
+- **A foreground listener's**, which came from `WINDBG_MCP_LISTEN_TOKEN` in the environment it was
+  launched with. Nothing rewrites that in place: the file command does not touch it, and the
+  process holds the old value until it is **relaunched** with a new one. A leaked bench token stays
+  valid for as long as that listener runs, so rotating it means killing the listener (by the PID
+  `netstat -ano` gives for its port) and starting it again.

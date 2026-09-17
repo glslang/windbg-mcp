@@ -72,6 +72,13 @@ import time
 HERE = os.path.dirname(os.path.abspath(__file__))
 DRIVER = os.path.join(HERE, "local_model_drive.py")
 CLAUDE_DRIVER = os.path.join(HERE, "claude_code_drive.py")
+FM_DRIVER = os.path.join(HERE, "fm_drive.py")
+
+# **The one model this backend can name.** Apple's on-device model has no tag to choose and no
+# digest to record; `fm_drive.py` writes this string into every record. A plan naming anything
+# else would key cells the records can never match, so the run would repeat the whole cell on
+# every invocation and still claim it - the same shape as the `think` trap below.
+FM_MODEL = "apple-foundation-models"
 
 
 def load(path):
@@ -178,11 +185,13 @@ def one_arm_per_log(plan, log_path):
         # the re-run and keep the false claim, which is the worse half.
         if group.get("backend") != "ollama":
             if "think" in group:
+                why = ("the on-device model reports `reasoning: false`, so there is no arm to run"
+                       if group.get("backend") == "fm" else
+                       "reasoning on that backend belongs to the client, not to the run")
                 raise SystemExit(
                     f"the `{group['backend']}` group in this plan sets `think`, which this bench "
-                    f"cannot honour: reasoning on that backend belongs to the client, not to the "
-                    f"run. Remove it - and if the arm matters for those rows, it is not a thing "
-                    f"this harness can vary.")
+                    f"cannot honour: {why}. Remove it - and if the arm matters for those rows, it "
+                    f"is not a thing this harness can vary.")
             continue
         think = bool(group.get("think", False))
         for model in group["models"]:
@@ -223,6 +232,42 @@ def one_arm_per_log(plan, log_path):
                 f"with `--compare`. A record written before the axis existed carries no "
                 f"`think` and counts as `off` here, because the driver sent `think: false` "
                 f"unconditionally until the axis landed.")
+
+
+def fm_axes_are_absent(plan):
+    """Refuse an `fm` group that asks for a model or a context this backend cannot vary.
+
+    **Both would run and both would re-run for ever**, which is why they are refused rather than
+    ignored. A cell is keyed by `(backend, model, num_ctx, surface)` against what the *records*
+    carry, and `fm_drive.py` writes `model` as one fixed string and `num_ctx` as null - it cannot
+    do otherwise, because Apple's model has no tag to choose and its window is fixed at whatever
+    the OS enforces. So a plan naming another model, or asking for a window, produces a cell key no
+    record can ever match: `already_done` never counts it, every invocation repeats the whole cell,
+    and the plan goes on claiming an axis nobody varied. That is the same trap `one_arm_per_log`
+    exists for, in the two other axes this grid has.
+
+    `fm_drive.py` refuses `NUM_CTX` on its own side too. This is the half that fails *before* a
+    cell is spent rather than inside it.
+    """
+    for group in plan["cells"]:
+        if group.get("backend") != "fm":
+            continue
+        wrong = [m for m in group.get("models", []) if m != FM_MODEL]
+        if wrong:
+            raise SystemExit(
+                f"an `fm` group in this plan names {', '.join(repr(m) for m in wrong)}, but this "
+                f"backend has exactly one model and records it as `{FM_MODEL}`. A cell keyed by "
+                f"any other name matches no record, so it would re-run on every invocation and "
+                f"still be reported as measured.")
+        contexts = [c for c in group.get("contexts", [None]) if c]
+        if contexts:
+            raise SystemExit(
+                f"an `fm` group in this plan asks for context {contexts}, which this backend "
+                f"cannot serve: the on-device window is whatever the OS enforces (8,192 on the "
+                f"build this was written against) and no request moves it. Its records carry "
+                f"`num_ctx: null`, so these cells would match nothing and re-run for ever. Drop "
+                f"`contexts` from the group - the window is recorded per run as `served_context`, "
+                f"measured rather than asked for.")
 
 
 def arm_of(record):
@@ -360,6 +405,13 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
         # same reason those rows carry no `model_digest`.
         env["OLLAMA_THINK"] = "true" if think else "false"
         argv = [sys.executable, "-u", DRIVER, plan["tasks"]]
+    elif backend == "fm":
+        # Nothing to set. The model is the one the OS ships, its window cannot be asked for, and it
+        # has no reasoning arm - which is why `fm_drive.py` refuses `OLLAMA_THINK` and `NUM_CTX`
+        # rather than accepting them and running without them. The three axes this grid varies are
+        # all absent here, and that is the finding rather than a gap: see
+        # `docs/apple-foundation-models.md`.
+        argv = [sys.executable, "-u", FM_DRIVER, plan["tasks"]]
     elif backend == "claude-code":
         env["CLAUDE_MODEL"] = model
         # **Every tool in the prompt, as the local models get them.** Claude Code defers MCP
@@ -2199,6 +2251,7 @@ def main():
     log_path = plan["out"]
     logs_dir = plan.get("logs", os.path.join(os.path.dirname(log_path), "logs"))
     one_arm_per_log(plan, log_path)
+    fm_axes_are_absent(plan)
     suite = cell_tasks(plan["tasks"], None)
     done = already_done(log_path, suite)
     print(f"plan {plan['run']}: {len(done)} task records already in {log_path}")
