@@ -14,7 +14,8 @@ full, every time, and length here is paid for by every other instruction competi
 
 ## What this is
 
-`windbg-mcp` is a Rust MCP server (stdio, `rmcp`) exposing **WinDbg/DbgEng** for live user-mode,
+`windbg-mcp` is a Rust MCP server (`rmcp`; stdio, or HTTP under `--listen`) exposing
+**WinDbg/DbgEng** for live user-mode,
 kernel, crash-dump, and Time Travel Debugging (TTD) work. The low-level DbgEng bindings come from
 the sibling crate [`dbgscope`](https://github.com/glslang/dbgscope) (a **path/git dependency we grow
 ourselves** — do not add third-party DbgEng crates).

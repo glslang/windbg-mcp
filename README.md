@@ -7,8 +7,10 @@
 [![Platform: Windows x64](https://img.shields.io/badge/platform-Windows%20x64-0078D6)](https://github.com/glslang/windbg-mcp/blob/main/docs/install.md#requirements)
 
 An [MCP](https://modelcontextprotocol.io) server that exposes **WinDbg/DbgEng** to AI agents
-(Claude Code, Claude Desktop, Cursor, …) over stdio. It drives a live debugger engine for
-**user-mode**, **kernel-mode**, **crash-dump**, and **Time Travel Debugging (TTD)** workflows.
+(Claude Code, Claude Desktop, Cursor, …) — over **stdio**, or over **HTTP** with `--listen`, which
+serves the same tools to clients that are not on the machine DbgEng runs on. It drives a live
+debugger engine for **user-mode**, **kernel-mode**, **crash-dump**, and
+**Time Travel Debugging (TTD)** workflows.
 
 The low-level engine bindings live in [`dbgscope`](https://github.com/glslang/dbgscope)
 (`src/dbgeng.rs`); this crate adds process-per-session engine supervision and the `rmcp` tool
