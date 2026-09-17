@@ -5242,6 +5242,106 @@ fn launch_tier() -> bool {
     true
 }
 
+/// **A read that crosses pages is the range it asked for, in order.**
+///
+/// Since [dbgscope#95](https://github.com/glslang/dbgscope/issues/95) a typed read is bounded by
+/// being taken **a page at a time**, so that a megabyte over a KD link cannot outrun the caller's
+/// clock or the deadline a `debug_batch` advertises to a teardown. The bound is honest and the
+/// *assembly* is the risk: a chunked read can drop a piece, repeat one or place one at the wrong
+/// offset, and every one of those produces a buffer that looks exactly like memory.
+///
+/// **The oracle is a read that cannot be chunked.** A request that lies within one page is a
+/// single `ReadVirtual` — that is the residual this bound is honest about — so four page-aligned
+/// 4 KiB reads go through the engine without touching the chunker at all, and a four-page read has
+/// to equal them laid end to end. The straddling case is checked as well, since a seam is where a
+/// chunked read goes wrong and a run of whole pages need never cross one.
+///
+/// **Comparing two chunked reads of the same range would not do**, which is worth recording
+/// because it was the first version of this test: a chunker that shifted every chunk after the
+/// first by a byte shifts *both* reads the same way, and the two agree while neither is the
+/// memory. The oracle has to be the path the bound does not change.
+///
+/// **A single `read_memory` of these sizes cannot be cut short**, which is why nothing here
+/// asserts a deadline: `watchdog_budget_ms` floors what the tool passes at `WATCHDOG_HEADROOM`,
+/// and 16 KiB of a dump takes microseconds. What the bound *does* under pressure is asserted where
+/// the pressure can be staged — over dbgscope's own chunker, against a reader that can be made to
+/// run out of time on demand. This is the other half: that it costs a correct read nothing.
+#[test]
+fn a_read_across_pages_is_the_range_it_asked_for() {
+    const PAGE: u64 = 4096;
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+
+    // `nt`'s image headers: present in a kernel minidump, and several pages of them.
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": session, "filter": "nt" }),
+        TARGET_STEP,
+    );
+    let base = modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|module| module["name"] == "nt")
+        .map(|module| address_of(&module["start"]))
+        .unwrap_or_else(|| panic!("a kernel dump loads `nt`: {modules}"));
+    assert_eq!(
+        base % PAGE,
+        0,
+        "a module base is page-aligned; {base:#x} is not, so the reads below would not be the \
+         single-transfer oracle this test needs"
+    );
+
+    let mut read = |at: u64, size: u32| -> String {
+        let out = server.tool_data(
+            "read_memory",
+            json!({ "session_id": session, "address": format!("{at:#x}"), "size": size }),
+            TARGET_STEP,
+        );
+        assert_eq!(
+            out["read_size"].as_u64(),
+            Some(u64::from(size)),
+            "a {size}-byte read at {at:#x} came back short: {out}"
+        );
+        assert_eq!(
+            out["stopped"],
+            Value::Null,
+            "a read that got every byte reported why it stopped: {out}"
+        );
+        out["data"]
+            .as_str()
+            .unwrap_or_else(|| panic!("a read answers with hex: {out}"))
+            .to_string()
+    };
+
+    // The oracle: one page each, page-aligned, so each is one `ReadVirtual`.
+    let pages: Vec<String> = (0..4).map(|n| read(base + n * PAGE, PAGE as u32)).collect();
+    let expected = pages.concat();
+
+    let whole = read(base, 4 * PAGE as u32);
+    assert_eq!(
+        whole, expected,
+        "the four-page read of {base:#x} is not the four pages it is made of — a chunk was \
+         dropped, repeated, or written at the wrong offset"
+    );
+
+    // And the seam itself, which a run of whole pages never has to cross. Two hex digits a byte.
+    let straddle = read(base + PAGE - 16, 32);
+    assert_eq!(
+        straddle,
+        format!(
+            "{}{}",
+            &pages[0][2 * (PAGE as usize - 16)..],
+            &pages[1][..32]
+        ),
+        "a read straddling the page boundary at {:#x} is not the bytes either side of it",
+        base + PAGE
+    );
+}
+
 /// **The §9 routine, as one call**, against a real unhandled-C++-exception dump.
 ///
 /// This is the test `every_tool_with_an_output_schema_answers_with_structured_content` defers to

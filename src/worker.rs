@@ -1699,9 +1699,17 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             address,
             size,
             coordinate,
+            patience_ms,
         } => {
             let address = resolve_coordinate(e, coordinate.as_deref(), address, u64::from(size))?;
-            read_memory(e, &address, size).map_err(Failed::from)
+            // The caller's own clock, on the same arithmetic as a bounded command's and with the
+            // same floor: zero would be *no* bound, so a read dequeued at or past the deadline
+            // would be the one read that runs unbounded — which is the wedge this op now carries a
+            // patience to avoid.
+            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued);
+            read_memory(e, &address, size, budget)
+                .map(|(output, _)| output)
+                .map_err(Failed::from)
         }
         // The caller's own deadline, on the same arithmetic as a pool walk's and for the same
         // reason — with one difference that makes it matter more here. A pool walk is bounded by
@@ -4689,11 +4697,27 @@ fn location_coordinate(
     })
 }
 
-/// Reads target memory and renders it as a hex dump.
+/// Reads target memory and renders it as a hex dump, **inside `budget_ms`**.
 ///
 /// Free function rather than an inline arm because a batch step reads memory the same way, and a
-/// second copy of the bound below would be a second chance to get it wrong.
-fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<Output, String> {
+/// second copy of the bound below would be a second chance to get it wrong. It answers the halt
+/// beside the output because its two callers need different things from it: the tool renders it,
+/// and a batch step has to know whether a *request* reached this step — see [`BatchEngine::ran`],
+/// which asks the same question of a command.
+///
+/// The bound is dbgscope's `read_memory_bounded`, which takes the range a page at a time and checks
+/// the deadline before each one. Before [dbgscope#95] there was no bound to pass: a typed read was
+/// one `ReadVirtual` with nothing between its start and its return, so [`MAX_READ_BYTES`] of it
+/// over a KD link was the one call in this worker that could outlast any clock — the caller's, and
+/// the one a batch advertises to a teardown.
+///
+/// [dbgscope#95]: https://github.com/glslang/dbgscope/issues/95
+fn read_memory(
+    e: &DebugEngine,
+    address: &str,
+    size: u32,
+    budget_ms: u32,
+) -> Result<(Output, Option<structured::WalkHalt>), String> {
     let addr = parse_u64(address)?;
     // Bounded before the allocation, not after. `size` arrives from the caller as a bare `u32`,
     // and a large one costs that many bytes here plus a hexdump several times larger — enough to
@@ -4708,15 +4732,43 @@ fn read_memory(e: &DebugEngine, address: &str, size: u32) -> Result<Output, Stri
     }
     addr.checked_add(u64::from(size))
         .ok_or("memory range overflows")?;
-    let bytes = e.read_memory(addr, size as usize).map_err(es)?;
-    Ok(Output::typed(
-        hexdump(addr, &bytes),
-        structured::MemoryRead {
-            address: structured::addr(addr),
-            requested_size: size,
-            read_size: bytes.len() as u32,
-            data: bytes.iter().map(|byte| format!("{byte:02x}")).collect(),
-        },
+    let read = e
+        .read_memory_bounded(addr, size as usize, budget_ms)
+        .map_err(es)?;
+    let stopped = read.cut_short.map(|cut_short| match cut_short {
+        Interruption::Deadline { .. } => structured::WalkHalt::Deadline,
+        Interruption::OnRequest => structured::WalkHalt::Interrupted,
+    });
+    // The note is what keeps a short dump from reading as a short *range*. Without it the hexdump
+    // below simply ends, and a caller decoding a structure out of it reads the tail from bytes
+    // that were never fetched — the failure `MemoryRead::stopped` exists for, arriving through the
+    // half of the answer that is prose.
+    let note = stopped.map(|stopped| {
+        format!(
+            "[windbg-mcp] this read {} after {} of the {size} bytes asked for, so the dump above \
+             stops at {:#x}. The bytes it has are real; what follows them was not read. Ask for \
+             the rest as its own call, or allow this one longer.",
+            stopped.phrase(),
+            read.bytes.len(),
+            addr.saturating_add(read.bytes.len() as u64),
+        )
+    });
+    Ok((
+        Output::typed(
+            appended(hexdump(addr, &read.bytes), note),
+            structured::MemoryRead {
+                address: structured::addr(addr),
+                requested_size: size,
+                read_size: read.bytes.len() as u32,
+                stopped,
+                data: read
+                    .bytes
+                    .iter()
+                    .map(|byte| format!("{byte:02x}"))
+                    .collect(),
+            },
+        ),
+        stopped,
     ))
 }
 
@@ -4928,10 +4980,17 @@ impl BatchEngine<'_> {
     /// batch before this step began.
     ///
     /// This is the authority for the calls dbgscope cannot answer for. A command knows its own
-    /// interruption — the engine clears and reads a flag around `Execute` — but a `run_to` verdict,
-    /// a typed memory read and a pool walk have no such notion, and a walk in particular *is*
-    /// interruptible: dbgscope's walker polls the same Ctrl+C flag and stops. Left unasked, they
-    /// reported every result as whole.
+    /// interruption — the engine clears and reads a flag around `Execute` — but a `run_to` verdict
+    /// and a pool walk have no such notion, and a walk in particular *is* interruptible: dbgscope's
+    /// walker polls the same Ctrl+C flag and stops. Left unasked, they reported every result as
+    /// whole.
+    ///
+    /// A typed memory read was in that list until
+    /// [dbgscope#95](https://github.com/glslang/dbgscope/issues/95) and no longer is: a bounded
+    /// read reports its own `cut_short`, so the step reads that *and* asks here, the way a command
+    /// step does. This stays the authority for a break that landed between the read's chunks and
+    /// this worker's record — same question, two places it can be answered from, and neither alone
+    /// covers the other.
     fn broken(&self) -> bool {
         interrupt_pending(self.job)
     }
@@ -5003,11 +5062,17 @@ impl Debuggee for BatchEngine<'_> {
         })
     }
 
-    fn read_memory(&mut self, address: &str, size: u32) -> Result<Ran, String> {
-        let output = read_memory(self.e, address, size)?.text;
+    fn read_memory(&mut self, address: &str, size: u32, budget_ms: u32) -> Result<Ran, String> {
+        // Bounded, always, and for the reason a command step is: this is the other operation a
+        // step can start that spends its time inside the engine rather than between calls — a
+        // megabyte over a KD wire — and the reserve the rollback lives on is what it would spend.
+        let (output, stopped) = read_memory(self.e, address, size, budget_ms)?;
         Ok(Ran {
-            output,
-            interrupted: self.broken(),
+            output: output.text,
+            // The same reading [`Self::ran_told`] gives a command's `cut_short`: a *request* is an
+            // interruption, and a deadline is this step's own budget doing its job, which the
+            // output now says in as many words.
+            interrupted: stopped == Some(structured::WalkHalt::Interrupted) || self.broken(),
             target_gone: false,
         })
     }

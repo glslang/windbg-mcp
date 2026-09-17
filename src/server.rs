@@ -3430,6 +3430,7 @@ impl WindbgServer {
                     address: location,
                     coordinate: args.coordinate.map(Box::new),
                     size: args.size,
+                    patience_ms: 0,
                 },
             )
             .await;
