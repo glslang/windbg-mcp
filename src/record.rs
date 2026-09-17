@@ -69,7 +69,7 @@ use serde_json::Value;
 
 use crate::kdconn;
 use crate::structured::{
-    BatchReportInfo, BreakpointSet, ErrorCategory, Outcome, RunToReport, StopReport,
+    BatchReportInfo, BreakpointKind, BreakpointSet, ErrorCategory, Outcome, RunToReport, StopReport,
 };
 
 /// Names the file to record into. Absent — the ordinary case — and nothing is recorded at all.
@@ -939,7 +939,27 @@ fn breakpoint_detail(set: &BreakpointSet) -> String {
         Some(command) => format!(", running {command:?} on each hit"),
         None => String::new(),
     };
-    format!("breakpoint {} at {at}{deferred}{command}", bp.id)
+    // **Which kind, and what it watches**, because this line is the whole of what a transcript
+    // records about the state left in the target — and a data breakpoint leaves a *debug register*
+    // programmed where a code one leaves a patched byte. Without them a `ba w4` and a `bp` at one
+    // address read identically here, which is the shape of the loss: a transcript is read after the
+    // session it describes has gone, so what is not in the line is not recoverable from anywhere.
+    // Raised in review on [#334](https://github.com/glslang/windbg-mcp/pull/334).
+    let watching = match &bp.watch {
+        Some(watch) => format!(
+            ", watching {} byte(s) for {} access",
+            watch.size, watch.access
+        ),
+        None => String::new(),
+    };
+    format!(
+        "{} {} at {at}{watching}{deferred}{command}",
+        match &bp.kind {
+            BreakpointKind::Data => "data breakpoint",
+            _ => "breakpoint",
+        },
+        bp.id
+    )
 }
 
 // ---- redaction ------------------------------------------------------------
@@ -1507,6 +1527,86 @@ mod tests {
                 assert!(field.dropped.is_some(), "and it has to say so: {field:?}");
             }
         }
+    }
+
+    /// **A data breakpoint reads as one in the transcript**, with what it watches.
+    ///
+    /// A transcript is read after the session it describes has gone, so what is not in the
+    /// mutation line is not recoverable from anywhere — and a `ba w4` and a `bp` at one address
+    /// leave *different* state in the target: a programmed debug register against a patched byte.
+    /// The detail named neither until this, so the two were one sentence. Raised in review on
+    /// [#334](https://github.com/glslang/windbg-mcp/pull/334).
+    ///
+    /// The code case is asserted beside it, because "says `data breakpoint`" is satisfied by a
+    /// line that says it about everything.
+    #[test]
+    fn a_data_breakpoint_records_what_it_watches() {
+        let path = std::env::temp_dir()
+            .join("windbg-mcp-transcript-tests")
+            .join(format!("watch-detail-{}.jsonl", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let rec = Recorder::to_file(&path, 0).expect("open the transcript");
+
+        let breakpoint = |extra: serde_json::Value| {
+            let mut bp = serde_json::json!({
+                "id": 0,
+                "kind": "code",
+                "address": "0x00007ffb12340000",
+                "enabled": true,
+                "deferred": false,
+                "one_shot": false,
+                "pass_count": 1,
+                "passes_remaining": 1,
+            });
+            for (name, value) in extra.as_object().expect("an object").clone() {
+                bp[name] = value;
+            }
+            serde_json::json!({
+                "status": "ok",
+                "breakpoint": bp,
+                "replaced": [],
+                "breakpoints": [],
+                "cut_short": false,
+            })
+        };
+
+        let call = rec.tool_request("set_breakpoint", None);
+        rec.tool_result(
+            call,
+            true,
+            "",
+            Some(&breakpoint(serde_json::json!({
+                "kind": "data",
+                "watch": { "access": "write", "size": 4 },
+            }))),
+        );
+        let call = rec.tool_request("set_breakpoint", None);
+        rec.tool_result(call, true, "", Some(&breakpoint(serde_json::json!({}))));
+
+        let details: Vec<String> = records(&path)
+            .iter()
+            .filter_map(|r| match &r.event {
+                Event::Mutation { detail, .. } => Some(detail.text.clone()),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(details.len(), 2, "one mutation per call: {details:?}");
+
+        assert!(
+            details[0].contains("data breakpoint"),
+            "a data breakpoint reads as a code one: {:?}",
+            details[0]
+        );
+        assert!(
+            details[0].contains("4 byte(s)") && details[0].contains("write"),
+            "the transcript lost what the breakpoint watches: {:?}",
+            details[0]
+        );
+        assert!(
+            !details[1].contains("data breakpoint") && !details[1].contains("watching"),
+            "a code breakpoint was recorded as watching something: {:?}",
+            details[1]
+        );
     }
 
     /// The whole-record ceiling: the backstop under the per-field caps.
