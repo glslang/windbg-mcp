@@ -1465,8 +1465,27 @@ fn apply_symbol_path(e: &DebugEngine, setting: &SymbolPathSetting) -> Result<(),
 }
 
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
-/// only the bounded-command path cares about.
+/// only the bounded paths care about.
 fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<Output, Failed> {
+    // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
+    // *plus* whatever this op has already spent getting to the point of arming one. Every budget
+    // armed in an arm below is sized from this rather than from `queued`; the messages that report
+    // the queue wait still report `queued`, because those are two different facts.
+    //
+    // The queue wait alone is the figure that is easy to reach for and is short by exactly the work
+    // an op does first. `resolve_coordinate` is that work: it enumerates the module table and can
+    // send the engine to a symbol server for a PDB identity, so a slow lookup followed by a slow
+    // multi-page read hands the read the full remainder of a clock that is already spent. Raised in
+    // review on [#332](https://github.com/glslang/windbg-mcp/pull/332), against `ReadMemory` — a
+    // budget that branch had just given it, and the shape `SetBreakpoint` has had since it began
+    // resolving eagerly.
+    //
+    // The two ops that take the queue wait as a *parameter* and budget inside are unchanged, and
+    // neither is an exception to the rule: nothing runs before either call, and `crash_triage`
+    // already adds its own elapsed time to what it was handed, which is this written out a second
+    // time for the reads that follow its `!analyze`.
+    let dequeued = Instant::now();
+    let spent = || queued + dequeued.elapsed();
     if let Some(refusal) = refuse_when_the_target_is_gone(e, &op) {
         return Err(refusal);
     }
@@ -1653,7 +1672,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             command,
             patience_ms,
         } => {
-            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued);
+            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent());
             raw_command(e, &command, budget)
                 .map(|run| Output::text(told(run)))
                 .map_err(failed)
@@ -1692,7 +1711,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 command.as_deref(),
                 one_shot,
                 pass_count,
-                watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued),
+                watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent()),
             )
         }
         EngineOp::ReadMemory {
@@ -1706,7 +1725,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // same floor: zero would be *no* bound, so a read dequeued at or past the deadline
             // would be the one read that runs unbounded — which is the wedge this op now carries a
             // patience to avoid.
-            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), queued);
+            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent());
             read_memory(e, &address, size, budget)
                 .map(|(output, _)| output)
                 .map_err(Failed::from)
@@ -1717,7 +1736,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         // only bound there is.
         EngineOp::Walk(op) => {
             let patience = Duration::from_millis(u64::from(op.patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => walk_memory(e, op, budget),
                 // Refused rather than attempted, as a pool query that must walk is. A walk with no
                 // time reads nothing and reports an empty table with `stopped: deadline`, which
@@ -1764,7 +1783,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // than starting: a map with no clock disassembles nothing and reports a dispatch
             // routine that accepts no codes, which is an answer rather than an absence.
             let patience = Duration::from_millis(u64::from(patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => ioctl_map(e, &dispatch, Instant::now() + budget),
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
@@ -1789,7 +1808,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // report itself empty or unavailable, which is a composite shaped exactly like a
             // driver with no devices, no control codes and no sensitive imports.
             let patience = Duration::from_millis(u64::from(patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => driver_surface(e, &driver, Instant::now() + budget),
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
@@ -1813,7 +1832,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // search is hundreds of reads, so a call with nothing left would answer with the
             // device's fields and no links -- which is what a device nothing reaches looks like.
             let patience = Duration::from_millis(u64::from(patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => device_security(e, &device, Instant::now() + budget),
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
@@ -1837,7 +1856,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // a refusal when there is none: a scan that stops early names what it found and says
             // it stopped, where a walk with no time reads nothing and reports an empty table.
             let patience = Duration::from_millis(u64::from(patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => driver_hazards(e, &module, Instant::now() + budget),
                 None => Err(Failed::categorised(
                     structured::ErrorCategory::NotRun,
@@ -1860,7 +1879,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // walk that stops early reports NOT REACHABLE *with the reason attached* — which is
             // the same shape as hitting a bound, and already a thing a caller must read.
             let patience = Duration::from_millis(u64::from(args.patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => reachable(e, args, Instant::now() + budget),
                 // Refused rather than attempted with nothing. An already-expired deadline halts
                 // before the seed is disassembled, which leaves `from_entry` unset — and that is
@@ -1900,7 +1919,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         // was wrong in both directions — see [`EngineOp::Pool`].
         EngineOp::Pool { query, patience_ms } => {
             let patience = Duration::from_millis(u64::from(patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => {
                     // Logged because a truncated walk otherwise says only *that* it was truncated,
                     // and the two explanations — this deadline, or a target the walk could not
@@ -1950,7 +1969,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         }
         EngineOp::Heap { query, patience_ms } => {
             let patience = Duration::from_millis(u64::from(patience_ms));
-            match walk_budget(patience, queued) {
+            match walk_budget(patience, spent()) {
                 Some(budget) => {
                     tracing::debug!("worker: heap walk budget {budget:?} (queued {queued:?})");
                     heap(e, query, budget)
@@ -10314,6 +10333,52 @@ mod tests {
     /// before the first poll. Both take `execute_command_bounded` on the remainder of the clock
     /// now, as does the `? <expr>` this op resolves its arguments with ([`resolve_within`]).
     ///
+    /// **No budget is sized from the queue wait alone.**
+    ///
+    /// `queued` is how long an op waited its turn; `spent()` is that plus what the op has already
+    /// used getting to the point of arming a bound. They differ by exactly the work an arm does
+    /// first, and `resolve_coordinate` is that work — it enumerates the module table and can send
+    /// the engine to a symbol server for a PDB identity. A budget taken from `queued` after one of
+    /// those hands the operation the full remainder of a clock that is already spent, which is a
+    /// read or a breakpoint outliving the caller it was sized for. Raised in review on
+    /// [#332](https://github.com/glslang/windbg-mcp/pull/332).
+    ///
+    /// **Read from the source, because the defect is a spelling.** The two arguments are both
+    /// `Duration` and both plausible at every site, so nothing type-checks the difference and no
+    /// runtime test can see an arm that took the wrong one — the numbers agree on every host where
+    /// the work before the bound happens to be fast, which is every host without a cold symbol
+    /// server. What makes this worth a test rather than a comment is that a new arm is written by
+    /// copying the one above it.
+    #[test]
+    fn no_budget_in_this_worker_is_sized_from_the_queue_wait_alone() {
+        let code = include_str!("worker.rs")
+            .split_once("\n#[cfg(test)]")
+            .expect("this module has a test half")
+            .0;
+
+        // Comments are skipped for the reason the scan below skips them: this rule is *named* in
+        // the prose that explains it, so a scan that read comments would fail on the
+        // documentation of the very rule it enforces.
+        let from_the_queue: Vec<&str> = code
+            .lines()
+            .map(str::trim)
+            .filter(|line| !line.starts_with("//") && !line.starts_with("///"))
+            .filter(|line| {
+                // `contains`, not `ends_with`: the two shapes these calls take differ by a
+                // trailing `;` against a trailing ` {`, and a matcher pinned to one of them waves
+                // the other through. Mutation-verified both ways, which is how that was found.
+                (line.contains("watchdog_budget_ms(") || line.contains("walk_budget("))
+                    && line.contains(", queued)")
+            })
+            .collect();
+
+        assert!(
+            from_the_queue.is_empty(),
+            "a budget sized from the queue wait alone is short by whatever its arm ran first — \
+             pass `spent()`: {from_the_queue:?}"
+        );
+    }
+
     /// Read from the source for `record::tests::this_module_never_writes_to_stdout`'s reason: the
     /// property is about what is *written*, and no runtime test can prove the absence of a call
     /// nobody made today.
