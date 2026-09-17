@@ -37,7 +37,9 @@ This file is the map. Each topic is one document, and each document is the whole
 | [The local-model eval](docs/local-model-eval.md) | A grid of model × tool surface × context window against a verified answer key: what a laptop-sized model can drive, and the two defects it found in this server |
 
 Operator and reference material: [remote listener](docs/remote-listener.md),
-[driving it with ollama](docs/local-model.md), [disassembler coordinates](docs/coordinates.md),
+[driving it with ollama](docs/local-model.md),
+[driving it with Apple's on-device model](docs/apple-foundation-models.md),
+[disassembler coordinates](docs/coordinates.md),
 [smoke test](docs/smoke-test.md), [token budget](docs/token-budget.md),
 [releasing](docs/releasing.md).
 
