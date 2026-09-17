@@ -195,7 +195,7 @@ def one_arm_per_log(plan, log_path):
             continue
         think = bool(group.get("think", False))
         for model in group["models"]:
-            for context in group.get("contexts", [None]):
+            for context in contexts_of(group):
                 for surface in group["surfaces"]:
                     coord = (model, context, surface)
                     if seen.setdefault(coord, think) != think:
@@ -234,6 +234,19 @@ def one_arm_per_log(plan, log_path):
                 f"unconditionally until the axis landed.")
 
 
+def contexts_of(group):
+    """A group's context list, with any falsy entry read as "the runtime's default" — `None`.
+
+    **The normalisation is what keeps a cell findable.** Both drivers record `num_ctx` as
+    `NUM_CTX or None`, so a plan writing `0` — a perfectly natural way to spell "don't ask for a
+    window" — produces records carrying `null` while the run loop keys the cell as `0`. They never
+    meet: `already_done` counts nothing, the cell repeats on every invocation, and the plan reports
+    an axis value no record holds. Read once, here, rather than at the three places that iterate a
+    group.
+    """
+    return [c if c else None for c in group.get("contexts", [None])]
+
+
 def fm_axes_are_absent(plan):
     """Refuse an `fm` group that asks for a model or a context this backend cannot vary.
 
@@ -259,7 +272,7 @@ def fm_axes_are_absent(plan):
                 f"backend has exactly one model and records it as `{FM_MODEL}`. A cell keyed by "
                 f"any other name matches no record, so it would re-run on every invocation and "
                 f"still be reported as measured.")
-        contexts = [c for c in group.get("contexts", [None]) if c]
+        contexts = [c for c in contexts_of(group) if c is not None]
         if contexts:
             raise SystemExit(
                 f"an `fm` group in this plan asks for context {contexts}, which this backend "
@@ -2264,7 +2277,7 @@ def main():
         # mention it is the grid as it was.
         draws = int(group.get("draws", 1))
         for model in group["models"]:
-            for context in group.get("contexts", [None]):
+            for context in contexts_of(group):
                 for surface in group["surfaces"]:
                     subset = group.get("subset")
                     wanted = cell_tasks(plan["tasks"], subset)
