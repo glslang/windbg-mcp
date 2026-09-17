@@ -389,6 +389,15 @@ def run_cell(plan, tokens, backend, model, context, surface, draw, subset, plann
     label = (f"{backend}:{model} ctx={context or 'default'} surface={surface}"
              + (f" draw={draw}" if draw != 1 else ""))
     env = dict(os.environ)
+    # **A cell's axes come from the plan, never from the operator's shell.** Each of these is set
+    # by exactly one backend's branch below, so inheriting one into a *different* backend is always
+    # wrong - and `docs/local-model.md` documents driving ollama by hand with `NUM_CTX` and
+    # `OLLAMA_THINK` exported, which is the shell a plan is most likely to be run from. An
+    # inherited `OLLAMA_THINK` reaches `fm_drive.py`, which refuses an arm this model does not
+    # have, and a valid plan dies at `0s, exit 1` blaming a group that asked for nothing.
+    for inherited in ("LOCAL_MODEL", "NUM_CTX", "OLLAMA_THINK", "OLLAMA_KEEP_ALIVE", "EVAL_SEED",
+                      "CLAUDE_MODEL", "ENABLE_TOOL_SEARCH", "EVAL_SUBSET"):
+        env.pop(inherited, None)
     env.update({
         "WINDBG_MCP_URL": plan["url"],
         "WINDBG_MCP_TOKEN": tokens[surface],
