@@ -1332,33 +1332,39 @@ one end-to-end user-mode heap check is standing down on every current build.
 read feeding it, `examples/user_heap_smoke.rs`, and `heap_list`'s description in
 `windbg-mcp`'s `src/server.rs`.
 
-## 80. [windbg-mcp] `identity()` branches two ways on backend, and there are three
+## 80. [windbg-mcp] `identity()` re-derives the backend distinction once per field
 
-`local_model_eval.identity()` decides what a record contributes with one test — `claude-code`, or
-everything else. That was right while there were two backends. There are three, and the `fm` rows
-answer differently from the ollama rows on every field the function collects, so each one had to be
-found separately:
+`local_model_eval.identity()` decides what a record contributes to each identity field by testing
+the backend **again, separately, in every place that needs it**. As it stands there are two such
+tests and they do not agree in shape: a three-way `if/elif/else` covering `harness` and `reasoning`,
+and an unrelated inline ternary choosing `os_build` over `model_digest` for `weights`. Neither knows
+about the other, and a field added tomorrow gets whichever arm its author happens to write — in
+practice the `else`, which is the ollama answer.
 
-- `model_digest` is null by construction (Apple ships the weights with the OS and gives them no
-  address), which reduced every fm run to `weights apple-foundation-models unavailable` — two runs
-  across a macOS update, which *is* a model update, compared as though nothing had moved. Fixed by
-  reading `os_build` for that backend (`09aa279`).
-- `think: false` is an absence rather than an arm, and folding it in printed `on, off` for a run
-  where every backend with the knob ran with it on — the false "something moved" the Claude rows
-  are already excluded to prevent. Fixed as `unavailable` (`faa147a`).
+Both existing tests were added *reactively*, one per review round on the PR that introduced the
+third backend, each after a run had already reported something false:
 
-**Both were review findings on the PR that added the backend, one per round**, which is the shape
-worth acting on rather than either bug: a two-way branch cannot express three backends, so the next
-field added will be wrong for `fm` by default and will be found the same way.
+- `model_digest` is null by construction on an fm row (Apple ships the weights with the OS and gives
+  them no address), so every fm run read `weights apple-foundation-models unavailable` and two runs
+  across a macOS update — which *is* a model update — compared as though nothing had moved
+  (`09aa279`).
+- `think: false` is an absence rather than an arm, so folding it into the reasoning field printed
+  `on, off` for a run in which every backend *with* the knob ran with it on (`faa147a`).
 
-- **Why deferred:** the fix touches the ollama and `claude-code` paths, so it does not belong in the
+**The bugs are fixed; the shape that produced them is not.** Two fields needed a backend test and
+two got one, independently, after the fact. There is no reason the third will be noticed sooner.
+
+- **Why deferred:** the fix touches the ollama and `claude-code` paths, so it had no business in the
   PR that added a third backend. It is also not urgent — both known instances are fixed, and the
   cost of the next one is a review round rather than a wrong number shipped.
-- **What would close it:** make each backend state its own identity rather than have `identity()`
-  infer it — a small table of `(field, backend) -> how to read it`, or a per-backend hook the
-  drivers already could fill, since each driver already knows which of its fields are unavailable
-  and writes them as null deliberately. Then adding a fourth backend declares its answers instead of
-  inheriting the `else` branch.
+- **What would close it:** make each backend *declare* what it can and cannot answer rather than
+  have `identity()` infer it per field. Each driver already knows — all three write the fields they
+  cannot fill as null deliberately — so the knowledge exists at the point of writing and is being
+  re-guessed at the point of reading. A per-backend table, or a hook the drivers fill, means a
+  fourth backend states its answers instead of inheriting an `else`.
+- **A smaller check that would have caught both:** a test that builds one record per backend and
+  asserts every identity field is what that backend claims, so a new field with no backend opinion
+  fails rather than defaults.
 
 **Where it picks up.** `identity()` in `tools/local_model_eval.py`, the `stated()` helper beside it
 and its `unrecorded`/`unavailable` distinction, and the three drivers' cell dicts
