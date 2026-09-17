@@ -519,7 +519,9 @@ is the deliberate end state: this backend varies none of the three axes that gri
 rows in its tables would imply a comparison the design cannot support.
 
 What is left is not a step but a consequence, recorded as `FOLLOWUPS.md` item 80: `identity()`
-decides what a record contributes with a two-way branch on backend, and there are three. Both
-instances that produced — an fm run hiding a macOS update, and `think: false` reading as the `off`
-arm — are fixed, but the branch is still two-way, so the next field added will be wrong for `fm`
-by default.
+works out what a record contributes by testing the backend **again in each field that needs it** —
+a three-way branch for `harness` and `reasoning`, an unrelated ternary for `weights`, neither aware
+of the other, both added one review round apart after a run had already reported something false.
+The two instances that produced — an fm run hiding a macOS update, and `think: false` reading as
+the `off` arm — are fixed. The per-field re-derivation is not, so a field added next inherits
+whichever arm its author happens to write rather than an answer this backend has stated.
