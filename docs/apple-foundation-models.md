@@ -180,34 +180,40 @@ that order — but nothing has proven it.
 
 The whole v1 suite, five draws, on `--tools crash`, graded against the checked-in answer key:
 
-| Task | Answerable on `crash` | Correct | Local models pooled, think off |
-|---|---|---:|---:|
-| `bugcheck` | yes | **5/5** | 19/20 |
-| `driver_blame` | yes | **5/5** | 20/20 |
-| `module_count` | yes | **5/5** | 18/20 |
-| `arm64_pc` | yes | **0/5** | 3/20 |
-| `unloaded_driver` | no | — | — |
-| `ioctl_decode` | no | — | — |
+| Task | Answerable on `crash` | Correct | Local models, think **off** | Local models, think **on** |
+|---|---|---:|---:|---:|
+| `bugcheck` | yes | **5/5** | 19/20 | 20/20 |
+| `driver_blame` | yes | **5/5** | 20/20 | 20/20 |
+| `module_count` | yes | **5/5** | 20/20 | 20/20 |
+| `arm64_pc` | yes | **0/5** | 3/20 | 8/20 |
+| `unloaded_driver` | no | — | — | — |
+| `ioctl_decode` | no | — | — | — |
 
-**15/20 of the 30 task-runs**, 594 s, 31 tool calls. The last column is the published grid's
-[`local-model-eval.md`](local-model-eval.md) figure for the three ~30B MLX models pooled at the same
-surface and draw count, and it is there to stop the total being read as a model comparison: on the
-three tasks this surface answers straightforwardly the on-device model is 15/15 where the 30B-class
-models pooled 57/60, and on `arm64_pc` it is 0/5 against their 3/20. **Five draws cannot separate
-0/5 from a 15% rate** — at 3/20 you would see a clean sweep of failures 44% of the time — so read
-that row as "joins every other local model in failing this task", not as worse than them.
+**15 correct of the 20 answerable task-runs**, out of 30 run in all, in 594 s and 31 tool calls. The last two columns are
+[`local-model-eval.md`](local-model-eval.md)'s reasoning A/B: **four** local models × five draws at
+this same surface, in both arms.
 
-**It fails `arm64_pc` the same way five times out of five**, which is what makes it a capability
-rather than a variance. Asked for the `pc` register it answers `0x0000019e7b820000` every time —
-which is bug check Arg1, and which `crash_triage` prints two lines later as
-`FAULTING FRAME: 0x0000019e7b820000 (frame 10)`. The real `pc` is `0xfffff8013c65bca8`, in frame 0.
-So the model is not inventing a value; it is taking the one this server labels most prominently and
-answering the question it was asked with it. `local-model-eval.md` already calls this task's
-difficulty interpretation rather than surface, and this is that, in one number repeated five times.
+**Read the `think on` column, not the `think off` one.** Matching modes — this model does not
+reason, so compare it to models told not to — is the wrong fairness: those models *can* reason, it
+makes them better, and nobody would deploy them with it off. The honest question is how this
+compares to a local model as you would actually run one, and that is the right-hand column.
 
-The task where reasoning helps most is the one this backend cannot bring reasoning to: the pooled
-rows go 3/20 → 8/20 on `arm64_pc` with thinking on, and `reasoning: false` puts that improvement
-structurally out of reach here.
+Against it, the three straightforward tasks are a **tie at the ceiling**: 15/15 here, 60/60 there.
+The on-device model gives up nothing on the work a `crash` surface actually supports.
+
+`arm64_pc` is where the arms matter, and the pooled figures hide the shape. Per model, the two that
+move go **2/5 → 5/5** and **1/5 → 3/5**; the other two score **0/5 in both arms**. So half the local
+models never answer this task at all, reasoning or not, and the half that do only manage it with
+reasoning **on**. This model's 0/5 puts it with the first half — and `reasoning: false` means the
+lever that moves the second half does not exist for it. That is the finding: not that it is worse
+at this task, but that the only known way to become better at it is unavailable here.
+
+**No probability is quoted for any of that, deliberately.** An earlier draft of this page said a
+clean sweep of failures would happen 44% of the time at the pooled rate, which treats 20 outcomes as
+20 independent trials of one model when they are four models × five draws — the exact
+pseudoreplication [`local-model-eval.md`](local-model-eval.md) documents catching in its own draft.
+Five draws of one model against a four-model pooled rate does not support a test; it supports
+saying which group this model lands in, which is what the paragraph above does.
 
 ### And `session,inspect,crash` fails exactly where the arithmetic says
 
@@ -463,8 +469,10 @@ folded into an aggregate with the ollama cells, which is the misreading
 
    - **A model other than `apple-foundation-models`.** There is one, it has no tag to choose, and
      the driver writes that string into every record.
-   - **Any `contexts` entry.** The window is whatever the OS enforces and no request moves it, so
-     the records carry `num_ctx: null`.
+   - **Any `contexts` entry asking for a real window.** The window is whatever the OS enforces and
+     no request moves it, so the records carry `num_ctx: null`. A *falsy* entry — `null`, `0` — is
+     accepted, because it is normalised to "the runtime's default" and then keys as the records do;
+     only a truthy value is refused.
 
    Both are refused *before* a cell is spent rather than inside it, and for the reason the `think`
    guard already exists: a cell is keyed against what the records carry, so a plan asking for

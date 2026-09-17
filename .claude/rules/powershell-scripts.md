@@ -51,8 +51,15 @@ of them:
   that file and the running service picks it up with nothing stopped; it keeps that client's
   sessions, where a remove-then-add does not. Then re-match every consumer of the old value — the
   guest's environment variable, the `windbg-vm` header in `~/.claude.json`.
-- **A foreground listener's**, which came from `WINDBG_MCP_LISTEN_TOKEN` in the environment it was
-  launched with. Nothing rewrites that in place: the file command does not touch it, and the
-  process holds the old value until it is **relaunched** with a new one. A leaked bench token stays
+- **A foreground listener's**, which nothing rewrites in place: the file command does not touch it,
+  and the process holds what it started with until it is **relaunched**. A leaked bench token stays
   valid for as long as that listener runs, so rotating it means killing the listener (by the PID
-  `netstat -ano` gives for its port) and starting it again.
+  `netstat -ano` gives for its port) and starting it again — *with the right thing changed*, which
+  depends on where its credentials came from:
+  - **Environment-backed** (`WINDBG_MCP_LISTEN_TOKEN`, which is how the bench listener runs):
+    relaunch with a new value.
+  - **File-backed** (`WINDBG_MCP_LISTEN_TOKEN_FILE`): replace the file's token first. Changing the
+    environment variable does nothing here — `Credentials::from_entries` does not read the
+    environment *at all* when a file is configured (`src/client.rs`), so a relaunch with a new
+    `WINDBG_MCP_LISTEN_TOKEN` beside an unchanged file keeps serving the leaked one and looks like
+    a successful rotation.
