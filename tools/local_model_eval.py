@@ -1809,7 +1809,14 @@ def identity(log_records):
                 else ("on" if record["think"] else "off"))
         model = record.get("model")
         if model:
-            weights.setdefault(model, set()).add(stated(record, "model_digest"))
+            # **For the fm rows the OS build *is* the model version.** Apple ships the weights with
+            # the OS and gives them no address, so `model_digest` is null by construction - and
+            # reading it here would reduce every macOS revision to one indistinguishable
+            # "unavailable", which is the opposite of what this block is for: two runs whose model
+            # changed underneath them would compare as though nothing had. `os_build` is the only
+            # identity that moves when the shipped model does.
+            digest = ("os_build" if record.get("backend") == "fm" else "model_digest")
+            weights.setdefault(model, set()).add(stated(record, digest))
     return {name: sorted(values) for name, values in fields.items()} | {
         "weights": {model: sorted(digests) for model, digests in sorted(weights.items())}}
 
