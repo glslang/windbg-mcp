@@ -443,12 +443,12 @@
     },
     {
       "annotations": 115,
-      "description": 330,
-      "inputSchema": 2356,
-      "modelVisible": 2741,
+      "description": 584,
+      "inputSchema": 3265,
+      "modelVisible": 3904,
       "name": "set_breakpoint",
       "outputSchema": 2538,
-      "wire": 5425
+      "wire": 6588
     },
     {
       "annotations": 123,
@@ -552,14 +552,14 @@
   ],
   "totals": {
     "annotations": 6441,
-    "description": 34668,
-    "inputSchema": 52398,
+    "description": 34922,
+    "inputSchema": 53307,
     "instructions": 1983,
-    "modelVisible": 90274,
+    "modelVisible": 91437,
     "outputSchema": 150988,
-    "payload": 249426,
+    "payload": 250589,
     "tools": 61,
-    "wire": 249354,
+    "wire": 250517,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

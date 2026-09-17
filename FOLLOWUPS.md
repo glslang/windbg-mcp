@@ -81,9 +81,11 @@ Items are roughly ordered by how soon they're worth doing, within each cluster.
   ([dbgscope#126](https://github.com/glslang/dbgscope/issues/126),
   [dbgscope#127](https://github.com/glslang/dbgscope/pull/127)). Size and alignment are refused
   before the engine sees them, on the **resolved** address, because the engine takes a bad pair at
-  the set and rejects it at the next *resume* — against a `go` that did nothing wrong. No windbg-mcp
-  tool exposes it yet: `set_breakpoint` takes an expression and nothing else, so a caller wanting
-  `ba` still reaches for `execute`. That is a tool-surface question rather than a primitive one now.
+  the set and rejects it at the next *resume* — against a `go` that did nothing wrong. **And the
+  tool surface caught up on 2026-09-17**: `set_breakpoint` takes a `watch`, so `ba` no longer needs
+  `execute`, and the whole of dbgscope#126 is closed with it. What remains under this item is the
+  rest of the first line — `write_virtual` and a typed register write — and nothing about
+  breakpoints.
 - **Why the rest is deferred:** primarily needed by the state-injection path (item 3); no consumer
   without it.
 - **Note:** dbgscope is the right home for these (DECISIONS.md D3 — typed `DebugEngine` methods, not the

@@ -1702,15 +1702,22 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             command,
             one_shot,
             pass_count,
+            watch,
             patience_ms,
         } => {
-            let expression = resolve_coordinate(e, coordinate.as_deref(), expression, 1)?;
+            // The **watched region's** size, not one byte, where there is one: a coordinate names a
+            // place inside an image, and a four-byte watch one byte from the end of a module is a
+            // region that does not fit the image it was aimed at. A code breakpoint is one byte
+            // because an instruction's entry is one address.
+            let span = watch.map_or(1, |watch| u64::from(watch.size));
+            let expression = resolve_coordinate(e, coordinate.as_deref(), expression, span)?;
             set_breakpoint(
                 e,
                 &expression,
                 command.as_deref(),
                 one_shot,
                 pass_count,
+                watch,
                 watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent()),
             )
         }
@@ -4396,6 +4403,7 @@ fn set_breakpoint(
     command: Option<&str>,
     one_shot: bool,
     pass_count: Option<u32>,
+    watch: Option<structured::WatchRequest>,
     budget_ms: u32,
 ) -> Result<Output, Failed> {
     let location = expression
@@ -4403,7 +4411,17 @@ fn set_breakpoint(
         .and_then(|hex| u64::from_str_radix(hex, 16).ok())
         .map(BreakpointAt::Address)
         .unwrap_or_else(|| BreakpointAt::Expression(expression.to_string()));
-    let mut spec = BreakpointSpec::code(location).replacing_existing();
+    // `data` where a region was named and `code` otherwise, which is the whole of the kind: the
+    // spec has no field for it, so a data breakpoint with nothing to watch is unspellable rather
+    // than refused. The size and alignment rules are dbgscope's to enforce — it checks the size
+    // here and the alignment again on the *resolved* address, which is where `ba` on `nt!Foo+1` is
+    // caught — because the engine accepts a bad pair and rejects it at the next resume, against a
+    // `go` that did nothing wrong.
+    let mut spec = match watch {
+        Some(watch) => BreakpointSpec::data(location, watch.into()),
+        None => BreakpointSpec::code(location),
+    }
+    .replacing_existing();
     if let Some(command) = command {
         spec = spec.with_command(command);
     }
@@ -4476,7 +4494,15 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
     // call did is known before the listing is read and cannot be contradicted by it failing.
     let bp = &set.breakpoint;
     let mut out = format!(
-        "\nBreakpoint {} set at {}{}.\n",
+        "\n{} {} set at {}{}.\n",
+        // **Named by what it stops on**, because the two are not interchangeable and the text is
+        // where a caller reads what they got: a data breakpoint fires on an *access* to a region
+        // and a code one on execution reaching an address, and rendering both as "Breakpoint N set
+        // at X" leaves the difference visible only in the structured half.
+        match &bp.kind {
+            structured::BreakpointKind::Data => "Data breakpoint",
+            _ => "Breakpoint",
+        },
         bp.id,
         bp.address
             .as_deref()
@@ -4488,6 +4514,15 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
             ""
         },
     );
+    // The watch as the **engine** holds it, read back rather than echoed from the request, which
+    // is the half of a `ba` most worth confirming: a size the engine narrowed or an access it
+    // reinterpreted is the difference between a breakpoint that fires and one that does not.
+    if let Some(watch) = &bp.watch {
+        out.push_str(&format!(
+            "It watches {} byte(s) from there for `{}` access.\n",
+            watch.size, watch.access,
+        ));
+    }
     if !set.replaced.is_empty() {
         // The replacement is worth saying out loud rather than leaving in a field: a caller who
         // had a *logging* breakpoint at this address has just lost it, and would otherwise notice

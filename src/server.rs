@@ -1009,6 +1009,10 @@ pub struct BreakpointArgs {
     /// reach those.
     #[serde(default)]
     pub pass_count: Option<u32>,
+    /// Watch a region instead of an address in code — `ba`, as parameters. Omit for a code
+    /// breakpoint. `{"access": "write", "size": 4}` watches four bytes from the location above.
+    #[serde(default)]
+    pub watch: Option<structured::WatchRequest>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
     #[serde(default)]
@@ -3770,6 +3774,9 @@ impl WindbgServer {
     /// breakpoint the session then holds. A successful `bp` prints nothing at all, so the
     /// structured result is where "it was set, and here is its id" actually lives — along with
     /// whether it resolved to an address or is deferred until its module loads.
+    /// Pass `watch` to make it a **data** breakpoint (`ba`) instead: the target stops on a read,
+    /// write or execute of a region, which is what answers "this value changes and nothing says
+    /// where". Needs a live target — a dump has no debug registers to arm.
     #[rmcp::tool(
         annotations(
             title = "Set breakpoint",
@@ -3813,6 +3820,7 @@ impl WindbgServer {
                     command: None,
                     one_shot: args.one_shot.unwrap_or(false),
                     pass_count: args.pass_count,
+                    watch: args.watch,
                     patience_ms: 0,
                 },
             )
@@ -4450,6 +4458,9 @@ impl WindbgServer {
                     // pass count would skip the first n.
                     one_shot: false,
                     pass_count: None,
+                    // Code, not data: this arms the dispatch routine's entry, which is an address
+                    // execution reaches rather than a region anything accesses.
+                    watch: None,
                     patience_ms: 0,
                 },
             )
