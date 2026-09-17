@@ -1322,6 +1322,62 @@ pub enum BreakpointKind {
     Other { kind_code: u32 },
 }
 
+// **The prose on the two types below is `//` and not `///` wherever a caller does not need it**,
+// which is the opposite of this file's habit and is deliberate. These are *input* types: their doc
+// comments become `description` strings in `set_breakpoint`'s inputSchema, which — unlike an
+// outputSchema — is paid for on every conversation (`docs/token-budget.md`). So the rationale lives
+// here, where schemars cannot see it, and the doc comments carry what a model needs to call the
+// tool correctly and nothing else.
+//
+// `WatchAccess` is an enum on the way in and [`DataWatch::access`] is a string on the way out, and
+// the asymmetry is not two spellings of one thing. Reading a breakpoint back has to cope with a
+// combination of engine bits this build does not name, so that field reports them rather than
+// folding them into a plausible neighbour. A *request* has no such case: a caller asking for bits
+// nobody has named is asking for a debugger error, and the schema refusing it says so before a call
+// is made. The two serialize to the same strings, so what a caller sends is what the result reports
+// back.
+//
+// `WatchRequest` is one object rather than two optional fields beside the location, so "an access
+// with no size" cannot be spelled — a data breakpoint needs both, and a caller supplying one of
+// them would otherwise be told so by the engine after the call.
+
+/// What a data breakpoint stops on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum WatchAccess {
+    Read,
+    Write,
+    ReadWrite,
+    /// One byte only on x86/x64.
+    Execute,
+    /// Kernel mode on x86 only; refused elsewhere.
+    Io,
+}
+
+/// The region a data breakpoint watches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct WatchRequest {
+    pub access: WatchAccess,
+    /// Bytes watched: 1, 2, 4 or 8 (1, 2 or 4 on x86). The address must be a multiple of it.
+    pub size: u32,
+}
+
+impl From<WatchRequest> for dbgscope::dbgeng::DataWatch {
+    fn from(watch: WatchRequest) -> Self {
+        use dbgscope::dbgeng::DataAccess as Engine;
+        Self {
+            access: match watch.access {
+                WatchAccess::Read => Engine::Read,
+                WatchAccess::Write => Engine::Write,
+                WatchAccess::ReadWrite => Engine::ReadWrite,
+                WatchAccess::Execute => Engine::Execute,
+                WatchAccess::Io => Engine::Io,
+            },
+            size: watch.size,
+        }
+    }
+}
+
 /// What a data breakpoint watches, as the engine holds it.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DataWatch {

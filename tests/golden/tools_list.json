@@ -1637,7 +1637,8 @@
         "expression: string|null",
         "one_shot: boolean|null",
         "pass_count: integer|null/uint32",
-        "session_id: string|null"
+        "session_id: string|null",
+        "watch: any"
       ],
       "required": [],
       "title": "Set breakpoint"

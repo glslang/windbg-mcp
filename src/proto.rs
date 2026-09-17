@@ -268,6 +268,19 @@ pub enum EngineOp {
         /// the engine.
         #[serde(default)]
         pass_count: Option<u32>,
+        /// Makes this a **data** breakpoint — `ba` — over the region it names, where `None` makes
+        /// it a code one, `bp`.
+        ///
+        /// The last thing dbgscope#126 named that had no tool to reach it. The primitive has taken
+        /// a [`crate::structured::WatchRequest`]'s worth of parameters since dbgscope#127 and the
+        /// *read* side has reported them since — `BreakpointKind::Data` beside a `watch` — so a
+        /// caller could see a data breakpoint it had no way to set except through `execute`.
+        ///
+        /// One field rather than a kind beside a watch, for the reason
+        /// [`crate::structured::WatchRequest`] is one object: the combination that cannot exist —
+        /// a data breakpoint with nothing to watch — is then not spellable.
+        #[serde(default)]
+        watch: Option<crate::structured::WatchRequest>,
         patience_ms: u32,
     },
     /// A range of target memory, as bytes and as a hex dump.
@@ -939,6 +952,7 @@ mod tests {
                 command: None,
                 one_shot: false,
                 pass_count: None,
+                watch: None,
                 patience_ms: 0,
             },
             EngineOp::ReadMemory {

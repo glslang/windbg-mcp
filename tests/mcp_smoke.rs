@@ -6020,6 +6020,133 @@ fn a_second_breakpoint_at_one_address_replaces_the_first_and_says_so() {
     );
 }
 
+/// **A `watch` makes it a data breakpoint, and the engine says so on the way back.**
+///
+/// The last thing [dbgscope#126](https://github.com/glslang/dbgscope/issues/126) named that had no
+/// tool to reach it. dbgscope has taken an access and a size since dbgscope#127 and this server has
+/// *reported* them since — `kind: "data"` beside a `watch` — so until now a caller could see a data
+/// breakpoint it had no way to set except by going round the tool with `execute`.
+///
+/// **Read back from the engine, not echoed from the request**, which is the whole reason the
+/// assertion is worth making: a `watch` that reached the argument and not `SetDataParameters` would
+/// leave every field of this result looking exactly as it does when it worked.
+///
+/// The address is a module base, so it is page-aligned and therefore aligned for any size the
+/// engine takes. A function entry would do on this host and is not something to rest a test on.
+///
+/// The two refusals are dbgscope's and are the reason they are refusals at all: the engine accepts
+/// a bad size or a misaligned address at the *set* and rejects it at the next **resume**, naming a
+/// debug register — so the complaint lands on a `go` that did nothing wrong, and a caller has no
+/// way back to the call that caused it.
+#[test]
+fn a_watch_sets_a_data_breakpoint_and_reads_back_what_it_watches() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    let modules = server.tool_data(
+        "modules",
+        json!({ "session_id": &session, "filter": "ntdll" }),
+        TARGET_STEP,
+    );
+    let base = modules["modules"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .find(|module| module["name"].as_str() == Some("ntdll"))
+        .map(|module| address_of(&module["start"]))
+        .unwrap_or_else(|| panic!("every process loads ntdll: {modules}"));
+
+    let set = server.call_tool(
+        "set_breakpoint",
+        json!({
+            "session_id": &session,
+            "expression": format!("{base:#x}"),
+            "watch": { "access": "write", "size": 4 },
+        }),
+        TARGET_STEP,
+    );
+    assert_no_error(&set, "set_breakpoint with a watch");
+    let data = &set["result"]["structuredContent"];
+    assert_eq!(data["status"], "ok", "{}", text_of(&set["result"]));
+
+    let bp = &data["breakpoint"];
+    assert_eq!(
+        bp["kind"], "data",
+        "a breakpoint set with a watch is a data breakpoint: {data}"
+    );
+    assert_eq!(
+        bp["watch"],
+        json!({ "access": "write", "size": 4 }),
+        "the watch the engine holds is not the one that was asked for: {data}"
+    );
+
+    // The text half too, since that is what a client without structured support reads — and a
+    // data breakpoint rendered as "Breakpoint N set at X" is indistinguishable from a code one.
+    let text = text_of(&set["result"]);
+    assert!(
+        text.contains("Data breakpoint"),
+        "the rendering does not say which kind was set:\n{text}"
+    );
+    assert!(
+        text.contains("4 byte(s)") && text.contains("write"),
+        "the rendering does not say what is watched:\n{text}"
+    );
+
+    // Unchanged for a code breakpoint, which is the default this must not have moved.
+    let code = server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "ntdll!NtClose" }),
+        TARGET_STEP,
+    );
+    assert_eq!(code["breakpoint"]["kind"], "code", "{code}");
+    assert!(
+        code["breakpoint"]["watch"].is_null(),
+        "a code breakpoint watches no region: {code}"
+    );
+
+    // A size the processor has no debug-register encoding for. The message is asserted, not only
+    // the failure: `tool_failure` is satisfied by *any* refusal, including ones that never reached
+    // the check — an unroutable handle, a target that had gone — so a bare "it failed" would pass
+    // against a server that had stopped validating watches at all.
+    let bad_size = server.tool_failure(
+        "set_breakpoint",
+        json!({
+            "session_id": &session,
+            "expression": format!("{base:#x}"),
+            "watch": { "access": "write", "size": 3 },
+        }),
+        TARGET_STEP,
+    );
+    let why = bad_size["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("1, 2, 4 or 8"),
+        "a 3-byte watch was refused for some other reason: {bad_size}"
+    );
+
+    // And an address that is not a multiple of the size, checked on the **resolved** address.
+    let misaligned = server.tool_failure(
+        "set_breakpoint",
+        json!({
+            "session_id": &session,
+            "expression": format!("{:#x}", base + 1),
+            "watch": { "access": "write", "size": 4 },
+        }),
+        TARGET_STEP,
+    );
+    let why = misaligned["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        why.contains("aligned"),
+        "a misaligned watch was refused for some other reason: {misaligned}"
+    );
+}
+
 /// `.lastevent`, or whatever came back instead — for a failure message, never for an assertion.
 fn last_event(server: &mut Server, session: &str) -> String {
     raw(server, session, ".lastevent")

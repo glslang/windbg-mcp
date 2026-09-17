@@ -20,8 +20,8 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 61 | 90,274 B |
-| `session,inspect,exec,crash` | 31 | 43,784 B |
+| *(absent)* — every tool | 61 | 91,437 B |
+| `session,inspect,exec,crash` | 31 | 44,947 B |
 | `session,inspect,crash` | 23 | 32,322 B |
 | `crash` | 13 | 19,078 B |
 
