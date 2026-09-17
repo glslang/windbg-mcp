@@ -6,8 +6,8 @@ interface would have to be.
 
 Every figure here was measured on **macOS 27.0 (build 26A428), Apple M4 Max, 64 GB** on
 2026-09-17, with [`tools/fm_probe.swift`](../tools/fm_probe.swift) built against the
-`FoundationModels.swiftinterface` in the 27.0 SDK, against a `tools/list` captured from the
-ARM64 Windows VM. They are a reading of one machine on one day, not invariants: Apple moves the
+`FoundationModels.swiftinterface` in the 27.0 SDK, against `tools/list` captures from the
+ARM64 Windows VM (server `0.16.0+g57a47e9c` — see the note under the surface table). They are a reading of one machine on one day, not invariants: Apple moves the
 model with the OS, and this server's surface moves with every tool description.
 
 ## The short answer
@@ -56,6 +56,17 @@ listeners on the Windows VM and measured with [`tools/fm_probe.swift`](../tools/
 | `session,inspect,crash` | 23 | 31,157 | 7,542 | **92%** |
 | `session,inspect,exec,crash` | 31 | 42,232 | 10,115 | **123%** |
 | *(absent)* — every tool | 61 | 87,248 | 20,829 | **254%** |
+
+> **Which build these came from, because it is not this one.** The listener they were captured
+> from reports `windbg-mcp 0.16.0+g57a47e9c`; this tree is 0.18.0. That is why `crash` measures
+> 18,396 B here against the 19,078 B [`tool-surface.md`](tool-surface.md) records — a 3.6% gap that
+> is a different server, not a different measure. Since then `main` has also added a data
+> breakpoint parameter to `set_breakpoint`, which is in `exec`, taking the two surfaces that
+> contain it up by 1,163 B each (full 90,274 → 91,437, `session,inspect,exec,crash`
+> 43,784 → 44,947) and leaving `crash` and `session,inspect,crash` untouched. None of it moves a
+> conclusion on this page — the fence is at 54% against 92% against 254%, and a percent or two
+> either way changes nothing about which surfaces fit. Re-capturing against a current build is
+> worth doing before any of these figures are quoted as this server's.
 
 Bytes are name + description + input schema as **MCP** serialises them — the measure
 [`tool-surface.md`](tool-surface.md) calls "model context". They are *not* the figure the driver
