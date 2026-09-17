@@ -408,10 +408,35 @@ folded into an aggregate with the ollama cells, which is the misreading
    (`--listen 127.0.0.1:8766 --tools crash`, its own generated token, held open by one ssh
    connection and gone with it) rather than the service the editor uses: a shared credential is a
    shared namespace, and the service's own client is served all 61 tools, which does not fit.
-3. **`backend: "fm"` in `local_model_eval.py`**, beside the two refusals that already key on
-   backend, so a cell asking for `think` or a `num_ctx` is refused rather than silently ignored —
-   this model has neither, and a silently ignored axis is how a grid fakes a controlled result.
-   `fm_drive.py` refuses both already; this is the runner half. **Not done.**
+3. ~~**`backend: "fm"` in `local_model_eval.py`**~~ — **built.** A driver constant, a dispatch arm
+   that sets no environment at all, and two refusals of its own, because this backend can vary
+   neither of the axes a plan might ask it to:
+
+   - **A model other than `apple-foundation-models`.** There is one, it has no tag to choose, and
+     the driver writes that string into every record.
+   - **Any `contexts` entry.** The window is whatever the OS enforces and no request moves it, so
+     the records carry `num_ctx: null`.
+
+   Both are refused *before* a cell is spent rather than inside it, and for the reason the `think`
+   guard already exists: a cell is keyed against what the records carry, so a plan asking for
+   either would key cells no record can match — `already_done` would never count them, every
+   invocation would repeat the whole cell, and the plan would go on claiming an axis nobody varied.
+   `think` needed no new guard; the existing non-ollama refusal already covers `fm`, and now says
+   why for this backend (the model reports `reasoning: false`) rather than blaming the client.
+
+   **The first graded run**, two draws of the `short` subset on `--tools crash`, against the
+   checked-in v1 answer key:
+
+   ```text
+   backend  model                    ctx  surface tools draws  ok/possible  tokens      wall
+   fm       apple-foundation-models  dflt min        13     2  4/4 of 6     4486-4486    82s
+   ```
+
+   Four of the six task-runs are answerable on this surface — `ioctl_decode` needs a group `crash`
+   does not serve — and **all four were right**, both draws, one tool call each. A re-run skips
+   both draws as already recorded, which is the property those refusals protect and the thing worth
+   checking before trusting any of it.
+
 4. ~~Re-measure against a real `tools/list`~~ — **done**, and it found two bugs rather than just
    moving numbers: six tools whose `anyOf` the converter was turning into bare strings, one that
    would not build at all, and a measurement method that inflated every narrowed surface.
@@ -431,6 +456,7 @@ folded into an aggregate with the ollama cells, which is the misreading
    `fm_probe surface` takes any number of captures and measures each exactly as given. It does not
    subset, and deliberately no longer can.
 
-What is left is step 3, and a graded run: the six tasks on `--tools crash`, several draws, against
-the same answer key — reported as its own row, never folded into an aggregate with the ollama
-cells.
+What is left is a full graded run: the whole six-task suite rather than the `short` subset, more
+draws, and the result written up where the other backends' are — **as its own row**, never folded
+into an aggregate with the ollama cells, since this backend holds none of the grid's three axes
+fixed by choice.

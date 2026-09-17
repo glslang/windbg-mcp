@@ -184,8 +184,23 @@ struct FMChat {
         let definitions = specs.map {
             Transcript.ToolDefinition(name: $0.name, description: $0.description, parameters: $0.parameters)
         }
-        for problem in problems where problem.contains("FAILED TO BUILD") {
+        // **Every note reaches stderr, not just the fatal ones.** A note means a schema was
+        // *degraded* - an untranslatable branch widened to a string - and the tool still builds
+        // and still generates arguments, which the server then rejects. Logging only the fatal
+        // class hides exactly the failures that look like the model being bad at its job.
+        for problem in problems {
             FileHandle.standardError.write(Data("fm_chat: \(problem)\n".utf8))
+        }
+
+        // **A tool that will not build at all ends the turn.** Serving the model 60 of 61 tools
+        // while the driver records 61 - with their names, bytes and digest - produces an eval
+        // record for a surface that was never offered, and nothing downstream could tell.
+        let untranslatable = problems.filter { $0.contains("FAILED TO BUILD") }
+        if !untranslatable.isEmpty {
+            fail("\(untranslatable.count) tool(s) could not be translated: "
+                 + untranslatable.joined(separator: "; "),
+                 kind: "tool_translation_failed",
+                 extra: ["tools_requested": surface.count, "tools_translated": specs.count])
         }
 
         // A trailing user message is the *new* prompt for this turn rather than history; anything else
