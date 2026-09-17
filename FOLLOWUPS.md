@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-one clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-two clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -43,7 +43,10 @@ against (2026-09-13), and items 73–74 from checking the four driver tools agai
 Driver Buddy Revolutions over `mountmgr` and HEVD — an import directory the loader may have
 freed, and the one section of the ported program with no counterpart here (2026-09-14) — and item
 79 from item 78's own fix, which got the user-mode heap walker past the layout refusal and one step
-into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16).
+into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16), and item 80
+from adding Apple's on-device model as the eval's third backend (#335 / #336, 2026-09-17), where
+two review rounds found `identity()` reporting something false about a run because it works out
+what a record contributes by testing the backend again in each field that needs it.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
