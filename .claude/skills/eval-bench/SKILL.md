@@ -8,8 +8,18 @@ description: Run and read the local-model benchmark (`tools/local_model_eval.py`
 ## The grid, and what bites while running it
 
 `docs/local-model-eval.md` is the result; this is what bites while running it again. The grid is
-three scripts — the ollama driver, the Claude Code driver, and the matrix runner that spawns either
-one per cell and grades the log afterwards.
+four scripts — the ollama driver, the Claude Code driver, the Foundation Models driver, and the
+matrix runner that spawns one of the three per cell and grades the log afterwards.
+
+**The `fm` backend varies none of the grid's three axes, and that is its result rather than a gap.**
+Apple's on-device model has one model with no tag to choose, a window fixed at whatever the OS
+enforces, and `reasoning: false` — so a plan naming another model, asking for a `context`, or
+setting `think` is **refused** at validation rather than run. Each of those would otherwise key a
+cell against a record that carries something else (`num_ctx: null`, one fixed model name), and a
+cell nothing can match re-runs on every invocation while the plan goes on claiming the axis. Only
+`--tools crash` fits the window at all, so the surface axis collapses to one cell too. Read its row
+on its own and never fold it into an aggregate with the ollama cells; `docs/apple-foundation-models.md`
+is the write-up and carries the measurements.
 
 **Record what the runtime *served*, not what you asked for.** `num_ctx` on a request does not
 shrink an instance ollama already holds: with a 32,768 instance loaded, cells asking for 8,192 are
@@ -108,7 +118,9 @@ everywhere is a task to read, not a model to blame.**
 
 **A run records what it ran against, and that is what makes two of them comparable** (item 46).
 Every record carries `server` (the build that answered), `model_digest` (the weights behind a
-mutable ollama tag), `suite`, and `harness_version` for the Claude rows, which can have no digest -
+mutable ollama tag), `suite`, and `harness_version` for the Claude rows, which can have no digest
+(nor can the `fm` rows: Apple's weights have no address to record, so they carry `model_digest: null`
+and name the OS build instead) -
 `opus` and `sonnet` are aliases resolved inside a client this bench does not own. `--compare` reads
 two logs with **two rules that are not one rule**: a *changed question* blocks a pairing (via
 `stale_prompt`, printed at the row), while a changed build, model or window is *named above the
