@@ -769,9 +769,28 @@ arm one over a counter precisely so this can be tried without a debuggee. Then g
 absence silently gave `Self::Pool` dbgscope's default walk budget instead of this server's
 deadline.
 
+**What [dbgscope#95](https://github.com/glslang/dbgscope/issues/95) settled, and what it did not**
+(2026-09-17). That issue asked the identical question of `read_memory` — a direct engine call with
+no bound, where the watchdog was the obvious answer and nobody had measured whether `SetInterrupt`
+reaches one. It could not be measured: the target it needs is a live kernel behind a link slow
+enough for the call to sit in, and this bench had none. So it did **not** arm a watchdog on an
+expectation, and shipped a different lever instead — read the range a page at a time and check the
+deadline between chunks ([#332](https://github.com/glslang/windbg-mcp/pull/332)).
+
+That lever does not transfer here. `Reload("")` is one opaque engine call with nothing to split, so
+there is nothing to poll between, and the measurement this item asks for stays the only thing that
+decides it. What does transfer is the second half of the paragraph above: `EngineOp::ReadMemory`
+carries a `patience_ms` and is in `patience_slot`'s match, so there is a worked example of that
+change rather than a description of one. And the doctrine it rests on has been corrected in
+`EngineOp::Backtrace`'s doc — the absence of a `patience_ms` is a claim about whether the call
+underneath can be **stopped**, not about whether the op runs a command, which is the form this
+item's first paragraph was already stating it in.
+
 **Where it picks up.** `worker::resynchronise` and `EngineOp::Modules` in `src/proto.rs`,
 `DebugEngine::reload_symbols` and `Watchdog` in dbgscope's `src/dbgeng.rs`, and
 `execute_command_bounded` beside it for the shape a bounded direct call takes here.
+`DebugEngine::read_memory_bounded` is the shape an *unbounded* direct call takes when the watchdog
+cannot be shown to reach it, and `EngineOp::ReadMemory` is the `patience_ms` half already done.
 ## 56. [windbg-mcp] `resolve`'s `? <expr>` is a caller's command on nobody's clock
 
 `worker::resolve` evaluates an address expression by running `? <expr>` through
