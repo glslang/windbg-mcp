@@ -177,12 +177,11 @@ func loadSurface(_ path: String) throws -> [[String: Any]] {
 ///
 /// A tool that cannot be translated is **dropped rather than fatal**: a surface is worth driving
 /// with 60 of its 61 tools, and the caller decides whether the missing one matters.
-func buildSpecs(_ surface: [[String: Any]], only: Set<String>? = nil) -> ([ToolSpec], [String]) {
+func buildSpecs(_ surface: [[String: Any]]) -> ([ToolSpec], [String]) {
     var specs: [ToolSpec] = []
     var problems: [String] = []
     for entry in surface {
         guard let name = entry["name"] as? String else { continue }
-        if let only, !only.contains(name) { continue }
         let schema = (entry["inputSchema"] as? [String: Any]) ?? ["type": "object", "properties": [String: Any]()]
         let converter = SchemaConverter()
         converter.defs = (schema["$defs"] as? [String: Any]) ?? [:]
