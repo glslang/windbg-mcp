@@ -87,7 +87,8 @@ them — read it to pick the one you want.
 | `cargo-and-dependencies.md` | `Cargo.toml`, `Cargo.lock`, `build.rs` | moving the `dbgscope` `rev` pin, why a `[patch]` is never committed, and why a green dbgscope PR says nothing about Miri |
 | `cross-target-check.md` | any `src/` or `tests/` Rust, or `build.rs` | type-checking the whole crate from a Mac, `build.rs`'s PE version resource and its expected warning, reading a dependency's pinned source with `cargo fetch`/`metadata` |
 | `markdown-and-docs.md` | `**/*.md` | CI's two non-Rust gates: `cargo fmt --all --check` and the markdownlint globs |
-| `powershell-scripts.md` | `**/*.ps1`, `tools/**`, `examples/**` | the three ways a shipped `.ps1` fails only under PowerShell 5.1; draining stderr when driving the server from a script |
+| `powershell-scripts.md` | `**/*.ps1`, `tools/**`, `examples/**` | the three ways a shipped `.ps1` fails only under PowerShell 5.1; draining stderr when driving the server from a script; handling a token so it stays out of the transcript |
+| `measurement-provenance.md` | `tools/**`, `docs/**/*.md` | which build answered, why an exe's date is not evidence, and why a narrowed surface has to be captured from a narrowed listener |
 | `execution-waits.md` | any `src/` or `tests/` Rust, or `build.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
 | `async-runs.md` | any `src/` or `tests/` Rust, or `build.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
 | `session-teardown.md` | any `src/` or `tests/` Rust, or `build.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |

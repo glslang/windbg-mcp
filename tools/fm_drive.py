@@ -59,6 +59,10 @@ BUILT_DIR = ""
 # can no longer claim the full served surface when translation served less than it.
 FM_TURNS = []
 
+# The enforced context window, read from the running system once per run by `ensure_window()`.
+# `None` until it has been, and `None` is what gets recorded if the probe cannot answer.
+SERVED_CONTEXT = None
+
 
 def ensure_binary():
     """Find or build `fm_chat`, and hand back its path.
@@ -80,6 +84,30 @@ def ensure_binary():
     if build.returncode != 0:
         raise SystemExit("could not build fm_chat:\n" + (build.stderr or "")[-2000:])
     return CHAT_BIN
+
+
+def ensure_window():
+    """Read the enforced context window off the running model, once.
+
+    **Measured rather than remembered.** 8,192 is what this OS build enforces today; the window is
+    a property of the model the OS ships, and both move. Recording a constant as `served_context`
+    would mislabel every token-utilisation figure on the next OS revision, and `served_context` is
+    exactly the field the ollama rows use to catch "asked for one window, served another".
+
+    There is no API that reports it, so the probe exceeds it and reads `contextSize` off the
+    refusal - a few seconds, once per run, against a run that is minutes of turns. A probe that
+    cannot answer leaves the field `None`, which is honest where a default would not be.
+    """
+    global SERVED_CONTEXT
+    try:
+        proc = subprocess.run([CHAT_BIN], input=json.dumps({"probe": "window"}),
+                              capture_output=True, text=True, timeout=300)
+        out = json.loads(proc.stdout)
+        SERVED_CONTEXT = out.get("context_size")
+    except Exception as e:  # noqa: BLE001 - an unknown window is recorded, never fatal
+        print(f"  could not read the context window: {e}")
+        SERVED_CONTEXT = None
+    return SERVED_CONTEXT
 
 
 def cleanup_binary():
@@ -155,7 +183,7 @@ def runtime_identity():
 
     The ollama rows read the loaded instance's digest and served window from `/api/ps`. There is
     no such endpoint here and no address for the weights, so the honest equivalents are the OS
-    build the model ships with and the window it enforces - and the fields the ollama rows fill
+    build the model ships with and the window `ensure_window()` measured on this run - and the fields the ollama rows fill
     are **null rather than absent**, which is the convention `claude_code_drive.py` set: a field
     left out reads as one nobody thought to record.
     """
@@ -165,13 +193,14 @@ def runtime_identity():
                                timeout=30).stdout.strip()
     except Exception:  # noqa: BLE001 - identity is a nicety, never a reason to fail a run
         pass
-    return {"model_digest": None, "served_context": 8192, "os_build": build or None}
+    return {"model_digest": None, "served_context": SERVED_CONTEXT, "os_build": build or None}
 
 
 def main():
     refuse_axes_this_model_does_not_have()
     ensure_binary()
     print(f"model: apple-foundation-models (on-device), via {CHAT_BIN}")
+    print(f"context window measured: {ensure_window()}")
     if drive.DRAW != 1:
         print(f"draw {drive.DRAW}")
 

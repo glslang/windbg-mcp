@@ -138,13 +138,39 @@ struct FMChat {
             fail("stdin was not a JSON object", kind: "bad_request")
         }
 
-        let messages = (request["messages"] as? [[String: Any]]) ?? []
-        guard !messages.isEmpty else { fail("no messages", kind: "bad_request") }
-
         let model = SystemLanguageModel.default
         guard model.isAvailable else {
             fail("the on-device model is unavailable: \(model.availability)", kind: "model_unavailable")
         }
+
+        // **`{"probe": "window"}` reads the enforced context window from the running system.**
+        // There is no API that reports it, so the only honest way to learn it is to exceed it and
+        // read `contextSize` off the refusal. The driver asks once per run rather than recording a
+        // figure measured on some other OS build as if it were this run's runtime identity - the
+        // window is a property of the model the OS ships, and both move.
+        if (request["probe"] as? String) == "window" {
+            let oversized = String(repeating: "windbg kernel debugger crash dump analysis. ", count: 4000)
+            do {
+                _ = try await LanguageModelSession(model: model).respond(to: oversized)
+                fail("the probe prompt did not exceed the window", kind: "window_not_reached")
+            } catch let error as LanguageModelError {
+                if case .contextSizeExceeded(let exceeded) = error {
+                    emit(["context_size": exceeded.contextSize, "probed_with": exceeded.tokenCount])
+                }
+                if let overflow = overflowFromMessage(error) {
+                    emit(["context_size": overflow.maximum, "probed_with": overflow.provided])
+                }
+                fail("\(error)", kind: "window_probe_failed")
+            } catch {
+                if let overflow = overflowFromMessage(error) {
+                    emit(["context_size": overflow.maximum, "probed_with": overflow.provided])
+                }
+                fail("\(error)", kind: "window_probe_failed")
+            }
+        }
+
+        let messages = (request["messages"] as? [[String: Any]]) ?? []
+        guard !messages.isEmpty else { fail("no messages", kind: "bad_request") }
 
         let surface: [[String: Any]]
         do {
