@@ -301,10 +301,12 @@ struct FMChat {
                 out["eval_count"] = response.usage.output.totalTokenCount
                 out["fm"] = ["cached_token_count": response.usage.input.cachedTokenCount,
                              "tools_translated": specs.count,
-                             "tools_dropped": problems.filter { $0.contains("FAILED TO BUILD") }.count]
+                             "tools_dropped": problems.filter { $0.contains("FAILED TO BUILD") }.count,
+                             "notes": problems]
             } else if let measured = await measuredPromptTokens() {
                 out["prompt_eval_count"] = measured
-                out["fm"] = ["prompt_tokens_measured": true, "tools_translated": specs.count]
+                out["fm"] = ["prompt_tokens_measured": true, "tools_translated": specs.count,
+                             "notes": problems]
             }
             emit(out)
         } catch let error where requestedCall(error) != nil {
@@ -317,8 +319,14 @@ struct FMChat {
                 "done": true,
                 "total_duration": Int(Date().timeIntervalSince(started) * 1e9),
             ]
+            // **The notes travel in the answer, not only on stderr.** A degraded schema still builds
+            // and then generates arguments the server rejects, which reads as the model being bad
+            // at its job - so the record has to carry why. stderr alone did not: the driver
+            // captures this process's pipe and the matrix runner captures the driver's, so
+            // anything not put in the record is gone by the time anyone grades it.
             var fm: [String: Any] = ["tools_translated": specs.count,
-                                     "tools_dropped": problems.filter { $0.contains("FAILED TO BUILD") }.count]
+                                     "tools_dropped": problems.filter { $0.contains("FAILED TO BUILD") }.count,
+                                     "notes": problems]
             if let measured = await measuredPromptTokens() {
                 out["prompt_eval_count"] = measured
                 fm["prompt_tokens_measured"] = true

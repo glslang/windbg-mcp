@@ -138,7 +138,11 @@ def chat(messages, tools):
     if proc.stderr.strip():
         # Translation notes, one line each. A tool that would not translate at all does not
         # arrive here - it comes back as a `tool_translation_failed` result and ends the turn.
-        for line in proc.stderr.strip().splitlines()[:4]:
+        # Every line, not a prefix of them: past the fourth, a truncated print is the only place
+        # a degraded schema was ever mentioned, and the record would show a tool generating
+        # arguments the server rejects with nothing to say why. They are also carried structurally
+        # in each turn's `fm.notes`, which is what survives into the eval record.
+        for line in proc.stderr.strip().splitlines():
             print(f"    {line}")
     if proc.returncode != 0 or not proc.stdout.strip():
         raise drive.ChatFailed(
