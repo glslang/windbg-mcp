@@ -1372,10 +1372,22 @@ two got one, independently, after the fact. There is no reason the third will be
   backend-specific reasoning branch exists for. An implementation keyed on nulls would fix
   `weights` and leave `reasoning` precisely where it is.
 
-  So the declaration has to be its own thing: a per-backend statement of *which identity fields
-  this backend can answer*, written where the record is written, and consulted instead of
-  re-derived. A fourth backend then states its answers rather than inheriting whatever an author
-  wrote for the others.
+  And *which fields* is not enough either, because one of the two existing dispatches is not a
+  can/cannot question at all: `weights` reads `os_build` for `fm` and `model_digest` for the other
+  two, so a backend that merely declares "I can answer `weights`" leaves `identity()` still
+  deciding where to read it from. Two shapes close it and one of them closes it completely:
+
+  - **Map each logical field to its source**, per backend — `weights -> ("os_build", render)` for
+    `fm`, `weights -> ("model_digest", render)` for the rest. This removes the inference but keeps
+    a table `identity()` has to consult.
+  - **Have each driver emit the resolved value** under one agreed key, so `fm_drive.py` writes the
+    OS build into it, `local_model_drive.py` writes the digest, `claude_code_drive.py` writes
+    `None`. `identity()` then reads one key for every backend and the dispatch is gone rather than
+    relocated — which is the point, since every instance so far has been `identity()` inferring
+    something the writer already knew.
+
+  Either way a fourth backend states its answers rather than inheriting whatever an author wrote
+  for the others.
 - **A smaller check that would have caught both:** a test that builds one record per backend and
   asserts every identity field is what that backend claims, so a new field with no backend opinion
   fails rather than defaults.
