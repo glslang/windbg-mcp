@@ -19,12 +19,20 @@ adding the debugger tier takes it to ~60s, most of it two tests waiting out real
 grace, and a call staying silent long enough to have to report that it is still running.
 
 **The pass count is the same either way**, because each gate is inside its own test: `cargo test
---test mcp_smoke` reports the same number passed with the tier off as with it on — 97 on 2026-08-31,
-against ~2s and ~60s respectively, but it moves whenever a test is added, so re-derive it rather
-than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a result line
-per binary, so it is this harness's own line to read.) The runtime is what tells the two runs apart,
-and `--nocapture` is what prints the `SKIPPED` reason — a run that reports every test green having
-taken a second covered no debugger claim at all.
+--test mcp_smoke` reports the same number passed with the tier off as with it on — 112 on
+2026-09-17, against ~2s and ~66s respectively, but it moves whenever a test is added, so re-derive
+it rather than reading it here. (A plain `cargo test` runs the unit tests beside it and prints a
+result line per binary, so it is this harness's own line to read.) The runtime is what tells the two
+runs apart, and `--nocapture` is what prints the `SKIPPED` reason — a run that reports every test
+green having taken a second covered no debugger claim at all.
+
+**A slow run is not by itself the debugger tier**, which is the other half of reading the clock.
+`ensure_x86_worker` rebuilds the 32-bit worker whenever the one beside the test binary is absent
+*or from another build*, and staleness is decided by comparing its `ProductVersion` against the
+supervisor's — which `build.rs` re-stamps from `.git\HEAD` and the branch ref, so **any** commit
+makes the existing worker stale. Measured on the x64 bench 2026-09-17, immediately after the 0.18.0
+version bump: a tier-**off** run took **26.1s**, against 2.2s once the worker was current. So the
+clock says *some* tier had work to do; which one is a `RAN:`/`SKIPPED` line, not an inference.
 
 ### Tiers
 
