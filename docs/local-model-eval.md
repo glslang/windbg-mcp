@@ -1257,6 +1257,21 @@ Pseudoreplication of that shape makes a p-value anti-conservative — it answers
 independent trials nobody ran. Review caught it, and the honest fix is to stop quoting one rather
 than to hedge it.
 
+**A fourth backend measured itself against this table, and it is not in it.** Apple's on-device
+model drives this server through the same runner (`backend: "fm"`), and its row is kept in
+[`apple-foundation-models.md`](apple-foundation-models.md) rather than folded in here, because it
+varies none of the three axes this grid is built on: one model with no tag, a window fixed at
+whatever macOS enforces, and `reasoning: false`. Putting it in these tables would imply a
+comparison the design does not support.
+
+What it does add is a reading of the row above. On `min`, five draws: 5/5 on `bugcheck`,
+`driver_blame` and `module_count` — a tie at the ceiling with the `think on` column — and **0/5 on
+`arm64_pc`**, which is where the two arms separate. Per model this table's `arm64_pc` is
+2/5 → 5/5, 1/5 → 3/5, and **two models at 0/5 in both arms**; the on-device model lands in that
+second group, and having no reasoning arm it cannot leave it. The `think on` column is the fair
+comparison for it and the `think off` one is not — matching its *mode* would mean comparing it to
+models deliberately handicapped at something they can do.
+
 What the design *can* support is the block it was built from, which is the per-model table above:
 of four models, **two moved and two did not**, and the two that moved went 2/5 → 5/5 and 1/5 → 3/5.
 That is a direction observed in every block that could move, at a sample size that will not carry a
