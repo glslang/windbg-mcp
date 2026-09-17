@@ -513,7 +513,13 @@ folded into an aggregate with the ollama cells, which is the misreading
    `fm_probe surface` takes any number of captures and measures each exactly as given. It does not
    subset, and deliberately no longer can.
 
-The full graded run is done and is [What it scores](#what-it-scores) above. What is left is to fold
-that row into [`local-model-eval.md`](local-model-eval.md) beside the other backends — **as its own
-row**, never into an aggregate with the ollama cells, since this backend holds none of the grid's
-three axes fixed by choice.
+All four are done, and the full graded run with them — [What it scores](#what-it-scores) above.
+[`local-model-eval.md`](local-model-eval.md) carries a **cross-reference** rather than rows, which
+is the deliberate end state: this backend varies none of the three axes that grid is built on, so
+rows in its tables would imply a comparison the design cannot support.
+
+What is left is not a step but a consequence, recorded as `FOLLOWUPS.md` item 80: `identity()`
+decides what a record contributes with a two-way branch on backend, and there are three. Both
+instances that produced — an fm run hiding a macOS update, and `think: false` reading as the `off`
+arm — are fixed, but the branch is still two-way, so the next field added will be wrong for `fm`
+by default.
