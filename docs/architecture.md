@@ -37,8 +37,9 @@ process. Two things follow, and they are why it is built this way:
   resolution, and the `Connection` type whose `Debug`/`Display` are redacted so a key can only be
   unwrapped deliberately (see [Kernel connection profiles](./kernel-profiles.md)).
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
-- **`main.rs`** — role selection (supervisor or worker), tokio + stdio transport. **Logs go to
-  stderr** (stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
+- **`main.rs`** — role selection (supervisor or worker) and, for the supervisor, which transport it
+  serves on: tokio with stdio, or HTTP when `--listen` names an address. **Logs go to
+  stderr** (under stdio, stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
   lands in the same place. Workers never outlive the connection: a disconnect asks every session
   to release its target — all of them concurrently — waits **five seconds**, and terminates only
   the workers that have not finished by then; a worker also exits on its own once its request

@@ -25,7 +25,8 @@ than `panic!`/`.expect`, never the `execute` text hatch. It is here rather than 
 `.claude/rules/cargo-and-dependencies.md` with the rest of the dbgscope material because it binds a
 Rust-only change, which loads that rule never — it is scoped to the manifests and `build.rs`.
 
-**The binary has two roles.** Started normally it is the **supervisor**: MCP on stdio, no DbgEng.
+**The binary has two roles.** Started normally it is the **supervisor**: MCP on stdio — or over HTTP,
+where `--listen` routes the same non-worker role to `serve_http` — and no DbgEng in either case.
 Re-executed with `--engine-worker` it owns exactly one debug session, because dbgeng.dll holds one
 debuggee session per process. Key source: `src/engine.rs` (the supervisor — session registry,
 worker supervision, routing), `src/worker.rs` (the child process and the engine thread inside it),
