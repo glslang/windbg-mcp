@@ -1338,8 +1338,11 @@ read feeding it, `examples/user_heap_smoke.rs`, and `heap_list`'s description in
 the backend **again, separately, in every place that needs it**. As it stands there are two such
 tests and they do not agree in shape: a three-way `if/elif/else` covering `harness` and `reasoning`,
 and an unrelated inline ternary choosing `os_build` over `model_digest` for `weights`. Neither knows
-about the other, and a field added tomorrow gets whichever arm its author happens to write — in
-practice the `else`, which is the ollama answer.
+about the other, and a field added tomorrow gets whatever its author happens to write. The likeliest
+shape is worse than picking a wrong arm: a single `fields["x"].add(stated(record, "x"))` with **no
+backend test at all**, which treats three backends as one and is only correct for whichever of them
+the author had in mind. There is no `else` waiting to catch it — the one that exists belongs to
+`reasoning` alone.
 
 Both existing tests were added *reactively*, one per review round on the PR that introduced the
 third backend, each after a run had already reported something false:
