@@ -5,16 +5,18 @@ cannot be reached the way the [ollama bench](local-model.md) reaches its models 
 interface would have to be.
 
 Every figure here was measured on **macOS 27.0 (build 26A428), Apple M4 Max, 64 GB** on
-2026-09-17, with a probe built against the `FoundationModels.swiftinterface` in the 27.0 SDK. They
-are a reading of one machine on one day, not invariants: Apple moves the model with the OS, and
-this server's surface moves with every tool description.
+2026-09-17, with [`tools/fm_probe.swift`](../tools/fm_probe.swift) built against the
+`FoundationModels.swiftinterface` in the 27.0 SDK, against a `tools/list` captured from the
+ARM64 Windows VM. They are a reading of one machine on one day, not invariants: Apple moves the
+model with the OS, and this server's surface moves with every tool description.
 
 ## The short answer
 
 1. **Not through ollama.** Nothing bridges the two, and the reason is structural rather than a
    missing feature.
-2. **Directly through `FoundationModels`, yes.** It is not a maybe — the on-device model opened a
-   dump, threaded the returned `session_id` into a second call and answered correctly, in 7.4 s.
+2. **Directly through `FoundationModels`, yes.** It is not a maybe — against the live listener on
+   the Windows VM the on-device model opened a real kernel dump, threaded the returned
+   `session_id` into `crash_triage`, and named the bug check correctly.
 3. **Tool-calling is not the constraint; the context window is.** At 8,192 tokens, the full
    61-tool surface does not fit in the window *twice over*, and the choice of `--tools` spec stops
    being a tuning knob and becomes the thing that decides whether a run is possible at all.
@@ -45,25 +47,29 @@ transcript, every tool result and the answer.
 ## What the surface costs against that window
 
 Token counts are `SystemLanguageModel.tokenCount(for: [any Tool])` — Apple's own tokenizer, not a
-rule of thumb. They were measured against a **reconstruction** of the tool surface (descriptions
-lifted from the doc comments in `src/server.rs`, input schemas rebuilt from the `JsonSchema`
-structs), because this crate does not build on a Mac and no captured `tools/list` with prose exists
-in the tree. The reconstruction lands at **83%** of the model-visible bytes
-[`tool-surface.md`](tool-surface.md) records on each narrowed surface and 80% on the full one, so
-the *scaled* column is each measured count divided by its own fidelity:
+rule of thumb — against a **real `tools/list`**, captured from the listener running on the Windows
+VM and measured with [`tools/fm_probe.swift`](../tools/fm_probe.swift):
 
-| `--tools` | Tools | Real bytes | Measured | Scaled | Share of the 8,192 window |
-|---|---:|---:|---:|---:|---:|
-| `crash` | 13 | 19,078 | 3,984 | ~4,795 | **59%** |
-| `session,inspect,crash` | 23 | 32,322 | 6,795 | ~8,164 | **100%** |
-| `session,inspect,exec,crash` | 31 | 43,784 | 9,106 | ~11,007 | **134%** |
-| *(absent)* — every tool | 61 | 90,274 | 16,735 | ~21,012 | **256%** |
+| `--tools` | Tools | Model-visible bytes | Tokens | Share of the 8,192 window |
+|---|---:|---:|---:|---:|
+| `crash` | 13 | 19,078 | 4,732 | **58%** |
+| `session,inspect,crash` | 23 | 32,322 | 7,793 | **95%** |
+| `session,inspect,exec,crash` | 31 | 43,784 | 10,326 | **126%** |
+| *(absent)* — every tool | 61 | 87,176 | 20,829 | **254%** |
 
 The `instructions` add **95 tokens**, which is the only line here that is cheap.
 
 **Read the last column as a hard fence, not a warning.** Only `--tools crash` leaves usable room.
-`session,inspect,crash` — the bench's `lean` client — consumes the entire window before the first
-question is asked.
+`session,inspect,crash` — the bench's `lean` client — spends 95% of the window before the first
+question is asked, which is not a surface anything can be driven on.
+
+> **These replaced a set of scaled estimates, and the scaling held.** Until the VM was reachable
+> the figures came from a reconstruction of the surface (descriptions from the doc comments in
+> `src/server.rs`, schemas rebuilt from the `JsonSchema` structs) at 80–83% fidelity, scaled by
+> that ratio: 4,795 / 8,164 / 11,007 / 21,012 against the 4,732 / 7,793 / 10,326 / 20,829 measured
+> here. Every one is within 6%, and no claim on this page moved — but
+> `session,inspect,crash` was quoted as "exactly 100%" of the window and is 95%, which is the kind
+> of too-neat number that should have been suspected before it was measured.
 
 ### The ≈4 B/token rule of thumb does not survive contact with this tokenizer
 
@@ -88,11 +94,11 @@ memory.
 
 ### And then the results have to fit
 
-Surface plus instructions leaves roughly **3,300 tokens** on the `crash` surface, and that is what
+Surface plus instructions leaves roughly **3,360 tokens** on the `crash` surface, and that is what
 the whole investigation gets. Against the result sizes in [`token-budget.md`](token-budget.md),
 converted at the 2.2 B/token measured above:
 
-| Result | Model-visible bytes | ≈ tokens | Against the 3,300 left |
+| Result | Model-visible bytes | ≈ tokens | Against the 3,360 left |
 |---|---:|---:|---|
 | `session_status` | 297 | 135 | fine |
 | `open_dump` | 1,347 | 612 | fine |
@@ -111,30 +117,42 @@ fitting surface does not serve.
 
 ## The live drive
 
-The proof, on `--tools crash` with stubbed replies standing in for a Windows host:
+Against the real thing: the listener on the Windows VM, `--tools crash`, and a kernel dump from
+`docs/samples`. No fixtures.
 
 ```text
-task: "Open the crash dump at C:\dumps\MEMORY.DMP and tell me the bug check
-       code and which driver is at fault."
+MCP revision negotiated: 2025-06-18
+read-only fence: 8 of 13 served tools runnable (from the server's own readOnlyHint)
+tools offered: 13 (19641 B, measured as the ollama rows are)
 
--> open_dump    {"path": "C:\\dumps\\MEMORY.DMP"}
--> crash_triage {"analyze": false, "session_id": "s1", "frames": 16}
-
-"The bug check code is 0xD1, which corresponds to DRIVER_IRQL_NOT_LESS_OR_EQUAL.
- The faulting driver is HEVD.sys, specifically in HEVD!TriggerArbitraryWrite."
-
-elapsed: 6.5–7.5 s
+=== task: "Open the crash dump at C:\workspace\windbg-mcp\docs\samples\052126-34312-01.dmp
+           and tell me the bug check code and which driver is at fault."
+  prompt tokens: 4486
+  [ 4.9s] -> open_dump({"path": "...\052126-34312-01.dmp"})  ok  2236 chars
+  [ 6.1s] -> crash_triage({"analyze": false, "frames": 16,
+                           "session_id": "sess-18d62c6cc5b31864-2"})  ok  2873 chars
+  [13.8s] answer: The bug check code is 0x9f (DRIVER_POWER_STATE_FAILURE). The faulting
+          driver cannot be definitively identified as none of the captured frames are in
+          a driver context, but the innermost frame is nt!KeBugCheckEx.
+  released sess-18d62c6cc5b31864-2
+  closed the MCP session (202)
 ```
 
-Both calls are well-formed, the order is right, and **the `session_id` from the opener's result was
-threaded into the second call** — the one piece of protocol discipline this server needs from every
-client, and the thing narrow models most often get wrong.
+The bug check is right, and **the `session_id` the opener returned was threaded into the next
+call** — the one piece of protocol discipline this server needs from every client, and the thing
+narrow models most often get wrong. The whole path is exercised here and not simulated: handshake,
+the fence derived from the server's own `readOnlyHint`, two real DbgEng calls, session release and
+transport teardown.
 
-**Five draws, five identical runs**: two calls, same arguments (only their key order varies), the
-right answer every time. That is a rate rather than a sighting, which is the distinction
-[`local-model-eval.md`](local-model-eval.md) exists to enforce — but it is one easy task on the
-smallest surface with canned replies, and it says nothing about the six-task grid. What it
-establishes is that the mechanism works, not that the model is good at this.
+The hedge on the second half of the answer is the model, not the harness. This dump's stack is
+kernel frames with no third-party driver in them, so "cannot be definitively identified" is a
+defensible reading rather than a miss — but which it is, is a question for a graded run against the
+answer key, not for one task watched by hand.
+
+**What is still not exercised is the keepalive.** Turns here are 4–14 s against a 390 s lease
+grace, so the mechanism `local_model_drive` grew after a 440 s ollama turn outlived that grace has
+never been under load on this backend. It is unlikely to matter — this model's slowness is not of
+that order — but nothing has proven it.
 
 ## Why not ollama
 
@@ -253,8 +271,8 @@ struct DynamicTool: Tool {
 }
 ```
 
-The converter is where the work is. Against this server's actual surface, **60 of 61 tools
-translate** with a converter of about 50 lines. What it has to handle, in the order the surface
+The converter is where the work is. Against this server's actual surface, **all 61 tools translate**
+with a converter of about 70 lines. What it has to handle, in the order the surface
 forces it to:
 
 - **`$ref` / `$defs`.** `usesDefs` is true in
@@ -265,18 +283,29 @@ forces it to:
   **a missed dependency fails when the schema is built, not when the tool is called**, with
   `undefinedReferences`. Resolve `$defs` transitively; the first version of the probe did not, and
   eight tools failed to construct.
-- **Nullable types.** `string|null` is `isOptional: true` on the `Property`, not a union. Every
-  `Option<T>` in `src/server.rs` arrives this way, so this is most of the surface.
-- **Enums.** `DynamicGenerationSchema(name:anyOf: [String])` takes a string enum directly —
-  `server_log`'s `Level`, `heap_allocations`'s two.
+- **Nullable types.** An `Option<String>` arrives as the type array `["string","null"]`, and the
+  nullability belongs on the `Property`'s `isOptional`, not on the type. An `Option<Enum>` or
+  `Option<Struct>` does **not** come this way — see the `anyOf` entry below, which is where this
+  gets interesting.
+- **Enums.** `DynamicGenerationSchema(name:anyOf: [String])` takes a string enum directly, once the
+  `anyOf` wrapper around the optional ones has been unwrapped.
 - **Objectless tools.** `attach_kernel_local` takes no arguments, and an empty `properties` is
   rejected. A single optional ignored field is the workaround.
-- **Tagged unions — the one that failed.** `debug_batch`'s `StepAction` is an externally-tagged
-  Rust enum with struct variants, which `schemars` renders as an `anyOf` of single-key objects.
-  `DynamicGenerationSchema(name:anyOf: [DynamicGenerationSchema])` can express exactly that shape,
-  so this is a converter that needs writing rather than a wall — but note that `debug_batch` is
-  **10,021 model-visible bytes on its own**, roughly 2,550 tokens, or **31% of this model's entire
-  window for one tool**. On any surface this model can run, `--tools` has already excluded it.
+- **`anyOf`, which is how `Option<T>` actually arrives — and the bug the reconstruction hid.**
+  `schemars` renders an optional enum or struct as `{"anyOf": [{"$ref": …}, {"type": "null"}]}`
+  rather than as a type array, and six tools use it: `coordinate` on `read_memory`,
+  `set_breakpoint` and `run_to_address`, `level` on `server_log`, `backend` and `state` on
+  `heap_allocations`. A converter that does not know this falls through to its default and makes
+  them **bare strings** — which *builds*, and then generates arguments the server rejects. The
+  reconstruction this converter was first written against used type arrays, so it was clean on all
+  six; the real `tools/list` failed six of them the first time it was pointed at one. Dropping the
+  null branch is right rather than lossy, because nullability travels on the property's
+  `isOptional`.
+- **Traversing those branches is also what *defines* what they reference.** `debug_batch` was the
+  one tool that would not build at all, with `undefinedReferences: ["Check"]` — not because a
+  tagged union is inexpressible, but because the branch holding the `$ref` was never walked, so the
+  reference existed with no definition behind it. Handling `anyOf` fixed the schema and the missing
+  definition in one change: **all 61 tools translate**, with no notes.
 
 ### Context discipline is the feature, not a nicety
 
@@ -348,13 +377,32 @@ folded into an aggregate with the ollama cells, which is the misreading
    back as `ChatFailed: context size exceeded: 16757 tokens against a window of 8192` — the
    overflow arriving as a recorded result rather than a crash, which is what the grid needs.
 
-   **What is still untested is the live path**: every MCP call in that run was a fixture, so the
-   handshake, the lease keepalive and session cleanup have not been exercised against a real
-   `--listen`. That is the first thing to do when the VM is reachable.
+   **The live path is now exercised too** — see [the live drive](#the-live-drive): a real
+   handshake, the fence read off the server's own `readOnlyHint`, two DbgEng calls against a
+   kernel dump and a clean session release. It was run against a **second, throwaway listener**
+   (`--listen 127.0.0.1:8766 --tools crash`, its own generated token, held open by one ssh
+   connection and gone with it) rather than the service the editor uses: a shared credential is a
+   shared namespace, and the service's own client is served all 61 tools, which does not fit.
 3. **`backend: "fm"` in `local_model_eval.py`**, beside the two refusals that already key on
    backend, so a cell asking for `think` or a `num_ctx` is refused rather than silently ignored —
    this model has neither, and a silently ignored axis is how a grid fakes a controlled result.
-4. Re-measure the surface costs against a **real** `tools/list` captured from a Windows host rather
-   than the reconstruction above, which is the one number in this document that is inferred.
+   `fm_drive.py` refuses both already; this is the runner half. **Not done.**
+4. ~~Re-measure against a real `tools/list`~~ — **done**, and it found a bug rather than just
+   moving numbers: six tools whose `anyOf` the converter was turning into bare strings, and one
+   that would not build at all. The scaled estimates it replaced were all within 6%. Capturing it
+   is two steps, and worth writing down because the second is easy to get wrong:
 
-Step 1 carries no dependency on the VM; steps 2 and 4 need the listener reachable.
+   ```console
+   # against a listener serving the whole surface
+   WINDBG_MCP_TOKEN=... WINDBG_MCP_URL=http://127.0.0.1:8767/ python3 -c '...tools/list...'
+   swiftc -swift-version 6 -O tools/fm_schema.swift tools/fm_probe.swift -o /tmp/fm_probe
+   /tmp/fm_probe surface tools_list_real.json
+   ```
+
+   The capture must come from a **full** surface: `fm_probe` subsets it by name itself, so one
+   capture answers for all four `--tools` specs, but a capture taken through a narrowed client can
+   only ever describe that client.
+
+What is left is step 3, and a graded run: the six tasks on `--tools crash`, several draws, against
+the same answer key — reported as its own row, never folded into an aggregate with the ollama
+cells.
