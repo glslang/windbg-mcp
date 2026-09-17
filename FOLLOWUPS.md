@@ -1361,10 +1361,21 @@ two got one, independently, after the fact. There is no reason the third will be
   PR that added a third backend. It is also not urgent — both known instances are fixed, and the
   cost of the next one is a review round rather than a wrong number shipped.
 - **What would close it:** make each backend *declare* what it can and cannot answer rather than
-  have `identity()` infer it per field. Each driver already knows — all three write the fields they
-  cannot fill as null deliberately — so the knowledge exists at the point of writing and is being
-  re-guessed at the point of reading. A per-backend table, or a hook the drivers fill, means a
-  fourth backend states its answers instead of inheriting an `else`.
+  have `identity()` infer it per field — as **new, explicit capability metadata**, which is the
+  part worth stating precisely, because the obvious shortcut does not work.
+
+  The tempting shortcut is to read the nulls the drivers already write. That works for
+  `model_digest`, which both `claude_code_drive.py` and `fm_drive.py` set to `None` deliberately,
+  and it fails on the field that caused the trouble: `fm_drive.py` writes `think: False` — a
+  value, not a null, because the field is part of a cell — and `claude_code_drive.py` **omits**
+  `think` altogether. One absent, one false, neither null, and those two are exactly the cases the
+  backend-specific reasoning branch exists for. An implementation keyed on nulls would fix
+  `weights` and leave `reasoning` precisely where it is.
+
+  So the declaration has to be its own thing: a per-backend statement of *which identity fields
+  this backend can answer*, written where the record is written, and consulted instead of
+  re-derived. A fourth backend then states its answers rather than inheriting whatever an author
+  wrote for the others.
 - **A smaller check that would have caught both:** a test that builds one record per backend and
   asserts every identity field is what that backend claims, so a new field with no backend opinion
   fails rather than defaults.
