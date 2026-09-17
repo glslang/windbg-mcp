@@ -176,6 +176,55 @@ grace, so the mechanism `local_model_drive` grew after a 440 s ollama turn outli
 never been under load on this backend. It is unlikely to matter — this model's slowness is not of
 that order — but nothing has proven it.
 
+## What it scores
+
+The whole v1 suite, five draws, on `--tools crash`, graded against the checked-in answer key:
+
+| Task | Answerable on `crash` | Correct | Local models pooled, think off |
+|---|---|---:|---:|
+| `bugcheck` | yes | **5/5** | 19/20 |
+| `driver_blame` | yes | **5/5** | 20/20 |
+| `module_count` | yes | **5/5** | 18/20 |
+| `arm64_pc` | yes | **0/5** | 3/20 |
+| `unloaded_driver` | no | — | — |
+| `ioctl_decode` | no | — | — |
+
+**15/20 of the 30 task-runs**, 594 s, 31 tool calls. The last column is the published grid's
+[`local-model-eval.md`](local-model-eval.md) figure for the three ~30B MLX models pooled at the same
+surface and draw count, and it is there to stop the total being read as a model comparison: on the
+three tasks this surface answers straightforwardly the on-device model is 15/15 where the 30B-class
+models pooled 57/60, and on `arm64_pc` it is 0/5 against their 3/20. **Five draws cannot separate
+0/5 from a 15% rate** — at 3/20 you would see a clean sweep of failures 44% of the time — so read
+that row as "joins every other local model in failing this task", not as worse than them.
+
+**It fails `arm64_pc` the same way five times out of five**, which is what makes it a capability
+rather than a variance. Asked for the `pc` register it answers `0x0000019e7b820000` every time —
+which is bug check Arg1, and which `crash_triage` prints two lines later as
+`FAULTING FRAME: 0x0000019e7b820000 (frame 10)`. The real `pc` is `0xfffff8013c65bca8`, in frame 0.
+So the model is not inventing a value; it is taking the one this server labels most prominently and
+answering the question it was asked with it. `local-model-eval.md` already calls this task's
+difficulty interpretation rather than surface, and this is that, in one number repeated five times.
+
+The task where reasoning helps most is the one this backend cannot bring reasoning to: the pooled
+rows go 3/20 → 8/20 on `arm64_pc` with thinking on, and `reasoning: false` puts that improvement
+structurally out of reach here.
+
+### And `session,inspect,crash` fails exactly where the arithmetic says
+
+The 92% in the table above is not "tight", it is a surface whose work does not fit, and the run says
+so precisely. One draw of the `short` subset on `lean`, 7,572 prompt tokens against 8,192:
+
+| Task | First call | Outcome |
+|---|---|---|
+| `bugcheck` | `open_dump` ok, 2,582 chars | **context size exceeded: 8,935 against 8,192** |
+| `module_count` | `open_dump` ok, 2,432 chars | **context size exceeded: 8,832 against 8,192** |
+| `ioctl_decode` | `decode_error_reporting` ok, 340 chars | survived, answered, wrong |
+
+**The surface fits and the work does not.** Both dump tasks die on the *first* tool result, because
+`open_dump` alone is ~1,200 tokens on top of 7,572. The only task that survives is the one whose
+tool answers in 340 bytes. It also exercises the overflow path end to end — `fm_chat` classifies it,
+`fm_drive` raises `ChatFailed`, and the runner records it as the cell's result rather than a crash.
+
 ## Why not ollama
 
 Ollama runs weights it can load — GGUF through llama.cpp, or MLX. Apple's model is neither
@@ -456,7 +505,7 @@ folded into an aggregate with the ollama cells, which is the misreading
    `fm_probe surface` takes any number of captures and measures each exactly as given. It does not
    subset, and deliberately no longer can.
 
-What is left is a full graded run: the whole six-task suite rather than the `short` subset, more
-draws, and the result written up where the other backends' are — **as its own row**, never folded
-into an aggregate with the ollama cells, since this backend holds none of the grid's three axes
-fixed by choice.
+The full graded run is done and is [What it scores](#what-it-scores) above. What is left is to fold
+that row into [`local-model-eval.md`](local-model-eval.md) beside the other backends — **as its own
+row**, never into an aggregate with the ollama cells, since this backend holds none of the grid's
+three axes fixed by choice.

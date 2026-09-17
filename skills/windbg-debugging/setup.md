@@ -707,6 +707,13 @@ MCP endpoint, and anything that speaks MCP can hold one.
   driver, it wants a checkout and Python, and it ships in no release.
 - **A model in ollama's cloud.** The same endpoint and the same script; a cloud tag changes the
   model name and nothing else.
+- **Apple's on-device model, on a Mac.** Possible and measured, but not turnkey: no MCP client
+  drives it today, because it is reachable only through the Swift `FoundationModels` framework and
+  is not distributed as weights. The repository's `tools/fm_drive.py` does it and is the benchmark's
+  driver in the same sense as the ollama one — a checkout, Python and Xcode, shipping in no release.
+  **The binding constraint is the context window, not the debugger.** It is 8,192 tokens on the
+  build this was written against, and this server's full 61-tool surface is over twice that, so only
+  `--tools crash` leaves usable room. `docs/apple-foundation-models.md` has the measurements.
 
 Four things decide whether the ollama route works, and none of them is about the debugger:
 
