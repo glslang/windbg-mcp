@@ -1331,3 +1331,36 @@ one end-to-end user-mode heap check is standing down on every current build.
 **Where it picks up.** `walk_user_segment_heaps` in `dbgscope`'s `src/pool/snapshot.rs` and the PEB
 read feeding it, `examples/user_heap_smoke.rs`, and `heap_list`'s description in
 `windbg-mcp`'s `src/server.rs`.
+
+## 80. [windbg-mcp] `identity()` branches two ways on backend, and there are three
+
+`local_model_eval.identity()` decides what a record contributes with one test — `claude-code`, or
+everything else. That was right while there were two backends. There are three, and the `fm` rows
+answer differently from the ollama rows on every field the function collects, so each one had to be
+found separately:
+
+- `model_digest` is null by construction (Apple ships the weights with the OS and gives them no
+  address), which reduced every fm run to `weights apple-foundation-models unavailable` — two runs
+  across a macOS update, which *is* a model update, compared as though nothing had moved. Fixed by
+  reading `os_build` for that backend (`09aa279`).
+- `think: false` is an absence rather than an arm, and folding it in printed `on, off` for a run
+  where every backend with the knob ran with it on — the false "something moved" the Claude rows
+  are already excluded to prevent. Fixed as `unavailable` (`faa147a`).
+
+**Both were review findings on the PR that added the backend, one per round**, which is the shape
+worth acting on rather than either bug: a two-way branch cannot express three backends, so the next
+field added will be wrong for `fm` by default and will be found the same way.
+
+- **Why deferred:** the fix touches the ollama and `claude-code` paths, so it does not belong in the
+  PR that added a third backend. It is also not urgent — both known instances are fixed, and the
+  cost of the next one is a review round rather than a wrong number shipped.
+- **What would close it:** make each backend state its own identity rather than have `identity()`
+  infer it — a small table of `(field, backend) -> how to read it`, or a per-backend hook the
+  drivers already could fill, since each driver already knows which of its fields are unavailable
+  and writes them as null deliberately. Then adding a fourth backend declares its answers instead of
+  inheriting the `else` branch.
+
+**Where it picks up.** `identity()` in `tools/local_model_eval.py`, the `stated()` helper beside it
+and its `unrecorded`/`unavailable` distinction, and the three drivers' cell dicts
+(`local_model_drive.py`, `claude_code_drive.py`, `fm_drive.py`) which are where a backend could
+declare what it cannot answer.
