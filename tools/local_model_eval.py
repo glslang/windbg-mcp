@@ -1800,6 +1800,15 @@ def identity(log_records):
                                     lambda s: f"{s.get('name')} {s.get('version')}"))
         if record.get("backend") == "claude-code":
             fields["harness"].add(stated(record, "harness_version"))
+        elif record.get("backend") == "fm":
+            # **`think: false` on an fm row is an absence, not a setting.** The driver writes it
+            # because the field is part of a cell, but this model reports `reasoning: false` - it
+            # has no arm to be in. Folding it in as `off` beside a `think: true` ollama group would
+            # print `on, off` for a run in which every backend that *has* the knob ran with it on:
+            # the same false "something moved" the Claude rows are kept out for. `unavailable` is
+            # the vocabulary this block already uses for a row with no such answer to give, and the
+            # footnote already explains it.
+            fields["reasoning"].add(UNAVAILABLE)
         else:
             # **Only the rows that have the knob.** Folding the Claude rows in here would report
             # every mixed run as reasoning both ways, which is exactly the false "something moved"
