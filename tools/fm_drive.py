@@ -205,6 +205,12 @@ def main():
             "num_ctx": None,
             "seed": None,
             "think": False,
+            # **Which draw this process is.** `local_model_eval.draw_of()` reads a record with no
+            # `draw` as draw 1 - deliberately, so logs recorded before draws existed still grade -
+            # which means omitting it does not fail, it silently collapses every draw of a cell
+            # onto draw 1 and the grader's `(cell, draw, task)` dedup keeps only the last. A
+            # five-draw rate would be recorded, and graded, as one sighting.
+            "draw": drive.DRAW,
             "server": dict(drive.SERVER_INFO) or None,
             "suite": dict(drive.SUITE) or None,
             "surface": {"client": os.environ.get("EVAL_SURFACE", ""),
