@@ -339,19 +339,19 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 18% |
-   | `inspect` | 10 | 13,152 | 14.4% |
+   | `allocator` | 10 | 16,457 | 17.9% |
+   | `inspect` | 10 | 13,152 | 14.3% |
    | `session` | 10 | 12,817 | 14% |
-   | `ioctl` | 10 | 12,435 | 13.6% |
-   | `exec` | 8 | 12,472 | 13.6% |
+   | `ioctl` | 10 | 12,435 | 13.5% |
+   | `exec` | 8 | 12,652 | 13.8% |
    | `batch` | 1 | 10,021 | 10.9% |
    | `crash` | 3 | 7,427 | 8.1% |
-   | `ttd` | 9 | 6,829 | 7.5% |
+   | `ttd` | 9 | 6,829 | 7.4% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 61 | 91,610 |
-   | `session,inspect,exec,crash` | 31 | 44,947 |
+   | *(absent)* | 61 | 91,790 |
+   | `session,inspect,exec,crash` | 31 | 45,127 |
    | `session,inspect,crash` | 23 | 32,322 |
    | `crash` | 13 | 19,078 |
 
