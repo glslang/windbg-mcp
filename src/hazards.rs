@@ -34,7 +34,7 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use dbgscope::dbgeng::{Effect, Flow, Instruction, Operand};
+use dbgscope::dbgeng::{Effect, Flow, Instruction, InstructionSet, Operand};
 
 use crate::walk::Halt;
 use dbgscope::pe;
@@ -231,7 +231,7 @@ impl PrivilegeKind {
 /// `mov cr3, rax` and `mov rax, rbx` share a mnemonic, so the control-register case is decided by
 /// an operand being a control or debug register — which is a field here, not a substring of a
 /// printed line.
-fn privilege_kind(instruction: &Instruction) -> Option<PrivilegeKind> {
+fn privilege_kind(instruction: &Instruction, set: InstructionSet) -> Option<PrivilegeKind> {
     let control_register = || {
         instruction.operands.iter().any(|operand| match operand {
             Operand::Register(register) => {
@@ -255,7 +255,38 @@ fn privilege_kind(instruction: &Instruction) -> Option<PrivilegeKind> {
             _ => false,
         })
     };
-    let family = match instruction.mnemonic.as_str() {
+    // **A family table is one architecture's vocabulary, and the namespaces collide.** x86's
+    // `str` stores the task register and belongs to the descriptor tables; A64's `str` stores a
+    // register and is among the commonest instructions in any image. Matched on the name alone, a
+    // scan of an ARM64 `nt` reported **every store** as a descriptor-table access: 897 in the
+    // listed sample and 59,450 privileged instructions in all, which is a disassembly rather than
+    // a hazard report.
+    //
+    // Found by the debugger tier against a real ARM64 image, and nothing built from x86 fixtures
+    // could have shown it -- the two namespaces are *mostly* disjoint, which is the worst way for
+    // them to be, since it is one collision rather than a wholesale mismatch that would have been
+    // obvious. So the table is now chosen by the target rather than searched across all of them.
+    //
+    // An architecture with no table here keeps `Other` for anything the decoder calls privileged,
+    // which is what makes the split safe: it loses family names and loses no findings.
+    let family = match set {
+        InstructionSet::Arm64 => arm64_family(instruction, interrupt_mask),
+        InstructionSet::X86 | InstructionSet::Amd64 => x86_family(instruction, control_register),
+        InstructionSet::Other(_) => None,
+    };
+    match (family, instruction.privileged) {
+        (Some(kind), _) => Some(kind),
+        (None, true) => Some(PrivilegeKind::Other),
+        (None, false) => None,
+    }
+}
+
+/// The x86 and x64 families, by mnemonic and -- where a mnemonic does not settle it -- by operand.
+fn x86_family(
+    instruction: &Instruction,
+    control_register: impl Fn() -> bool,
+) -> Option<PrivilegeKind> {
+    match instruction.mnemonic.as_str() {
         "rdmsr" | "wrmsr" => Some(PrivilegeKind::ModelSpecificRegister),
         "in" | "out" | "insb" | "insw" | "insd" | "outsb" | "outsw" | "outsd" => {
             Some(PrivilegeKind::PortIo)
@@ -270,27 +301,35 @@ fn privilege_kind(instruction: &Instruction) -> Option<PrivilegeKind> {
             Some(PrivilegeKind::MachineState)
         }
         "cli" | "sti" => Some(PrivilegeKind::InterruptFlag),
-        // **A64's cache, TLB and address-translation maintenance**, which is the same family as
-        // `invd`/`wbinvd`/`invlpg` above and is where an ARM64 driver's machine-state work lives.
-        // Every one of them is `privileged` from the decoder, so this decides only the family --
-        // without it they were reported correctly and namelessly, under [`PrivilegeKind::Other`].
-        "dc" | "ic" | "tlbi" | "at" => Some(PrivilegeKind::MachineState),
-        // `msr daifset,#2` masks interrupts and `msr daifclr,#2` unmasks them, which is `cli` and
-        // `sti` under another spelling; `DAIF` reached as a *register* is the same gate, and
-        // dbgscope spells a system register by its encoding rather than its name. Only the
-        // interrupt masks are named here: the rest of the system-register space is far too wide to
-        // family-name honestly, and lands in `Other` **with its register in the operands**, which
-        // is a better answer than a family invented for it.
-        "msr" | "mrs" if interrupt_mask() => Some(PrivilegeKind::InterruptFlag),
         "vmlaunch" | "vmresume" | "vmxon" | "vmxoff" | "vmread" | "vmwrite" | "vmptrld"
         | "vmptrst" | "vmclear" | "invept" | "invvpid" | "vmrun" | "vmload" | "vmsave" | "clgi"
         | "stgi" | "skinit" => Some(PrivilegeKind::Virtualization),
         _ => None,
-    };
-    match (family, instruction.privileged) {
-        (Some(kind), _) => Some(kind),
-        (None, true) => Some(PrivilegeKind::Other),
-        (None, false) => None,
+    }
+}
+
+/// The A64 families.
+///
+/// Deliberately short. Every member is `privileged` from the decoder already, so this decides only
+/// the family *name* -- without it they were reported correctly and namelessly under
+/// [`PrivilegeKind::Other`], which is the state ARM64 was in the day dbgscope#170 landed. Adding a
+/// name is worth doing; inventing one is not, which is why the system-register space past the
+/// interrupt masks is deliberately absent.
+fn arm64_family(
+    instruction: &Instruction,
+    interrupt_mask: impl Fn() -> bool,
+) -> Option<PrivilegeKind> {
+    match instruction.mnemonic.as_str() {
+        // Cache, TLB and address-translation maintenance: the same family as `invd`/`wbinvd`/
+        // `invlpg`, and where an ARM64 driver's machine-state work lives.
+        "dc" | "ic" | "tlbi" | "at" => Some(PrivilegeKind::MachineState),
+        // `msr daifset,#2` masks interrupts and `msr daifclr,#2` unmasks them, which is `cli` and
+        // `sti` under another spelling; `DAIF` reached as a *register* is the same gate, and
+        // dbgscope spells a system register by its encoding rather than by name. The rest of that
+        // space lands in `Other` **with its register still in the operands**, which is a better
+        // answer than a family invented for it.
+        "msr" | "mrs" if interrupt_mask() => Some(PrivilegeKind::InterruptFlag),
+        _ => None,
     }
 }
 
@@ -436,6 +475,7 @@ const WINDOW: u64 = 64 * 1024;
 pub fn scan(
     image: &pe::Image,
     imports: &[pe::Import],
+    set: InstructionSet,
     mut decode: impl FnMut(u64, usize) -> Option<Vec<Instruction>>,
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> Scan {
@@ -617,7 +657,7 @@ pub fn scan(
                         listed_call_sites += 1;
                     }
                 }
-                if let Some(kind) = privilege_kind(instruction) {
+                if let Some(kind) = privilege_kind(instruction, set) {
                     privileged_count += 1;
                     if privileged.len() < MAX_PRIVILEGED {
                         privileged.push(Privileged {
@@ -1009,6 +1049,16 @@ mod tests {
     /// The pairs are spelled out rather than derived, because a fixture that computed them would
     /// be sharing whatever the code under test uses to decide — and the answer is the decoder's on
     /// a real target, so here it is data like an instruction's bytes.
+    /// `privilege_kind` for an x64 target, which is what every fixture here but one is.
+    fn privilege_kind_x86(instruction: &Instruction) -> Option<PrivilegeKind> {
+        privilege_kind(instruction, InstructionSet::Amd64)
+    }
+
+    /// And for an ARM64 one, so a call site says which vocabulary it is asking about.
+    fn privilege_kind_arm64(instruction: &Instruction) -> Option<PrivilegeKind> {
+        privilege_kind(instruction, InstructionSet::Arm64)
+    }
+
     fn register(name: &str) -> RegisterOperand {
         let full = match name {
             "rax" | "eax" | "ax" | "al" | "ah" => "rax",
@@ -1243,6 +1293,7 @@ mod tests {
         let found = scan(
             &image,
             &imports,
+            InstructionSet::Amd64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
         );
@@ -1396,6 +1447,7 @@ mod tests {
         let found = scan(
             &image,
             &imports,
+            InstructionSet::Arm64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
         );
@@ -1442,7 +1494,7 @@ mod tests {
         // Cache, TLB and address-translation maintenance: the same family as `invd`/`invlpg`.
         for mnemonic in ["dc", "ic", "tlbi", "at"] {
             assert_eq!(
-                privilege_kind(&other(mnemonic, Vec::new())),
+                privilege_kind_arm64(&other(mnemonic, Vec::new())),
                 Some(PrivilegeKind::MachineState),
                 "{mnemonic}"
             );
@@ -1451,7 +1503,7 @@ mod tests {
         // the same gate: `s3_3_c4_c2_1`.
         for name in ["daifset", "daifclr", "s3_3_c4_c2_1"] {
             assert_eq!(
-                privilege_kind(&other("msr", vec![Operand::Other(name.to_string())])),
+                privilege_kind_arm64(&other("msr", vec![Operand::Other(name.to_string())])),
                 Some(PrivilegeKind::InterruptFlag),
                 "{name}"
             );
@@ -1459,7 +1511,7 @@ mod tests {
         // **`NZCV` is one `op2` away and is EL0's own**, so a looser match would call every flag
         // restore an interrupt mask. It is not privileged at all, so it is not reported.
         assert_eq!(
-            privilege_kind(&insn(
+            privilege_kind_arm64(&insn(
                 BASE + 0x1000,
                 "00000000",
                 "msr",
@@ -1470,8 +1522,32 @@ mod tests {
         );
         // Everything else privileged keeps its mnemonic under `Other` rather than being dropped.
         assert_eq!(
-            privilege_kind(&other("eret", Vec::new())),
+            privilege_kind_arm64(&other("eret", Vec::new())),
             Some(PrivilegeKind::Other),
+        );
+        // **The collision that made these tables architecture-specific.** x86's `str` stores the
+        // task register and belongs to the descriptor tables; A64's stores a register and is among
+        // the commonest instructions there is. Read in one namespace, a scan of an ARM64 `nt`
+        // called **every store** a descriptor-table access -- 59,450 privileged instructions,
+        // which is a disassembly rather than a hazard report. Found by the debugger tier against a
+        // real image, and asserted in **both** directions here: the x86 reading has to survive,
+        // since that one is right.
+        let store = insn(
+            BASE + 0x1000,
+            "00000000",
+            "str",
+            Flow::Fallthrough,
+            Vec::new(),
+        );
+        assert_eq!(
+            privilege_kind_arm64(&store),
+            None,
+            "an A64 store is not a descriptor-table access"
+        );
+        assert_eq!(
+            privilege_kind_x86(&store),
+            Some(PrivilegeKind::DescriptorTable),
+            "and an x86 `str` still is"
         );
     }
 
@@ -1534,6 +1610,7 @@ mod tests {
         let found = scan(
             &image,
             &[],
+            InstructionSet::Amd64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
         );
@@ -1602,6 +1679,7 @@ mod tests {
         let found = scan(
             &image,
             &[],
+            InstructionSet::Amd64,
             |at, _| (at == BASE + 0x1000).then(|| block.clone()),
             never,
         );
@@ -1638,6 +1716,7 @@ mod tests {
         let found = scan(
             &image,
             &[],
+            InstructionSet::Amd64,
             |at, _| {
                 asked.push(at);
                 // The first window ends on a three-byte instruction, so the next must begin one
@@ -1683,7 +1762,13 @@ mod tests {
         let image = image();
 
         // An empty but successful decode.
-        let empty = scan(&image, &[], |_, _| Some(Vec::new()), never);
+        let empty = scan(
+            &image,
+            &[],
+            InstructionSet::Amd64,
+            |_, _| Some(Vec::new()),
+            never,
+        );
         assert!(empty.scanned.is_empty(), "{:?}", empty.scanned);
         assert_eq!(empty.unreadable.len(), 1, "{:?}", empty.unreadable);
         assert_eq!(empty.unreadable[0].start, BASE + 0x1000);
@@ -1696,6 +1781,7 @@ mod tests {
         let stuck = scan(
             &image,
             &[],
+            InstructionSet::Amd64,
             |at, _| Some(vec![insn(at, "", "nop", Flow::Fallthrough, Vec::new())]),
             never,
         );
@@ -1713,7 +1799,7 @@ mod tests {
     #[test]
     fn an_unreadable_window_is_recorded_rather_than_skipped_in_silence() {
         let image = image();
-        let found = scan(&image, &[], |_, _| None, never);
+        let found = scan(&image, &[], InstructionSet::Amd64, |_, _| None, never);
         assert!(
             found.scanned.is_empty(),
             "nothing was covered, and nothing claims to have been: {:?}",
@@ -1750,6 +1836,7 @@ mod tests {
         let hole = scan(
             &wide,
             &[],
+            InstructionSet::Amd64,
             |at, want| (at != BASE + 0x11000).then(|| filler(at, want)),
             never,
         );
@@ -1783,6 +1870,7 @@ mod tests {
         let found = scan(
             &image,
             &[],
+            InstructionSet::Amd64,
             |at, len| {
                 asked.push(at + len as u64);
                 None
@@ -1824,6 +1912,7 @@ mod tests {
         let found = scan(
             &image,
             &imports,
+            InstructionSet::Amd64,
             |at, want| {
                 let mut block = Vec::new();
                 let mut address = at;
@@ -1889,6 +1978,7 @@ mod tests {
             let found = scan(
                 image,
                 &imports,
+                InstructionSet::Amd64,
                 |at, _| {
                     decoded_from.push(at);
                     (at == BASE + 0x1000).then(|| block.clone())
@@ -1968,6 +2058,7 @@ mod tests {
         let found = scan(
             &image,
             &imports,
+            InstructionSet::Amd64,
             |at, want| {
                 let mut block = Vec::new();
                 let mut address = at;
@@ -2019,7 +2110,7 @@ mod tests {
             .map(|index| import("memcpy", BASE + 0x3000 + (index as u64 * 8)))
             .collect();
 
-        let found = scan(&image, &imports, |_, _| None, never);
+        let found = scan(&image, &imports, InstructionSet::Amd64, |_, _| None, never);
         assert_eq!(
             found.sinks.len(),
             1,
@@ -2045,7 +2136,7 @@ mod tests {
             name: pe::ImportName::Named("memcpy".to_string()),
             slot: BASE + 0x3900,
         });
-        let found = scan(&image, &two, |_, _| None, never);
+        let found = scan(&image, &two, InstructionSet::Amd64, |_, _| None, never);
         assert_eq!(found.sinks.len(), 2, "{:?}", found.sinks);
     }
 
@@ -2062,6 +2153,7 @@ mod tests {
         let found = scan(
             &image,
             &[],
+            InstructionSet::Amd64,
             |_, _| panic!("nothing outside the image is read"),
             never,
         );
@@ -2085,6 +2177,7 @@ mod tests {
         let found = scan(
             &image,
             &[],
+            InstructionSet::Amd64,
             |at, _| Some(vec![insn(at, "90", "nop", Flow::Fallthrough, Vec::new())]),
             || {
                 polls += 1;

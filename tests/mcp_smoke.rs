@@ -9994,22 +9994,24 @@ fn an_ioctl_map_of_a_driver_in_a_dump_is_its_chain_and_both_its_tables() {
         TARGET_STEP,
     );
 }
-
-/// An architecture whose **operands** this build cannot read is **refused**, not answered.
+/// **ARM64 is not refused for being ARM64**, which is the assertion this test used to make
+/// backwards.
 ///
-/// The ARM64 driver crash is the fixture, opened on whatever host runs this: an x64 engine reads
-/// an ARM64 kernel dump perfectly well, which is exactly what makes the failure available. A walk
-/// over instructions whose compares it cannot read finds no code and no switch, and the honest
-/// answer to that is not a driver that accepts no control codes — that is a real driver's map, and
-/// a reader has no way to tell the two apart.
+/// It asserted that `ioctl_map` refuses an ARM64 target and that the refusal names machine
+/// `0xaa64`, which was right for as long as `InstructionSet::operands_are_read` answered `false`
+/// there: a map that cannot read a compare reports a driver accepting no control codes, which is
+/// what a driver with no dispatch routine looks like, so refusing was the honest answer.
+/// dbgscope#170 decoded A64's operands and that gate now passes, so the refusal is gone and this
+/// says so from the other side.
 ///
-/// **This stayed a refusal when the reachability walk stopped being one**
-/// ([#297](https://github.com/glslang/windbg-mcp/issues/297)), and that is the point worth
-/// keeping: A64's control *flow* is decoded now and its operands are not, so the two tools gate on
-/// different questions. The test below is this one's counterpart, on the same dump, and the pair
-/// is what says the gates came apart rather than one of them being forgotten.
+/// **The rule is about the architecture, not about the outcome.** On this dump the call still
+/// fails, and correctly: a kernel minidump carries no driver pages and this bench serves no image
+/// for a third-party driver, so `HEVD`'s code is not here to disassemble — the same fact the walk
+/// below works around by asking about `nt`. What must not come back is a refusal about the
+/// *machine*, which is why the assertions are on what the message may not say rather than on
+/// whether there is one. A host that did serve `HEVD` would map it, and this would still hold.
 #[test]
-fn an_ioctl_map_of_an_architecture_this_build_cannot_decode_is_refused() {
+fn an_ioctl_map_of_an_arm64_target_is_not_refused_for_its_architecture() {
     if target_tier().is_none() {
         return;
     }
@@ -10034,20 +10036,106 @@ fn an_ioctl_map_of_an_architecture_this_build_cannot_decode_is_refused() {
         TARGET_STEP,
     );
     assert_no_error(&response, "ioctl_map on an ARM64 target");
+    let message = response["result"]["structuredContent"]["error"]["message"]
+        .as_str()
+        .unwrap_or_default()
+        .to_string();
     assert!(
-        is_tool_error(&response),
-        "a target this build cannot decode has to be refused rather than mapped: {response}"
+        !message.contains("0xaa64"),
+        "an ARM64 target is not refused for its machine any more: {response}"
     );
+    assert!(
+        !message.contains("operands this build does not read"),
+        "and not for its operands, which are read now: {response}"
+    );
+    // Whatever it does say is about *this target* -- here, the driver whose pages a kernel
+    // minidump does not carry.
+    if is_tool_error(&response) {
+        assert!(
+            message.contains("IrpDeviceIoCtlHandler"),
+            "a failure has to name what it could not read: {response}"
+        );
+    }
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
+/// **The hazard scan reads real A64 code**, which is the half no unit test can stand in for.
+///
+/// `nt` rather than `HEVD`, for the reason the walk below gives: the driver's pages are not in a
+/// kernel minidump and `nt`'s are. That makes this the only place in the suite where
+/// `hazards::Formed` and the A64 privilege families meet an actual ARM64 image — 855 `movk` and
+/// a `msr`, `dc` or `tlbi` in every other routine — rather than a fixture built from encodings.
+///
+/// The assertion is that it **answers**, and that what it found is shaped like ARM64 rather than
+/// like an empty scan: a scan reporting nothing is exactly the wrong answer these tools refused
+/// ARM64 to avoid, and it is indistinguishable from a clean driver.
+#[test]
+fn a_hazard_scan_of_an_arm64_image_answers_with_a64_instructions() {
+    if target_tier().is_none() {
+        return;
+    }
+    if !std::path::Path::new(ARM64_DRIVER_CRASH_DUMP).exists() {
+        skip(&format!(
+            "sample dump not found at {ARM64_DRIVER_CRASH_DUMP}"
+        ));
+        return;
+    }
+    let mut server = Server::started();
+    let opened = server.call_tool(
+        "open_dump",
+        json!({ "path": ARM64_DRIVER_CRASH_DUMP }),
+        TARGET_STEP,
+    );
+    assert_no_error(&opened, "open_dump");
+    let session_id = session_id_of(&opened["result"]);
+
+    let response = server.call_tool(
+        "driver_hazards",
+        json!({ "session_id": session_id, "module": "nt" }),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "driver_hazards on an ARM64 image");
     let data = &response["result"]["structuredContent"];
-    assert_eq!(
-        data["status"], "error",
-        "the refusal carries structured content, as the schema promises: {response}"
-    );
-    let message = data["error"]["message"].as_str().unwrap_or_default();
+    let privileged = data["privileged"].as_array().cloned().unwrap_or_default();
     assert!(
-        message.contains("0xaa64"),
-        "and says which machine it found, so the refusal is about this target rather than about \
-         the tool: {response}"
+        !privileged.is_empty(),
+        "an ARM64 kernel is full of `msr`, `dc` and `tlbi`; an empty list is the answer this \
+         refusal used to exist to avoid: {response}"
+    );
+    let kinds: Vec<&str> = privileged
+        .iter()
+        .filter_map(|row| row["kind"].as_str())
+        .collect();
+    let mnemonics: Vec<&str> = privileged
+        .iter()
+        .filter_map(|row| row["mnemonic"].as_str())
+        .collect();
+    // **The A64 families fire on real code**, rather than everything landing in `other`.
+    assert!(
+        kinds.contains(&"interrupt_flag") || kinds.contains(&"machine_state"),
+        "the A64 families are read off real instructions: {kinds:?}"
+    );
+    assert!(
+        mnemonics
+            .iter()
+            .any(|m| matches!(*m, "msr" | "mrs" | "dc" | "ic" | "tlbi" | "at")),
+        "and what it found is A64: {mnemonics:?}"
+    );
+    // **No store is a descriptor-table access.** x86's `str` is the task register and A64's is a
+    // store; read in the wrong namespace this scan called 59,450 of `nt`'s instructions
+    // privileged, 897 of the listed ones `descriptor_table`. That is the regression this asserts.
+    assert!(
+        !mnemonics.contains(&"str"),
+        "an A64 store is not a privileged instruction: {privileged:?}"
+    );
+    assert!(
+        !kinds.contains(&"descriptor_table"),
+        "and A64 has no descriptor tables to reach: {privileged:?}"
     );
 
     server.tool_data(

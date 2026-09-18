@@ -7017,6 +7017,10 @@ fn hazards_at(
     let mut scan = hazards::scan(
         &image,
         &table.imports,
+        // **Which mnemonic vocabulary the family table is read in.** x86's `str` is the task
+        // register and A64's is a store, so a scan that does not know the target reports every
+        // ARM64 store as a descriptor-table access.
+        e.instruction_set(),
         |at, len| e.decode_range(at, len).ok(),
         || {
             if matches!(e.interrupted(), Ok(true)) {
