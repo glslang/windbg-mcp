@@ -1993,6 +1993,13 @@ fn ttd_memory_command(start: u64, end: u64, mode: Option<&str>) -> String {
 /// It is a lexer over `"` and `\`, not a parser — it makes no claim about `.if`, `.foreach` or an
 /// alias, which reach execution without naming what they run (`FOLLOWUPS.md` item 81).
 pub(crate) fn outside_quotes(command: &str) -> String {
+    /// What a character contributes once quoting is known. A quote is only ever *inside* a line.
+    fn kept(c: char, in_quote: bool) -> char {
+        match in_quote {
+            true => ' ',
+            false => c,
+        }
+    }
     let mut out = String::with_capacity(command.len());
     let mut in_quote = false;
     let mut chars = command.chars();
@@ -2001,21 +2008,36 @@ pub(crate) fn outside_quotes(command: &str) -> String {
             // A backslash escape belongs to whichever side of the quote it is on, and takes the
             // next character with it — so `\"` inside a string does not end it.
             '\\' => {
-                out.push(if in_quote { ' ' } else { c });
+                out.push(kept(c, in_quote));
                 if let Some(escaped) = chars.next() {
-                    out.push(if in_quote { ' ' } else { escaped });
+                    out.push(kept(escaped, in_quote));
                 }
             }
             '"' => {
                 in_quote = !in_quote;
                 out.push(' ');
             }
-            _ => out.push(if in_quote { ' ' } else { c }),
+            // **A line break ends the command and any quote open inside it**, which is why it
+            // survives the blanking and resets the state. DbgEng ends a command at one whatever
+            // the quoting, and [`changes_debug_target`] splits on `\r` and `\n` for that reason.
+            // Carrying the quote across would read `.echo "banner\n.detach"` as one printed
+            // string and let the `.detach` on the next line run at hit time unseen — the exact
+            // bypass this function must not open while closing the `;` one.
+            '\r' | '\n' => {
+                in_quote = false;
+                out.push(c);
+            }
+            _ => out.push(kept(c, in_quote)),
         }
     }
     match in_quote {
-        // Unbalanced: hand back the original rather than a reading nobody can trust.
-        true => command.to_string(),
+        // **Unbalanced: ignore quoting entirely rather than trust a reading of it** — blank
+        // nothing, but drop the quote *characters* so the names either side of them are still
+        // words. Handing back the raw text instead looks conservative and is not: a `"` sitting
+        // against a name leaves `.kill"` as the token, which matches nothing, so the very command
+        // this cannot parse would be the one it waves through. Measured on
+        // `.echo "banner\r\n.kill"`, which the raw fallback accepted.
+        true => command.replace('"', " "),
         false => out,
     }
 }
@@ -3836,7 +3858,15 @@ impl WindbgServer {
         annotations(
             title = "Set breakpoint",
             read_only_hint = false,
-            destructive_hint = false,
+            // **True since this tool grew a `command`**, and `false` for the years before it. An
+            // annotation describes what a tool *may* do, not what one call does, and a breakpoint
+            // carrying arbitrary debugger text may write memory on every hit — deferred to a
+            // moment the caller is not watching, which is the harder half. `execute` takes the
+            // same text and has always said `true`; the two cannot differ now that the capability
+            // does not. It over-declares the plain breakpoint that carries no command, and that is
+            // the right way round: the cost is a prompt, where under-declaring lets a client that
+            // auto-approves the harmless-looking tools arm a latent write.
+            destructive_hint = true,
             idempotent_hint = false,
             open_world_hint = true
         ),
@@ -6994,6 +7024,16 @@ mod tests {
                 outside_quotes(command)
             );
         }
+        // **A line break is a command boundary whatever the quoting**, so it survives the
+        // blanking: DbgEng ends a command at one, and blanking it would join the next line to the
+        // `.echo` in front and read the pair as one printed string.
+        assert!(changes_debug_target(&outside_quotes(
+            ".echo \"banner\n.detach\nend\""
+        )));
+        assert!(changes_debug_target(&outside_quotes(
+            ".echo \"banner\r\n.kill\""
+        )));
+
         // An unbalanced quote is judged on the whole text rather than a reading nobody can trust,
         // so this errs towards refusing rather than towards missing a `.detach`.
         assert!(changes_debug_target(&outside_quotes(
