@@ -1445,6 +1445,34 @@ fn immediate_of(operand: &Operand) -> Option<u64> {
     }
 }
 
+/// The literal a `movk` leaves in the register it names, given what that register already held.
+///
+/// **Two readers need this and must not disagree**, which is why it is a function. [`update`] uses
+/// it to keep following a compare chain; [`status_after`] uses it because an A64 `NTSTATUS` is two
+/// instructions -- `mov w0,#0xD` / `movk w0,#0xC000,lsl #0x10` is `STATUS_INVALID_DEVICE_REQUEST`
+/// -- and that second instruction runs through here *before* `update` sees it. Without it the
+/// `movk` reads as a write of something unmodelled, the status is cleared, and a handler that
+/// returns an ordinary multi-instruction status is reported as **accepting** the request. Raised
+/// on windbg-mcp#343.
+///
+/// The decoder hands the immediate already shifted, so which halfword it lands in is read back out
+/// of it; a zero immediate is ambiguous between the halfwords and keeps no answer at all.
+fn movk_literal(held: Option<&Value>, operand: Option<&Operand>) -> Option<u32> {
+    let immediate = match operand {
+        Some(Operand::Immediate(value)) if *value != 0 => *value,
+        _ => return None,
+    };
+    let Some(Value::Literal(literal)) = held else {
+        return None;
+    };
+    let mask = 0xffff_u64 << ((immediate.trailing_zeros() / 16) * 16);
+    // The immediate has to sit inside the halfword it starts in.
+    match immediate & !mask == 0 {
+        true => u32::try_from((u64::from(*literal) & !mask) | immediate).ok(),
+        false => None,
+    }
+}
+
 /// One step of the dispatch arithmetic, in the width the value actually has.
 ///
 /// A control code is a `ULONG`: the machine computes `code - offset` modulo 2^32, so the offset
@@ -1871,25 +1899,11 @@ fn update(
         // zero clears a halfword, and every halfword's zero looks alike -- so that keeps the
         // conservative answer below rather than guessing which one to clear.
         Effect::Other if instruction.mnemonic == "movk" => {
-            let inserted = operands
-                .get(1)
-                .and_then(immediate_of)
-                .filter(|immediate| *immediate != 0);
-            let value = match (held, inserted) {
-                (Some(Value::Literal(literal)), Some(immediate)) => {
-                    let mask = 0xffff_u64 << ((immediate.trailing_zeros() / 16) * 16);
-                    // The immediate has to sit inside the halfword it starts in. Anything else is
-                    // not a shape this modelled, and is not one to guess at.
-                    match immediate & !mask == 0 {
-                        true => u32::try_from((u64::from(literal) & !mask) | immediate)
-                            .ok()
-                            .map(Value::Literal),
-                        false => None,
-                    }
-                }
-                _ => None,
-            };
-            set(facts, &destination, value);
+            set(
+                facts,
+                &destination,
+                movk_literal(held.as_ref(), operands.get(1)).map(Value::Literal),
+            );
         }
         _ => set(facts, &destination, None),
     }
@@ -2527,17 +2541,40 @@ fn status_after(
     // case comes back rejected and its handler is taken away, which is a wrong answer about a code
     // the driver accepts. So the destination has to be a dword at that displacement off a register
     // this walk watched the IRP reach.
-    let stores = matches!(
-        instruction.operands.first(),
-        Some(Operand::Memory(memory))
-            if memory.index.is_none()
+    //
+    // **By operand role rather than by position**, which is what a second architecture costs here:
+    // x86 writes `mov [rbx+30h],ecx` with the memory first and A64 writes `str w9,[x8,#30h]` with
+    // it second, so a first-operand rule sees no store at all on ARM64. A handler that refuses
+    // through `Irp->IoStatus.Status` -- which is the shape a rejection takes once a completion
+    // call has clobbered the return register -- was then reported as **accepting** the code.
+    // Raised on windbg-mcp#343.
+    //
+    // A load off the same field has the same two operands the other way round, and the decoder is
+    // what tells them apart: a load writes the register it names and a store writes none of them.
+    let addressed = instruction
+        .operands
+        .iter()
+        .find_map(|operand| match operand {
+            Operand::Memory(memory) => Some(memory),
+            _ => None,
+        });
+    let writes_a_named_register = instruction.operands.iter().any(|operand| match operand {
+        Operand::Register(register) => instruction
+            .writes
+            .iter()
+            .any(|written| written.full == register.full),
+        _ => false,
+    });
+    let stores = !writes_a_named_register
+        && addressed.is_some_and(|memory| {
+            memory.index.is_none()
                 && memory.size == Some(FIELD_WIDTH)
                 && memory.displacement == layout.status_field
                 && memory
                     .base
                     .as_ref()
                     .is_some_and(|base| facts.registers.get(&base.full) == Some(&Value::Irp))
-    );
+        });
     if !returns && !stores {
         return status;
     }
@@ -2555,7 +2592,17 @@ fn status_after(
     // there in a register: `mov ecx,0C0000010h` / `mov [rbx+30h],ecx` is the same refusal as the
     // one-instruction form, and reading only the immediate takes it for a store of something
     // unknown -- which clears the field's status and loses the rejection.
-    let written = match instruction.operands.get(1) {
+    // The source is operand one where the destination is a register, and the operand that is
+    // *not* the memory where the destination is memory -- again because the two architectures put
+    // it on opposite sides.
+    let source = match stores {
+        true => instruction
+            .operands
+            .iter()
+            .find(|operand| !matches!(operand, Operand::Memory(_))),
+        false => instruction.operands.get(1),
+    };
+    let written = match source {
         Some(Operand::Immediate(value)) => u32::try_from(*value).ok(),
         Some(Operand::Register(register)) => match facts.registers.get(&register.full) {
             Some(Value::Literal(value)) if register.width >= FIELD_WIDTH => Some(*value),
@@ -2563,13 +2610,29 @@ fn status_after(
         },
         _ => None,
     };
-    let refusal = instruction.effect == Effect::Move
-        && match written {
-            Some(value) => value >> 30 == 0b11,
-            // The destination was written with something that is not a literal status: whatever
-            // is there now is no longer the refusal that was loaded.
-            None => false,
-        };
+    // **A64 states a status in two instructions**, and the second is not a `Move`. This runs
+    // before [`update`] does, so the combined literal is asked for here from the same helper
+    // rather than waited for -- without it `movk` reads as a write of something unmodelled and
+    // takes the refusal back, which reports an ordinary rejection as an accepted code.
+    let inserted = match instruction.mnemonic == "movk" {
+        true => movk_literal(
+            facts.registers.get(layout.return_register),
+            instruction.operands.get(1),
+        ),
+        false => None,
+    };
+    let refusal = match inserted {
+        Some(value) => value >> 30 == 0b11,
+        None => {
+            instruction.effect == Effect::Move
+                && match written {
+                    Some(value) => value >> 30 == 0b11,
+                    // The destination was written with something that is not a literal status:
+                    // whatever is there now is no longer the refusal that was loaded.
+                    None => false,
+                }
+        }
+    };
     // **What is in the return register now**, which this pass can say only for a write it
     // modelled: a destination it recognised, taking something the arms above could read. An
     // implicit write names nothing for them, so what it left is neither a refusal nor the status
@@ -3647,6 +3710,111 @@ mod tests {
             found.cases
         );
         assert_eq!(found.case_count, 0);
+    }
+
+    /// **An ARM64 rejection is read, through either place it can be written.**
+    ///
+    /// Both were invisible when this branch first enabled the map on ARM64, and both fail in the
+    /// direction that matters: a refused code reported as **accepted**, with whatever it called
+    /// named as its handler.
+    ///
+    /// - The status itself takes two instructions. `mov w0,#0x10` / `movk w0,#0xC000,lsl #0x10` is
+    ///   `0xC0000010`, and `status_after` runs before the walk folds those together -- so the
+    ///   `movk` read as an unmodelled write and took the refusal back.
+    /// - A store to `Irp->IoStatus.Status` names its **source** first on A64, so a rule reading
+    ///   operand zero for the memory saw no store at all. That is the shape a rejection takes once
+    ///   a completion call has clobbered the return register, which is the ordinary case.
+    ///
+    /// Raised on windbg-mcp#343.
+    #[test]
+    fn an_arm64_rejection_is_read_from_its_status_and_from_its_store() {
+        let refusal = |through_the_irp: bool| {
+            let mut block = vec![
+                insn(
+                    DISPATCH,
+                    "ldr",
+                    vec![reg("x8"), pointer("x1", 0xb8)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 4,
+                    "ldr",
+                    vec![reg("w9"), mem("x8", 0x18)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("w10"), imm(0x2003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xc,
+                    "movk",
+                    vec![reg("w10"), imm(0x22_0000)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x10,
+                    "cmp",
+                    vec![reg("w9"), reg("w10")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "b.eq",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x40)),
+                ),
+                insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return),
+            ];
+            // The handler. `w11` for the store so that the return register is untouched and the
+            // two paths are actually separate -- built in `w0`, this would pass on `returned`
+            // whatever the store did.
+            let status = match through_the_irp {
+                true => "w11",
+                false => "w0",
+            };
+            block.extend([
+                insn(
+                    DISPATCH + 0x40,
+                    "mov",
+                    vec![reg(status), imm(0x10)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x44,
+                    "movk",
+                    vec![reg(status), imm(0xc000_0000)],
+                    Flow::Fallthrough,
+                ),
+            ]);
+            if through_the_irp {
+                block.push(insn(
+                    DISPATCH + 0x48,
+                    "str",
+                    vec![reg("w11"), mem("x1", 0x30)],
+                    Flow::Fallthrough,
+                ));
+            }
+            block.push(insn(DISPATCH + 0x4c, "ret", Vec::new(), Flow::Return));
+
+            let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+            assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
+            assert_eq!(found.cases[0].code, 0x222003, "{:?}", found.cases);
+            found.cases[0].accepted
+        };
+
+        assert_eq!(
+            refusal(false),
+            Some(false),
+            "a status built by `mov`/`movk` and returned is a refusal"
+        );
+        assert_eq!(
+            refusal(true),
+            Some(false),
+            "and so is one stored into `Irp->IoStatus.Status`, whose source A64 names first"
+        );
     }
 
     /// A compare chain is the ordinary shape, and each `cmp`/`je` pair is one case.
