@@ -13,7 +13,9 @@
   follows an instruction's control flow, which this build decodes from the encoding for those
   three sets and for no other — so on a target outside them every instruction's flow is unknown
   and any verdict would be about what could not be read rather than about the target. The refusal
-  names the machine type. Analysis that needs no control flow is unaffected there: `modules`,
+  names the machine type and the tools that do work on that target, and deliberately **not** the
+  list above: a reader cannot change their target's architecture, and a list repeated into a
+  message is one that goes stale the first time a gate moves. Analysis that needs no control flow is unaffected there: `modules`,
   `read_memory`, `backtrace` and `disassemble` all work. **ARM64 is not the same answer as x64,
   and the difference is the operands**: A64's flow is decoded and its operands are not, so this
   tool answers there while `ioctl_map` and `driver_hazards` still decline — those read what an

@@ -6699,6 +6699,13 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
 /// Exhaustive rather than a `_` arm: x86 and x64 never reach a refusal today, and an arm that
 /// falls back to `Debug` is how the ARM64 case would have started printing a variant name the day
 /// the enum grew one — which is exactly what happened.
+///
+/// **Which sets *do* work is deliberately in none of the messages this feeds.** It would be a
+/// hand-written list beside a `matches!` in another crate, and it would go stale silently the
+/// first time one of those gates moved — the drift this whole change is an instance of. It is not
+/// the actionable half either: a reader cannot change their target's architecture, so what helps
+/// is which *tools* answer on the target they have, which is what each refusal ends with and what
+/// [`also_reachable`] adds where there is something to add.
 fn machine_label(set: dbgscope::dbgeng::InstructionSet) -> String {
     use dbgscope::dbgeng::InstructionSet;
     match set {
@@ -6745,10 +6752,10 @@ fn hazards_of(
         return Err(Failed::categorised(
             structured::ErrorCategory::Debugger,
             format!(
-                "this build reads x86 and x64 operands, and this target's instructions are \
-                 machine {machine} — so a scan of `{module}` could not read a privileged \
-                 instruction or the import slot behind a call, and would report a driver with \
-                 neither rather than a question it could not ask. The import table alone is \
+                "this target's instructions are machine {machine}, whose operands this build \
+                 does not read — so a scan of `{module}` could not read a privileged instruction \
+                 or the import slot behind a call, and would report a driver with neither rather \
+                 than a question it could not ask. The import table alone is \
                  architecture-neutral; `modules` and `read_memory` work here.{flow}",
                 machine = machine_label(set),
                 flow = also_reachable(set),
@@ -8107,9 +8114,9 @@ fn ioctl_map_of(
         return Err(Failed::categorised(
             structured::ErrorCategory::Debugger,
             format!(
-                "this build reads x86 and x64 operands, and this target's instructions are \
-                 machine {machine} — so the compares that recognise a control code cannot be \
-                 read, and a map of `{dispatch}` would report a routine that accepts none. \
+                "this target's instructions are machine {machine}, whose operands this build \
+                 does not read — so the compares that recognise a control code cannot be read, \
+                 and a map of `{dispatch}` would report a routine that accepts none. \
                  `driver_object` and `decode_ioctl` work here.{flow}",
                 machine = machine_label(set),
                 flow = also_reachable(set),
@@ -8582,11 +8589,11 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         return Err(Failed::categorised(
             structured::ErrorCategory::Debugger,
             format!(
-                "this build follows x86, x64 and ARM64 control flow, and this target's \
-                 instructions are machine {machine} — so a reachability walk over it cannot \
-                 follow control flow, and any verdict would be about what could not be read \
-                 rather than about the target. Analysis that needs no flow is unaffected: \
-                 modules, memory, stacks and `disassemble` all work here.",
+                "this target's instructions are machine {machine}, whose control flow this \
+                 build does not decode — so a reachability walk over it cannot follow that flow, \
+                 and any verdict would be about what could not be read rather than about the \
+                 target. Analysis that needs no flow is unaffected: modules, memory, stacks and \
+                 `disassemble` all work here.",
                 machine = machine_label(set),
             ),
         ));
