@@ -125,14 +125,14 @@ you can let go of it:
 |---|---|---|
 | Started by | Claude Code, per session | the SCM, at boot (`AUTO_START`) |
 | Holds the exe | the client's own child process | a service you can stop |
-| Frees the exe by | renaming it (you cannot stop it without ending the session) | `sc stop` |
-| New code loads on | `/mcp` reconnect | `sc start` |
+| Frees the exe by | renaming it (you cannot stop it without ending the session) | `sc.exe stop` |
+| New code loads on | `/mcp` reconnect | `sc.exe start` |
 | `/mcp` reconnect alone | **is** the fix | changes **nothing** — it reopens a socket to the same process |
 
 **Read the registration to tell them apart, not the host.** `claude mcp list` prints each server's
 transport — a URL marked `(HTTP)` is the second column, a command line is the first. A running
 service proves nothing on its own: a host can serve HTTP clients from one *and* register a stdio
-server for this project, and then `sc query` picks the wrong column. That failure is worse than
+server for this project, and then `sc.exe query` picks the wrong column. That failure is worse than
 guessing, because `session_status` answers for whichever server is **registered** — so you would
 read the stdio supervisor's empty session list and then stop a service holding somebody else's live
 targets. On this repo it is the second column.
@@ -174,20 +174,37 @@ the Mac. Ask the host rather than reading the wiring from here — it is per mac
 public repository, so the shapes are given with placeholders:
 
 ```console
-$ sc qc windbg-mcp         # on the guest
+$ sc.exe qc windbg-mcp     # on the guest
 BINARY_PATH_NAME : <repo>\target\release\windbg-mcp.exe --service --listen 127.0.0.1:<port>
 START_TYPE       : 2   AUTO_START          SERVICE_START_NAME : LocalSystem
 $ ps aux | grep <port>     # on the client, to find the forward
 ssh -f -N -L <port>:127.0.0.1:<port> <user>@<guest>
 ```
 
+**`sc.exe`, never bare `sc`.** In PowerShell — which is the shell `README.md`'s own install steps
+use — `sc` is an alias for `Set-Content`, so `sc stop windbg-mcp` writes the text `windbg-mcp` to a
+file called `stop` and reports nothing wrong. Over ssh into `cmd.exe` the bare name happens to
+reach the real thing, which is how a runbook written from an ssh session ships a command that fails
+silently for everyone reading it in a PowerShell window.
+
 So **the rename dance is unnecessary and the `/mcp` reconnect is useless**: stopping the service
 frees the exe outright, and reconnecting only reopens a socket to whatever process the SCM is
 running. The procedure is:
 
-1. **Check for live sessions first** — `session_status`. Stopping the service kills the supervisor,
-   and its workers exit with it, so every open target goes. There is no `.stale` equivalent here:
-   the old code does not survive the stop.
+1. **Check for live sessions first**, and **not with `session_status` alone.** Stopping the service
+   kills the supervisor, and its workers exit with it, so every open target goes — including other
+   people's. There is no `.stale` equivalent here: the old code does not survive the stop.
+
+   `session_status` answers for **the calling client only** (`Sessions::snapshot` filters
+   `s.owner == caller`, deliberately — another client's handles would be unusable and listing them
+   would say how many clients this server has and what they are debugging). On a listener serving
+   one credential that is the whole truth; on one serving several it is not, and a clean
+   `session_status` is no evidence at all about the others. `sc.exe qc` shows the listen address,
+   `--list-listen-clients` shows how many credentials it serves, and what settles it host-wide is
+   the **process count**: a supervisor spawns one worker per live session, so
+   `(Get-Process windbg-mcp).Count` is `1` when nothing is open and `n+1` for `n` sessions —
+   measured both ways on this bench. Coordinate with the other clients before stopping; nothing in
+   the server does it for you.
 2. **Put the guest's tree on the commit you mean to run** — *that* commit, named. A branch under
    review is not `main`, and fetching `main` here builds a different tree and then attributes
    everything you measure to the code you meant. So pass the ref and **check the head afterwards**
@@ -201,21 +218,21 @@ running. The procedure is:
    `git fetch` fails with *"make sure you have the correct access rights"* — which reads as a
    permissions problem and is a missing key. Giving the URL avoids reconfiguring their remote
    (`dbgscope`'s remote there is already HTTPS and fetches fine).
-3. **`sc stop windbg-mcp`**, and *verify* — `sc stop` prints the state at the moment of the request,
-   which is still `RUNNING`. `sc query windbg-mcp` is what says `STOPPED`. The name is fixed by
+3. **`sc.exe stop windbg-mcp`**, and *verify* — `sc.exe stop` prints the state at the moment of the request,
+   which is still `RUNNING`. `sc.exe query windbg-mcp` is what says `STOPPED`. The name is fixed by
    `--install-service`, which is why `README.md`'s install ends `Start-Service windbg-mcp`; the
-   *path* it was installed from is the machine-specific half, and `sc qc` prints that.
+   *path* it was installed from is the machine-specific half, and `sc.exe qc` prints that.
 4. **Check free space before building.** This guest fills up, and the failure names a compiler bug
    rather than a disk (`rustc-LLVM ERROR: IO failure on output stream`). Measured today:
    **2.0 GB** free against a 9.79 GB `target\debug\incremental`; deleting that one directory —
    regenerable, git-ignored, and *not* `target\release`, which is the service's image — gave
    11.0 GB back.
 5. **`cargo build --release`.** No rename: the path is free. 34.7s here.
-6. **`sc start windbg-mcp`**, then verify the *process* rather than the service state — a new
+6. **`sc.exe start windbg-mcp`**, then verify the *process* rather than the service state — a new
    `Get-Process windbg-mcp` `Id` and `StartTime`, against the exe's `LastWriteTime`.
 7. **Nothing to do on the client.** The tunnel survives the restart (it forwards a port; only the
    far end went away), and the next tool call reconnects on its own — measured: an `open_dump`
-   straight after `sc start` succeeded with no `/mcp` reconnect. And nothing to delete afterwards.
+   straight after `sc.exe start` succeeded with no `/mcp` reconnect. And nothing to delete afterwards.
 
 **Do not paste this bench's own wiring back into this file.** The hostname, account and port are
 machine-specific, `AGENTS.md` keeps them out of version control, and the repository is public —
