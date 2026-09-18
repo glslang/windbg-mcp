@@ -212,8 +212,12 @@ running. The procedure is:
    ```console
    git -C <repo> fetch <url> <branch-or-sha>
    git -C <repo> reset --hard FETCH_HEAD
-   git -C <repo> log --oneline -1 && git -C <repo> status --short   # the tree you are about to build
+   git -C <repo> log --oneline -1
+   git -C <repo> status --short
    ```
+   The last two are the tree you are about to build. They are on **separate lines** on purpose:
+   `&&` is a PowerShell 7 operator and a parse error in 5.1, which is the shell this section's
+   reader may well be in — the same trap as `sc` below.
    Fetch **over HTTPS by URL**: this guest's `origin` is an SSH remote with no key on it, so a plain
    `git fetch` fails with *"make sure you have the correct access rights"* — which reads as a
    permissions problem and is a missing key. Giving the URL avoids reconfiguring their remote
@@ -240,12 +244,21 @@ running. The procedure is:
    it with the supervisor:
    ```console
    cargo build --release --target i686-pc-windows-msvc
+   mkdir target\release\x86
    copy target\i686-pc-windows-msvc\release\windbg-mcp.exe target\release\x86\
    ```
    It lands in the triple's own directory, not in the `x86\` subdirectory the loader rule needs, so
-   the copy is the point. **This guest deploys no `target\release\x86\` at all** (checked
-   2026-09-18), so there is nothing to strand here — which is exactly why the step is written down
-   rather than remembered.
+   the copy is the point — and the `mkdir` is not boilerplate, because **this guest deploys no
+   `target\release\x86\` at all** (checked 2026-09-18). Nothing was stranded here by the rebuilds
+   above, which is the reason to write the step down rather than rely on remembering it.
+
+   **The worker also needs a 32-bit `dbgeng.dll` beside it, and without one the copy buys nothing.**
+   `engine::x86_worker_image` returns `None` unless both files are in `x86\`, and that check is not
+   caution: the engine is an import-table dependency the loader resolves *before `main`*, so a
+   worker with no engine next to it does not fail to open a dump — it fails to **start**, as a
+   loader error with no Rust in it. Staging the exe alone therefore leaves the fallback exactly
+   where it was. That fallback is deliberate and not a failure: an x86 target opens fine in this
+   build and only SOS is lost (`.claude/rules/worker-architecture.md`).
 6. **`sc.exe start windbg-mcp`**, then verify the *process* rather than the service state — a new
    `Get-Process windbg-mcp` `Id` and `StartTime`, against the exe's `LastWriteTime`.
 7. **Nothing to do on the client.** The tunnel survives the restart (it forwards a port; only the
