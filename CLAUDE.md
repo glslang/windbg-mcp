@@ -135,7 +135,23 @@ service proves nothing on its own: a host can serve HTTP clients from one *and* 
 server for this project, and then `sc.exe query` picks the wrong column. That failure is worse than
 guessing, because `session_status` answers for whichever server is **registered** — so you would
 read the stdio supervisor's empty session list and then stop a service holding somebody else's live
-targets. On this repo it is the second column.
+targets.
+
+**`(HTTP)` is still not enough on its own**, because a listener can also run in the *foreground*
+(`docs/remote-listener.md`) — so the registered URL may be a process the SCM knows nothing about
+while an unrelated service sits beside it. What settles it is the **port**: match the registration's
+port against the service's own listen address, and if you want it beyond doubt, against the pid
+holding the socket. Measured on this bench:
+
+```pwsh
+$port = 8765                                             # from the registered URL
+(Get-NetTCPConnection -LocalPort $port -State Listen).OwningProcess   # 5524
+(Get-CimInstance Win32_Service -Filter "Name='windbg-mcp'").ProcessId # 5524 -> it is the service
+```
+
+A mismatch means the endpoint you are talking to is *not* that service, and stopping it releases
+somebody else's targets while changing nothing about yours. On this repo the two match, so it is
+the second column.
 
 ### The stdio shape
 
@@ -248,7 +264,11 @@ running. The procedure is:
    **2.0 GB** free against a 9.79 GB `target\debug\incremental`; deleting that one directory —
    regenerable, git-ignored, and *not* `target\release`, which is the service's image — gave
    11.0 GB back.
-5. **`cargo build --release`.** No rename: the path is free. 34.7s here.
+5. **`cd <repo>` first, then `cargo build --release`.** No rename: the path is free. 34.7s here.
+   The `git -C <repo>` above updates that checkout **without changing the shell's directory**, so a
+   bare `cargo build` run from anywhere else either finds no manifest or — worse — builds a
+   different checkout and restarts the service on it. The staging paths below are relative to
+   `<repo>` for the same reason.
 
    **This does not rebuild the 32-bit worker, and the identity check will reject the old one.**
    `x86\windbg-mcp.exe` is a second target triple Cargo does not build for you, and the build
