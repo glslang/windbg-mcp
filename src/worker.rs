@@ -8297,11 +8297,20 @@ fn ioctl_map_of(
         .map(|image| image.executable_ranges())
         .unwrap_or_default();
     let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
-    // **The structure offsets follow the target, and the check above is what makes this pair
-    // exhaustive**: an instruction set whose operands are not read was refused before this point,
-    // so the only two left are the two that have a layout.
+    // **The structure offsets and the register names both follow the target**, and the check above
+    // is what makes this match exhaustive: an instruction set whose operands are not read was
+    // refused before this point, so the three that remain are the three that have a layout.
+    //
+    // **ARM64 is named rather than left to the fallback**, and it was the fallback for as long as
+    // the gate above refused it. The moment dbgscope answered A64 operands it stopped being
+    // refused and started arriving here, where `_` handed it x64's *registers*: the IRP seeded
+    // into `rdx`, refusals checked against `rax`, and a volatile list matching nothing an A64
+    // decoder names -- so a `call` invalidated nothing and a literal that survived one would be
+    // reported as a control code. A wildcard is the right shape for offsets that are shared and
+    // the wrong one for names that are not.
     let layout = match set {
         dbgscope::dbgeng::InstructionSet::X86 => ioctl::Layout::X86,
+        dbgscope::dbgeng::InstructionSet::Arm64 => ioctl::Layout::ARM64,
         _ => ioctl::Layout::X64,
     };
     let found = ioctl::map(entry, &block, layout, read, in_image, || {
@@ -8675,9 +8684,15 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // **The gate is the flow and no longer the operands**, which is what issue #297 was: ARM64
     // used to fail this test and now passes it, dbgscope decoding A64's six branch classes
     // (dbgscope#148) and its two-word unwind record (dbgscope#146). Nothing in the walk changed —
-    // it reads `Instruction::flow` and has never known which architecture produced one. What
-    // *cannot* follow is the IOCTL map and the hazard scan: both read operands, which ARM64 still
-    // does not answer, so they keep the narrower `operands_are_read` gate and say so.
+    // it reads `Instruction::flow` and has never known which architecture produced one.
+    //
+    // The IOCTL map and the hazard scan keep the narrower `operands_are_read` gate, which is
+    // still a different question and is no longer a different *answer*: dbgscope#170 decoded
+    // A64's operands, so all three of these now pass on ARM64. The gates stay because the
+    // question is real — a set whose operands go unread still exists, and both tools need them
+    // — and because each says what it could not do rather than reporting an empty scan. What
+    // arrived with that, and had to, is `ioctl::Layout::ARM64` and the slot formation in
+    // `hazards`: both tools were correct on ARM64 only for as long as they refused it.
     let set = e.instruction_set();
     if !set.flow_is_read() {
         // `Debugger` rather than `InvalidArgument`, which is the tempting one because the call is

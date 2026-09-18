@@ -336,6 +336,39 @@ impl Layout {
         volatile: &["eax", "ecx", "edx"],
         irp_register: None,
     };
+    /// **The same structures as [`Self::X64`] and none of the same registers.** Both are 64-bit
+    /// targets, so every offset here is that layout's -- the IRP is laid out around a pointer and
+    /// nothing about it is x86's. What does not carry over is every register name, and that is the
+    /// reason this exists rather than ARM64 sharing the x64 constant: a layout is a statement
+    /// about the *target*, and an x64 one applied to an ARM64 driver seeds the IRP into a register
+    /// that target has never heard of, so no chain is ever traced and every case falls back to the
+    /// bare displacement.
+    ///
+    /// The `volatile` list is the one that would fail quietly rather than emptily. Spelled in
+    /// x86's registers it matches nothing an A64 decoder ever names, so a `call` would invalidate
+    /// **nothing** -- and a literal surviving a call is a compare after it reported as a control
+    /// code the driver accepts. That is the failure this field's own documentation describes, and
+    /// it is the one an architecture falling through to a neighbour's layout arrives at.
+    ///
+    /// Windows on ARM64 makes `x0`-`x17` volatile and reserves `x18` as the platform register, so
+    /// `x18` is deliberately **not** here; `x19`-`x28` are callee-saved. The link register is
+    /// clobbered by every call and the decoder spells it `lr`, which is the spelling this list has
+    /// to use -- these are matched against `RegisterOperand::full`.
+    pub(crate) const ARM64: Self = Self {
+        current_stack_location: 0xb8,
+        control_code: 0x18,
+        input_length: 0x10,
+        output_length: 0x08,
+        return_register: "x0",
+        pointer: 8,
+        status_field: 0x30,
+        volatile: &[
+            "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
+            "x14", "x15", "x16", "x17", "lr",
+        ],
+        // AAPCS64's second argument, which is where a dispatch routine's `Irp` arrives.
+        irp_register: Some("x1"),
+    };
 }
 
 /// What the walk knows on one path into a block.
@@ -1636,6 +1669,28 @@ fn update(
         note_loss(facts, &carried_the_code, instruction, lost, layout, traced);
         return None;
     };
+    // **And operand zero is the destination only where the instruction writes it**, which is not
+    // the same question and is only visibly not the same on A64. x86 names its destination first
+    // and a store puts *memory* there, so the `else` above catches it; A64 names a store's
+    // **source** first, so `str w9,[x8,#0x30]` arrives here with a register in hand and would be
+    // modelled as a load *into* `w9` -- reading the memory operand for what `w9` now holds, when
+    // what the instruction did was leave `w9` alone. The comment above says exactly that ("a store
+    // through a register does not change what the register holds"), and it stopped being true the
+    // moment an ARM64 target could reach this code.
+    //
+    // Asked of `Instruction::writes` rather than of the mnemonic, which is the same answer the
+    // loop above uses and for the same reason (dbgscope#155). It also corrects a case that was
+    // already wrong on x86: `mul ecx` names `ecx` first and writes `rax` and `rdx`, so `ecx` was
+    // being cleared by the fallback arm below -- conservative, but a control code lost for an
+    // instruction that never touched it.
+    if !instruction
+        .writes
+        .iter()
+        .any(|register| register.full == written.full)
+    {
+        note_loss(facts, &carried_the_code, instruction, lost, layout, traced);
+        return None;
+    }
     let destination = written.full.clone();
     // **A partial write leaves something that is not the value.** `sub ax,2003h` changes sixteen
     // bits of a `ULONG` and leaves the rest of the old code above them, so what the register holds
@@ -1794,6 +1849,48 @@ fn update(
             }
             _ => set(facts, &destination, None),
         },
+        // **A halfword insert, which is the only way A64 states a constant wider than sixteen
+        // bits.** `mov w9,#8` / `movk w9,#0x6D,lsl #0x10` is how a compiler writes `0x6D0008`, and
+        // a control code is almost always wider than a `movz` can hold -- so without this every
+        // ARM64 compare chain is against a register this pass lost at the *second* instruction,
+        // and the map reports a driver that accepts no codes. Measured on this bench's ARM64
+        // kernel: 855 `movk`, 58 of them immediately before a compare, and the idiom is always
+        // this pair (`mov x0,#0xD` / `movk x0,#0xC000,lsl #0x10` builds `0xC000000D`).
+        //
+        // **This is the only mnemonic the production path reads**, and the module keeps no table
+        // for a reason worth restating rather than quietly breaking. A table deciding *membership*
+        // over an open set -- which instructions are privileged, which are calls -- is wrong by
+        // construction, because the one it omits is a silent wrong answer. This is not that: it is
+        // a single instruction whose semantics [`Effect`] has no vocabulary for, since it neither
+        // moves a value nor computes one but replaces sixteen bits and keeps the rest. And the
+        // cost of *not* recognising it is a case this loses rather than one it invents, which is
+        // the direction that decides how much a reading like this may guess.
+        //
+        // The decoder hands the immediate already shifted into place, so which halfword it lands
+        // in is read back out of it. Where the immediate is zero that is ambiguous -- a `movk` of
+        // zero clears a halfword, and every halfword's zero looks alike -- so that keeps the
+        // conservative answer below rather than guessing which one to clear.
+        Effect::Other if instruction.mnemonic == "movk" => {
+            let inserted = operands
+                .get(1)
+                .and_then(immediate_of)
+                .filter(|immediate| *immediate != 0);
+            let value = match (held, inserted) {
+                (Some(Value::Literal(literal)), Some(immediate)) => {
+                    let mask = 0xffff_u64 << ((immediate.trailing_zeros() / 16) * 16);
+                    // The immediate has to sit inside the halfword it starts in. Anything else is
+                    // not a shape this modelled, and is not one to guess at.
+                    match immediate & !mask == 0 {
+                        true => u32::try_from((u64::from(literal) & !mask) | immediate)
+                            .ok()
+                            .map(Value::Literal),
+                        false => None,
+                    }
+                }
+                _ => None,
+            };
+            set(facts, &destination, value);
+        }
         _ => set(facts, &destination, None),
     }
     // **Asked after every arm, because every arm can be the one that drops it.** A `sub` against a
@@ -3039,6 +3136,10 @@ mod tests {
     fn insn(address: u64, mnemonic: &str, operands: Vec<Operand>, flow: Flow) -> Instruction {
         let effect = match mnemonic {
             "mov" | "movzx" => Effect::Move,
+            // A64's load and store are both moves; which way is decided by where the memory
+            // operand is, not by the effect. `movk` is deliberately absent -- it falls to
+            // `Effect::Other` below, which is what the decoder answers for it.
+            "ldr" | "str" => Effect::Move,
             "movsx" | "movsxd" => Effect::MoveSigned,
             "lea" => Effect::LoadAddress,
             "cmp" => Effect::Compare,
@@ -3057,8 +3158,8 @@ mod tests {
             _ => Effect::Other,
         };
         let condition = match mnemonic {
-            "je" | "jz" => Some(Condition::Equal),
-            "jne" | "jnz" => Some(Condition::NotEqual),
+            "je" | "jz" | "b.eq" => Some(Condition::Equal),
+            "jne" | "jnz" | "b.ne" => Some(Condition::NotEqual),
             "ja" | "jnbe" => Some(Condition::UnsignedAbove),
             "jae" | "jnb" | "jnc" => Some(Condition::UnsignedAboveOrEqual),
             "jb" | "jnae" | "jc" => Some(Condition::UnsignedBelow),
@@ -3092,6 +3193,12 @@ mod tests {
             // `mul ecx` reads `ecx` and writes `rax` and `rdx`, naming neither. dbgscope's own
             // test pins that against the decoder, which is what this has to stay true to.
             ("mul" | "div", _) => vec![named("rax"), named("rdx")],
+            // **A64 names a store's source first and writes no register at all**, which is the
+            // fact the fixture has to state rather than derive: a rule taking operand zero would
+            // say `str w9,[x8,#0x30]` writes `w9`, and a test built on that agrees with the
+            // defect it is meant to catch. Without a writeback there is nothing in `writes`, and
+            // that is what dbgscope answers.
+            ("str", _) => Vec::new(),
             ("xchg", _) => operands
                 .iter()
                 .filter_map(|operand| match operand {
@@ -3214,6 +3321,23 @@ mod tests {
                 name: name.to_string(),
                 full,
                 width,
+            };
+        }
+        // **A64's two spellings of one register**, which is the same relationship `rax`/`eax` has
+        // and the same field a partial-read test is about: `x9` is the whole of it and `w9` is its
+        // low four bytes, which the decoder reports as `full: "x9"` either way. No x86 register is
+        // spelled this way, so this catches nothing it should not.
+        if let Some(digits) = name.strip_prefix('w').or_else(|| name.strip_prefix('x'))
+            && !digits.is_empty()
+            && digits.chars().all(|c| c.is_ascii_digit())
+        {
+            return RegisterOperand {
+                name: name.to_string(),
+                full: format!("x{digits}"),
+                width: match name.starts_with('w') {
+                    true => 4,
+                    false => 8,
+                },
             };
         }
         let width = match name {
@@ -3400,6 +3524,129 @@ mod tests {
 
     fn in_image(address: u64) -> bool {
         (IMAGE_BASE..IMAGE_BASE + IMAGE_SIZE).contains(&address)
+    }
+
+    /// An ARM64 dispatch routine, whose control code is materialised across two instructions.
+    ///
+    /// **A64 cannot state a control code in a compare.** Its immediates are twelve bits, so any
+    /// code above `0xfff` is built with `movz`/`movk` into a register and compared register to
+    /// register -- which is why dbgscope#170 named "the immediate a compare holds" as the thing
+    /// this map was waiting on. Without the `movk` arm the pass loses the register at the second
+    /// instruction and reports a driver that accepts nothing.
+    ///
+    /// The prologue is the same chain as x64's under different names: the `Irp` arrives in `x1`
+    /// per AAPCS64, and the structure offsets are shared because both targets are 64-bit.
+    #[test]
+    fn an_arm64_chain_recovers_a_code_built_from_two_halves() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            // `mov w10,#8` / `movk w10,#0x6D,lsl #0x10` -- the decoder folds each shift into the
+            // value, so the second immediate arrives as `0x6D0000` rather than as `0x6D` and a
+            // shift.
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x6d_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w9"), reg("w10")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+
+        assert!(found.code_proved, "the chain from the IRP was followed");
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.recovered))
+                .collect::<Vec<_>>(),
+            vec![(0x6d_0008, 0x900, Recovery::Compare)],
+            "{:?}",
+            found.cases
+        );
+    }
+
+    /// **A64 names a store's source first, and a store is not a load.**
+    ///
+    /// x86 puts memory in operand zero for a store, so the walk's "operand zero is the
+    /// destination" rule catches it by shape. A64 puts the *register* there, so `str w11,[x8,#18h]`
+    /// arrives with a register in hand and would be modelled as a load **into** `w11` -- reading
+    /// the control code out of the memory operand and handing it to whatever compares `w11` next.
+    /// That invents a case out of an instruction that stored to the field, which is the direction
+    /// of wrongness this module is arranged against.
+    ///
+    /// The fix reads `Instruction::writes`, so the assertion is that comparing the stored-from
+    /// register recovers **no** case at all.
+    #[test]
+    fn an_arm64_store_does_not_load_the_register_it_names() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            // A store *to* the control-code offset through the traced pointer: the worst case,
+            // since every displacement the walk recognises is in play.
+            insn(
+                DISPATCH + 4,
+                "str",
+                vec![reg("w11"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("w11"), imm(5)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x10, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+
+        assert!(
+            found.cases.is_empty(),
+            "a store put nothing in w11, so the compare after it is about nothing: {:?}",
+            found.cases
+        );
+        assert_eq!(found.case_count, 0);
     }
 
     /// A compare chain is the ordinary shape, and each `cmp`/`je` pair is one case.

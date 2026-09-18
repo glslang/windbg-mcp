@@ -32,9 +32,9 @@
 //! `DebugEngine`: one to decode a range of instructions, one to ask whether to stop. The worker
 //! supplies the two that touch DbgEng; the tests supply fixtures.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
-use dbgscope::dbgeng::{Flow, Instruction, Operand};
+use dbgscope::dbgeng::{Effect, Flow, Instruction, Operand};
 
 use crate::walk::Halt;
 use dbgscope::pe;
@@ -243,6 +243,18 @@ fn privilege_kind(instruction: &Instruction) -> Option<PrivilegeKind> {
             _ => false,
         })
     };
+    // `DAIF`, by each of the three ways it is written: the two processor-state fields, and the
+    // system register itself -- `s3_3_c4_c2_1`, which is `op0` 3, `op1` 3, `CRn` 4, `CRm` 2,
+    // `op2` 1. The neighbouring `..._0` is `NZCV` and is EL0's own, so the last field is the whole
+    // distinction and matching it loosely would call every flag restore an interrupt mask.
+    let interrupt_mask = || {
+        instruction.operands.iter().any(|operand| match operand {
+            Operand::Other(name) => {
+                matches!(name.as_str(), "daifset" | "daifclr" | "s3_3_c4_c2_1")
+            }
+            _ => false,
+        })
+    };
     let family = match instruction.mnemonic.as_str() {
         "rdmsr" | "wrmsr" => Some(PrivilegeKind::ModelSpecificRegister),
         "in" | "out" | "insb" | "insw" | "insd" | "outsb" | "outsw" | "outsd" => {
@@ -258,6 +270,18 @@ fn privilege_kind(instruction: &Instruction) -> Option<PrivilegeKind> {
             Some(PrivilegeKind::MachineState)
         }
         "cli" | "sti" => Some(PrivilegeKind::InterruptFlag),
+        // **A64's cache, TLB and address-translation maintenance**, which is the same family as
+        // `invd`/`wbinvd`/`invlpg` above and is where an ARM64 driver's machine-state work lives.
+        // Every one of them is `privileged` from the decoder, so this decides only the family --
+        // without it they were reported correctly and namelessly, under [`PrivilegeKind::Other`].
+        "dc" | "ic" | "tlbi" | "at" => Some(PrivilegeKind::MachineState),
+        // `msr daifset,#2` masks interrupts and `msr daifclr,#2` unmasks them, which is `cli` and
+        // `sti` under another spelling; `DAIF` reached as a *register* is the same gate, and
+        // dbgscope spells a system register by its encoding rather than its name. Only the
+        // interrupt masks are named here: the rest of the system-register space is far too wide to
+        // family-name honestly, and lands in `Other` **with its register in the operands**, which
+        // is a better answer than a family invented for it.
+        "msr" | "mrs" if interrupt_mask() => Some(PrivilegeKind::InterruptFlag),
         "vmlaunch" | "vmresume" | "vmxon" | "vmxoff" | "vmread" | "vmwrite" | "vmptrld"
         | "vmptrst" | "vmclear" | "invept" | "invvpid" | "vmrun" | "vmload" | "vmsave" | "clgi"
         | "stgi" | "skinit" => Some(PrivilegeKind::Virtualization),
@@ -509,6 +533,10 @@ pub fn scan(
         // counting only the bytes that read — a shape that cannot say where the hole was, and
         // whose `start` is wrong for everything after it.
         let mut run: Option<(u64, u64)> = None;
+        // The addresses this section's code has been watched computing, for the calls that reach
+        // an import through a register rather than through a memory operand. Per section, so a
+        // register's meaning never crosses from one section's code into another's.
+        let mut formed = Formed::default();
         let close = |run: &mut Option<(u64, u64)>, scanned: &mut Vec<Scanned>| {
             if let Some((from, bytes)) = run.take()
                 && bytes > 0
@@ -572,7 +600,10 @@ pub fn scan(
                 break;
             }
             for instruction in &block {
-                if let Some(import) = by_slot.get(&called_slot(instruction).unwrap_or(0))
+                // The slot the call names, or -- where the architecture cannot name one -- the
+                // slot this watched being computed into the register it calls through.
+                let slot = called_slot(instruction).or_else(|| formed.slot_of(instruction));
+                if let Some(import) = by_slot.get(&slot.unwrap_or(0))
                     && let Some(sink) =
                         sinks.get_mut(&(import.library.clone(), import.name.to_string()))
                 {
@@ -596,6 +627,10 @@ pub fn scan(
                         });
                     }
                 }
+                // **After the reads above, not before**: the call is the last step of the sequence
+                // this watches, and applying it first would clear the register the call reaches
+                // the slot through.
+                formed.apply(instruction);
             }
             // Resume after the last instruction that decoded whole, not at a fixed stride: a
             // window's tail is usually a partial instruction, and restarting at `at + want` would
@@ -659,6 +694,117 @@ fn called_slot(instruction: &Instruction) -> Option<u64> {
             Operand::Memory(memory) => memory.address,
             _ => None,
         })
+}
+
+/// An import slot whose address the code **computed** rather than named, watched across the
+/// instructions that compute it.
+///
+/// [`called_slot`] reads the slot straight off the call, which works because x64 states it there:
+/// `call qword ptr [rip+1234h]` is one instruction carrying one memory operand carrying the
+/// address. **A64 has no pc-relative memory operand at all**, so the identical call is three
+/// instructions -- `adrp x8,page` / `ldr x8,[x8,#off]` / `blr x8` -- and a scan reading only the
+/// call finds a register and no address.
+///
+/// Every sensitive call in an ARM64 driver has that shape, so without this the scan reports a
+/// driver that calls none of them. That is precisely the answer this module's own documentation
+/// warns readers about, and the refusal these tools used to give on ARM64 existed to avoid it; the
+/// refusal went when dbgscope started answering A64 operands, so the answer had to arrive with it.
+///
+/// **It cannot invent a call site**, which is what makes carrying state here safe. The address it
+/// computes is reported only where the import table already holds that exact slot, so a sequence
+/// it misreads names no import and falls out. Nothing about it is ARM64-specific either:
+/// `lea rax,[rip+X]` / `mov rax,[rax+8]` / `call rax` is the same three steps and the same answer,
+/// and x64 compilers do emit it.
+///
+/// What it does not reach is a pair split across the decode window, the maps starting empty on
+/// each one. A missed call site, never an invented one, and the same direction as every other
+/// shortfall here.
+#[derive(Debug, Default)]
+struct Formed {
+    /// A register holding an address the code computed: `adrp`'s page, or a `lea`'s target.
+    address: HashMap<String, u64>,
+    /// A register holding what was loaded *through* a slot, against that slot's own address.
+    loaded_from: HashMap<String, u64>,
+}
+
+impl Formed {
+    /// The slot an indirect call through a register reaches, where this watched it being formed.
+    fn slot_of(&self, instruction: &Instruction) -> Option<u64> {
+        if !matches!(instruction.flow, Flow::Call(None) | Flow::Jmp(None)) {
+            return None;
+        }
+        match instruction.operands.first() {
+            Some(Operand::Register(register)) => self.loaded_from.get(&register.full).copied(),
+            _ => None,
+        }
+    }
+
+    /// Applies one instruction.
+    fn apply(&mut self, instruction: &Instruction) {
+        // **Read before anything is cleared**, because the second step of the pair reads the
+        // register it overwrites: `ldr x8,[x8,#off]` is the ordinary spelling, and clearing `x8`
+        // first would lose the page that makes the slot.
+        let formed = self.forms(instruction);
+        // Everything the instruction writes stops being believed -- the same rule the IOCTL walk
+        // applies, from the same field, and for the same reason: a register the decoder says was
+        // written holds neither the address it held nor the slot it was loaded through.
+        for written in &instruction.writes {
+            self.address.remove(&written.full);
+            self.loaded_from.remove(&written.full);
+        }
+        match formed {
+            Some((register, Held::Address(address))) => {
+                self.address.insert(register, address);
+            }
+            Some((register, Held::Slot(slot))) => {
+                self.loaded_from.insert(register, slot);
+            }
+            None => {}
+        }
+    }
+
+    /// What this instruction leaves in the register it writes, of the two things worth keeping.
+    fn forms(&self, instruction: &Instruction) -> Option<(String, Held)> {
+        let Some(Operand::Register(destination)) = instruction.operands.first() else {
+            return None;
+        };
+        // Operand zero is the destination only where the decoder says it is written -- an A64
+        // store names its source there, and reading that as a destination is how a `str` through a
+        // formed address would be recorded as forming one.
+        if !instruction
+            .writes
+            .iter()
+            .any(|register| register.full == destination.full)
+        {
+            return None;
+        }
+        let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
+            return None;
+        };
+        match instruction.effect {
+            // `adrp x8,page`, and `lea rax,[rip+X]`: the address itself.
+            Effect::LoadAddress => memory
+                .address
+                .map(|address| (destination.full.clone(), Held::Address(address))),
+            // A load off one of those, which is the slot the pointer came through. An **indexed**
+            // load is an array element rather than a named slot, and is not one.
+            Effect::Move if memory.index.is_none() => {
+                let base = memory.base.as_ref()?;
+                let page = self.address.get(&base.full)?;
+                let slot = page.wrapping_add_signed(memory.displacement);
+                Some((destination.full.clone(), Held::Slot(slot)))
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The two things [`Formed`] keeps about a register.
+enum Held {
+    /// An address the code computed into it.
+    Address(u64),
+    /// The slot a pointer in it was loaded through.
+    Slot(u64),
 }
 
 /// The encoded length of an instruction, from the bytes the decoder reported.
@@ -946,8 +1092,9 @@ mod tests {
             operands,
             flow,
             privileged: false,
-            // The scan reads the flow, the operands and the mnemonic; the decoder's other answers
-            // are not what these fixtures are about.
+            // The scan reads the flow, the operands and the mnemonic, and `Formed` reads the
+            // effect and the writes as well -- so a fixture about a **formed** slot has to supply
+            // those two rather than take these defaults. `forming` below is that fixture.
             effect: Effect::Other,
             condition: None,
             writes_flags: false,
@@ -972,6 +1119,29 @@ mod tests {
         Instruction {
             privileged: true,
             ..insn(address, bytes, mnemonic, flow, operands)
+        }
+    }
+
+    /// An instruction that computes something into the register it names first.
+    ///
+    /// [`Formed`] reads the effect and `Instruction::writes`, neither of which the plain fixture
+    /// supplies -- and the second is the one that matters, since it is what tells a store from a
+    /// load on a target that spells both with the register first. So a test about A64's three-step
+    /// import call has to state both, as the decoder would.
+    fn forming(
+        address: u64,
+        mnemonic: &str,
+        effect: Effect,
+        operands: Vec<Operand>,
+    ) -> Instruction {
+        let writes = match operands.first() {
+            Some(Operand::Register(register)) => vec![register.clone()],
+            _ => Vec::new(),
+        };
+        Instruction {
+            effect,
+            writes,
+            ..insn(address, "00000000", mnemonic, Flow::Fallthrough, operands)
         }
     }
 
@@ -1111,6 +1281,141 @@ mod tests {
         // The section that is not executable is never decoded.
         assert_eq!(found.scanned.len(), 1, "{:?}", found.scanned);
         assert_eq!(found.scanned[0].section, ".text");
+    }
+
+    /// An ARM64 import call, whose slot address is computed across three instructions.
+    ///
+    /// **A64 has no pc-relative memory operand**, so the call x64 writes as
+    /// `call qword ptr [rip+disp]` is `adrp` / `ldr` / `blr` there, and a scan reading only the
+    /// call finds a register and no address. Every sensitive call in an ARM64 driver is that
+    /// shape, so without [`Formed`] this reports a driver that calls none of them -- the answer
+    /// that looks exactly like a clean driver, which is what these tools refused ARM64 outright to
+    /// avoid until dbgscope#170 made the refusal wrong.
+    ///
+    /// The two negative halves matter as much as the positive one: a slot **loaded** but never
+    /// called is not a call site, and a call through a register nothing formed resolves to nothing
+    /// at all rather than to whatever was last in the map.
+    #[test]
+    fn an_arm64_import_call_is_matched_through_the_slot_it_forms() {
+        let image = image();
+        let imports = [
+            import("memcpy", BASE + 0x3008),
+            import("ProbeForRead", BASE + 0x3000),
+        ];
+        let block = vec![
+            // `adrp x8,BASE+3000h` / `ldr x8,[x8,#8]` / `blr x8` -- one call of `memcpy`.
+            forming(
+                BASE + 0x1000,
+                "adrp",
+                Effect::LoadAddress,
+                vec![
+                    Operand::Register(register("x8")),
+                    Operand::Memory(MemoryOperand {
+                        size: None,
+                        segment: None,
+                        base: None,
+                        index: None,
+                        scale: 0,
+                        displacement: 0,
+                        address: Some(BASE + 0x3000),
+                    }),
+                ],
+            ),
+            forming(
+                BASE + 0x1004,
+                "ldr",
+                Effect::Move,
+                vec![
+                    Operand::Register(register("x8")),
+                    Operand::Memory(MemoryOperand {
+                        size: Some(8),
+                        segment: None,
+                        base: Some(register("x8")),
+                        index: None,
+                        scale: 1,
+                        displacement: 8,
+                        address: None,
+                    }),
+                ],
+            ),
+            insn(
+                BASE + 0x1008,
+                "00000000",
+                "blr",
+                Flow::Call(None),
+                vec![Operand::Register(register("x8"))],
+            ),
+            // **A slot formed and never called is not a call site.** `ProbeForRead`'s pointer is
+            // loaded into `x9` and nothing calls through it, exactly as the x64 test's `mov` of a
+            // slot is not one.
+            forming(
+                BASE + 0x100c,
+                "adrp",
+                Effect::LoadAddress,
+                vec![
+                    Operand::Register(register("x9")),
+                    Operand::Memory(MemoryOperand {
+                        size: None,
+                        segment: None,
+                        base: None,
+                        index: None,
+                        scale: 0,
+                        displacement: 0,
+                        address: Some(BASE + 0x3000),
+                    }),
+                ],
+            ),
+            forming(
+                BASE + 0x1010,
+                "ldr",
+                Effect::Move,
+                vec![
+                    Operand::Register(register("x9")),
+                    Operand::Memory(MemoryOperand {
+                        size: Some(8),
+                        segment: None,
+                        base: Some(register("x9")),
+                        index: None,
+                        scale: 1,
+                        displacement: 0,
+                        address: None,
+                    }),
+                ],
+            ),
+            // **A call through a register nothing formed reaches nothing.** `x10` was never
+            // written here, so the map holds no slot for it and this must not borrow one.
+            insn(
+                BASE + 0x1014,
+                "00000000",
+                "blr",
+                Flow::Call(None),
+                vec![Operand::Register(register("x10"))],
+            ),
+        ];
+
+        let found = scan(
+            &image,
+            &imports,
+            |at, _| (at == BASE + 0x1000).then(|| block.clone()),
+            never,
+        );
+
+        let copy = found
+            .sinks
+            .iter()
+            .find(|sink| sink.name == "memcpy")
+            .unwrap_or_else(|| panic!("{:?}", found.sinks));
+        assert_eq!(
+            copy.call_sites,
+            vec![BASE + 0x1008],
+            "the `blr` reaches the import through the slot adrp/ldr formed"
+        );
+        assert_eq!(copy.call_site_count, 1);
+        let probe = found.sinks.iter().find(|sink| sink.name == "ProbeForRead");
+        assert!(
+            probe.is_none_or(|sink| sink.call_sites.is_empty()),
+            "a slot loaded and never called through is not a call site: {probe:?}"
+        );
     }
 
     /// A privileged instruction is decided by its **operands**, not by its mnemonic.
