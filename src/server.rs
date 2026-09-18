@@ -6924,6 +6924,18 @@ mod tests {
                 "`{command}` must be allowed"
             );
         }
+
+        // **A wrapper gets through, and this pins that rather than claiming otherwise.**
+        // `changes_debug_target` reads the first token of each `;`-separated segment, so `.if`,
+        // `.foreach` and an alias all reach execution without naming what they run. The gap is
+        // `execute`'s too and predates this parameter -- the same string through `execute` is
+        // equally unretired -- and closing it means parsing the command language, where an alias
+        // resolves at execution time and no static reading is complete. `FOLLOWUPS.md` item 81.
+        // A parser landing here should flip these to `assert!`.
+        assert!(!changes_debug_target(".if (1) { .opendump C:\\other.dmp }"));
+        assert!(!changes_debug_target(
+            ".foreach (x { .echo 1 }) { .detach }"
+        ));
     }
 
     /// Omitting the command is still the ordinary case, and still a plain breakpoint.
