@@ -2002,14 +2002,21 @@ pub(crate) fn outside_quotes(command: &str) -> String {
     }
     let mut out = String::with_capacity(command.len());
     let mut in_quote = false;
-    let mut chars = command.chars();
+    let mut chars = command.chars().peekable();
     while let Some(c) = chars.next() {
         match c {
             // A backslash escape belongs to whichever side of the quote it is on, and takes the
             // next character with it — so `\"` inside a string does not end it.
+            //
+            // **Except a line break, which is a command boundary before it is anything's escape.**
+            // Swallowing it here would blank it *and* skip the arm below that closes the quote, so
+            // `.echo "banner\` / `.detach"` over two lines would hide a `.detach` that DbgEng
+            // runs -- and with the quotes balanced, the unbalanced fallback never sees it either.
             '\\' => {
                 out.push(kept(c, in_quote));
-                if let Some(escaped) = chars.next() {
+                if !matches!(chars.peek(), Some('\r' | '\n'))
+                    && let Some(escaped) = chars.next()
+                {
                     out.push(kept(escaped, in_quote));
                 }
             }
@@ -7032,6 +7039,13 @@ mod tests {
         )));
         assert!(changes_debug_target(&outside_quotes(
             ".echo \"banner\r\n.kill\""
+        )));
+
+        // A backslash does not escape a line break: the break still ends the command, and still
+        // closes the quote. Balanced quotes either side mean the fallback never fires, so this is
+        // the one shape where swallowing it would have been silent.
+        assert!(changes_debug_target(&outside_quotes(
+            ".echo \"banner\\\n.detach\""
         )));
 
         // An unbalanced quote is judged on the whole text rather than a reading nobody can trust,
