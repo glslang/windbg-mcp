@@ -986,11 +986,22 @@ pub struct DxArgs {
     pub session_id: Option<String>,
 }
 
+// **Refuses unknown fields, and it is the second struct here to do so.** The criterion is
+// `DebugBatchArgs`' own: serde drops an unknown field silently, and every other tool's typo costs a
+// wrong *answer* while these two cost the **target**. A misspelt `command` here is a breakpoint
+// that stops instead of logging and continuing -- on a live kernel that halts the machine and
+// leaves it halted, which is exactly what a caller asking for `gc` was avoiding. Measured the hard
+// way: a `command` this struct did not have was accepted and dropped through a whole
+// investigation, and the stopped target it produced was read as a defect in `gc` itself.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BreakpointArgs {
     /// Breakpoint location: symbol, address, or expression (e.g. "nt!NtCreateFile").
     #[serde(default)]
     pub expression: Option<String>,
+    /// Command to run on each hit; end it with `gc` to log and continue rather than stop.
+    #[serde(default)]
+    pub command: Option<String>,
     /// Identity-guarded image location. Requires an explicit session and no other location.
     #[serde(default)]
     pub coordinate: Option<structured::ImageCoordinate>,
@@ -3817,7 +3828,11 @@ impl WindbgServer {
                 EngineOp::SetBreakpoint {
                     expression: location,
                     coordinate: args.coordinate.map(Box::new),
-                    command: None,
+                    // **Not screened, unlike the location above.** The engine takes it through
+                    // `SetCommand`, where nothing is parsed, and a command is the one argument
+                    // whose whole purpose is to be debugger text -- `gc` and `.printf` included.
+                    // Screening it for `;` or `"` would reject the documented logging form.
+                    command: args.command,
                     one_shot: args.one_shot.unwrap_or(false),
                     pass_count: args.pass_count,
                     watch: args.watch,
@@ -6820,6 +6835,49 @@ mod tests {
         let parsed: DebugBatchArgs =
             serde_json::from_value(serde_json::Value::Object(fixed)).expect("valid");
         assert_eq!(parsed.always.len(), 1);
+    }
+
+    /// A breakpoint command is carried, and a misspelt one is **refused** rather than dropped.
+    ///
+    /// Both halves matter and the second is why this struct denies unknown fields. Serde drops an
+    /// unknown field silently, so before this the tool accepted a `command` it did not have and
+    /// answered `ok` with a plain breakpoint — which stops the target instead of logging and
+    /// continuing, and on a live kernel halts the machine. That cost a whole investigation, whose
+    /// conclusion ("`gc` does not resume under this server") was wrong precisely because the
+    /// breakpoints under test had no command on them at all.
+    #[test]
+    fn a_breakpoint_command_is_carried_and_a_misspelt_one_is_refused() {
+        let args = serde_json::json!({
+            "expression": "nt!IofCallDriver",
+            "command": r#".printf "hit\n"; gc"#,
+        });
+        let parsed: BreakpointArgs = serde_json::from_value(args.clone()).expect("valid");
+        assert_eq!(parsed.command.as_deref(), Some(r#".printf "hit\n"; gc"#));
+
+        // The quotes and the `;` survive: a command is debugger text by definition, and screening
+        // it the way the *location* is screened would reject the documented logging form.
+        assert!(parsed.command.unwrap().contains(';'));
+
+        // Misspelt, it is refused by name rather than accepted and dropped.
+        let mut typo = args.as_object().unwrap().clone();
+        let command = typo.remove("command").unwrap();
+        typo.insert("comand".to_string(), command);
+        let refused = serde_json::from_value::<BreakpointArgs>(serde_json::Value::Object(typo))
+            .err()
+            .expect("an unknown field must be refused");
+        assert!(
+            refused.to_string().contains("comand"),
+            "the refusal should name the field: {refused}"
+        );
+    }
+
+    /// Omitting the command is still the ordinary case, and still a plain breakpoint.
+    #[test]
+    fn a_breakpoint_with_no_command_carries_none() {
+        let parsed: BreakpointArgs =
+            serde_json::from_value(serde_json::json!({ "expression": "nt!NtCreateFile" }))
+                .expect("valid");
+        assert_eq!(parsed.command, None);
     }
 
     #[test]

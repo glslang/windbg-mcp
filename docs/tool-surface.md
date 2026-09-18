@@ -6,7 +6,7 @@ how much of that surface a run serves, and three behaviours the table has no roo
 ## Serving fewer tools (`--tools`)
 
 All sixty-one tools are served unless you say otherwise, and their definitions cost the model
-**91,610 bytes — about 23k tokens — before it has asked anything**, once per conversation. Every
+**91,790 bytes — about 23k tokens — before it has asked anything**, once per conversation. Every
 figure on this page is a measurement of 2026-09-17 rather than an invariant: any edit to a tool's
 description moves it, so re-derive before quoting one. Seven
 tenths of that is the prose that tells a model how to drive them, so it cannot be trimmed without
@@ -20,8 +20,8 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 61 | 91,610 B |
-| `session,inspect,exec,crash` | 31 | 44,947 B |
+| *(absent)* — every tool | 61 | 91,790 B |
+| `session,inspect,exec,crash` | 31 | 45,127 B |
 | `session,inspect,crash` | 23 | 32,322 B |
 | `crash` | 13 | 19,078 B |
 

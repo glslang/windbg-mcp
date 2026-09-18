@@ -1,7 +1,7 @@
 //! Which of this server's sixty-one tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 91,610 bytes — roughly 23k tokens (measured 2026-09-18; every figure here moves with any edit
+//! 91,790 bytes — roughly 23k tokens (measured 2026-09-18; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -23,7 +23,7 @@
 //!   allocator     10   16,457  pool and heap walks, and `walk_memory`
 //!   inspect       10   13,152  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session       10   12,817  opening a target, ending it, and watching this server
-//!   exec           8   12,472  breakpoints and execution control
+//!   exec           8   12,652  breakpoints and execution control
 //!   batch          1   10,021  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
@@ -32,7 +32,7 @@
 //! ```
 //!
 //! Those bytes are a measurement of **2026-09-17** and move with any edit to a description — the
-//! whole surface they are shares of is 61 tools and 91,610 B, which is what the rows above sum to.
+//! whole surface they are shares of is 61 tools and 91,790 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads

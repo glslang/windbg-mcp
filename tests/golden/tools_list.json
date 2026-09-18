@@ -1633,6 +1633,7 @@
         "root": "object"
       },
       "params": [
+        "command: string|null",
         "coordinate: any",
         "expression: string|null",
         "one_shot: boolean|null",
