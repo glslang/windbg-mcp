@@ -3822,6 +3822,31 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("expression", &location, Quotes::Rejected) {
             return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
+        // **A breakpoint command that changes the target is refused, where `execute`'s is
+        // allowed and retires the handle.** The difference is *when* it runs. `execute` knows the
+        // command is about to run, so it retires the handle first — a `.detach` that reports an
+        // error may still have detached. A breakpoint's command runs at **hit** time, which may be
+        // never, may be minutes later, and is not something this server observes: there is no
+        // moment at which it could retire the handle, so a `.opendump` here would replace the
+        // target while every outstanding handle still read as live.
+        //
+        // This closes the path this parameter opens. It does **not** close the same hole through
+        // raw text — `execute` with `bp nt!Foo ".detach"` reaches it, and has all along, because
+        // finding it there means parsing `bp`'s own quoted argument rather than reading a field.
+        if let Some(command) = &args.command
+            && changes_debug_target(command)
+        {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                "a breakpoint command that opens, attaches to, releases or terminates a target is \
+                 refused: it runs when the breakpoint is hit, which this server does not observe, \
+                 so the target would be replaced or released with every handle to it still \
+                 reading as live. Run such a command through `execute`, which retires the handle \
+                 as it runs it."
+                    .to_string(),
+                args.session_id,
+            );
+        }
         let out = self
             .run(
                 args.session_id.as_deref(),
@@ -6869,6 +6894,36 @@ mod tests {
             refused.to_string().contains("comand"),
             "the refusal should name the field: {refused}"
         );
+    }
+
+    /// A breakpoint command that changes the target is refused, and the logging form is not.
+    ///
+    /// `execute` runs such a command and retires the handle first, because it knows the command is
+    /// about to run. A breakpoint's runs at **hit** time — maybe never, maybe minutes later, and
+    /// not at any moment this server observes — so there is nowhere to put the retirement and the
+    /// only sound answer is to refuse. `changes_debug_target` is the same list `execute` uses, so
+    /// the two agree about what counts.
+    #[test]
+    fn a_breakpoint_command_that_changes_the_target_is_refused() {
+        for command in [
+            ".detach",
+            ".opendump C:\\other.dmp",
+            ".printf \"hit\"; .kill",
+            "qd",
+        ] {
+            assert!(
+                changes_debug_target(command),
+                "`{command}` must be caught by the same list `execute` uses"
+            );
+        }
+        // The logging form this parameter exists for is untouched, `gc` and `.printf` being
+        // neither session control nor anything the list names.
+        for command in [".printf \"IOCTL %08x\\n\", @x1; gc", ".echo hit; gc", "gc"] {
+            assert!(
+                !changes_debug_target(command),
+                "`{command}` must be allowed"
+            );
+        }
     }
 
     /// Omitting the command is still the ordinary case, and still a plain breakpoint.
