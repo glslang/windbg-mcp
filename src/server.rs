@@ -1976,6 +1976,50 @@ fn ttd_memory_command(start: u64, end: u64, mode: Option<&str>) -> String {
 /// failure this mechanism exists to prevent. It cannot be exhaustive — DbgEng has more ways
 /// to reach the target than a name list can enumerate — so `execute` remains the one place
 /// where a handle is a strong hint rather than a guarantee.
+/// A command with its **quoted** spans blanked out, so a listed name inside a string is not read
+/// as one.
+///
+/// [`changes_debug_target`] splits on `;` without regard for quotes, which is right where a match
+/// merely *retires* a handle: over-triggering there costs a handle the caller can reopen.
+/// `set_breakpoint` **refuses** on a match, and there the same false positive costs the call —
+/// `.printf "begin; .detach; end"; gc` is a perfectly good logging breakpoint whose `.detach` is
+/// only ever printed. So the refusing caller blanks the strings first and the retiring one does
+/// not, which is the two sites differing in the direction each can afford to be wrong in.
+///
+/// **An unbalanced quote blanks nothing**, so a command this cannot read is still judged on its
+/// whole text. That keeps the failure on the refusing side: this may say no to something harmless,
+/// and must never say yes to a `.detach` it could not see.
+///
+/// It is a lexer over `"` and `\`, not a parser — it makes no claim about `.if`, `.foreach` or an
+/// alias, which reach execution without naming what they run (`FOLLOWUPS.md` item 81).
+pub(crate) fn outside_quotes(command: &str) -> String {
+    let mut out = String::with_capacity(command.len());
+    let mut in_quote = false;
+    let mut chars = command.chars();
+    while let Some(c) = chars.next() {
+        match c {
+            // A backslash escape belongs to whichever side of the quote it is on, and takes the
+            // next character with it — so `\"` inside a string does not end it.
+            '\\' => {
+                out.push(if in_quote { ' ' } else { c });
+                if let Some(escaped) = chars.next() {
+                    out.push(if in_quote { ' ' } else { escaped });
+                }
+            }
+            '"' => {
+                in_quote = !in_quote;
+                out.push(' ');
+            }
+            _ => out.push(if in_quote { ' ' } else { c }),
+        }
+    }
+    match in_quote {
+        // Unbalanced: hand back the original rather than a reading nobody can trust.
+        true => command.to_string(),
+        false => out,
+    }
+}
+
 pub(crate) fn changes_debug_target(command: &str) -> bool {
     /// Session-control commands: open, attach to, release, or terminate a target.
     const RETIRES_SESSION: &[&str] = &[
@@ -3834,7 +3878,7 @@ impl WindbgServer {
         // raw text — `execute` with `bp nt!Foo ".detach"` reaches it, and has all along, because
         // finding it there means parsing `bp`'s own quoted argument rather than reading a field.
         if let Some(command) = &args.command
-            && changes_debug_target(command)
+            && changes_debug_target(&outside_quotes(command))
         {
             return typed_error(
                 ErrorCategory::InvalidArgument,
@@ -6924,6 +6968,37 @@ mod tests {
                 "`{command}` must be allowed"
             );
         }
+
+        // **A listed name inside a string is not one**, which matters here and not at the
+        // retiring site: there a false positive costs a handle, here it costs the call.
+        for command in [
+            r#".printf "begin; .detach; end"; gc"#,
+            r#".printf "say \"q\"; more"; gc"#,
+            r#".echo qd; gc"#,
+        ] {
+            assert!(
+                !changes_debug_target(&outside_quotes(command)),
+                "`{command}` only prints it: {}",
+                outside_quotes(command)
+            );
+        }
+        // Outside the quotes it still counts, including after one.
+        for command in [
+            r#".printf "begin"; .detach"#,
+            r#".printf "a"; q"#,
+            ".detach",
+        ] {
+            assert!(
+                changes_debug_target(&outside_quotes(command)),
+                "`{command}` really runs it: {}",
+                outside_quotes(command)
+            );
+        }
+        // An unbalanced quote is judged on the whole text rather than a reading nobody can trust,
+        // so this errs towards refusing rather than towards missing a `.detach`.
+        assert!(changes_debug_target(&outside_quotes(
+            r#".printf "oops; .detach"#
+        )));
 
         // **A wrapper gets through, and this pins that rather than claiming otherwise.**
         // `changes_debug_target` reads the first token of each `;`-separated segment, so `.if`,
