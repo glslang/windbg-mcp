@@ -27,7 +27,7 @@
 //!   batch          1   10,021  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
-//!   ioctl         10   12,262  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
+//!   ioctl         10   12,435  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                device security and the whole-driver survey
 //! ```
 //!
