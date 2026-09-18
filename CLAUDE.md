@@ -229,10 +229,20 @@ running. The procedure is:
    `s.owner == caller`, deliberately — another client's handles would be unusable and listing them
    would say how many clients this server has and what they are debugging). On a listener serving
    one credential that is the whole truth; on one serving several it is not, and a clean
-   `session_status` is no evidence at all about the others. `sc.exe qc` shows the listen address and
-   the **process count** settles what is open right now — a supervisor spawns one worker per live
-   session, so `(Get-Process windbg-mcp).Count` is `1` when nothing is open and `n+1` for `n`
-   sessions, measured both ways on this bench.
+   `session_status` is no evidence at all about the others. What settles what is open *right now* is
+   the **worker count of the service you matched above** — a supervisor spawns one worker per live
+   session, and a worker is a direct child of it:
+
+   ```pwsh
+   $svc = (Get-CimInstance Win32_Service -Filter "Name='windbg-mcp'").ProcessId
+   @(Get-CimInstance Win32_Process -Filter "Name='windbg-mcp.exe' AND ParentProcessId=$svc").Count
+   ```
+
+   **Scoped to that pid on purpose.** A bare `Get-Process windbg-mcp` counts every supervisor on
+   the guest and all of their workers — and this section's whole premise is that a stdio supervisor
+   and a service can coexist there — so it reports an idle service as holding sessions. Measured
+   here: the service is pid 5524 with parent 908 (`services.exe`), and one open session adds pid
+   7228 whose parent is 5524.
 
    **Neither of those is a roster, and `--list-listen-clients` is not one either**: it reads the
    credential *file*, and the file and the running service can disagree — a `--remove` or
@@ -345,9 +355,10 @@ This project is also installable as a user-scope Claude Code plugin (`windbg-mcp
 is a snapshot of the last *published* release and does **not** track working-tree edits.
 
 **What is registered here is neither that plugin nor a local build** (checked 2026-09-18, and this
-paragraph used to say otherwise): the one MCP server on this project is `windbg-vm`, an HTTP
-transport pointed at `127.0.0.1:8765` — the forwarded port of the guest's service, which is the
-second column of the table above. There is no `.claude/settings.local.json` disabling anything; the
+paragraph used to say otherwise): this project has a single MCP server, and it is an **HTTP**
+transport on a forwarded loopback port — the guest's service, which is the second column of the
+table above. Its name and endpoint are machine-specific and deliberately not written down here; ask
+the host, as that table says. There is no `.claude/settings.local.json` disabling anything; the
 `.claude/` directory holds `rules/` and `skills/` and nothing else. So a change is live once the
 **service** has been restarted, and never because a build finished on this Mac — which cannot
 produce a Windows binary anyway.
