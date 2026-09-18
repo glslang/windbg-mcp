@@ -1075,14 +1075,39 @@ fn simulate(
                 {
                     untracked.push(at);
                 }
-                // **Every compare live here, because each belongs to a path that reaches
-                // this branch.** Two paths meeting at one `je` make two cases, at two `case_rva`s,
-                // which is the same "a case per site" rule the rest of this module keeps.
-                for (was, condition) in compared
-                    .iter()
-                    .filter_map(|was| Some((was, last.condition?)))
+                // **A64 folds the compare into the branch**, and then there is exactly one
+                // reading rather than one per live compare: the comparison is this instruction's
+                // own, so no earlier path contributed one. Where the branch reads *flags*, every
+                // live compare is still a reading -- two paths meeting at one `je` make two cases
+                // at two `case_rva`s, which is the "a case per site" rule the rest of this module
+                // keeps.
+                let folded = folded_compare(&facts, last, layout, &mut traced);
+                let readings: Vec<(Compared, Condition)> = match folded {
+                    Some((was, condition)) => vec![(was, condition)],
+                    None => match last.condition {
+                        Some(condition) => compared
+                            .iter()
+                            .cloned()
+                            .map(|was| (was, condition))
+                            .collect(),
+                        None => Vec::new(),
+                    },
+                };
+                // **A conditional branch this could not read at all**, over a register holding the
+                // control code. On A64 that is `tbz`/`tbnz` -- one bit of a `ULONG`, which is not
+                // a value and so not a case -- and anything else that grows here lands in the same
+                // arm rather than quietly shortening the list. `Flow::Branch` with no condition is
+                // the compare-and-branch family and nothing else; an unconditional `b` is
+                // `Flow::Jmp`, so this cannot fire on x86, where every conditional branch carries
+                // one.
+                if readings.is_empty()
+                    && last.condition.is_none()
+                    && branches_on_the_code(&facts, last)
                 {
-                    match (condition, was.code) {
+                    untracked.push(last.address);
+                }
+                for (was, condition) in &readings {
+                    match (*condition, was.code) {
                         (Condition::Equal, Some(code)) => {
                             if let Some(target) = target {
                                 cases.push((code, target, was.at, was.proved));
@@ -1789,7 +1814,10 @@ fn update(
         }
         // `sub eax, 6D0034h` rebases the code: the register now holds `code - (offset + K)`, and
         // the `je` that follows is a case for that value rather than for zero.
-        Effect::Subtract => match (held, scalar_of(facts, operands.get(1))) {
+        Effect::Subtract => match (
+            arithmetic_source(facts, operands, held),
+            scalar_of(facts, arithmetic_amount(operands)),
+        ) {
             (
                 Some(Value::Code {
                     offset,
@@ -1820,7 +1848,10 @@ fn update(
             }
             _ => set(facts, &destination, None),
         },
-        Effect::Add => match (held, scalar_of(facts, operands.get(1))) {
+        Effect::Add => match (
+            arithmetic_source(facts, operands, held),
+            scalar_of(facts, arithmetic_amount(operands)),
+        ) {
             (
                 Some(Value::Code {
                     offset,
@@ -1859,7 +1890,10 @@ fn update(
             // this does not model.
             _ => set(facts, &destination, None),
         },
-        Effect::ShiftRight => match (held, operands.get(1).and_then(immediate_of)) {
+        Effect::ShiftRight => match (
+            arithmetic_source(facts, operands, held),
+            arithmetic_amount(operands).and_then(immediate_of),
+        ) {
             (
                 Some(Value::Code {
                     offset,
@@ -2049,6 +2083,91 @@ fn source_value(
 }
 
 /// Reads a `cmp`, which is where a case and a bounds check both begin.
+/// The value an arithmetic instruction operates **on**, which is not always what it writes to.
+///
+/// x86 is two-operand and destructive: `sub ecx,6D0034h` reads `ecx` and writes `ecx`, so the
+/// destination's own value is the source and one lookup answers both. A64 is three-operand --
+/// `sub w9,w8,w10` reads `w8` -- and taking the destination there reads the register this
+/// instruction is about to overwrite.
+///
+/// **The common spelling has them the same register**, which is exactly why this stayed invisible:
+/// `sub w9,w9,w10` gives the right answer by accident, and it was a chain written that way which
+/// first showed the amount being read from the wrong operand. Raised on windbg-mcp#343.
+fn arithmetic_source(facts: &Facts, operands: &[Operand], held: Option<Value>) -> Option<Value> {
+    match operands.len() >= 3 {
+        true => operands
+            .get(operands.len() - 2)
+            .and_then(register_full)
+            .and_then(|register| facts.registers.get(&register).cloned()),
+        false => held,
+    }
+}
+
+/// And the amount it operates **by**, which is the last operand on both shapes.
+///
+/// Two-operand `sub ecx,eax` and three-operand `sub w9,w8,w10` agree about that, and a shift or
+/// extension folded into an A64 operand never reaches here -- the decoder reports those as
+/// [`Operand::Other`] and drops the effect, so `add x8,x9,x10,lsl #3` is not an `Add` at all.
+fn arithmetic_amount(operands: &[Operand]) -> Option<&Operand> {
+    match operands.len() >= 2 {
+        true => operands.last(),
+        false => None,
+    }
+}
+
+/// The compare a branch carries **inside itself**, which is how A64 writes a dispatch chain.
+///
+/// x86 always leaves a comparison in the flags and then reads them, so [`compare`] runs over an
+/// earlier instruction and the branch consults what it left. A64 has both forms, and the folded
+/// one is the common one: `cbz w9,handler` is `cmp w9,#0` and `b.eq` in a single instruction that
+/// writes no flags at all. Nothing in the loop over a block's body sees it, because it *is* the
+/// terminator -- so a `sub w9,w9,w10` / `cbz w9,handler` chain, which is exactly the rebased shape
+/// this module cites HEVD's `sub ecx,222003h` / `je` for, recovered **no cases and no unresolved
+/// transfers**: a map that said `code_proved` and listed nothing, which reads as a driver that
+/// accepts no control codes. Measured on windbg-mcp#343 before this existed.
+///
+/// `tbz`/`tbnz` are deliberately **not** here. They test one bit, which is a statement about part
+/// of a `ULONG` rather than a value -- the same thing `test ecx,3` / `je` is on x86, and it gets
+/// the same answer: not a case, and a loss recorded so the map reads as a lower bound.
+fn folded_compare(
+    facts: &Facts,
+    instruction: &Instruction,
+    layout: Layout,
+    traced: &mut bool,
+) -> Option<(Compared, Condition)> {
+    let condition = match instruction.mnemonic.as_str() {
+        // Branch if the register is zero, which after a rebasing `sub` is "equal to the code".
+        "cbz" => Condition::Equal,
+        "cbnz" => Condition::NotEqual,
+        _ => return None,
+    };
+    let register = instruction.operands.first()?;
+    if !matches!(register, Operand::Register(_)) {
+        return None;
+    }
+    // Asked of [`compare`] through a probe rather than rebuilt, so the width guard, the shifted-
+    // index rule and the `Value::Code` arithmetic are the ones every other compare gets.
+    let mut probe = instruction.clone();
+    probe.operands = vec![register.clone(), Operand::Immediate(0)];
+    probe.effect = Effect::Compare;
+    Some((compare(facts, &probe, layout, traced)?, condition))
+}
+
+/// Whether a branch this walk could not read is branching **on the control code**.
+///
+/// The question a silent short list needs asked: `tbz w9,#3,handler` where `w9` holds the code is
+/// a decision about the request that this cannot name, and saying nothing about it is what lets a
+/// map report fewer codes than the driver accepts with nothing marking the gap.
+fn branches_on_the_code(facts: &Facts, instruction: &Instruction) -> bool {
+    instruction.operands.iter().any(|operand| match operand {
+        Operand::Register(register) => matches!(
+            facts.registers.get(&register.full),
+            Some(Value::Code { .. })
+        ),
+        _ => false,
+    })
+}
+
 fn compare(
     facts: &Facts,
     instruction: &Instruction,
@@ -3252,6 +3371,11 @@ mod tests {
         let writes: Vec<RegisterOperand> = match (mnemonic, effect) {
             // `push rax` reads `rax` and writes `rsp`, which nothing here tracks.
             (_, Effect::Compare | Effect::Test | Effect::Push) => Vec::new(),
+            // **A64's compare-and-branch reads a register and writes none**, which the first-
+            // operand rule below would get backwards -- and a fixture saying `cbz w9` writes `w9`
+            // would clear the very fact the branch is about, so the test would pass for having
+            // nothing left to find rather than for the rule under test.
+            ("cbz" | "cbnz" | "tbz" | "tbnz", _) => Vec::new(),
             // **The implicit destination**, which is the shape a first-operand rule cannot reach:
             // `mul ecx` reads `ecx` and writes `rax` and `rdx`, naming neither. dbgscope's own
             // test pins that against the decoder, which is what this has to stay true to.
@@ -3710,6 +3834,182 @@ mod tests {
             found.cases
         );
         assert_eq!(found.case_count, 0);
+    }
+
+    /// **A64 folds the compare into the branch, and a dispatch chain written that way is read.**
+    ///
+    /// `sub w9,w9,w10` / `cbz w9,handler` is the ARM64 spelling of the `sub ecx,222003h` / `je`
+    /// chain this module cites HEVD for, and it is the shape a rebased switch takes on that
+    /// target. Before `folded_compare` it recovered **nothing**: no cases, and no `unresolved`
+    /// either, so the map reported `code_proved` with an empty list -- a driver that accepts no
+    /// control codes, which is the answer this whole module is arranged against. Measured on
+    /// windbg-mcp#343.
+    ///
+    /// The second half is the one that keeps the list honest. `tbz` tests a single bit, which is a
+    /// statement about part of a `ULONG` and not a value, so it is **not** a case -- exactly what
+    /// `test ecx,3` / `je` gets on x86. What it must not be is silent, and `untracked` is where it
+    /// goes so a short map reads as a lower bound.
+    #[test]
+    fn an_arm64_compare_and_branch_is_both_halves() {
+        let chain = |terminator: Instruction| {
+            let mut block = vec![
+                insn(
+                    DISPATCH,
+                    "ldr",
+                    vec![reg("x8"), pointer("x1", 0xb8)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 4,
+                    "ldr",
+                    vec![reg("w9"), mem("x8", 0x18)],
+                    Flow::Fallthrough,
+                ),
+                // The code is materialised and subtracted, which is what rebases the register.
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("w10"), imm(0x2003)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xc,
+                    "movk",
+                    vec![reg("w10"), imm(0x22_0000)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x10,
+                    "sub",
+                    vec![reg("w9"), reg("w9"), reg("w10")],
+                    Flow::Fallthrough,
+                ),
+            ];
+            block.push(terminator);
+            block.push(insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return));
+            map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never)
+        };
+
+        // `cbz w9,handler` -- the register is zero exactly when the code was `0x222003`.
+        let zero = chain(insn(
+            DISPATCH + 0x14,
+            "cbz",
+            vec![reg("w9")],
+            Flow::Branch(Some(0x900)),
+        ));
+        assert_eq!(
+            zero.cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.recovered))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, 0x900, Recovery::Compare)],
+            "{:?}",
+            zero.cases
+        );
+        assert!(zero.code_proved);
+        assert!(zero.untracked.is_empty(), "{:?}", zero.untracked);
+
+        // `cbnz w9,other` -- the branch is the rejection, so the case is the fall-through.
+        let not_zero = chain(insn(
+            DISPATCH + 0x14,
+            "cbnz",
+            vec![reg("w9")],
+            Flow::Branch(Some(0x900)),
+        ));
+        assert_eq!(
+            not_zero
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, DISPATCH + 0x18)],
+            "the case is what follows a branch that rejects: {:?}",
+            not_zero.cases
+        );
+
+        // **A bit test is not a value.** `tbz w9,#3,handler` decides something about the code that
+        // this cannot name, so there is no case -- and an entry in `untracked`, without which the
+        // map would be short by one with nothing saying so.
+        let bit = chain(insn(
+            DISPATCH + 0x14,
+            "tbz",
+            vec![reg("w9"), imm(3)],
+            Flow::Branch(Some(0x900)),
+        ));
+        assert!(
+            bit.cases.is_empty(),
+            "one bit of a ULONG is not a control code: {:?}",
+            bit.cases
+        );
+        assert_eq!(
+            bit.untracked,
+            vec![DISPATCH + 0x14],
+            "and the branch it could not read is recorded: {bit:?}"
+        );
+
+        // **A three-register `sub`, which is the form that pins where the source is read from.**
+        // Every chain above writes `sub w9,w9,w10`, where the destination *is* the source -- so
+        // taking either gives the same answer and the rule goes untested. Mutation said so: with
+        // `arithmetic_source` forced back to the destination, all of the above still passed.
+        // `sub w9,w8,w10` is the same statement with the code left in `w8`, and there the two
+        // readings differ: the destination holds nothing yet, so a walk reading it loses the chain.
+        let separate = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w8"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0x2003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "sub",
+                vec![reg("w9"), reg("w8"), reg("w10")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "cbz",
+                vec![reg("w9")],
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return),
+        ];
+        let found = map(
+            DISPATCH,
+            &separate,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            never,
+        );
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x222003, 0x900)],
+            "the source is operand one on a three-register `sub`: {:?}",
+            found.cases
+        );
     }
 
     /// **An ARM64 rejection is read, through either place it can be written.**
