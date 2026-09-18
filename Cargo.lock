@@ -164,7 +164,7 @@ dependencies = [
 [[package]]
 name = "dbgscope"
 version = "0.2.0"
-source = "git+https://github.com/glslang/dbgscope?rev=65a6c3462f2c5224510f46e11c6c9acd0c3a6256#65a6c3462f2c5224510f46e11c6c9acd0c3a6256"
+source = "git+https://github.com/glslang/dbgscope?rev=158f48cbc7e391d4dc62cd8118182b95cb78a231#158f48cbc7e391d4dc62cd8118182b95cb78a231"
 dependencies = [
  "hex",
  "iced-x86",
