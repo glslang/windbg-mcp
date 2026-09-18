@@ -228,6 +228,24 @@ running. The procedure is:
    regenerable, git-ignored, and *not* `target\release`, which is the service's image — gave
    11.0 GB back.
 5. **`cargo build --release`.** No rename: the path is free. 34.7s here.
+
+   **This does not rebuild the 32-bit worker, and the identity check will reject the old one.**
+   `x86\windbg-mcp.exe` is a second target triple Cargo does not build for you, and the build
+   identity on `WorkerMessage::Ready` refuses a worker built from *any* other state of the tree —
+   which **a commit moves**, not just a code change, since the identity digests the uncommitted
+   diff of `build.rs`'s `INPUTS` and committing takes that diff to empty
+   (`.claude/rules/worker-architecture.md`). So a documentation-only commit is enough to strand it,
+   and the symptom reads as a *missing* file rather than a stale one: "this host could not give the
+   target a 32-bit worker", with every 32-bit dump and WoW64 attach losing SOS. Rebuild and stage
+   it with the supervisor:
+   ```console
+   cargo build --release --target i686-pc-windows-msvc
+   copy target\i686-pc-windows-msvc\release\windbg-mcp.exe target\release\x86\
+   ```
+   It lands in the triple's own directory, not in the `x86\` subdirectory the loader rule needs, so
+   the copy is the point. **This guest deploys no `target\release\x86\` at all** (checked
+   2026-09-18), so there is nothing to strand here — which is exactly why the step is written down
+   rather than remembered.
 6. **`sc.exe start windbg-mcp`**, then verify the *process* rather than the service state — a new
    `Get-Process windbg-mcp` `Id` and `StartTime`, against the exe's `LastWriteTime`.
 7. **Nothing to do on the client.** The tunnel survives the restart (it forwards a port; only the
