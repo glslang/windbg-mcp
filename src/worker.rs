@@ -6778,6 +6778,29 @@ fn also_reachable(set: dbgscope::dbgeng::InstructionSet) -> &'static str {
 /// this bench to check it against, and that is said here rather than left for a reader to assume
 /// the figure was taken from one. The x64 and ARM64 forms are measured against real dispatch
 /// routines.
+/// Which structure offsets and register names an IOCTL map reads the target through.
+///
+/// **Extracted so that the selection is testable on its own**, which is the half a test of
+/// [`ioctl::Layout`]'s contents does not reach: the defect was never in a layout, it was in the
+/// line that picked one. `ioctl_map` refuses a set whose operands go unread before it gets here,
+/// so the three below are the three that remain.
+///
+/// **ARM64 is named rather than left to the fallback**, and it was the fallback for as long as the
+/// gate above refused it. The moment dbgscope#170 answered A64 operands it stopped being refused
+/// and started arriving here, where `_` handed it x64's *registers*: the IRP seeded into `rdx`,
+/// refusals checked against `rax`, and a volatile list matching nothing an A64 decoder names -- so
+/// a `call` invalidated nothing and a literal surviving one would be reported as a control code
+/// the driver accepts. The **offsets** are shared, both being 64-bit targets whose `_IRP` is laid
+/// out around a pointer, which is what made a wildcard look right; the names are not, and that is
+/// the half a wildcard cannot carry. `dispatch_irp_expression` had ARM64's `@x1` all along.
+fn ioctl_layout(set: dbgscope::dbgeng::InstructionSet) -> ioctl::Layout {
+    match set {
+        dbgscope::dbgeng::InstructionSet::X86 => ioctl::Layout::X86,
+        dbgscope::dbgeng::InstructionSet::Arm64 => ioctl::Layout::ARM64,
+        _ => ioctl::Layout::X64,
+    }
+}
+
 fn dispatch_irp_expression(set: dbgscope::dbgeng::InstructionSet) -> Result<&'static str, Failed> {
     use dbgscope::dbgeng::InstructionSet;
     match set {
@@ -8297,22 +8320,7 @@ fn ioctl_map_of(
         .map(|image| image.executable_ranges())
         .unwrap_or_default();
     let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
-    // **The structure offsets and the register names both follow the target**, and the check above
-    // is what makes this match exhaustive: an instruction set whose operands are not read was
-    // refused before this point, so the three that remain are the three that have a layout.
-    //
-    // **ARM64 is named rather than left to the fallback**, and it was the fallback for as long as
-    // the gate above refused it. The moment dbgscope answered A64 operands it stopped being
-    // refused and started arriving here, where `_` handed it x64's *registers*: the IRP seeded
-    // into `rdx`, refusals checked against `rax`, and a volatile list matching nothing an A64
-    // decoder names -- so a `call` invalidated nothing and a literal that survived one would be
-    // reported as a control code. A wildcard is the right shape for offsets that are shared and
-    // the wrong one for names that are not.
-    let layout = match set {
-        dbgscope::dbgeng::InstructionSet::X86 => ioctl::Layout::X86,
-        dbgscope::dbgeng::InstructionSet::Arm64 => ioctl::Layout::ARM64,
-        _ => ioctl::Layout::X64,
-    };
+    let layout = ioctl_layout(set);
     let found = ioctl::map(entry, &block, layout, read, in_image, || {
         if let Some(why) = halted.get() {
             return Some(why);
@@ -8939,6 +8947,34 @@ mod tests {
         assert!(
             refused.message.contains("0x01c4"),
             "the refusal says which machine it found: {refused:?}"
+        );
+    }
+
+    /// The IOCTL map reads each target through **its own** registers, not just its own offsets.
+    ///
+    /// The selection used to be `X86 => X86, _ => X64`, and its comment called that exhaustive
+    /// because everything else was refused before it. ARM64 stopped being refused the moment
+    /// dbgscope#170 decoded A64's operands, and the wildcard then gave it x64's register names --
+    /// an IRP seeded into `rdx` no A64 target has, and a volatile list that made a `call`
+    /// invalidate nothing. The offsets really are shared; that is what made the wildcard look
+    /// right, and it is the half of a layout a wildcard can carry.
+    ///
+    /// Pinned here rather than through [`ioctl::Layout`]'s own tests, which is the distinction
+    /// that matters: those assert what a layout *contains*, and the defect was in the line that
+    /// picks one. This is that line.
+    #[test]
+    fn the_ioctl_map_reads_a_target_through_its_own_registers() {
+        use dbgscope::dbgeng::InstructionSet;
+        assert_eq!(ioctl_layout(InstructionSet::Arm64), ioctl::Layout::ARM64);
+        assert_eq!(ioctl_layout(InstructionSet::Amd64), ioctl::Layout::X64);
+        assert_eq!(ioctl_layout(InstructionSet::X86), ioctl::Layout::X86);
+        // The two 64-bit layouts are **not** interchangeable, which is the whole finding: a test
+        // asserting only "ARM64 gets a 64-bit layout" passes against the wildcard that was there.
+        assert_ne!(ioctl::Layout::ARM64, ioctl::Layout::X64);
+        // And the same register the breakpoint path has used for ARM64 all along.
+        assert_eq!(
+            dispatch_irp_expression(InstructionSet::Arm64).expect("arm64"),
+            "@x1"
         );
     }
 

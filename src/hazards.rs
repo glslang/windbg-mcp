@@ -1418,6 +1418,63 @@ mod tests {
         );
     }
 
+    /// A64's privileged instructions land in families rather than all in [`PrivilegeKind::Other`].
+    ///
+    /// Membership is the decoder's answer and always was, so these were reported correctly and
+    /// namelessly the moment dbgscope#170 made `privileged` true on ARM64 -- which is what
+    /// `Other` is for and why enabling these tools on ARM64 was safe before this. What the table
+    /// adds is the family, for the two groups where it is unambiguous.
+    ///
+    /// The system-register space is deliberately **not** family-named beyond the interrupt masks:
+    /// it is far too wide to map honestly onto x86's families, and `Other` carries the register in
+    /// the operands, which is a better answer than an invented name.
+    #[test]
+    fn an_arm64_privileged_instruction_lands_in_a_family() {
+        let other = |mnemonic: &str, operands: Vec<Operand>| {
+            privileged_insn(
+                BASE + 0x1000,
+                "00000000",
+                mnemonic,
+                Flow::Fallthrough,
+                operands,
+            )
+        };
+        // Cache, TLB and address-translation maintenance: the same family as `invd`/`invlpg`.
+        for mnemonic in ["dc", "ic", "tlbi", "at"] {
+            assert_eq!(
+                privilege_kind(&other(mnemonic, Vec::new())),
+                Some(PrivilegeKind::MachineState),
+                "{mnemonic}"
+            );
+        }
+        // `msr daifset,#2` is `cli` under another spelling, and `DAIF` reached as a register is
+        // the same gate: `s3_3_c4_c2_1`.
+        for name in ["daifset", "daifclr", "s3_3_c4_c2_1"] {
+            assert_eq!(
+                privilege_kind(&other("msr", vec![Operand::Other(name.to_string())])),
+                Some(PrivilegeKind::InterruptFlag),
+                "{name}"
+            );
+        }
+        // **`NZCV` is one `op2` away and is EL0's own**, so a looser match would call every flag
+        // restore an interrupt mask. It is not privileged at all, so it is not reported.
+        assert_eq!(
+            privilege_kind(&insn(
+                BASE + 0x1000,
+                "00000000",
+                "msr",
+                Flow::Fallthrough,
+                vec![Operand::Other("s3_3_c4_c2_0".to_string())],
+            )),
+            None,
+        );
+        // Everything else privileged keeps its mnemonic under `Other` rather than being dropped.
+        assert_eq!(
+            privilege_kind(&other("eret", Vec::new())),
+            Some(PrivilegeKind::Other),
+        );
+    }
+
     /// A privileged instruction is decided by its **operands**, not by its mnemonic.
     ///
     /// `mov cr3, rax` and `mov rax, rbx` are the same mnemonic, and the difference between a
