@@ -78,7 +78,7 @@ most the narrow ones. Measured after round twelve: **77,169 B** against **6,496 
 a measurement rather than an invariant, since any edit to a rule moves it, and the second of those
 figures was already stale by 30 bytes when first written here, and staler again since
 `measurement-provenance.md` grew the code scope. How many narrow rules fire is
-deliberately not stated: the globs intersect (`examples/README.md` matches two rules, `build.rs` nine),
+deliberately not stated: the globs intersect (`examples/README.md` matches two rules, `build.rs` **eleven** — nine code rules, `cargo-and-dependencies.md` and `measurement-provenance.md`; counted from the frontmatter 2026-09-18, and it said nine before that count was taken),
 and two attempts to give the exact composition were both wrong, one in the commit that fixed the
 other. `/handoff` carries the method and what went wrong with it.
 
@@ -91,7 +91,7 @@ them — read it to pick the one you want.
 | `cross-target-check.md` | any `src/` or `tests/` Rust, or `build.rs` | type-checking the whole crate from a Mac, `build.rs`'s PE version resource and its expected warning, reading a dependency's pinned source with `cargo fetch`/`metadata` |
 | `markdown-and-docs.md` | `**/*.md` | CI's two non-Rust gates: `cargo fmt --all --check` and the markdownlint globs |
 | `powershell-scripts.md` | `**/*.ps1`, `tools/**`, `examples/**` | the three ways a shipped `.ps1` fails only under PowerShell 5.1; draining stderr when driving the server from a script; handling a token so it stays out of the transcript |
-| `measurement-provenance.md` | `tools/**`, `docs/**/*.md`, any `src/` or `tests/` Rust | which build answered, why an exe's date is not evidence, why a narrowed surface has to be captured from a narrowed listener — and why *"this fails safe"* is a hypothesis needing a test rather than a property |
+| `measurement-provenance.md` | `tools/**`, `docs/**/*.md`, any `src/` or `tests/` Rust, or `build.rs` | which build answered, why an exe's date is not evidence, why a narrowed surface has to be captured from a narrowed listener — and why *"this fails safe"* is a hypothesis needing a test rather than a property |
 | `execution-waits.md` | any `src/` or `tests/` Rust, or `build.rs` | the two waits, what a raw `execute` of execution-control text leaves behind, `settle`, the load-wait outcome, the session fuzz |
 | `async-runs.md` | any `src/` or `tests/` Rust, or `build.rs` | `continue_async`: the slot, the filing task, the refusal, `submit_gate`, breaking the pump, bars, `break_in` against `interrupt` |
 | `session-teardown.md` | any `src/` or `tests/` Rust, or `build.rs` | what `end_session` does to a dump, a live kernel, an attached process and a launched one — and the handle it still accepts |
