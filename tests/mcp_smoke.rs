@@ -9995,13 +9995,19 @@ fn an_ioctl_map_of_a_driver_in_a_dump_is_its_chain_and_both_its_tables() {
     );
 }
 
-/// An architecture this build cannot decode is **refused**, not answered.
+/// An architecture whose **operands** this build cannot read is **refused**, not answered.
 ///
 /// The ARM64 driver crash is the fixture, opened on whatever host runs this: an x64 engine reads
 /// an ARM64 kernel dump perfectly well, which is exactly what makes the failure available. A walk
-/// over instructions it cannot decode finds no compare and no switch, and the honest answer to
-/// that is not a driver that accepts no control codes — that is a real driver's map, and a reader
-/// has no way to tell the two apart.
+/// over instructions whose compares it cannot read finds no code and no switch, and the honest
+/// answer to that is not a driver that accepts no control codes — that is a real driver's map, and
+/// a reader has no way to tell the two apart.
+///
+/// **This stayed a refusal when the reachability walk stopped being one**
+/// ([#297](https://github.com/glslang/windbg-mcp/issues/297)), and that is the point worth
+/// keeping: A64's control *flow* is decoded now and its operands are not, so the two tools gate on
+/// different questions. The test below is this one's counterpart, on the same dump, and the pair
+/// is what says the gates came apart rather than one of them being forgotten.
 #[test]
 fn an_ioctl_map_of_an_architecture_this_build_cannot_decode_is_refused() {
     if target_tier().is_none() {
@@ -10042,6 +10048,144 @@ fn an_ioctl_map_of_an_architecture_this_build_cannot_decode_is_refused() {
         message.contains("0xaa64"),
         "and says which machine it found, so the refusal is about this target rather than about \
          the tool: {response}"
+    );
+
+    server.tool_data(
+        "end_session",
+        json!({ "session_id": session_id }),
+        TARGET_STEP,
+    );
+}
+
+/// **ARM64 gets a verdict, and the verdict is about the target rather than about what was read.**
+///
+/// The counterpart to the `ioctl_map` refusal above, on the same dump and with the same engine:
+/// that tool reads what an instruction *is* and still declines, this one reads where control
+/// *goes* and now answers ([#297](https://github.com/glslang/windbg-mcp/issues/297)).
+///
+/// **`blind_stops` is the assertion that matters**, and it is the one a refusal could not make.
+/// Before A64's flow was decoded, every instruction here was `Flow::Unknown`; a walk stops at
+/// those, so it would have explored exactly one instruction and reported NOT REACHABLE — a verdict
+/// shaped like an answer, which is why the tool refused instead. A `reachable` verdict with zero
+/// blind stops says the opposite in the only way that cannot be faked: the graph was followed, and
+/// nothing in it went unread.
+///
+/// `nt` rather than the dump's own `HEVD`, and that is not a convenience: a kernel minidump carries
+/// no driver pages and this bench serves no image for a third-party driver, so `HEVD`'s code is not
+/// here to walk. The probe below asks a *different* tool whether `nt`'s is, so a regression in the
+/// tool under test cannot be what silences this.
+///
+/// The pair is a direct `bl` and its callee, bounded to one hop, so what is asserted is one
+/// decoded call edge rather than a transitive path whose shape depends on the build.
+#[test]
+fn a_reachability_walk_over_an_arm64_target_answers_rather_than_refuses() {
+    if target_tier().is_none() {
+        return;
+    }
+    if !std::path::Path::new(ARM64_DRIVER_CRASH_DUMP).exists() {
+        skip(&format!(
+            "sample dump not found at {ARM64_DRIVER_CRASH_DUMP}"
+        ));
+        return;
+    }
+    const FROM: &str = "nt!EtwpDestructIptData";
+    const TARGET: &str = "nt!ExFreePoolWithTag";
+    let mut server = Server::started();
+    let opened = server.call_tool(
+        "open_dump",
+        json!({ "path": ARM64_DRIVER_CRASH_DUMP }),
+        TARGET_STEP,
+    );
+    assert_no_error(&opened, "open_dump");
+    let session_id = session_id_of(&opened["result"]);
+
+    // Can this host read `nt`'s code and resolve its private symbols at all? Asked of another
+    // tool, and of the first instruction rather than of the symbol: a routine whose pages are
+    // missing disassembles as `???`, which is not a prologue.
+    let probe = server.call_tool(
+        "disassemble",
+        json!({ "session_id": session_id, "address": FROM, "count": 1 }),
+        TARGET_STEP,
+    );
+    let readable = !is_tool_error(&probe)
+        && probe["result"]["structuredContent"]["instructions"]
+            .as_array()
+            .and_then(|rows| rows.first().cloned())
+            .and_then(|row| row["text"].as_str().map(|t| !t.contains('?')))
+            .unwrap_or(false);
+    if !readable {
+        skip(
+            "this host could not disassemble `nt!EtwpDestructIptData`, so there is no ARM64 code \
+             here to walk: the kernel's private symbols did not resolve, or its pages were not \
+             served. A NOT REACHABLE for want of code is not something to assert.",
+        );
+        server.tool_data(
+            "end_session",
+            json!({ "session_id": session_id }),
+            TARGET_STEP,
+        );
+        return;
+    }
+
+    let walk = server.tool_data(
+        "reachable_from_dispatch",
+        json!({
+            "session_id": session_id,
+            "from": FROM,
+            "address": TARGET,
+            "max_depth": 1,
+            "max_functions": 8,
+        }),
+        TARGET_STEP,
+    );
+
+    assert_eq!(
+        walk["verdict"], "reachable",
+        "`{FROM}` calls `{TARGET}` directly, and the encoding says so: {walk}"
+    );
+    assert_eq!(
+        walk["blind_stops"], 0,
+        "every instruction the walk crossed had its flow read -- which is the whole of what #297 \
+         changed, and the one thing a refusal could not have reported: {walk}"
+    );
+    assert_eq!(
+        walk["path"].as_array().map(Vec::len),
+        Some(1),
+        "one hop, the direct call: {walk}"
+    );
+    assert_eq!(
+        walk["bound_hit"], false,
+        "one hop fits inside the bounds this asked for, so the verdict is the graph's rather than \
+         the bound's: {walk}"
+    );
+
+    // **The recipe is left at its default**, which is on, because that is what a caller gets and
+    // because the recipe pass is the one part of this tool that reads more than the flow. On A64
+    // it gets exactly the flow: the branch and the direction that keeps control on the path, and
+    // no predicate, operands being unread there.
+    //
+    // The two steps are this routine's own shape and are checkable against `uf`: reaching the
+    // `bl` in the block at `+0x58` needs `cbz x19` at `+0x18` to **fall through** and `cbz x8` at
+    // `+0x20` to be **taken**. Getting either direction backwards would send a reader an input
+    // that does not take the path -- which is the failure a recipe exists to prevent, and it is
+    // decided entirely by the branch class this change decodes.
+    let steps = walk["recipe"][0]["steps"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the default is a recipe, and a reachable walk has one: {walk}"));
+    let directions: Vec<(&str, &str)> = steps
+        .iter()
+        .filter_map(|step| Some((step["jcc"].as_str()?, step["required"].as_str()?)))
+        .collect();
+    assert_eq!(
+        directions,
+        vec![("cbz", "fallthrough"), ("cbz", "taken")],
+        "the on-path branches and the directions that keep control on it: {walk}"
+    );
+    assert!(
+        steps.iter().all(|step| step["predicate"].is_null()),
+        "and no predicate, because nothing here reads an operand -- a step that grew one would \
+         mean A64's operands are decoded now, which is a different change and wants its own \
+         assertions rather than this one passing quietly: {walk}"
     );
 
     server.tool_data(

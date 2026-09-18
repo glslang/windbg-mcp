@@ -6690,30 +6690,68 @@ fn driver_hazards(e: &DebugEngine, module: &str, deadline: Instant) -> Result<Ou
     Ok(Output::typed(fenced(&hazards::render(&report)), report))
 }
 
+/// How a refusal names the instruction set it found.
+///
+/// **The machine type an operator would recognise, not a `Debug` rendering.** The `0xaa64` in a
+/// refusal is searchable — it is what `!dh`, `lm v` and every PE tool print — and `Arm64` is the
+/// name of a Rust variant, as `Other(43620)` was the name of one with a decimal inside it.
+///
+/// Exhaustive rather than a `_` arm: x86 and x64 never reach a refusal today, and an arm that
+/// falls back to `Debug` is how the ARM64 case would have started printing a variant name the day
+/// the enum grew one — which is exactly what happened.
+fn machine_label(set: dbgscope::dbgeng::InstructionSet) -> String {
+    use dbgscope::dbgeng::InstructionSet;
+    match set {
+        InstructionSet::X86 => "0x014c".to_string(),
+        InstructionSet::Amd64 => "0x8664".to_string(),
+        InstructionSet::Arm64 => "0xaa64".to_string(),
+        InstructionSet::Other(machine) => format!("{machine:#06x}"),
+    }
+}
+
+/// The sentence an operand refusal adds when the **flow** on this target is readable after all.
+///
+/// The two gates came apart in [#297](https://github.com/glslang/windbg-mcp/issues/297): ARM64's
+/// control flow is decoded and its operands are not, so `reachable_from_dispatch` answers on a
+/// target the IOCTL map and the hazard scan still decline. A refusal that did not say so would
+/// send a reader away from the one static analysis that does work here — and the sentence is
+/// conditional rather than fixed because on a set with *neither* it would be an advertisement for
+/// a second refusal.
+fn also_reachable(set: dbgscope::dbgeng::InstructionSet) -> &'static str {
+    match set.flow_is_read() {
+        true => {
+            " `reachable_from_dispatch` works here too: its walk needs only the control flow, \
+                 which this build does decode for this target."
+        }
+        false => "",
+    }
+}
+
 /// The scan itself, as a value.
 fn hazards_of(
     e: &DebugEngine,
     module: &str,
     deadline: Instant,
 ) -> Result<structured::DriverHazards, Failed> {
-    // Refused outright on an instruction set whose encodings this build does not decode, exactly
-    // as the reachability walk is and for a sharper reason: every instruction would come back
-    // `Flow::Unknown` with no operands, so a scan would report *no* privileged instructions and no
-    // call sites — an answer shaped like a clean driver rather than like a question not asked.
+    // Refused outright on an instruction set whose **operands** this build does not read, which
+    // since ARM64's flow landed is a narrower thing than the reachability walk's gate and not the
+    // same one. This scan is about what an instruction *is*: `privileged` is the decoder's own
+    // answer, and a sensitive call is named by the import slot inside a memory operand. Neither is
+    // a question about control flow, so both come back empty on a set whose operands are unread —
+    // and a scan reporting no privileged instructions and no call sites is shaped like a clean
+    // driver rather than like a question that was not asked.
     let set = e.instruction_set();
     if !set.operands_are_read() {
-        let machine = match set {
-            dbgscope::dbgeng::InstructionSet::Other(machine) => format!("{machine:#06x}"),
-            other => format!("{other:?}"),
-        };
         return Err(Failed::categorised(
             structured::ErrorCategory::Debugger,
             format!(
-                "this build decodes x86 and x64 instructions, and this target's are machine \
-                 {machine} — so a scan of `{module}` could not read a call site or a privileged \
-                 instruction, and would report a driver with neither rather than a question it \
-                 could not ask. The import table alone is architecture-neutral; `modules` and \
-                 `read_memory` work here."
+                "this build reads x86 and x64 operands, and this target's instructions are \
+                 machine {machine} — so a scan of `{module}` could not read a privileged \
+                 instruction or the import slot behind a call, and would report a driver with \
+                 neither rather than a question it could not ask. The import table alone is \
+                 architecture-neutral; `modules` and `read_memory` work here.{flow}",
+                machine = machine_label(set),
+                flow = also_reachable(set),
             ),
         ));
     }
@@ -8058,23 +8096,23 @@ fn ioctl_map_of(
     dispatch: &str,
     deadline: Instant,
 ) -> Result<structured::IoctlMap, Failed> {
-    // Refused on an instruction set this build does not decode, exactly as the walk and the hazard
-    // scan are. Every instruction would come back with no operands, so every compare would be
-    // invisible and the answer would be a driver that accepts no control codes -- which is what a
-    // driver with no IOCTL dispatch looks like.
+    // Refused on an instruction set whose **operands** this build does not read, exactly as the
+    // hazard scan is and for the same narrowed reason. Following the flow is not enough here: what
+    // recovers a control code is the immediate a compare holds and the register it is compared
+    // against, so on a set with no operands every compare is invisible and the answer would be a
+    // driver that accepts no control codes -- which is what a driver with no IOCTL dispatch looks
+    // like.
     let set = e.instruction_set();
     if !set.operands_are_read() {
-        let machine = match set {
-            dbgscope::dbgeng::InstructionSet::Other(machine) => format!("{machine:#06x}"),
-            other => format!("{other:?}"),
-        };
         return Err(Failed::categorised(
             structured::ErrorCategory::Debugger,
             format!(
-                "this build decodes x86 and x64 instructions, and this target's are machine \
-                 {machine} — so the compares that recognise a control code cannot be read, and a \
-                 map of `{dispatch}` would report a routine that accepts none. `driver_object` \
-                 and `decode_ioctl` work here."
+                "this build reads x86 and x64 operands, and this target's instructions are \
+                 machine {machine} — so the compares that recognise a control code cannot be \
+                 read, and a map of `{dispatch}` would report a routine that accepts none. \
+                 `driver_object` and `decode_ioctl` work here.{flow}",
+                machine = machine_label(set),
+                flow = also_reachable(set),
             ),
         ));
     }
@@ -8524,23 +8562,19 @@ fn function_listing(
 }
 
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
-    // Refused outright on an instruction set whose flow this build does not decode — ARM64
-    // today, which this server otherwise supports (`src/target.rs`). Every instruction there
-    // decodes to `Flow::Unknown`, and the walk stops at those, so the answer would be a NOT
-    // REACHABLE that says nothing: not "the graph was explored and it is not there" but "nothing
-    // could be read". An honest refusal beats a verdict shaped like an answer.
+    // Refused outright on an instruction set whose **flow** this build does not decode. Every
+    // instruction there decodes to `Flow::Unknown`, and the walk stops at those, so the answer
+    // would be a NOT REACHABLE that says nothing: not "the graph was explored and it is not
+    // there" but "nothing could be read". An honest refusal beats a verdict shaped like an answer.
     //
-    // Lifting it is issue #297, and what it waits on is dbgscope: decoding ARM64 instructions
-    // into `Flow` (dbgscope#148) and its unwind record into an extent (dbgscope#146). One says
-    // where control goes and the other where a function ends; the walk itself needs no change.
+    // **The gate is the flow and no longer the operands**, which is what issue #297 was: ARM64
+    // used to fail this test and now passes it, dbgscope decoding A64's six branch classes
+    // (dbgscope#148) and its two-word unwind record (dbgscope#146). Nothing in the walk changed —
+    // it reads `Instruction::flow` and has never known which architecture produced one. What
+    // *cannot* follow is the IOCTL map and the hazard scan: both read operands, which ARM64 still
+    // does not answer, so they keep the narrower `operands_are_read` gate and say so.
     let set = e.instruction_set();
-    if !set.operands_are_read() {
-        // Named as the machine type an operator would recognise, not as a `Debug` rendering: the
-        // `0xaa64` in a refusal is searchable and `Other(43620)` is not.
-        let machine = match set {
-            dbgscope::dbgeng::InstructionSet::Other(machine) => format!("{machine:#06x}"),
-            other => format!("{other:?}"),
-        };
+    if !set.flow_is_read() {
         // `Debugger` rather than `InvalidArgument`, which is the tempting one because the call is
         // refused before the walk starts. No change to an *argument* helps: the refusal is about
         // the target this session holds, and that is what `Debugger` names — actionable by
@@ -8548,11 +8582,12 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         return Err(Failed::categorised(
             structured::ErrorCategory::Debugger,
             format!(
-                "this build decodes x86 and x64 instructions, and this target's are machine \
-                 {machine} — so a reachability walk over it cannot follow control flow, and any \
-                 verdict would be about what could not be read rather than about the target. \
-                 Analysis that needs no flow is unaffected: modules, memory, stacks and \
-                 `disassemble` all work here."
+                "this build follows x86, x64 and ARM64 control flow, and this target's \
+                 instructions are machine {machine} — so a reachability walk over it cannot \
+                 follow control flow, and any verdict would be about what could not be read \
+                 rather than about the target. Analysis that needs no flow is unaffected: \
+                 modules, memory, stacks and `disassemble` all work here.",
+                machine = machine_label(set),
             ),
         ));
     }
