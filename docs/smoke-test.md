@@ -572,9 +572,22 @@ reading the same bytes, so a regression in the one under test cannot be what sil
 
 The ARM64 driver crash is the negative, and it is asserted rather than skipped: an x64 engine reads
 that dump perfectly well, so the map has to be **refused**, naming the machine it found, rather
-than answered. A walk over instructions this build cannot decode finds no compare and no switch,
-and "this driver accepts no control codes" is a real driver's answer — a reader has no way to tell
-the two apart.
+than answered. A routine whose compares this build cannot read yields no code and no switch, and
+"this driver accepts no control codes" is a real driver's answer — a reader has no way to tell the
+two apart.
+
+**It is a negative about the operands, not about the architecture, and since
+[#297](https://github.com/glslang/windbg-mcp/issues/297) those are different things.** A64's
+control *flow* is decoded and its operands are not, so `reachable_from_dispatch` answers on the
+same dump that `ioctl_map` declines — and the pair on one fixture is what says the two gates came
+apart rather than one of them being forgotten. The walk's assertion is `blind_stops: 0` beside a
+`reachable` verdict, which is the thing a refusal could not have reported: before #297 every
+instruction there was unread, so the walk would have explored exactly one and said NOT REACHABLE.
+Its recipe is left at the default rather than switched off, because the recipe pass is the one part
+of that tool reading more than the flow; on A64 it gets exactly the flow, and the two `cbz`
+directions it reports are checkable against `uf`. It uses `nt` rather than the dump's own `HEVD`,
+and not for convenience — a kernel minidump carries no driver pages and no image is served for a
+third-party driver here, so `HEVD`'s code is not there to walk.
 
 Those checks are made against **typed fields** wherever a tool has them (issue #84): the handle is
 read from `structuredContent`, not from a `session_id:` line; `nt` and `hal` are matched as module
