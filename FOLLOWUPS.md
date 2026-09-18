@@ -1411,7 +1411,12 @@ that would do the same at hit time.
 **A wrapper reaches the same commands without naming them.** `.if (1) { .opendump C:\other.dmp }`
 presents `.if`; `.foreach`, `.block`, `j`, `z` and an alias defined with `as` all do the same, and
 an alias resolves at *execution* time, so no reading of the text before it runs can be complete.
-Raised by Codex on [#341](https://github.com/glslang/windbg-mcp/pull/341).
+Raised by Codex on [#341](https://github.com/glslang/windbg-mcp/pull/341), and **reached
+independently by CodeRabbit on the same PR** — which is the useful part, because the two arrived at
+the same remedy without conferring: keep the text scan as an early defence, and reconcile the
+target's identity at hit time rather than trusting a deny-list, "because wrappers and
+execution-time aliases can still hide target-changing commands". Two readings converging on the
+third shape below is worth more than either raising it.
 
 **It is not new and it is not specific to breakpoints.** The identical string through `execute`
 leaves the handle unretired exactly as it did before that PR — the check is the same function — and
