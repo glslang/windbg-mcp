@@ -129,8 +129,13 @@ you can let go of it:
 | New code loads on | `/mcp` reconnect | `sc start` |
 | `/mcp` reconnect alone | **is** the fix | changes **nothing** — it reopens a socket to the same process |
 
-`sc query windbg-mcp` tells you which you are in: a running service means the second column. On
-this repo's ARM64 bench it is the second, and the section after next is that procedure.
+**Read the registration to tell them apart, not the host.** `claude mcp list` prints each server's
+transport — a URL marked `(HTTP)` is the second column, a command line is the first. A running
+service proves nothing on its own: a host can serve HTTP clients from one *and* register a stdio
+server for this project, and then `sc query` picks the wrong column. That failure is worse than
+guessing, because `session_status` answers for whichever server is **registered** — so you would
+read the stdio supervisor's empty session list and then stop a service holding somebody else's live
+targets. On this repo it is the second column.
 
 ### The stdio shape
 
@@ -163,16 +168,17 @@ supervisor, and its workers exit with it, so step 4 is still just "after the rec
 
 ### The service shape (this repo's ARM64 bench)
 
-Measured 2026-09-18. The registered `windbg-vm` server is **not** a child of Claude Code: it is a
-Windows service on the guest, and the client reaches it over HTTP through an ssh port-forward from
-the Mac.
+Measured 2026-09-18. The registered server is **not** a child of Claude Code: it is a Windows
+service on the debugger guest, and the client reaches it over HTTP through an ssh port-forward from
+the Mac. Ask the host rather than reading the wiring from here — it is per machine, and this is a
+public repository, so the shapes are given with placeholders:
 
 ```console
-$ sc qc windbg-mcp
-BINARY_PATH_NAME : C:\workspace\windbg-mcp\target\release\windbg-mcp.exe --service --listen 127.0.0.1:8765
+$ sc qc windbg-mcp         # on the guest
+BINARY_PATH_NAME : <repo>\target\release\windbg-mcp.exe --service --listen 127.0.0.1:<port>
 START_TYPE       : 2   AUTO_START          SERVICE_START_NAME : LocalSystem
-$ ps aux | grep 8765        # on the Mac
-ssh -f -N -L 8765:127.0.0.1:8765 Admin@winarmsandboxdebugger.shared
+$ ps aux | grep <port>     # on the client, to find the forward
+ssh -f -N -L <port>:127.0.0.1:<port> <user>@<guest>
 ```
 
 So **the rename dance is unnecessary and the `/mcp` reconnect is useless**: stopping the service
@@ -182,16 +188,23 @@ running. The procedure is:
 1. **Check for live sessions first** — `session_status`. Stopping the service kills the supervisor,
    and its workers exit with it, so every open target goes. There is no `.stale` equivalent here:
    the old code does not survive the stop.
-2. **Put the guest's tree on the commit you mean to run.** Its `origin` is an **SSH** remote with no
-   key on that host, so `git fetch` fails with *"make sure you have the correct access rights"* —
-   which reads as a permissions problem and is a missing key. Fetch over HTTPS by URL rather than
-   reconfiguring the remote (`dbgscope`'s remote there is already HTTPS and fetches fine):
+2. **Put the guest's tree on the commit you mean to run** — *that* commit, named. A branch under
+   review is not `main`, and fetching `main` here builds a different tree and then attributes
+   everything you measure to the code you meant. So pass the ref and **check the head afterwards**
+   rather than trusting the fetch:
    ```console
-   git -C C:\workspace\windbg-mcp fetch https://github.com/glslang/windbg-mcp.git main
-   git -C C:\workspace\windbg-mcp reset --hard FETCH_HEAD
+   git -C <repo> fetch <url> <branch-or-sha>
+   git -C <repo> reset --hard FETCH_HEAD
+   git -C <repo> log --oneline -1 && git -C <repo> status --short   # the tree you are about to build
    ```
+   Fetch **over HTTPS by URL**: this guest's `origin` is an SSH remote with no key on it, so a plain
+   `git fetch` fails with *"make sure you have the correct access rights"* — which reads as a
+   permissions problem and is a missing key. Giving the URL avoids reconfiguring their remote
+   (`dbgscope`'s remote there is already HTTPS and fetches fine).
 3. **`sc stop windbg-mcp`**, and *verify* — `sc stop` prints the state at the moment of the request,
-   which is still `RUNNING`. `sc query` is what says `STOPPED`.
+   which is still `RUNNING`. `sc query windbg-mcp` is what says `STOPPED`. The name is fixed by
+   `--install-service`, which is why `README.md`'s install ends `Start-Service windbg-mcp`; the
+   *path* it was installed from is the machine-specific half, and `sc qc` prints that.
 4. **Check free space before building.** This guest fills up, and the failure names a compiler bug
    rather than a disk (`rustc-LLVM ERROR: IO failure on output stream`). Measured today:
    **2.0 GB** free against a 9.79 GB `target\debug\incremental`; deleting that one directory —
@@ -203,6 +216,10 @@ running. The procedure is:
 7. **Nothing to do on the client.** The tunnel survives the restart (it forwards a port; only the
    far end went away), and the next tool call reconnects on its own — measured: an `open_dump`
    straight after `sc start` succeeded with no `/mcp` reconnect. And nothing to delete afterwards.
+
+**Do not paste this bench's own wiring back into this file.** The hostname, account and port are
+machine-specific, `AGENTS.md` keeps them out of version control, and the repository is public —
+which is how a sandbox guest's name reached a tracked file once and had to be taken out again.
 
 A worker is still re-executed from the supervisor's own image, so the consistency argument above
 holds — but here the supervisor is gone the moment you stop it, so there is no window in which old
