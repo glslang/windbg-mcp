@@ -393,6 +393,38 @@ pub enum EngineOp {
         /// filled in by the supervisor's pump.
         patience_ms: u32,
     },
+    /// An IRP's current stack location, `!irp` — with the IRP itself defaulted **here** rather than
+    /// by the caller.
+    ///
+    /// `irp` is `None` when the caller wants the one a dispatch routine was entered with, and that
+    /// is the whole reason this is an op rather than a [`Self::BoundedCommand`] the supervisor
+    /// builds: where a dispatch routine's second argument lives is the *target's* calling
+    /// convention, and only the worker can ask which one that is. Built as a command line the
+    /// supervisor had to hardcode one, so it hardcoded x64's `@rdx` and a caller on any other
+    /// target got a register that is not there.
+    IrpStack {
+        /// The IRP, as an expression the debugger evaluates, or `None` for the dispatch entry's
+        /// own argument.
+        #[serde(default)]
+        irp: Option<String>,
+        /// Whatever is left of the caller's own clock when this reaches the front of the queue,
+        /// filled in by the supervisor's pump.
+        patience_ms: u32,
+    },
+    /// A logging breakpoint on a dispatch routine that prints each control code and continues.
+    ///
+    /// [`Self::SetBreakpoint`] with a command the *worker* writes, for [`Self::IrpStack`]'s reason
+    /// and one more: the command dereferences the IRP at fixed offsets, so it is wrong on a target
+    /// whose `_IRP` has a different layout as well as on one whose second argument is elsewhere.
+    /// The supervisor can know neither.
+    IoctlTrace {
+        /// The dispatch routine, as a symbol or an address — what `bp` would take.
+        dispatch: String,
+        /// Whatever is left of the caller's own clock when this reaches the front of the queue,
+        /// filled in by the supervisor's pump. Carried for the reason [`Self::SetBreakpoint`]
+        /// carries one: the symbolic location is resolved eagerly and `SetInterrupt` reaches it.
+        patience_ms: u32,
+    },
     /// A pool query. Like [`Self::Reachability`] this is one indivisible job: a query may have
     /// to walk every pool page, and letting another call for the same session interleave would
     /// let the walk describe a target that moved underneath it.
@@ -555,6 +587,8 @@ impl EngineOp {
             | Self::Reachability(ReachabilityOp { patience_ms, .. })
             | Self::DriverHazards { patience_ms, .. }
             | Self::IoctlMap { patience_ms, .. }
+            | Self::IrpStack { patience_ms, .. }
+            | Self::IoctlTrace { patience_ms, .. }
             | Self::DeviceSecurity { patience_ms, .. }
             | Self::DriverSurface { patience_ms, .. }
             | Self::Batch(BatchOp { patience_ms, .. }) => Some(patience_ms),

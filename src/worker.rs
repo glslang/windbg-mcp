@@ -1721,6 +1721,33 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent()),
             )
         }
+        EngineOp::IrpStack { irp, patience_ms } => {
+            // The caller's own expression wins outright: they may have an IRP from a queue, a
+            // completion routine or a crash dump, none of which is the one in a register.
+            let irp = match irp {
+                Some(irp) => irp,
+                None => dispatch_irp_expression(e.instruction_set())?.to_string(),
+            };
+            let budget = watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent());
+            raw_command(e, &format!("!irp {irp} 1"), budget)
+                .map(|run| Output::text(told(run)))
+                .map_err(failed)
+        }
+        EngineOp::IoctlTrace {
+            dispatch,
+            patience_ms,
+        } => {
+            let command = ioctl_trace_command(e.instruction_set())?;
+            set_breakpoint(
+                e,
+                &dispatch,
+                Some(&command),
+                false,
+                None,
+                None,
+                watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent()),
+            )
+        }
         EngineOp::ReadMemory {
             address,
             size,
@@ -6734,6 +6761,77 @@ fn also_reachable(set: dbgscope::dbgeng::InstructionSet) -> &'static str {
     }
 }
 
+/// Where a dispatch routine's `PIRP` argument is **at its entry**, as an expression the debugger
+/// evaluates.
+///
+/// `DRIVER_DISPATCH(PDEVICE_OBJECT DeviceObject, PIRP Irp)` — so this is the *second* argument, and
+/// where a second argument lives is the target's calling convention rather than anything this
+/// server decides. It was `@rdx` unconditionally until [#340](https://github.com/glslang/windbg-mcp/issues/340):
+/// correct on x64, and on ARM64 a register the processor has not got, evaluated against whatever
+/// the debugger made of the name.
+///
+/// **Only valid at the entry**, before a step or a call clobbers the register — which is a property
+/// of the answer and not of this function, and is why both callers say so.
+///
+/// x86 is derived from the documented `__stdcall` frame rather than measured: at entry the return
+/// address is at `@esp`, `DeviceObject` at `+4` and `Irp` at `+8`. No x86 *kernel* target exists on
+/// this bench to check it against, and that is said here rather than left for a reader to assume
+/// the figure was taken from one. The x64 and ARM64 forms are measured against real dispatch
+/// routines.
+fn dispatch_irp_expression(set: dbgscope::dbgeng::InstructionSet) -> Result<&'static str, Failed> {
+    use dbgscope::dbgeng::InstructionSet;
+    match set {
+        InstructionSet::Amd64 => Ok("@rdx"),
+        InstructionSet::Arm64 => Ok("@x1"),
+        InstructionSet::X86 => Ok("poi(@esp+8)"),
+        InstructionSet::Other(_) => Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "this target's instructions are machine {machine}, and where a dispatch routine's \
+                 `PIRP` argument lives is that architecture's calling convention — which this \
+                 build does not know, so there is no register to read it from. Pass the IRP's \
+                 address explicitly if you have one from elsewhere.",
+                machine = machine_label(set),
+            ),
+        )),
+    }
+}
+
+/// The logging breakpoint `ioctl_trace` arms, written for the target's own architecture.
+///
+/// Two things in it depend on the target and the old one hardcoded both. The **IRP** comes from
+/// [`dispatch_irp_expression`]. The **offsets** are the 64-bit layout of `_IRP` and
+/// `_IO_STACK_LOCATION`: `CurrentStackLocation` at `+0xb8`, and within the stack location the
+/// `Parameters` union at `+0x08`, so `OutputBufferLength` `+0x08`, `InputBufferLength` `+0x10` and
+/// `IoControlCode` `+0x18`. Those hold for x64 and ARM64 alike, both being 64-bit — the fields are
+/// pointers and the layout follows the pointer, not the instruction set.
+///
+/// **x86 is refused rather than given the same string with a different register.** Its `_IRP` puts
+/// `CurrentStackLocation` elsewhere and its `_IO_STACK_LOCATION` packs the union at a different
+/// offset again, so the 64-bit numbers would dereference the wrong words and `.printf` would
+/// report a control code — a plausible one — for every hit. Nothing here has measured a 32-bit
+/// kernel's layout, and a refusal is the honest answer until something does. That is the same rule
+/// the rest of this file keeps: decode what has been measured and decline the rest by name.
+/// [`crate::ioctl`] has the offsets' provenance on the x64 side.
+fn ioctl_trace_command(set: dbgscope::dbgeng::InstructionSet) -> Result<String, Failed> {
+    if set == dbgscope::dbgeng::InstructionSet::X86 {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            "a 32-bit kernel lays out `_IRP` and `_IO_STACK_LOCATION` differently from the 64-bit \
+             one this command reads, and nothing here has measured that layout — so the trace \
+             would print a plausible control code taken from the wrong words rather than fail. \
+             `irp_stack` works on this target: it hands the IRP to `!irp`, which knows the layout \
+             itself."
+                .to_string(),
+        ));
+    }
+    let irp = dispatch_irp_expression(set)?;
+    Ok(format!(
+        ".printf \"IOCTL %08x in=%x out=%x\\n\", dwo(poi({irp}+0xb8)+0x18), \
+         dwo(poi({irp}+0xb8)+0x10), dwo(poi({irp}+0xb8)+0x08); gc"
+    ))
+}
+
 /// The scan itself, as a value.
 fn hazards_of(
     e: &DebugEngine,
@@ -8794,6 +8892,80 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+
+    /// The IRP a dispatch routine was entered with is **wherever this target puts a second
+    /// argument**, and it was `@rdx` on every target until #340.
+    ///
+    /// `DRIVER_DISPATCH(PDEVICE_OBJECT, PIRP)`, so the answer is the calling convention's. On
+    /// ARM64 `@rdx` is not a register at all, and the failure it produced was the bad kind: the
+    /// breakpoint armed, the tool reported success, and the printf would have read whatever the
+    /// debugger made of the name.
+    #[test]
+    fn the_dispatch_irp_comes_from_the_targets_calling_convention() {
+        use dbgscope::dbgeng::InstructionSet;
+        assert_eq!(
+            dispatch_irp_expression(InstructionSet::Amd64).expect("x64"),
+            "@rdx"
+        );
+        assert_eq!(
+            dispatch_irp_expression(InstructionSet::Arm64).expect("arm64"),
+            "@x1"
+        );
+        // x86 passes both arguments on the stack: return address at `@esp`, `DeviceObject` at
+        // `+4`, `Irp` at `+8`.
+        assert_eq!(
+            dispatch_irp_expression(InstructionSet::X86).expect("x86"),
+            "poi(@esp+8)"
+        );
+        // An architecture whose convention this does not know is refused by name rather than
+        // given one of the three above.
+        let refused = dispatch_irp_expression(InstructionSet::Other(0x01c4))
+            .expect_err("an unknown machine has no register to offer");
+        assert!(
+            refused.message.contains("0x01c4"),
+            "the refusal says which machine it found: {refused:?}"
+        );
+    }
+
+    /// The trace command carries the target's IRP **and** is refused where its offsets would be
+    /// wrong.
+    ///
+    /// Two things in it depend on the target and both used to be fixed. x64 and ARM64 differ only
+    /// in the register, their 64-bit `_IRP`/`_IO_STACK_LOCATION` layout being the same; x86
+    /// differs in the layout too, which is why it is declined rather than given the same string
+    /// with `poi(@esp+8)` in it — that would print a plausible control code read out of the wrong
+    /// words, which is the one failure mode a refusal exists to prevent.
+    #[test]
+    fn the_ioctl_trace_command_is_written_for_the_target() {
+        use dbgscope::dbgeng::InstructionSet;
+        let x64 = ioctl_trace_command(InstructionSet::Amd64).expect("x64");
+        assert!(x64.contains("dwo(poi(@rdx+0xb8)+0x18)"), "{x64}");
+
+        let arm64 = ioctl_trace_command(InstructionSet::Arm64).expect("arm64");
+        assert!(arm64.contains("dwo(poi(@x1+0xb8)+0x18)"), "{arm64}");
+        assert!(
+            !arm64.contains("rdx"),
+            "no x64 register survives on an ARM64 target: {arm64}"
+        );
+
+        // The two differ **only** in the register: same offsets, same format, same `gc`.
+        assert_eq!(arm64, x64.replace("@rdx", "@x1"), "{arm64}");
+
+        // And the shape the engine is handed is the literal command, not a quoted argument --
+        // dbgscope#126. A stray escape here would reach `SetCommand` verbatim.
+        assert!(
+            arm64.starts_with(".printf \"IOCTL %08x in=%x out=%x\\n\", "),
+            "{arm64}"
+        );
+        assert!(arm64.ends_with("; gc"), "{arm64}");
+
+        let refused = ioctl_trace_command(InstructionSet::X86)
+            .expect_err("a 32-bit kernel lays these structures out differently");
+        assert!(
+            refused.message.contains("irp_stack"),
+            "and points at the tool that does work there: {refused:?}"
+        );
+    }
     use dbgscope::dbgeng::TargetLeft;
 
     /// A live kernel says which of the two states it was left in, and both are sayable.

@@ -1441,9 +1441,9 @@ pub struct DeviceObjectArgs {
 
 #[derive(Deserialize, JsonSchema)]
 pub struct IrpStackArgs {
-    /// IRP address (decimal or 0x-hex). Defaults to `@rdx` — the PIRP passed to the
-    /// dispatch routine on x64, valid only at the dispatch *entry*, before any step
-    /// clobbers the register.
+    /// IRP address (decimal or 0x-hex). Omit it for the PIRP the dispatch routine was
+    /// entered with, read per the target's calling convention — valid only at that
+    /// *entry*, before any step clobbers it.
     #[serde(default)]
     pub irp: Option<String>,
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
@@ -4372,8 +4372,9 @@ impl WindbgServer {
     }
 
     /// Dump the current IO_STACK_LOCATION of an IRP (`!irp <irp> 1`): major/minor,
-    /// IoControlCode, input/output buffer lengths, and buffer pointers. Defaults the IRP
-    /// to `@rdx` (the PIRP at the dispatch entry on x64) — valid only before stepping.
+    /// IoControlCode, input/output buffer lengths, and buffer pointers. Omit `irp` for the
+    /// one the dispatch routine was entered with, read per the target's own calling
+    /// convention — valid only at that entry, before a step clobbers it.
     #[rmcp::tool(annotations(
         title = "Dump IRP stack location",
         read_only_hint = true,
@@ -4388,13 +4389,16 @@ impl WindbgServer {
         {
             return tool_error(e);
         }
-        let irp = args.irp.unwrap_or_else(|| "@rdx".to_string());
-        let cmd = format!("!irp {irp} 1");
+        // **Not defaulted here.** Where a dispatch routine's second argument lives is the
+        // *target's* calling convention, and this process has no engine to ask — which is how it
+        // came to hardcode x64's `@rdx` and hand an ARM64 caller a register that is not there.
+        // The worker fills it, and `patience_ms` is filled by the pump exactly as every other
+        // bounded op's is.
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::BoundedCommand {
-                    command: cmd,
+                EngineOp::IrpStack {
+                    irp: args.irp,
                     patience_ms: 0,
                 },
             )
@@ -4404,9 +4408,11 @@ impl WindbgServer {
 
     /// Install a conditional logging breakpoint at the IOCTL dispatch routine that prints
     /// each IoControlCode + input/output lengths and continues (`gc`), so the IOCTL sweep
-    /// needs no hand-assembled offsets. Reads the current IO_STACK_LOCATION via
-    /// `poi(@rdx+0xb8)` (x64); confirm the offset with `dt nt!_IRP` / `dt nt!_IO_STACK_LOCATION`
-    /// on the target. Requires a real KDNET/VM target — a local kernel cannot set code bp's.
+    /// needs no hand-assembled offsets. Reads the IRP and its IO_STACK_LOCATION per the
+    /// target's architecture: x64 and ARM64, whose layout is shared; a 32-bit kernel's
+    /// differs and is refused. Confirm the offsets with `dt nt!_IRP` /
+    /// `dt nt!_IO_STACK_LOCATION` on the target. Requires a real KDNET/VM target — a local
+    /// kernel cannot set code bp's.
     // The output schema is not decoration here: routing this through `EngineOp::SetBreakpoint`
     // makes it answer with `structuredContent`, and a structured-aware client **replaces** the
     // text block with it (`docs/token-budget.md`). A tool that sends one without declaring a
@@ -4434,33 +4440,29 @@ impl WindbgServer {
         if let Err(e) = reject_command_breakers("dispatch", &args.dispatch, Quotes::Rejected) {
             return typed_error(ErrorCategory::InvalidArgument, e, args.session_id);
         }
-        // IRP in @rdx at dispatch entry (x64). CurrentStackLocation = poi(Irp+0xb8).
-        // Within IO_STACK_LOCATION: OutputBufferLength +0x08, InputBufferLength +0x10,
-        // IoControlCode +0x18 (Parameters union begins at +0x08).
+        // **The command is built in the worker**, which is the whole of this fix. It hardcoded
+        // x64's `@rdx` for the IRP and the 64-bit `_IRP`/`_IO_STACK_LOCATION` offsets around it,
+        // and this process cannot know either — it has no engine to ask what the target is. On
+        // ARM64 that armed a breakpoint naming a register the processor has not got and reported
+        // success, which is worse than refusing.
         //
-        // **Written plainly since dbgscope#126.** This was a `bp <dispatch> "…"` built as one
-        // string, so the command had to survive being a quoted argument inside a `;`-separated
-        // command line: every `"` was `\\\"` and the newline `\\\\n`, hand-escaped in a format
-        // string, and `dispatch` had to be screened for the same two characters because an operand
-        // carrying one would have closed the quote and appended a command of the caller's
-        // choosing. As a parameter it needs none of that — the engine takes it through
-        // `SetCommand`, where nothing is parsed — so what is written here is what runs.
-        let command = ".printf \"IOCTL %08x in=%x out=%x\\n\", dwo(poi(@rdx+0xb8)+0x18), \
-                       dwo(poi(@rdx+0xb8)+0x10), dwo(poi(@rdx+0xb8)+0x08); gc";
+        // **Written plainly since dbgscope#126**, and that still holds wherever it is built. This
+        // was a `bp <dispatch> "…"` assembled as one string, so the command had to survive being a
+        // quoted argument inside a `;`-separated command line: every `"` was `\\\"` and the
+        // newline `\\\\n`, hand-escaped in a format string, and `dispatch` had to be screened for
+        // the same two characters because an operand carrying one would have closed the quote and
+        // appended a command of the caller's choosing. As a parameter it needs none of that — the
+        // engine takes it through `SetCommand`, where nothing is parsed.
+        //
+        // A trace wants every hit, so the op fixes `one_shot` false and no pass count: a one-shot
+        // would log one IOCTL and disarm, and a pass count would skip the first n. It is a **code**
+        // breakpoint, arming the dispatch routine's entry — an address execution reaches rather
+        // than a region anything accesses.
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::SetBreakpoint {
-                    expression: args.dispatch,
-                    coordinate: None,
-                    command: Some(command.to_string()),
-                    // A trace wants every hit; a one-shot would log one IOCTL and disarm, and a
-                    // pass count would skip the first n.
-                    one_shot: false,
-                    pass_count: None,
-                    // Code, not data: this arms the dispatch routine's entry, which is an address
-                    // execution reaches rather than a region anything accesses.
-                    watch: None,
+                EngineOp::IoctlTrace {
+                    dispatch: args.dispatch,
                     patience_ms: 0,
                 },
             )

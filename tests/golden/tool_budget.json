@@ -281,21 +281,21 @@
     },
     {
       "annotations": 124,
-      "description": 422,
+      "description": 513,
       "inputSchema": 532,
-      "modelVisible": 1006,
+      "modelVisible": 1097,
       "name": "ioctl_trace",
       "outputSchema": 2538,
-      "wire": 3699
+      "wire": 3790
     },
     {
       "annotations": 76,
-      "description": 243,
-      "inputSchema": 559,
-      "modelVisible": 852,
+      "description": 309,
+      "inputSchema": 575,
+      "modelVisible": 934,
       "name": "irp_stack",
       "outputSchema": 0,
-      "wire": 943
+      "wire": 1025
     },
     {
       "annotations": 129,
@@ -552,14 +552,14 @@
   ],
   "totals": {
     "annotations": 6441,
-    "description": 34922,
-    "inputSchema": 53307,
+    "description": 35079,
+    "inputSchema": 53323,
     "instructions": 1983,
-    "modelVisible": 91437,
+    "modelVisible": 91610,
     "outputSchema": 150988,
-    "payload": 250589,
+    "payload": 250762,
     "tools": 61,
-    "wire": 250517,
+    "wire": 250690,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
