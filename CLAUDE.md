@@ -199,31 +199,48 @@ running. The procedure is:
    `s.owner == caller`, deliberately — another client's handles would be unusable and listing them
    would say how many clients this server has and what they are debugging). On a listener serving
    one credential that is the whole truth; on one serving several it is not, and a clean
-   `session_status` is no evidence at all about the others. `sc.exe qc` shows the listen address,
-   `--list-listen-clients` shows how many credentials it serves, and what settles it host-wide is
-   the **process count**: a supervisor spawns one worker per live session, so
-   `(Get-Process windbg-mcp).Count` is `1` when nothing is open and `n+1` for `n` sessions —
-   measured both ways on this bench. Coordinate with the other clients before stopping; nothing in
-   the server does it for you.
+   `session_status` is no evidence at all about the others. `sc.exe qc` shows the listen address and
+   the **process count** settles what is open right now — a supervisor spawns one worker per live
+   session, so `(Get-Process windbg-mcp).Count` is `1` when nothing is open and `n+1` for `n`
+   sessions, measured both ways on this bench.
+
+   **Neither of those is a roster, and `--list-listen-clients` is not one either**: it reads the
+   credential *file*, and the file and the running service can disagree — a `--remove` or
+   `--rotate` whose reload failed leaves a token the service still accepts and the file no longer
+   names, which is exactly the case you would run it to check. There is no way to ask the service
+   what it has in force; its only channel carries a status code and no data
+   (`docs/remote-listener.md`). And the process count is a reading *at an instant*: a client the
+   file does not name can open a session between your check and your stop. So on a multi-client
+   listener this is a maintenance window and out-of-band coordination, not a check — nothing in the
+   server will do it for you, and nothing in it can.
 2. **Put the guest's tree on the commit you mean to run** — *that* commit, named. A branch under
    review is not `main`, and fetching `main` here builds a different tree and then attributes
    everything you measure to the code you meant. So pass the ref and **check the head afterwards**
    rather than trusting the fetch:
    ```console
+   git -C <repo> status --short
+   ```
+   **Read that first and stop if it prints anything.** `reset --hard` discards uncommitted tracked
+   work without asking, and a shared bench's tree is dirty more often than not — this session put
+   files there with `scp` repeatedly. Checking *after* the reset, which this step did until review
+   caught it, cannot report what the reset destroyed: it shows a clean tree and calls it safe.
+   Commit, stash or copy the work aside, then:
+   ```console
    git -C <repo> fetch <url> <branch-or-sha>
    git -C <repo> reset --hard FETCH_HEAD
    git -C <repo> log --oneline -1
-   git -C <repo> status --short
    ```
-   The last two are the tree you are about to build. They are on **separate lines** on purpose:
-   `&&` is a PowerShell 7 operator and a parse error in 5.1, which is the shell this section's
-   reader may well be in — the same trap as `sc` below.
+   `&&` is deliberately not used to chain these: it is a PowerShell 7 operator and a parse error in
+   5.1, which is the shell this section's reader may well be in — the same trap as `sc` below.
    Fetch **over HTTPS by URL**: this guest's `origin` is an SSH remote with no key on it, so a plain
    `git fetch` fails with *"make sure you have the correct access rights"* — which reads as a
    permissions problem and is a missing key. Giving the URL avoids reconfiguring their remote
    (`dbgscope`'s remote there is already HTTPS and fetches fine).
-3. **`sc.exe stop windbg-mcp`**, and *verify* — `sc.exe stop` prints the state at the moment of the request,
-   which is still `RUNNING`. `sc.exe query windbg-mcp` is what says `STOPPED`. The name is fixed by
+3. **`sc.exe stop windbg-mcp`**, and *verify* — `sc.exe stop` prints the state at the moment of the
+   request, which is still `RUNNING`. `sc.exe query windbg-mcp` is what says `STOPPED`, and the gap
+   is not always brief: a stop ends the accept loop and *then* releases every target, which on a
+   host holding a live kernel is minutes. `STOP_PENDING` is not stopped, and connections already
+   accepted are served until the process exits. The name is fixed by
    `--install-service`, which is why `README.md`'s install ends `Start-Service windbg-mcp`; the
    *path* it was installed from is the machine-specific half, and `sc.exe qc` prints that.
 4. **Check free space before building.** This guest fills up, and the failure names a compiler bug
