@@ -614,6 +614,10 @@ pub fn scan(
                 // whose `.text` is partly absent still answers for the rest of it — but it is
                 // **recorded**. Left silent, a dump missing one page reports a driver with no
                 // privileged instructions, and nothing anywhere says a page was missing.
+                //
+                // Nothing a register held survives the gap: what is on the far side of an
+                // unreadable page is not the next instruction of anything.
+                formed.clear();
                 close(&mut run, &mut scanned);
                 unreadable.push(Scanned {
                     section: section.name.clone(),
@@ -631,6 +635,7 @@ pub fn scan(
             // that decoded to nothing ends a section silently and the rest of it is missing from
             // both lists, which is the same silence an unreadable window used to keep.
             if block.is_empty() {
+                formed.clear();
                 close(&mut run, &mut scanned);
                 unreadable.push(Scanned {
                     section: section.name.clone(),
@@ -671,6 +676,12 @@ pub fn scan(
                 // this watches, and applying it first would clear the register the call reaches
                 // the slot through.
                 formed.apply(instruction);
+                // And nothing survives a terminator. The sequence is three adjacent instructions,
+                // so this costs almost nothing and is what keeps a slot from being attributed to a
+                // `blr` on an unrelated path.
+                if !matches!(instruction.flow, Flow::Fallthrough) {
+                    formed.clear();
+                }
             }
             // Resume after the last instruction that decoded whole, not at a fixed stride: a
             // window's tail is usually a partial instruction, and restarting at `at + want` would
@@ -750,15 +761,25 @@ fn called_slot(instruction: &Instruction) -> Option<u64> {
 /// warns readers about, and the refusal these tools used to give on ARM64 existed to avoid it; the
 /// refusal went when dbgscope started answering A64 operands, so the answer had to arrive with it.
 ///
-/// **It cannot invent a call site**, which is what makes carrying state here safe. The address it
-/// computes is reported only where the import table already holds that exact slot, so a sequence
-/// it misreads names no import and falls out. Nothing about it is ARM64-specific either:
-/// `lea rax,[rip+X]` / `mov rax,[rax+8]` / `call rax` is the same three steps and the same answer,
-/// and x64 compilers do emit it.
+/// **It cannot invent an address, which is not the same as not inventing a call site**, and the
+/// first draft of this claimed the second on the strength of the first. Matching an exact IAT slot
+/// stops a *misread* sequence naming an import; it does nothing about a correctly read slot being
+/// attributed to a `blr` that never held it. State that outlives the straight-line run which
+/// formed it does exactly that -- one path forms an import pointer in `x8`, an unrelated one later
+/// in the section executes `blr x8`, and the second is reported as calling the first's import.
+/// Raised on windbg-mcp#343 by both reviewers.
 ///
-/// What it does not reach is a pair split across the decode window, the maps starting empty on
-/// each one. A missed call site, never an invented one, and the same direction as every other
-/// shortfall here.
+/// So the state is carried **only along contiguous fallthrough**. Anything else -- a return, a
+/// branch taken or not, a direct call clobbering the caller-saved registers, a window that would
+/// not decode -- drops all of it. That is nearly free in practice: `adrp` / `ldr` / `blr` is three
+/// adjacent instructions in every image, which is the whole sequence this exists to read.
+///
+/// Nothing about it is ARM64-specific either: `lea rax,[rip+X]` / `mov rax,[rax+8]` / `call rax`
+/// is the same three steps and the same answer, and x64 compilers do emit it.
+///
+/// What it does not reach is a pair split across a decode window, the maps starting empty on each
+/// one. A missed call site, never an invented one, which is the direction every shortfall here
+/// goes.
 #[derive(Debug, Default)]
 struct Formed {
     /// A register holding an address the code computed: `adrp`'s page, or a `lea`'s target.
@@ -777,6 +798,16 @@ impl Formed {
             Some(Operand::Register(register)) => self.loaded_from.get(&register.full).copied(),
             _ => None,
         }
+    }
+
+    /// Everything this has watched, forgotten.
+    ///
+    /// Called wherever straight-line execution stops being a fact: a terminator of any kind, and a
+    /// window that would not decode. A register's meaning does not survive the instruction that
+    /// jumped away from it.
+    fn clear(&mut self) {
+        self.address.clear();
+        self.loaded_from.clear();
     }
 
     /// Applies one instruction.
@@ -1442,6 +1473,19 @@ mod tests {
                 Flow::Call(None),
                 vec![Operand::Register(register("x10"))],
             ),
+            // **And nothing survives a terminator**, which is the half the first draft got wrong.
+            // `x8` still holds `memcpy`'s slot as far as the maps are concerned; a `ret` ends the
+            // straight-line run that formed it, so the `blr` after it is a different path's and
+            // must not be credited with the import. Matching a real IAT slot is what makes this
+            // dangerous rather than harmless -- the address is genuine, the attribution is not.
+            insn(BASE + 0x1018, "00000000", "ret", Flow::Return, Vec::new()),
+            insn(
+                BASE + 0x101c,
+                "00000000",
+                "blr",
+                Flow::Call(None),
+                vec![Operand::Register(register("x8"))],
+            ),
         ];
 
         let found = scan(
@@ -1460,9 +1504,13 @@ mod tests {
         assert_eq!(
             copy.call_sites,
             vec![BASE + 0x1008],
-            "the `blr` reaches the import through the slot adrp/ldr formed"
+            "the `blr` reaches the import through the slot adrp/ldr formed, and the one past the \
+             `ret` does not: {copy:?}"
         );
-        assert_eq!(copy.call_site_count, 1);
+        assert_eq!(
+            copy.call_site_count, 1,
+            "exactly one, so the stale-state call is not merely unlisted: {copy:?}"
+        );
         let probe = found.sinks.iter().find(|sink| sink.name == "ProbeForRead");
         assert!(
             probe.is_none_or(|sink| sink.call_sites.is_empty()),
