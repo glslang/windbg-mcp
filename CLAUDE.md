@@ -139,19 +139,33 @@ targets.
 
 **`(HTTP)` is still not enough on its own**, because a listener can also run in the *foreground*
 (`docs/remote-listener.md`) — so the registered URL may be a process the SCM knows nothing about
-while an unrelated service sits beside it. What settles it is the **port**: match the registration's
-port against the service's own listen address, and if you want it beyond doubt, against the pid
-holding the socket. Measured on this bench:
+while an unrelated service sits beside it. What settles it is which process holds the **guest-side**
+socket.
+
+**The registered URL gives the *local* port, which need not be the guest's.** A forward is
+`-L <local>:<host>:<remote>` and `ssh` treats those as separate fields, so `-L 9000:127.0.0.1:8765`
+is perfectly ordinary. Comparing the URL's port against the service would then reject a real
+service — and worse, if some unrelated service on the guest happens to listen on the *local*
+number, it would correlate the registration with that one and send you to stop it. So read the
+remote port out of the forward rather than assuming it:
+
+```console
+$ ps -Ao args= | grep -oE '\-L [0-9]+:[^ ]+'        # on the client
+-L 8765:127.0.0.1:8765                              # local 8765 -> guest 8765 (they can differ)
+```
+
+Then correlate **that** remote port on the guest:
 
 ```pwsh
-$port = 8765                                             # from the registered URL
-(Get-NetTCPConnection -LocalPort $port -State Listen).OwningProcess   # 5524
-(Get-CimInstance Win32_Service -Filter "Name='windbg-mcp'").ProcessId # 5524 -> it is the service
+$remote = 8765                                                          # from the forward, not the URL
+(Get-NetTCPConnection -LocalPort $remote -State Listen).OwningProcess    # 5524
+(Get-CimInstance Win32_Service -Filter "Name='windbg-mcp'").ProcessId    # 5524 -> it is the service
 ```
 
 A mismatch means the endpoint you are talking to is *not* that service, and stopping it releases
-somebody else's targets while changing nothing about yours. On this repo the two match, so it is
-the second column.
+somebody else's targets while changing nothing about yours. On this bench the two ports happen to
+be equal and the pids match, so it is the second column — and the equal ports are a coincidence of
+this setup, not something to build the check on.
 
 ### The stdio shape
 
@@ -193,8 +207,8 @@ public repository, so the shapes are given with placeholders:
 $ sc.exe qc windbg-mcp     # on the guest
 BINARY_PATH_NAME : <repo>\target\release\windbg-mcp.exe --service --listen 127.0.0.1:<port>
 START_TYPE       : 2   AUTO_START          SERVICE_START_NAME : LocalSystem
-$ ps aux | grep <port>     # on the client, to find the forward
-ssh -f -N -L <port>:127.0.0.1:<port> <user>@<guest>
+$ ps aux | grep ssh        # on the client, to find the forward
+ssh -f -N -L <local>:127.0.0.1:<remote> <user>@<guest>
 ```
 
 **`sc.exe`, never bare `sc`.** In PowerShell — which is the shell `README.md`'s own install steps
