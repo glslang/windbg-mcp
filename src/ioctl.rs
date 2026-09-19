@@ -570,13 +570,14 @@ const MAX_SWEEPS: usize = 32;
 /// take the targets of one jump for another's -- an edge that does not exist would make a REACHABLE
 /// verdict unsound, which is the one direction that walk may not be wrong in.
 ///
-/// **A partial map yields no targets, and says which kind of partial it was.** [`map`] returns a
-/// retained *prefix* of its cases in two different circumstances, and both were once handed over
-/// as though they were the whole table:
+/// **A partial map is three things, and only one of them can hand over what it has.** [`map`]
+/// returns a retained *prefix* of its cases in three circumstances, all three of which were once
+/// handed over as though they were the whole table and then all three refused outright:
 ///
 /// - it **halted** -- a deadline or an interrupt during case enrichment, with [`Map::halted`] set;
-/// - it hit a **bound** of its own -- [`MAX_CASES`], [`MAX_TABLE_ENTRIES`], [`MAX_POOL_READS`] --
-///   with [`Map::cap_hit`] set and `case_count` still counting past what `cases` holds;
+/// - it hit a **bound** of its own -- [`MAX_CASES`], [`MAX_TABLES`], [`MAX_TABLE_ENTRIES`],
+///   [`MAX_UNRESOLVED`], [`MAX_POOL_READS`] -- with [`Map::cap_hit`] set and `case_count` still
+///   counting past what `cases` holds;
 /// - or its facts never **settled** inside [`MAX_SWEEPS`], with [`Map::unsettled`] set, which
 ///   discards every belief rather than reporting one a later edge would have taken away.
 ///
@@ -584,6 +585,32 @@ const MAX_SWEEPS: usize = 32;
 /// resolver's caps: the condition read `cap_hit` and `unsettled` is a field of its own, so an
 /// analysis that ran out of sweeps answered with no edges and `bounded: false` -- a clean
 /// `NOT REACHABLE` about a graph whose tables were never resolved. Raised on review of #351.
+///
+/// **`cap_hit` reports the targets it recovered; the other two report none** (`FOLLOWUPS.md` item
+/// 90). Read one at a time, because the three are not the same kind of partial:
+///
+/// - a **cap** is a bound on work already done *correctly*. Every retained case was recorded from
+///   settled facts, and each cap shortens the answer rather than skewing it: `MAX_CASES`,
+///   `MAX_TABLES` and `MAX_UNRESOLVED` stop a list growing, `MAX_TABLE_ENTRIES` refuses a whole
+///   table rather than shortening one -- on `entries` before it is read, and again on `slots` once
+///   a byte map has been -- and `MAX_POOL_READS` leaves later literals unfolded, which makes the
+///   facts *weaker* so [`follow_table`] refuses rather than invents. The targets are
+///   therefore a sound subset and `bounded` beside them already says the set is short. Discarding
+///   them was conservative past what soundness needs, and it cost the caller the one answer the
+///   target will ever give: a cap is deterministic, so the retry that would recover those edges
+///   does not exist. Worse, the discard is per **listing** while the cap is spent anywhere in it --
+///   so a handler's own resolvable switch was thrown away because some *other* switch in the same
+///   routine was too big, which is what made scoping `from` past a dispatch no escape from a
+///   resolver bound.
+/// - a **halt** is the caller's rather than the routine's, and the same call answers differently
+///   next time. The poll that saw an interrupt **consumed** it, so
+///   [`crate::driver::reachability`] does not stop; handing it edges here would have it enqueue
+///   more functions and spend more engine round trips after somebody asked it to stop.
+/// - **`unsettled`** has nothing to hand over. A bound is only ever left on a branch's *outgoing*
+///   edge, so it reaches a jump in the facts its block was entered with -- and that arm clears
+///   every block's entry facts before the recording pass, leaving [`follow_table`] to meet its
+///   bounds-check requirement with nothing and refuse every table.
+///   `an_unsettled_resolver_pass_is_bounded` is that measurement.
 ///
 /// **Those three are the whole list, enumerated rather than discovered.** They arrived one review
 /// round at a time -- `halted`, then `cap_hit`, then `unsettled` -- which is three rounds spent on
@@ -604,12 +631,12 @@ const MAX_SWEEPS: usize = 32;
 /// `dispatch` -- are about which *codes* were recovered and how well, which is a different question
 /// from where a jump goes. A code this pass could not name does not move the jump.
 ///
-/// The edges in such a prefix are individually sound -- the resolver proved each one -- but a
-/// prefix is not the table, and handing one over silently lets a goal *past* it read as a clean
-/// `NOT REACHABLE`, or lets the walk reach its goal through it and answer `REACHABLE` with nothing
-/// saying the analysis behind that verdict stopped early. So both are reported and neither
-/// contributes edges: the third element of the answer is the bound, the second is the halt, and the
-/// caller merges each into what it reports.
+/// A prefix is not the table whichever of the three produced it, so the bound and the halt are
+/// reported *whatever* the targets: handing one over silently lets a goal **past** an omitted edge
+/// read as a clean `NOT REACHABLE`, or lets the walk reach its goal through the prefix and answer
+/// `REACHABLE` with nothing saying the analysis behind that verdict stopped early. The third
+/// element of the answer is the bound, the second is the halt, and the caller merges each into what
+/// it reports.
 /// What [`jump_targets`] answers: a listing's tables, and why they might be short.
 ///
 /// A struct rather than a tuple because two of its three fields exist to say the third is
@@ -673,7 +700,11 @@ fn jump_targets_within(
         sweeps,
     );
     let bounded = found.cap_hit || found.unsettled;
-    if found.halted.is_some() || bounded {
+    // **Two of the three arms above end here, and `cap_hit` deliberately does not.** A halted pass
+    // and one whose facts never settled contribute nothing; a capped one falls through and hands
+    // over what it proved, with `bounded` saying the set is short. See [`jump_targets`] for the
+    // reading of each.
+    if found.halted.is_some() || found.unsettled {
         return Tables {
             targets: Vec::new(),
             stopped: found.halted,
@@ -727,7 +758,7 @@ fn jump_targets_within(
     Tables {
         targets: by_site,
         stopped: None,
-        bounded: false,
+        bounded,
     }
 }
 
@@ -5159,6 +5190,152 @@ mod tests {
             "and the caller has to learn a limit stopped it"
         );
         assert!(starved.stopped.is_none(), "which is not a halt");
+    }
+
+    /// **A cap keeps the targets it proved, which is `FOLLOWUPS.md` item 90.**
+    ///
+    /// The resolver answers per **listing**, so a `from` scoped past a dispatch switch into a
+    /// handler that holds a switch of its own still runs it over the whole routine. Discarding
+    /// every target on `cap_hit` therefore took the handler's own resolvable switch away because
+    /// some *other* switch in the same routine was too big -- which is what made the report's
+    /// advice to scope `from` no escape from a resolver bound, and it is conservative past what
+    /// soundness needs: each retained case was recorded from settled facts, and `bounded` already
+    /// says the set is short.
+    ///
+    /// Two switches in one listing, differing only in the bound their index was checked against:
+    /// the first is one entry past [`MAX_TABLE_ENTRIES`], so [`follow_table`] refuses it before a
+    /// byte is read and sets `capped`; the second is three entries and resolves. The assertion is
+    /// that the second's edges survive the first's cap, and that the answer still says it is short
+    /// -- reporting them *without* `bounded` would be the older defect this fix must not reintroduce.
+    #[test]
+    fn a_resolver_cap_keeps_the_targets_it_recovered() {
+        const IMAGE: u64 = 0xfffff803_3e250000;
+        const OVER: i64 = 0x8000;
+        const SMALL: i64 = 0x9000;
+        // One index past the cap, so `entries` is `MAX_TABLE_ENTRIES + 1` and the table is refused
+        // before it is read -- the reader's silence below is what says so.
+        let over = u64::try_from(MAX_TABLE_ENTRIES).expect("a usize this small is a u64");
+
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "cmp",
+                vec![reg("eax"), imm(over)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x30)),
+            ),
+            insn(
+                DISPATCH + 0x17,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1e,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", OVER, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x25,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x28, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            // The handler's own switch, reached where the first one's bounds check refuses.
+            insn(
+                DISPATCH + 0x30,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x33,
+                "cmp",
+                vec![reg("eax"), imm(2)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x36,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(0xfa11)),
+            ),
+            insn(
+                DISPATCH + 0x3c,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x43,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", SMALL, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x4a,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x4d, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+
+        let small_at = IMAGE.wrapping_add(SMALL as u64);
+        let asked: std::cell::RefCell<Vec<u64>> = std::cell::RefCell::new(Vec::new());
+        let read = |at: u64, len: usize| {
+            asked.borrow_mut().push(at);
+            (at == small_at && len == 12).then(|| {
+                [0x1000u32, 0x1100, 0x1200]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let tables = jump_targets(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            asked.borrow().as_slice(),
+            [small_at],
+            "the over-sized table is refused before it is read, so only the small one is fetched"
+        );
+        assert!(
+            tables.bounded,
+            "a cap was hit and the answer still has to say so: {:?}",
+            tables.targets
+        );
+        assert!(tables.stopped.is_none(), "which is not a halt");
+        assert_eq!(
+            tables.targets,
+            vec![(
+                DISPATCH + 0x4d,
+                vec![IMAGE + 0x1000, IMAGE + 0x1100, IMAGE + 0x1200]
+            )],
+            "the switch that resolved keeps its edges, and the one that capped contributes none"
+        );
     }
 
     /// **A64 names a store's source first, and a store is not a load.**

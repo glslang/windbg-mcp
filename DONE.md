@@ -110,6 +110,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 86](#86-windbg-mcp-a-pool-walk-test-caps-the-whole-server-including-the-open-it-needs-first--done-2026-09-19) — [windbg-mcp] A pool-walk test caps the whole server, including the open it needs first — done (2026-09-19)
 - [Item 82](#82-windbg-mcp-a64-puts-constants-in-a-literal-pool-and-the-walk-cannot-read-one--done-2026-09-19) — [windbg-mcp] A64 puts constants in a literal pool, and the walk cannot read one — done (2026-09-19)
 - [Item 83](#83-windbg-mcp-reachable_from_dispatch-does-not-follow-the-jump-tables-ioctl_map-now-reads--done-2026-09-19) — [windbg-mcp] `reachable_from_dispatch` does not follow the jump tables `ioctl_map` now reads — done (2026-09-19)
+- [Item 90](#90-windbg-mcp-the-resolver-reads-a-whole-function-so-scoping-from-does-not-narrow-it--done-2026-09-19) — [windbg-mcp] The resolver reads a whole function, so scoping `from` does not narrow it — done (2026-09-19)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3856,3 +3857,64 @@ is the measurement -- backing the bound out of `join` publishes six fabricated e
 happens when the recipe follows fewer than the walk), and the worker's per-listing resolver.
 `docs/limitations.md` and the two prose caveats in `src/driver.rs` say the table is crossed where it
 resolves and that the walk still ends at one that does not.
+
+## 90. [windbg-mcp] The resolver reads a whole function, so scoping `from` does not narrow it — **done** (2026-09-19)
+
+**Repo:** `windbg-mcp`.
+
+`driver::reachability` probes with no tables first and asks `ioctl::jump_targets` only where a path
+from `start_used` met an indirect jump (item 83). That guard is all-or-nothing: once **any**
+indirect jump is reached, the whole listing goes to the resolver, which walks it from the function
+entry. So a `from` scoped past a large dispatch switch into a handler holding a switch of its own
+still paid for the dispatch's literal pool and tables -- and if those spent `MAX_POOL_READS`,
+`MAX_CASES`, `MAX_TABLES` or `MAX_TABLE_ENTRIES`, `jump_targets_within` discarded **every** target
+and reported `bounded`, taking the handler's own resolvable switch with it. The visible half was
+fixed when the item was filed: `format_report`'s two resolver-cap arms and `docs/limitations.md`
+had told the reader to scope `from` past the dispatch, which is exactly that loop.
+
+**What landed is the entry's second option, and the reason is that the first one cannot reach the
+cap most likely to fire.** Resolving only the sites the probe reached would need the reachable set
+threaded into `jump_targets` and `follow_table` called selectively -- but `with_pool_immediates`
+runs over the whole listing *before* the walk, which is where `MAX_POOL_READS` is spent, so site
+filtering leaves that cap exactly where it was. And narrowing the fact propagation to `start_used`
+is not available at all: it is the meet over every entry-to-site path that makes an entry-derived
+table sound for a scoped start (`a_bound_on_one_path_is_not_a_bound_at_the_join`, from item 83's own
+declined round). So `jump_targets_within` now hands over the targets a capped pass recovered, with
+`bounded` beside them saying the set is short.
+
+**The entry asked for a reading of why each of `halted`, `cap_hit` and `unsettled` discards, and
+the three turn out to be three different things.** A **cap** is a bound on work already done
+*correctly*: every retained case was recorded from settled facts, and each cap shortens the answer
+rather than skewing it -- `MAX_CASES`, `MAX_TABLES` and `MAX_UNRESOLVED` stop a list growing,
+`MAX_TABLE_ENTRIES` refuses a whole table rather than shortening one (on `entries` before it is
+read, and again on `slots` once a byte map has been), and `MAX_POOL_READS` leaves later literals
+unfolded, which makes the facts *weaker* so `follow_table` refuses rather than invents. It is also **deterministic**, which is the half that decides it: the retry that would
+recover those edges does not exist, so discarding them cost the caller the only answer that target
+will ever give. A **halt** is the caller's rather than the routine's and the same call answers
+differently next time -- and the poll that saw an interrupt **consumed** it, so `reachability` walks
+on: handing it more edges there means enqueueing more functions and spending more engine round trips
+after somebody asked it to stop. And **`unsettled`** has nothing to hand over, which is a fact about
+this module rather than a policy: a bound is only ever left on a branch's *outgoing* edge
+(`ioctl.rs`'s `bounding` arm), so it reaches a jump in the facts its block was entered with, and the
+`unsettled` arm clears every block's entry facts before the recording pass -- leaving `follow_table`
+to meet its bounds-check requirement with nothing and refuse every table.
+`an_unsettled_resolver_pass_is_bounded` already asserted the empty answer; what was missing was the
+reason.
+
+**What did *not* change, deliberately: the report's advice.** `format_report`'s two cap arms say a
+handler VA as `from` escapes the resolver only "if that handler holds no switch of its own -- the
+resolver reads a whole function". That is still exactly right, and for the reason it was written:
+the probe guard decides whether the resolver runs *at all*, and a handler reaching no indirect jump
+never resolves anything. A handler that does hold a switch still pays this routine's tables, and
+`MAX_POOL_READS` can still be spent before its own literals are read, so the cap can still cost it
+edges. What this change removes is the *other* way it lost them -- a cap spent anywhere in the
+listing discarding everything the listing had proved.
+
+**Not reachable on any target measured here**, which is unchanged: `MAX_POOL_READS` is far past any
+real dispatch routine and `mountmgr`'s two 81-entry tables are the largest seen, so the fixture is
+synthetic -- two switches in one listing, differing only in the bound their index is checked
+against.
+
+**Where it landed:** `ioctl::jump_targets_within`'s early return and its `Tables` doc comment
+(`src/ioctl.rs`), with `a_resolver_cap_keeps_the_targets_it_recovered` as the test, and the third
+reachability bullet of `docs/limitations.md`.
