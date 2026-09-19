@@ -62,7 +62,7 @@ lost at the `add`, and an ARM64 surface a second implementation has already agre
 figure without either ever being diffed against the other. That run filed two more, both now in
 [`DONE.md`](./DONE.md) -- the literal pool the fact walk could not read (item 82, which was the
 whole of why 235 codes carried no proven size or refusal) and the switch tables the reachability
-walk did not follow while the map resolved them (item 83). And item 87 from verifying one of the review findings on
+walk did not follow while the map resolved them (item 83) — and item **89** is what item 83's own fourteen review rounds left behind, the one way a `NOT REACHABLE` can be short that the report still does not count: a switch the resolver ran on and could not answer prints *the reachable call graph was fully explored*. And item 87 from verifying one of the review findings on
 [#347](https://github.com/glslang/windbg-mcp/pull/347), where checking which `untracked` entries
 `volmgr` actually had turned up a code the map loses beside three identical ones it keeps
 (2026-09-19).
@@ -1847,3 +1847,54 @@ no one constant fits a small dump and a live kernel both.
 **Picks up at** `engine::reader`'s `WorkerMessage::Done` arm, `Sessions::call_within`'s timeout
 path, and `continue_async`'s filing task as the worked example. Independent of item 8, and cheaper:
 no capability negotiation, no extension, and it works for the client item 8 measured.
+
+## 89. [windbg-mcp] A switch that would not resolve is the one incompleteness the report does not count
+
+`reachable_from_dispatch` names four ways a `NOT REACHABLE` can be short of the graph, and each
+has a remedy the others do not reach: `halted` (the clock or an interrupt), `bound_hit` (raise
+`max_functions`/`max_depth`), `blind_stops` (bytes that would not read — get the image), and since
+item 83 `tables_bounded` (the resolver's own caps, which those arguments do not reach). A fifth is
+computed and thrown away.
+
+`driver::walk_function` sets `FnWalk::met_indirect` where a `Flow::Jmp(None)` has no targets, and
+`reachability` reads it **once**, to decide whether resolving is worth the engine round trips. The
+final walk's copy is discarded. So a walk that ended at a switch the resolver ran on and could not
+answer — as against one it stopped short of, which `tables_bounded` covers — carries no signal at
+all: `blind` counts only `Flow::Unreadable` and `Flow::Unknown`, and `format_report` then prints
+**"Bound hit: no — the reachable call graph was fully explored"**. The boilerplate caveat three
+lines below it says a jump table that would not resolve is not followed, which is true and is not
+where a reader stops.
+
+The other two silent arms are the same seam: an instruction set whose *operands* go unread
+(`set.operands_are_read()`, documented as the honest degradation — and it is honest about the
+target, not about the report), and a listing in no loaded module. A module enumeration that
+**fails** used to be a fourth and is not any more, that being the half of this that was in scope
+for #351.
+
+**Pre-existing and made narrower rather than created by item 83.** Before it, every table was
+unresolved and the sentence was uniformly wrong; now it is wrong only where resolution was tried
+and failed, which is rarer and more misleading — the reader has been told elsewhere that tables are
+crossed.
+
+**Why it was deferred:** it is a rendering change on every `NOT REACHABLE` that meets an
+unresolvable switch, which is a distinct defect from the two this PR was for (items 82 and 83) with
+its own tier and golden exposure. Widening a round-fourteen PR to take it is how the *next* entry
+gets written about the seam this one opened.
+
+**What would close it.** Carry the final walk's `met_indirect` — per site, so the count is of
+jumps rather than of functions — into `Report` and `structured::Reachability`, beside
+`tables_bounded` rather than folded into it: the remedies differ, which is the argument that put
+`tables_bounded` there in the first place. Its own remedy is the one `format_report` already gives
+for a scoped walk — pass a specific handler VA as `from` — plus, on a live kernel, `modules` with
+`refresh: true`, since a table needs the image's executable ranges and a fresh attach has none
+(`docs/limitations.md` records **19** control codes against **45** on `mountmgr` for exactly that
+reason). Withhold the "fully explored" claim when it is non-zero, the way `blind` already does.
+The honest-degradation arms report through the same field, because a caller cannot act on the
+difference between "resolved nothing" and "never asked".
+
+**Picks up at** `driver::walk_function`'s `Flow::Jmp` arm, `driver::reachability`'s
+`probe.met_indirect` match, `driver::format_report`'s `Bound hit` arms, and
+`structured::Reachability`. `docs/limitations.md`'s third and fourth reachability bullets are where
+the prose goes — the fourth already describes an uncounted unseen edge (a branch class the decoder
+does not know) and says *"nothing in the report says so"*, which is this entry's sentence about a
+different cause.
