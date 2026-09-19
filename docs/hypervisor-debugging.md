@@ -117,6 +117,29 @@ answering; native KD's explicit-target retry crashed, and passive reconnection d
 session. No reboot or target/outer-host configuration change was made. A temporary workspace-only
 firewall rule for the diagnostic was removed. Guest recovery and live validation remain pending.
 
+Further recovery on the same day narrowed the connection failure:
+
+- The owner's firewall approval left inbound rules for native KD and the diagnostic on the
+  workspace's active Public profile. This alone did not recover the guest.
+- The native-KD crash dump showed an access violation in DbgEng's AES-related instruction
+  sequence during initial connection. Without matching symbols, the function and root cause
+  remain unidentified; this is not evidence that the candidate teardown ran.
+- One explicit-target native-KD retry without `-bonc` avoided that crash and received
+  `STATE_CHANGE64` packets. KD rejected their packet ID `0x1b8` because it expected `0x0`.
+  Repeated transport reset requests did not resolve the mismatch.
+- The documented [Ctrl+R resynchronization command](https://learn.microsoft.com/en-us/windows-hardware/drivers/debugger/ctrl-r--re-synchronize-)
+  completed a reset handshake, but subsequent state packets retained the rejected ID. There
+  was no usable command prompt. A transport reset is not a reboot of the guest.
+- KD exited cleanly through Ctrl+B while waiting; its listener was released. The guest's WinRM
+  TCP port still timed out. No guest reset, reboot, or VELKO configuration change was performed.
+
+Receiving and decoding target packets rules out a completely blocked inbound path for that
+retry. It does not establish why the transport sequence became inconsistent, nor prove the
+original detach failure has the same cause. Preserve this distinction when resuming the lab.
+The candidate dbgscope revision also passed its manually dispatched
+[Miri workflow](https://github.com/glslang/dbgscope/actions/runs/35441987860); that does not
+validate live kernel transport or recovery.
+
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. Neither new live test below has run: further live
 checks require guest recovery and validation of the candidate teardown. Hypervisor stepping and breakpoint
