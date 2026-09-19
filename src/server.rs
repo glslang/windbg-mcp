@@ -866,6 +866,11 @@ pub struct ConnectionArgs {
     /// exist, so guessing costs one call rather than a leaked key.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Experimental KDNET lab mode: request one break on DbgEng's English connection
+    /// announcement, without INITIAL_BREAK or the extra attach resume. Only for a known-running
+    /// hypervisor target; text-dependent, not a readiness guarantee. Default false.
+    #[serde(default)]
+    pub experimental_break_on_connect: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2438,7 +2443,9 @@ impl WindbgServer {
         .await
     }
 
-    /// Attach to a kernel target over a connection string (e.g. KDNET).
+    /// Attach to a Windows kernel or hypervisor over a connection string (e.g. KDNET).
+    /// For hypervisor debugging, use its own port/key profile, not the NT kernel endpoint.
+    /// Stopping a hypervisor pauses its guests; the debugger must run outside that hypervisor.
     /// Takes exactly one of `profile` (a connection configured on this host, which the server
     /// resolves locally — the target's debug key never enters this request) or `connection` (the
     /// raw string, key and all). Prefer `profile`; call it with neither to be told which profiles
@@ -2446,7 +2453,7 @@ impl WindbgServer {
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it.
     /// A live kernel attach waits for the target to dial in, and that wait has no timeout and
-    /// cannot be interrupted: if the guest is powered off, not booted with `/debug on`, or
+    /// cannot be interrupted: if the target is powered off, its selected debug endpoint is disabled, or
     /// pointed at the wrong host/port/key, this call reports a timeout and the attach keeps
     /// waiting forever. That costs only this session — other sessions and the server are
     /// unaffected — and `session_status` says how long it has been waiting. Recover with
@@ -2478,11 +2485,27 @@ impl WindbgServer {
                 return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
             }
         };
+        if args.experimental_break_on_connect
+            && !selected
+                .connection
+                .expose()
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b"net:"))
+        {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                "experimental_break_on_connect requires a KDNET connection".into(),
+                None,
+                TargetCreated::No,
+            );
+        }
         self.opened(
             SessionKind::Kernel,
             selected.label,
             EngineOp::AttachKernel {
                 connection: selected.connection,
+                experimental_break_on_connect: args.experimental_break_on_connect,
             },
         )
         .await
@@ -5354,6 +5377,18 @@ fn text_of(result: &CallToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_announcement_attach_requires_explicit_opt_in() {
+        let default: ConnectionArgs =
+            serde_json::from_value(serde_json::json!({"profile":"lab"})).unwrap();
+        assert!(!default.experimental_break_on_connect);
+        let experimental: ConnectionArgs = serde_json::from_value(
+            serde_json::json!({"profile":"lab", "experimental_break_on_connect":true}),
+        )
+        .unwrap();
+        assert!(experimental.experimental_break_on_connect);
+    }
 
     /// A reachability bound is capped and never raised.
     ///

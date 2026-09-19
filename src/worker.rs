@@ -1596,7 +1596,10 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             || kernel_report(e),
         ),
 
-        EngineOp::AttachKernel { connection } => open(
+        EngineOp::AttachKernel {
+            connection,
+            experimental_break_on_connect,
+        } => open(
             e,
             id,
             |commit| {
@@ -1607,9 +1610,13 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // This `wait` is the one that can never return: `SetInterrupt` cannot reach a
                 // wait still establishing the link, so a guest that never dials in parks here
                 // for good. It parks *this process*, which the supervisor can kill.
-                // The one place the key is unwrapped, and the last: it goes straight into
-                // DbgEng. Everything else that touches this value renders it redacted.
-                let pending = e.attach_kernel_begin(connection.expose()).map_err(es)?;
+                // Unwrap only for the typed attach call; never log the exposed connection.
+                let pending = if experimental_break_on_connect {
+                    e.attach_kernel_announcement_begin(connection.expose())
+                } else {
+                    e.attach_kernel_begin(connection.expose())
+                }
+                .map_err(es)?;
                 commit();
                 pending.wait().map_err(es)
             },
@@ -2086,16 +2093,17 @@ fn ending(left: dbgscope::dbgeng::TargetLeft, detaching: bool) -> (&'static str,
     use dbgscope::dbgeng::TargetLeft;
     match left {
         TargetLeft::KernelRunning => (
-            "Session ended. The live kernel was resumed and detached, and is running.",
+            "Session ended. The live kernel's quit-and-detach completed. Verify that the guest \
+             is running through its console or management channel; it may stop again after detach.",
             Some(true),
         ),
         // Reported rather than raised: the session *did* end, and a caller told only that
         // something failed has no reason to go and look at the guest -- which is the one useful
         // thing to do about a kernel sitting at a break with no debugger left on it.
         TargetLeft::KernelHalted => (
-            "Session ended, but the live kernel could not be told to run before it was detached, \
-             so it is probably still halted at a break with one processor stopped. Attaching again \
-             and running `qd` resumes and releases it.",
+            "Session ended, but the live kernel's resume could not be confirmed. It may still be \
+             halted. Check the target console; a fresh native debugger attach and `qd` may recover \
+             it. Do not reset the target solely because this teardown failed.",
             Some(false),
         ),
         TargetLeft::Unspoken if detaching => (
@@ -6413,7 +6421,7 @@ where
     // Both halves, or it is half a warning: a structured-aware client forwards `structuredContent`
     // and drops the text block, so a limitation stated only in the sentence is one the better
     // clients never see (`FOLLOWUPS.md` item 43).
-    summary.limitation = session_limitation();
+    summary.limitation = open_limitation(summary.kernel_target, session_limitation());
     let text = appended(
         summary_text(&diagnostic, &summary),
         summary.limitation.clone(),
@@ -6455,19 +6463,20 @@ fn target_summary(e: &DebugEngine) -> structured::TargetSummary {
         .modules()
         .inspect_err(|why| tracing::debug!("worker: open summary could not list modules: {why}"))
         .ok();
+    let primary = modules
+        .as_deref()
+        .and_then(|modules| primary_module(modules, kernel_mode));
     structured::TargetSummary {
         kernel_mode,
+        kernel_target: kernel_target(kernel_mode, primary),
         modules_loaded: modules.as_ref().map(Vec::len),
-        primary_module: modules
-            .as_deref()
-            .and_then(|modules| primary_module(modules, kernel_mode))
-            .map(|module| {
-                Box::new(with_pdb_identity(
-                    e,
-                    module,
-                    structured::ModuleInfo::from(module),
-                ))
-            }),
+        primary_module: primary.map(|module| {
+            Box::new(with_pdb_identity(
+                e,
+                module,
+                structured::ModuleInfo::from(module),
+            ))
+        }),
         // `Ok(None)` is the target that did not bug check, and `Err` is the target that has no
         // bug check data to read at all (user mode). Both are simply "no bug check here".
         bug_check: e
@@ -6476,22 +6485,17 @@ fn target_summary(e: &DebugEngine) -> structured::TargetSummary {
             .flatten()
             .as_ref()
             .map(triage::bug_check_info),
-        // Filled by [`open`], not here: this reads the *target*, and a limitation is a fact about
-        // the engine that was built for it — known before the target existed.
+        // Filled by [`open`], which combines the target and engine limitations.
         limitation: None,
     }
 }
 
 /// The image a target is *about*, out of everything the engine has loaded.
 ///
-/// On a kernel target that is the kernel, which the engine always names `nt` whichever image the
-/// build shipped (`ntkrnlmp.exe` and friends) — so it is matched by that name, and the name is what
-/// every `nt!Symbol` in the session is qualified by. Anywhere else it is the first module in the
-/// engine's list, which is load order, which is the process's own executable.
+/// Prefer the Windows kernel (`nt`), then the hypervisor (`hv`), on a kernel-mode target.
+/// User-mode targets keep load order, even if an executable happens to be named `hv`.
 ///
-/// The kernel lookup falls back to the same first entry rather than to nothing: `nt` is first on
-/// every kernel target seen, and a build that ordered it differently should cost a caller a
-/// slightly odd answer, not an empty one.
+/// An unrecognised kernel inventory still falls back to its first entry.
 fn primary_module(
     modules: &[dbgscope::dbgeng::Module],
     kernel_mode: Option<bool>,
@@ -6500,10 +6504,45 @@ fn primary_module(
         && let Some(kernel) = modules
             .iter()
             .find(|module| module.name.eq_ignore_ascii_case("nt"))
+            .or_else(|| {
+                modules
+                    .iter()
+                    .find(|module| module.name.eq_ignore_ascii_case("hv"))
+            })
     {
         return Some(kernel);
     }
     modules.first()
+}
+
+fn kernel_target(
+    kernel_mode: Option<bool>,
+    primary: Option<&dbgscope::dbgeng::Module>,
+) -> Option<structured::KernelTarget> {
+    if kernel_mode != Some(true) {
+        return None;
+    }
+    match primary?.name.to_ascii_lowercase().as_str() {
+        "nt" => Some(structured::KernelTarget::Windows),
+        "hv" => Some(structured::KernelTarget::Hypervisor),
+        _ => None,
+    }
+}
+
+fn open_limitation(
+    target: Option<structured::KernelTarget>,
+    engine_limitation: Option<String>,
+) -> Option<String> {
+    if target != Some(structured::KernelTarget::Hypervisor) {
+        return engine_limitation;
+    }
+    let note = "Hypervisor target, not the Windows NT kernel. NT process, driver, object and pool \
+                inspection do not apply here. Symbols may be unavailable; use image identity and \
+                module-relative addresses. Stopping this hypervisor pauses the guests it runs.";
+    Some(match engine_limitation {
+        Some(existing) => format!("{existing}\n{note}"),
+        None => note.to_string(),
+    })
 }
 
 /// The opener's diagnostic with the summary rendered under it.
@@ -9033,6 +9072,8 @@ mod tests {
         let (text, running) = super::ending(TargetLeft::KernelRunning, false);
         assert_eq!(running, Some(true));
         assert!(text.contains("running"), "{text}");
+        assert!(text.contains("Verify"), "{text}");
+        assert!(!text.contains("and is running"), "{text}");
 
         let (text, running) = super::ending(TargetLeft::KernelHalted, false);
         assert_eq!(running, Some(false));
@@ -10542,6 +10583,7 @@ mod tests {
             (
                 EngineOp::AttachKernel {
                     connection: crate::kdconn::Connection::new("net:port=50000,key=1.2.3.4"),
+                    experimental_break_on_connect: false,
                 },
                 Some(TargetOrigin::Kernel),
             ),
@@ -13567,6 +13609,7 @@ mod tests {
     fn summary_of(modules: &[dbgscope::dbgeng::Module], kernel: bool) -> structured::TargetSummary {
         structured::TargetSummary {
             kernel_mode: Some(kernel),
+            kernel_target: kernel_target(Some(kernel), primary_module(modules, Some(kernel))),
             modules_loaded: Some(modules.len()),
             primary_module: primary_module(modules, Some(kernel))
                 .map(|module| Box::new(structured::ModuleInfo::from(module))),
@@ -13595,6 +13638,51 @@ mod tests {
 
         // And a target with nothing loaded has no primary module rather than a made-up one.
         assert!(primary_module(&[], Some(true)).is_none());
+    }
+
+    #[test]
+    fn a_hypervisor_summary_is_distinct_from_nt_and_user_mode() {
+        use structured::KernelTarget;
+        let mut modules = vec![module("helper", 0x1000), module("HV", 0x2000)];
+        let summary = summary_of(&modules, true);
+        assert_eq!(summary.kernel_target, Some(KernelTarget::Hypervisor));
+        assert_eq!(summary.primary_module.as_ref().unwrap().name, "HV");
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["kernel_target"], "hypervisor");
+        assert_eq!(summary_of(&modules, false).kernel_target, None);
+        assert_eq!(kernel_target(None, Some(&modules[1])), None);
+        assert_eq!(
+            summary_of(&[module("hvloader", 0)], true).kernel_target,
+            None
+        );
+        assert_eq!(summary_of(&[], true).kernel_target, None);
+        assert_eq!(summary_of(&[module("hv", 0)], false).kernel_target, None);
+        modules.push(module("NT", 0x3000));
+        assert_eq!(
+            summary_of(&modules, true).kernel_target,
+            Some(KernelTarget::Windows)
+        );
+    }
+
+    #[test]
+    fn a_hypervisor_limitation_preserves_the_engine_limitation() {
+        let note = open_limitation(Some(structured::KernelTarget::Hypervisor), None).unwrap();
+        assert!(note.contains("not the Windows NT kernel"));
+        let combined = open_limitation(
+            Some(structured::KernelTarget::Hypervisor),
+            Some("engine limitation".into()),
+        )
+        .unwrap();
+        assert_eq!(combined, format!("engine limitation\n{note}"));
+        assert_eq!(open_limitation(None, None), None);
+        assert_eq!(
+            open_limitation(Some(structured::KernelTarget::Windows), None),
+            None
+        );
+        assert_eq!(
+            open_limitation(None, Some("engine limitation".into())).as_deref(),
+            Some("engine limitation")
+        );
     }
 
     /// The diagnostic is the answer; the summary is a couple of lines under it.

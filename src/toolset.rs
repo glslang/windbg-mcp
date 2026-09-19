@@ -1,7 +1,7 @@
 //! Which of this server's sixty-one tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 91,790 bytes — roughly 23k tokens (measured 2026-09-18; every figure here moves with any edit
+//! 91,992 bytes — roughly 23k tokens (measured 2026-09-19; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -22,7 +22,7 @@
 //!   group      tools   bytes   what it is for
 //!   allocator     10   16,457  pool and heap walks, and `walk_memory`
 //!   inspect       10   13,152  registers, stacks, memory, modules, symbols, location, raw commands
-//!   session       10   12,817  opening a target, ending it, and watching this server
+//!   session       10   13,348  opening a target, ending it, and watching this server
 //!   exec           8   12,652  breakpoints and execution control
 //!   batch          1   10,021  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code
@@ -31,12 +31,12 @@
 //!                                device security and the whole-driver survey
 //! ```
 //!
-//! Those bytes are a measurement of **2026-09-17** and move with any edit to a description — the
-//! whole surface they are shares of is 61 tools and 91,790 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-09-19** and move with any edit to a description — the
+//! whole surface they are shares of is 61 tools and 91,992 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 19,078 bytes, not the 20,244 its two rows add to, because the thirteen tools it keeps also stop
+//! 19,280 bytes, not the 20,446 its two rows add to, because the thirteen tools it keeps also stop
 //! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
 //! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
 //! dearer.
@@ -45,7 +45,7 @@
 //!
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
-//! spec that leaves one out is asking for something that does not exist. On its own it is 11,714
+//! spec that leaves one out is asking for something that does not exist. On its own it is 11,916
 //! bytes, and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
 //! and the startup line says so rather than leaving the addition to be discovered.
 //!

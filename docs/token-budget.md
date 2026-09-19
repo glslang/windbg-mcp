@@ -335,34 +335,34 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-09-17** and move with any edit to a description.
+   Both tables are measurements of **2026-09-19** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 17.9% |
-   | `inspect` | 10 | 13,152 | 14.3% |
-   | `session` | 10 | 12,817 | 14% |
+   | `allocator` | 10 | 16,457 | 17.8% |
+   | `inspect` | 10 | 13,152 | 14.2% |
+   | `session` | 10 | 13,348 | 14.5% |
    | `ioctl` | 10 | 12,435 | 13.5% |
-   | `exec` | 8 | 12,652 | 13.8% |
+   | `exec` | 8 | 12,652 | 13.7% |
    | `batch` | 1 | 10,021 | 10.9% |
-   | `crash` | 3 | 7,427 | 8.1% |
+   | `crash` | 3 | 7,427 | 8.0% |
    | `ttd` | 9 | 6,829 | 7.4% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 61 | 91,790 |
-   | `session,inspect,exec,crash` | 31 | 45,127 |
-   | `session,inspect,crash` | 23 | 32,322 |
-   | `crash` | 13 | 19,078 |
+   | *(absent)* | 61 | 92,321 |
+   | `session,inspect,exec,crash` | 31 | 45,658 |
+   | `session,inspect,crash` | 23 | 32,853 |
+   | `crash` | 13 | 19,609 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 19,078 rather than the 20,244 its two rows sum to, because the cross-references leave with
+   is 19,609 rather than the 20,775 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
-   the only issuer of — 11,714 B is the floor, and `crash` is thirteen tools rather than three. The
+   the only issuer of — 11,916 B is the floor, and `crash` is thirteen tools rather than three. The
    flag is a **run's** choice, and on a listener it is the *default*: a named client may be
    configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
    client rather than per server — which is what lets a local model and a hosted client share one
@@ -553,6 +553,13 @@ Those margins are stable rather than noisy, which is worth knowing before anyone
 dump on both CI runners — and both printed it byte for byte identically, ARM64 included. That is
 not true of the baseline table further up, three of whose rows were re-measured on the ARM64 bench
 against the ARM64 dump; the two tables are read differently for that reason.
+
+## Experimental attach input (2026-09-19)
+
+The experimental attach option added on 2026-09-19 costs 329 model-visible bytes, including its
+text-dependency and lab-only cautions. The measured surface is 92,321 B model-visible and
+252,226 B on the wire. The model ceiling moves from 92,000 to 93,000 B; the wire and per-tool
+ceilings are unchanged. This is one optional input field, not a new tool.
 
 ## Binary Ninja bridge surface (2026-09-05)
 

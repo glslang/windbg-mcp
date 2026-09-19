@@ -380,11 +380,15 @@ pub struct TargetSummary {
     /// Whether the engine calls this a kernel target. Absent only if the query itself failed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kernel_mode: Option<bool>,
+    /// Kernel identity inferred from the engine's primary module (`nt` or `hv`). Absent for
+    /// user mode, unknown target types, or an unrecognised/missing kernel module inventory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kernel_target: Option<KernelTarget>,
     /// How many modules the engine holds **at this moment**, which is what makes it worth
     /// carrying: a fresh kernel attach can report one. The table is `modules`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub modules_loaded: Option<usize>,
-    /// The image this target is *about*: the kernel (`nt`) on a kernel target, and on a user-mode
+    /// The image this target is *about*: `nt` on Windows or `hv` on a hypervisor target; on a user-mode
     /// one the first image the engine lists, which is the process's own executable. A base to
     /// compute `module+RVA` against without asking for the whole table first.
     ///
@@ -408,11 +412,17 @@ pub struct TargetSummary {
     /// tool, for the reason that item gives: this is built in the worker, which owns one session
     /// and has never heard of the caller's surface.
     ///
-    /// The case that exists today is a 32-bit dump opened by an engine that is not 32-bit, where
-    /// the .NET SOS extension cannot be loaded at all — an extension is loaded into the debugger's
-    /// own process, so its architecture is the host's.
+    /// Examples: an engine of the wrong architecture for a 32-bit target's SOS extension, or a
+    /// hypervisor target where NT-specific inspection does not apply.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub limitation: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum KernelTarget {
+    Windows,
+    Hypervisor,
 }
 
 /// A failed open, and the one thing a caller must know about it.
