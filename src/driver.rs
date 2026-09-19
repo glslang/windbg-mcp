@@ -147,6 +147,16 @@ struct FnWalk {
     /// could not see past, and they are the difference between a graph that was explored and one
     /// that merely ran out.
     blind: usize,
+    /// Whether the walk reached an indirect `jmp` whose targets these tables did not hold.
+    ///
+    /// What decides whether resolving them is worth an engine round trip at all. A `from` scoped to
+    /// a handler *past* a dispatch switch reaches no such jump — the switch is behind it — so a
+    /// walk from there needs no tables, and asking for them would spend the caller's clock on
+    /// literal and table reads whose answers nothing in this walk can use. It would also make the
+    /// report's own advice untrue: "pass a handler VA as `from` to scope past the dispatch" is no
+    /// escape from a resolver cap if the resolver runs anyway. `FOLLOWUPS.md` item 83's resolver is
+    /// what made that reachable, and it was raised on review of #351.
+    met_indirect: bool,
 }
 
 /// Returns `None` if `start` is not an instruction boundary in `block` (the caller
@@ -161,6 +171,7 @@ fn walk_function(block: &[Instruction], start: u64, tables: &JumpTables) -> Opti
     let mut reachable: HashSet<u64> = HashSet::new();
     let mut external: Vec<(u64, u64, &'static str)> = Vec::new();
     let mut blind = 0usize;
+    let mut met_indirect = false;
     let mut stack = vec![start_i];
     while let Some(i) = stack.pop() {
         let insn = &block[i];
@@ -205,7 +216,11 @@ fn walk_function(block: &[Instruction], start: u64, tables: &JumpTables) -> Opti
                 // `ioctl_map` was resolving the same table three functions away.
                 leave(insn.address, t, "jmp");
                 if t.is_none() {
-                    for &target in tables.at(insn.address) {
+                    let targets = tables.at(insn.address);
+                    // Recorded whether or not anything follows, because the question this answers is
+                    // "would tables have helped here", asked of a walk that ran without them.
+                    met_indirect |= targets.is_empty();
+                    for &target in targets {
                         leave(insn.address, Some(target), "jmp");
                     }
                 }
@@ -233,6 +248,7 @@ fn walk_function(block: &[Instruction], start: u64, tables: &JumpTables) -> Opti
         reachable,
         external,
         blind,
+        met_indirect,
     })
 }
 
@@ -764,14 +780,22 @@ pub(crate) fn path_recipe(
         let textmap = instruction_text(&block);
         // A route the search could not reconstruct is the same defect one level down: the branches
         // on the way to the goal are unknown, and an empty list of them claims there are none.
-        // Once per listing, and its halt stops the recipe rather than being lost: without this a
-        // cancelled reconstruction is `gates_unknown` with no reason, which reads as an ordinary
-        // route this walk does not support.
-        let tables = resolve_jump(&block);
-        if let Some(why) = tables.stopped {
-            return (recipes, Some(why));
+        // **Tried without tables first**, for the reason the walk does it: this pass is pure graph
+        // work, and a route that does not cross a switch needs no resolver -- which is most of them,
+        // and all of them for a `from` scoped past a dispatch. Asking anyway would spend the
+        // caller's clock on reads the route cannot use.
+        let mut route = find_path(&block, &idx, start, goal, &JumpTables::default());
+        if route.is_none() {
+            // No route without them, so the tables are worth their cost. Their halt stops the
+            // recipe rather than being lost: without that a cancelled reconstruction is
+            // `gates_unknown` with no reason, which reads as an ordinary route this walk does not
+            // support.
+            let tables = resolve_jump(&block);
+            if let Some(why) = tables.stopped {
+                return (recipes, Some(why));
+            }
+            route = find_path(&block, &idx, start, goal, &tables);
         }
-        let route = find_path(&block, &idx, start, goal, &tables);
         let gates_unknown = route.is_none();
         let mut steps: Vec<BranchStep> = route
             .unwrap_or_default()
@@ -1031,26 +1055,45 @@ pub(crate) fn reachability(
         // seed at its resolved address, or the entry if `from` was a symbol. Fall back
         // to the entry if the requested address isn't an instruction boundary.
         let desired = token.or(seed_start).unwrap_or(entry);
-        // Once per function, before either walk of it. The tables are the same whichever address
-        // the walk starts from, and the resolver runs a whole analysis per call.
-        let tables = resolve_jump(&block);
-        // **Merged here rather than polled for.** The resolver's interrupt poll consumes what it
-        // sees, so a halt inside it is one `halt()` will never answer -- and a bound it hit is not a
-        // halt at all. Both make the verdict below a statement about part of the graph.
-        if rpt.halted.is_none() {
-            rpt.halted = tables.stopped;
-        }
-        // Both, and the pair is the point: `bound_hit` says the graph is partial, which is true
-        // however it happened, and `tables_bounded` says the remedy is not the one `bound_hit` is
-        // rendered with.
-        rpt.bound_hit |= tables.bounded;
-        rpt.tables_bounded |= tables.bounded;
-        let (start_used, walk) = match walk_function(&block, desired, &tables) {
+        // **Walked once with no tables first, which is what decides whether to ask for any.** This
+        // pass costs nothing but graph traversal -- no engine, no reads -- and answers the question
+        // the resolver is expensive for: does any path from *this* start reach an indirect jump?
+        //
+        // A `from` scoped to a handler past a dispatch switch reaches none, the switch being behind
+        // it, so resolving would spend the caller's clock on literal and table reads nothing in the
+        // walk can use, and could report the scoped walk as stopped or bounded on their account.
+        // That also made the report's own advice untrue: "pass a handler VA as `from` to scope past
+        // the dispatch" is no escape from a resolver cap if the resolver runs regardless. Raised on
+        // review of #351, against the advice added one commit earlier.
+        let empty = JumpTables::default();
+        let (start_used, probe) = match walk_function(&block, desired, &empty) {
             Some(w) => (desired, w),
             None => (
                 entry,
-                walk_function(&block, entry, &tables).expect("entry is always an instruction"),
+                walk_function(&block, entry, &empty).expect("entry is always an instruction"),
             ),
+        };
+        let walk = match probe.met_indirect {
+            false => probe,
+            true => {
+                // Once per function, and only now. The tables are the same whichever address the
+                // walk starts from, so the second walk uses the start the first settled on.
+                let tables = resolve_jump(&block);
+                // **Merged here rather than polled for.** The resolver's interrupt poll consumes
+                // what it sees, so a halt inside it is one `halt()` will never answer -- and a bound
+                // it hit is not a halt at all. Both make the verdict below a statement about part of
+                // the graph.
+                if rpt.halted.is_none() {
+                    rpt.halted = tables.stopped;
+                }
+                // Both, and the pair is the point: `bound_hit` says the graph is partial, which is
+                // true however it happened, and `tables_bounded` says the remedy is not the one
+                // `bound_hit` is rendered with.
+                rpt.bound_hit |= tables.bounded;
+                rpt.tables_bounded |= tables.bounded;
+                walk_function(&block, start_used, &tables)
+                    .expect("the first walk proved this is an instruction")
+            }
         };
         if !visited.insert(start_used) {
             continue; // this (function, start) was already explored (dedupe cycles)
@@ -3022,6 +3065,83 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert!(
             text.contains("handler VA"),
             "and give the remedy that does: {text}"
+        );
+    }
+
+    /// **A walk scoped past the switch never asks the resolver**, which is what makes the report's
+    /// own advice true.
+    ///
+    /// `format_report` tells a caller to pass a specific handler VA as `from` to scope past a
+    /// dispatch switch -- including, since the resolver gained a cap of its own, as the escape from
+    /// that cap. Resolving the whole listing before applying `desired` made that advice false: the
+    /// switch's literal and table reads happened anyway, could consume the deadline, and could mark
+    /// an otherwise complete scoped walk as stopped or bounded on the account of a jump the walk
+    /// never reaches. Raised on review of #351, against the advice added one commit earlier.
+    ///
+    /// So the walk runs once with no tables -- pure graph work, no engine -- and asks for them only
+    /// if a path from *this* start met an indirect jump. The assertion is the resolver's call count:
+    /// zero from the handler, and non-zero from the entry, which is what says the guard is about the
+    /// start rather than about the listing.
+    #[test]
+    fn a_scoped_walk_does_not_resolve_a_switch_it_cannot_reach() {
+        // Entry switches; two case blocks follow it. 0x1010 is a handler past the switch.
+        let dispatch = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Jmp(None), "jmp qword ptr [tbl]"),
+                insn(0x1008, Flow::Fallthrough, "nop"),
+                insn(0x100c, Flow::Return, "ret"),
+                insn(0x1010, Flow::Fallthrough, "nop"),
+                insn(0x1014, Flow::Return, "ret"),
+            ],
+        );
+        let mut uf = |a: &str| matches!(a, "0x1000" | "0x1010").then(|| dispatch.clone());
+
+        // Scoped to the handler: the switch is behind it, so nothing it reaches needs a table.
+        let asked = std::cell::Cell::new(0usize);
+        let mut counting = |_: &[Instruction]| {
+            asked.set(asked.get() + 1);
+            tables_of(&[(0x1004, vec![0x1008, 0x1010])])
+        };
+        let scoped = reachability(
+            "0x1010",
+            Some(0x1010),
+            0x1014,
+            256,
+            32,
+            &mut uf,
+            &mut counting,
+            never,
+        );
+        assert!(scoped.verdict_reachable, "{scoped:?}");
+        assert_eq!(
+            asked.get(),
+            0,
+            "a start past the switch must not pay for resolving it"
+        );
+        assert!(
+            !scoped.tables_bounded && scoped.halted.is_none(),
+            "and must not inherit its incompleteness: {scoped:?}"
+        );
+
+        // From the entry the switch *is* reached, so the resolver is asked -- which is what says the
+        // guard keys on the start rather than on the listing having a jump in it at all.
+        asked.set(0);
+        let whole = reachability(
+            "0x1000",
+            Some(0x1000),
+            0x1014,
+            256,
+            32,
+            &mut uf,
+            &mut counting,
+            never,
+        );
+        assert!(whole.verdict_reachable, "the table gets there: {whole:?}");
+        assert_eq!(
+            asked.get(),
+            1,
+            "asked once for the listing, not once per site"
         );
     }
 
