@@ -11,6 +11,39 @@ previous round. Before calling a review done, re-check with the head SHA:
 select(.original_commit_id=="<sha>")'` — with `--paginate`, since a busy PR's comments span pages
 and the first page is exactly where the older rounds are.
 
+**But no findings at the head does not mean the head was reviewed, and neither endpoint above says
+which it is.** Comments are findings; `pulls/<n>/reviews` lists only the reviews that *carried* one
+— so a clean head and an unreviewed head look identical from both, and on #349 that read as "Codex
+never reviewed the final commit" when it had, eight minutes before the merge. **Codex says so
+itself, in two places:**
+
+- **Its summary comment**, one per PR and updated in place, marked
+  `<!-- codex-pull-request-review-summary -->`. It is an *issue* comment, not a review comment, and
+  carries a table whose `Commit` column is the SHA of the latest review and whose `Status` says
+  whether it finished:
+  ```console
+  gh api --paginate repos/<owner>/<repo>/issues/<n>/comments \
+    --jq '.[] | select(.body | contains("codex-pull-request-review-summary")) | .body'
+  ```
+- **A reaction on the PR**: 👀 while a review is running, **👍 once every review has finished with
+  no findings** — which is the signal that a round is genuinely closed rather than pending.
+  ```console
+  gh api repos/<owner>/<repo>/issues/<n>/reactions --jq '.[] | "\(.user.login): \(.content)"'
+  ```
+  A `+1` from `chatgpt-codex-connector[bot]` is that 👍. Reactions on the *comments* are a different
+  thing and are usually empty — the completion signal is on the pull request.
+
+So the order is: findings at the head (act on them), else the summary comment's `Commit` (is the
+head even reviewed?), else the 👍 (did it finish clean?). Reviews re-trigger on new commits, and
+`@codex review` / `@codex security review` in a comment asks for one.
+
+**Codex is the bot to watch, and CodeRabbit's green is not evidence.** Its check reports `pass` with
+*"Review rate limited"* beside it when it has not reviewed at all. Measured on
+[#349](https://github.com/glslang/windbg-mcp/pull/349): across the PR's eight commits it filed **no
+reviews and no findings** — `pulls/<n>/reviews` has not one CodeRabbit entry — while its check read
+`pass` the whole way. All six findings there came from Codex. So read that check's reason text
+rather than its bucket, and do not wait on it or offer to re-trigger it.
+
 **They also circle the same topic, and contradict each other and themselves across rounds.** A bot
 reviews *this diff* without the argument that produced it, so the same seam comes back round after
 round from a different angle — and a finding framed as "fresh evidence relative to the prior
@@ -84,6 +117,28 @@ produced it twice in one PR ([#189](https://github.com/glslang/windbg-mcp/pull/1
   `(name, incarnation)` ([#192](https://github.com/glslang/windbg-mcp/pull/192)) deleted the `409`
   a re-added name waited out, `Sessions::unrevoke`, and the whole question of *when* to lift a
   gate — where two of the five findings had lived.
+
+**A third shape of it, and the cheapest to act on: the findings are all about what a claim
+*excludes*.** [#349](https://github.com/glslang/windbg-mcp/pull/349) drew six findings, **five on one
+paragraph** of one `FOLLOWUPS.md` entry, and every one of the five named an operation the paragraph
+had left *out* of a set — never one it had put in. The paragraph was an enumeration of which engine
+ops can outlive their caller; it was rewritten four times and wrong four times, each round naming
+another arm, because `EngineOp` has 34 of them and only `worker.rs` knows which are bounded.
+
+What ended it was not a better list but noticing the **asymmetry**: an inclusion is a claim about one
+op and is checkable on its own, while an exclusion is a claim about *every* path through that op —
+including a prelude that runs before the clock is armed. So the entry now names ops that are in scope
+and certifies **none** as out, and says the audit is unstarted. Generalising: in prose you own,
+prefer the claim whose counterexample is a thing you can go and look at. "These are in" survives an
+op being added; "these are the only ones" does not.
+
+Two traps that produced three of those five, both worth knowing before starting such an audit.
+`patience_slot`-style helpers answer about a **field**, not about the work — an op can carry a
+deadline and still have an unbounded tail (`CrashTriage`), or carry none and be bounded
+(`CommandAndWait`). And the unbounded work is often in a **shared prelude**: `resolve_coordinate`
+runs before the watchdog in three different arms, so reading `fn set_breakpoint` says nothing about
+`EngineOp::SetBreakpoint` — which is the "pinned at a site, not a function" rule below, met from the
+other direction.
 
 **And then check what the deleted thing was also load-bearing for**, because this repo has now got
 that wrong twice in one PR. A revocation was simplified into "an expiry that does not wait", which
