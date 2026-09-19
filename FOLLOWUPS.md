@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-six clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-five clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -58,11 +58,10 @@ read -- 235 codes recovered over seven drivers and **not one** proven size or re
 and, found beside it, a reachability walk that does not follow the switch tables the map now
 resolves, an `adrp`+`add` table base lost at the `add`, and an ARM64 surface a second
 implementation has already agreed with figure for figure without either ever being diffed against
-the other. And item 86 from that PR's own CI, where a
-Markdown-only diff went red on a test that caps the whole server to 60s and then opens a dump
-under it (2026-09-19). And item 87 from verifying one of that PR's review
-findings, where checking which `untracked` entries `volmgr` actually had turned up a code the map
-loses beside three identical ones it keeps (2026-09-19).
+the other. And item 87 from verifying one of the review findings on
+[#347](https://github.com/glslang/windbg-mcp/pull/347), where checking which `untracked` entries
+`volmgr` actually had turned up a code the map loses beside three identical ones it keeps
+(2026-09-19).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1627,55 +1626,6 @@ question again -- plus
 above, `binja_windbg_mcp.analysis.ioctl_map` for the counterpart tool, and
 `structured::IoctlCase`'s doc comment for the shared shape the two answer in. Its `traverse`
 already walks dispatch to sink, which is item 71 here.
-
-## 86. [windbg-mcp] A pool-walk test caps the whole server, including the open it needs first
-
-**Repo:** `windbg-mcp`.
-
-`mcp_smoke::a_pool_walk_takes_this_servers_deadline_not_the_walkers_default` starts a server with
-`WINDBG_MCP_CALL_TIMEOUT_SECS=60`, because the walk budget it pins is derived as the call timeout
-less 15s of headroom and 45s is distinctively not the walker's own 120s default. But that variable
-is **server-wide** and is read on every call, so the same 60s also caps the `open_dump` the test
-performs to get a session -- against a default of **300s** (`ENGINE_CALL_TIMEOUT`, `src/main.rs`).
-
-Opening the sample dump does symbol work. On a contended runner it exceeds 60s, and the test then
-fails with `open_dump` timing out, having measured nothing whatever about the budget it exists to
-pin:
-
-```
-assertion `left == right` failed: `open_dump` did not succeed: engine call timed out
-  left: String("error")
- right: "ok"
-```
-
-**Measured twice on 2026-09-19, on code neither change touched**: `main` at `ecfbabb` (the merge of
-[#345](https://github.com/glslang/windbg-mcp/pull/345), on the **x64** tier) and
-[#347](https://github.com/glslang/windbg-mcp/pull/347) at `08d6f6e` (a Markdown-only diff, on the
-**ARM64** tier). So it is neither architecture-specific nor caused by what it lands on -- it is a
-budget the test imposed on a step it was not reasoning about. Fifteen CI runs on `main` over the
-same period: fourteen green, one red, and the red one is this.
-
-**The remedy is already in this file, twice, and the first draft of this item did not say so.**
-Two other tests lower the same variable and both deal with the open it also caps.
-`a_running_command_is_interrupted_on_request_and_frees_its_session` hit *this exact failure* --
-"36s was measured on a CI runner against a budget of 30, and the test then failed inside the open
-rather than in anything it is about" -- and raised its budget to **90s**, sized for the open. And
-`a_pool_query_with_no_time_to_walk_is_refused_rather_than_run` runs at 10s and **skips** when the
-open does not land, so a slow runner cannot fail it. Raised on review of
-[#347](https://github.com/glslang/windbg-mcp/pull/347).
-
-90s here derives a 75s walk budget, still distinctively not the walker's 120s default, so the
-assertion survives that fix. This is therefore a small change following an established precedent
-rather than the design question the first draft posed -- and the second environment variable it
-reached for is not needed.
-
-**Why deferred rather than done here:** this is a docs-only branch, and the change belongs beside
-the test, with the rerun that proves it.
-
-**Where it picks up:** `tests/mcp_smoke.rs` -- the test at the `WINDBG_MCP_CALL_TIMEOUT_SECS=60`
-literal, its `Server::started_with`, and `Server::open_session` / `tool_data`, where the
-`status == "ok"` assertion that actually fired lives -- plus `main::call_timeout` and
-`ENGINE_CALL_TIMEOUT` (`src/main.rs`) for the default it is being measured against.
 
 ## 87. [windbg-mcp] A code materialised in the previous block is lost at the join
 

@@ -107,6 +107,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 76](#76-dbgscope-a-fold-that-cannot-decide-one-code-unit-declines-the-whole-comparison--deleted-unbuilt-2026-09-14) — [dbgscope] A fold that cannot decide one code unit declines the whole comparison — deleted unbuilt (2026-09-14)
 - [Item 77](#77-dbgscope-the-fold-is-the-hosts-upcase-table-not-the-targets--done-2026-09-15-dbgscope162) — [dbgscope] The fold is the *host's* upcase table, not the target's — done (2026-09-15, dbgscope#162)
 - [Item 78](#78-dbgscope-the-vs-allocator-layout-moved-again-and-the-pool-walker-refuses-the-build--done-2026-09-15-dbgscope167) — [dbgscope] The VS allocator layout moved again, and the pool walker refuses the build — done (2026-09-15, dbgscope#167)
+- [Item 86](#86-windbg-mcp-a-pool-walk-test-caps-the-whole-server-including-the-open-it-needs-first--done-2026-09-19) — [windbg-mcp] A pool-walk test caps the whole server, including the open it needs first — done (2026-09-19)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3650,3 +3651,73 @@ older shape against **real** type information rather than synthetic offsets.
 back-reference rules swapped in each direction). Live `ntdll` on 26200: 8,878 chunks where it
 previously refused. Live kernel, the guest this item was filed from: 326,098 chunks, and the
 tier passes 10/10 including the two tests named above.
+
+## 86. [windbg-mcp] A pool-walk test caps the whole server, including the open it needs first — **done** (2026-09-19)
+
+**Repo:** `windbg-mcp`.
+
+`mcp_smoke::a_pool_walk_takes_this_servers_deadline_not_the_walkers_default` started a server with
+`WINDBG_MCP_CALL_TIMEOUT_SECS=60`, because the walk budget it pins is derived as the call timeout
+less 15s of headroom and 45s is distinctively not the walker's own 120s default. But that variable
+is **server-wide** and is read on every call, so the same 60s also capped the `open_dump` the test
+performs to get a session -- against a default of **300s** (`ENGINE_CALL_TIMEOUT`, `src/main.rs`).
+
+Opening the sample dump does symbol work. On a contended runner it exceeded 60s, and the test then
+failed with `open_dump` timing out, having measured nothing whatever about the budget it exists to
+pin:
+
+```
+assertion `left == right` failed: `open_dump` did not succeed: engine call timed out
+  left: String("error")
+ right: "ok"
+```
+
+**Measured twice on 2026-09-19, on code neither change touched**: `main` at `ecfbabb` (the merge of
+[#345](https://github.com/glslang/windbg-mcp/pull/345), on the **x64** tier) and
+[#347](https://github.com/glslang/windbg-mcp/pull/347) at `08d6f6e` (a Markdown-only diff, on the
+**ARM64** tier). So it is neither architecture-specific nor caused by what it lands on -- it is a
+budget the test imposed on a step it was not reasoning about. Fifteen CI runs on `main` over the
+same period: fourteen green, one red, and the red one is this.
+
+**The remedy was already in that file, twice, and the first draft of this item did not say so.**
+Two other tests lower the same variable and both deal with the open it also caps.
+`a_running_command_is_interrupted_on_request_and_frees_its_session` hit *this exact failure* --
+"36s was measured on a CI runner against a budget of 30, and the test then failed inside the open
+rather than in anything it is about" -- and raised its budget to **90s**, sized for the open. And
+`a_pool_query_with_no_time_to_walk_is_refused_rather_than_run` runs at 10s and **skips** when the
+open does not land, so a slow runner cannot fail it. Raised on review of
+[#347](https://github.com/glslang/windbg-mcp/pull/347).
+
+**What landed.** 90s, following the first of those two precedents, with the comment beside it
+saying *why* rather than only what: the budget governs the open on the next line as well, and that
+open resolves symbols over the network, so how long it takes is the symbol server's to decide
+rather than this bench's.
+
+**What the item got wrong, and it is the half worth keeping.** "90s here derives a 75s walk budget,
+still distinctively not the walker's 120s default, so the assertion survives that fix" is true of
+the *property* and false of the *code*. The assertion is a literal range -- `(40.0..=46.0)` -- and
+its failure message quotes 60s and ~45s beside it, all of which are pinned to the budget being
+replaced. Raising the variable alone therefore would not have turned the test green; it would have
+turned a timeout into an assertion failure, red for a second wrong reason. Measured on the ARM64
+bench by narrowing the range to something impossible: at a 90s budget the worker derives
+**74.998947292s**, which the old range misses by 29 seconds. So the range moved to `(70.0..=76.0)`
+and the message with it -- a change of four literals, not one, and the item's "small change
+following an established precedent" was right about the shape and wrong about the extent.
+
+**Raised rather than skipped, because the two precedents are not interchangeable.** The 10s test
+skips when the open does not land because it *cannot* be sized for the open: a budget that is
+entirely reply headroom is the thing it exists to pin. This one can be, since it needs a
+*distinctive* budget rather than a short one -- and a skip here would buy the same green by
+measuring nothing on exactly the contended runners where the arithmetic is under stress.
+
+**Filed rather than fixed where it was found**, because that branch was docs-only and the change
+belongs beside the test, with the rerun that proves it -- which is what this entry records.
+
+**Verified** on the ARM64 bench (`aarch64-pc-windows-msvc`), on the tree at `b1c205f` plus this
+diff, debugger tier on (`WINDBG_MCP_SMOKE_DUMP=1`): `cargo test --test mcp_smoke pool` passes 2 and
+ignores the 2 that need a live KDNET target. The 74.998947292s above is from the same tier with the
+range mutated, which is also what says the assertion is reading a real budget rather than passing
+vacuously. `cargo fmt --all --check` and `cargo check --target x86_64-pc-windows-msvc --all-targets`
+are clean on the Mac. What is **not** measured is the failure itself: the open exceeding 60s needs a
+contended runner, so nothing here reproduces it on demand and the evidence for it remains the two
+CI runs above.
