@@ -1009,6 +1009,18 @@ pub(crate) fn reachability(
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> Report {
     let mut visited: HashSet<u64> = HashSet::new(); // walk start addresses already done
+    // Resolved tables, by the **function entry** they belong to. `visited` is keyed by *start*, so a
+    // function entered at two different boundaries -- one caller landing on its entry, another tail-
+    // jumping into the middle of it -- is two work items with two intra-function walks, and both
+    // reach the resolver below with the identical listing. Without this, "called once per function"
+    // is a contract this loop states and does not keep: the second visit reparses the image and
+    // repeats every literal-pool and table read, which on KD is round trips against the caller's
+    // deadline. Raised on review of #351.
+    //
+    // Keyed by entry rather than by start for the same reason: the tables are a property of the
+    // listing, and the listing is the same whichever address inside it the walk begins at. Bounded
+    // by `max_functions`, since nothing is inserted without a function having been explored.
+    let mut tables_by_fn: HashMap<u64, JumpTables> = HashMap::new();
     let mut enqueued: HashSet<u64> = HashSet::new(); // target tokens scheduled
     // child token -> (caller token (None = seed), call site, kind).
     let mut parent: HashMap<u64, (Option<u64>, u64, &'static str)> = HashMap::new();
@@ -1152,7 +1164,14 @@ pub(crate) fn reachability(
                 // which is the direction this walk is allowed to be wrong in. Declining them for a
                 // scoped start -- the remedy offered with the finding -- would drop real edges to
                 // close a hole that is not there.
-                let tables = resolve_jump(&block);
+                let tables = match tables_by_fn.get(&entry) {
+                    Some(already) => already.clone(),
+                    None => {
+                        let resolved = resolve_jump(&block);
+                        tables_by_fn.insert(entry, resolved.clone());
+                        resolved
+                    }
+                };
                 // **Merged here rather than polled for.** The resolver's interrupt poll consumes
                 // what it sees, so a halt inside it is one `halt()` will never answer -- and a bound
                 // it hit is not a halt at all. Both make the verdict below a statement about part of
@@ -3318,6 +3337,80 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             asked.get(),
             1,
             "asked once for the listing, not once per site"
+        );
+    }
+
+    /// One function entered twice is resolved **once**, and the second entry still gets the edges.
+    ///
+    /// `visited` is keyed by the *start* address, because two starts in one function have two
+    /// different reachable sets and both have to be walked. The resolver's answer does not: the
+    /// tables belong to the listing, and the listing is the same whichever boundary inside it the
+    /// walk begins at. Without a memo the second visit reruns the whole IOCTL analysis -- reparsing
+    /// the image and repeating every literal-pool and table read, which on KD is round trips against
+    /// the caller's deadline -- and "called once per function", which `reachability` states about
+    /// itself, is not kept. Raised on review of #351.
+    ///
+    /// Both halves are asserted, because a memo that returned nothing would satisfy the first: the
+    /// resolver runs once, **and** the goal behind the resolved edge is still reached. The second
+    /// visit is what makes this about the cache rather than about a switch being resolved at all --
+    /// two callers land on two different boundaries of the same routine, and both reach its jump.
+    #[test]
+    fn a_function_entered_at_two_boundaries_is_resolved_once() {
+        // Two calls into one routine: its entry, and a boundary three instructions in.
+        let seed = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Call(Some(0x2000)), "call"),
+                insn(0x1008, Flow::Call(Some(0x2008)), "call"),
+                insn(0x100c, Flow::Return, "ret"),
+            ],
+        );
+        // Reached from both starts: 0x2000 falls through to the jump, and so does 0x2008.
+        let shared = uf_fn(
+            0x2000,
+            vec![
+                insn(0x2004, Flow::Fallthrough, "nop"),
+                insn(0x2008, Flow::Fallthrough, "nop"),
+                insn(0x200c, Flow::Jmp(None), "jmp rax"),
+            ],
+        );
+        // Where the table sends it, and where the goal is.
+        let handler = uf_fn(0x3000, vec![insn(0x3004, Flow::Return, "ret")]);
+        let graph = functions(&[
+            ("start", seed),
+            ("0x2000", shared.clone()),
+            ("0x2008", shared),
+            ("0x3000", handler),
+        ]);
+
+        let calls = std::cell::Cell::new(0usize);
+        let resolver = |block: &[Instruction]| {
+            calls.set(calls.get() + 1);
+            match block.first().map(|first| first.address) {
+                Some(0x2000) => tables_of(&[(0x200c, vec![0x3000])]),
+                _ => JumpTables::default(),
+            }
+        };
+
+        let rpt = reachability(
+            "start",
+            None,
+            0x3004,
+            256,
+            32,
+            |a| graph.get(a).cloned(),
+            resolver,
+            never,
+        );
+
+        assert!(
+            rpt.verdict_reachable,
+            "the second entry must still carry the table's edge: {rpt:?}"
+        );
+        assert_eq!(
+            calls.get(),
+            1,
+            "one listing, one resolution -- the second entry into it reuses the first's tables"
         );
     }
 
