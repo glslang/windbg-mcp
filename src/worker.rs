@@ -8935,6 +8935,24 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         let Some(entry) = block.first().map(|first| first.address) else {
             return crate::driver::JumpTables::default();
         };
+        // **Nothing to resolve, so nothing is read.** The contract is one call per *listing*, which
+        // means every function the walk explores reaches here -- and a call graph of ordinary
+        // helpers contains no switch at all. Without this guard each of them parses the module
+        // headers twice and runs a whole IOCTL analysis whose answer nothing can use, and on ARM64
+        // that analysis also spends a DbgEng round trip per distinct literal load. A walk could
+        // therefore exhaust its deadline on functions that had no indirect jump in them.
+        //
+        // The cheap question first: the tables are keyed by indirect-jump site, so a listing with no
+        // `Flow::Jmp(None)` has no site to key and no target it could use. Raised on review of #351,
+        // against the per-listing contract that replaced a per-site one -- the cost moved from
+        // "quadratic where there are switches" to "constant everywhere", and this is what keeps it
+        // to the functions that can spend it.
+        if !block
+            .iter()
+            .any(|insn| matches!(insn.flow, dbgscope::dbgeng::Flow::Jmp(None)))
+        {
+            return crate::driver::JumpTables::default();
+        }
         // The module holding *this* listing rather than the seed's: a walk that has crossed into
         // another driver must read that driver's bytes, and a reader bounded to the wrong module
         // refuses every address -- which would look like a table that would not resolve.

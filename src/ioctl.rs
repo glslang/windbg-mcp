@@ -691,9 +691,9 @@ fn with_pool_immediates<'a>(
     read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
     is_constant: &impl Fn(u64) -> bool,
     halt: &mut impl FnMut() -> Option<Halt>,
-) -> (Cow<'a, [Instruction]>, Option<Halt>) {
+) -> (Cow<'a, [Instruction]>, Option<Halt>, bool) {
     if !layout.literal_pool {
-        return (Cow::Borrowed(block), None);
+        return (Cow::Borrowed(block), None, false);
     }
     // **Attempted, not resolved.** Keyed on every address asked about rather than on the ones that
     // answered, because a dump missing the page a pool sits on, or one malformed literal repeated
@@ -703,6 +703,7 @@ fn with_pool_immediates<'a>(
     let mut asked: HashMap<u64, Option<u32>> = HashMap::new();
     let mut reads = 0usize;
     let mut stopped = None;
+    let mut capped = false;
     for instruction in block {
         let Some(address) = pool_load(layout, instruction) else {
             continue;
@@ -728,7 +729,13 @@ fn with_pool_immediates<'a>(
             asked.insert(address, None);
             continue;
         }
+        // **Reported, not merely obeyed.** Stopping here leaves the literals after it unread, and
+        // one of them may hold the bound a switch is checked against or the value a compare names --
+        // so the answer is a prefix, and `cap_hit` is how this module says so. Silent, a map short of
+        // a table read as complete and a reachability walk omitted its edges while reporting that no
+        // bound was hit. Raised on review of #351.
         if reads >= MAX_POOL_READS {
+            capped = true;
             break;
         }
         // Polled **between reads**, not once before them. Each is an engine round trip -- tens of
@@ -756,7 +763,7 @@ fn with_pool_immediates<'a>(
         asked.insert(address, value);
     }
     if asked.values().all(Option::is_none) {
-        return (Cow::Borrowed(block), stopped);
+        return (Cow::Borrowed(block), stopped, capped);
     }
     let mut out = block.to_vec();
     for instruction in &mut out {
@@ -769,7 +776,7 @@ fn with_pool_immediates<'a>(
             *operand = Operand::Immediate(u64::from(*value));
         }
     }
-    (Cow::Owned(out), stopped)
+    (Cow::Owned(out), stopped, capped)
 }
 
 pub(crate) fn map(
@@ -811,7 +818,7 @@ fn map_within(
     // cannot encode as a PC-relative load, and resolving those here is what lets the sweeps and the
     // recording pass agree about the value -- see [`with_pool_immediates`]. Borrowed unchanged on a
     // target that has no literal pool, so nothing about x64 or x86 moves.
-    let (listing, pool_halt) =
+    let (listing, pool_halt, pool_capped) =
         with_pool_immediates(block, layout, &mut read, &is_constant, &mut halt);
     let block: &[Instruction] = &listing;
     let graph = cfg::graph(block);
@@ -826,7 +833,10 @@ fn map_within(
     // the recording pass refuses to start, so a halted walk reports nothing rather than reporting
     // from where it got to.
     let mut halted = pool_halt;
-    let mut cap_hit = false;
+    // Seeded from the pool phase for the same reason as `halted`: a literal it never got to read may
+    // have held the value a case or a table's bound is made of, so the answer below is a prefix and
+    // has to say it is one.
+    let mut cap_hit = pool_capped;
 
     // The facts on the way **into** each block, which is what the sweeps below settle.
     let mut entry: Vec<Option<Facts>> = vec![None; graph.blocks.len()];
@@ -4870,6 +4880,69 @@ mod tests {
             "three loads of one unreadable address are one attempt"
         );
         assert!(found.cases.is_empty(), "{:?}", found.cases);
+    }
+
+    /// **The pool-read limit is a bound, and a bound has to be reported.**
+    ///
+    /// `MAX_POOL_READS` stops the preprocessing phase, which leaves every literal after it unread --
+    /// and one of those may hold the value a compare names or the bound a switch is checked against.
+    /// So the map below it is a prefix. Silent, that prefix reads as a complete answer: `ioctl_map`
+    /// omits the cap warning it advertises, and `jump_targets` reports `bounded: false` while the
+    /// walk that trusted it omits a table's edges. Raised on review of #351.
+    #[test]
+    fn the_literal_pool_read_limit_is_reported_as_a_bound() {
+        // One more distinct pool address than the phase will read, each loaded once.
+        let mut block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+        ];
+        let mut at = DISPATCH + 8;
+        for slot in 0..=MAX_POOL_READS {
+            let pool = IMAGE_BASE + 0x1_0000 + (slot as u64) * 4;
+            block.push(insn(
+                at,
+                "ldr",
+                vec![reg("w10"), literal(pool, at)],
+                Flow::Fallthrough,
+            ));
+            at += 4;
+        }
+        block.push(insn(at, "ret", Vec::new(), Flow::Return));
+
+        let served = std::cell::Cell::new(0usize);
+        let read = |_address: u64, _len: usize| {
+            served.set(served.get() + 1);
+            Some(0x0022_203bu32.to_le_bytes().to_vec())
+        };
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            served.get(),
+            MAX_POOL_READS,
+            "the limit is what stopped it, not the listing"
+        );
+        assert!(
+            found.cap_hit,
+            "and a prefix has to say it is one: {found:?}"
+        );
     }
 
     /// **A64 names a store's source first, and a store is not a load.**
