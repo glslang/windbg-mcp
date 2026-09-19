@@ -562,8 +562,15 @@ const MAX_SWEEPS: usize = 32;
 /// as though they were the whole table:
 ///
 /// - it **halted** -- a deadline or an interrupt during case enrichment, with [`Map::halted`] set;
-/// - or it hit a **bound** of its own, [`MAX_CASES`], with [`Map::cap_hit`] set and `case_count`
-///   still counting past what `cases` holds.
+/// - it hit a **bound** of its own -- [`MAX_CASES`], [`MAX_TABLE_ENTRIES`], [`MAX_POOL_READS`] --
+///   with [`Map::cap_hit`] set and `case_count` still counting past what `cases` holds;
+/// - or its facts never **settled** inside [`MAX_SWEEPS`], with [`Map::unsettled`] set, which
+///   discards every belief rather than reporting one a later edge would have taken away.
+///
+/// The third was omitted here for a round, having been named in this very comment as one of the
+/// resolver's caps: the condition read `cap_hit` and `unsettled` is a field of its own, so an
+/// analysis that ran out of sweeps answered with no edges and `bounded: false` -- a clean
+/// `NOT REACHABLE` about a graph whose tables were never resolved. Raised on review of #351.
 ///
 /// The edges in such a prefix are individually sound -- the resolver proved each one -- but a
 /// prefix is not the table, and handing one over silently lets a goal *past* it read as a clean
@@ -596,12 +603,49 @@ pub(crate) fn jump_targets(
     is_constant: impl Fn(u64) -> bool,
     halt: impl FnMut() -> Option<Halt>,
 ) -> Tables {
-    let found = map(entry, block, layout, read, in_image, is_constant, halt);
-    if found.halted.is_some() || found.cap_hit {
+    jump_targets_within(
+        entry,
+        block,
+        layout,
+        read,
+        in_image,
+        is_constant,
+        halt,
+        MAX_SWEEPS,
+    )
+}
+
+/// The same with the sweep budget named, which is how the `unsettled` arm above is asserted: a
+/// routine whose facts never settle inside [`MAX_SWEEPS`] is one no fixture here can write down, and
+/// the rule about what is reported then should not go untested for that reason. Mirrors
+/// [`map_within`], which exists for the same reason and says so.
+#[allow(clippy::too_many_arguments)]
+fn jump_targets_within(
+    entry: u64,
+    block: &[Instruction],
+    layout: Layout,
+    read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    in_image: impl Fn(u64) -> bool,
+    is_constant: impl Fn(u64) -> bool,
+    halt: impl FnMut() -> Option<Halt>,
+    sweeps: usize,
+) -> Tables {
+    let found = map_within(
+        entry,
+        block,
+        layout,
+        read,
+        in_image,
+        is_constant,
+        halt,
+        sweeps,
+    );
+    let bounded = found.cap_hit || found.unsettled;
+    if found.halted.is_some() || bounded {
         return Tables {
             targets: Vec::new(),
             stopped: found.halted,
-            bounded: found.cap_hit,
+            bounded,
         };
     }
     let mut by_site: Vec<(u64, Vec<u64>)> = Vec::new();
@@ -4943,6 +4987,115 @@ mod tests {
             found.cap_hit,
             "and a prefix has to say it is one: {found:?}"
         );
+    }
+
+    /// **Facts that never settled are a bound, and the answer has to say so.**
+    ///
+    /// `map` discards every belief when it runs out of sweeps -- reporting one a later edge would
+    /// have taken away is worse than reporting none -- so `cases` and `tables` come back empty. The
+    /// resolver then answered with no edges and `bounded: false`, which let a reachability walk report
+    /// a clean `NOT REACHABLE` about a graph whose tables were never resolved.
+    ///
+    /// `MAX_SWEEPS` was named as one of the resolver's caps in `jump_targets`' own doc comment while
+    /// the condition beneath it read `cap_hit` alone; `unsettled` is a separate field. Raised on
+    /// review of #351, which is the third finding on "a partial answer that does not say which kind
+    /// of partial it is" -- and the first where the prose already named the case.
+    #[test]
+    fn an_unsettled_resolver_pass_is_bounded() {
+        // A switch whose table would resolve, so the difference is the sweep budget and nothing else.
+        const TABLE: u64 = IMAGE_BASE + 0x2_0000;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg("rbx"), pointer("rdx", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "mov",
+                vec![reg("r13d"), mem("rbx", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("r13d"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x20)),
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "lea",
+                vec![reg("rcx"), at_address(TABLE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movsxd",
+                vec![reg("rax"), table_load("rcx", "r13d", 4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x1c, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+        ];
+        let read = |at: u64, len: usize| {
+            (at == TABLE && len == 8).then(|| {
+                [0x20i32, 0x20]
+                    .iter()
+                    .flat_map(|entry| entry.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        // Settled: whatever it resolves, it is not *bounded*.
+        let settled = jump_targets_within(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+            MAX_SWEEPS,
+        );
+        assert!(
+            !settled.bounded,
+            "a pass with sweeps to spare is not bounded"
+        );
+
+        // And with no sweeps at all the facts cannot settle, so the answer is a prefix and says so.
+        let starved = jump_targets_within(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+            0,
+        );
+        assert!(
+            starved.targets.is_empty(),
+            "nothing settled, so nothing is an edge: {:?}",
+            starved.targets
+        );
+        assert!(
+            starved.bounded,
+            "and the caller has to learn a limit stopped it"
+        );
+        assert!(starved.stopped.is_none(), "which is not a halt");
     }
 
     /// **A64 names a store's source first, and a store is not a load.**
