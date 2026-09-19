@@ -157,10 +157,25 @@ The detach-only live test then ran twice, sequentially, against the recovered gu
   A later TCP reachability check timed out too. The wrapper stopped; the planned third cycle
   did not run. No MCP process or hypervisor-port listener remained after the failure.
 
-This does **not** validate reliable safe detach. The second cycle's console state and whether
-the guest halted, stopped again, or only lost management networking still need investigation.
-Do not treat the passing Rust test alone as an independently confirmed resume, or attribute this
-failure to the earlier packet-ID mismatch without a new transport trace.
+The owner confirmed a black/frozen console after the second cycle. A single native-KD recovery
+connection then reached the hypervisor without an explicit-target poke. Its trace initially rejected
+state packet ID `0x1e6` while expecting `0x0`, but subsequently received a target `RESET` packet
+and set its expected ID to `0x1e6`. Unlike the earlier failed recovery, synchronization progressed
+to a usable prompt. The last event was a first-chance break-in exception at `hv+0x404a60` on CPU 0,
+and the new controller's breakpoint list was empty.
+
+Native KD's `qd` set the program counter to `hv+0x404a61`, wrote control space, and sent
+`DbgKdContinue(10002)`, which the target acknowledged. KD exited successfully. WinRM subsequently
+answered twice with uptime advancing from 1444.51 to 1447.88 seconds and the same boot time
+as before the two candidate cycles. Recovery required no further reset, reboot, or configuration
+change. The recovery controller requested an initial break; its observed stop alone therefore does
+not establish precisely where the candidate originally left the target.
+
+This does **not** validate reliable safe detach. The frozen console and failed management checks
+establish an unusable guest after the second cycle, but do not distinguish a failed resume from an
+immediate subsequent stop. Do not treat the passing Rust test alone as an independently confirmed
+resume. The next reproduction needs packet-level evidence from the candidate teardown itself,
+not just a trace from the recovery controller.
 
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
