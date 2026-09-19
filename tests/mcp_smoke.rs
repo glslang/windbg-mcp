@@ -1305,55 +1305,88 @@ fn discover_opens_a_session_without_initialize() {
     );
 }
 
-/// Advertising a capability the server does not implement is worse than not advertising it:
-/// clients route real calls into a `method_not_found`. This asserts the honest surface — if an
-/// SDK bump switches something on for us, this test is where you find out and decide whether
-/// to implement it or suppress it.
-#[test]
-fn capabilities_advertise_only_what_is_implemented() {
-    let mut server = Server::spawn();
-    let result = server.initialize(SUPPORTED_REVISIONS[0]);
-    let capabilities = &result["capabilities"];
-
+/// What this server may advertise, as a whole key set rather than a list of keys that must be
+/// absent.
+///
+/// Every field of rmcp's `ServerCapabilities` is `skip_serializing_if = "Option::is_none"`, so the
+/// object on the wire is exactly what `get_info` builds — one key today. Naming the absent ones
+/// cannot catch a capability nobody here has heard of, and that is the shape the next one arrives
+/// in: `ServerCapabilities` is `#[non_exhaustive]`, and tasks
+/// (`io.modelcontextprotocol/tasks`, SEP-2663) would appear as `extensions` under the SEP rmcp
+/// implements but as a first-class `tasks` field if rmcp follows the reference TypeScript SDK,
+/// which still spells it that way (`FOLLOWUPS.md` item 8). The four-names-plus-`extensions` check
+/// this replaced covered the first of those two routes and would have passed the second in silence.
+fn assert_only_tools_advertised(capabilities: &Value, whose: &str) {
     assert!(
         !capabilities["tools"].is_null(),
-        "tools must be advertised: {capabilities}"
+        "{whose} must advertise tools: {capabilities}"
     );
-
-    // **The whole key set, not a list of the keys that must be absent.** Every field of rmcp's
-    // `ServerCapabilities` is `skip_serializing_if = "Option::is_none"` and `get_info`'s
-    // capabilities reach the wire unaltered (`negotiate_initialize` rewrites `protocolVersion`
-    // and nothing else), so what this server advertises is exactly what `get_info` builds — one
-    // key today. Naming the absent ones cannot catch a capability nobody here has heard of, and
-    // that is the shape the next one arrives in: `ServerCapabilities` is `#[non_exhaustive]`, and
-    // tasks (`io.modelcontextprotocol/tasks`, SEP-2663) would appear as `extensions` under the
-    // SEP rmcp implements but as a first-class `tasks` field if rmcp follows the reference
-    // TypeScript SDK, which still spells it that way (`FOLLOWUPS.md` item 8). What this replaced —
-    // four names plus an `extensions`-is-null check — covered the first of those two routes and
-    // would have passed the second in silence. A key set covers both, and the one after them.
     let advertised: std::collections::BTreeSet<&str> = capabilities
         .as_object()
-        .expect("`capabilities` must be a JSON object")
+        .unwrap_or_else(|| panic!("{whose} capabilities must be a JSON object: {capabilities}"))
         .keys()
         .map(String::as_str)
         .collect();
     assert_eq!(
         advertised,
         std::collections::BTreeSet::from(["tools"]),
-        "this server implements tools and no other capability, so `tools` is the whole of what it \
-         may advertise — anything else here is a door clients will open onto a method_not_found. \
-         If an SDK bump switched one on, implement it or suppress it rather than shipping the \
-         advertisement: {capabilities}"
+        "this server implements tools and no other capability, so `tools` is the whole of what \
+         {whose} may advertise — anything else here is a door clients will open onto a \
+         method_not_found. If an SDK bump switched one on, implement it or suppress it rather than \
+         shipping the advertisement: {capabilities}"
     );
+}
+
+/// Advertising a capability the server does not implement is worse than not advertising it:
+/// clients route real calls into a `method_not_found`. This asserts the honest surface — if an
+/// SDK bump switches something on for us, this test is where you find out and decide whether
+/// to implement it or suppress it.
+///
+/// **Asserted on both lifecycles, because the dispatch decision is not shared between them.** The
+/// *advertisement* cannot currently differ — `DiscoverResult::from_server_info` moves `get_info`'s
+/// `capabilities` across verbatim, so the two answers are one value — but what decides whether a
+/// `tasks/*` call is refused reads the **client's** capabilities as well as this server's, and
+/// `RequestContext::client_capabilities` resolves those per lifecycle: from the handshake for a
+/// legacy peer, and from each request's `_meta` where `request_metadata_required()`. So the two
+/// paths run different code to reach the same refusal, and one probe only covers one of them.
+/// Which is the gap this had on review: `FOLLOWUPS.md` item 8's own measurement says the stateless
+/// lifecycle is the *only* one where a task could be materialised at all, since every
+/// `initialize` settles on a legacy revision and SEP-2663 forbids tasks there.
+///
+/// What the helper above cannot express is the set of lifecycles — a third way of asking a server
+/// what it is would need naming here, not in it.
+#[test]
+fn capabilities_advertise_only_what_is_implemented() {
+    // The handshake lifecycle.
+    let mut server = Server::spawn();
+    let result = server.initialize(SUPPORTED_REVISIONS[0]);
+    assert_only_tools_advertised(&result["capabilities"], "`initialize`");
 
     // And the behaviour agreeing with the advertisement, for the extension most likely to arrive
     // first. Deliberately a second assertion rather than a consequence of the one above: rmcp
     // ships the whole server-side task runtime, so `tasks/get` answering is one `enable_tasks()`
-    // away and would not need a capability key to be wrong about.
+    // away and would not need a capability key to be wrong about. It is also not a vacuous probe —
+    // `validate_tasks_capability` refuses an unadvertised method with `method_not_found` and an
+    // advertised one that the *client* did not ask for with `-32021`, so an rmcp that started
+    // advertising tasks moves this assertion rather than leaving it green.
     let tasks = server.request("tasks/get", json!({ "taskId": "nope" }), STEP);
     assert_eq!(
         tasks["error"]["code"], -32601,
         "an unimplemented extension method must be method_not_found, got {tasks}"
+    );
+
+    // The stateless lifecycle, on a connection of its own: a discover-first client never sends
+    // `initialize`, and mixing the two on one connection would be a shape no client presents.
+    let mut discovered = Server::spawn();
+    let response = discovered.stateless_request("server/discover", json!({}), STEP);
+    assert_no_error(&response, "server/discover");
+    assert_only_tools_advertised(&response["result"]["capabilities"], "`server/discover`");
+
+    let tasks = discovered.stateless_request("tasks/get", json!({ "taskId": "nope" }), STEP);
+    assert_eq!(
+        tasks["error"]["code"], -32601,
+        "an unimplemented extension method must be method_not_found for a discover-first client \
+         too, got {tasks}"
     );
 }
 
