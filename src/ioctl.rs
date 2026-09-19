@@ -532,6 +532,59 @@ const MAX_SWEEPS: usize = 32;
 /// `read` serves the image's own bytes for a jump table, and answers `None` for an address that
 /// will not read, which ends that table rather than the map. `in_image` says whether an address is
 /// code in this driver, which is what a table recognised by accident fails.
+/// Where every jump table in this listing sends control, as `(jump site, targets)`.
+///
+/// **`FOLLOWUPS.md` item 83.** `ioctl_map` resolves A64 switch tables and
+/// [`crate::driver::reachability`] does not, so since windbg-mcp#345 the two tools disagree about
+/// the same driver: the map names a handler that the reachability walk calls NOT REACHABLE, and the
+/// tool's advice is to pass the handler's address by hand to scope past the switch.
+///
+/// **The same walk answers both, which is the point rather than an economy.** The alternative was
+/// extracting [`follow_table`]'s table read out of the fact tracking it is built around, and two
+/// resolvers would then have to agree about a table's base, its bound, its entry width, its byte
+/// map and its fold -- six things this module has been wrong about once each, and a second copy is
+/// six more chances. Running [`map`] instead costs the control-code analysis nobody asked for here,
+/// and buys the property that matters: a target this returns is a target `ioctl_map` publishes, so
+/// the two tools cannot disagree.
+///
+/// Every bound comes with it -- the sweep budget, `halt`, `MAX_TABLES`, `MAX_TABLE_ENTRIES`, and
+/// the refusal to resolve a table whose base, scale or bound was not recovered. A table this
+/// declines contributes **no** targets, which leaves the reachability walk ending at that jump
+/// exactly as it does today: its REACHABLE verdict stays sound because every edge here is one the
+/// resolver proved, and its NOT REACHABLE stays best-effort, which is already the contract.
+///
+/// Grouped by site because a listing may hold more than one table, and a reachability walk must not
+/// take the targets of one jump for another's -- an edge that does not exist would make a REACHABLE
+/// verdict unsound, which is the one direction that walk may not be wrong in.
+pub(crate) fn jump_targets(
+    entry: u64,
+    block: &[Instruction],
+    layout: Layout,
+    read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    in_image: impl Fn(u64) -> bool,
+    halt: impl FnMut() -> Option<Halt>,
+) -> Vec<(u64, Vec<u64>)> {
+    let found = map(entry, block, layout, read, in_image, halt);
+    let mut by_site: Vec<(u64, Vec<u64>)> = Vec::new();
+    for case in found
+        .cases
+        .iter()
+        .filter(|case| case.recovered == Recovery::JumpTable)
+    {
+        match by_site.iter_mut().find(|(site, _)| *site == case.site) {
+            Some((_, targets)) => targets.push(case.lands),
+            None => by_site.push((case.site, vec![case.lands])),
+        }
+    }
+    // A switch's slots routinely share a landing -- several codes handled by one block -- and an
+    // edge repeated is an edge walked twice for nothing.
+    for (_, targets) in &mut by_site {
+        targets.sort_unstable();
+        targets.dedup();
+    }
+    by_site
+}
+
 /// How many literal-pool entries one routine may have read for it.
 ///
 /// Each is an engine round trip, which over KD is tens of milliseconds -- so this is a bound on the
