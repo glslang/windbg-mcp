@@ -3763,16 +3763,32 @@ target, `volmgr` answers `code_proved: true` with **5** entries in `untracked` a
 `unresolved` -- so the mechanism does fire on ARM64. (Those five are `movz`/`movk` compares rather
 than pool loads, which is a *separate* question this item does not cover.)
 
-**Why deferred:** `map()` already takes a `read` closure and `follow_table` uses it, but `update`
-does not have it -- so this is threading a reader into the fact walk, not a local fix. It also
-needs a rule for *which* loads are safe to read: a pool entry is `.rdata`-like data at a
-PC-relative address with no base or index register, and reading anything looser would let a driver's
-mutable globals be folded in as constants.
+**Why it was deferred, and what the estimate got wrong:** the entry expected "threading a reader
+into the fact walk", `map()` having a `read` closure that `update` does not. That turned out not to
+be the shape. The walk runs **twice** -- sweeps that settle each block's facts, then a pass that
+records from them -- and both must agree about every value, since a literal visible only to the
+recording pass would produce a case the sweeps never admitted. So `with_pool_immediates` resolves
+each readable literal load into the immediate it stands for **once, before either pass**, and
+nothing downstream changed: `source_value` folds an immediate, `scalar_of` resolves a compare
+against one and `status_after` reads one as a refusal, each through the arm it already had.
 
-**Where it picks up:** `ioctl::update`'s `Operand::Memory` arm and `ioctl::error_status`
-(`src/ioctl.rs`), `Value::Literal`, and `map`/`map_within`'s `read` parameter. The x64 path is
-unaffected -- there the same constants are immediates -- so every existing size test stays green
-while the gap is open, which is why it took a live ARM64 measurement to see.
+**And the rule for which loads are safe took two goes, in opposite directions.** The entry guessed
+"`.rdata`-like data at a PC-relative address with no base or index register". Review found the form
+alone insufficient -- a base-less `ldr` can legally name writable module storage -- and the first
+remedy over-corrected to the *executable* sections, arguing from the encoding's ±1 MB reach that a
+compiler must put the pool among the functions reading it. That confuses distance with permissions:
+`.rdata` sits well within a megabyte of `.text`, so legitimate pools were refused unread. The gate
+is `worker::constant_ranges` -- readable image storage the driver cannot write, `IMAGE_SCN_MEM_READ`
+without `IMAGE_SCN_MEM_WRITE` -- and `spans_one` requires the whole four-byte span inside one such
+range, a literal beginning in a section's last bytes otherwise continuing into memory the driver
+writes.
+
+**Where it landed:** `ioctl::pool_load` and `ioctl::with_pool_immediates` (`src/ioctl.rs`),
+`Layout::literal_pool` as the per-target gate, `worker::constant_ranges` and `worker::spans_one`.
+`MAX_POOL_READS` bounds the cost and reports itself through `cap_hit`, so a routine past it answers
+a prefix that says it is one. The x64 path is untouched -- there the same constants are immediates --
+which is why every existing size test stayed green while the gap was open, and why it took a live
+ARM64 measurement to see.
 
 ## 83. [windbg-mcp] `reachable_from_dispatch` does not follow the jump tables `ioctl_map` now reads — **done** (2026-09-19)
 
@@ -3789,10 +3805,26 @@ is to pass the handler VA by hand to scope past the switch.
 Architecture-independent, and newly material rather than newly true: before #345 nothing here could
 resolve an A64 table, so there was no asymmetry to notice.
 
-**Why deferred:** the resolver is `ioctl::follow_table`, which is built around the dispatch walk's
-`Facts` and its bounds check -- reachability has neither, so sharing it means extracting the table
-read from the fact tracking rather than calling it.
+**Why it was deferred, and what replaced the plan:** the entry expected `ioctl::follow_table` to be
+extracted out of the `Facts` tracking it is built around. That would leave **two** resolvers having
+to agree about a table's base, its bound, its entry width, its byte map and its fold -- five things
+this module has each been wrong about once, and a second copy is five more chances. So
+`ioctl::jump_targets` runs `map`'s own walk instead and returns what its tables select: a target the
+reachability walk admits is a target `ioctl_map` publishes, and the two tools cannot disagree.
 
-**Where it picks up:** `driver::reachable_from_dispatch` and its `uf`-driven walk (`src/driver.rs`),
-`ioctl::follow_table` (`src/ioctl.rs`), and the two prose caveats at `src/driver.rs:755` and
-`:1069` that promise the jump table is not followed.
+**What the review rounds added to that, and none of it was in the estimate.** The resolver answers
+per **listing** rather than per site -- asked per site it ran a whole analysis each time, so *n*
+indirect jumps cost *n* × every pool and table read -- and its answer carries why it might be short:
+a halt it consumed (the interrupt poll behind it is `GetInterrupt`, a consuming read, so no later
+poll can find it) and a bound it hit (`cap_hit` or `unsettled`). `driver::JumpTables` is that answer,
+merged into the walk's `halted` and `bound_hit`/`tables_bounded` rather than polled for. And the walk
+probes **once with no tables first** -- pure graph work -- so a `from` scoped past a switch, or a path
+already proven, pays nothing for a resolver it does not need, which is what makes the report's own
+advice to scope past the dispatch true.
+
+**Where it landed:** `ioctl::jump_targets` and `ioctl::Tables` (`src/ioctl.rs`),
+`driver::JumpTables`, `driver::walk_function`'s `Flow::Jmp` arm and `FnWalk::met_indirect`,
+`driver::find_path` (which needed the same edges, its own `Flow::Call` comment recording what
+happens when the recipe follows fewer than the walk), and the worker's per-listing resolver.
+`docs/limitations.md` and the two prose caveats in `src/driver.rs` say the table is crossed where it
+resolves and that the walk still ends at one that does not.
