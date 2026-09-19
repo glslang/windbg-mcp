@@ -516,7 +516,7 @@ impl Facts {
 
 /// The width of every field this module reads: `IoControlCode` and the two lengths are `ULONG`s,
 /// so a value narrower than this is part of one rather than one.
-const FIELD_WIDTH: u32 = 4;
+pub(crate) const FIELD_WIDTH: u32 = 4;
 
 /// How many times the block walk may sweep the function before the facts stop moving.
 ///
