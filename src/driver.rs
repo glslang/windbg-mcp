@@ -1068,6 +1068,25 @@ pub(crate) fn reachability(
         let empty = JumpTables::default();
         let (start_used, probe) = match walk_function(&block, desired, &empty) {
             Some(w) => (desired, w),
+            // **The entry fallback is the seed's, and only the seed's** -- which is what the comment
+            // above already says: a `from` the caller spelled as a symbol, or one that resolved to an
+            // address this listing does not start an instruction at, is a question about *where to
+            // begin*, and beginning at the entry answers it.
+            //
+            // A **discovered** edge is not that. Its address came from the target's own bytes -- a
+            // call, a tail jump, or since `FOLLOWUPS.md` item 83 a resolved table slot -- and if that
+            // address is not an instruction boundary then execution does not arrive there. Widening
+            // it to the whole function explores code no path reaches and can answer `REACHABLE` for
+            // one, which is the single direction this walk may not be wrong in. So the edge is
+            // dropped instead.
+            //
+            // **Pre-existing, and deliberately fixed wider than it was reported.** Review raised it
+            // against the table slots, those being the new source; a corrupted `call` target has
+            // always reached the same fallback and does the same damage, and pruning only the
+            // tables would leave the identical hole behind the older of the two. Nothing legitimate
+            // is lost: a real call lands on a function's entry, and a real tail jump or case block
+            // lands on a boundary inside the listing `uf` returns -- only a bogus target falls here.
+            None if token.is_some() => continue,
             None => (
                 entry,
                 walk_function(&block, entry, &empty).expect("entry is always an instruction"),
@@ -3324,6 +3343,72 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(r.seed_start, Some(0x1000), "{r:?}");
         assert_eq!(r.funcs_explored, 1, "{r:?}");
         assert_eq!(r.containing_fn, Some(0x1000), "{r:?}");
+    }
+
+    /// **A discovered edge that is not an instruction boundary is dropped, not widened to the whole
+    /// function.**
+    ///
+    /// The entry fallback exists for the *seed*: a `from` spelled as a symbol, or resolved to an
+    /// address the listing does not start an instruction at, is a question about where to begin. A
+    /// discovered edge is not that -- its address came from the target's own bytes, and if execution
+    /// cannot arrive there then exploring the containing function from its entry invents
+    /// reachability. `REACHABLE` is the one direction this walk may not be wrong in.
+    ///
+    /// Raised on review of #351 against the jump-table slots, `follow_table` checking only that a
+    /// slot lands in an executable range. The fallback is older than that and a corrupted `call`
+    /// target has always reached it, so the fix covers every discovered edge -- which is what this
+    /// test uses, a call, to keep the rule and its newest source apart.
+    #[test]
+    fn a_discovered_edge_off_an_instruction_boundary_is_not_followed() {
+        // The callee's real entry is 0x2000; 0x2001 is inside its first instruction.
+        let callee = uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]);
+        let seed_at = |call: u64| {
+            uf_fn(
+                0x1000,
+                vec![
+                    insn(0x1004, Flow::Call(Some(call)), "call"),
+                    insn(0x1008, Flow::Return, "ret"),
+                ],
+            )
+        };
+
+        // **The control first**, so a green result cannot mean the fixture reaches nothing: a call
+        // to the real entry finds the goal.
+        let good = functions(&[("start", seed_at(0x2000)), ("0x2000", callee.clone())]);
+        let reached = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| good.get(a).cloned(),
+            no_tables,
+            never,
+        );
+        assert!(
+            reached.verdict_reachable,
+            "the control must reach: {reached:?}"
+        );
+
+        // And the same graph with the call one byte into that instruction. `uf` answers with the
+        // containing function, exactly as the engine does -- so the only thing that differs is
+        // whether the requested address starts an instruction in it.
+        let bad = functions(&[("start", seed_at(0x2001)), ("0x2001", callee)]);
+        let missed = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| bad.get(a).cloned(),
+            no_tables,
+            never,
+        );
+        assert!(
+            !missed.verdict_reachable,
+            "execution cannot arrive mid-instruction, so this function is not entered from here: \
+             {missed:?}"
+        );
     }
 
     #[test]
