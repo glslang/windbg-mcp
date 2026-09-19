@@ -939,6 +939,21 @@ pub(crate) struct Report {
     /// incomplete, and the one with a remedy neither of the others has — a dump missing its code
     /// pages needs an image search path, not a larger bound or a longer clock.
     blind: usize,
+    /// Whether the **jump-table resolver** stopped at a limit of its own, so a table's edges may be
+    /// missing from the graph this verdict is about.
+    ///
+    /// A fourth way to be incomplete, and it is here for the same reason [`Self::blind`] is: the
+    /// remedy is not the others'. [`Self::bound_hit`] is rendered as "raise max_functions/max_depth
+    /// and retry", and that advice is *wrong* for this one — those arguments do not reach
+    /// `MAX_POOL_READS`, `MAX_CASES`, `MAX_TABLE_ENTRIES` or `MAX_SWEEPS`, so a caller following it
+    /// retries and still gets a graph short of the same edges. Raised on review of #351, where the
+    /// resolver's bound was folded into `bound_hit` because that was the existing channel for "this
+    /// is incomplete" — which it is, and it is not the channel for "here is what to do".
+    ///
+    /// `bound_hit` is still set alongside it, deliberately: a bound *was* hit, and a consumer
+    /// reading the typed answer for whether the graph was fully explored gets the right answer from
+    /// the field that has always meant that. What this changes is the advice.
+    tables_bounded: bool,
 }
 
 /// Walks the call/branch graph from `from`, running `uf(arg)` for each discovered
@@ -985,6 +1000,7 @@ pub(crate) fn reachability(
         funcs_explored: 0,
         max_depth_seen: 0,
         bound_hit: false,
+        tables_bounded: false,
         max_functions,
         max_depth,
         halted: None,
@@ -1024,7 +1040,11 @@ pub(crate) fn reachability(
         if rpt.halted.is_none() {
             rpt.halted = tables.stopped;
         }
+        // Both, and the pair is the point: `bound_hit` says the graph is partial, which is true
+        // however it happened, and `tables_bounded` says the remedy is not the one `bound_hit` is
+        // rendered with.
         rpt.bound_hit |= tables.bounded;
+        rpt.tables_bounded |= tables.bounded;
         let (start_used, walk) = match walk_function(&block, desired, &tables) {
             Some(w) => (desired, w),
             None => (
@@ -1189,6 +1209,15 @@ pub(crate) fn format_report(r: &Report) -> String {
             Some(Halt::Interrupted) => {
                 out.push_str("  Stopped: interrupted — the graph was NOT fully explored.\n")
             }
+            // The resolver's own cap outranks the configurable bound for the same reason a halt
+            // outranks both: it decides what the reader should do next, and "raise
+            // max_functions/max_depth" does not reach it.
+            None if r.tables_bounded => out.push_str(
+                "  Bound hit: yes — the jump-table resolver stopped at a limit of its own, so a\n\
+                 \x20          switch's edges may be missing. max_functions/max_depth do not \
+                 reach it;\n\
+                 \x20          pass a specific handler VA as `from` to scope past the dispatch.\n",
+            ),
             None => out.push_str(&format!(
                 "  Bound hit: {}\n",
                 if r.bound_hit {
@@ -2914,6 +2943,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             funcs_explored: 1,
             max_depth_seen: 0,
             bound_hit: false,
+            tables_bounded: false,
             max_functions: 256,
             max_depth: 32,
             halted: Some(Halt::Interrupted),
@@ -2936,6 +2966,63 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         r.halted = None;
         let text = format_report(&r);
         assert!(!text.contains("Stopped:"), "{text}");
+    }
+
+    /// **A resolver's own cap is rendered with a remedy that exists.**
+    ///
+    /// `bound_hit` is printed as "raise max_functions/max_depth and retry", which is right for the
+    /// two arguments it was named for and wrong for `MAX_POOL_READS`, `MAX_CASES`,
+    /// `MAX_TABLE_ENTRIES` and `MAX_SWEEPS` -- none of which those arguments reach. Folded together,
+    /// the report told a caller to do something that cannot change the answer, and a retry came back
+    /// short of the same table edges. Raised on review of #351.
+    ///
+    /// `bound_hit` is still set for a resolver cap, deliberately: a bound *was* hit, and a consumer
+    /// asking the typed answer whether the graph was fully explored should get `true` from the field
+    /// that has always meant that. What the distinction changes is the advice, so that is what this
+    /// asserts -- both renderings, and that each excludes the other's remedy.
+    #[test]
+    fn a_resolver_cap_is_not_rendered_as_a_raisable_bound() {
+        let base = Report {
+            verdict_reachable: false,
+            from_entry: Some(0x1000),
+            target: 0x9999,
+            containing_fn: None,
+            path: Vec::new(),
+            funcs_explored: 1,
+            max_depth_seen: 0,
+            bound_hit: true,
+            max_functions: 256,
+            max_depth: 32,
+            halted: None,
+            blind: 0,
+            seed_start: None,
+            tables_bounded: false,
+        };
+
+        // The configurable bound: raising the arguments is the remedy, and it is named.
+        let text = format_report(&base);
+        assert!(text.contains("raise max_functions/max_depth"), "{text}");
+        assert!(!text.contains("handler VA"), "{text}");
+
+        // The resolver's own: the arguments are named as *not* reaching it, and the remedy that
+        // does is given instead.
+        let capped = Report {
+            tables_bounded: true,
+            ..base
+        };
+        let text = format_report(&capped);
+        assert!(
+            text.contains("jump-table resolver stopped at a limit of its own"),
+            "{text}"
+        );
+        assert!(
+            text.contains("do not reach it"),
+            "the advice has to say the arguments will not help: {text}"
+        );
+        assert!(
+            text.contains("handler VA"),
+            "and give the remedy that does: {text}"
+        );
     }
 
     #[test]
