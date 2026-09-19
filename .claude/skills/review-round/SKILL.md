@@ -20,10 +20,16 @@ itself, in two places:**
 - **Its summary comment**, one per PR and updated in place, marked
   `<!-- codex-pull-request-review-summary -->`. It is an *issue* comment, not a review comment, and
   carries a table whose `Commit` column is the SHA of the latest review and whose `Status` says
-  whether it finished:
+  whether it finished. **Match the author as well as the marker, and compare that SHA to the head** —
+  any comment may carry the marker, and the reason to check is mundane rather than adversarial: the
+  comment is updated in place, so the one sitting there is the *previous* review until the current
+  one finishes, and reading it without the comparison is how a reviewed-looking head turns out to be
+  the one before:
   ```console
   gh api --paginate repos/<owner>/<repo>/issues/<n>/comments \
-    --jq '.[] | select(.body | contains("codex-pull-request-review-summary")) | .body'
+    --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]")
+          | select(.body | contains("codex-pull-request-review-summary")) | .body'
+  git rev-parse --short HEAD   # and read the table's Commit against this
   ```
 - **A reaction on the PR**: 👀 while a review is running, **👍 once every review has finished with
   no findings** — which is the signal that a round is genuinely closed rather than pending.
