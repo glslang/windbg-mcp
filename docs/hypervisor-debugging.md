@@ -174,8 +174,10 @@ not establish precisely where the candidate originally left the target.
 This does **not** validate reliable safe detach. The frozen console and failed management checks
 establish an unusable guest after the second cycle, but do not distinguish a failed resume from an
 immediate subsequent stop. Do not treat the passing Rust test alone as an independently confirmed
-resume. The next reproduction needs packet-level evidence from the candidate teardown itself,
-not just a trace from the recovery controller.
+resume. A subsequent [candidate-side packet trace](hypervisor-detach-trace.md) captured an
+acknowledged continue from the candidate itself, followed by additional stops on different CPUs.
+Two sequential native recovery sessions were needed for that run. This narrows the investigation
+to break-in/stop handling but does not establish a safe replacement sequence.
 
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
