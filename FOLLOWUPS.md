@@ -1,8 +1,13 @@
 # Follow-ups
 
 Deferred work, in twenty-five clusters: items 2–6 come from the reachability-confirmation effort (path
-recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
-the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
+recipe + `run_to_address`, merged 2026-07-04), items 8–9, 11 and 88 from surveying this server
+against the MCP `2026-07-28` extensions (tasks, apps) and then re-measuring the tasks half of it
+(2026-09-19) — where rmcp and the reference TypeScript SDK turn out to implement two
+wire-incompatible generations of SEP-2663 while the client this server is actually driven by
+declares neither, and where the one thing a task would genuinely have bought surfaced as item 88
+instead: a call that outlives its budget finishes its work in the worker and has the answer
+thrown away — item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
 `walk_memory` (#103, 2026-08-13), item 27 from completing the coordinate work (#156–#158,
 2026-08-18), item 32 from running the debugger tier on the ARM64 runner image that replaces
@@ -151,68 +156,167 @@ than the human/LLM-readable recipe emitted today.
   debugger memory snapshot rather than building an in-house solver — kernel state modeling, loops,
   hashing, and stateful protocols make it brittle and a separate project.
 
-## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663)
+## 8. [windbg-mcp] Tasks extension (`io.modelcontextprotocol/tasks`, SEP-2663) — **measured and deferred** (2026-09-19)
 
-Nothing here speaks tasks today. `#[rmcp::tool_handler]` generates `get_info` as
-`ServerCapabilities::builder().enable_tools().build()` and nothing else, so no `extensions` map is
-advertised and `tasks/get` / `tasks/update` / `tasks/cancel` fall through to the `ServerHandler`
-trait defaults (`method_not_found`).
+Nothing here speaks tasks today. The hand-written `get_info` advertises
+`ServerCapabilities::builder().enable_tools()` and no `extensions` map, so `tasks/get` /
+`tasks/update` / `tasks/cancel` fall through to the `ServerHandler` trait defaults
+(`method_not_found`), which `capabilities_advertise_only_what_is_implemented` pins from the wire.
 
-The fit is unusually good, because the server already models the problem tasks exist to solve.
-`EngineError::Timeout` documents that a timeout abandons "the *waiter*, not the engine, so it may
-still be running" (`src/engine.rs:37-42`), and the `opens: VecDeque<(String, OpenOutcome)>` ring
-(`src/server.rs:43`) plus `session_status` (`:1963`) exist **only** so a caller whose open timed out
-can ask afterwards whether it is still pending, landed, or failed. That is a hand-rolled `tasks/get`;
-the extension replaces it with the standard one.
+The fit still looks unusually good, because the server models the problem tasks exist to solve.
+`EngineError::Timeout` documents that "the job was abandoned by the *waiter*, not by the worker, so
+it may still be running and may still succeed", and `Sessions::call_within` says the same of the job
+— *"the job itself is **not** cancelled — only this wait for it"*. **Deferred anyway**, because the
+measurement below says the wire has two mutually incompatible generations of this feature on it, and
+the generation the client end speaks is the one that is in a released schema.
 
-Wiring is mechanical. rmcp 3.0.0 ships the whole server-side runtime — `rmcp::task_manager::{TaskManager,
-TaskOptions, TaskContext, TaskExit}`, `CallToolResponse::Task(CreateTaskResult)`,
-`ClientCapabilities::supports_tasks()`, TTL expiry, cooperative cancel — and the macro does not fight
-it: `tool_handler` only synthesizes `call_tool`/`list_tools`/`get_tool`/`get_info` when the impl block
-does not already define them, so hand-writing `call_tool` and `get_info` inside the existing
-`impl rmcp::ServerHandler for WindbgServer` leaves the rest generated.
+- **What is stale in the analysis this entry used to carry**, all of it written 2026-07-29 and last
+  touched 2026-08-10, and worth recording because each was cited as the reason to do the work:
+  - The `opens: VecDeque<(String, OpenOutcome)>` ring it called a hand-rolled `tasks/get` is
+    **gone**. Item 10 replaced it with the supervisor's session registry — `engine::Registry`,
+    `SessionState`'s six states, `SessionSnapshot` carrying `state`, `in_state_for`, `age`,
+    `current` and `execution`, filtered to the caller by `Sessions::snapshot`. So
+    "`session_status` can shrink to a thin adapter over `tasks/get`" is **false**: that tool
+    answers about a **session** and a task is about a **call**, and `tasks/get` has a field for
+    none of it.
+  - `record_trace`, offered as the first conversion because it is "already off any engine", is no
+    longer a long call at all: `ttd::record_launch` returns after `STARTUP_WATCH`, 2,500 ms, and
+    never waits for the recording. The tools that reach no engine at all are `decode_ioctl`,
+    `session_status`, `server_log` and this one, and the first three answer from arithmetic or from
+    this server's own state — so the "no debugger risk" tool the conversion was to be proved on no
+    longer takes long enough to be worth converting.
+  - "Hand-writing `call_tool` and `get_info` leaves the rest generated" is already done, for
+    item 40's per-client instructions and for the recording and progress hooks. That half of the
+    wiring exists.
+  - Its step 3 — `go` / `run_to_address` / `execute` as tasks, with `tasks/cancel` raising item 7's
+    interrupt, and a queued-job cancel named as the half item 7 did not build — is overtaken by
+    [#83](https://github.com/glslang/windbg-mcp/issues/83). `continue_async` + `wait_for_stop` +
+    `break_in` are a create/poll/cancel triple already, with domain rules tasks cannot express (one
+    run per session, reads of a moving target refused, a stop read rather than taken, a break bound
+    to a job id), and `Running::barred` is the queued-cancel half.
+  - Its line/column citations (`src/engine.rs:37-42`, `src/server.rs:43`, `:1963`) had all moved.
+    This entry names symbols instead, which is the reason.
 
-Suggested order, chosen so the protocol work is proved before it touches DbgEng:
+- **The two generations, measured 2026-09-19.** rmcp 3.3.0 implements SEP-2663 (status **Final**)
+  faithfully. The reference TypeScript SDK 1.30.0 — which Claude Code 2.1.278 bundles, under
+  `dist/esm/experimental/tasks/` — implements the tasks defined in the released
+  `schema/2025-11-25/schema.json` instead, which SEP-2663 *removes* from the core protocol and
+  calls experimental. The SEP says outright that the two are "**not wire-compatible**":
 
-1. `record_trace` — already off any engine (`spawn_blocking`, `src/server.rs`), so converting it is
-   pure protocol work with no debugger risk.
-2. `open_dump` / `open_trace` / `index_trace` / `attach_kernel` — where the pain actually is, and
-   where `session_status` can shrink to a thin adapter over `tasks/get`.
-3. `go` / `run_to_address` / `execute` — these were held for item 7, which has landed. `tasks/cancel`
-   is *cooperative* by spec, so they were implementable without an interrupt; what they lacked was
-   any way to make an effort short of ending the session outright, since for exactly these three the
-   engine is blocked inside DbgEng. Now a cancel for the *running* job can raise the interrupt item 7
-   built, and the job returns what it reached. A cancel for a job still **queued** is the half item 7
-   did not build, and this is what would ask for it: drop it from the queue and answer its waiter,
-   rather than raise anything — a bare interrupt would Ctrl+Break the unrelated job that is actually
-   running. It needs a second request variant naming a job id, and the lock item 7 put in is what
-   makes both safe together.
+  | | rmcp 3.3.0 (SEP-2663) | SDK 1.30.0 / Claude Code 2.1.278 |
+  |---|---|---|
+  | Capability | `capabilities.extensions["io.modelcontextprotocol/tasks"]` | `capabilities.tasks{list,cancel,requests:{tools:{call}}}` |
+  | Who opts in | the server, per request | the **client**, via `params.task` |
+  | Create result | `{resultType:"task", taskId, …}`, flattened | `{task:{…}}`, nested |
+  | Poll | `tasks/get` — payload inlined | `tasks/get` — status only |
+  | Payload fetch | (inlined above) | `tasks/result` |
+  | Enumerate | (none, deliberately) | `tasks/list` |
+  | In-task input | `tasks/update` | (none) |
+  | Cancel result | empty acknowledgement | the `Task` |
+  | Push | `notifications/tasks` | `notifications/tasks/status` |
+  | TTL / poll fields | `ttlMs` / `pollIntervalMs` | `ttl` / `pollInterval` |
 
-Fast, pure tools (`decode_ioctl`, `registers`, `read_memory`, `modules`, `threads`, `disassemble`,
-`backtrace`, `session_status`) should stay synchronous.
+  What the two ends share is the extension identifier and the *spelling* of `tasks/get` and
+  `tasks/cancel`, and they disagree about what both of those return.
 
-- **Three things to get right, not plumbing:**
-  - **TTL must not re-introduce the lie.** `DEFAULT_TASK_TTL_MS` is 5 minutes and expiry marks a task
-    `failed`; a kernel attach waits indefinitely by design. Attaches need `ttl_ms: None`, or the task
-    reports a failure while the attach is still genuinely pending — the exact false report the
-    conversion was meant to remove.
+- **And the client this server is actually driven by declares neither.** Measured with a throwaway
+  stdio server registered through `claude -p --mcp-config --strict-mcp-config`, which records the
+  handshake and needs no VM:
+  - `initialize` sends `protocolVersion: "2025-11-25"` and
+    `capabilities: {roots:{listChanged:true}, elicitation:{}}` — no `tasks`, no `extensions`.
+    SDK 1.30.0's own `LATEST_PROTOCOL_VERSION` is `2025-11-25` and `2026-07-28` is absent from its
+    `SUPPORTED_PROTOCOL_VERSIONS`.
+  - Given a probe advertising the SDK's *own* `capabilities.tasks` shape, its `tools/call` carried
+    **no** `params.task`, and a bare `CreateTaskResult` came back to the model as a failed tool
+    call — reported as *"content is required when the body carries 'task' — another result family
+    cannot default into an empty tools/call success"*. Returning a task to this client is a broken
+    call, not a deferred one.
+  - That same `tools/call` carried `progressToken: 2`. Progress is the asynchrony channel this
+    client reads.
+
+- **At the revision every handshake settles on, the SEP forbids it anyway.** This is the part that
+  makes the deferral conformance rather than judgement. `is_legacy_version` is `< "2026-07-28"` and
+  `negotiate_protocol_version` answers `newest_legacy_version` for anything that is not itself a
+  supported legacy version, so **every client arriving through `initialize` settles on a legacy
+  revision — `2025-11-25` at newest** — whatever its body named. SEP-2663's
+  backward-compatibility table gives that revision its own row: *"This extension is not defined
+  under the `2025-11-25` protocol version. Servers **MUST NOT** treat this capability as enabling
+  tasks under that protocol version; requests proceed as if the client had declared no task
+  capability at all."* Its canonical row is
+  `2026-06-30`. So a task could only ever be materialised for a client arriving the **sessionless**
+  way — `server/discover`, per-request `_meta` — which in this repository is driven from
+  `mcp_smoke` and `src/server.rs`'s own tests and from nowhere else, and is not the route the
+  client measured above takes.
+
+- **Converting a tool would also give up the channel that works.** `progress::Watch::run` wraps the
+  tool's future in `dispatch`; a tool that answers with a task handle completes that future at once,
+  so the heartbeat stops and the real work runs detached with no token. Nothing replaces it:
+  rmcp's `TaskManager` never sends `notifications/tasks` (and `subscriptions/listen` refuses to
+  route one, saying `SubscriptionFilter` has no `taskIds` field yet), so a client polls or learns
+  nothing.
+
+- **What tasks would genuinely buy, which is one thing and not the openers.** A call that outlives
+  the budget has its **answer thrown away while the work completes**: `reader`'s
+  `WorkerMessage::Done` arm sends the result into a `oneshot` whose receiver went with the
+  timed-out caller, and acts on the failed send for `OPENER_JOB` alone. A `pool_census` past 300 s
+  therefore runs to the end in the worker and is reported as a timeout with nothing to collect.
+  The openers already escape this — their timeout hands back a `session_id` and `session_status`
+  resolves it — and **item 88 is what would close the rest**, with `continue_async`'s filing task
+  rather than a protocol extension.
+
+- **Three things to get right, not plumbing** — the durable half of the original entry, carried
+  over (the third is compressed, and its reference to item 10's worker teardown dropped now that
+  `end_session` terminating a worker is simply how this server behaves):
+  - **TTL must not re-introduce the lie.** `DEFAULT_TASK_TTL_MS` is 5 minutes and expiry marks a
+    task `failed`; a kernel attach waits indefinitely by design. Attaches need `ttl_ms: None`, or
+    the task reports a failure while the attach is still genuinely pending — the exact false report
+    the conversion was meant to remove.
   - **An `attach_kernel` task must not report `cancelled`.** Item 7's interrupt does not unblock a
-    KDNET wait before the target connects — `SetInterrupt` cannot reach it — so a cancel cannot end
-    that job — and the job is not
+    KDNET wait before the target connects — `SetInterrupt` cannot reach it — and the job is not
     inert while it runs: the attach self-heals and *lands* the moment the target dials in, replacing
-    the current target. A task that went `cancelled` on request would therefore have the session
-    swapped underneath a client that believes the operation is over. Cooperative cancellation is the
-    escape hatch here rather than the problem: acknowledge the request, decline to transition, and
-    leave the task `working` until the engine job actually resolves. A cancel that genuinely ends the
-    wait needs item 10's worker teardown, which has landed: `end_session` terminates the session's
-    process, so a client that genuinely wants out has a way — it just is not `tasks/cancel`.
+    the current target. A task that went `cancelled` on request would have the session swapped
+    underneath a client that believes the operation is over. Cooperative cancellation is the escape
+    hatch rather than the problem: acknowledge, decline to transition, leave the task `working`
+    until the engine job resolves. A cancel that genuinely ends the wait is `end_session`, which
+    terminates the session's process — it just is not `tasks/cancel`.
   - **The session-handle contract needs a task-path clause.** The queued-precheck design survives
-    untouched (a task's gate still runs in the same queued job, so the ordering guarantee in the
-    CHANGELOG holds), but if an opener returns a task then the `session_id` arrives in the task
+    untouched (a task's gate still runs in the same queued job, so the CHANGELOG's ordering
+    guarantee holds), but if an opener returns a task then the `session_id` arrives in the task
     *result*, not the immediate response. "Commit the handle as soon as the target transition
     succeeds" has to be restated for that path.
-- **Note:** tasks are client-negotiated (`supports_tasks()`), so every converted tool keeps its
-  synchronous path. This is additive, never a replacement.
+
+- **And two prerequisites the original entry did not have, both of which review would find.**
+  - **`TaskManager` has no owner scoping, and the SEP requires one.** Ids are `Uuid::new_v4`, and
+    `get_task` / `cancel_task` take an id and nothing else — so on a listener serving several
+    credentials, any of them holding an id reaches that task. SEP-2663's own security section says
+    servers *"**MUST** perform authentication and authorization checks on each task-related
+    request"*. This server already draws that line for sessions (`Sessions::snapshot` filters
+    `s.owner == caller`), so the check is a `crate::client::current()` comparison the SDK does not
+    provide and each of the three handler methods has to make.
+  - **A task-shaped answer is invisible to the transcript.** `dispatch` records
+    `CallToolResponse::Complete` and has `Ok(_) => {}` for everything else — deliberate for MRTR,
+    where no result exists yet — so every converted tool would lose its result from
+    `WINDBG_MCP_TRANSCRIPT` until that arm learns to file a task's eventual payload.
+
+- **What would reopen it**, either half being enough to make the work mean something:
+  the client this server is driven by declares `io.modelcontextprotocol/tasks` and reaches the
+  server on a revision where the extension applies; or rmcp and the reference SDK agree on the
+  wire. And the asymmetry runs the wrong way for building early, because the **client's**
+  generation is the standardised one. `schema/2025-11-25/schema.json` defines `Task`, `CreateTaskResult`,
+  `GetTaskPayloadRequest` and `tasks/get` / `tasks/result` / `tasks/list` / `tasks/cancel` /
+  `notifications/tasks/status` — the SDK's shape exactly — while SEP-2663, which removes all of it,
+  has reached no released schema at all: `schema/2026-07-28/schema.json` is byte-identical to
+  `schema/draft/schema.json` on `main` and defines no task type, the extension living only in
+  `seps/`, deliberately, "to incubate and evolve based on additional real-world implementation
+  feedback… Once the extension has stabilized and achieved broad adoption, it is intended to be
+  promoted into the core protocol." Other SDKs are mid-migration
+  ([mcp-go#980](https://github.com/mark3labs/mcp-go/issues/980),
+  [kotlin-sdk#1003](https://github.com/modelcontextprotocol/kotlin-sdk/issues/1003)).
+- **Note:** tasks are client-negotiated, so every converted tool keeps its synchronous path. This
+  is additive, never a replacement — which is also why building it early buys nothing: under
+  rmcp's own gates (`validate_tasks_capability`, and the `CallToolResponse::Task` check in
+  `handle_request`) a client that declares nothing takes the synchronous path and never reaches a
+  line of it.
 
 ## 9. [dbgscope + windbg-mcp] Incremental output from a running command
 
@@ -222,7 +326,13 @@ That is the route to partial output from a long `g` or `execute` — a task's `s
 progress line — without the engine call returning. Today `OutputCallbacks` is installed on the one
 client for the duration of a command, so output only lands when the command ends.
 
-- **Why deferred:** worth little before item 8 gives it somewhere to go.
+- **Why deferred:** it used to read "worth little before item 8 gives it somewhere to go", and item
+  8 is now deferred with a trigger — but the somewhere arrived from the other direction. A
+  `progressToken` on a call is a channel `src/progress.rs` already owns and the client measured in
+  item 8 already sends, so a partial line has a destination today with no task and no extension.
+  What still defers this is which *milestones* belong on that channel: `progress::Step` is
+  deliberately a closed set of transitions the supervisor acts on, and free-text debugger output is
+  the opposite of that, so the design question is what to admit rather than how to carry it.
 - **Does not buy concurrency.** A second client joins the *same* session and serializes on the same
   engine lock; while one thread is in `WaitForEvent`/`Execute`, calls from the other block. It would
   swap the worker's queue for DbgEng's internal one and gain nothing. Concurrency *between* targets
@@ -1687,3 +1797,65 @@ underneath it.
 `(Condition::Equal | Condition::NotEqual, None)` arm that files an `untracked` entry, and the
 block-entry merge that decides what `Facts` a block starts with. A fixture has to be built from the
 real block sequence -- a hand-written four-compare chain has no join in it and already passes.
+
+## 88. [windbg-mcp] A call that outlives its budget finishes its work and has the answer discarded
+
+`Sessions::call_within` says it plainly — *"Note the job itself is not cancelled — only this wait
+for it"* — and `reader`'s `WorkerMessage::Done` arm is where that lands: it removes the waiter,
+sends the result into a `oneshot` whose receiver went with the timed-out caller, and treats the
+failure as expected. Which it is, and the comment there says so: *"For an ordinary call that is
+fine — removing the entry above is what mattered, and it is how the session stops counting as
+busy."*
+
+**It is fine for the session and not for the work.** A `pool_census`, a `heap_census`, a
+`crash_triage` fetching symbols or a `modules { "refresh": true }` past the 300 s
+`ENGINE_CALL_TIMEOUT` runs to completion in the worker, produces the whole answer, and has it
+dropped on the floor — the caller is told the call timed out and has no way to ask for what it
+computed. Re-running it pays the same minutes again, against a target that may have moved in
+between. The **openers** already escape this, and by exactly the mechanism worth copying: their
+timeout hands back a `session_id`, the same `Done` arm special-cases `OPENER_JOB` so the state
+settles with nobody waiting, and `session_status` answers afterwards.
+
+**The pattern to build it from is already here**, which is why this is worth doing without the tasks
+extension (`FOLLOWUPS.md` item 8, where the measurement says no client on this wire can drive one
+today). `continue_async` spawns a task that files a run's stop into the session's `execution` slot
+**keyed by job** rather than by handle, precisely so a caller who has gone away still leaves a result
+somebody can read, and `wait_for_stop` reads it rather than taking it. A late answer to an ordinary
+call is the same shape with a different payload.
+
+**Five things the design has to answer, and the third is the one that makes this more than plumbing.**
+
+- **Where the caller gets the key.** The opener's timeout names a `session_id`; an ordinary call's
+  timeout names nothing it could come back with. So the job id has to reach the caller, which is a
+  change to the `EngineError::Timeout` message *and* to the structured half a client parses — not
+  just prose.
+- **How much of it to keep.** A stop is one `StopReport`, while these are the largest answers this
+  server gives — `docs/token-budget.md`'s *Results* section and
+  `tool_results_stay_within_their_budget` are where their sizes are recorded, and item 27's
+  baseline column measures one `modules` listing at 53,897 B model-visible. A per-session ring of them is a memory bound with no natural
+  size, so the store wants to be small and to **say what it dropped** rather than silently keeping
+  the last one.
+- **A late answer describes a moment, and a stale one read as current is worse than none.** This is
+  the asymmetry with a stop, which *is* a moment by construction. A census describes the target's
+  memory when the job ran, and between then and the collection an `execute`, a `go` or a
+  `continue_async` may have moved it — so the record has to carry when it was taken and what
+  happened to the session since, or a caller reads last-minute memory as present state. The
+  conservative answer may well be that a late answer is invalidated by any intervening mutation,
+  which is a rule the session already has the information to apply.
+- **It must not keep the session alive.** `Session::busy` reads the waiter map *and* the execution
+  slot, and `last_used` is what reclamation reads. A late-answer store that either of those noticed
+  would make a session un-reclaimable for holding a result nobody asked for — the opposite of the
+  `Done` arm's "it is how the session stops counting as busy".
+- **Which ops are eligible.** A read's late answer is a convenience; a *mutating* command's is a
+  report about a change that has already happened, and `end_session`'s is moot. Worth deciding by
+  op rather than filing everything, and `EngineOp` is where that distinction already lives.
+
+**Why deferred:** it is a new store, a new key on the wire and a staleness rule, on a path whose
+current behaviour is deliberate and documented rather than broken — so it wants weighing against
+simply raising `WINDBG_MCP_CALL_TIMEOUT_SECS` for the handful of tools that reach it. What argues
+for building it is that the timeout is per *call* and these tools' cost scales with the target, so
+no one constant fits a small dump and a live kernel both.
+
+**Picks up at** `engine::reader`'s `WorkerMessage::Done` arm, `Sessions::call_within`'s timeout
+path, and `continue_async`'s filing task as the worked example. Independent of item 8, and cheaper:
+no capability negotiation, no extension, and it works for the client item 8 measured.
