@@ -998,6 +998,17 @@ pub(crate) fn reachability(
             rpt.verdict_reachable = true;
             rpt.containing_fn = Some(entry);
             rpt.path = reconstruct(&parent, token);
+            // **Polled on the way out, because success is a return too.** The poll at the top of
+            // this loop runs before a function is walked, and the one after the queue drains is not
+            // reached from here -- so a halt that landed *during* this walk would leave a
+            // `REACHABLE` carrying `halted: None`, which says the graph was explored when it was
+            // cut short. The case that makes it reachable rather than theoretical is the jump-table
+            // resolver: it may consume a deadline or interrupt, file it, and return no targets,
+            // after which another branch of the same function reaches the goal on its own.
+            // `FOLLOWUPS.md` item 83's resolver is what introduced that path.
+            if rpt.halted.is_none() {
+                rpt.halted = halt();
+            }
             return rpt;
         }
 
@@ -2688,6 +2699,67 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             )
             .verdict_reachable,
             "only the slots the resolver proved are edges"
+        );
+    }
+
+    /// **A `REACHABLE` verdict reached after a halt says it was cut short.**
+    ///
+    /// The success path is a `return` of its own, so the poll at the top of the queue loop is behind
+    /// it and the poll after the queue drains is never reached from it. A halt landing *during* the
+    /// walk that finds the target therefore produced `verdict_reachable: true` with `halted: None` --
+    /// a report saying the reachable call graph was explored when it had been stopped.
+    ///
+    /// The path that makes it reachable rather than theoretical is item 83's jump-table resolver: it
+    /// may consume a deadline or an interrupt, file it, and return no targets, after which another
+    /// branch of the same function reaches the goal on its own. So the resolver here halts and
+    /// resolves nothing, while a plain conditional branch leads to the target. Raised on review of
+    /// #351.
+    #[test]
+    fn a_reachable_verdict_reports_a_halt_the_resolver_consumed() {
+        // Entry falls through to a branch; the taken edge reaches the goal, and the block after it
+        // ends in an indirect jump the resolver is asked about.
+        let func = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Branch(Some(0x1010)), "jne 1010h"),
+                insn(0x1008, Flow::Jmp(None), "jmp qword ptr [tbl]"),
+                insn(0x1010, Flow::Return, "ret"), // the goal
+            ],
+        );
+        let mut uf = |a: &str| (a == "0x1000").then(|| func.clone());
+        // Consumes the halt the way the worker's resolver does -- files it and answers nothing.
+        let stopped = std::cell::Cell::new(false);
+        let mut resolve = |_: &[Instruction], at: u64| {
+            if at == 0x1008 {
+                stopped.set(true);
+            }
+            Vec::new()
+        };
+        let mut halt = || stopped.get().then_some(Halt::Deadline);
+
+        let r = reachability(
+            "0x1000",
+            Some(0x1000),
+            0x1010,
+            256,
+            32,
+            &mut uf,
+            &mut resolve,
+            &mut halt,
+        );
+
+        assert!(
+            r.verdict_reachable,
+            "the branch reaches the goal on its own"
+        );
+        assert!(
+            stopped.get(),
+            "and the resolver was asked, so a halt was consumed"
+        );
+        assert_eq!(
+            r.halted,
+            Some(Halt::Deadline),
+            "a verdict reached after a halt has to say so: {r:?}"
         );
     }
 
