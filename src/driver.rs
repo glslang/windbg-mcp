@@ -1291,8 +1291,9 @@ pub(crate) fn format_report(r: &Report) -> String {
             None if r.tables_bounded => out.push_str(
                 "  Bound hit: the jump-table resolver stopped at a limit of its own — this path \n\
                  \x20          is real, but a switch's edges may be missing, so a shorter one may \n\
-                 \x20          exist. max_functions/max_depth do not reach it; pass a specific \n\
-                 \x20          handler VA as `from` to scope past the dispatch.\n",
+                 \x20          exist. max_functions/max_depth do not reach it, and neither does\n\
+                 \x20          scoping `from` within the same routine: the resolver reads a whole\n\
+                 \x20          function. A `from` in another function avoids it.\n",
             ),
             None => {}
         }
@@ -1332,8 +1333,13 @@ pub(crate) fn format_report(r: &Report) -> String {
             None if r.tables_bounded => out.push_str(
                 "  Bound hit: yes — the jump-table resolver stopped at a limit of its own, so a\n\
                  \x20          switch's edges may be missing. max_functions/max_depth do not \
-                 reach it;\n\
-                 \x20          pass a specific handler VA as `from` to scope past the dispatch.\n",
+                 reach it,\n\
+                 \x20          and neither does scoping `from` within the same routine: the \
+                 resolver\n\
+                 \x20          reads a whole function, so a handler holding a switch of its own \
+                 still\n\
+                 \x20          pays for the dispatch's. A `from` in another function avoids \
+                 it.\n",
             ),
             None => out.push_str(&format!(
                 "  Bound hit: {}\n",
@@ -3138,8 +3144,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "an ordinary bound must not claim the resolver's: {text}"
         );
 
-        // The resolver's own: the arguments are named as *not* reaching it, and the remedy that
-        // does is given instead.
+        // The resolver's own: the arguments are named as *not* reaching it, and so is scoping
+        // `from` within the routine -- the resolver reads a whole function, so a handler that
+        // holds its own switch still pays for the dispatch's, and the advice used to send readers
+        // round that loop. Raised on review of #351.
+        //
+        // **Asserted on a phrase the boilerplate does not carry.** The check here was
+        // `contains("handler VA")`, which every report satisfies: the caveats block printed under
+        // all of them says "pass a specific handler VA as `from`". So it passed whatever this arm
+        // rendered -- the same vacuity an earlier round of this PR found in a `!contains` of the
+        // very same phrase, from the other direction.
         let capped = Report {
             tables_bounded: true,
             ..base.clone()
@@ -3154,8 +3168,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "the advice has to say the arguments will not help: {text}"
         );
         assert!(
-            text.contains("handler VA"),
-            "and give the remedy that does: {text}"
+            text.contains("scoping `from` within the same routine"),
+            "and say why scoping `from` is not the way out either: {text}"
         );
 
         // **And on a REACHABLE verdict too**, which the halt already qualified and this did not: the
@@ -3174,7 +3188,10 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             text.contains("jump-table resolver stopped at a limit of its own"),
             "a reachable verdict from a partial graph has to say so: {text}"
         );
-        assert!(text.contains("handler VA"), "{text}");
+        assert!(
+            text.contains("scoping `from` within the same routine"),
+            "{text}"
+        );
 
         // A halt outranks it, naming a different remedy for a different cause.
         let halted = Report {
