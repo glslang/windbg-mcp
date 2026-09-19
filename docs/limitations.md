@@ -34,7 +34,10 @@
   so the two tools no longer disagree about a handler the switch selects (`FOLLOWUPS.md` item 83):
   an edge admitted there is one that resolver proved, which is what keeps `REACHABLE` sound. Where
   the table does **not** resolve the walk still ends at the jump — pass the specific handler VA as
-  `from` to scope past it, or confirm dynamically with a breakpoint + `go`. **A walk scoped that way says so**, in
+  `from` to scope past it, or confirm dynamically with a breakpoint + `go`. That scoping narrows
+  the **walk** and not the **resolver**, which reads a whole function at a time: a `from` inside a
+  dispatch routine still pays for that routine's tables and literal pool, so it is no escape from a
+  resolver bound for a handler that holds a switch of its own. A `from` in another function is. **A walk scoped that way says so**, in
   both channels, because the verdict depends on where it began: from one case block a sibling case
   is not reachable, so the same question asked from the function's entry is a different question.
 - That walk is bounded by **what is left of the caller's own timeout**
