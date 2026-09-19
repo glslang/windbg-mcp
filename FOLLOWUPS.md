@@ -1836,21 +1836,35 @@ comment's example list instead of the dispatcher:
     the execution slot), `EndSession` (`END_SESSION_TIMEOUT`, 20s). `Interrupt` is answered ahead of
     the worker's queue on `INTERRUPT_TIMEOUT`. And the six **openers** are out of scope for the
     other reason — their timeout hands back a `session_id`.
-  - **And an op can carry a patience and still have an unbounded tail.** `CrashTriage` is that case
-    and is the sharpest example here: its `!analyze` is bounded, the stack walk *after* it is not,
-    and `TRIAGE_READ_RESERVE` therefore *reserves* time for those reads rather than bounding them —
-    a reservation a symbol server can outlast. `patience_slot` calls it bounded; half of it is.
+  - **And an op can carry a patience and still have an unbounded tail, so the correction adds as
+    well as subtracts.** `CrashTriage` is that case and is the sharpest example here: `bug_check`
+    and `is_kernel_target` before it and the stack walk after it are direct engine calls, only the
+    `!analyze` in the middle is bounded, and `TRIAGE_READ_RESERVE` therefore *reserves* time for
+    those reads rather than bounding them — a reservation a symbol server can outlast.
+    `patience_slot` calls it bounded; half of it is, so it comes back **in**. Review had to point
+    that out twice over: the paragraph named the unbounded tail and the arithmetic below then
+    subtracted the op anyway.
 
-What is left is **eight of `EngineOp`'s thirty-four** arms (34 less the 15, the 6, the 4 and
-`Interrupt` — counted from `proto.rs` on 2026-09-19, and re-derivable from it rather than from this
-sentence), and they are what this item is about: `Modules`
+What is left is **nine of `EngineOp`'s thirty-four** arms — 34 less `patience_slot`'s 15, less the
+6 openers, less the 4 with a clock of another name, less `Interrupt`, **plus `CrashTriage` back**
+(counted from `proto.rs` on 2026-09-19, and re-derivable from it rather than from this sentence).
+They are what this item is about: `CrashTriage`, `Modules`
 (item 54 — `Reload("")` has no wall-clock bound and is a wait with no upper bound on 115200-baud
 serial), `SymbolPath` (`reload_symbols` plus a raw `.sympath`, and the tool you reach for
 *because* symbols are not resolving, i.e. against the slow source), `ExceptionTriage`,
 `Backtrace`, `Registers`, `Disassemble`, `CurrentLocation`, and `UnboundedCommand` —
 `index_trace`, the one the coverage rule exempts. Review found `SymbolPath` and `ExceptionTriage`
-missing from the first version of this paragraph, which is the argument for deriving the set here
-rather than naming it.
+missing from the first version of this paragraph and `CrashTriage` from the second, which is the
+argument for deriving the set here rather than naming it.
+
+**What is *not* certified, and is part of the work rather than settled by this entry:** the other
+fourteen `patience_slot` arms have not each been read for an unbounded prelude or tail the way
+`CrashTriage` was. Three were checked and are bounded end to end — `SetBreakpoint` is one
+`set_breakpoint_bounded`, and `IrpStack` and `IoctlTrace` reach `raw_command` and
+`set_breakpoint` on a `watchdog_budget_ms` after an `instruction_set()` that does no I/O. The
+remaining eleven are assumed bounded because they carry a patience, which is precisely the
+inference `CrashTriage` breaks. So the eligibility rule is "any part of the work has no clock",
+and applying it needs the arms read one at a time rather than a field consulted.
 
 **The pattern to build it from is already here**, which is why this is worth doing without the tasks
 extension (`FOLLOWUPS.md` item 8, where the measurement says no client on this wire can drive one
