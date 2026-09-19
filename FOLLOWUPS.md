@@ -1825,11 +1825,12 @@ budget exists, in its own words, to prevent "a walk still running after its call
 truncated walk is not even cached, so there is nothing to collect.
 
 **So the rule, and deliberately not a list of ops.** An op is in scope if **any part of its work has
-no clock** — not if the op as a whole looks unbounded. Five review rounds on this one paragraph
-established that the list is the wrong artefact for a follow-up entry to carry: it was written three
-times and was wrong three times, each round naming another arm, and the count of arms is a thing
-only `worker.rs` knows. What is durable is the rule, the method, and the two cases that show why the
-obvious shortcut fails.
+no clock** — not if the op as a whole looks unbounded. **Five of the six review findings on
+[#349](https://github.com/glslang/windbg-mcp/pull/349) landed on this one paragraph** (counted from
+its comments on 2026-09-19), each naming an arm the version before it had got wrong, which is what
+says the list is the wrong artefact for a follow-up entry to carry: the arms are a thing only
+`worker.rs` knows, and it moves. What is durable is the rule, the method, and the two cases that
+show why the obvious shortcut fails.
 
 **The shortcut is `EngineOp::patience_slot`**, which is already this crate's enumeration of what
 carries the caller's clock — and it answers about a **field**, not about the work, so it is wrong in
@@ -1848,15 +1849,26 @@ both directions:
     it.
 
 So the set cannot be read off a field, and this entry does not pretend to have it: **deriving it is
-part of the work.** What is known is that the ops with no clock anywhere include `Modules` (item 54 —
-`Reload("")` has no wall-clock bound and is a wait with no upper bound on 115200-baud serial),
-`SymbolPath` (`reload_symbols` plus a raw `.sympath`, and the tool reached for *because* symbols are
-not resolving, i.e. against the slow source), `ExceptionTriage`, `Backtrace`, `Registers`,
-`Disassemble`, `CurrentLocation` and `UnboundedCommand` — and that `CrashTriage` and `RunToAddress`
-join them by the rule above. Three were checked and are bounded end to end: `SetBreakpoint` is one
-`set_breakpoint_bounded`, and `IrpStack` and `IoctlTrace` reach `raw_command` and `set_breakpoint`
-on a `watchdog_budget_ms` after an `instruction_set()` that does no I/O. The rest are **unaudited**,
-and assuming them bounded because they carry a patience is the inference both cases above break.
+part of the work, and the audit is unstarted.** It names ops that *are* in scope and deliberately
+certifies **none** as out — all five of those findings were about an op this entry had **excluded**,
+and not one about an op it had included, so the exclusions are the half that cannot be written here
+honestly. In scope, non-exhaustively: `Modules` (item 54 — `Reload("")` has no
+wall-clock bound and is a wait with no upper bound on 115200-baud serial), `SymbolPath`
+(`reload_symbols` plus a raw `.sympath`, and the tool reached for *because* symbols are not
+resolving, i.e. against the slow source), `ExceptionTriage`, `Backtrace`, `Registers`,
+`Disassemble`, `CurrentLocation`, `UnboundedCommand`, and `CrashTriage` and `RunToAddress` by the
+rule above.
+
+**And the trap that made half those rounds, which is the thing actually worth carrying:** classify
+the **dispatch arm**, never the helper it calls. The unbounded work sits in a *prelude*, before the
+clock is armed, so reading `fn set_breakpoint` says nothing about `EngineOp::SetBreakpoint`. The
+worked case is `resolve_coordinate`, shared by **three** arms — `SetBreakpoint`, `ReadMemory` and
+`RunToAddress` — which runs `e.modules()` (itself an op on the in-scope list above) and
+`with_pdb_identity` before any of the three reaches its watchdog. Two of those three carry a
+patience, so `patience_slot` clears all three. One precision while doing that audit, because it is
+easy to inflate: `with_pdb_identity` calls `module_pdb` only where `module.symbols` is already
+`Pdb` or `Dia`, so it *reads* an identity the engine holds rather than fetching a PDB — the
+unbounded part is the enumeration and that read, not a symbol download.
 
 **One half of this is a clamp rather than a store, and is worth doing on its own.**
 `run_to_address` passes the caller's `timeout_ms` straight through
