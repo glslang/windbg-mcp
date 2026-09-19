@@ -2526,7 +2526,13 @@ pub struct Reachability {
     /// answer — a caller retried as instructed and got a graph short of the same table edges.
     ///
     /// Absent rather than `false` on the ordinary answer, so a bound nobody hit costs no bytes.
-    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    ///
+    /// `default` beside the skip, as every other omitted `bool` in this file has it, and as
+    /// `a_field_serde_may_skip_is_never_required_by_the_schema` requires: without it the derived
+    /// `Deserialize` still demands the field, so the ordinary answer — the one that omits it — fails
+    /// its own `outputSchema`. Half the attribute was copied from
+    /// [`CodeLocation::attribution_failed`] and the half that makes the omission legible was not.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tables_bounded: bool,
     /// Why the walk stopped early, when it did. Outranks [`Self::bound_hit`] in what it means:
     /// a walk that ran out of time did not explore the graph it was *bounded* to either.
