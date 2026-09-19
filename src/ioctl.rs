@@ -63,6 +63,7 @@
 //! halt poll. So every case below is unit-tested against a hand-built instruction list with no
 //! debugger anywhere near it.
 
+use std::borrow::Cow;
 use std::collections::{BTreeMap, HashMap};
 
 use dbgscope::dbgeng::{Condition, Effect, Flow, Instruction, MemoryOperand, Operand};
@@ -293,6 +294,22 @@ pub(crate) struct Layout {
     /// How wide a pointer is on this target, which is what a load of the IRP's stack location has
     /// to be to have loaded one.
     pointer: u32,
+    /// Whether this target spells a constant it cannot encode as a **PC-relative literal load**,
+    /// which is what makes such a load readable as an immediate rather than as a memory access.
+    ///
+    /// **An architectural gate and not a shape test, because the shape is ambiguous.** A64 has no
+    /// instruction that can materialise an arbitrary 32-bit constant, so a compiler emits either
+    /// `movz`/`movk` or `ldr w20,<pool>` -- and the literal form has *no base register*, because
+    /// nothing at run time contributes to its address. A global on A64 does not look like that: it
+    /// is `adrp x8,<page>` plus `ldr w8,[x8,#off]`, which has one. So on A64 the no-base form is
+    /// the pool and reading it is reading the immediate the encoding could not hold.
+    ///
+    /// On x86 and x64 the identical operand -- no base, no index, an absolute `address` -- is a
+    /// **global read**: `mov eax,[00401000h]`, or a RIP-relative load of the driver's own mutable
+    /// data. Folding those would publish whatever the driver last wrote there as a constant it
+    /// compares control codes against, which is the class of wrong answer this module is arranged
+    /// against. Hence a flag per target rather than one rule for all three.
+    literal_pool: bool,
     /// `Irp->IoStatus.Status`, which with the return register is where a refusal puts its status.
     status_field: i64,
     /// The registers a `call` may return over, spelled as **this target's** decoder spells a full
@@ -321,6 +338,7 @@ impl Layout {
         output_length: 0x08,
         return_register: "rax",
         pointer: 8,
+        literal_pool: false,
         status_field: 0x30,
         volatile: &["rax", "rcx", "rdx", "r8", "r9", "r10", "r11"],
         irp_register: Some("rdx"),
@@ -332,6 +350,7 @@ impl Layout {
         output_length: 0x04,
         return_register: "eax",
         pointer: 4,
+        literal_pool: false,
         status_field: 0x18,
         volatile: &["eax", "ecx", "edx"],
         irp_register: None,
@@ -361,6 +380,7 @@ impl Layout {
         output_length: 0x08,
         return_register: "x0",
         pointer: 8,
+        literal_pool: true,
         status_field: 0x30,
         volatile: &[
             "x0", "x1", "x2", "x3", "x4", "x5", "x6", "x7", "x8", "x9", "x10", "x11", "x12", "x13",
@@ -512,6 +532,113 @@ const MAX_SWEEPS: usize = 32;
 /// `read` serves the image's own bytes for a jump table, and answers `None` for an address that
 /// will not read, which ends that table rather than the map. `in_image` says whether an address is
 /// code in this driver, which is what a table recognised by accident fails.
+/// How many literal-pool entries one routine may have read for it.
+///
+/// Each is an engine round trip, which over KD is tens of milliseconds -- so this is a bound on the
+/// *cost* rather than on the shape, and a routine past it simply has its later literals unresolved.
+/// That degrades to the behaviour before they were read at all: the compare against an unknown
+/// value reports the site in [`Map::untracked`] instead of naming a code, which already says the
+/// map is a lower bound. Far past any real dispatch routine, which holds a handful.
+const MAX_POOL_READS: usize = 256;
+
+/// The address a PC-relative literal load reads, where this target spells constants that way.
+///
+/// **One predicate, two callers**, deliberately: [`with_pool_immediates`] collects the addresses
+/// and the rewrite it performs is read back by [`source_value`]'s ordinary immediate arm, so there
+/// is no second description of the form to fall out of step with the first. That is the failure
+/// this module has most often had -- two places agreeing about a shape until one of them is edited.
+///
+/// Four things are required and each excludes a real instruction that is not this:
+/// - `layout.literal_pool`, which is the architectural gate its own documentation explains;
+/// - [`Effect::Move`] and not [`Effect::MoveSigned`], so `ldrsw` is left alone: it sign-extends to
+///   64 bits, and a status or a control code with its top bit set is then not the `ULONG` the
+///   compare is about;
+/// - no base and no index register, which on A64 is what tells a pool entry from a global;
+/// - [`FIELD_WIDTH`], because every value this module folds is a `ULONG`. An eight-byte literal is
+///   a pointer or a doubleword constant, and neither is a control code or a status.
+fn pool_load(layout: Layout, instruction: &Instruction) -> Option<u64> {
+    if !layout.literal_pool || instruction.effect != Effect::Move {
+        return None;
+    }
+    let Some(Operand::Memory(memory)) = instruction.operands.get(1) else {
+        return None;
+    };
+    (memory.base.is_none() && memory.index.is_none() && memory.size == Some(FIELD_WIDTH))
+        .then_some(memory.address)?
+}
+
+/// The listing with every readable literal pool entry put back as the immediate it stands for.
+///
+/// **A rewrite before the walk rather than a reader inside it**, and the reason is that the walk
+/// runs twice. The sweeps settle each block's facts and a later pass records from them, and the two
+/// must agree about every value: a literal visible only to the recording pass would produce a case
+/// the sweeps had not admitted, which is precisely the class of defect this module's history is
+/// made of. Resolving first makes the two passes read the same instruction, and makes each address
+/// cost **one** read however many times the block is swept.
+///
+/// It is also why nothing downstream needed changing. `ldr w8,<pool>` becomes `mov`-of-immediate
+/// in every respect the walk asks about, so [`source_value`] folds it, [`scalar_of`] resolves a
+/// compare against it, and [`status_after`] reads it as a refusal -- each through the arm it
+/// already had for an immediate. The claim being made is not that a memory access is an immediate
+/// in general; it is that **this** load is how A64 writes one the encoding could not hold.
+///
+/// `reads` and `writes` are left exactly as the decoder set them. A literal load names no base or
+/// index, so it read no register to begin with, and the destination it writes is unchanged -- which
+/// is what keeps [`note_loss`] answering as before. (It never saw one of these anyway: a loss is
+/// recorded only for an instruction that writes flags, and a load writes none.)
+///
+/// Borrowed where nothing matched, so the x64 and x86 paths clone no listing and are bit-for-bit
+/// the walk they were before this existed.
+fn with_pool_immediates<'a>(
+    block: &'a [Instruction],
+    layout: Layout,
+    read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+) -> Cow<'a, [Instruction]> {
+    if !layout.literal_pool {
+        return Cow::Borrowed(block);
+    }
+    // Resolved once per address rather than once per instruction: a routine comparing against the
+    // same pool entry twice is ordinary, and the second read would buy nothing.
+    let mut resolved: HashMap<u64, u32> = HashMap::new();
+    let mut reads = 0usize;
+    for instruction in block {
+        let Some(address) = pool_load(layout, instruction) else {
+            continue;
+        };
+        if resolved.contains_key(&address) {
+            continue;
+        }
+        if reads >= MAX_POOL_READS {
+            break;
+        }
+        reads += 1;
+        // The caller's reader is what bounds this to the image: it refuses an address outside the
+        // module holding the routine, so a pool address computed from a malformed displacement
+        // reads nothing rather than reaching another module's memory. Anything it declines is left
+        // as the load it was.
+        if let Some(bytes) = read(address, FIELD_WIDTH as usize)
+            && let Ok(value) = <[u8; 4]>::try_from(bytes.as_slice())
+        {
+            resolved.insert(address, u32::from_le_bytes(value));
+        }
+    }
+    if resolved.is_empty() {
+        return Cow::Borrowed(block);
+    }
+    let mut out = block.to_vec();
+    for instruction in &mut out {
+        let Some(address) = pool_load(layout, instruction) else {
+            continue;
+        };
+        if let Some(&value) = resolved.get(&address)
+            && let Some(operand) = instruction.operands.get_mut(1)
+        {
+            *operand = Operand::Immediate(u64::from(value));
+        }
+    }
+    Cow::Owned(out)
+}
+
 pub(crate) fn map(
     dispatch: u64,
     block: &[Instruction],
@@ -536,6 +663,12 @@ fn map_within(
     mut halt: impl FnMut() -> Option<Halt>,
     sweeps: usize,
 ) -> Map {
+    // **Before the graph, because every pass below reads this listing.** A64 spells a constant it
+    // cannot encode as a PC-relative load, and resolving those here is what lets the sweeps and the
+    // recording pass agree about the value -- see [`with_pool_immediates`]. Borrowed unchanged on a
+    // target that has no literal pool, so nothing about x64 or x86 moves.
+    let listing = with_pool_immediates(block, layout, &mut read);
+    let block: &[Instruction] = &listing;
     let graph = cfg::graph(block);
     let index_of: HashMap<u64, usize> = block
         .iter()
@@ -4021,6 +4154,396 @@ mod tests {
             "{:?}",
             found.cases
         );
+    }
+
+    /// A PC-relative literal load, as dbgscope decodes one: no base, no index, and the address the
+    /// encoding names.
+    ///
+    /// Its own test pins that shape -- `ldr x5,nt!HalpStubVmTarget+0x34` answers `base: None` with
+    /// the resolved address, "nothing at run time contributes to it" -- so this fixture is that
+    /// answer rather than a guess at it.
+    fn literal(at: u64, from: u64) -> Operand {
+        Operand::Memory(MemoryOperand {
+            size: Some(4),
+            segment: None,
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: at.wrapping_sub(from) as i64,
+            address: Some(at),
+        })
+    }
+
+    /// The ARM64 chain the narrow-form tests share: the code out of the IRP, a load whose form is
+    /// under test, and a compare of the two. Only the middle instruction differs between them, so
+    /// it is the argument and the rest is fixed -- a fixture that varied elsewhere would let a test
+    /// pass for the wrong reason.
+    fn literal_compare(mnemonic: &str, operands: Vec<Operand>) -> Vec<Instruction> {
+        vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 8, mnemonic, operands, Flow::Fallthrough),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w9"), reg("w10")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+        ]
+    }
+
+    /// A reader serving one four-byte pool entry, and counting what it was asked.
+    fn pool_reader(
+        at: u64,
+        value: u32,
+        served: &std::cell::Cell<usize>,
+    ) -> impl FnMut(u64, usize) -> Option<Vec<u8>> + '_ {
+        move |address, len| {
+            served.set(served.get() + 1);
+            (address == at && len == 4).then(|| value.to_le_bytes().to_vec())
+        }
+    }
+
+    /// **A control code in a literal pool is a case**, which is the half of `FOLLOWUPS.md` item 82
+    /// that reaches the codes rather than the evidence.
+    ///
+    /// HEVD's ARM64 dispatch compares against `ldr w9,HEVD+0x87824`, whose pool entry is a control
+    /// code. Before the pool was read, `scalar_of` saw a memory operand where it wanted a value and
+    /// the compare resolved to nothing -- the site landed in `untracked` and the code was never
+    /// named. The assertion is the code itself, not the warning.
+    #[test]
+    fn an_arm64_literal_pool_entry_is_recovered_as_a_case() {
+        const POOL: u64 = IMAGE_BASE + 0x8_7824;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            // The constant no A64 instruction can hold, so the compiler put it in `.text` and reads
+            // it back through the program counter.
+            insn(
+                DISPATCH + 8,
+                "ldr",
+                vec![reg("w10"), literal(POOL, DISPATCH + 8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w9"), reg("w10")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let served = std::cell::Cell::new(0usize);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            pool_reader(POOL, 0x0022_203b, &served),
+            in_image,
+            never,
+        );
+
+        assert!(found.code_proved, "the chain from the IRP was followed");
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.recovered))
+                .collect::<Vec<_>>(),
+            vec![(0x0022_203b, 0x900, Recovery::Compare)],
+            "{:?}",
+            found.cases
+        );
+        // **Once, not once per sweep.** The whole reason the pool is resolved before the walk is
+        // that the walk runs many times over, and a read inside it would cost an engine round trip
+        // per sweep -- see `with_pool_immediates`.
+        assert_eq!(served.get(), 1, "the pool entry was read exactly once");
+    }
+
+    /// **And a status in a literal pool is a refusal**, which is the other half of item 82.
+    ///
+    /// `rdyboost!SmdDispatchDeviceControl+0x1b8` is `ldr w20,<pool>` / `b <epilogue>` with
+    /// `0xc000000d` (`STATUS_INVALID_PARAMETER`) in the pool. `status_after` already reads a
+    /// `Value::Literal` out of the register a routine returns through; what it could not do was see
+    /// one arrive from memory, so `error_status` found a memory operand where it wanted a constant
+    /// and the block was not a refusal. Item 82's measurement is the consequence: 235 codes
+    /// recovered across seven drivers and **not one** reporting `accepted: false`.
+    ///
+    /// So the assertion is `accepted: Some(false)` on the case whose landing block loads the pool
+    /// status -- the case is a rejection rather than a code the driver takes.
+    #[test]
+    fn an_arm64_literal_pool_status_is_read_as_a_refusal() {
+        const POOL: u64 = IMAGE_BASE + 0x4_0100;
+        const REFUSES: u64 = DISPATCH + 0x18;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "cmp",
+                vec![reg("w9"), imm(0x222_003)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(REFUSES)),
+            ),
+            // The accepting path, so the routine is not one block carrying two meanings.
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w0"), imm(0)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+            // Where the recognised code lands: the status this driver refuses it with is in the
+            // pool, and `w0` is where an ARM64 routine returns one.
+            insn(
+                REFUSES,
+                "ldr",
+                vec![reg("w0"), literal(POOL, REFUSES)],
+                Flow::Fallthrough,
+            ),
+            insn(REFUSES + 4, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let served = std::cell::Cell::new(0usize);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            pool_reader(POOL, 0xc000_000d, &served),
+            in_image,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.accepted))
+                .collect::<Vec<_>>(),
+            vec![(0x222_003, Some(false))],
+            "the pool status makes this case a refusal: {:?}",
+            found.cases
+        );
+    }
+
+    /// **The same operand shape on x64 is a global, and folding it would invent constants.**
+    ///
+    /// `mov eax,[00401000h]` has no base, no index and an absolute address -- byte for byte the
+    /// form an A64 literal load takes. On x64 it reads the driver's own mutable data, so a compare
+    /// after it is a statement about whatever was last written there rather than about a constant.
+    /// That is why `Layout::literal_pool` is a per-target flag and not a shape test, and this is
+    /// the assertion that keeps it one: no case, and the reader is never even asked.
+    #[test]
+    fn an_x64_absolute_load_is_not_a_literal_pool() {
+        const GLOBAL: u64 = IMAGE_BASE + 0x2_0000;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "mov",
+                vec![reg("rbx"), pointer("rdx", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "mov",
+                vec![reg("r13d"), mem("rbx", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), literal(GLOBAL, DISPATCH + 8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("r13d"), reg("eax")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x10, "je", Vec::new(), Flow::Branch(Some(0x900))),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let served = std::cell::Cell::new(0usize);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            pool_reader(GLOBAL, 0x0022_203b, &served),
+            in_image,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "a global is not a constant: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            served.get(),
+            0,
+            "an x64 target has no literal pool, so nothing should have been read for one"
+        );
+    }
+
+    /// **A pool entry the reader declines is left as the load it was**, which is the degradation
+    /// item 82's bound relies on: the compare resolves to nothing, the site is reported, and no
+    /// code is invented from bytes nobody could read.
+    ///
+    /// The reader here refuses everything, which is what one does for an address outside the module
+    /// holding the routine.
+    #[test]
+    fn an_unreadable_arm64_pool_entry_names_no_code() {
+        const POOL: u64 = IMAGE_BASE + 0x8_7824;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "ldr",
+                vec![reg("w10"), literal(POOL, DISPATCH + 8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w9"), reg("w10")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+
+        assert!(
+            found.cases.is_empty(),
+            "nothing was read, so nothing may be named: {:?}",
+            found.cases
+        );
+        // **The compare's address, not the branch's.** `Compared::at` is where the comparison is,
+        // and the equality arm that files an unnameable case pushes that -- so this pins the site a
+        // reader is sent to as well as the fact that one is reported.
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0xc],
+            "the compare against a value that would not resolve is reported instead"
+        );
+    }
+
+    /// **`ldrsw` is not the literal form this folds**, and the reason is the value rather than the
+    /// shape: a sign-extending load of `0xc000000d` leaves `0xffffffffc000000d`, which is not the
+    /// `ULONG` the compare is about. [`pool_load`] requires [`Effect::Move`] for that, and the
+    /// assertion is that the reader is never asked.
+    #[test]
+    fn a_sign_extending_arm64_literal_is_not_folded() {
+        const POOL: u64 = IMAGE_BASE + 0x8_7824;
+        let served = std::cell::Cell::new(0usize);
+        let found = map(
+            DISPATCH,
+            &literal_compare("ldrsw", vec![reg("w10"), literal(POOL, DISPATCH + 8)]),
+            Layout::ARM64,
+            pool_reader(POOL, 0x0022_203b, &served),
+            in_image,
+            never,
+        );
+
+        assert_eq!(served.get(), 0, "a signed load is not this form");
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+    }
+
+    /// **And an eight-byte literal is not one either**: it is a pointer or a doubleword constant,
+    /// and neither is a control code or a status. [`FIELD_WIDTH`] is what excludes it, which is the
+    /// same rule every other value this module folds has to pass.
+    #[test]
+    fn a_wide_arm64_literal_is_not_folded() {
+        const POOL: u64 = IMAGE_BASE + 0x8_7824;
+        let wide = Operand::Memory(MemoryOperand {
+            size: Some(8),
+            segment: None,
+            base: None,
+            index: None,
+            scale: 1,
+            displacement: 0x20,
+            address: Some(POOL),
+        });
+        let served = std::cell::Cell::new(0usize);
+        let found = map(
+            DISPATCH,
+            &literal_compare("ldr", vec![reg("x10"), wide]),
+            Layout::ARM64,
+            pool_reader(POOL, 0x0022_203b, &served),
+            in_image,
+            never,
+        );
+
+        assert_eq!(served.get(), 0, "a doubleword literal is not this form");
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
     }
 
     /// **A64 names a store's source first, and a store is not a load.**
