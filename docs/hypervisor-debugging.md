@@ -45,7 +45,8 @@ documented readiness contract**. The observer is scoped to the attach; duplicate
 do not request another break, and a later attach gets fresh state. Missing output, failed
 interrupt, interrupted wait, or unconfirmed stopped status fails the attach. A 60-second watchdog
 requests exit from the wait without requesting a second target break; an unconnected transport
-may still block. On failure the claimed session must be inspected or ended, not blindly retried.
+may still block, including after a transport synchronization announcement. On failure the claimed
+session must be inspected or ended, not blindly retried.
 Already-halted targets and failure recovery are not live-validated. Omitting the option retains
 the ordinary attach behavior, including the failure shape documented below.
 
@@ -223,6 +224,13 @@ library run to 395 passed, 13 ignored, and four passing doctests. Removing resto
 the error return makes the new cleanup test fail. These are not hypervisor timeout-recovery
 tests: the initial probe read execution status `BREAK` after an exit deadline, so status alone
 must not be treated as independent liveness evidence. No lab guest was touched by this follow-up.
+
+The later [live timeout probe](hypervisor-detach-trace.md#live-timeout-and-recovery-probe)
+remained blocked beyond 60 seconds despite transport synchronization. Reclaiming the probe while
+the guest was independently verified running, then attaching afresh, passed. A second attempt
+using one explicit break on the same controller remained blocked and lost WinRM reachability;
+it was held for console inspection without another break or reset. This does not establish safe
+timeout recovery. Keep the recovery cases distinct from the passing normal attach/detach cycles.
 
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor

@@ -201,6 +201,29 @@ No reset, reboot, recovery controller, installed-server replacement, or VELKO co
 change was required. Broader stepping, breakpoint-hit, live NT, drop, and cross-build coverage
 remain separate work.
 
+## Live timeout and recovery probe
+
+The example's `timeout` mode replaces the scoped announcement observer with its passive trace
+before waiting. This injects a missing announcement without changing the production 60-second
+watchdog or sending an automatic target break.
+
+The first run synchronized but remained in the wait at 143 seconds. No break-in send was logged,
+and WinRM answered immediately before the probe process was reclaimed. Guest uptime subsequently
+advanced from 11414.365 to 11417.691 seconds on the same boot, with the endpoint free. A fresh
+MCP experimental attach/detach passed the independent guest-health wrapper. Thus process
+reclamation followed by a new attach worked in this verified-running, never-broken case; it is
+not permission to kill a debugger whose target may be stopped.
+
+A second run tested a single explicit interrupt after the deadline, keeping the same controller.
+The guest answered before that interrupt. One break-in send appeared, but no stop/wait result
+followed and WinRM then timed out. No second interrupt, detach, reset, or competing controller
+was attempted; console inspection was requested with the original probe still held. This
+checkpoint does not validate same-controller timeout recovery.
+
+The 60-second exit-only watchdog cannot be treated as a cancellation guarantee even when the
+transport has printed synchronization success. These diagnostic runs did not change the server
+binary, target boot settings, or VELKO configuration.
+
 ## Local evidence index
 
 These filenames identify the retained bench artifacts, not portable repository inputs:
@@ -222,3 +245,5 @@ These filenames identify the retained bench artifacts, not portable repository i
 - `synchronized-detach-probe-20260919-153400.log`: retained example source, automatic trigger and successful teardown.
 - `synchronized-detach-probe-20260919-153857.log`: final example source, including secret-safe input errors and resume-result checks.
 - `synchronized-detach-probe-20260919-162939.log`: first typed experimental attach integration, one send and successful detach.
+- `synchronized-detach-probe-20260919-170924.log`: injected missing announcement; reclaimed still-waiting process with independently responsive guest, then fresh MCP attach/detach passed.
+- `synchronized-detach-probe-20260919-171404.log`: second injected timeout; one manual break-in send, wait still blocked and WinRM unavailable at the recorded checkpoint.
