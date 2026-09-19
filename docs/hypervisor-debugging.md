@@ -202,7 +202,7 @@ subsequently passed four runs using the normal-output connection announcement to
 break. Its reproducible source and matcher tests are retained in dbgscope's `kernel_attach_probe`
 example. Those diagnostic runs preceded the explicitly opt-in server integration described above.
 
-The integration pins dbgscope `2d49a887bb0fb9376dd8865b4524d59046992b6c`. One direct library
+The first integration pinned dbgscope `2d49a887bb0fb9376dd8865b4524d59046992b6c`. One direct library
 probe and then three sequential MCP detach-only cycles passed on DbgEng 10.0.29617.1000 and
 the four-processor Hyper-V 29671 target. The wrapper verified guest identity, unchanged boot
 time, and advancing uptime twice after each MCP cycle. No recovery attach, reboot, reset,
@@ -216,6 +216,13 @@ ignored), plus the enabled real-debugger NT dump summary regression. Formatting 
 Clippy checks passed. dbgscope passed 393 tests and four doctests, with 13 tests ignored;
 its Clippy run retained only pre-existing warnings. Three pure announcement/failure tests
 passed local Miri. These offline results do not substitute for the live checks above.
+
+The follow-up pin `1767cf2c151d8375aa447b854919edb9f9afd2b3` adds real-engine local-process
+tests for missing-announcement deadline cleanup and exit-deadline attribution, bringing the
+library run to 395 passed, 13 ignored, and four passing doctests. Removing restoration before
+the error return makes the new cleanup test fail. These are not hypervisor timeout-recovery
+tests: the initial probe read execution status `BREAK` after an exit deadline, so status alone
+must not be treated as independent liveness evidence. No lab guest was touched by this follow-up.
 
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
