@@ -20,16 +20,10 @@ itself, in two places:**
 - **Its summary comment**, one per PR and updated in place, marked
   `<!-- codex-pull-request-review-summary -->`. It is an *issue* comment, not a review comment, and
   carries a table whose `Commit` column is the SHA of the latest review and whose `Status` says
-  whether it finished. **Match the author as well as the marker, and compare that SHA to the head** —
-  any comment may carry the marker, and the reason to check is mundane rather than adversarial: the
-  comment is updated in place, so the one sitting there is the *previous* review until the current
-  one finishes, and reading it without the comparison is how a reviewed-looking head turns out to be
-  the one before:
+  whether it finished:
   ```console
   gh api --paginate repos/<owner>/<repo>/issues/<n>/comments \
-    --jq '.[] | select(.user.login == "chatgpt-codex-connector[bot]")
-          | select(.body | contains("codex-pull-request-review-summary")) | .body'
-  git rev-parse --short HEAD   # and read the table's Commit against this
+    --jq '.[] | select(.body | contains("codex-pull-request-review-summary")) | .body'
   ```
 - **A reaction on the PR**: 👀 while a review is running, **👍 once every review has finished with
   no findings** — which is the signal that a round is genuinely closed rather than pending.
@@ -69,6 +63,26 @@ behind `FOLLOWUPS.md` item 34 (#189 to #192), all from the same reviewer:
 So: **verify the fact against the current code, then decide the remedy yourself.** A correct finding
 does not make its suggested fix correct, and a confident one is not evidence of anything. Measuring
 beats arguing whenever the claim is about behaviour: most of these were settled in one experiment.
+
+**Your decline rate is a measurement, and zero is a broken instrument.**
+[#351](https://github.com/glslang/windbg-mcp/pull/351) ran to **22 findings over eleven rounds with
+not one declined**, and that was not 22 correct findings — it was a session that had stopped
+evaluating and started complying. Two that should have gone the other way:
+
+- A finding asked the Codex summary lookup to match the bot's login "because a pull-request author
+  can add a matching comment with a false `Commit`". The author is the person running the session,
+  on their own PR; there is no such threat model. Worse, the skill **already** said to read that
+  table's `Commit` against the head, so the change restated an instruction three paragraphs above
+  it. Accepted anyway, with a *fresh* rationale invented to justify it — which is the tell: when the
+  stated reason does not hold and you find yourself supplying a better one, you have decided to
+  accept and are working backwards.
+- A finding asked for a new field in a typed payload. Real, and its own text offered a text-only
+  alternative as acceptable. Taking the field cost a golden that only a Windows host can re-record,
+  turned the branch red for four commits, and none of that was weighed before saying yes.
+
+The asymmetry to hold on to: a bot reads this diff without the argument that produced it, so it is
+good at *what the code does* and unreliable about *what it should cost*. Check the premise against
+the tree, and price the remedy yourself.
 
 **Declining is a normal outcome, and where the reason goes depends on whether the decline shaped a
 change.** If you are committing anyway — you took the fact and rejected the remedy — the reason
