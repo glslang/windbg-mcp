@@ -29,9 +29,12 @@
   cross-function tail jumps but **not** indirect calls through function pointers or unresolved
   compiler jump tables, and it stops at any instruction whose flow it could not decode. So a
   `REACHABLE` verdict is sound (a concrete static path exists, and the path is reported), while
-  `NOT REACHABLE` is best-effort within the explored bounds. If the dispatch uses a
-  `switch(IoControlCode)` jump table (common), pass the specific handler VA as `from` to scope
-  past it, or confirm dynamically with a breakpoint + `go`. **A walk scoped that way says so**, in
+  `NOT REACHABLE` is best-effort within the explored bounds. **A `switch(IoControlCode)` jump table
+  is crossed where it resolves**, through the same resolver `ioctl_map` publishes its tables from,
+  so the two tools no longer disagree about a handler the switch selects (`FOLLOWUPS.md` item 83):
+  an edge admitted there is one that resolver proved, which is what keeps `REACHABLE` sound. Where
+  the table does **not** resolve the walk still ends at the jump — pass the specific handler VA as
+  `from` to scope past it, or confirm dynamically with a breakpoint + `go`. **A walk scoped that way says so**, in
   both channels, because the verdict depends on where it began: from one case block a sibling case
   is not reachable, so the same question asked from the function's entry is a different question.
 - That walk is bounded by **what is left of the caller's own timeout**

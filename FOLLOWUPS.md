@@ -55,15 +55,14 @@ what a record contributes by testing the backend again in each field that needs 
 [#341](https://github.com/glslang/windbg-mcp/pull/341)'s breakpoint-command guard, where both
 review bots independently reached the same finding — a command scanner that reads the first token
 of a segment cannot see `.opendump` inside an `.if`, a `.foreach` or an alias that resolves only
-when it runs (2026-09-18). And items **82–85** from running
+when it runs (2026-09-18). And items **84–85** from running
 `ioctl_map` against a live **ARM64** target for the first time
-([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): A64 keeps constants a
-compiler cannot spell as immediates in a PC-relative literal pool, which the fact walk does not
-read -- 235 codes recovered over seven drivers and **not one** proven size or refusal among them --
-and, found beside it, a reachability walk that does not follow the switch tables the map now
-resolves, an `adrp`+`add` table base lost at the `add`, and an ARM64 surface a second
-implementation has already agreed with figure for figure without either ever being diffed against
-the other. And item 87 from verifying one of the review findings on
+([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): an `adrp`+`add` table base
+lost at the `add`, and an ARM64 surface a second implementation has already agreed with figure for
+figure without either ever being diffed against the other. That run filed two more, both now in
+[`DONE.md`](./DONE.md) -- the literal pool the fact walk could not read (item 82, which was the
+whole of why 235 codes carried no proven size or refusal) and the switch tables the reachability
+walk did not follow while the map resolved them (item 83). And item 87 from verifying one of the review findings on
 [#347](https://github.com/glslang/windbg-mcp/pull/347), where checking which `untracked` entries
 `volmgr` actually had turned up a code the map loses beside three identical ones it keeps
 (2026-09-19).
@@ -1575,79 +1574,6 @@ breakpoint's command runs at a hit this server never observes.
 `Call::retiring`, `set_breakpoint`'s refusal), `batch::retires_handle`, and
 `server::tests::a_breakpoint_command_that_changes_the_target_is_refused`, whose last two assertions
 pin the gap and should flip to `assert!` when it closes.
-
-## 82. [windbg-mcp] A64 puts constants in a literal pool, and the walk cannot read one
-
-**Repo:** `windbg-mcp`.
-
-No single A64 instruction can materialise an arbitrary 32-bit constant. A compiler builds one
-either as `movz`/`movk` -- which [#343](https://github.com/glslang/windbg-mcp/pull/343) taught the
-walk to fold -- or as a **PC-relative literal load**, `ldr w20,<pool>`, which reads four bytes of
-`.text` the walk never looks at. The second is one instruction against two, and MSVC uses it
-freely.
-
-Measured on the live ARM64 target, 2026-09-19, over seven drivers and **235** recovered control
-codes: **0** carry a proven size, and 15 carry length-check evidence marked `exact: false`. Not one
-case anywhere reports `accepted: false`.
-
-The cause is one read. `rdyboost!SmdDispatchDeviceControl+0x1b8` is
-`ldr w20,<pool>` / `b <epilogue>`, and the pool holds `0xc000000d`
-(`STATUS_INVALID_PARAMETER`). [`error_status`](./src/ioctl.rs) looks for a constant put in the
-return register or the IRP's status field and finds a *memory operand* instead, so the block is not
-a refusal -- and `exact` requires `Condition::NotEqual` **and** a target that refuses. The
-condition half is already right: `cmp w2,#4` / `bne` at `rdyboost+0xf2f4` is exactly the shape the
-rule wants. Only the refusal is invisible.
-
-It reaches the codes themselves, not just the evidence. HEVD's dispatch compares against
-`ldr w8,HEVD+0x87824`, whose pool entry is `0x0022203b` -- a control code. That map is right only
-because HEVD's *cases* come from the `sub`-and-compare chain beside it and the literal is merely
-the range bound.
-
-**What is missing there is the cases, not the warning**, and the distinction matters because it
-decides what a fix is for. A compare of the traced code register against a value `scalar_of` cannot
-resolve still returns a `Compared` carrying an `index` and `code: None`, and the equality arm pushes
-it onto **`untracked`** (`src/ioctl.rs`) -- the list built for exactly this, after a map reported
-four of HEVD's twenty-eight codes and read as complete. So such a map says it is a lower bound; what
-it cannot do is name the code, so a caller gets a site to go and look at instead of a control code.
-Raised on review of [#347](https://github.com/glslang/windbg-mcp/pull/347), and it is right: the
-work here is recovering the values, not adding a second incompleteness report. Measured on the live
-target, `volmgr` answers `code_proved: true` with **5** entries in `untracked` and none in
-`unresolved` -- so the mechanism does fire on ARM64. (Those five are `movz`/`movk` compares rather
-than pool loads, which is a *separate* question this item does not cover.)
-
-**Why deferred:** `map()` already takes a `read` closure and `follow_table` uses it, but `update`
-does not have it -- so this is threading a reader into the fact walk, not a local fix. It also
-needs a rule for *which* loads are safe to read: a pool entry is `.rdata`-like data at a
-PC-relative address with no base or index register, and reading anything looser would let a driver's
-mutable globals be folded in as constants.
-
-**Where it picks up:** `ioctl::update`'s `Operand::Memory` arm and `ioctl::error_status`
-(`src/ioctl.rs`), `Value::Literal`, and `map`/`map_within`'s `read` parameter. The x64 path is
-unaffected -- there the same constants are immediates -- so every existing size test stays green
-while the gap is open, which is why it took a live ARM64 measurement to see.
-
-## 83. [windbg-mcp] `reachable_from_dispatch` does not follow the jump tables `ioctl_map` now reads
-
-**Repo:** `windbg-mcp`.
-
-`ioctl_map` resolves A64 switch tables as of
-[#345](https://github.com/glslang/windbg-mcp/pull/345) -- 9 tables and 48 codes across `mountmgr`,
-`volmgr` and `volsnap` on the live ARM64 target. `reachable_from_dispatch` does not: its walk
-follows direct calls and cross-function tail jumps, and its own test says so
-(`src/driver.rs`, "the jump table isn't followed"). So the two tools now disagree about the same
-driver -- the map names a handler the reachability walk calls NOT REACHABLE, and the tool's advice
-is to pass the handler VA by hand to scope past the switch.
-
-Architecture-independent, and newly material rather than newly true: before #345 nothing here could
-resolve an A64 table, so there was no asymmetry to notice.
-
-**Why deferred:** the resolver is `ioctl::follow_table`, which is built around the dispatch walk's
-`Facts` and its bounds check -- reachability has neither, so sharing it means extracting the table
-read from the fact tracking rather than calling it.
-
-**Where it picks up:** `driver::reachable_from_dispatch` and its `uf`-driven walk (`src/driver.rs`),
-`ioctl::follow_table` (`src/ioctl.rs`), and the two prose caveats at `src/driver.rs:755` and
-`:1069` that promise the jump table is not followed.
 
 ## 84. [windbg-mcp] An `adrp`+`add` table base is lost at the `add`
 

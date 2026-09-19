@@ -65,10 +65,22 @@ use dbgscope::dbgeng::{Effect, Flow, Instruction};
 use crate::walk::Halt;
 
 /// Instructions reachable from `start` by walking *inside* one function — following
-/// fall-through, direct conditional branches, and direct `jmp`s that stay in the
-/// function — and stopping at `ret` or an unfollowed indirect/jump-table `jmp`. This
-/// keeps a mid-function start (a handler scoped past a switch) from spuriously
+/// fall-through, direct conditional branches, direct `jmp`s that stay in the function, and a
+/// **resolved** jump table's targets — and stopping at `ret` or at an indirect `jmp` nothing could
+/// resolve. This keeps a mid-function start (a handler scoped past a switch) from spuriously
 /// treating sibling switch cases as reachable.
+///
+/// `resolve` answers what an indirect jump's targets are, and is how `FOLLOWUPS.md` item 83 was
+/// closed: the walk used to end at every such jump, so a handler a switch selects read as NOT
+/// REACHABLE while `ioctl_map` named it. It takes the listing as well as the site because the
+/// resolver works over a whole function, and it is a closure rather than a call into
+/// [`crate::ioctl`] because this module is deliberately free of the engine — the worker wires the
+/// two tools together.
+///
+/// **An empty answer keeps today's behaviour exactly**, which is what makes this safe to add: the
+/// path ends at the jump, and the verdict is the one it was. The walk's contract is that REACHABLE
+/// is sound, so every edge this admits has to be one a resolver *proved* — never a guess about
+/// where a jump might go.
 struct FnWalk {
     /// Instruction addresses reachable from `start` within the function.
     reachable: HashSet<u64>,
@@ -84,7 +96,11 @@ struct FnWalk {
 
 /// Returns `None` if `start` is not an instruction boundary in `block` (the caller
 /// then falls back to the function entry).
-fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
+fn walk_function(
+    block: &[Instruction],
+    start: u64,
+    resolve: &mut impl FnMut(&[Instruction], u64) -> Vec<u64>,
+) -> Option<FnWalk> {
     let idx: HashMap<u64, usize> = block
         .iter()
         .enumerate()
@@ -132,8 +148,20 @@ fn walk_function(block: &[Instruction], start: u64) -> Option<FnWalk> {
             // reachable call graph was fully explored when part of it was never visible.
             Flow::Unreadable | Flow::Unknown => blind += 1,
             Flow::Jmp(t) => {
-                // An unconditional jump has no fall-through, so an *indirect* one ends the path.
+                // An unconditional jump has no fall-through, so an *indirect* one ends the path --
+                // unless a resolver can say where it goes. A jump table is the case that matters:
+                // the IOCTL dispatch switch is one, and before item 83 the walk stopped at it while
+                // `ioctl_map` was resolving the same table three functions away.
                 leave(insn.address, t, "jmp");
+                if t.is_none() {
+                    // Collected before the loop because `leave` borrows `external` mutably and the
+                    // resolver borrows nothing of this walk -- two mutable borrows of the frame
+                    // otherwise, for a call that cannot touch either.
+                    let targets = resolve(block, insn.address);
+                    for target in targets {
+                        leave(insn.address, Some(target), "jmp");
+                    }
+                }
             }
             Flow::Branch(t) => {
                 leave(insn.address, t, "jmp");
@@ -433,12 +461,32 @@ fn branch_relation(jcc: &str, taken: bool) -> Option<&'static str> {
 /// conditional-branch decisions `(branch addr, took_taken)` in path order, or `None` if
 /// `goal` is not reachable within the function. Follows the same edges as
 /// [`walk_function`]; a global visited-set bounds it and guarantees termination.
+///
+/// **Including a resolved jump table's, and it has to.** The `Flow::Call` arm below records what
+/// happens when this follows fewer edges than the walk did: `find_path` answers `None`, the
+/// segment is rendered from `unwrap_or_default()`, and an empty list of gates is presented as the
+/// complete set of them. Teaching [`walk_function`] to cross a switch (`FOLLOWUPS.md` item 83)
+/// without teaching this the same thing would reproduce that defect exactly, for every handler a
+/// switch selects.
+///
+/// The targets are resolved **once, up front**, rather than per visit: this DFS backtracks, so a
+/// resolver called from inside it would re-read the same table for every route tried.
 fn find_path(
     block: &[Instruction],
     idx: &HashMap<u64, usize>,
     start: u64,
     goal: u64,
+    resolve: &mut impl FnMut(&[Instruction], u64) -> Vec<u64>,
 ) -> Option<Vec<(u64, bool)>> {
+    let mut tables: HashMap<u64, Vec<u64>> = HashMap::new();
+    for insn in block {
+        if matches!(insn.flow, Flow::Jmp(None)) {
+            let targets = resolve(block, insn.address);
+            if !targets.is_empty() {
+                tables.insert(insn.address, targets);
+            }
+        }
+    }
     fn dfs(
         block: &[Instruction],
         idx: &HashMap<u64, usize>,
@@ -446,6 +494,7 @@ fn find_path(
         goal: u64,
         visited: &mut HashSet<usize>,
         acc: &mut Vec<(u64, bool)>,
+        tables: &HashMap<u64, Vec<u64>>,
     ) -> bool {
         let insn = &block[i];
         if insn.address == goal {
@@ -463,20 +512,29 @@ fn find_path(
             // above it — conditions for a path that does not exist.
             Flow::Return | Flow::Trap | Flow::Unreadable | Flow::Unknown => false,
             Flow::Jmp(t) => match t.and_then(|t| idx.get(&t)) {
-                Some(&j) => dfs(block, idx, j, goal, visited, acc),
-                None => false,
+                Some(&j) => dfs(block, idx, j, goal, visited, acc, tables),
+                // A table's targets, where one was resolved. A switch gates nothing this recipe can
+                // state -- the gate is the bounds check above it, and which slot was taken is the
+                // control code itself -- so no step is pushed for the jump, exactly as none is
+                // pushed for a call.
+                None => tables.get(&insn.address).is_some_and(|targets| {
+                    targets.iter().any(|target| {
+                        idx.get(target)
+                            .is_some_and(|&j| dfs(block, idx, j, goal, visited, acc, tables))
+                    })
+                }),
             },
             Flow::Branch(t) => {
                 if let Some(&j) = t.and_then(|t| idx.get(&t)) {
                     acc.push((insn.address, true));
-                    if dfs(block, idx, j, goal, visited, acc) {
+                    if dfs(block, idx, j, goal, visited, acc, tables) {
                         return true;
                     }
                     acc.pop();
                 }
                 if let Some(n) = next {
                     acc.push((insn.address, false));
-                    if dfs(block, idx, n, goal, visited, acc) {
+                    if dfs(block, idx, n, goal, visited, acc, tables) {
                         return true;
                     }
                     acc.pop();
@@ -484,7 +542,7 @@ fn find_path(
                 false
             }
             Flow::Fallthrough => match next {
-                Some(n) => dfs(block, idx, n, goal, visited, acc),
+                Some(n) => dfs(block, idx, n, goal, visited, acc, tables),
                 None => false,
             },
             // A call whose target is **in this same listing** is an edge inside the function, and
@@ -498,12 +556,12 @@ fn find_path(
             // gates nothing, so neither successor pushes a step: the branches on the way to it do.
             Flow::Call(t) => {
                 if let Some(n) = next
-                    && dfs(block, idx, n, goal, visited, acc)
+                    && dfs(block, idx, n, goal, visited, acc, tables)
                 {
                     return true;
                 }
                 match t.and_then(|t| idx.get(&t)) {
-                    Some(&j) => dfs(block, idx, j, goal, visited, acc),
+                    Some(&j) => dfs(block, idx, j, goal, visited, acc, tables),
                     None => false,
                 }
             }
@@ -512,7 +570,7 @@ fn find_path(
     let start_i = *idx.get(&start)?;
     let mut visited = HashSet::new();
     let mut acc = Vec::new();
-    dfs(block, idx, start_i, goal, &mut visited, &mut acc).then_some(acc)
+    dfs(block, idx, start_i, goal, &mut visited, &mut acc, &tables).then_some(acc)
 }
 
 /// Classifies one on-path branch decision into a [`BranchStep`]: the concrete direction the
@@ -593,6 +651,7 @@ pub(crate) fn path_recipe(
     seed_start: Option<u64>,
     rpt: &Report,
     mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
+    mut resolve_jump: impl FnMut(&[Instruction], u64) -> Vec<u64>,
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> (Vec<SegmentRecipe>, Option<Halt>) {
     let Some(from_entry) = rpt.from_entry else {
@@ -668,7 +727,7 @@ pub(crate) fn path_recipe(
         let textmap = instruction_text(&block);
         // A route the search could not reconstruct is the same defect one level down: the branches
         // on the way to the goal are unknown, and an empty list of them claims there are none.
-        let route = find_path(&block, &idx, start, goal);
+        let route = find_path(&block, &idx, start, goal, &mut resolve_jump);
         let gates_unknown = route.is_none();
         let mut steps: Vec<BranchStep> = route
             .unwrap_or_default()
@@ -752,13 +811,16 @@ pub(crate) fn format_recipe(recipes: &[SegmentRecipe], stopped: Option<Halt>) ->
         None => {}
     }
     out.push_str(
-        "  Note: the IOCTL dispatch switch is an indirect jump table the static walk does\n",
+        "  Note: the IOCTL dispatch switch is an indirect jump table. Its cases are followed\n",
     );
     out.push_str(
-        "        not follow — pass the handler VA as `from`. Its IoControlCode is implied\n",
+        "        where the table resolved; where it did not the walk ends at the jump, and\n",
     );
     out.push_str(
-        "        by that choice, not by the branches below. Field mappings are heuristic.\n",
+        "        passing the handler VA as `from` scopes past it. Its IoControlCode is then\n",
+    );
+    out.push_str(
+        "        implied by that choice, not by the branches below. Field mappings are heuristic.\n",
     );
     for (n, seg) in recipes.iter().enumerate() {
         out.push_str(&format!(
@@ -841,11 +903,16 @@ pub(crate) struct Report {
 /// or a bound is hit. `uf` returns the raw `uf <arg>` text or `None` (bad address /
 /// forwarded export / disassembly failure) to prune that branch.
 ///
+/// `resolve_jump` answers where an indirect `jmp` goes, and is what lets the walk cross the IOCTL
+/// dispatch switch (`FOLLOWUPS.md` item 83). Returning nothing for a jump leaves the walk ending
+/// there, which is what it did before this existed.
+///
 /// `seed_start` is the resolved numeric VA of `from` (the caller resolves symbols /
 /// backtick / `module!sym+off` forms). When it points *inside* the seed function — a
 /// handler scoped past a switch — the intra-function walk begins there, not at the
 /// entry, so sibling switch cases aren't spuriously reachable. `None` (unresolvable)
 /// falls back to the function entry.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn reachability(
     from: &str,
     seed_start: Option<u64>,
@@ -853,6 +920,7 @@ pub(crate) fn reachability(
     max_functions: usize,
     max_depth: usize,
     mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
+    mut resolve_jump: impl FnMut(&[Instruction], u64) -> Vec<u64>,
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> Report {
     let mut visited: HashSet<u64> = HashSet::new(); // walk start addresses already done
@@ -901,11 +969,12 @@ pub(crate) fn reachability(
         // seed at its resolved address, or the entry if `from` was a symbol. Fall back
         // to the entry if the requested address isn't an instruction boundary.
         let desired = token.or(seed_start).unwrap_or(entry);
-        let (start_used, walk) = match walk_function(&block, desired) {
+        let (start_used, walk) = match walk_function(&block, desired, &mut resolve_jump) {
             Some(w) => (desired, w),
             None => (
                 entry,
-                walk_function(&block, entry).expect("entry is always an instruction"),
+                walk_function(&block, entry, &mut resolve_jump)
+                    .expect("entry is always an instruction"),
             ),
         };
         if !visited.insert(start_used) {
@@ -1066,15 +1135,15 @@ pub(crate) fn format_report(r: &Report) -> String {
         r.funcs_explored, r.max_functions, r.max_depth_seen, r.max_depth
     ));
     out.push_str(
-        "  Caveats: indirect/computed calls (call [ptr], call reg) and unresolved jump tables\n",
+        "  Caveats: indirect/computed calls (call [ptr], call reg) are NOT followed, nor is a\n",
     );
     out.push_str(
-        "           are NOT followed. REACHABLE is sound; NOT REACHABLE within bounds does not\n",
+        "           jump table that would not resolve. REACHABLE is sound; NOT REACHABLE within\n",
     );
     out.push_str(
-        "           prove unreachability — raise max_functions/max_depth, or pass a specific\n",
+        "           bounds does not prove unreachability — raise max_functions/max_depth, or\n",
     );
-    out.push_str("           handler VA as `from` to scope past a jump-table switch dispatch.\n");
+    out.push_str("           pass a specific handler VA as `from` to scope past the dispatch.\n");
     out
 }
 
@@ -1192,6 +1261,13 @@ mod tests {
 
     /// A walk that is never asked to stop. Named rather than a bare closure at every call site,
     /// so a test that *is* about halting reads differently from the fifteen that are not.
+    /// A resolver that follows nothing, which is the behaviour the walk had before
+    /// `FOLLOWUPS.md` item 83: every indirect jump ends its path. Used by every test that is not
+    /// about a jump table, so each of them still pins what it pinned.
+    fn no_tables(_: &[Instruction], _: u64) -> Vec<u64> {
+        Vec::new()
+    }
+
     fn never() -> Option<Halt> {
         None
     }
@@ -1302,6 +1378,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 256,
                 32,
                 |a| m.get(a).cloned(),
+                no_tables,
                 || {
                     polls += 1;
                     (polls > 1).then_some(why)
@@ -1328,7 +1405,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         }
 
         // And a walk nobody stops still reports the sweep it really did.
-        let r = reachability("start", None, 0x9999, 256, 32, |a| m.get(a).cloned(), never);
+        let r = reachability(
+            "start",
+            None,
+            0x9999,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert_eq!(r.halted, None);
         assert!(
             format_report(&r).contains("the reachable call graph was fully explored"),
@@ -1360,13 +1446,31 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         ]);
 
         // Depth 0: the callee is enqueued at depth 1 and refused, so its body is out of reach.
-        let bounded = reachability("start", None, 0x2004, 256, 0, |a| m.get(a).cloned(), never);
+        let bounded = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            0,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(!bounded.verdict_reachable, "{bounded:?}");
         assert!(bounded.bound_hit);
         assert_eq!(bounded.funcs_explored, 1);
 
         // Depth 1 reaches it, which is what makes the line above a bound rather than an accident.
-        let wider = reachability("start", None, 0x2004, 256, 1, |a| m.get(a).cloned(), never);
+        let wider = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            1,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(wider.verdict_reachable, "{wider:?}");
     }
 
@@ -1398,6 +1502,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 decoded.set(true);
                 m.get(a).cloned()
             },
+            no_tables,
             || decoded.get().then_some(Halt::Deadline),
         );
 
@@ -1438,14 +1543,17 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             .collect();
 
         assert_eq!(
-            find_path(&block, &idx, 0x1000, 0x1008),
+            find_path(&block, &idx, 0x1000, 0x1008, &mut no_tables),
             None,
             "the recipe invented a route through an instruction whose flow is not known"
         );
 
         // And a goal reached without crossing one is still routed to, so the line above is a
         // refusal rather than a DFS that finds nothing.
-        assert_eq!(find_path(&block, &idx, 0x1000, 0x1004), Some(Vec::new()));
+        assert_eq!(
+            find_path(&block, &idx, 0x1000, 0x1004, &mut no_tables),
+            Some(Vec::new())
+        );
     }
 
     /// A recipe cut short says so, because a prefix of it is not a weaker version of it.
@@ -1476,7 +1584,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
             ),
         ]);
-        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
 
         // Halts after the first segment, which is what a deadline reached mid-recipe looks like.
@@ -1486,6 +1603,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             None,
             &rpt,
             |a| m.get(a).cloned(),
+            no_tables,
             || {
                 segments += 1;
                 (segments > 1).then_some(Halt::Deadline)
@@ -1498,7 +1616,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert!(text.contains("INCOMPLETE"), "{text}");
 
         // And a recipe nobody stops is rendered without the caveat.
-        let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (whole, none) =
+            path_recipe("start", None, &rpt, |a| m.get(a).cloned(), no_tables, never);
         assert_eq!(none, None);
         assert!(!format_recipe(&whole, none).contains("INCOMPLETE"));
     }
@@ -1530,7 +1649,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         };
 
         // Scoped into case 1, whose body is reachable and whose sibling is not.
-        let rpt = reachability("0x1008", Some(0x1008), 0x100c, 256, 32, &mut uf, never);
+        let rpt = reachability(
+            "0x1008",
+            Some(0x1008),
+            0x100c,
+            256,
+            32,
+            &mut uf,
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.from_entry, Some(0x1000), "the function is the same one");
 
@@ -1551,7 +1679,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
         // And a walk from the entry says nothing extra, on either channel: there is nothing to
         // say, and every existing rendering stays byte-identical.
-        let plain = reachability("0x1000", Some(0x1000), 0x1004, 256, 32, &mut uf, never);
+        let plain = reachability(
+            "0x1000",
+            Some(0x1000),
+            0x1004,
+            256,
+            32,
+            &mut uf,
+            no_tables,
+            never,
+        );
         assert!(plain.verdict_reachable);
         assert!(
             structured_report(&plain, None, located)
@@ -1604,9 +1741,19 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
             ),
         ]);
-        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
-        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) =
+            path_recipe("start", None, &rpt, |a| m.get(a).cloned(), no_tables, never);
 
         let mut asked: Vec<u64> = Vec::new();
         let typed = structured_report(&rpt, Some((&recipes, stopped)), |address| {
@@ -1688,7 +1835,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
             ),
         ]);
-        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
 
         let typed = structured_report(
@@ -1736,6 +1892,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             256,
             32,
             |a| m.get(a).cloned(),
+            no_tables,
             || {
                 polls += 1;
                 (polls > 1).then_some(Halt::Deadline)
@@ -1785,14 +1942,24 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ],
         )]);
 
-        let rpt = reachability("start", None, 0x1034, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x1034,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable, "{rpt:?}");
         assert!(
             rpt.path.is_empty(),
             "an in-listing call is not a hop, which is what puts the whole route in one segment"
         );
 
-        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) =
+            path_recipe("start", None, &rpt, |a| m.get(a).cloned(), no_tables, never);
         assert_eq!(stopped, None);
         assert_eq!(recipes.len(), 1, "{recipes:?}");
         let steps = &recipes[0].steps;
@@ -1836,7 +2003,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
             ),
         ]);
-        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
 
         // One: the callee will not disassemble the second time, and nothing halted.
@@ -1845,6 +2021,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             None,
             &rpt,
             |a| (a != "0x2000").then(|| m.get(a).cloned()).flatten(),
+            no_tables,
             never,
         );
         assert_eq!(stopped, None, "nothing halted; this is an ordinary failure");
@@ -1881,6 +2058,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 }
                 m.get(a).cloned()
             },
+            no_tables,
             never,
         );
         assert_eq!(stopped, None);
@@ -1891,7 +2069,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
         // And a recipe that *is* straight-line still says so, so the sentence above is about the
         // unknown case rather than about every empty segment.
-        let (whole, none) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (whole, none) =
+            path_recipe("start", None, &rpt, |a| m.get(a).cloned(), no_tables, never);
         assert!(!whole[1].gates_unknown);
         assert!(format_recipe(&whole, none).contains("straight-line"));
     }
@@ -1927,7 +2106,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]),
             ),
         ]);
-        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
 
         // The shape the worker has: the deadline is noticed by whatever fetches the listing, which
@@ -1944,6 +2132,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 }
                 m.get(a).cloned()
             },
+            no_tables,
             || recorded.get(),
         );
 
@@ -1987,7 +2176,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(block[1].address, 0x1004);
         assert_eq!(block[1].flow, Flow::Unreadable);
 
-        let walk = walk_function(&block, 0x1000).expect("the entry is an instruction");
+        let walk =
+            walk_function(&block, 0x1000, &mut no_tables).expect("the entry is an instruction");
         assert!(
             !walk.reachable.contains(&0x1008),
             "the walk must stop at the hole, not step over it: {walk:?}",
@@ -2001,7 +2191,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             insn(0x1000, Flow::Fallthrough, "nop"),
             insn(0x1008, Flow::Return, "ret"),
         ];
-        let joined = walk_function(&spliced, 0x1000).expect("the entry is an instruction");
+        let joined =
+            walk_function(&spliced, 0x1000, &mut no_tables).expect("the entry is an instruction");
         assert!(
             joined.reachable.contains(&0x1008),
             "the spliced block is what the barrier exists to prevent"
@@ -2032,6 +2223,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             256,
             32,
             |a| blind.get(a).cloned(),
+            no_tables,
             never,
         );
         assert!(!rpt.verdict_reachable);
@@ -2064,6 +2256,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             256,
             32,
             |a| clear.get(a).cloned(),
+            no_tables,
             never,
         );
         let text = format_report(&seen);
@@ -2157,7 +2350,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 0x1000,
                 vec![insn(0x1004, flow, "x"), insn(0x1008, Flow::Return, "ret")],
             );
-            let walk = walk_function(&block, 0x1000).expect("entry is an instruction");
+            let walk =
+                walk_function(&block, 0x1000, &mut no_tables).expect("entry is an instruction");
             (
                 walk.reachable.contains(&0x1008),
                 walk.external.iter().map(|e| (e.1, e.2)).collect::<Vec<_>>(),
@@ -2217,7 +2411,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2008, Flow::Return, "ret")]),
             ),
         ]);
-        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned(), never);
+        let r = reachability(
+            "start",
+            None,
+            0x2008,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(r.verdict_reachable);
         assert_eq!(r.from_entry, Some(0x1000));
         assert_eq!(r.containing_fn, Some(0x2000));
@@ -2239,7 +2442,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 uf_fn(0x2000, vec![insn(0x2008, Flow::Return, "ret")]),
             ),
         ]);
-        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned(), never);
+        let r = reachability(
+            "start",
+            None,
+            0x2008,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(r.verdict_reachable);
         assert_eq!(r.path, vec![(0x1004, "jmp", 0x2000)]);
     }
@@ -2250,7 +2462,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "start",
             uf_fn(0x1000, vec![insn(0x1004, Flow::Return, "ret")]),
         )]);
-        let r = reachability("start", None, 0x1004, 256, 32, |a| m.get(a).cloned(), never);
+        let r = reachability(
+            "start",
+            None,
+            0x1004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(r.verdict_reachable);
         assert_eq!(r.containing_fn, Some(0x1000));
         assert!(r.path.is_empty());
@@ -2266,7 +2487,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         )]);
         // The target sits behind the indirect call, which is never followed.
-        let r = reachability("start", None, 0x2008, 256, 32, |a| m.get(a).cloned(), never);
+        let r = reachability(
+            "start",
+            None,
+            0x2008,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(!r.verdict_reachable);
         assert!(!r.bound_hit); // graph exhausted, not a bound
     }
@@ -2290,7 +2520,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         ]);
         // Target is absent — the A<->B cycle must not loop forever.
-        let r = reachability("start", None, 0x7777, 256, 32, |a| m.get(a).cloned(), never);
+        let r = reachability(
+            "start",
+            None,
+            0x7777,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(!r.verdict_reachable);
         assert_eq!(r.funcs_explored, 2);
     }
@@ -2311,7 +2550,16 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ),
         ]);
         // Bound to a single function: B (which contains the target) is never explored.
-        let r = reachability("start", None, 0x2004, 1, 32, |a| m.get(a).cloned(), never);
+        let r = reachability(
+            "start",
+            None,
+            0x2004,
+            1,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(!r.verdict_reachable);
         assert!(r.bound_hit);
         assert_eq!(r.funcs_explored, 1);
@@ -2319,10 +2567,11 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
 
     #[test]
     fn reachability_scopes_from_mid_function_start() {
-        // A single dispatch function: the entry does an indirect jump-table `jmp` (which is not
-        // followed), then two independent switch-case blocks. Disassembling any address returns
-        // the whole function, so a mid-function `from` must NOT treat the *other* case as
-        // reachable.
+        // A single dispatch function: the entry does an indirect jump-table `jmp`, then two
+        // independent switch-case blocks. Disassembling any address returns the whole function, so
+        // a mid-function `from` must NOT treat the *other* case as reachable -- which is what this
+        // test is about, and holds however the jump is resolved: the cases are reached from the
+        // **jump**, so a walk starting past it reaches neither.
         let dispatch = uf_fn(
             0x1000,
             vec![
@@ -2339,17 +2588,106 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         };
         // Starting inside case 1 (seed_start resolved to 0x1008), case 1's body IS reachable.
         assert!(
-            reachability("0x1008", Some(0x1008), 0x100c, 256, 32, &mut uf, never).verdict_reachable
+            reachability(
+                "0x1008",
+                Some(0x1008),
+                0x100c,
+                256,
+                32,
+                &mut uf,
+                no_tables,
+                never
+            )
+            .verdict_reachable
         );
         // ...but case 2's body is NOT reachable from case 1 (no intra-function path).
         assert!(
-            !reachability("0x1008", Some(0x1008), 0x1014, 256, 32, &mut uf, never)
-                .verdict_reachable
+            !reachability(
+                "0x1008",
+                Some(0x1008),
+                0x1014,
+                256,
+                32,
+                &mut uf,
+                no_tables,
+                never
+            )
+            .verdict_reachable
         );
-        // From the entry, the switch cases are unreachable — the jump table isn't followed.
+        // From the entry, the switch cases are unreachable **while nothing resolves the table** --
+        // which is the degradation `FOLLOWUPS.md` item 83's fix has to preserve, not a property of
+        // the walk. A resolver that answers nothing leaves the verdict exactly as it was.
         assert!(
-            !reachability("0x1000", Some(0x1000), 0x1008, 256, 32, &mut uf, never)
-                .verdict_reachable
+            !reachability(
+                "0x1000",
+                Some(0x1000),
+                0x1008,
+                256,
+                32,
+                &mut uf,
+                no_tables,
+                never
+            )
+            .verdict_reachable
+        );
+
+        // **And reachable once the table is resolved**, which is the fix. The resolver stands in
+        // for `ioctl::jump_targets`: the walk reaches `br x8` at `0x1004`, asks where it goes, and
+        // crosses to the case the switch selects. Before item 83 this was NOT REACHABLE while
+        // `ioctl_map` was naming that same handler from the same table.
+        let mut resolved = |_: &[Instruction], at: u64| match at {
+            0x1004 => vec![0x1008, 0x1010],
+            _ => Vec::new(),
+        };
+        assert!(
+            reachability(
+                "0x1000",
+                Some(0x1000),
+                0x1008,
+                256,
+                32,
+                &mut uf,
+                &mut resolved,
+                never
+            )
+            .verdict_reachable,
+            "the first case the table selects"
+        );
+        assert!(
+            reachability(
+                "0x1000",
+                Some(0x1000),
+                0x1014,
+                256,
+                32,
+                &mut uf,
+                &mut resolved,
+                never
+            )
+            .verdict_reachable,
+            "and the second, which no intra-function path reaches from the first"
+        );
+
+        // **A target the resolver does not name stays unreachable**, so the walk follows the table
+        // rather than opening the function up: an edge it invented would make REACHABLE unsound,
+        // which is the one direction this walk may not be wrong in.
+        let mut only_first = |_: &[Instruction], at: u64| match at {
+            0x1004 => vec![0x1008],
+            _ => Vec::new(),
+        };
+        assert!(
+            !reachability(
+                "0x1000",
+                Some(0x1000),
+                0x1014,
+                256,
+                32,
+                &mut uf,
+                &mut only_first,
+                never
+            )
+            .verdict_reachable,
+            "only the slots the resolver proved are edges"
         );
     }
 
@@ -2368,12 +2706,31 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         let mut uf = |a: &str| (a == "0x1000").then(|| guard.clone());
         // The entry (before the trap) is reachable...
         assert!(
-            reachability("0x1000", Some(0x1000), 0x1000, 256, 32, &mut uf, never).verdict_reachable
+            reachability(
+                "0x1000",
+                Some(0x1000),
+                0x1000,
+                256,
+                32,
+                &mut uf,
+                no_tables,
+                never
+            )
+            .verdict_reachable
         );
         // ...but code after the trap is not (the walk stops at the trap).
         assert!(
-            !reachability("0x1000", Some(0x1000), 0x1006, 256, 32, &mut uf, never)
-                .verdict_reachable
+            !reachability(
+                "0x1000",
+                Some(0x1000),
+                0x1006,
+                256,
+                32,
+                &mut uf,
+                no_tables,
+                never
+            )
+            .verdict_reachable
         );
     }
 
@@ -2404,12 +2761,19 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             256,
             32,
             |a| m.get(a).cloned(),
+            no_tables,
             never,
         );
         assert!(rpt.verdict_reachable);
 
-        let (recipes, stopped) =
-            path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) = path_recipe(
+            "Handler",
+            Some(0x1000),
+            &rpt,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].start, 0x1000);
@@ -2454,12 +2818,19 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             256,
             32,
             |a| m.get(a).cloned(),
+            no_tables,
             never,
         );
         assert!(rpt.verdict_reachable);
 
-        let (recipes, stopped) =
-            path_recipe("Merge", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) = path_recipe(
+            "Merge",
+            Some(0x1000),
+            &rpt,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 1);
         assert_eq!(recipes[0].steps.len(), 1);
@@ -2491,12 +2862,19 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             256,
             32,
             |a| m.get(a).cloned(),
+            no_tables,
             never,
         );
         assert!(rpt.verdict_reachable);
 
-        let (recipes, stopped) =
-            path_recipe("Handler", Some(0x1000), &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) = path_recipe(
+            "Handler",
+            Some(0x1000),
+            &rpt,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert_eq!(stopped, None, "these fixtures never halt");
         let step = &recipes[0].steps[0];
         assert_eq!(step.required, Direction::Taken);
@@ -2544,11 +2922,21 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 ),
             ),
         ]);
-        let rpt = reachability("start", None, 0x200c, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x200c,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x100c, "call", 0x2000)]);
 
-        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) =
+            path_recipe("start", None, &rpt, |a| m.get(a).cloned(), no_tables, never);
         assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 2);
         // Segment 1: A, routing from entry to the call site.
@@ -2592,11 +2980,21 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 ),
             ),
         ]);
-        let rpt = reachability("start", None, 0x2004, 256, 32, |a| m.get(a).cloned(), never);
+        let rpt = reachability(
+            "start",
+            None,
+            0x2004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
         assert!(rpt.verdict_reachable);
         assert_eq!(rpt.path, vec![(0x1008, "jmp", 0x2000)]);
 
-        let (recipes, stopped) = path_recipe("start", None, &rpt, |a| m.get(a).cloned(), never);
+        let (recipes, stopped) =
+            path_recipe("start", None, &rpt, |a| m.get(a).cloned(), no_tables, never);
         assert_eq!(stopped, None, "these fixtures never halt");
         assert_eq!(recipes.len(), 2);
         // Segment 1 (A): the exit branch is captured as a required "take" with its predicate.

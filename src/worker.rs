@@ -8306,22 +8306,7 @@ fn ioctl_map_of(
     // it instead, and an image whose headers will not read answers `false` for everything -- no
     // table is followed there rather than every one being trusted, and the jumps say so.
     let executable: Vec<std::ops::Range<u64>> = holding
-        .and_then(|module| {
-            let mut headers = |at: u64, len: usize| {
-                within_module(module.base, module.size, at, len)
-                    .then(|| e.read_memory(at, len).ok())?
-            };
-            let mut image = pe::read_image(module.base, &mut headers).ok()?;
-            // **The loader's extent wins**, for the reason `driver_hazards` gives at length: every
-            // bound in `src/pe.rs` is a `checked_va` against `SizeOfImage`, which on an untrusted
-            // driver is memory that driver may have written. A section declared past the loaded
-            // extent would otherwise put the next module's code inside this one's ranges, and a
-            // table entry landing there would be published as this driver's case with the jump
-            // reported as followed.
-            image.size_of_image = smaller_extent(image.size_of_image, module.size);
-            Some(image)
-        })
-        .map(|image| image.executable_ranges())
+        .map(|module| executable_ranges(e, module))
         .unwrap_or_default();
     let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
     let layout = ioctl_layout(set);
@@ -8687,6 +8672,36 @@ fn function_listing(
     Some(in_listing_order(&listing, &mut decoded))
 }
 
+/// One module's **executable** ranges, read from the image's own section table.
+///
+/// The question a resolved table entry has to pass, and the loader's extent is not it: `.rdata`,
+/// `.data` and the headers are all inside that, so a malformed or accidentally matched table full
+/// of module-relative *data* addresses would pass and be published as cases with the jump reported
+/// as followed. An image whose headers will not read answers `false` for everything -- no table is
+/// followed there rather than every one being trusted.
+///
+/// **The loader's extent still wins on the size**, for the reason `driver_hazards` gives at length:
+/// every bound in [`crate::pe`] is a `checked_va` against `SizeOfImage`, which on an untrusted
+/// driver is memory that driver may have written. A section declared past the loaded extent would
+/// otherwise put the next module's code inside this one's ranges.
+///
+/// Shared by the IOCTL map and by the reachability walk's table resolver (`FOLLOWUPS.md` item 83)
+/// rather than written twice: the two tools now follow the same tables, and a second copy of this
+/// predicate is how they would come to disagree about which entries are code.
+fn executable_ranges(
+    e: &DebugEngine,
+    module: &dbgscope::dbgeng::Module,
+) -> Vec<std::ops::Range<u64>> {
+    let mut headers = |at: u64, len: usize| {
+        within_module(module.base, module.size, at, len).then(|| e.read_memory(at, len).ok())?
+    };
+    let Ok(mut image) = pe::read_image(module.base, &mut headers) else {
+        return Vec::new();
+    };
+    image.size_of_image = smaller_extent(image.size_of_image, module.size);
+    image.executable_ranges()
+}
+
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
     // Refused outright on an instruction set whose **flow** this build does not decode. Every
     // instruction there decodes to `Flow::Unknown`, and the walk stops at those, so the answer
@@ -8843,6 +8858,67 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         }
     };
 
+    // **Where an indirect jump goes, answered by the tool that already knows** -- `FOLLOWUPS.md`
+    // item 83. `ioctl_map` resolves A64 switch tables and this walk did not, so the two disagreed
+    // about the same driver: the map named a handler and the walk called it NOT REACHABLE, with the
+    // advice to pass that handler's address by hand. `ioctl::jump_targets` runs the map's own walk
+    // and returns what its tables select, so a target admitted here is a target `ioctl_map`
+    // publishes and neither tool can contradict the other.
+    //
+    // **Gated on the operands, which is a narrower question than this walk's own gate.**
+    // `reachable` is refused only where the *flow* is undecoded, because the walk reads nothing
+    // else; a table resolver reads operands. On a set whose operands go unread the resolver answers
+    // nothing and the walk ends at the jump exactly as it did before -- which is the honest
+    // degradation rather than a verdict about bytes nobody decoded.
+    let set_reads_operands = set.operands_are_read();
+    // Read once: the walk crosses functions and may cross modules, and asking the engine for its
+    // module table per jump would be a round trip for a question whose answer does not move.
+    let loaded = e.modules().unwrap_or_default();
+    let layout = ioctl_layout(set);
+    let mut resolve_jump = |block: &[Instruction], at: u64| -> Vec<u64> {
+        if !set_reads_operands {
+            return Vec::new();
+        }
+        let Some(entry) = block.first().map(|first| first.address) else {
+            return Vec::new();
+        };
+        // The module holding *this* listing rather than the seed's: a walk that has crossed into
+        // another driver must read that driver's bytes, and a reader bounded to the wrong module
+        // refuses every address -- which would look like a table that would not resolve.
+        let Some(module) = loaded
+            .iter()
+            .find(|module| entry >= module.base && entry < module.end())
+        else {
+            return Vec::new();
+        };
+        let read = |address: u64, len: usize| {
+            within_module(module.base, module.size, address, len)
+                .then(|| e.read_memory(address, len).ok())?
+        };
+        // The same question `ioctl_map`'s own wiring asks, and for the same reason: the loader's
+        // extent admits `.rdata` and the headers, so a table of module-relative *data* addresses
+        // would pass and be followed. Only this module's executable sections are code.
+        let executable = executable_ranges(e, module);
+        let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
+        let targets = ioctl::jump_targets(entry, block, layout, read, in_image, || {
+            if let Some(why) = halted.get() {
+                return Some(why);
+            }
+            if matches!(e.interrupted(), Ok(true)) {
+                Some(walk::Halt::Interrupted)
+            } else if Instant::now() >= deadline {
+                Some(walk::Halt::Deadline)
+            } else {
+                None
+            }
+        });
+        targets
+            .into_iter()
+            .find(|(site, _)| *site == at)
+            .map(|(_, targets)| targets)
+            .unwrap_or_default()
+    };
+
     let rpt = reachability(
         &args.from,
         seed_start,
@@ -8850,6 +8926,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         args.max_functions,
         args.max_depth,
         &mut uf,
+        &mut resolve_jump,
         &mut halt,
     );
 
@@ -8894,7 +8971,14 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // branch each on-path `jcc` must take, and what it tests).
     let mut out = format_report(&rpt);
     let recipe = (rpt.verdict_reachable && args.recipe).then(|| {
-        let (recipes, stopped) = path_recipe(&args.from, seed_start, &rpt, &mut uf, &mut halt);
+        let (recipes, stopped) = path_recipe(
+            &args.from,
+            seed_start,
+            &rpt,
+            &mut uf,
+            &mut resolve_jump,
+            &mut halt,
+        );
         out.push_str(&format_recipe(&recipes, stopped));
         (recipes, stopped)
     });
