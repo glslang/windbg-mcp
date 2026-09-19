@@ -58,6 +58,8 @@ pub enum EngineOp {
     /// cannot become the leak. See [`crate::kdconn`].
     AttachKernel {
         connection: Connection,
+        #[serde(default)]
+        experimental_break_on_connect: bool,
     },
     AttachProcess {
         pid: u32,
@@ -961,6 +963,21 @@ impl HeapOp {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_announcement_option_survives_the_worker_wire() {
+        for enabled in [false, true] {
+            let op = EngineOp::AttachKernel {
+                connection: Connection::new("net:port=50000,key=1.2.3.4"),
+                experimental_break_on_connect: enabled,
+            };
+            let encoded = serde_json::to_value(&op).unwrap();
+            let decoded: EngineOp = serde_json::from_value(encoded).unwrap();
+            assert!(
+                matches!(decoded, EngineOp::AttachKernel { experimental_break_on_connect, .. } if experimental_break_on_connect == enabled)
+            );
+        }
+    }
 
     /// Every op that *carries* a caller's patience must hand it out, and no other op may claim to.
     ///

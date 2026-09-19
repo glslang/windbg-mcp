@@ -3,11 +3,11 @@
     {
       "annotations": 123,
       "description": 1245,
-      "inputSchema": 904,
-      "modelVisible": 2203,
+      "inputSchema": 1233,
+      "modelVisible": 2532,
       "name": "attach_kernel",
       "outputSchema": 4078,
-      "wire": 6435
+      "wire": 6764
     },
     {
       "annotations": 122,
@@ -553,13 +553,13 @@
   "totals": {
     "annotations": 6440,
     "description": 35281,
-    "inputSchema": 53503,
+    "inputSchema": 53832,
     "instructions": 1983,
-    "modelVisible": 91992,
+    "modelVisible": 92321,
     "outputSchema": 151844,
-    "payload": 251999,
+    "payload": 252328,
     "tools": 61,
-    "wire": 251927,
+    "wire": 252256,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

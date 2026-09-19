@@ -20,10 +20,10 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 61 | 91,992 B |
-| `session,inspect,exec,crash` | 31 | 45,329 B |
-| `session,inspect,crash` | 23 | 32,524 B |
-| `crash` | 13 | 19,280 B |
+| *(absent)* — every tool | 61 | 92,321 B |
+| `session,inspect,exec,crash` | 31 | 45,658 B |
+| `session,inspect,crash` | 23 | 32,853 B |
+| `crash` | 13 | 19,609 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of
 individual tool names, or `all`.

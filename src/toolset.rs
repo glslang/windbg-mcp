@@ -22,7 +22,7 @@
 //!   group      tools   bytes   what it is for
 //!   allocator     10   16,457  pool and heap walks, and `walk_memory`
 //!   inspect       10   13,152  registers, stacks, memory, modules, symbols, location, raw commands
-//!   session       10   13,019  opening a target, ending it, and watching this server
+//!   session       10   13,348  opening a target, ending it, and watching this server
 //!   exec           8   12,652  breakpoints and execution control
 //!   batch          1   10,021  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code

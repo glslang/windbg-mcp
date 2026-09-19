@@ -1,10 +1,11 @@
 # Microsoft hypervisor debugging
 
-**Experimental: safe hypervisor detach is not yet validated.** The first MCP probe left the
+**Experimental: use only on a disposable lab target.** The first MCP probe left the
 guest unresponsive despite reporting a successful resume/detach; native KD subsequently
 recovered it without a reset. The candidate passed one independently checked detach cycle,
 but its second cycle lost WinRM reachability despite passing MCP assertions.
-See [Validation](#validation) before attempting a live session.
+The new opt-in announcement attach passed three independently checked MCP cycles on the measured
+build. The default attach path remains unchanged. See [Validation](#validation) before use.
 
 Use `attach_kernel` with a profile for the **hypervisor's** KDNET endpoint. The existing
 DbgEng kernel transport handles this; no EXDI backend, separate attach tool, or Secure Kernel
@@ -32,11 +33,21 @@ debugger owns the same port. Do not operate two controllers on one endpoint.
 
 ## Through MCP
 
-Call `attach_kernel`:
+For a known-running lab hypervisor, explicitly select the experimental attach path:
 
 ```json
-{ "profile": "lab-hypervisor" }
+{ "profile": "lab-hypervisor", "experimental_break_on_connect": true }
 ```
+
+This KDNET-only option requests one break upon DbgEng's English connection announcement, with no
+persistent initial-break flag or extra attach resume. That text is observed behavior, **not a
+documented readiness contract**. The observer is scoped to the attach; duplicate announcements
+do not request another break, and a later attach gets fresh state. Missing output, failed
+interrupt, interrupted wait, or unconfirmed stopped status fails the attach. A 60-second watchdog
+requests exit from the wait without requesting a second target break; an unconnected transport
+may still block. On failure the claimed session must be inspected or ended, not blindly retried.
+Already-halted targets and failure recovery are not live-validated. Omitting the option retains
+the ordinary attach behavior, including the failure shape documented below.
 
 Check the returned identity before doing anything else. On the measured x64 target, the report
 says `Microsoft Hypervisor Kernel Version`, and `summary.primary_module` names `hv` with image
@@ -189,8 +200,22 @@ a fix and validation. No reset, reboot, or VELKO configuration change was needed
 An [automatic diagnostic](hypervisor-detach-trace.md#callback-readiness-and-automatic-diagnostic)
 subsequently passed four runs using the normal-output connection announcement to request one
 break. Its reproducible source and matcher tests are retained in dbgscope's `kernel_attach_probe`
-example. This is not a new server attach option: the announcement has no documented readiness
-contract, and the probe does not provide production failure/reconnect handling.
+example. Those diagnostic runs preceded the explicitly opt-in server integration described above.
+
+The integration pins dbgscope `2d49a887bb0fb9376dd8865b4524d59046992b6c`. One direct library
+probe and then three sequential MCP detach-only cycles passed on DbgEng 10.0.29617.1000 and
+the four-processor Hyper-V 29671 target. The wrapper verified guest identity, unchanged boot
+time, and advancing uptime twice after each MCP cycle. No recovery attach, reboot, reset,
+installed-server replacement, or VELKO configuration change was needed. Local tests cover
+missing and repeated announcements, callback restoration, argument validation, and worker
+option forwarding. This does not establish live deadline-failure or already-halted reconnect
+behavior, owning-engine drop, live NT behavior, or cross-version safety.
+
+The integration passed 960 server unit tests and 117 default smoke tests (18 opt-in tests
+ignored), plus the enabled real-debugger NT dump summary regression. Formatting and server
+Clippy checks passed. dbgscope passed 393 tests and four doctests, with 13 tests ignored;
+its Clippy run retained only pre-existing warnings. Three pure announcement/failure tests
+passed local Miri. These offline results do not substitute for the live checks above.
 
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
@@ -202,14 +227,15 @@ without stepping first. After recovering the lab, use its independent WinRM heal
 
 ```powershell
 .\examples\hypervisor_detach_regression.ps1 -Profile lab-hypervisor `
-    -ComputerName '<guest-address>' -ExpectedComputerName '<guest-computer-name>'
+    -ComputerName '<guest-address>' -ExpectedComputerName '<guest-computer-name>' `
+    -ExperimentalBreakOnConnect
 ```
 
 Verify beforehand that the profile names that guest's hypervisor endpoint and its debugger host
 address matches this workspace. The wrapper checks guest identity, stable boot time, and advancing
 uptime after each of three cycles. It stops on failure and performs no reset or automatic recovery.
-The measured runs above used one cycle, followed by a two-cycle invocation that stopped after
-its first failed health check; there were two attaches in total, not three successful cycles.
+The original default-path runs used one cycle, followed by a two-cycle invocation that stopped
+after its first failed health check. The later opt-in run passed all three requested cycles.
 
 The broader regression test is also opt-in and ignored by normal `cargo test`:
 
