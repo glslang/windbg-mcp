@@ -1565,6 +1565,20 @@ same two drivers item 82 was measured on. It already shares this repo's IOCTL-ca
 recovered there and a case recovered here are the same record about the same driver and diff
 directly. Ghidra stays the x64 lane; Binary Ninja is the one that can answer on ARM64 today.
 
+**And its counterpart is the same tool by name.** `binja_windbg_mcp.analysis.ioctl_map` is one of
+that companion's five driver tools (`driver_entry`, `sink_imports`, `device_security`, `ioctl_map`,
+`driver_surface`), and it carries `cases` with `evidence` and an `unresolved` list with reasons --
+the shapes this one answers in. What makes it an oracle rather than a second copy is *how* it finds
+the control code: it admits a branch whose `input` is
+`Parameters.DeviceIoControl.IoControlCode`, which is Binary Ninja's **type propagation** over the
+IO stack location, where this walk traces a displacement through `Facts`. Two different methods
+over the same bytes is the whole point of a second opinion, and it is what makes the diff able to
+answer item 82 -- whether a decompiler that constant-folds a read-only PC-relative load recovers
+the refusal and the size this walk cannot. That is the measurement to take first, before either
+implementation is changed.
+
+Its `traverse` also already walks dispatch to sink, which is item 71 here.
+
 **Why deferred:** neither Ghidra nor Driver Buddy Revolutions is installed on this bench (checked
 2026-09-19; the README's `C:\ghidra_12.1.3_PUBLIC` is not there), so the Ghidra lane needs a host
 stood up first. The Binary Ninja route needs no install here -- it needs the diff written, and a
