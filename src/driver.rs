@@ -2946,15 +2946,21 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ],
         );
         let m = functions(&[("start", func.clone()), ("0x1000", func)]);
-        // Reachable without the table, so the recipe is attempted at all.
+        // **The goal is behind the jump**, which is what makes the resolver necessary. Aimed at
+        // `0x1004` instead, the recipe's first phase finds the route with no tables at all -- rightly,
+        // the goal being on the fall-through -- and the resolver is never asked, so there is no halt
+        // to report and this test passed for having nothing to find. That is what it did until the
+        // two-phase change, which is the shape a fixture has to be re-read against rather than
+        // trusted.
+        let reaching = tables_of(&[(0x1004, vec![0x1008])]);
         let rpt = reachability(
             "start",
             None,
-            0x1004,
+            0x1008,
             256,
             32,
             |a| m.get(a).cloned(),
-            no_tables,
+            |_: &[Instruction]| reaching.clone(),
             never,
         );
         assert!(rpt.verdict_reachable, "{rpt:?}");
@@ -3054,9 +3060,18 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         };
 
         // The configurable bound: raising the arguments is the remedy, and it is named.
+        //
+        // **Asserted against the resolver's own sentence, not against "handler VA".** That phrase is
+        // in the caveats block every report ends with -- "pass a specific handler VA as `from` to
+        // scope past the dispatch" -- so its absence is unassertable and a test demanding it can
+        // never pass. Found by CI rather than here, which is the cost of a substring standing in for
+        // a claim.
         let text = format_report(&base.clone());
         assert!(text.contains("raise max_functions/max_depth"), "{text}");
-        assert!(!text.contains("handler VA"), "{text}");
+        assert!(
+            !text.contains("jump-table resolver stopped at a limit of its own"),
+            "an ordinary bound must not claim the resolver's: {text}"
+        );
 
         // The resolver's own: the arguments are named as *not* reaching it, and the remedy that
         // does is given instead.
