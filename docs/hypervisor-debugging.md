@@ -186,6 +186,11 @@ requested one break before detaching. Independent WinRM checks confirmed stable 
 advancing uptime after every run. These comparisons bypassed the server's automatic attach helper
 and its unconditional artifact-absorption `g`; that production path is unchanged and still requires
 a fix and validation. No reset, reboot, or VELKO configuration change was needed for the comparisons.
+An [automatic diagnostic](hypervisor-detach-trace.md#callback-readiness-and-automatic-diagnostic)
+subsequently passed four runs using the normal-output connection announcement to request one
+break. Its reproducible source and matcher tests are retained in dbgscope's `kernel_attach_probe`
+example. This is not a new server attach option: the announcement has no documented readiness
+contract, and the probe does not provide production failure/reconnect handling.
 
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor

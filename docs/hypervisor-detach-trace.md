@@ -133,6 +133,51 @@ does not justify a fixed sleep, a fixed number of resumes, or parsing diagnostic
 transport contract. The probe's infinite wait is a controlled diagnostic, not a new bounded-wait
 guarantee. Stepping, breakpoint hits, live NT teardown, and owning-engine drop remain separate tests.
 
+## Callback readiness and automatic diagnostic
+
+A follow-up instrumented session, engine-state, and debuggee-state callbacks without requesting an
+initial break. `ChangeEngineState(EXECUTION_STATUS, GO)` arrived before synchronization;
+`SessionStatus(ACTIVE)` arrived only after the manually requested break. Neither supplied a usable
+pre-break readiness signal in this run. Microsoft's
+[session callback contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugeventcallbacks-sessionstatus)
+describes session activation, not transport synchronization. The guest remained healthy after this
+probe's typed teardown (uptime 5029.86 → 5033.13 seconds).
+
+Next, one explicit `SetInterrupt` was issued before the first wait with the initial-break option
+disabled. The trace logged one send before synchronization, but no stop followed and WinRM remained
+responsive. A later manual interrupt produced a second send and reached CPU 0. Typed teardown then
+passed independent health checks (5115.95 → 5119.27 seconds). Moving the request before the wait
+therefore did not reproduce the successful post-synchronization behavior.
+
+Finally, an automatic diagnostic watched the normal-output `Connected to target` announcement prefix
+(mask `0x1`), signaled a channel, and requested one interrupt from its reader thread. This text was
+emitted before the synchronization-complete trace; the break-in send appeared afterward. The callback
+made no DbgEng call. Only the existing `InterruptHandle` crossed the engine thread boundary.
+
+| Automatic diagnostic | Stop CPU | Recorded break-in sends | Post-detach uptime samples (seconds) |
+|---|---|---|---|
+| Local prototype, first run | 3 | 1 | 5234.84 → 5238.15 |
+| Local prototype, second run | 1 | 1 | 5356.23 → 5359.52 |
+| Retained example source, tested stream matcher | 3 | 1 | 5560.96 → 5564.28 |
+| Final example source, input/result checks added | 1 | 1 | 5845.34 → 5848.65 |
+
+All four returned `OnRequest`, reached the same first-chance exception at `hv+0x404a60`, and reported
+`Ok(KernelRunning)` followed by `DEBUG_STATUS_NO_DEBUGGEE`. Independent WinRM checks passed after
+each run with the same boot time. No recovery attach, reset, reboot, or host configuration change
+was required. No hypervisor controller was retained after the checks.
+
+The reproducible source is `examples/kernel_attach_probe.rs` on dbgscope's `fix/safe-kernel-detach`
+branch, with a runbook in `docs/kernel-attach-probe.md`. It includes manual, pre-wait, and announcement
+modes and five offline tests for the bounded, line-anchored, one-shot announcement matcher. The
+retained example suppresses raw DbgEng text to avoid exposing connection keys. Its live measurement
+used the already-approved diagnostic executable path and pinned candidate library, not an MCP test.
+
+This implements an **automatic diagnostic**, not a production attach fix. The text is an observed
+engine behavior rather than a documented readiness contract, and the wait remains unbounded if the
+announcement never arrives. No server option, default attach behavior, or installed binary changed.
+Production integration still needs an explicit policy and tested failure/reconnect handling; the
+successful diagnostic is not grounds for silently changing NT attach or retrying breaks in a loop.
+
 ## Local evidence index
 
 These filenames identify the retained bench artifacts, not portable repository inputs:
@@ -147,3 +192,9 @@ These filenames identify the retained bench artifacts, not portable repository i
 - `synchronized-detach-probe-20260919-145358.log`: first typed comparison, including the firewall delay.
 - `synchronized-detach-probe-20260919-145628.log`: second typed comparison.
 - `synchronized-detach-probe-20260919-145720.log`: third typed comparison.
+- `synchronized-detach-probe-20260919-152410.log`: callback ordering, followed by manual break and successful teardown.
+- `synchronized-detach-probe-20260919-152601.log`: ineffective pre-wait interrupt, then successful manual completion.
+- `synchronized-detach-probe-20260919-152843.log`: first automatic announcement-trigger prototype.
+- `synchronized-detach-probe-20260919-152958.log`: second automatic prototype.
+- `synchronized-detach-probe-20260919-153400.log`: retained example source, automatic trigger and successful teardown.
+- `synchronized-detach-probe-20260919-153857.log`: final example source, including secret-safe input errors and resume-result checks.
