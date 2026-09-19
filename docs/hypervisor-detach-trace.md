@@ -216,9 +216,25 @@ not permission to kill a debugger whose target may be stopped.
 
 A second run tested a single explicit interrupt after the deadline, keeping the same controller.
 The guest answered before that interrupt. One break-in send appeared, but no stop/wait result
-followed and WinRM then timed out. No second interrupt, detach, reset, or competing controller
-was attempted; console inspection was requested with the original probe still held. This
-checkpoint does not validate same-controller timeout recovery.
+followed and WinRM then timed out. The original probe was held until the owner confirmed a
+black/frozen console. It never reported a stop or performed teardown.
+
+### Manual recovery after the stalled wait
+
+The operator verified the original probe's exact process identity and exclusive endpoint
+ownership, terminated only that probe, and checked the endpoint was free before starting native
+KD. This was a deliberate recovery handoff, not successful cancellation or routine cleanup.
+Native KD ran without `-bonc` and without an explicit target-address poke. It synchronized and
+collected a first-chance `0x80000003` on CPU 0 at `hv+0x404a60`; no break-in send appeared in its
+trace. `.lastevent;bl` confirmed the exception and listed no breakpoints. One `qd` advanced the
+PC by one byte and received an acknowledged `DbgKdContinue(10002)` before native KD exited 0.
+
+Independent WinRM checks identified the same guest and boot, with uptime advancing from
+12612.9890683 to 12616.3650664 seconds. The debugger endpoint was free. No reboot/reset or second
+explicit break was issued. This is one successful manual native-KD recovery of a frozen target,
+not validation of same-controller or automatic timeout recovery. It supports a pending-stop
+interpretation but does not establish why the original wait failed to return. Do not turn the
+observed single `qd` into a fixed-count recovery loop.
 
 The 60-second exit-only watchdog cannot be treated as a cancellation guarantee even when the
 transport has printed synchronization success. These diagnostic runs did not change the server
@@ -247,3 +263,5 @@ These filenames identify the retained bench artifacts, not portable repository i
 - `synchronized-detach-probe-20260919-162939.log`: first typed experimental attach integration, one send and successful detach.
 - `synchronized-detach-probe-20260919-170924.log`: injected missing announcement; reclaimed still-waiting process with independently responsive guest, then fresh MCP attach/detach passed.
 - `synchronized-detach-probe-20260919-171404.log`: second injected timeout; one manual break-in send, wait still blocked and WinRM unavailable at the recorded checkpoint.
+- `native-hv-recovery-20260919-173050.log`: recovery after the owner confirmed the frozen console; no break-in send, CPU-0 stop, acknowledged `qd`, native KD exit 0.
+- `timeout-recovery-health-20260919-1732.md`: independent same-boot uptime checks and free endpoint after that recovery.
