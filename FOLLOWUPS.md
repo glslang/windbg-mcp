@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-four clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-five clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -57,7 +57,9 @@ compiler cannot spell as immediates in a PC-relative literal pool, which the fac
 read -- 235 codes recovered over seven drivers and **not one** proven size or refusal among them --
 and, found beside it, a reachability walk that does not follow the switch tables the map now
 resolves, an `adrp`+`add` table base lost at the `add`, and an ARM64 surface that no second
-implementation has ever checked.
+implementation has ever checked. And item 86 from that PR's own CI, where a
+Markdown-only diff went red on a test that caps the whole server to 60s and then opens a dump
+under it (2026-09-19).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1590,3 +1592,42 @@ question again -- plus
 [`docs/binja-windbg-mcp-plan.md`](./docs/binja-windbg-mcp-plan.md) and
 [`docs/binja-windbg-mcp-validation.md`](./docs/binja-windbg-mcp-validation.md) for what the
 companion already answers, and `structured::IoctlCase`'s doc comment for the shared shape.
+
+## 86. [windbg-mcp] A pool-walk test caps the whole server, including the open it needs first
+
+**Repo:** `windbg-mcp`.
+
+`mcp_smoke::a_pool_walk_takes_this_servers_deadline_not_the_walkers_default` starts a server with
+`WINDBG_MCP_CALL_TIMEOUT_SECS=60`, because the walk budget it pins is derived as the call timeout
+less 15s of headroom and 45s is distinctively not the walker's own 120s default. But that variable
+is **server-wide** and is read on every call, so the same 60s also caps the `open_dump` the test
+performs to get a session -- against a default of **300s** (`ENGINE_CALL_TIMEOUT`, `src/main.rs`)
+that every other dump test in the tier opens under.
+
+Opening the sample dump does symbol work. On a contended runner it exceeds 60s, and the test then
+fails with `open_dump` timing out, having measured nothing whatever about the budget it exists to
+pin:
+
+```
+assertion `left == right` failed: `open_dump` did not succeed: engine call timed out
+  left: String("error")
+ right: "ok"
+```
+
+**Measured twice on 2026-09-19, on code neither change touched**: `main` at `ecfbabb` (the merge of
+[#345](https://github.com/glslang/windbg-mcp/pull/345), on the **x64** tier) and
+[#347](https://github.com/glslang/windbg-mcp/pull/347) at `08d6f6e` (a Markdown-only diff, on the
+**ARM64** tier). So it is neither architecture-specific nor caused by what it lands on -- it is a
+budget the test imposed on a step it was not reasoning about. Fifteen CI runs on `main` over the
+same period: fourteen green, one red, and the red one is this.
+
+**Why deferred:** the fix is a judgement about the test rather than a mechanical change, and the
+obvious ones each cost something. Raising the cap weakens the "distinctively not 120s" property
+the assertion rests on; opening the session first is impossible, because the variable is read from
+the server process's own environment and the open happens inside it; and giving the open its own
+allowance means a second env var, which is surface added to make a test pass.
+
+**Where it picks up:** `tests/mcp_smoke.rs` -- the test at the `WINDBG_MCP_CALL_TIMEOUT_SECS=60`
+literal, its `Server::started_with`, and `Server::open_session` / `tool_data`, where the
+`status == "ok"` assertion that actually fired lives -- plus `main::call_timeout` and
+`ENGINE_CALL_TIMEOUT` (`src/main.rs`) for the default it is being measured against.
