@@ -556,6 +556,14 @@ const MAX_SWEEPS: usize = 32;
 /// Grouped by site because a listing may hold more than one table, and a reachability walk must not
 /// take the targets of one jump for another's -- an edge that does not exist would make a REACHABLE
 /// verdict unsound, which is the one direction that walk may not be wrong in.
+///
+/// **A halted map yields no targets, and says so.** [`map`] can stop during case enrichment and
+/// return a retained *prefix* of its cases with [`Map::halted`] set. Those edges are individually
+/// sound -- the resolver proved each one -- but handing them over silently lets the walk reach its
+/// goal through them and answer a clean `REACHABLE`, with nothing recording that the analysis
+/// behind that verdict was cut short. A verdict is about the graph that was explored, so the halt
+/// travels with the answer and the caller reports it; the targets are dropped rather than used,
+/// because a prefix is not the table.
 pub(crate) fn jump_targets(
     entry: u64,
     block: &[Instruction],
@@ -563,8 +571,11 @@ pub(crate) fn jump_targets(
     read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
     in_image: impl Fn(u64) -> bool,
     halt: impl FnMut() -> Option<Halt>,
-) -> Vec<(u64, Vec<u64>)> {
+) -> (Vec<(u64, Vec<u64>)>, Option<Halt>) {
     let found = map(entry, block, layout, read, in_image, halt);
+    if let Some(why) = found.halted {
+        return (Vec::new(), Some(why));
+    }
     let mut by_site: Vec<(u64, Vec<u64>)> = Vec::new();
     for case in found
         .cases
@@ -582,7 +593,7 @@ pub(crate) fn jump_targets(
         targets.sort_unstable();
         targets.dedup();
     }
-    by_site
+    (by_site, None)
 }
 
 /// How many literal-pool entries one routine may have read for it.
@@ -646,36 +657,63 @@ fn with_pool_immediates<'a>(
     block: &'a [Instruction],
     layout: Layout,
     read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
+    in_image: &impl Fn(u64) -> bool,
+    halt: &mut impl FnMut() -> Option<Halt>,
 ) -> Cow<'a, [Instruction]> {
     if !layout.literal_pool {
         return Cow::Borrowed(block);
     }
-    // Resolved once per address rather than once per instruction: a routine comparing against the
-    // same pool entry twice is ordinary, and the second read would buy nothing.
-    let mut resolved: HashMap<u64, u32> = HashMap::new();
+    // **Attempted, not resolved.** Keyed on every address asked about rather than on the ones that
+    // answered, because a dump missing the page a pool sits on, or one malformed literal repeated
+    // through a routine, would otherwise retry it per instruction and spend the whole read budget
+    // on an address that will never read -- leaving the readable literals after it unfolded, so
+    // recoverable codes disappear for want of a slot.
+    let mut asked: HashMap<u64, Option<u32>> = HashMap::new();
     let mut reads = 0usize;
     for instruction in block {
         let Some(address) = pool_load(layout, instruction) else {
             continue;
         };
-        if resolved.contains_key(&address) {
+        if asked.contains_key(&address) {
+            continue;
+        }
+        // **The one thing the operand's shape does not prove.** A base-less `ldr` is a PC-relative
+        // access and nothing more; it can legally address writable module storage, and folding that
+        // would publish whatever the driver last wrote there as a control code or a refusal status
+        // -- the false positive the per-target gate exists to avoid, arriving by another door.
+        // `in_image` is this module's existing answer to "is this address code in this driver",
+        // computed from the image's own **executable** sections, and a writable data section is not
+        // one of them.
+        //
+        // It is sufficient rather than merely conservative, and the encoding is why: the
+        // displacement is a signed 19-bit word offset, so a literal load reaches **±1 MB** of its
+        // own address. A compiler therefore emits the pool inline among the functions that read it
+        // -- it cannot reach a distant `.rdata` -- which is exactly where `in_image` says yes. A
+        // pool that somehow sits outside is left as the load it was, which costs a code rather than
+        // inventing one.
+        if !in_image(address) {
+            asked.insert(address, None);
             continue;
         }
         if reads >= MAX_POOL_READS {
             break;
         }
-        reads += 1;
-        // The caller's reader is what bounds this to the image: it refuses an address outside the
-        // module holding the routine, so a pool address computed from a malformed displacement
-        // reads nothing rather than reaching another module's memory. Anything it declines is left
-        // as the load it was.
-        if let Some(bytes) = read(address, FIELD_WIDTH as usize)
-            && let Ok(value) = <[u8; 4]>::try_from(bytes.as_slice())
-        {
-            resolved.insert(address, u32::from_le_bytes(value));
+        // Polled **between reads**, not once before them. Each is an engine round trip -- tens of
+        // milliseconds over KD -- so a routine with many literals could otherwise spend seconds on
+        // them after its caller had gone, before `map_within` reached its own first poll.
+        if halt().is_some() {
+            break;
         }
+        reads += 1;
+        // The caller's reader is what bounds this to the module: it refuses an address outside the
+        // module holding the routine, so a pool address computed from a malformed displacement
+        // reads nothing rather than reaching another module's memory.
+        let value = read(address, FIELD_WIDTH as usize)
+            .and_then(|bytes| <[u8; 4]>::try_from(bytes.as_slice()).ok())
+            .map(u32::from_le_bytes);
+        asked.insert(address, value);
     }
-    if resolved.is_empty() {
+    if asked.values().all(Option::is_none) {
         return Cow::Borrowed(block);
     }
     let mut out = block.to_vec();
@@ -683,10 +721,10 @@ fn with_pool_immediates<'a>(
         let Some(address) = pool_load(layout, instruction) else {
             continue;
         };
-        if let Some(&value) = resolved.get(&address)
+        if let Some(Some(value)) = asked.get(&address)
             && let Some(operand) = instruction.operands.get_mut(1)
         {
-            *operand = Operand::Immediate(u64::from(value));
+            *operand = Operand::Immediate(u64::from(*value));
         }
     }
     Cow::Owned(out)
@@ -720,7 +758,7 @@ fn map_within(
     // cannot encode as a PC-relative load, and resolving those here is what lets the sweeps and the
     // recording pass agree about the value -- see [`with_pool_immediates`]. Borrowed unchanged on a
     // target that has no literal pool, so nothing about x64 or x86 moves.
-    let listing = with_pool_immediates(block, layout, &mut read);
+    let listing = with_pool_immediates(block, layout, &mut read, &in_image, &mut halt);
     let block: &[Instruction] = &listing;
     let graph = cfg::graph(block);
     let index_of: HashMap<u64, usize> = block
@@ -4596,6 +4634,88 @@ mod tests {
         );
 
         assert_eq!(served.get(), 0, "a doubleword literal is not this form");
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+    }
+
+    /// **A literal outside the image's executable sections is not folded.**
+    ///
+    /// A base-less `ldr` is a PC-relative access and nothing more: the operand's shape does not
+    /// prove the location is constant, and it can legally address writable module storage. Folding
+    /// that would publish whatever the driver last wrote there as a control code -- the false
+    /// positive `Layout::literal_pool` exists to avoid, arriving by another door. Raised on review
+    /// of #351.
+    ///
+    /// The gate is `in_image`, this module's existing "is this address code in this driver",
+    /// computed from the image's own executable sections. Sufficient rather than merely
+    /// conservative: a literal load's displacement is a signed 19-bit word offset, so it reaches
+    /// ±1 MB and a compiler must put the pool among the functions that read it.
+    #[test]
+    fn an_arm64_literal_outside_the_executable_sections_is_not_folded() {
+        // Past `IMAGE_SIZE`, so `in_image` says no -- which is what a writable data section, or
+        // another module, answers too.
+        const OUTSIDE: u64 = IMAGE_BASE + IMAGE_SIZE + 0x100;
+        let served = std::cell::Cell::new(0usize);
+        let found = map(
+            DISPATCH,
+            &literal_compare("ldr", vec![reg("w10"), literal(OUTSIDE, DISPATCH + 8)]),
+            Layout::ARM64,
+            pool_reader(OUTSIDE, 0x0022_203b, &served),
+            in_image,
+            never,
+        );
+
+        assert_eq!(
+            served.get(),
+            0,
+            "an address outside the executable sections must not even be read"
+        );
+        assert!(
+            found.cases.is_empty(),
+            "and nothing may be named from it: {:?}",
+            found.cases
+        );
+    }
+
+    /// **An address that would not read is asked once, not once per instruction.**
+    ///
+    /// The dedup map keys on every address *attempted* rather than on the ones that answered. Keyed
+    /// on successes, a missing dump page or one malformed literal repeated through a routine would
+    /// retry it per instruction and spend the whole read budget on an address that will never read
+    /// -- leaving the readable literals after it unfolded, so recoverable codes disappear for want
+    /// of a slot. Raised on review of #351.
+    #[test]
+    fn an_unreadable_arm64_pool_address_is_attempted_once() {
+        const POOL: u64 = IMAGE_BASE + 0x8_7824;
+        let served = std::cell::Cell::new(0usize);
+        let read = |address: u64, _len: usize| -> Option<Vec<u8>> {
+            served.set(served.get() + 1);
+            let _ = address;
+            None
+        };
+        // The same pool address loaded three times over, which is what a routine comparing against
+        // one constant in three places looks like.
+        let mut block = literal_compare("ldr", vec![reg("w10"), literal(POOL, DISPATCH + 8)]);
+        block.push(insn(
+            DISPATCH + 0x18,
+            "ldr",
+            vec![reg("w11"), literal(POOL, DISPATCH + 0x18)],
+            Flow::Fallthrough,
+        ));
+        block.push(insn(
+            DISPATCH + 0x1c,
+            "ldr",
+            vec![reg("w12"), literal(POOL, DISPATCH + 0x1c)],
+            Flow::Fallthrough,
+        ));
+        block.push(insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return));
+
+        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+
+        assert_eq!(
+            served.get(),
+            1,
+            "three loads of one unreadable address are one attempt"
+        );
         assert!(found.cases.is_empty(), "{:?}", found.cases);
     }
 
