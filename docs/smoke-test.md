@@ -197,6 +197,19 @@ about. If an SDK bump starts advertising something on this server's behalf, this
 find out, and the choice is implement it or suppress it — not ship an advertisement clients will
 call into a dead end.
 
+**Both assertions run on both lifecycles**, on a connection each. The *advertisement* cannot
+currently differ between them — `DiscoverResult::from_server_info` moves `get_info`'s
+`capabilities` across verbatim, so `initialize` and `server/discover` return one value — but the
+refusal is decided from the **client's** capabilities as well as this server's, and
+`RequestContext::client_capabilities` resolves those per lifecycle: from the handshake for a legacy
+peer, from each request's `_meta` where `request_metadata_required()`. Two paths to one refusal, so
+one probe covers one of them — and the stateless one is the path that matters, item 8's measurement
+being that it is the only lifecycle where a task could be materialised at all, since every
+`initialize` settles on a legacy revision and SEP-2663 forbids tasks there. Neither probe is
+vacuous: `tasks/get` is a method rmcp parses, so the `-32601` comes from the capability gate
+rather than from an unknown method, and a server that advertised tasks to a client that did not ask
+for them answers `-32021` instead.
+
 **Tool surface golden.** `tests/golden/tools_list.json` records the *structural* `tools/list`
 surface as it appears on the wire: JSON Schema dialect, `$defs` usage (`true` since `debug_batch`
 introduced the first nested schema), tool count, and per tool its
