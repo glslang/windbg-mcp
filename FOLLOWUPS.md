@@ -56,8 +56,9 @@ when it runs (2026-09-18). And items **82–85** from running
 compiler cannot spell as immediates in a PC-relative literal pool, which the fact walk does not
 read -- 235 codes recovered over seven drivers and **not one** proven size or refusal among them --
 and, found beside it, a reachability walk that does not follow the switch tables the map now
-resolves, an `adrp`+`add` table base lost at the `add`, and an ARM64 surface that no second
-implementation has ever checked. And item 86 from that PR's own CI, where a
+resolves, an `adrp`+`add` table base lost at the `add`, and an ARM64 surface a second
+implementation has already agreed with figure for figure without either ever being diffed against
+the other. And item 86 from that PR's own CI, where a
 Markdown-only diff went red on a test that caps the whole server to 60s and then opens a dump
 under it (2026-09-19).
 Each item notes its repo, why it was deferred, and where it picks up. See
@@ -1467,10 +1468,11 @@ pin the gap and should flip to `assert!` when it closes.
 
 **Repo:** `windbg-mcp`.
 
-A64 has no 32-bit immediate. A compiler materialises one either as `movz`/`movk` -- which
-[#343](https://github.com/glslang/windbg-mcp/pull/343) taught the walk to fold -- or as a
-**PC-relative literal load**, `ldr w20,<pool>`, which reads four bytes of `.text` the walk never
-looks at. The second is the cheaper encoding and MSVC uses it freely.
+No single A64 instruction can materialise an arbitrary 32-bit constant. A compiler builds one
+either as `movz`/`movk` -- which [#343](https://github.com/glslang/windbg-mcp/pull/343) taught the
+walk to fold -- or as a **PC-relative literal load**, `ldr w20,<pool>`, which reads four bytes of
+`.text` the walk never looks at. The second is one instruction against two, and MSVC uses it
+freely.
 
 Measured on the live ARM64 target, 2026-09-19, over seven drivers and **235** recovered control
 codes: **0** carry a proven size, and 15 carry length-check evidence marked `exact: false`. Not one
@@ -1487,8 +1489,19 @@ rule wants. Only the refusal is invisible.
 It reaches the codes themselves, not just the evidence. HEVD's dispatch compares against
 `ldr w8,HEVD+0x87824`, whose pool entry is `0x0022203b` -- a control code. That map is right only
 because HEVD's *cases* come from the `sub`-and-compare chain beside it and the literal is merely
-the range bound; a driver comparing codes directly against pool entries would have them all
-invisible, with `code_proved` true and nothing in `unresolved` to say so.
+the range bound.
+
+**What is missing there is the cases, not the warning**, and the distinction matters because it
+decides what a fix is for. A compare of the traced code register against a value `scalar_of` cannot
+resolve still returns a `Compared` carrying an `index` and `code: None`, and the equality arm pushes
+it onto **`untracked`** (`src/ioctl.rs`) -- the list built for exactly this, after a map reported
+four of HEVD's twenty-eight codes and read as complete. So such a map says it is a lower bound; what
+it cannot do is name the code, so a caller gets a site to go and look at instead of a control code.
+Raised on review of [#347](https://github.com/glslang/windbg-mcp/pull/347), and it is right: the
+work here is recovering the values, not adding a second incompleteness report. Measured on the live
+target, `volmgr` answers `code_proved: true` with **5** entries in `untracked` and none in
+`unresolved` -- so the mechanism does fire on ARM64. (Those five are `movz`/`movk` compares rather
+than pool loads, which is a *separate* question this item does not cover.)
 
 **Why deferred:** `map()` already takes a `read` closure and `follow_table` uses it, but `update`
 does not have it -- so this is threading a reader into the fact walk, not a local fix. It also
@@ -1543,55 +1556,58 @@ every `Value::Address` consumer -- worth doing beside item 82, which opens the s
 **Where it picks up:** `ioctl::update`'s `Effect::Add` arm (`src/ioctl.rs`), where the
 `_ => set(facts, &destination, None)` fall-through is.
 
-## 85. [windbg-mcp] No second opinion has ever seen an ARM64 driver
+## 85. [windbg-mcp] The ARM64 second opinion exists and has never been diffed
 
 **Repo:** `windbg-mcp`.
 
 `tools/ghidra_oracle/` exists because everything else checking the driver tools was derived from my
 own reading of the same drivers, and it paid for itself on its first run by finding
-`IOCTL_MOUNTMGR_CREATE_POINT` missing from `ioctl_map`. Every run of it has been **x64**. The ARM64
-half of these tools -- the layout, `movk` folding, the privilege families, compare-and-branch, and
-now switch tables -- rests entirely on measurements taken with the pass under test, plus hand
-computation from raw table bytes.
+`IOCTL_MOUNTMGR_CREATE_POINT` missing from `ioctl_map`. Every run of *that* lane has been x64, and
+neither Ghidra nor Driver Buddy Revolutions is installed on this bench (checked 2026-09-19).
 
-That is the arrangement the lane was built to end, and item 82 is what it would have caught: a
-decompiler folds a literal-pool load into a constant, so the disassembler's C for `rdyboost` names
-`STATUS_INVALID_PARAMETER` where this walk sees an unreadable memory operand.
+**But a second implementation has already answered on ARM64, and it agrees.** This item first
+claimed otherwise and was wrong; review caught it. The Binary Ninja companion
+([`binja-windbg-mcp`](https://github.com/glslang/binja-windbg-mcp)) records, in
+[`docs/binja-windbg-mcp-validation.md`](./docs/binja-windbg-mcp-validation.md):
 
-**The oracle does not have to be Ghidra, and the cheaper one is already built.**
-[`binja-windbg-mcp`](https://github.com/glslang/binja-windbg-mcp), the sister MCP server, is a
-Binary Ninja companion whose core acceptance is recorded **for the identified ARM64 HEVD and
-`mountmgr` fixtures** ([`docs/binja-windbg-mcp-plan.md`](./docs/binja-windbg-mcp-plan.md)) -- the
-same two drivers item 82 was measured on. It already shares this repo's IOCTL-case shape, which
-`structured::IoctlCase` names as the reason those field names are what they are, so a case
-recovered there and a case recovered here are the same record about the same driver and diff
-directly. Ghidra stays the x64 lane; Binary Ninja is the one that can answer on ARM64 today.
+| fixture | companion | `ioctl_map` on the live ARM64 target |
+|---|---|---|
+| ARM64 HEVD | all **29** cases, no unresolved entries | **29** cases |
+| ARM64 `mountmgr` 10.0.26100.1 | **93** code/site records: **48** routes for **24** recognised codes, **three** jump tables | **48** records, **24** distinct codes, **three** tables |
 
-**And its counterpart is the same tool by name.** `binja_windbg_mcp.analysis.ioctl_map` is one of
-that companion's five driver tools (`driver_entry`, `sink_imports`, `device_security`, `ioctl_map`,
-`driver_surface`), and it carries `cases` with `evidence` and an `unresolved` list with reasons --
-the shapes this one answers in. What makes it an oracle rather than a second copy is *how* it finds
-the control code: it admits a branch whose `input` is
-`Parameters.DeviceIoControl.IoControlCode`, which is Binary Ninja's **type propagation** over the
-IO stack location, where this walk traces a displacement through `Facts`. Two different methods
-over the same bytes is the whole point of a second opinion, and it is what makes the diff able to
-answer item 82 -- whether a decompiler that constant-folds a read-only PC-relative load recovers
-the refusal and the size this walk cannot. That is the measurement to take first, before either
-implementation is changed.
+Independently derived and identical on every figure -- the companion admits a branch whose `input`
+is `Parameters.DeviceIoControl.IoControlCode`, which is Binary Ninja's type propagation over the IO
+stack location, where this walk traces a displacement through `Facts`.
 
-Its `traverse` also already walks dispatch to sink, which is item 71 here.
+**So the gap is narrower than "unchecked", and more specific.** Three parts:
 
-**Why deferred:** neither Ghidra nor Driver Buddy Revolutions is installed on this bench (checked
-2026-09-19; the README's `C:\ghidra_12.1.3_PUBLIC` is not there), so the Ghidra lane needs a host
-stood up first. The Binary Ninja route needs no install here -- it needs the diff written, and a
-decision about which of the two lanes `tools/ghidra_oracle/` grows to hold.
+- **No diff is run as a lane.** The agreement above was read out of two documents by hand. Nothing
+  fails when they diverge, which is the whole point of `tools/ghidra_oracle/` and the reason it
+  exists for x64.
+- **The two fixtures that agree are the two that cannot separate the implementations.** The
+  companion's own record says *"Exact buffer sizes remain unproven"* for ARM64 `mountmgr` -- and on
+  that driver **no size is provable**, because its length checks are in callees rather than in the
+  dispatch routine's case blocks (measured: the block at `mountmgr+0x192ac` is `mov w20,#0` and a
+  branch to the epilogue). Both implementations reporting none is correct behaviour agreeing with
+  correct behaviour, so it says nothing about item 82.
+- **The driver that would separate them has not been run.** `rdyboost` is where the literal pool
+  bites: 13 cases carrying length-check evidence, every one `exact: false`, because the refusal it
+  branches to is `ldr w20,<pool>` over `STATUS_INVALID_PARAMETER`. Whether a decompiler that
+  constant-folds a read-only PC-relative load proves those sizes is the measurement to take, and it
+  is the one that would answer item 82 before either implementation is changed.
+
+**Why deferred:** the Ghidra lane needs a host stood up. The Binary Ninja route needs no install --
+it needs the diff written, a decision about which lane `tools/ghidra_oracle/` grows to hold, and
+the companion pointed at a driver neither implementation has published figures for.
 
 **Where it picks up:** `tools/ghidra_oracle/README.md` -- its bench table, and its third trap about
 the cached image having to be the one the dump mapped, which on a live ARM64 target is a different
 question again -- plus
 [`docs/binja-windbg-mcp-plan.md`](./docs/binja-windbg-mcp-plan.md) and
-[`docs/binja-windbg-mcp-validation.md`](./docs/binja-windbg-mcp-validation.md) for what the
-companion already answers, and `structured::IoctlCase`'s doc comment for the shared shape.
+[`docs/binja-windbg-mcp-validation.md`](./docs/binja-windbg-mcp-validation.md) for the figures
+above, `binja_windbg_mcp.analysis.ioctl_map` for the counterpart tool, and
+`structured::IoctlCase`'s doc comment for the shared shape the two answer in. Its `traverse`
+already walks dispatch to sink, which is item 71 here.
 
 ## 86. [windbg-mcp] A pool-walk test caps the whole server, including the open it needs first
 
