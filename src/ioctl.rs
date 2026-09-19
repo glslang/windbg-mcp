@@ -557,13 +557,36 @@ const MAX_SWEEPS: usize = 32;
 /// take the targets of one jump for another's -- an edge that does not exist would make a REACHABLE
 /// verdict unsound, which is the one direction that walk may not be wrong in.
 ///
-/// **A halted map yields no targets, and says so.** [`map`] can stop during case enrichment and
-/// return a retained *prefix* of its cases with [`Map::halted`] set. Those edges are individually
-/// sound -- the resolver proved each one -- but handing them over silently lets the walk reach its
-/// goal through them and answer a clean `REACHABLE`, with nothing recording that the analysis
-/// behind that verdict was cut short. A verdict is about the graph that was explored, so the halt
-/// travels with the answer and the caller reports it; the targets are dropped rather than used,
-/// because a prefix is not the table.
+/// **A partial map yields no targets, and says which kind of partial it was.** [`map`] returns a
+/// retained *prefix* of its cases in two different circumstances, and both were once handed over
+/// as though they were the whole table:
+///
+/// - it **halted** -- a deadline or an interrupt during case enrichment, with [`Map::halted`] set;
+/// - or it hit a **bound** of its own, [`MAX_CASES`], with [`Map::cap_hit`] set and `case_count`
+///   still counting past what `cases` holds.
+///
+/// The edges in such a prefix are individually sound -- the resolver proved each one -- but a
+/// prefix is not the table, and handing one over silently lets a goal *past* it read as a clean
+/// `NOT REACHABLE`, or lets the walk reach its goal through it and answer `REACHABLE` with nothing
+/// saying the analysis behind that verdict stopped early. So both are reported and neither
+/// contributes edges: the third element of the answer is the bound, the second is the halt, and the
+/// caller merges each into what it reports.
+/// What [`jump_targets`] answers: a listing's tables, and why they might be short.
+///
+/// A struct rather than a tuple because two of its three fields exist to say the third is
+/// incomplete, and a caller that destructures three positional values is one that can drop the
+/// second and the third without noticing -- which is exactly how a prefix came to be reported as a
+/// whole table twice over.
+pub(crate) struct Tables {
+    /// Indirect jump site -> the targets its table selects, each site once and each target once.
+    pub(crate) targets: Vec<(u64, Vec<u64>)>,
+    /// A deadline or interrupt the walk consumed. No later poll can find it; see [`Self::bounded`]
+    /// for the other reason an answer here is partial.
+    pub(crate) stopped: Option<Halt>,
+    /// Whether the walk stopped at a bound of its own rather than finishing.
+    pub(crate) bounded: bool,
+}
+
 pub(crate) fn jump_targets(
     entry: u64,
     block: &[Instruction],
@@ -572,10 +595,14 @@ pub(crate) fn jump_targets(
     in_image: impl Fn(u64) -> bool,
     is_constant: impl Fn(u64) -> bool,
     halt: impl FnMut() -> Option<Halt>,
-) -> (Vec<(u64, Vec<u64>)>, Option<Halt>) {
+) -> Tables {
     let found = map(entry, block, layout, read, in_image, is_constant, halt);
-    if let Some(why) = found.halted {
-        return (Vec::new(), Some(why));
+    if found.halted.is_some() || found.cap_hit {
+        return Tables {
+            targets: Vec::new(),
+            stopped: found.halted,
+            bounded: found.cap_hit,
+        };
     }
     let mut by_site: Vec<(u64, Vec<u64>)> = Vec::new();
     for case in found
@@ -594,7 +621,11 @@ pub(crate) fn jump_targets(
         targets.sort_unstable();
         targets.dedup();
     }
-    (by_site, None)
+    Tables {
+        targets: by_site,
+        stopped: None,
+        bounded: false,
+    }
 }
 
 /// How many literal-pool entries one routine may have read for it.
