@@ -669,18 +669,22 @@ processes, so they need real ones:
   produces the identical result. That is exactly why it shipped wrong
   ([#75](https://github.com/glslang/windbg-mcp/issues/75)): the query carried no deadline at all and
   quietly took dbgscope's 120s however long its caller was willing to wait, and nothing that looked
-  at results could see it. The test shrinks the call budget to 60s and checks the worker derived
-  ~45s — a range, since the milliseconds already spent come off the patience, and one that contains
-  neither the 15s floor nor the 120s default. The query itself is allowed to fail: the sample dump
-  has no pool-layout symbols on a bare machine (that is the live tier's business), and the budget is
+  at results could see it. The test sets the call budget to 90s and checks the worker derived ~75s
+  — a range, since the milliseconds already spent come off the patience, and one that contains
+  neither the 15s floor nor the 120s default. 90s rather than something tighter because the budget
+  is the **server's** and so governs the `open_dump` the test needs first: at 60s that open timed
+  out on a contended CI runner and the test failed having measured nothing about the budget it
+  exists to pin (`FOLLOWUPS.md` item 86). The query itself is allowed to fail: the sample dump has
+  no pool-layout symbols on a bare machine (that is the live tier's business), and the budget is
   derived before the first page is read.
 - *A running command is interrupted on request.* A `.for` sized to run for hours is stopped by
   `interrupt` while its `execute` call is still outstanding, comes back **as a result** carrying
   what it reached, and the session serves the next call. It belongs in this tier rather than the
   bounded one below because nothing waits out a deadline: the break lands in milliseconds
-  (measured: 203ms), and the test bounds the session's call budget to 30s so a *failure* fails fast
-  — anything at the watchdog's 15s floor means the deadline did the work and the run proves nothing
-  about the request path, which the assertions say. The claim only the shipped binary can settle is
+  (measured: 203ms), and the test bounds the session's call budget so a *failure* fails fast —
+  anything at the watchdog's bound means the deadline did the work and the run proves nothing about
+  the request path, which the assertions say. That budget is 90s and was 30s, for the same reason
+  as the test above: 30s did not outlast the open it also caps. The claim only the shipped binary can settle is
   that the interrupt is answered by the worker's **request reader** rather than queued for its
   engine thread: queued, it would be read only once the command had ended, and every other
   assertion here would still pass. The test retries the interrupt until it reports it reached
