@@ -8309,8 +8309,14 @@ fn ioctl_map_of(
         .map(|module| executable_ranges(e, module))
         .unwrap_or_default();
     let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
+    // Where a literal pool may be read from, which is not the same question as where a jump-table
+    // entry may land. See `constant_ranges`.
+    let constant: Vec<std::ops::Range<u64>> = holding
+        .map(|module| constant_ranges(e, module))
+        .unwrap_or_default();
+    let is_constant = |address: u64| constant.iter().any(|range| range.contains(&address));
     let layout = ioctl_layout(set);
-    let found = ioctl::map(entry, &block, layout, read, in_image, || {
+    let found = ioctl::map(entry, &block, layout, read, in_image, is_constant, || {
         if let Some(why) = halted.get() {
             return Some(why);
         }
@@ -8672,6 +8678,53 @@ fn function_listing(
     Some(in_listing_order(&listing, &mut decoded))
 }
 
+/// One module's **constant** ranges: sections the loader maps readable and the driver cannot write.
+///
+/// What a value read out of the image has to sit in before it may be folded as a constant -- an A64
+/// literal pool, today. A base-less `ldr` proves only that the address is PC-relative; it can
+/// legally name writable module storage, and folding that would publish whatever the driver last
+/// wrote there as a control code or a refusal status.
+///
+/// **Deliberately wider than [`executable_ranges`], and a different question.** That one answers
+/// "is this address code in this driver", which is what a jump-table entry must be; a pool is
+/// *data*. Gating the pool on it was the first attempt and refused legitimate pools in `.rdata`,
+/// having argued from the literal load's ±1 MB reach that a compiler must place the pool among the
+/// functions reading it -- which confuses distance with permissions. Widening `executable_ranges`
+/// instead is not available: an entry landing in `.rdata` is data published as a case.
+///
+/// `IMAGE_SCN_MEM_READ` and not `IMAGE_SCN_MEM_WRITE`, spelled here because `dbgscope`'s `Section`
+/// exposes `characteristics` and an accessor for neither. The same clamp as its neighbour, for the
+/// same reason.
+fn constant_ranges(
+    e: &DebugEngine,
+    module: &dbgscope::dbgeng::Module,
+) -> Vec<std::ops::Range<u64>> {
+    /// `IMAGE_SCN_MEM_READ`.
+    const READ: u32 = 0x4000_0000;
+    /// `IMAGE_SCN_MEM_WRITE`.
+    const WRITE: u32 = 0x8000_0000;
+    let mut headers = |at: u64, len: usize| {
+        within_module(module.base, module.size, at, len).then(|| e.read_memory(at, len).ok())?
+    };
+    let Ok(mut image) = pe::read_image(module.base, &mut headers) else {
+        return Vec::new();
+    };
+    image.size_of_image = smaller_extent(image.size_of_image, module.size);
+    image
+        .sections
+        .iter()
+        .filter(|section| {
+            section.characteristics & READ != 0 && section.characteristics & WRITE == 0
+        })
+        .filter_map(|section| {
+            let start = module.base.checked_add(u64::from(section.rva))?;
+            let end = start.checked_add(u64::from(section.virtual_size))?;
+            (end <= module.base.saturating_add(u64::from(image.size_of_image)))
+                .then_some(start..end)
+        })
+        .collect()
+}
+
 /// One module's **executable** ranges, read from the image's own section table.
 ///
 /// The question a resolved table entry has to pass, and the loader's extent is not it: `.rdata`,
@@ -8900,18 +8953,21 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // would pass and be followed. Only this module's executable sections are code.
         let executable = executable_ranges(e, module);
         let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
-        let (targets, stopped) = ioctl::jump_targets(entry, block, layout, read, in_image, || {
-            if let Some(why) = halted.get() {
-                return Some(why);
-            }
-            if matches!(e.interrupted(), Ok(true)) {
-                Some(walk::Halt::Interrupted)
-            } else if Instant::now() >= deadline {
-                Some(walk::Halt::Deadline)
-            } else {
-                None
-            }
-        });
+        let constant = constant_ranges(e, module);
+        let is_constant = |address: u64| constant.iter().any(|range| range.contains(&address));
+        let (targets, stopped) =
+            ioctl::jump_targets(entry, block, layout, read, in_image, is_constant, || {
+                if let Some(why) = halted.get() {
+                    return Some(why);
+                }
+                if matches!(e.interrupted(), Ok(true)) {
+                    Some(walk::Halt::Interrupted)
+                } else if Instant::now() >= deadline {
+                    Some(walk::Halt::Deadline)
+                } else {
+                    None
+                }
+            });
         // **A halt inside the resolver is the walk's halt.** Filed in the same cell the decoder
         // uses, which the walk's own poll reads on its next step -- so a verdict reached after this
         // carries "cut short" rather than reading as a graph that was fully explored. Without it a
