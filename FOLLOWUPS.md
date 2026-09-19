@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-two clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-four clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -26,7 +26,7 @@ reach on three different clocks (2026-08-31) — items 58–59 from
 [#286](https://github.com/glslang/windbg-mcp/pull/286)'s user-mode fault triage, where the engine
 call that names a target's machine turns out to name the *processor's*, and where nothing can ask
 which thread the engine has selected (2026-09-05), items
-61–65 from completing Personal similarity delivery while separating CVE-specific investigation,
+61–62 and 64–65 from completing Personal similarity delivery while separating CVE-specific investigation,
 upstream Binary Ninja limitations, and unaffordable Ultimate validation (2026-09-12), and items
 66–67 from the IOCTL recovery in [#305](https://github.com/glslang/windbg-mcp/pull/305) and
 [#307](https://github.com/glslang/windbg-mcp/pull/307): thirty-nine review findings over fourteen
@@ -46,7 +46,18 @@ freed, and the one section of the ported program with no counterpart here (2026-
 into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16), and item 80
 from adding Apple's on-device model as the eval's third backend (#335 / #336, 2026-09-17), where
 two review rounds found `identity()` reporting something false about a run because it works out
-what a record contributes by testing the backend again in each field that needs it.
+what a record contributes by testing the backend again in each field that needs it. And item 81 from
+[#341](https://github.com/glslang/windbg-mcp/pull/341)'s breakpoint-command guard, where both
+review bots independently reached the same finding — a command scanner that reads the first token
+of a segment cannot see `.opendump` inside an `.if`, a `.foreach` or an alias that resolves only
+when it runs (2026-09-18). And items **82–85** from running
+`ioctl_map` against a live **ARM64** target for the first time
+([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): A64 keeps constants a
+compiler cannot spell as immediates in a PC-relative literal pool, which the fact walk does not
+read -- 235 codes recovered over seven drivers and **not one** proven size or refusal among them --
+and, found beside it, a reachability walk that does not follow the switch tables the map now
+resolves, an `adrp`+`add` table base lost at the `add`, and an ARM64 surface that no second
+implementation has ever checked.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1449,3 +1460,119 @@ breakpoint's command runs at a hit this server never observes.
 `Call::retiring`, `set_breakpoint`'s refusal), `batch::retires_handle`, and
 `server::tests::a_breakpoint_command_that_changes_the_target_is_refused`, whose last two assertions
 pin the gap and should flip to `assert!` when it closes.
+
+## 82. [windbg-mcp] A64 puts constants in a literal pool, and the walk cannot read one
+
+**Repo:** `windbg-mcp`.
+
+A64 has no 32-bit immediate. A compiler materialises one either as `movz`/`movk` -- which
+[#343](https://github.com/glslang/windbg-mcp/pull/343) taught the walk to fold -- or as a
+**PC-relative literal load**, `ldr w20,<pool>`, which reads four bytes of `.text` the walk never
+looks at. The second is the cheaper encoding and MSVC uses it freely.
+
+Measured on the live ARM64 target, 2026-09-19, over seven drivers and **235** recovered control
+codes: **0** carry a proven size, and 15 carry length-check evidence marked `exact: false`. Not one
+case anywhere reports `accepted: false`.
+
+The cause is one read. `rdyboost!SmdDispatchDeviceControl+0x1b8` is
+`ldr w20,<pool>` / `b <epilogue>`, and the pool holds `0xc000000d`
+(`STATUS_INVALID_PARAMETER`). [`error_status`](./src/ioctl.rs) looks for a constant put in the
+return register or the IRP's status field and finds a *memory operand* instead, so the block is not
+a refusal -- and `exact` requires `Condition::NotEqual` **and** a target that refuses. The
+condition half is already right: `cmp w2,#4` / `bne` at `rdyboost+0xf2f4` is exactly the shape the
+rule wants. Only the refusal is invisible.
+
+It reaches the codes themselves, not just the evidence. HEVD's dispatch compares against
+`ldr w8,HEVD+0x87824`, whose pool entry is `0x0022203b` -- a control code. That map is right only
+because HEVD's *cases* come from the `sub`-and-compare chain beside it and the literal is merely
+the range bound; a driver comparing codes directly against pool entries would have them all
+invisible, with `code_proved` true and nothing in `unresolved` to say so.
+
+**Why deferred:** `map()` already takes a `read` closure and `follow_table` uses it, but `update`
+does not have it -- so this is threading a reader into the fact walk, not a local fix. It also
+needs a rule for *which* loads are safe to read: a pool entry is `.rdata`-like data at a
+PC-relative address with no base or index register, and reading anything looser would let a driver's
+mutable globals be folded in as constants.
+
+**Where it picks up:** `ioctl::update`'s `Operand::Memory` arm and `ioctl::error_status`
+(`src/ioctl.rs`), `Value::Literal`, and `map`/`map_within`'s `read` parameter. The x64 path is
+unaffected -- there the same constants are immediates -- so every existing size test stays green
+while the gap is open, which is why it took a live ARM64 measurement to see.
+
+## 83. [windbg-mcp] `reachable_from_dispatch` does not follow the jump tables `ioctl_map` now reads
+
+**Repo:** `windbg-mcp`.
+
+`ioctl_map` resolves A64 switch tables as of
+[#345](https://github.com/glslang/windbg-mcp/pull/345) -- 9 tables and 48 codes across `mountmgr`,
+`volmgr` and `volsnap` on the live ARM64 target. `reachable_from_dispatch` does not: its walk
+follows direct calls and cross-function tail jumps, and its own test says so
+(`src/driver.rs`, "the jump table isn't followed"). So the two tools now disagree about the same
+driver -- the map names a handler the reachability walk calls NOT REACHABLE, and the tool's advice
+is to pass the handler VA by hand to scope past the switch.
+
+Architecture-independent, and newly material rather than newly true: before #345 nothing here could
+resolve an A64 table, so there was no asymmetry to notice.
+
+**Why deferred:** the resolver is `ioctl::follow_table`, which is built around the dispatch walk's
+`Facts` and its bounds check -- reachability has neither, so sharing it means extracting the table
+read from the fact tracking rather than calling it.
+
+**Where it picks up:** `driver::reachable_from_dispatch` and its `uf`-driven walk (`src/driver.rs`),
+`ioctl::follow_table` (`src/ioctl.rs`), and the two prose caveats at `src/driver.rs:755` and
+`:1069` that promise the jump table is not followed.
+
+## 84. [windbg-mcp] An `adrp`+`add` table base is lost at the `add`
+
+**Repo:** `windbg-mcp`.
+
+`adr` reaches ±1 MB. Past that a compiler builds the address in two instructions --
+`adrp x8,<page>` / `add x8,x8,#<offset>` -- and `ioctl::update` models `Effect::Add` only as
+`Value::Code + immediate`, so the `add` clears the register and the table base is gone. The jump
+goes back `unresolved`, which is the safe direction but is silent about *why*.
+
+Hypothetical on this bench and stated as such: all nine tables found on the live ARM64 target, and
+all four jumps correctly refused, use a single `adr` -- these drivers are 60–200 KB. A large
+third-party driver is the case that needs it.
+
+**Why deferred:** no measurement here reaches it, and the fix is one arm whose blast radius is
+every `Value::Address` consumer -- worth doing beside item 82, which opens the same function.
+
+**Where it picks up:** `ioctl::update`'s `Effect::Add` arm (`src/ioctl.rs`), where the
+`_ => set(facts, &destination, None)` fall-through is.
+
+## 85. [windbg-mcp] No second opinion has ever seen an ARM64 driver
+
+**Repo:** `windbg-mcp`.
+
+`tools/ghidra_oracle/` exists because everything else checking the driver tools was derived from my
+own reading of the same drivers, and it paid for itself on its first run by finding
+`IOCTL_MOUNTMGR_CREATE_POINT` missing from `ioctl_map`. Every run of it has been **x64**. The ARM64
+half of these tools -- the layout, `movk` folding, the privilege families, compare-and-branch, and
+now switch tables -- rests entirely on measurements taken with the pass under test, plus hand
+computation from raw table bytes.
+
+That is the arrangement the lane was built to end, and item 82 is what it would have caught: a
+decompiler folds a literal-pool load into a constant, so the disassembler's C for `rdyboost` names
+`STATUS_INVALID_PARAMETER` where this walk sees an unreadable memory operand.
+
+**The oracle does not have to be Ghidra, and the cheaper one is already built.**
+[`binja-windbg-mcp`](https://github.com/glslang/binja-windbg-mcp), the sister MCP server, is a
+Binary Ninja companion whose core acceptance is recorded **for the identified ARM64 HEVD and
+`mountmgr` fixtures** ([`docs/binja-windbg-mcp-plan.md`](./docs/binja-windbg-mcp-plan.md)) -- the
+same two drivers item 82 was measured on. It already shares this repo's IOCTL-case shape, which
+`structured::IoctlCase` names as the reason those field names are what they are, so a case
+recovered there and a case recovered here are the same record about the same driver and diff
+directly. Ghidra stays the x64 lane; Binary Ninja is the one that can answer on ARM64 today.
+
+**Why deferred:** neither Ghidra nor Driver Buddy Revolutions is installed on this bench (checked
+2026-09-19; the README's `C:\ghidra_12.1.3_PUBLIC` is not there), so the Ghidra lane needs a host
+stood up first. The Binary Ninja route needs no install here -- it needs the diff written, and a
+decision about which of the two lanes `tools/ghidra_oracle/` grows to hold.
+
+**Where it picks up:** `tools/ghidra_oracle/README.md` -- its bench table, and its third trap about
+the cached image having to be the one the dump mapped, which on a live ARM64 target is a different
+question again -- plus
+[`docs/binja-windbg-mcp-plan.md`](./docs/binja-windbg-mcp-plan.md) and
+[`docs/binja-windbg-mcp-validation.md`](./docs/binja-windbg-mcp-validation.md) for what the
+companion already answers, and `structured::IoctlCase`'s doc comment for the shared shape.
