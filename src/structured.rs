@@ -2511,8 +2511,23 @@ pub struct Reachability {
     pub max_functions: usize,
     pub max_depth_reached: usize,
     pub max_depth: usize,
-    /// Whether a work bound stopped the walk short of the graph. Raise the bounds and retry.
+    /// Whether a work bound stopped the walk short of the graph. Raise the bounds and retry —
+    /// **unless [`Self::tables_bounded`] is set**, which is the case those two arguments do not
+    /// reach.
     pub bound_hit: bool,
+    /// Whether the bound that stopped it was the **jump-table resolver's own**, in which case
+    /// `max_functions`/`max_depth` are not the remedy: pass a specific handler address as `from` to
+    /// scope past the dispatch instead.
+    ///
+    /// Beside [`Self::bound_hit`] rather than instead of it, because the two answer different
+    /// questions. That one says the graph is partial, which is true however it happened, and is what
+    /// a consumer checking "was this fully explored" has always read. This one says what to do about
+    /// it, and folding them left the documented remedy pointing at arguments that cannot change the
+    /// answer — a caller retried as instructed and got a graph short of the same table edges.
+    ///
+    /// Absent rather than `false` on the ordinary answer, so a bound nobody hit costs no bytes.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub tables_bounded: bool,
     /// Why the walk stopped early, when it did. Outranks [`Self::bound_hit`] in what it means:
     /// a walk that ran out of time did not explore the graph it was *bounded* to either.
     #[serde(skip_serializing_if = "Option::is_none")]
