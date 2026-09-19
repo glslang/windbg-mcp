@@ -1,0 +1,60 @@
+{
+  "recorded_date": "2026-09-19",
+  "provenance": "Selected measurements transcribed from secure-kernel-debugging-validation.md; not a raw transcript",
+  "engine_version": "10.0.29617.1000",
+  "target_build": "29671.1000",
+  "outer_host_build": "26200",
+  "native_secure_kernel_attached": false,
+  "hypervisor_activation_trace": {
+    "image_sha256": "AD601A867EA480988EC0B618EABDB6F5D242F00F75D2E6C4B4CD62CB886DBAB1",
+    "return_site_rva": "0x2A04A0",
+    "vtl0_ax": "0x0",
+    "vtl1_ax": "0x1D",
+    "scope": "Return values directly observed in one early-boot trace"
+  },
+  "debug_reservation_experiment": {
+    "before_displayed": "1000",
+    "after_displayed": "2000",
+    "vtl1_active_port_before": "0xFFFF",
+    "vtl1_active_port_after": 50012,
+    "first_buffer_after": {"size_field": "0x1000", "count_field": 2},
+    "second_buffer_after": {"size_field": "0x1000", "count_field": 160},
+    "scope": "Post-boot state; activation return was not directly recaptured"
+  },
+  "session_path_trace": {
+    "site_rva": "0x2E00A8",
+    "vtl0_hits": 2,
+    "nonzero_vtl_hits": 0,
+    "scope": "Bounded boot interval at a post-guard point; earlier rejection and alternative paths not excluded"
+  },
+  "loader_configuration_trace": {
+    "image_sha256": "B24C5B501077621524530A8C4DB719655D7A21108B5245F3A5BC83F367FDCC8C",
+    "gate_return_site_rva": "0x2B508",
+    "gate_eax": 3,
+    "setup_return_site_rva": "0x2B6C1",
+    "setup_eax": 0,
+    "final_site_rva": "0x2B71E",
+    "type_field_offset": "0x740",
+    "type_value": 3,
+    "port_field_offset": "0x738",
+    "port_value": 50012,
+    "adjacent_flags_raw": "0x21E",
+    "scope": "Selected fields at this loader stage, not proof of later SK consumption; no SK listener during trace",
+    "temporary_bootdebug_restored": true
+  },
+  "read_only_queries": [
+    {"api": "NtQuerySystemInformation", "class": 149, "status": "0x00000000", "return_length": 3, "bytes": [1, 1, 1]},
+    {"api": "NtQuerySystemInformation", "class": 237, "status": "0xC00000BB", "return_length": 0, "bytes": null, "scope": "NT dispatch returns unsupported without querying SK"},
+    {"api": "NtQuerySystemInformationEx", "class": 237, "input": "null, length zero", "status": "0xC000000D", "return_length": 0, "bytes": null, "scope": "Invalid probe form; no capability conclusion"}
+  ],
+  "host_preflight": {
+    "scheduler_event_value": 4,
+    "target_vcpus": 4,
+    "target_extensions_exposed": true,
+    "target_dynamic_memory": true,
+    "target_startup_bytes": 4294967296,
+    "target_minimum_bytes": 2147483648,
+    "target_maximum_bytes": 4294967296,
+    "decision": "No changes on hardened outer host; separate nested lab deferred until after publication"
+  }
+}

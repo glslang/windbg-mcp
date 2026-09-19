@@ -1,0 +1,118 @@
+{
+    "captured_date":  "2026-09-19",
+    "scope":  "Selected offline function bodies; not a live support test",
+    "images":  [
+                   {
+                       "file_version":  "10.0.26100.9457",
+                       "architecture":  "x64",
+                       "image_sha256":  "A9CDE82E39794FB2910BD53A7DDA3DF750C443222F898C49092D5E51F8B2095E",
+                       "image_size_bytes":  1385944,
+                       "evidence_file":  "26100.9457.txt",
+                       "evidence_sha256":  "3BF7C300891217A6221DFF506A55E0CDA3F37B90A3C3E6887E99EF24E7CA11C7",
+                       "source_log_sha256":  [
+                                                 {
+                                                     "file":  "26100.9457-resolved.log",
+                                                     "sha256":  "446367648732E505BC59362286234BBC56F6A495CE4F43F88A4143F7FE2DD854"
+                                                 },
+                                                 {
+                                                     "file":  "26100.9457-metadata.log",
+                                                     "sha256":  "3A9FC4385DB938D0C14BD81BBE3A86ED729DE2D92828DA9E1CCF75BD1EB89160"
+                                                 }
+                                             ]
+                   },
+                   {
+                       "file_version":  "10.0.28000.2952",
+                       "architecture":  "x64",
+                       "image_sha256":  "BA493451314B11A139088BE95AC6B8A1413560958618B1ACBB279922526D4969",
+                       "image_size_bytes":  1447448,
+                       "evidence_file":  "28000.2952.txt",
+                       "evidence_sha256":  "A604E36B481139A649E8FAF09AB9A481D68058820244CA4F883A5FA9F0618D64",
+                       "source_log_sha256":  [
+                                                 {
+                                                     "file":  "28000.2952-resolved.log",
+                                                     "sha256":  "899E848D9C5DCFA3BBD4CDF6FEAD6C5AA5A2B625E69EBBC364D222F3E09CDD5D"
+                                                 },
+                                                 {
+                                                     "file":  "28000.2952-metadata.log",
+                                                     "sha256":  "E4C2FCD0080E26D93B64CE5384043AF3E2530AE14D02F7B95B1553863E1F478F"
+                                                 }
+                                             ]
+                   },
+                   {
+                       "file_version":  "10.0.29617.1000",
+                       "architecture":  "x64",
+                       "image_sha256":  "BB29E5EFCFEE50FD82975FCA45535B2C6A01D430F5A86B4F235DB33848B951AA",
+                       "image_size_bytes":  1515744,
+                       "evidence_file":  "29617.1000.txt",
+                       "evidence_sha256":  "1D0E9902337D74F61838750E2207695E977B647740ADA52945215DEE32C37CCB",
+                       "source_log_sha256":  [
+                                                 {
+                                                     "file":  "29617-resolved.log",
+                                                     "sha256":  "FE24C4CDFB4B9CB635CA6FA3275B8C30C9B510E5740273457C83F7F83B53852A"
+                                                 },
+                                                 {
+                                                     "file":  "29617-metadata.log",
+                                                     "sha256":  "FBD2EF6C23CC66675DAB01EDD8D5973092E15ABA48293B3A8A100631708A90FB"
+                                                 }
+                                             ]
+                   },
+                   {
+                       "file_version":  "10.0.29639.1000",
+                       "architecture":  "x64",
+                       "image_sha256":  "28FAEB48277EE5F85D97300B5B992C9482AD2EFB3AFA8BA885EA0551E9A301EE",
+                       "image_size_bytes":  1521808,
+                       "evidence_file":  "29639.1000.txt",
+                       "evidence_sha256":  "567CC2B7B9D29B54214A5726BABA82B9BAF4A8390469AB75471F92D4EAAD039E",
+                       "source_log_sha256":  [
+                                                 {
+                                                     "file":  "29639-resolved.log",
+                                                     "sha256":  "62955F8C38B42FA9ABAD2562D453D3A69931AB445689CFDB57E3EFBA753A472A"
+                                                 },
+                                                 {
+                                                     "file":  "29639-metadata.log",
+                                                     "sha256":  "BD6E83978E13DF2FEF60266CCB96C79D523C8CAFEFBAB4F4795453611835C652"
+                                                 }
+                                             ]
+                   },
+                   {
+                       "file_version":  "10.0.29648.1000",
+                       "architecture":  "x64",
+                       "image_sha256":  "77DA0F3187B736554070DCB812A6AEB94BEFDDA48818BFE471CAFF3BD5DE390D",
+                       "image_size_bytes":  1431672,
+                       "evidence_file":  "29648.1000.txt",
+                       "evidence_sha256":  "AA9807B58881C73E97EE240C4447892B2D109DDB440415FBA65EAE197A8BF75A",
+                       "source_log_sha256":  [
+                                                 {
+                                                     "file":  "29648-resolved.log",
+                                                     "sha256":  "7AF08C6F31C0FA20E8F8C5AF54800B6CD647758055BCB9244428D2EEB02E90D4"
+                                                 },
+                                                 {
+                                                     "file":  "29648-metadata.log",
+                                                     "sha256":  "AE3E64263969C9D7B015ED22A2D2B5DEA9DAA55DDB344AFBFAC17FB33DE0E1E3"
+                                                 }
+                                             ]
+                   },
+                   {
+                       "file_version":  "10.0.29671.1000",
+                       "architecture":  "x64",
+                       "image_sha256":  "F6112AEEA8D5306D401D9D8779A40BD67667CD67A323C3BF1E27BFA59086AAEA",
+                       "image_size_bytes":  1452152,
+                       "evidence_file":  "29671.1000.txt",
+                       "evidence_sha256":  "D0902F9DC33D9E37DE0FA24DFAF968EC9E47E2C18B4721845623E7518A3DFDD0",
+                       "source_log_sha256":  [
+                                                 {
+                                                     "file":  "sk-init.log",
+                                                     "sha256":  "7AC3650B236F9A5DD2EBED2714EFDDD58F98C2D6EA3AB9A21A0F6643FA84BB80"
+                                                 },
+                                                 {
+                                                     "file":  "sk-debug-status-20260919.log",
+                                                     "sha256":  "2026AA12A07092DDDCA003AA0C2BB6345D2E2F2411D6D29251D0FAAA4D9CDCCB"
+                                                 },
+                                                 {
+                                                     "file":  "sk-downstream-20260919.log",
+                                                     "sha256":  "44B878EF1B473223CFD1313F815BFF1F3D678DF8FFC6B265C97F182A23684B35"
+                                                 }
+                                             ]
+                   }
+               ]
+}

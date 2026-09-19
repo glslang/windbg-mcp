@@ -1,0 +1,2 @@
+# Preserve the bytes covered by evidence_sha256 across Windows and Unix checkouts.
+*.txt text eol=lf
