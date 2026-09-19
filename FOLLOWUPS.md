@@ -260,8 +260,8 @@ the generation the client end speaks is the one that is in a released schema.
   `WorkerMessage::Done` arm sends the result into a `oneshot` whose receiver went with the
   timed-out caller, and acts on the failed send for `OPENER_JOB` alone. A refreshing `modules` past
   300 s therefore runs to the end in the worker and is reported as a timeout with nothing to
-  collect — item 88 enumerates which jobs can reach that state, the allocator walks having a budget
-  of their own that stops them first. The openers already escape this — their timeout hands back a
+  collect — item 88 carries the rule for which jobs can reach that state, the allocator walks having
+  a budget of their own that stops them first. The openers already escape this — their timeout hands back a
   `session_id` and `session_status` resolves it — and **item 88 is what would close the rest**,
   with `continue_async`'s filing task rather than a protocol extension.
 
@@ -1824,47 +1824,47 @@ delivered* answer rather than running past the deadline. That is deliberate and 
 budget exists, in its own words, to prevent "a walk still running after its caller gave up", and a
 truncated walk is not even cached, so there is nothing to collect.
 
-**So the set is derived rather than listed, because a list in prose drifts and `EngineOp` grows.**
-The starting point is `EngineOp::patience_slot`, which is already this crate's enumeration of what
-carries the caller's clock: the fifteen arms it returns `Some` for spend it, through
-`watchdog_budget_ms` for a command or `walk_budget` for a walk. **Two corrections to it**, and
-neither is optional — this is where a first pass at the enumeration went wrong by reading a doc
-comment's example list instead of the dispatcher:
+**So the rule, and deliberately not a list of ops.** An op is in scope if **any part of its work has
+no clock** — not if the op as a whole looks unbounded. Five review rounds on this one paragraph
+established that the list is the wrong artefact for a follow-up entry to carry: it was written three
+times and was wrong three times, each round naming another arm, and the count of arms is a thing
+only `worker.rs` knows. What is durable is the rule, the method, and the two cases that show why the
+obvious shortcut fails.
 
-  - **It answers about a field, not about the work.** Four ops carry a clock under another name and
-    are bounded: `CommandAndWait` and `RunToAddress` (`timeout_ms`), `Resume` (`max_run_ms`, plus
-    the execution slot), `EndSession` (`END_SESSION_TIMEOUT`, 20s). `Interrupt` is answered ahead of
-    the worker's queue on `INTERRUPT_TIMEOUT`. And the six **openers** are out of scope for the
-    other reason — their timeout hands back a `session_id`.
-  - **And an op can carry a patience and still have an unbounded tail, so the correction adds as
-    well as subtracts.** `CrashTriage` is that case and is the sharpest example here: `bug_check`
-    and `is_kernel_target` before it and the stack walk after it are direct engine calls, only the
-    `!analyze` in the middle is bounded, and `TRIAGE_READ_RESERVE` therefore *reserves* time for
-    those reads rather than bounding them — a reservation a symbol server can outlast.
-    `patience_slot` calls it bounded; half of it is, so it comes back **in**. Review had to point
-    that out twice over: the paragraph named the unbounded tail and the arithmetic below then
-    subtracted the op anyway.
+**The shortcut is `EngineOp::patience_slot`**, which is already this crate's enumeration of what
+carries the caller's clock — and it answers about a **field**, not about the work, so it is wrong in
+both directions:
 
-What is left is **nine of `EngineOp`'s thirty-four** arms — 34 less `patience_slot`'s 15, less the
-6 openers, less the 4 with a clock of another name, less `Interrupt`, **plus `CrashTriage` back**
-(counted from `proto.rs` on 2026-09-19, and re-derivable from it rather than from this sentence).
-They are what this item is about: `CrashTriage`, `Modules`
-(item 54 — `Reload("")` has no wall-clock bound and is a wait with no upper bound on 115200-baud
-serial), `SymbolPath` (`reload_symbols` plus a raw `.sympath`, and the tool you reach for
-*because* symbols are not resolving, i.e. against the slow source), `ExceptionTriage`,
-`Backtrace`, `Registers`, `Disassemble`, `CurrentLocation`, and `UnboundedCommand` —
-`index_trace`, the one the coverage rule exempts. Review found `SymbolPath` and `ExceptionTriage`
-missing from the first version of this paragraph and `CrashTriage` from the second, which is the
-argument for deriving the set here rather than naming it.
+  - **An op can carry a patience and still have an unbounded tail.** `CrashTriage`: `bug_check` and
+    `is_kernel_target` before the analysis and the stack walk after it are direct engine calls, and
+    only the `!analyze` in the middle is bounded. `TRIAGE_READ_RESERVE` *reserves* time for those
+    reads rather than bounding them — a reservation a symbol server can outlast.
+  - **And an op can carry no patience and still be mostly bounded, with an unbounded step in front
+    of it.** `RunToAddress`: the run itself is bounded by `timeout_ms`, but `run_to_address` reaches
+    the target through the **unbounded** `resolve` — the same call
+    `the_reachability_op_resolves_nothing_unbounded` exists to keep out of the reachability op, and
+    which `proto.rs` says is deliberate here because this op "carr[ies] no deadline to spend"
+    (item 56). A symbolic address whose symbol has to be fetched blocks with nothing able to stop
+    it.
 
-**What is *not* certified, and is part of the work rather than settled by this entry:** the other
-fourteen `patience_slot` arms have not each been read for an unbounded prelude or tail the way
-`CrashTriage` was. Three were checked and are bounded end to end — `SetBreakpoint` is one
-`set_breakpoint_bounded`, and `IrpStack` and `IoctlTrace` reach `raw_command` and
-`set_breakpoint` on a `watchdog_budget_ms` after an `instruction_set()` that does no I/O. The
-remaining eleven are assumed bounded because they carry a patience, which is precisely the
-inference `CrashTriage` breaks. So the eligibility rule is "any part of the work has no clock",
-and applying it needs the arms read one at a time rather than a field consulted.
+So the set cannot be read off a field, and this entry does not pretend to have it: **deriving it is
+part of the work.** What is known is that the ops with no clock anywhere include `Modules` (item 54 —
+`Reload("")` has no wall-clock bound and is a wait with no upper bound on 115200-baud serial),
+`SymbolPath` (`reload_symbols` plus a raw `.sympath`, and the tool reached for *because* symbols are
+not resolving, i.e. against the slow source), `ExceptionTriage`, `Backtrace`, `Registers`,
+`Disassemble`, `CurrentLocation` and `UnboundedCommand` — and that `CrashTriage` and `RunToAddress`
+join them by the rule above. Three were checked and are bounded end to end: `SetBreakpoint` is one
+`set_breakpoint_bounded`, and `IrpStack` and `IoctlTrace` reach `raw_command` and `set_breakpoint`
+on a `watchdog_budget_ms` after an `instruction_set()` that does no I/O. The rest are **unaudited**,
+and assuming them bounded because they carry a patience is the inference both cases above break.
+
+**One half of this is a clamp rather than a store, and is worth doing on its own.**
+`run_to_address` passes the caller's `timeout_ms` straight through
+(`args.timeout_ms.unwrap_or(EXEC_WAIT_MS)`), where `wait_for_stop` caps its own wait below the call
+timeout with a `.min(…)` and `STOP_WAIT_MARGIN` for exactly this reason. So a caller may name a run
+bound *longer* than the server's call timeout and guarantee the discard: the supervisor gives up
+first, the run continues, and the verdict — `HIT`, `STOPPED ELSEWHERE` — is thrown away. Capping it
+the way `wait_for_stop` does needs none of the machinery below.
 
 **The pattern to build it from is already here**, which is why this is worth doing without the tasks
 extension (`FOLLOWUPS.md` item 8, where the measurement says no client on this wire can drive one
