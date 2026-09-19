@@ -114,8 +114,8 @@
       "inputSchema": 723,
       "modelVisible": 1413,
       "name": "device_security",
-      "outputSchema": 3864,
-      "wire": 5390
+      "outputSchema": 3847,
+      "wire": 5373
     },
     {
       "annotations": 64,
@@ -150,8 +150,8 @@
       "inputSchema": 623,
       "modelVisible": 1706,
       "name": "driver_surface",
-      "outputSchema": 10411,
-      "wire": 12266
+      "outputSchema": 10369,
+      "wire": 12224
     },
     {
       "annotations": 130,
@@ -276,8 +276,8 @@
       "inputSchema": 563,
       "modelVisible": 1368,
       "name": "ioctl_map",
-      "outputSchema": 4118,
-      "wire": 5606
+      "outputSchema": 4085,
+      "wire": 5573
     },
     {
       "annotations": 124,
@@ -556,10 +556,10 @@
     "inputSchema": 53503,
     "instructions": 1983,
     "modelVisible": 91790,
-    "outputSchema": 150988,
-    "payload": 250941,
+    "outputSchema": 150896,
+    "payload": 250849,
     "tools": 61,
-    "wire": 250869,
+    "wire": 250777,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
