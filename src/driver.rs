@@ -934,7 +934,7 @@ pub(crate) fn format_recipe(recipes: &[SegmentRecipe], stopped: Option<Halt>) ->
 
 /// Outcome of a reachability walk. `verdict_reachable` is sound (a concrete static
 /// path exists); a false verdict is best-effort within the explored bounds.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub(crate) struct Report {
     pub(crate) verdict_reachable: bool,
     /// Resolved entry of the `from` function (None if `from` didn't disassemble).
@@ -1220,6 +1220,16 @@ pub(crate) fn format_report(r: &Report) -> String {
                 "  Stopped: interrupted — this path is real, but the graph was NOT fully \n\
                  \x20          explored, so a shorter one may exist.\n",
             ),
+            // The resolver's cap qualifies a REACHABLE verdict exactly as a halt does, and for the
+            // same reason: the path is real, and the graph it was found in is partial, so a shorter
+            // one may have been omitted with it. Rendered only where nothing outranks it -- a halt
+            // says the same thing and names a different remedy.
+            None if r.tables_bounded => out.push_str(
+                "  Bound hit: the jump-table resolver stopped at a limit of its own — this path \n\
+                 \x20          is real, but a switch's edges may be missing, so a shorter one may \n\
+                 \x20          exist. max_functions/max_depth do not reach it; pass a specific \n\
+                 \x20          handler VA as `from` to scope past the dispatch.\n",
+            ),
             None => {}
         }
         if let Some(f) = r.containing_fn {
@@ -1368,6 +1378,7 @@ pub(crate) fn structured_report(
         max_depth_reached: r.max_depth_seen,
         max_depth: r.max_depth,
         bound_hit: r.bound_hit,
+        tables_bounded: r.tables_bounded,
         stopped: r.halted.map(halt),
         blind_stops: r.blind,
         recipe: recipe.map(|(segments, _)| {
@@ -3043,7 +3054,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         };
 
         // The configurable bound: raising the arguments is the remedy, and it is named.
-        let text = format_report(&base);
+        let text = format_report(&base.clone());
         assert!(text.contains("raise max_functions/max_depth"), "{text}");
         assert!(!text.contains("handler VA"), "{text}");
 
@@ -3051,7 +3062,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         // does is given instead.
         let capped = Report {
             tables_bounded: true,
-            ..base
+            ..base.clone()
         };
         let text = format_report(&capped);
         assert!(
@@ -3065,6 +3076,74 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert!(
             text.contains("handler VA"),
             "and give the remedy that does: {text}"
+        );
+
+        // **And on a REACHABLE verdict too**, which the halt already qualified and this did not: the
+        // path is real, and the graph it was found in is partial, so a shorter one may have been
+        // omitted with the switch's edges. Raised on review of #351, one commit after the
+        // not-reachable half.
+        let reached = Report {
+            verdict_reachable: true,
+            containing_fn: Some(0x1000),
+            tables_bounded: true,
+            ..base.clone()
+        };
+        let text = format_report(&reached);
+        assert!(text.contains("VERDICT: REACHABLE"), "{text}");
+        assert!(
+            text.contains("jump-table resolver stopped at a limit of its own"),
+            "a reachable verdict from a partial graph has to say so: {text}"
+        );
+        assert!(text.contains("handler VA"), "{text}");
+
+        // A halt outranks it, naming a different remedy for a different cause.
+        let halted = Report {
+            halted: Some(Halt::Deadline),
+            ..reached.clone()
+        };
+        let text = format_report(&halted);
+        assert!(text.contains("ran out of time"), "{text}");
+        assert!(
+            !text.contains("jump-table resolver stopped"),
+            "one qualification, not two: {text}"
+        );
+    }
+
+    /// **The typed answer carries the distinction, not only the text.**
+    ///
+    /// `bound_hit` is documented as remedied by raising `max_functions`/`max_depth`, and a resolver
+    /// cap is not -- so a structured consumer following that field got guidance that cannot change
+    /// the answer, and had no way to tell the two limits apart. The text was fixed first and the
+    /// payload left alone on the belief that a new field would churn
+    /// `tests/golden/tools_list.json`; it does not, because that golden records a branch's payload
+    /// *type* and `required` list rather than the payload's own fields. Raised on review of #351,
+    /// twice -- the second time because the first fix stopped at the prose.
+    #[test]
+    fn the_typed_report_separates_a_resolver_cap_from_a_raisable_bound() {
+        let r = Report {
+            verdict_reachable: false,
+            from_entry: Some(0x1000),
+            target: 0x9999,
+            containing_fn: None,
+            path: Vec::new(),
+            funcs_explored: 1,
+            max_depth_seen: 0,
+            bound_hit: true,
+            max_functions: 256,
+            max_depth: 32,
+            halted: None,
+            blind: 0,
+            seed_start: None,
+            tables_bounded: true,
+        };
+        let typed = structured_report(&r, None, located);
+        assert!(
+            typed.bound_hit,
+            "the graph is partial, which has always been this"
+        );
+        assert!(
+            typed.tables_bounded,
+            "and which bound it was, which is what decides the remedy"
         );
     }
 
