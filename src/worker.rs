@@ -8951,7 +8951,22 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     let set_reads_operands = set.operands_are_read();
     // Read once: the walk crosses functions and may cross modules, and asking the engine for its
     // module table per jump would be a round trip for a question whose answer does not move.
-    let loaded = e.modules().unwrap_or_default();
+    //
+    // **Propagated rather than defaulted, which is the difference between two very similar empty
+    // lists.** `Ok(vec![])` is a target with no modules and degrades correctly: no listing finds a
+    // containing module, no table resolves, and the walk ends at each indirect jump exactly as it
+    // did before `FOLLOWUPS.md` item 83. An `Err` is the debugger failing to answer, and
+    // `unwrap_or_default` made the two the same value -- so a resolvable switch went unresolved for
+    // *every* function and the walk reported NOT REACHABLE with `halted`, `bound_hit`,
+    // `tables_bounded` and `blind_stops` all clear: a verdict that says the graph was explored when
+    // the only thing that could have crossed it never ran. Raised on review of #351.
+    //
+    // It fails the call rather than filing a fifth kind of incompleteness, for two reasons. It is
+    // what `ioctl_map` does with the same enumeration four thousand lines up, and what six of the
+    // seven other `modules()` reads in this file do. And it is the same judgement the flow gate at
+    // the top of this function makes -- an honest refusal beats a verdict shaped like an answer --
+    // where a new channel would be the fourth one this PR has had to explain the remedy for.
+    let loaded = e.modules().map_err(failed)?;
     let layout = ioctl_layout(set);
     let mut resolve_jump = |block: &[Instruction]| -> crate::driver::JumpTables {
         if !set_reads_operands {

@@ -9413,6 +9413,194 @@ mod tests {
         );
     }
 
+    /// A **bounds check** that is not on every path into a block is not a bound there either — the
+    /// half of the join above that decides whether a jump table resolves at all.
+    ///
+    /// This is the property `driver::reachability` leans on when it resolves a listing's tables
+    /// from the function **entry** while the walk itself may have begun past a prologue. Review of
+    /// #351 called that unsound: state the skipped path established could admit edges the scoped
+    /// walk cannot take. It cannot, because propagation here is a *meet* — the facts at a jump site
+    /// are the ones every entry-to-site path agrees on, and the paths a scoped start can take are a
+    /// subset of those. A meet over more paths drops facts rather than inventing them, so an
+    /// entry-derived table is a subset of what a start-scoped propagation would find.
+    ///
+    /// The fixture states it where it bites: two paths reach one indirect jump, and they disagree
+    /// about how far the index was bounded. The limit is what decides how many slots are read, so a
+    /// walk keeping either one would publish edges from a table sized by a check the other path
+    /// never made. Both halves differ by one immediate, and the reader's count is what says the
+    /// refusal happens before the table is read rather than after.
+    #[test]
+    fn a_bound_on_one_path_is_not_a_bound_at_the_join() {
+        const TABLE: i64 = 0x9000;
+        let block = |limit_on_the_other_path: u64| {
+            let mut block = prologue(DISPATCH);
+            block.extend([
+                insn(
+                    DISPATCH + 8,
+                    "mov",
+                    vec![reg("eax"), reg("r13d")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0xb,
+                    "sub",
+                    vec![reg("eax"), imm(0x6dc004)],
+                    Flow::Fallthrough,
+                ),
+                // A split that touches neither the index nor the base, so the only thing the two
+                // paths below differ about is the bound.
+                insn(
+                    DISPATCH + 0x11,
+                    "test",
+                    vec![reg("r14b"), reg("r14b")],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x14,
+                    "je",
+                    Vec::new(),
+                    Flow::Branch(Some(DISPATCH + 0x30)),
+                ),
+                // One path bounds the index at three slots.
+                insn(
+                    DISPATCH + 0x1a,
+                    "cmp",
+                    vec![reg("eax"), imm(2)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x1d,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x23,
+                    "jmp",
+                    Vec::new(),
+                    Flow::Jmp(Some(DISPATCH + 0x40)),
+                ),
+                // The other bounds it at however many the caller asked for.
+                insn(
+                    DISPATCH + 0x30,
+                    "cmp",
+                    vec![reg("eax"), imm(limit_on_the_other_path)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x33,
+                    "ja",
+                    Vec::new(),
+                    Flow::Branch(Some(0xfa11)),
+                ),
+                insn(
+                    DISPATCH + 0x39,
+                    "jmp",
+                    Vec::new(),
+                    Flow::Jmp(Some(DISPATCH + 0x40)),
+                ),
+                // Reached from both, and the only place the table is read.
+                insn(
+                    DISPATCH + 0x40,
+                    "lea",
+                    vec![reg("rcx"), at_address(IMAGE_BASE)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x47,
+                    "mov",
+                    vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                    Flow::Fallthrough,
+                ),
+                insn(
+                    DISPATCH + 0x4e,
+                    "add",
+                    vec![reg("rax"), reg("rcx")],
+                    Flow::Fallthrough,
+                ),
+                insn(DISPATCH + 0x51, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+            ]);
+            block
+        };
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let served = std::cell::Cell::new(0usize);
+        // **Serves whatever length is asked for**, which is what keeps the assertions below about
+        // the join. A reader answering only the control's twelve bytes would refuse a six-slot
+        // read and leave the switch unresolved for want of *bytes* -- so a walk that wrongly kept
+        // the longer path's bound would still look like a walk that correctly dropped it, and
+        // every assertion but the reader's own count would pass with the rule backed out.
+        let read = |at: u64, len: usize| {
+            served.set(served.get() + 1);
+            (at == table_at).then(|| {
+                [0x1000u32, 0x1100, 0x1200, 0x1300, 0x1400, 0x1500]
+                    .iter()
+                    .flat_map(|rva| rva.to_le_bytes())
+                    .take(len)
+                    .collect()
+            })
+        };
+
+        // **The control first**, with both paths making the same check: the bound survives the
+        // join and the switch resolves, so a green result below cannot mean the fixture never had
+        // a table in it.
+        let agreeing = map(
+            DISPATCH,
+            &block(2),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
+        assert_eq!(
+            agreeing
+                .cases
+                .iter()
+                .map(|case| (case.lands, case.recovered))
+                .collect::<Vec<_>>(),
+            vec![
+                (IMAGE_BASE + 0x1000, Recovery::JumpTable),
+                (IMAGE_BASE + 0x1100, Recovery::JumpTable),
+                (IMAGE_BASE + 0x1200, Recovery::JumpTable),
+            ],
+            "the control must resolve: {:?}",
+            agreeing.cases
+        );
+        assert!(agreeing.unresolved.is_empty(), "{:?}", agreeing.unresolved);
+
+        served.set(0);
+        let disagreeing = map(
+            DISPATCH,
+            &block(5),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
+        assert!(
+            disagreeing.cases.is_empty(),
+            "neither path's limit is the limit here, so no slot is a case: {:?}",
+            disagreeing.cases
+        );
+        assert!(
+            disagreeing.tables.is_empty(),
+            "and no table was followed: {:?}",
+            disagreeing.tables
+        );
+        assert_eq!(
+            disagreeing.unresolved,
+            vec![DISPATCH + 0x51],
+            "the switch goes back unresolved rather than short: {:?}",
+            disagreeing.unresolved
+        );
+        assert_eq!(
+            served.get(),
+            0,
+            "and the refusal is before the read, not after it"
+        );
+    }
+
     /// A bounds check holds on the path it **admits**, and not on the one it rejects.
     ///
     /// `cmp index,N` / `ja default` says nothing about the index on the branch it takes — that is
