@@ -1543,17 +1543,25 @@ read from the fact tracking rather than calling it.
 
 **Repo:** `windbg-mcp`.
 
-`adr` reaches ±1 MB. Past that a compiler builds the address in two instructions --
-`adrp x8,<page>` / `add x8,x8,#<offset>` -- and `ioctl::update` models `Effect::Add` only as
-`Value::Code + immediate`, so the `add` clears the register and the table base is gone. The jump
-goes back `unresolved`, which is the safe direction but is silent about *why*.
+A compiler materialises a page-relative address in two instructions -- `adrp x8,<page>` /
+`add x8,x8,#<offset>` -- and `ioctl::update` models `Effect::Add` only as `Value::Code +
+immediate`, so the `add` clears the register and a table base built that way is gone. The jump goes
+back `unresolved`, which is the safe direction but is silent about *why*.
 
-Hypothetical on this bench and stated as such: all nine tables found on the live ARM64 target, and
-all four jumps correctly refused, use a single `adr` -- these drivers are 60–200 KB. A large
-third-party driver is the case that needs it.
+**It is not a size threshold, and the first draft of this item said it was.** `adr` reaches ±1 MB,
+so it is tempting to reason that only a driver larger than that needs the pair -- but a compiler
+picks `adrp`+`add` for ordinary globals and relocatable references well inside that range, which is
+a codegen choice rather than a reach one. Raised on review of
+[#347](https://github.com/glslang/windbg-mcp/pull/347), and `mountmgr` proves it at **139 KB**:
+`mountmgr+0x19450` is `adrp x8,mountmgr!QueryPointsFromMemory+0x610` / `add x22,x8,#0x4E8`, four
+instructions after one of the jump tables this branch reads. So the shape is already on this bench
+and in the smallest fixtures; what none of them does is use it for a **table base**, which is the
+only position `follow_table` asks about.
 
-**Why deferred:** no measurement here reaches it, and the fix is one arm whose blast radius is
-every `Value::Address` consumer -- worth doing beside item 82, which opens the same function.
+**Why deferred:** no measurement here reaches the position that matters, and the fix is one arm
+whose blast radius is every `Value::Address` consumer -- worth doing beside item 82, which opens
+the same function. A fixture for it should be one of the small drivers rather than a hypothetical
+large one.
 
 **Where it picks up:** `ioctl::update`'s `Effect::Add` arm (`src/ioctl.rs`), where the
 `_ => set(facts, &destination, None)` fall-through is.
@@ -1577,9 +1585,18 @@ claimed otherwise and was wrong; review caught it. The Binary Ninja companion
 | ARM64 HEVD | all **29** cases, no unresolved entries | **29** cases |
 | ARM64 `mountmgr` 10.0.26100.1 | **93** code/site records: **48** routes for **24** recognised codes, **three** jump tables | **48** records, **24** distinct codes, **three** tables |
 
-Independently derived and identical on every figure -- the companion admits a branch whose `input`
-is `Parameters.DeviceIoControl.IoControlCode`, which is Binary Ninja's type propagation over the IO
-stack location, where this walk traces a displacement through `Facts`.
+Independently derived, and identical **where the two report the same thing** -- the companion
+admits a branch whose `input` is `Parameters.DeviceIoControl.IoControlCode`, which is Binary
+Ninja's type propagation over the IO stack location, where this walk traces a displacement through
+`Facts`.
+
+**The 93 has no counterpart here, and a record-level diff would report 45 phantom discrepancies.**
+The companion's 93 is those 48 routes plus **45 explicit default-rejection table slots**; this
+implementation drops a slot whose target is the bounds check's own branch (`src/ioctl.rs`, "a slot
+that goes to the default is not a case"), so it emits the 48 and never the 45. A lane that diffs
+records without saying so measures a deliberate difference in *reporting* and calls it
+disagreement. It has to compare the accepted routes, or normalise the default slots explicitly --
+part of writing the lane rather than a detail of it. Raised on review.
 
 **So the gap is narrower than "unchecked", and more specific.** Three parts:
 
@@ -1619,8 +1636,7 @@ already walks dispatch to sink, which is item 71 here.
 `WINDBG_MCP_CALL_TIMEOUT_SECS=60`, because the walk budget it pins is derived as the call timeout
 less 15s of headroom and 45s is distinctively not the walker's own 120s default. But that variable
 is **server-wide** and is read on every call, so the same 60s also caps the `open_dump` the test
-performs to get a session -- against a default of **300s** (`ENGINE_CALL_TIMEOUT`, `src/main.rs`)
-that every other dump test in the tier opens under.
+performs to get a session -- against a default of **300s** (`ENGINE_CALL_TIMEOUT`, `src/main.rs`).
 
 Opening the sample dump does symbol work. On a contended runner it exceeds 60s, and the test then
 fails with `open_dump` timing out, having measured nothing whatever about the budget it exists to
@@ -1639,11 +1655,22 @@ assertion `left == right` failed: `open_dump` did not succeed: engine call timed
 budget the test imposed on a step it was not reasoning about. Fifteen CI runs on `main` over the
 same period: fourteen green, one red, and the red one is this.
 
-**Why deferred:** the fix is a judgement about the test rather than a mechanical change, and the
-obvious ones each cost something. Raising the cap weakens the "distinctively not 120s" property
-the assertion rests on; opening the session first is impossible, because the variable is read from
-the server process's own environment and the open happens inside it; and giving the open its own
-allowance means a second env var, which is surface added to make a test pass.
+**The remedy is already in this file, twice, and the first draft of this item did not say so.**
+Two other tests lower the same variable and both deal with the open it also caps.
+`a_running_command_is_interrupted_on_request_and_frees_its_session` hit *this exact failure* --
+"36s was measured on a CI runner against a budget of 30, and the test then failed inside the open
+rather than in anything it is about" -- and raised its budget to **90s**, sized for the open. And
+`a_pool_query_with_no_time_to_walk_is_refused_rather_than_run` runs at 10s and **skips** when the
+open does not land, so a slow runner cannot fail it. Raised on review of
+[#347](https://github.com/glslang/windbg-mcp/pull/347).
+
+90s here derives a 75s walk budget, still distinctively not the walker's 120s default, so the
+assertion survives that fix. This is therefore a small change following an established precedent
+rather than the design question the first draft posed -- and the second environment variable it
+reached for is not needed.
+
+**Why deferred rather than done here:** this is a docs-only branch, and the change belongs beside
+the test, with the rerun that proves it.
 
 **Where it picks up:** `tests/mcp_smoke.rs` -- the test at the `WINDBG_MCP_CALL_TIMEOUT_SECS=60`
 literal, its `Server::started_with`, and `Server::open_session` / `tool_data`, where the
@@ -1654,15 +1681,21 @@ literal, its `Server::started_with`, and `Server::open_session` / `tool_data`, w
 
 **Repo:** `windbg-mcp`.
 
-`volmgr!VmDeviceControl` on the live ARM64 target compares the traced control code against four
-constants in twenty bytes, each built the same way -- `mov w9,#<low>` /
-`movk w9,#0x76,lsl #0x10` / `cmp w8,w9` / `b.eq`. Three are recovered and the fourth is not:
+`volmgr!VmDeviceControl` on the live ARM64 target runs a chain of compares against the traced
+control code, each constant built `mov w9,#<low>` / `movk w9,#0x76,lsl #0x10` and tested
+`cmp w8,w9` / `b.eq`. Four such compares sit at `+0x1cf0`, `+0x1d04`, `+0x1d18` and `+0x1d28` --
+spaced 20, 20 and 16 bytes, the wider gaps being the two that carry a `b.hi` as well. Three
+constants were read off the target; the fourth was not, so it is left out rather than guessed at:
 
 | site | constant | branch target? | result |
 |---|---|---|---|
 | `volmgr+0x1d04` | `0x764328` | no | case |
 | `volmgr+0x1d18` | `0x760320` | no | case |
 | `volmgr+0x1d28` | `0x764324` | **yes** | **absent**, site in `untracked` |
+
+`+0x1cf0` is a recovered site too; its constant was not read, which is why it is not a row. The
+first draft of this item said "four constants in twenty bytes" and gave a distance of twelve for
+`+0x1d04`; both were wrong, and review caught them.
 
 **The third column is the cause.** Something else in the routine branches to `+0x1d28`, so the
 `cmp` *begins a basic block* and the `mov`/`movk` that build `w9` are in the block before it. What
@@ -1680,12 +1713,20 @@ instructions to build the constant at all, which gives the join something to fal
 **Not silently short.** `untracked` carries the site, which is what item 82 is about, and `volmgr`
 reports five of them against 63 recovered cases. What is missing is the code's *value*.
 
-**Why deferred, and what the decision is.** The current behaviour is conservative rather than
-wrong: control really can reach `+0x1d28` by another path, and on that path `w9` may hold something
-else. The fix is not "keep the literal" -- it is deciding whether a value **every** predecessor
-sets identically may survive the join, which is a question about the merge and not about `movk`.
-Doing it wrong invents a code the driver does not accept, which is the failure mode this module
-refuses above all others. Worth doing beside item 82, which opens the same walk.
+**The remedy this item first proposed is a no-op, and that is the useful part of it.** The draft
+said the decision was whether a value *every* predecessor sets identically may survive the join.
+`Facts::join` already does exactly that -- it retains a register only where the incoming value
+equals the one it holds (`src/ioctl.rs`) -- so implementing that sentence changes nothing. Raised
+on review of [#347](https://github.com/glslang/windbg-mcp/pull/347), and checking it is what makes
+the real shape of the work visible: the predecessors here **do not** agree. One edge into `+0x1d28`
+falls through the `mov`/`movk` and carries `0x764324`; the other arrives from elsewhere and does
+not. The join is right to drop it.
+
+**So closing this needs path sensitivity, not a better merge.** The compare has to be evaluated on
+the edge that carries the literal -- per-edge facts, or a representation that keeps a register's
+value qualified by where it came from -- which is a different and larger change from anything in
+items 82 to 84. Doing it loosely invents a code the driver does not accept, which is the failure
+this module is arranged against above all others.
 
 **How it was found:** verifying a review finding on
 [#347](https://github.com/glslang/windbg-mcp/pull/347) that item 82 overstated its diagnostic gap.
