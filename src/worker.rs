@@ -8900,7 +8900,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // would pass and be followed. Only this module's executable sections are code.
         let executable = executable_ranges(e, module);
         let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
-        let targets = ioctl::jump_targets(entry, block, layout, read, in_image, || {
+        let (targets, stopped) = ioctl::jump_targets(entry, block, layout, read, in_image, || {
             if let Some(why) = halted.get() {
                 return Some(why);
             }
@@ -8912,6 +8912,15 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
                 None
             }
         });
+        // **A halt inside the resolver is the walk's halt.** Filed in the same cell the decoder
+        // uses, which the walk's own poll reads on its next step -- so a verdict reached after this
+        // carries "cut short" rather than reading as a graph that was fully explored. Without it a
+        // resolver that timed out mid-table would hand back nothing and the walk would report an
+        // ordinary NOT REACHABLE, or reach its goal through an earlier edge and report a clean
+        // REACHABLE. Both are verdicts about an analysis that stopped.
+        if let Some(why) = stopped {
+            halted.set(Some(why));
+        }
         targets
             .into_iter()
             .find(|(site, _)| *site == at)
@@ -10027,15 +10036,26 @@ mod tests {
              in `src/pe.rs` is against a number the image itself supplies."
         );
 
-        // And `ioctl_map`, which derives the executable ranges a jump-table entry has to land in
-        // from the same header. Unclamped, a section declared past the loaded extent puts the next
-        // module's code inside this one's ranges, and an entry landing there is published as this
-        // driver's case with the jump reported as followed.
-        let walk = bodies_of(&["ioctl_map", "ioctl_map_of"], 4_000);
+        // And the executable ranges a jump-table entry has to land in, derived from the same
+        // header. Unclamped, a section declared past the loaded extent puts the next module's code
+        // inside this one's ranges, and an entry landing there is published as this driver's case
+        // with the jump reported as followed.
+        //
+        // **Read from `executable_ranges` rather than from `ioctl_map`'s body**, because that is
+        // where the clamp now is: the reachability walk's table resolver needs the same ranges
+        // (`FOLLOWUPS.md` item 83), and two copies of this computation are how the two tools would
+        // come to disagree about which entries are code. This guard caught that move -- it was
+        // green on the inline version and failed the moment it was extracted, which is the point of
+        // asserting the call is *there* rather than only that the arithmetic is right.
+        //
+        // One assertion now covers both readers, so the floor is the small body's rather than two
+        // large ones'.
+        let walk = bodies_of(&["executable_ranges"], 300);
         assert!(
             walk.contains("image.size_of_image = smaller_extent("),
-            "`ioctl_map` no longer clamps the image's extent to the loader's, so a jump-table \
-             entry can land in the next module and be published as this driver's case."
+            "the shared executable-range reader no longer clamps the image's extent to the \
+             loader's, so a jump-table entry can land in the next module and be published as this \
+             driver's case -- for `ioctl_map` and for the reachability walk alike."
         );
     }
 
