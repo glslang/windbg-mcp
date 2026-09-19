@@ -184,11 +184,18 @@ session with no handshake at all, and — the rule that is easy to get wrong —
 **every** request must carry the `_meta` protocol keys, not just the opener; a request without them
 is refused with `-32602`.
 
-**Capability honesty.** `tools` is advertised; `resources`, `prompts`, `completions`, `logging` and
-`extensions` are not, because none are implemented. `tasks/get` answers `method_not_found`
-(deliberate — [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 8). If an SDK bump starts advertising something
-on this server's behalf, this test is where you find out, and the choice is implement it or
-suppress it — not ship an advertisement clients will call into a dead end.
+**Capability honesty.** `tools` is advertised and asserted to be the **whole** key set of
+`capabilities` on the wire, rather than a list of the keys that must be absent — because a list can
+only catch a capability it already names, and the next one arrives under a key nobody here has
+heard of: rmcp's `ServerCapabilities` is `#[non_exhaustive]`, and tasks would appear as
+`extensions` under the SEP rmcp implements but as a first-class `tasks` field if rmcp follows the
+reference TypeScript SDK, which still spells it that way. Beside it, `tasks/get` answering
+`method_not_found` (deliberate — [`FOLLOWUPS.md`](../FOLLOWUPS.md) item 8), as a second assertion
+rather than a consequence of the first: rmcp ships the whole server-side task runtime, so the
+method is one `enable_tasks()` from answering and would not need a capability key to be wrong
+about. If an SDK bump starts advertising something on this server's behalf, this test is where you
+find out, and the choice is implement it or suppress it — not ship an advertisement clients will
+call into a dead end.
 
 **Tool surface golden.** `tests/golden/tools_list.json` records the *structural* `tools/list`
 surface as it appears on the wire: JSON Schema dialect, `$defs` usage (`true` since `debug_batch`

@@ -1319,20 +1319,37 @@ fn capabilities_advertise_only_what_is_implemented() {
         !capabilities["tools"].is_null(),
         "tools must be advertised: {capabilities}"
     );
-    for unimplemented in ["resources", "prompts", "completions", "logging"] {
-        assert!(
-            capabilities[unimplemented].is_null(),
-            "`{unimplemented}` is advertised but this server implements no such handler — \
-             clients will call it and get method_not_found: {capabilities}"
-        );
-    }
 
-    // Tasks (`io.modelcontextprotocol/tasks`, SEP-2663) are deliberately not implemented —
-    // see FOLLOWUPS.md item 8. The advertisement and the behaviour have to agree.
-    assert!(
-        capabilities["extensions"].is_null(),
-        "no protocol extension is implemented yet, so none may be advertised: {capabilities}"
+    // **The whole key set, not a list of the keys that must be absent.** Every field of rmcp's
+    // `ServerCapabilities` is `skip_serializing_if = "Option::is_none"` and `get_info`'s
+    // capabilities reach the wire unaltered (`negotiate_initialize` rewrites `protocolVersion`
+    // and nothing else), so what this server advertises is exactly what `get_info` builds — one
+    // key today. Naming the absent ones cannot catch a capability nobody here has heard of, and
+    // that is the shape the next one arrives in: `ServerCapabilities` is `#[non_exhaustive]`, and
+    // tasks (`io.modelcontextprotocol/tasks`, SEP-2663) would appear as `extensions` under the
+    // SEP rmcp implements but as a first-class `tasks` field if rmcp follows the reference
+    // TypeScript SDK, which still spells it that way (`FOLLOWUPS.md` item 8). What this replaced —
+    // four names plus an `extensions`-is-null check — covered the first of those two routes and
+    // would have passed the second in silence. A key set covers both, and the one after them.
+    let advertised: std::collections::BTreeSet<&str> = capabilities
+        .as_object()
+        .expect("`capabilities` must be a JSON object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    assert_eq!(
+        advertised,
+        std::collections::BTreeSet::from(["tools"]),
+        "this server implements tools and no other capability, so `tools` is the whole of what it \
+         may advertise — anything else here is a door clients will open onto a method_not_found. \
+         If an SDK bump switched one on, implement it or suppress it rather than shipping the \
+         advertisement: {capabilities}"
     );
+
+    // And the behaviour agreeing with the advertisement, for the extension most likely to arrive
+    // first. Deliberately a second assertion rather than a consequence of the one above: rmcp
+    // ships the whole server-side task runtime, so `tasks/get` answering is one `enable_tasks()`
+    // away and would not need a capability key to be wrong about.
     let tasks = server.request("tasks/get", json!({ "taskId": "nope" }), STEP);
     assert_eq!(
         tasks["error"]["code"], -32601,
