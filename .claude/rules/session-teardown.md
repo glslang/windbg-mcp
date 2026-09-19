@@ -7,6 +7,14 @@ paths:
 
 ## What ending a session does to its target (`FOLLOWUPS.md` item 51)
 
+**The hypervisor-development branch uses a candidate quit path, not the old GO/active-EndSession
+sequence.** Checked breakpoint removal, the engine's fixed `qd`, a no-target postcondition, then
+passive session cleanup. Explicit teardown and owning-engine drop share it. Local regressions do
+not establish live kernel resume; `docs/hypervisor-debugging.md` records the blocked live validation.
+Do not equate successful `SetExecutionStatus(GO)` with execution or add an infinite event wait to
+teardown. The change belongs in dbgscope's typed `end_session`, never a raw-command workaround in
+this server. Repoint the feature-branch dependency to dbgscope main before merging, and re-test.
+
 **Three different things, and which one is decided by the opener rather than by the target type.**
 A dump or a trace is closed. A live kernel is resumed and actively detached. A process
 `attach_process` attached to is actively detached and **left running**; one `launch` created is

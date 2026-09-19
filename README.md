@@ -28,6 +28,7 @@ This file is the map. Each topic is one document, and each document is the whole
 | [The tool surface](docs/tool-surface.md) | Serving fewer tools with `--tools`, what a typed operand may contain, and how the control-flow and TTD tools behave |
 | [Sessions and session handles](docs/sessions.md) | `session_id` routing, the four-session cap, `interrupt`, progress notifications, and recovering a parked attach |
 | [Kernel connection profiles](docs/kernel-profiles.md) | Keeping a KDNET debug key out of tool arguments and out of the client's transcript |
+| [Hypervisor debugging](docs/hypervisor-debugging.md) | Attach to the Microsoft hypervisor through KDNET, with target identity, limitations, and a separate live test |
 | [Structured results](docs/structured-results.md) | Which tools answer with `structuredContent`, what each carries, and the error categories a caller can branch on |
 | [Transactional batches](docs/debug-batch.md) | `debug_batch`: a mutating sequence whose cleanup runs on every path, including a timeout or a disconnect |
 | [Walking a structure](docs/walk-memory.md) | `walk_memory`: lists, arrays and chains where an unreadable node is a row rather than the end of the walk |

@@ -2,12 +2,12 @@
   "tools": [
     {
       "annotations": 123,
-      "description": 1043,
+      "description": 1245,
       "inputSchema": 904,
-      "modelVisible": 2001,
+      "modelVisible": 2203,
       "name": "attach_kernel",
-      "outputSchema": 3937,
-      "wire": 6092
+      "outputSchema": 4078,
+      "wire": 6435
     },
     {
       "annotations": 122,
@@ -15,8 +15,8 @@
       "inputSchema": 33,
       "modelVisible": 330,
       "name": "attach_kernel_local",
-      "outputSchema": 3937,
-      "wire": 4420
+      "outputSchema": 4078,
+      "wire": 4561
     },
     {
       "annotations": 117,
@@ -24,8 +24,8 @@
       "inputSchema": 204,
       "modelVisible": 547,
       "name": "attach_process",
-      "outputSchema": 3937,
-      "wire": 4632
+      "outputSchema": 4078,
+      "wire": 4773
     },
     {
       "annotations": 68,
@@ -303,8 +303,8 @@
       "inputSchema": 229,
       "modelVisible": 586,
       "name": "launch",
-      "outputSchema": 3937,
-      "wire": 4683
+      "outputSchema": 4078,
+      "wire": 4824
     },
     {
       "annotations": 65,
@@ -321,8 +321,8 @@
       "inputSchema": 211,
       "modelVisible": 718,
       "name": "open_dump",
-      "outputSchema": 3937,
-      "wire": 4814
+      "outputSchema": 4078,
+      "wire": 4955
     },
     {
       "annotations": 114,
@@ -330,8 +330,8 @@
       "inputSchema": 211,
       "modelVisible": 534,
       "name": "open_trace",
-      "outputSchema": 3937,
-      "wire": 4616
+      "outputSchema": 4078,
+      "wire": 4757
     },
     {
       "annotations": 123,
@@ -552,14 +552,14 @@
   ],
   "totals": {
     "annotations": 6440,
-    "description": 35079,
+    "description": 35281,
     "inputSchema": 53503,
     "instructions": 1983,
-    "modelVisible": 91790,
-    "outputSchema": 150896,
-    "payload": 250849,
+    "modelVisible": 91992,
+    "outputSchema": 151742,
+    "payload": 251897,
     "tools": 61,
-    "wire": 250777,
+    "wire": 251825,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- Microsoft hypervisor KDNET workflow through the existing `attach_kernel` tool. Attach summaries
+  distinguish known Windows and hypervisor kernel images with `kernel_target`, and hypervisor
+  summaries warn about NT-only inspection and the scope of a hypervisor halt. Includes a separate
+  opt-in live hypervisor smoke test and [runbook](docs/hypervisor-debugging.md).
+
+### Changed
+
+- Experimental live-kernel teardown uses dbgscope's guarded quit-and-detach path before passive
+  cleanup, checks breakpoint-removal errors, and requires the engine to release its target before
+  reporting resume. Local regressions pass; live NT/hypervisor validation is still pending.
+
 ## [0.18.0] - 2026-09-17
 
 ### Fixed
