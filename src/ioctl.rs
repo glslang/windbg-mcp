@@ -570,9 +570,10 @@ pub(crate) fn jump_targets(
     layout: Layout,
     read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
     in_image: impl Fn(u64) -> bool,
+    is_constant: impl Fn(u64) -> bool,
     halt: impl FnMut() -> Option<Halt>,
 ) -> (Vec<(u64, Vec<u64>)>, Option<Halt>) {
-    let found = map(entry, block, layout, read, in_image, halt);
+    let found = map(entry, block, layout, read, in_image, is_constant, halt);
     if let Some(why) = found.halted {
         return (Vec::new(), Some(why));
     }
@@ -657,11 +658,11 @@ fn with_pool_immediates<'a>(
     block: &'a [Instruction],
     layout: Layout,
     read: &mut impl FnMut(u64, usize) -> Option<Vec<u8>>,
-    in_image: &impl Fn(u64) -> bool,
+    is_constant: &impl Fn(u64) -> bool,
     halt: &mut impl FnMut() -> Option<Halt>,
-) -> Cow<'a, [Instruction]> {
+) -> (Cow<'a, [Instruction]>, Option<Halt>) {
     if !layout.literal_pool {
-        return Cow::Borrowed(block);
+        return (Cow::Borrowed(block), None);
     }
     // **Attempted, not resolved.** Keyed on every address asked about rather than on the ones that
     // answered, because a dump missing the page a pool sits on, or one malformed literal repeated
@@ -670,6 +671,7 @@ fn with_pool_immediates<'a>(
     // recoverable codes disappear for want of a slot.
     let mut asked: HashMap<u64, Option<u32>> = HashMap::new();
     let mut reads = 0usize;
+    let mut stopped = None;
     for instruction in block {
         let Some(address) = pool_load(layout, instruction) else {
             continue;
@@ -681,17 +683,17 @@ fn with_pool_immediates<'a>(
         // access and nothing more; it can legally address writable module storage, and folding that
         // would publish whatever the driver last wrote there as a control code or a refusal status
         // -- the false positive the per-target gate exists to avoid, arriving by another door.
-        // `in_image` is this module's existing answer to "is this address code in this driver",
-        // computed from the image's own **executable** sections, and a writable data section is not
-        // one of them.
         //
-        // It is sufficient rather than merely conservative, and the encoding is why: the
-        // displacement is a signed 19-bit word offset, so a literal load reaches **±1 MB** of its
-        // own address. A compiler therefore emits the pool inline among the functions that read it
-        // -- it cannot reach a distant `.rdata` -- which is exactly where `in_image` says yes. A
-        // pool that somehow sits outside is left as the load it was, which costs a code rather than
-        // inventing one.
-        if !in_image(address) {
+        // So the question is **storage class**: readable image memory the driver cannot write. That
+        // is `.text` and `.rdata` and not `.data`, and it is deliberately *not* `in_image`, which
+        // answers "is this address **code**" for a jump-table entry. Gating on that was the first
+        // attempt and was wrong in the other direction: it argued from the encoding's ±1 MB reach
+        // that a compiler must put the pool among the functions reading it, which confuses distance
+        // with permissions -- `.rdata` ordinarily sits within a megabyte of `.text`, so a
+        // legitimate pool there was refused without being read and the code it held stayed lost.
+        // Widening `in_image` instead is not available: a jump-table entry landing in `.rdata` is
+        // data published as a case, which is the failure that predicate exists for.
+        if !is_constant(address) {
             asked.insert(address, None);
             continue;
         }
@@ -701,7 +703,16 @@ fn with_pool_immediates<'a>(
         // Polled **between reads**, not once before them. Each is an engine round trip -- tens of
         // milliseconds over KD -- so a routine with many literals could otherwise spend seconds on
         // them after its caller had gone, before `map_within` reached its own first poll.
-        if halt().is_some() {
+        //
+        // **And the reason it is returned rather than merely obeyed: the poll consumes it.**
+        // `DebugEngine::interrupted` is `GetInterrupt`, which clears the pending flag -- the worker
+        // calls it elsewhere precisely to drain one. So a break seen here is a break `map_within`'s
+        // own polls will never see, and breaking the loop without carrying the reason out left
+        // `Map::halted` and the structured `stopped` field unset: an answer cut short by a Ctrl+Break
+        // reported as a complete one. Raised on review of #351, against the poll added one commit
+        // earlier for the other half of this.
+        if let Some(why) = halt() {
+            stopped = Some(why);
             break;
         }
         reads += 1;
@@ -714,7 +725,7 @@ fn with_pool_immediates<'a>(
         asked.insert(address, value);
     }
     if asked.values().all(Option::is_none) {
-        return Cow::Borrowed(block);
+        return (Cow::Borrowed(block), stopped);
     }
     let mut out = block.to_vec();
     for instruction in &mut out {
@@ -727,7 +738,7 @@ fn with_pool_immediates<'a>(
             *operand = Operand::Immediate(u64::from(*value));
         }
     }
-    Cow::Owned(out)
+    (Cow::Owned(out), stopped)
 }
 
 pub(crate) fn map(
@@ -736,9 +747,19 @@ pub(crate) fn map(
     layout: Layout,
     read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
     in_image: impl Fn(u64) -> bool,
+    is_constant: impl Fn(u64) -> bool,
     halt: impl FnMut() -> Option<Halt>,
 ) -> Map {
-    map_within(dispatch, block, layout, read, in_image, halt, MAX_SWEEPS)
+    map_within(
+        dispatch,
+        block,
+        layout,
+        read,
+        in_image,
+        is_constant,
+        halt,
+        MAX_SWEEPS,
+    )
 }
 
 /// The same with the sweep budget named, which is how the state **at** that bound is asserted: a
@@ -751,6 +772,7 @@ fn map_within(
     layout: Layout,
     mut read: impl FnMut(u64, usize) -> Option<Vec<u8>>,
     in_image: impl Fn(u64) -> bool,
+    is_constant: impl Fn(u64) -> bool,
     mut halt: impl FnMut() -> Option<Halt>,
     sweeps: usize,
 ) -> Map {
@@ -758,7 +780,8 @@ fn map_within(
     // cannot encode as a PC-relative load, and resolving those here is what lets the sweeps and the
     // recording pass agree about the value -- see [`with_pool_immediates`]. Borrowed unchanged on a
     // target that has no literal pool, so nothing about x64 or x86 moves.
-    let listing = with_pool_immediates(block, layout, &mut read, &in_image, &mut halt);
+    let (listing, pool_halt) =
+        with_pool_immediates(block, layout, &mut read, &is_constant, &mut halt);
     let block: &[Instruction] = &listing;
     let graph = cfg::graph(block);
     let index_of: HashMap<u64, usize> = block
@@ -767,7 +790,11 @@ fn map_within(
         .map(|(index, instruction)| (instruction.address, index))
         .collect();
 
-    let mut halted = None;
+    // Seeded from the pool phase, because its poll **consumed** the break it saw and no later one
+    // can find it. Everything below reads this the way it reads its own polls: the sweeps stop and
+    // the recording pass refuses to start, so a halted walk reports nothing rather than reporting
+    // from where it got to.
+    let mut halted = pool_halt;
     let mut cap_hit = false;
 
     // The facts on the way **into** each block, which is what the sweeps below settle.
@@ -788,6 +815,13 @@ fn map_within(
     for sweep in 0.. {
         if sweep >= sweeps {
             unsettled = true;
+            break;
+        }
+        // Already stopped, by this loop's own poll on an earlier sweep or by the pool phase before
+        // it. Checked as well as polled, because the poll is consuming: a break the pool phase drained
+        // is one `halt()` will answer `None` for, and a sweep budget spent after it is work done for
+        // a caller who has gone.
+        if halted.is_some() {
             break;
         }
         // Polled per sweep rather than per instruction: a sweep is the unit of work here, and a
@@ -4173,6 +4207,21 @@ mod tests {
     const IMAGE_BASE: u64 = 0xfffff803_3e250000;
     const IMAGE_SIZE: u64 = 0x0010_0000;
 
+    /// Readable image memory the driver cannot write -- `.text` and `.rdata` -- which is what a
+    /// literal pool has to sit in.
+    ///
+    /// Deliberately **wider** than [`in_image`] and asked for a different reason: that one answers
+    /// "is this address code in this driver", for a jump-table entry, and a pool is data. The
+    /// fixtures have no section table, so this is the whole fixture image plus a writable window
+    /// carved out of it -- enough to state both halves of the rule.
+    fn constant_data(address: u64) -> bool {
+        (IMAGE_BASE..IMAGE_BASE + IMAGE_SIZE).contains(&address) && !WRITABLE.contains(&address)
+    }
+
+    /// A `.data`-like window inside the fixture image: readable, and writable, so nothing in it is a
+    /// constant however it is addressed.
+    const WRITABLE: std::ops::Range<u64> = (IMAGE_BASE + 0x9_0000)..(IMAGE_BASE + 0xa_0000);
+
     fn in_image(address: u64) -> bool {
         (IMAGE_BASE..IMAGE_BASE + IMAGE_SIZE).contains(&address)
     }
@@ -4232,7 +4281,15 @@ mod tests {
             insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.code_proved, "the chain from the IRP was followed");
         assert_eq!(
@@ -4365,6 +4422,7 @@ mod tests {
             Layout::ARM64,
             pool_reader(POOL, 0x0022_203b, &served),
             in_image,
+            constant_data,
             never,
         );
 
@@ -4451,6 +4509,7 @@ mod tests {
             Layout::ARM64,
             pool_reader(POOL, 0xc000_000d, &served),
             in_image,
+            constant_data,
             never,
         );
 
@@ -4512,6 +4571,7 @@ mod tests {
             Layout::X64,
             pool_reader(GLOBAL, 0x0022_203b, &served),
             in_image,
+            constant_data,
             never,
         );
 
@@ -4570,7 +4630,15 @@ mod tests {
             insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.cases.is_empty(),
@@ -4601,6 +4669,7 @@ mod tests {
             Layout::ARM64,
             pool_reader(POOL, 0x0022_203b, &served),
             in_image,
+            constant_data,
             never,
         );
 
@@ -4630,6 +4699,7 @@ mod tests {
             Layout::ARM64,
             pool_reader(POOL, 0x0022_203b, &served),
             in_image,
+            constant_data,
             never,
         );
 
@@ -4637,37 +4707,81 @@ mod tests {
         assert!(found.cases.is_empty(), "{:?}", found.cases);
     }
 
-    /// **A literal outside the image's executable sections is not folded.**
+    /// **A pool in read-only data is folded, even though it is not code.**
     ///
-    /// A base-less `ldr` is a PC-relative access and nothing more: the operand's shape does not
-    /// prove the location is constant, and it can legally address writable module storage. Folding
-    /// that would publish whatever the driver last wrote there as a control code -- the false
-    /// positive `Layout::literal_pool` exists to avoid, arriving by another door. Raised on review
-    /// of #351.
+    /// The finding this pins: the first gate was `in_image`, the predicate that answers whether an
+    /// address is **code** in this driver, and a legitimate `.rdata` pool was therefore refused
+    /// without being read -- so the control code it held stayed lost, which is the whole of what
+    /// item 82 was for. The argument for that gate was the literal load's ±1 MB reach, and it
+    /// confuses distance with permissions: `.rdata` ordinarily sits well within a megabyte of
+    /// `.text`.
     ///
-    /// The gate is `in_image`, this module's existing "is this address code in this driver",
-    /// computed from the image's own executable sections. Sufficient rather than merely
-    /// conservative: a literal load's displacement is a signed 19-bit word offset, so it reaches
-    /// ±1 MB and a compiler must put the pool among the functions that read it.
+    /// So the two predicates are made to **disagree** here, which is the only way to state the rule:
+    /// `in_image` excludes the pool address and `constant_data` admits it. A test where both cover
+    /// the whole fixture image cannot tell which one the fold consults.
     #[test]
-    fn an_arm64_literal_outside_the_executable_sections_is_not_folded() {
-        // Past `IMAGE_SIZE`, so `in_image` says no -- which is what a writable data section, or
-        // another module, answers too.
-        const OUTSIDE: u64 = IMAGE_BASE + IMAGE_SIZE + 0x100;
+    fn an_arm64_literal_pool_in_read_only_data_is_folded() {
+        // Past the window `only_text` admits, so "not code" -- and inside the image and outside
+        // `WRITABLE`, so "constant". That is `.rdata`.
+        const POOL: u64 = IMAGE_BASE + 0x8_7824;
+        fn only_text(address: u64) -> bool {
+            (IMAGE_BASE..IMAGE_BASE + 0x8_0000).contains(&address)
+        }
+        assert!(
+            !only_text(POOL) && constant_data(POOL),
+            "the fixture has to make the two predicates disagree, or it tests nothing"
+        );
+
         let served = std::cell::Cell::new(0usize);
         let found = map(
             DISPATCH,
-            &literal_compare("ldr", vec![reg("w10"), literal(OUTSIDE, DISPATCH + 8)]),
+            &literal_compare("ldr", vec![reg("w10"), literal(POOL, DISPATCH + 8)]),
             Layout::ARM64,
-            pool_reader(OUTSIDE, 0x0022_203b, &served),
+            pool_reader(POOL, 0x0022_203b, &served),
+            only_text,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(served.get(), 1, "the pool was read");
+        assert_eq!(
+            found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
+            vec![0x0022_203b],
+            "and the code it held is a case: {:?}",
+            found.cases
+        );
+    }
+
+    /// **And a literal in writable storage is not folded**, which is the other half of the same rule
+    /// and the reason the gate exists at all.
+    ///
+    /// A base-less `ldr` proves only that the address is PC-relative; it can legally name module
+    /// memory the driver writes. Folded, whatever was last written there becomes a control code the
+    /// driver is reported to accept -- a value invented from runtime state, which is the class of
+    /// wrong answer this module is arranged against. Raised on review of #351.
+    #[test]
+    fn an_arm64_literal_in_writable_storage_is_not_folded() {
+        const MUTABLE: u64 = IMAGE_BASE + 0x9_0100;
+        assert!(
+            WRITABLE.contains(&MUTABLE) && !constant_data(MUTABLE),
+            "the fixture's writable window has to contain this"
+        );
+
+        let served = std::cell::Cell::new(0usize);
+        let found = map(
+            DISPATCH,
+            &literal_compare("ldr", vec![reg("w10"), literal(MUTABLE, DISPATCH + 8)]),
+            Layout::ARM64,
+            pool_reader(MUTABLE, 0x0022_203b, &served),
             in_image,
+            constant_data,
             never,
         );
 
         assert_eq!(
             served.get(),
             0,
-            "an address outside the executable sections must not even be read"
+            "writable storage must not even be read for a constant"
         );
         assert!(
             found.cases.is_empty(),
@@ -4709,7 +4823,15 @@ mod tests {
         ));
         block.push(insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return));
 
-        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             served.get(),
@@ -4762,7 +4884,15 @@ mod tests {
             insn(DISPATCH + 0x10, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.cases.is_empty(),
@@ -4823,7 +4953,15 @@ mod tests {
             ];
             block.push(terminator);
             block.push(insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return));
-            map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::ARM64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         // `cbz w9,handler` -- the register is zero exactly when the code was `0x222003`.
@@ -4934,6 +5072,7 @@ mod tests {
             Layout::ARM64,
             unreadable,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -5035,7 +5174,15 @@ mod tests {
             }
             block.push(insn(DISPATCH + 0x4c, "ret", Vec::new(), Flow::Return));
 
-            let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::ARM64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             assert_eq!(found.cases[0].code, 0x222003, "{:?}", found.cases);
             found.cases[0].accepted
@@ -5075,7 +5222,15 @@ mod tests {
             insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.code_proved, "the chain from the IRP was followed");
         assert_eq!(
@@ -5130,7 +5285,15 @@ mod tests {
             insn(DISPATCH + 0x100, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -5181,7 +5344,15 @@ mod tests {
             ),
             insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
         ]);
-        let found = map(DISPATCH, &above, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &above,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert!(
             found.cases.is_empty(),
             "a code the branch just ruled out is not a case: {:?}",
@@ -5214,7 +5385,15 @@ mod tests {
             ),
             insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
         ]);
-        let found = map(DISPATCH, &below, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &below,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert!(
             found.cases.is_empty(),
             "below the compare, an equality against it cannot hold either: {:?}",
@@ -5234,7 +5413,15 @@ mod tests {
             insn(DISPATCH + 0x14, "je", Vec::new(), Flow::Branch(Some(0x980))),
             insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
         ]);
-        let found = map(DISPATCH, &equal, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &equal,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found
                 .cases
@@ -5282,7 +5469,15 @@ mod tests {
             ),
             insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
         ]);
-        let found = map(DISPATCH, &taken, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &taken,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found
                 .cases
@@ -5313,7 +5508,15 @@ mod tests {
             insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
             insn(DISPATCH + 0x100, "ret", Vec::new(), Flow::Return),
         ]);
-        let found = map(DISPATCH, &fallen, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &fallen,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert!(
             found.cases.is_empty(),
             "above the compare, an equality against it cannot hold: {:?}",
@@ -5365,7 +5568,15 @@ mod tests {
                 ),
                 insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         // A subtraction leaves `CF=0`, so `jae` is taken and the case is at its target.
@@ -5433,11 +5644,19 @@ mod tests {
                 ),
                 insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
-                .cases
-                .iter()
-                .map(|case| case.lands)
-                .collect::<Vec<_>>()
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
+            .cases
+            .iter()
+            .map(|case| case.lands)
+            .collect::<Vec<_>>()
         };
 
         // `jno` after an ordinary `add`: no overflow, so it is taken and the case is at its target.
@@ -5490,7 +5709,15 @@ mod tests {
                 ),
                 insn(DISPATCH + 0x106, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert_eq!(
@@ -5557,7 +5784,15 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found
                 .cases
@@ -5612,7 +5847,15 @@ mod tests {
             insn(DISPATCH + 0x36, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found
                 .cases
@@ -5696,7 +5939,15 @@ mod tests {
             insn(DISPATCH + 0x66, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         let mut recovered: Vec<_> = found
             .cases
             .iter()
@@ -5777,7 +6028,15 @@ mod tests {
             insn(DISPATCH + 0x34, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -5836,7 +6095,15 @@ mod tests {
             insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -5888,7 +6155,15 @@ mod tests {
             insn(DISPATCH + 0x100, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert_eq!(
@@ -5926,7 +6201,15 @@ mod tests {
             insn(DISPATCH + 0xf, "je", Vec::new(), Flow::Branch(Some(0x900))),
             insn(DISPATCH + 0x15, "ret", Vec::new(), Flow::Return),
         ]);
-        let found = map(DISPATCH, &narrow, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &narrow,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert!(
             found.cases.is_empty(),
             "sixteen bits of a `ULONG` is not the code: {:?}",
@@ -5990,7 +6273,15 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found.untracked,
             vec![DISPATCH + 0xb],
@@ -6021,7 +6312,15 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
             vec![0x222003],
@@ -6052,7 +6351,15 @@ mod tests {
             insn(DISPATCH + 0x26, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found
                 .cases
@@ -6092,7 +6399,15 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(found.untracked, vec![DISPATCH + 0xb], "{:?}", found.cases);
     }
 
@@ -6129,7 +6444,15 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert!(found.untracked.is_empty(), "{:?}", found.untracked);
     }
 
@@ -6160,7 +6483,15 @@ mod tests {
                 insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
         let about_with_the_code_first = |mnemonic: &str| {
             let mut block = prologue(DISPATCH);
@@ -6186,7 +6517,15 @@ mod tests {
                 insn(DISPATCH + 0x17, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x1d, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert_eq!(
@@ -6273,7 +6612,15 @@ mod tests {
             "the operand list names no register, which is the whole point: {flag_write:?}"
         );
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found.untracked,
             vec![DISPATCH + 0xb],
@@ -6308,7 +6655,15 @@ mod tests {
             insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.cases.is_empty(),
@@ -6341,7 +6696,15 @@ mod tests {
             insn(DISPATCH + 0xe, "ret", Vec::new(), Flow::Return),
         ];
         direct.dedup_by_key(|one| one.address);
-        let found = map(DISPATCH, &direct, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &direct,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             found.untracked,
             vec![DISPATCH + 4],
@@ -6360,7 +6723,15 @@ mod tests {
             insn(DISPATCH + 0xa, "je", Vec::new(), Flow::Branch(Some(0x900))),
             insn(DISPATCH + 0x10, "ret", Vec::new(), Flow::Return),
         ]);
-        let found = map(DISPATCH, &other, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &other,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         assert!(
             found.untracked.is_empty(),
             "every dispatch routine tests something; only the code's own tests are short lists: \
@@ -6412,7 +6783,15 @@ mod tests {
             insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -6471,7 +6850,15 @@ mod tests {
             insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
@@ -6525,7 +6912,15 @@ mod tests {
             insn(DISPATCH + 0x12, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.untracked.is_empty(),
@@ -6567,7 +6962,15 @@ mod tests {
             insn(DISPATCH + 0x13, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.cases.is_empty(),
@@ -6621,7 +7024,15 @@ mod tests {
             insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -6685,7 +7096,15 @@ mod tests {
             insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         let mut codes: Vec<u32> = found.cases.iter().map(|case| case.code).collect();
         codes.sort_unstable();
@@ -6742,7 +7161,15 @@ mod tests {
             insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found.cases.iter().map(|case| case.code).collect::<Vec<_>>(),
@@ -6810,7 +7237,15 @@ mod tests {
             insn(DISPATCH + 0x29, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found32 = map(DISPATCH, &block32, Layout::X86, unreadable, in_image, never);
+        let found32 = map(
+            DISPATCH,
+            &block32,
+            Layout::X86,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found32
@@ -6900,7 +7335,15 @@ mod tests {
                 .then(|| 0x3000u32.to_le_bytes().to_vec())
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(found.tables.len(), MAX_TABLES, "the table list stops");
         assert_eq!(
@@ -6923,7 +7366,15 @@ mod tests {
             })
             .collect();
 
-        let found = map(DISPATCH, &jumps, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &jumps,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found.unresolved.len(),
@@ -7019,7 +7470,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block(false), Layout::X64, &read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block(false),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -7047,7 +7506,15 @@ mod tests {
         assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
 
         served.set(0);
-        let shifted = map(DISPATCH, &block(true), Layout::X64, &read, in_image, never);
+        let shifted = map(
+            DISPATCH,
+            &block(true),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             shifted.cases.is_empty(),
@@ -7157,7 +7624,15 @@ mod tests {
             _ => None,
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -7236,7 +7711,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.cases.is_empty(),
@@ -7319,7 +7802,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -7412,7 +7903,15 @@ mod tests {
             Some(vec![0u8; len])
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert!(found.tables.is_empty(), "{:?}", found.tables);
@@ -7488,7 +7987,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X86, read, in_image32, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X86,
+            read,
+            in_image32,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -7568,7 +8075,15 @@ mod tests {
             Some(vec![0u8; len])
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert_eq!(found.unresolved, vec![DISPATCH + 0x28]);
@@ -7627,7 +8142,15 @@ mod tests {
                 ),
                 insn(DISPATCH + 0x4c, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             (found.cases[0].accepted, found.cases[0].handler)
         };
@@ -7700,6 +8223,7 @@ mod tests {
             Layout::X64,
             unreadable,
             in_image,
+            constant_data,
             never,
         );
         assert!(
@@ -7715,6 +8239,7 @@ mod tests {
             Layout::X64,
             unreadable,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -7766,6 +8291,7 @@ mod tests {
             Layout::X64,
             unreadable,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -7786,6 +8312,7 @@ mod tests {
             Layout::X64,
             unreadable,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -7876,7 +8403,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -7987,7 +8522,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -8083,7 +8626,15 @@ mod tests {
         let read =
             |at: u64, len: usize| (at == TABLE && len == 4).then(|| vec![0x11, 0xa2, 0xa2, 0x97]);
 
-        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -8150,7 +8701,15 @@ mod tests {
             insn(DISPATCH + 0x18, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::ARM64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
         let report = structured_report(&found, |address| crate::structured::CodeLocation {
             address: crate::structured::addr(address),
             module: None,
@@ -8278,7 +8837,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -8363,7 +8930,15 @@ mod tests {
         // 0xfe: -2 extended to 64 bits, and 0xfffffffe extended only as far as `w8` goes.
         let read = |at: u64, len: usize| (at == TABLE && len == 1).then(|| vec![0xfeu8]);
 
-        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.cases.is_empty(),
@@ -8458,7 +9033,15 @@ mod tests {
             insn(DISPATCH + 0x85, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -8526,7 +9109,15 @@ mod tests {
                 insn(DISPATCH + 0x26, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert!(
@@ -8611,7 +9202,15 @@ mod tests {
             Some(vec![0u8; len])
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert_eq!(found.unresolved, vec![DISPATCH + 0x41]);
@@ -8648,7 +9247,15 @@ mod tests {
                 insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert_eq!(
@@ -8714,7 +9321,15 @@ mod tests {
                 ),
                 insn(DISPATCH + 0x4f, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         let argument = case_block("ecx");
@@ -8809,6 +9424,7 @@ mod tests {
             Layout::X64,
             unreadable,
             in_image,
+            constant_data,
             never,
         );
 
@@ -8826,6 +9442,7 @@ mod tests {
             Layout::X64,
             unreadable,
             in_image,
+            constant_data,
             never,
         );
 
@@ -8950,7 +9567,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -9000,7 +9625,15 @@ mod tests {
                 insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert!(
@@ -9114,6 +9747,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -9130,6 +9764,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -9218,6 +9853,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -9234,6 +9870,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -9338,7 +9975,15 @@ mod tests {
             )
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -9430,7 +10075,15 @@ mod tests {
             })
         };
 
-        let settled = map(DISPATCH, &block, Layout::X64, &read, in_image, never);
+        let settled = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             settled.cases.len(),
             2,
@@ -9439,7 +10092,16 @@ mod tests {
         );
         assert!(!settled.unsettled && settled.unresolved.is_empty());
 
-        let short = map_within(DISPATCH, &block, Layout::X64, &read, in_image, never, 1);
+        let short = map_within(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+            1,
+        );
 
         assert!(short.unsettled, "the walk says the facts never settled");
         assert!(
@@ -9521,10 +10183,18 @@ mod tests {
         }
 
         let polls = std::cell::Cell::new(0usize);
-        let counted = map(DISPATCH, &block, Layout::X64, unreadable, in_image, || {
-            polls.set(polls.get() + 1);
-            None
-        });
+        let counted = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            || {
+                polls.set(polls.get() + 1);
+                None
+            },
+        );
         assert_eq!(counted.cases.len(), 3, "{:?}", counted.cases);
         assert!(
             counted.cases.iter().all(|case| case.handler.is_some()),
@@ -9534,10 +10204,18 @@ mod tests {
         let total = polls.get();
 
         polls.set(0);
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, || {
-            polls.set(polls.get() + 1);
-            (polls.get() >= total).then_some(Halt::Deadline)
-        });
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            || {
+                polls.set(polls.get() + 1);
+                (polls.get() >= total).then_some(Halt::Deadline)
+            },
+        );
 
         assert_eq!(found.halted, Some(Halt::Deadline));
         assert_eq!(
@@ -9652,6 +10330,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -9668,6 +10347,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -9724,7 +10404,15 @@ mod tests {
                 insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         let element = read_with(Some("rcx"));
@@ -9804,7 +10492,15 @@ mod tests {
                 ),
                 insn(at + 0xc, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             (found.cases[0].accepted, found.cases[0].handler)
         };
@@ -9902,7 +10598,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -9962,7 +10666,15 @@ mod tests {
                 insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
             ];
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             (
                 found
                     .cases
@@ -10017,7 +10729,15 @@ mod tests {
                 insn(DISPATCH + 0x11, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x17, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert_eq!(
@@ -10077,7 +10797,15 @@ mod tests {
                 at += 2;
             }
             block.push(insn(at, "ret", Vec::new(), Flow::Return));
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             found.cases[0].accepted
         };
@@ -10126,7 +10854,15 @@ mod tests {
             insn(TAIL, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
         assert_eq!(
@@ -10201,7 +10937,15 @@ mod tests {
                 ),
                 insn(DISPATCH + 0x65, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             found.cases[0].in_size.map(|size| (size.value, size.exact))
         };
@@ -10313,7 +11057,15 @@ mod tests {
             }
         };
 
-        let whole = map(DISPATCH, &block, Layout::X64, served(3), in_image, never);
+        let whole = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            served(3),
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(
             whole.cases.len(),
             3,
@@ -10321,7 +11073,15 @@ mod tests {
             whole.cases
         );
 
-        let short = map(DISPATCH, &block, Layout::X64, served(2), in_image, never);
+        let short = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            served(2),
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             short.cases.is_empty(),
@@ -10426,6 +11186,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(straight.cases.len(), 2, "{:?}", straight.cases);
@@ -10437,6 +11198,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -10535,6 +11297,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -10551,6 +11314,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -10626,7 +11390,15 @@ mod tests {
                 ),
                 insn(DISPATCH + 0x4e, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             (found.cases[0].accepted, found.cases[0].handler)
         };
@@ -10715,11 +11487,27 @@ mod tests {
             })
         };
 
-        let whole = map(DISPATCH, &based("rcx"), Layout::X64, &read, in_image, never);
+        let whole = map(
+            DISPATCH,
+            &based("rcx"),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(whole.cases.len(), 2, "{:?}", whole.cases);
 
         served.set(0);
-        let narrow = map(DISPATCH, &based("ecx"), Layout::X64, &read, in_image, never);
+        let narrow = map(
+            DISPATCH,
+            &based("ecx"),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             narrow.cases.is_empty(),
@@ -10819,6 +11607,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -10835,6 +11624,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -10935,6 +11725,7 @@ mod tests {
                 Layout::X64,
                 &read,
                 in_image,
+                constant_data,
                 never
             )
             .cases
@@ -10942,7 +11733,15 @@ mod tests {
             2,
             "one fold is the switch"
         );
-        let twice = map(DISPATCH, &folded(true), Layout::X64, &read, in_image, never);
+        let twice = map(
+            DISPATCH,
+            &folded(true),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
         assert!(
             twice.cases.is_empty(),
             "and two is a target this did not compute: {:?}",
@@ -11047,7 +11846,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -11153,7 +11960,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -11264,6 +12079,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(straight.cases.len(), 2, "{:?}", straight.cases);
@@ -11275,6 +12091,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -11386,6 +12203,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -11408,6 +12226,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -11446,6 +12265,7 @@ mod tests {
             Layout::X64,
             unreadable,
             in_image,
+            constant_data,
             never,
             0,
         );
@@ -11541,7 +12361,15 @@ mod tests {
             insn(SHARED + 0xc, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         let case = found
             .cases
@@ -11594,7 +12422,15 @@ mod tests {
                 insn(DISPATCH + 0x45, mnemonic, operands, Flow::Fallthrough),
                 insn(DISPATCH + 0x4b, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             found.cases[0].accepted
         };
@@ -11684,7 +12520,15 @@ mod tests {
             })
         };
 
-        let within = map(DISPATCH, &admitting(1), Layout::X64, &read, in_image, never);
+        let within = map(
+            DISPATCH,
+            &admitting(1),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
         assert_eq!(within.cases.len(), 2, "{:?}", within.cases);
         assert!(!within.cap_hit, "nothing here reached a bound");
 
@@ -11694,6 +12538,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
 
@@ -11825,6 +12670,7 @@ mod tests {
             Layout::X64,
             &read,
             in_image,
+            constant_data,
             never,
         );
         assert_eq!(
@@ -11834,7 +12680,15 @@ mod tests {
             once.cases
         );
 
-        let twice = map(DISPATCH, &staged(true), Layout::X64, &read, in_image, never);
+        let twice = map(
+            DISPATCH,
+            &staged(true),
+            Layout::X64,
+            &read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             twice.cases.is_empty(),
@@ -11907,7 +12761,15 @@ mod tests {
                 ),
                 insn(at + 0xe, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             (found.cases[0].accepted, found.cases[0].handler)
         };
@@ -12001,7 +12863,15 @@ mod tests {
                 ),
                 insn(COMPLETE + 7, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             let case = found
                 .cases
                 .iter()
@@ -12098,7 +12968,15 @@ mod tests {
                 ));
             }
             block.push(insn(DISPATCH + 0x4a, "ret", Vec::new(), Flow::Return));
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             (found.cases[0].accepted, found.cases[0].handler)
         };
@@ -12186,7 +13064,15 @@ mod tests {
                 )),
             }
             block.push(insn(DISPATCH + 0x4d, "ret", Vec::new(), Flow::Return));
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             (found.cases[0].accepted, found.cases[0].handler)
         };
@@ -12255,7 +13141,15 @@ mod tests {
                 ),
                 insn(SHARED, "ret", Vec::new(), Flow::Return),
             ]);
-            let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
             (found.cases[0].accepted, found.cases[0].handler)
         };
@@ -12384,7 +13278,15 @@ mod tests {
                         .collect()
                 })
             };
-            let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+            let found = map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                read,
+                in_image,
+                constant_data,
+                never,
+            );
             assert_eq!(found.cases.len(), 2, "{:?}", found.cases);
             found
                 .cases
@@ -12441,7 +13343,15 @@ mod tests {
                 insn(DISPATCH + 0x13, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x19, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert_eq!(
@@ -12530,7 +13440,15 @@ mod tests {
             Some(vec![0u8; len])
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert_eq!(found.unresolved, vec![DISPATCH + 0x2d]);
@@ -12563,7 +13481,15 @@ mod tests {
             insn(DISPATCH + 0x19, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             found.cases.is_empty(),
@@ -12631,7 +13557,15 @@ mod tests {
             insn(DISPATCH + 0x2a, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::X86, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X86,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
         assert_eq!(
@@ -12665,7 +13599,15 @@ mod tests {
                 insn(DISPATCH + 0xe, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x14, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert!(
@@ -12710,7 +13652,15 @@ mod tests {
                 insn(DISPATCH + 0x14, "je", Vec::new(), Flow::Branch(Some(0x900))),
                 insn(DISPATCH + 0x1a, "ret", Vec::new(), Flow::Return),
             ]);
-            map(DISPATCH, &block, Layout::X64, unreadable, in_image, never)
+            map(
+                DISPATCH,
+                &block,
+                Layout::X64,
+                unreadable,
+                in_image,
+                constant_data,
+                never,
+            )
         };
 
         assert!(
@@ -12798,7 +13748,15 @@ mod tests {
             })
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -12836,7 +13794,15 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
         assert_eq!(
@@ -12882,7 +13848,15 @@ mod tests {
             insn(DISPATCH + 0x22, "jmp", vec![reg("rax")], Flow::Jmp(None)),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert_eq!(found.unresolved, vec![DISPATCH + 0x22]);
@@ -12945,7 +13919,15 @@ mod tests {
             Some(vec![0u8; len])
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(found.cases.is_empty(), "{:?}", found.cases);
         assert!(found.tables.is_empty(), "{:?}", found.tables);
@@ -12977,7 +13959,15 @@ mod tests {
             insn(DISPATCH + 0x10, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(found.cases.len(), 1, "{:?}", found.cases);
         assert_eq!(found.cases[0].code, 0x222003);
@@ -13104,7 +14094,15 @@ mod tests {
             insn(DISPATCH + 0xd5, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -13175,7 +14173,15 @@ mod tests {
             insn(DISPATCH + 0x65, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -13231,7 +14237,15 @@ mod tests {
             insn(DISPATCH + 0x15, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::X86, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X86,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -13245,7 +14259,15 @@ mod tests {
         );
         assert!(!found.code_proved, "the IRP is on the stack on x86");
 
-        let wrong = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let wrong = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert!(
             wrong.cases.is_empty(),
@@ -13318,9 +14340,33 @@ mod tests {
             block
         };
 
-        let inclusive = map(DISPATCH, &switch("ja"), Layout::X64, read, in_image, never);
-        let exclusive = map(DISPATCH, &switch("jae"), Layout::X64, read, in_image, never);
-        let signed = map(DISPATCH, &switch("jg"), Layout::X64, read, in_image, never);
+        let inclusive = map(
+            DISPATCH,
+            &switch("ja"),
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
+        let exclusive = map(
+            DISPATCH,
+            &switch("jae"),
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
+        let signed = map(
+            DISPATCH,
+            &switch("jg"),
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(inclusive.cases.len(), 4, "0..=3: {:?}", inclusive.cases);
         assert_eq!(exclusive.cases.len(), 3, "0..3: {:?}", exclusive.cases);
@@ -13359,7 +14405,15 @@ mod tests {
             insn(DISPATCH + 0x21, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(found.blind, 1, "the barrier is a hole in the answer");
         assert!(
@@ -13414,7 +14468,15 @@ mod tests {
             insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
         ];
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -13514,7 +14576,15 @@ mod tests {
             insn(DISPATCH + 0x8d, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -13596,7 +14666,15 @@ mod tests {
             ),
         ]);
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(
             found
@@ -13631,7 +14709,15 @@ mod tests {
             at += 12;
         }
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(found.cases.len(), MAX_CASES, "the list stops");
         assert_eq!(
@@ -13667,7 +14753,15 @@ mod tests {
             insn(at + 0x10, "ret", Vec::new(), Flow::Return),
         ]);
 
-        let mixed = map(DISPATCH, &block, Layout::X64, unreadable, in_image, never);
+        let mixed = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
 
         assert_eq!(mixed.cases.len(), MAX_CASES);
         assert_eq!(mixed.case_count, MAX_CASES + 17);
@@ -13707,7 +14801,15 @@ mod tests {
             (polls > 1).then_some(Halt::Deadline)
         };
 
-        let found = map(DISPATCH, &block, Layout::X64, unreadable, in_image, halt);
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            unreadable,
+            in_image,
+            constant_data,
+            halt,
+        );
 
         assert_eq!(found.halted, Some(Halt::Deadline));
         assert!(

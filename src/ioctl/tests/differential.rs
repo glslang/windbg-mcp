@@ -724,7 +724,15 @@ fn every_case_the_map_reports_is_one_the_machine_produces() {
             })
         };
 
-        let found = map(DISPATCH, &built.listing, Layout::X64, read, in_image, never);
+        let found = map(
+            DISPATCH,
+            &built.listing,
+            Layout::X64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
 
         tables += found.tables.len();
         for case in &found.cases {
