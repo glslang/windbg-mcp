@@ -1136,6 +1136,22 @@ pub(crate) fn reachability(
             true => {
                 // Once per function, and only now. The tables are the same whichever address the
                 // walk starts from, so the second walk uses the start the first settled on.
+                //
+                // **Including when that start is inside the function, which review raised as an
+                // unsound `REACHABLE`.** The resolver propagates from the listing's *entry* while
+                // this walk may have begun past a prologue, so the worry is a table admitted from
+                // state the skipped path established. The propagation is a **meet**:
+                // `ioctl::Facts::join` keeps a register's value, and keeps a bounds check at all,
+                // only where every path into a block agrees. So the facts at a jump site are the
+                // meet over all entry-to-site paths -- and the paths a scoped start can take are a
+                // subset of those. A meet over more paths drops facts rather than inventing them,
+                // and `follow_table` refuses without them: it can return a shorter table or none,
+                // never a larger `bound.limit` or a base no path establishes. A block the entry
+                // cannot reach is never simulated and contributes nothing at all. Entry-derived
+                // tables are therefore a subset of what a start-scoped propagation would find,
+                // which is the direction this walk is allowed to be wrong in. Declining them for a
+                // scoped start -- the remedy offered with the finding -- would drop real edges to
+                // close a hole that is not there.
                 let tables = resolve_jump(&block);
                 // **Merged here rather than polled for.** The resolver's interrupt poll consumes
                 // what it sees, so a halt inside it is one `halt()` will never answer -- and a bound
@@ -3408,6 +3424,75 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             !missed.verdict_reachable,
             "execution cannot arrive mid-instruction, so this function is not entered from here: \
              {missed:?}"
+        );
+    }
+
+    /// The other half of the rule above, which is the half nothing pinned: a discovered edge that
+    /// *is* a boundary is still entered **at its own address**, and a case block inside another
+    /// function is the shape that distinguishes the three possible answers.
+    ///
+    /// The commit that pruned non-boundary edges claims "nothing legitimate is lost", and that is
+    /// a hypothesis rather than a property (`.claude/rules/measurement-provenance.md`). Its
+    /// control case calls a function's **entry**, where entering at the edge and falling back to
+    /// the entry are the same address and the assertion cannot tell a correct rule from one
+    /// pruning too widely. Here they differ: entering at `0x2008` reaches the goal, entering at
+    /// the entry `0x2000` does not, and pruning the edge reaches nothing. So the over-broad
+    /// version of that rule -- drop any discovered edge that is not a function entry -- fails
+    /// this, and the entry-fallback it replaced fails it too.
+    #[test]
+    fn a_discovered_edge_onto_a_boundary_is_entered_there_and_not_at_the_entry() {
+        // Two blocks in one listing with no flow between them: entering at the entry returns
+        // before reaching the second, so only an edge landing on `0x2008` gets to `0x200c`.
+        let callee = uf_fn(
+            0x2000,
+            vec![
+                insn(0x2004, Flow::Return, "ret"),
+                insn(0x2008, Flow::Fallthrough, "nop"),
+                insn(0x200c, Flow::Return, "ret"),
+            ],
+        );
+        // The seed's indirect jump, which only the resolver can answer.
+        let dispatch = uf_fn(0x1000, vec![insn(0x1004, Flow::Jmp(None), "jmp rax")]);
+        // `uf` answers with the containing function whichever address inside it is asked for,
+        // exactly as the engine's does -- so the listing is identical under both keys and the
+        // only thing that differs is where the walk is told to begin.
+        let graph = functions(&[
+            ("start", dispatch),
+            ("0x2008", callee.clone()),
+            ("0x2000", callee),
+        ]);
+
+        // **The negative control first**: the goal is genuinely out of reach from the entry, so a
+        // pass below cannot come from a fixture that reaches it either way.
+        let from_entry = reachability(
+            "0x2000",
+            Some(0x2000),
+            0x200c,
+            256,
+            32,
+            |a| graph.get(a).cloned(),
+            no_tables,
+            never,
+        );
+        assert!(
+            !from_entry.verdict_reachable,
+            "the control must not reach from the entry, or this test proves nothing: \
+             {from_entry:?}"
+        );
+
+        let reached = reachability(
+            "start",
+            None,
+            0x200c,
+            256,
+            32,
+            |a| graph.get(a).cloned(),
+            |_: &[Instruction]| tables_of(&[(0x1004, vec![0x2008])]),
+            never,
+        );
+        assert!(
+            reached.verdict_reachable,
+            "a resolved case block is a real edge and execution does arrive there: {reached:?}"
         );
     }
 
