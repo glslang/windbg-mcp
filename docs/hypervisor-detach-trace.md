@@ -172,11 +172,34 @@ modes and five offline tests for the bounded, line-anchored, one-shot announceme
 retained example suppresses raw DbgEng text to avoid exposing connection keys. Its live measurement
 used the already-approved diagnostic executable path and pinned candidate library, not an MCP test.
 
-This implements an **automatic diagnostic**, not a production attach fix. The text is an observed
+That stage implemented an **automatic diagnostic**, not a production attach fix. The text is an observed
 engine behavior rather than a documented readiness contract, and the wait remains unbounded if the
 announcement never arrives. No server option, default attach behavior, or installed binary changed.
 Production integration still needs an explicit policy and tested failure/reconnect handling; the
 successful diagnostic is not grounds for silently changing NT attach or retrying breaks in a loop.
+
+## Explicitly opt-in integration
+
+The next implementation adds `experimental_break_on_connect: true` to `attach_kernel`; omitted
+or false leaves the existing path unchanged. dbgscope `2d49a88` provides the typed
+`attach_kernel_announcement_begin` method. Its scoped wide output callback requests one interrupt
+on the callback thread, forwards the prior callback's mask, and restores the prior callback and
+mask afterward. No engine call other than `SetInterrupt` crosses threads. The existing watchdog
+uses `SetInterrupt(EXIT)` for this mode, avoiding a second target break at the deadline.
+
+Success requires an observed announcement, successful interrupt request, a stopped wait outcome,
+and typed `DEBUG_STATUS_BREAK`. Failure does not trigger an ordinary-attach fallback. Missing and
+duplicate announcements, a fresh observer for the next attach, and callback restoration are
+covered locally. A missing-announcement deadline and an already-halted reconnect are not yet
+live-validated; an unconnected transport still has no guaranteed cancellation bound.
+
+The direct integration probe recorded one send and stopped on CPU 2. Typed detach returned
+`KernelRunning` and `NO_DEBUGGEE`; independent uptime advanced from 8886.065 to 8889.403 seconds
+on the same boot. Three subsequent MCP detach-only cycles using the new option each passed,
+with identity, unchanged boot time, and advancing uptime checked over WinRM after every cycle.
+No reset, reboot, recovery controller, installed-server replacement, or VELKO configuration
+change was required. Broader stepping, breakpoint-hit, live NT, drop, and cross-build coverage
+remain separate work.
 
 ## Local evidence index
 
@@ -198,3 +221,4 @@ These filenames identify the retained bench artifacts, not portable repository i
 - `synchronized-detach-probe-20260919-152958.log`: second automatic prototype.
 - `synchronized-detach-probe-20260919-153400.log`: retained example source, automatic trigger and successful teardown.
 - `synchronized-detach-probe-20260919-153857.log`: final example source, including secret-safe input errors and resume-result checks.
+- `synchronized-detach-probe-20260919-162939.log`: first typed experimental attach integration, one send and successful detach.

@@ -19,6 +19,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- Opt-in `attach_kernel.experimental_break_on_connect` for known-running KDNET hypervisor labs:
+  one announcement-triggered break without the default attach's additional resume. Text-dependent
+  and experimental; three detach-only MCP cycles passed independent guest-health checks on the
+  measured build. Default attach behavior is unchanged. See `docs/hypervisor-debugging.md`.
+
 - Microsoft hypervisor KDNET workflow through the existing `attach_kernel` tool. Attach summaries
   distinguish known Windows and hypervisor kernel images with `kernel_target`, and hypervisor
   summaries warn about NT-only inspection and the scope of a hypervisor halt. Includes a separate

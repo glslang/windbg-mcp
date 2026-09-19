@@ -1957,7 +1957,8 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// is the tightest headroom any of these raises has left. That is deliberate: this is the last
 /// tool the driver plan adds, so there is no next one to be quietly sized for, and the five review
 /// rounds that moved `device_security`'s figure moved it by 119 B in total.
-const MODEL_VISIBLE_CEILING: usize = 92_000;
+// 2026-09-19: the opt-in attach field adds 329 B; retain its experimental safety qualifiers.
+const MODEL_VISIBLE_CEILING: usize = 93_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -15324,6 +15325,39 @@ fn a_live_hypervisor_detaches_at_the_initial_break() {
             assert_eq!(attached["summary"]["kernel_target"], "hypervisor");
         },
     );
+}
+
+/// Same detach-only regression, with the explicitly experimental announcement attach.
+#[test]
+#[ignore = "halts a disposable hypervisor; use the independent guest-health wrapper"]
+fn a_live_hypervisor_announcement_attach_detaches_at_the_first_stop() {
+    let profile = std::env::var("WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE")
+        .expect("set WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE to a configured hypervisor profile");
+    assert!(!profile.trim().is_empty(), "empty hypervisor profile");
+    let mut server = Server::started();
+    with_live_kernel_selector(
+        &mut server,
+        json!({ "profile": profile, "experimental_break_on_connect": true }),
+        |_, _, attached| {
+            assert_eq!(attached["summary"]["kernel_target"], "hypervisor");
+        },
+    );
+}
+
+#[test]
+fn experimental_announcement_attach_refuses_non_kdnet_before_claiming_a_target() {
+    let mut server = Server::started();
+    let response = server.call_tool(
+        "attach_kernel",
+        json!({"connection":"com:port=COM1,baud=115200", "experimental_break_on_connect":true}),
+        TARGET_STEP,
+    );
+    assert_no_error(&response, "experimental attach refusal");
+    assert!(is_tool_error(&response));
+    let result = &response["result"]["structuredContent"];
+    assert_eq!(result["status"], "error", "{result}");
+    assert_eq!(result["target"], "no", "{result}");
+    assert_eq!(result["error"]["category"], "invalid_argument", "{result}");
 }
 
 /// A separate gate from the NT tier: no driver, process, pool or NT-symbol assumptions.

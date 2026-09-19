@@ -10,7 +10,8 @@ param(
     [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$Profile,
     [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$ComputerName,
     [Parameter(Mandatory=$true)][ValidateNotNullOrEmpty()][string]$ExpectedComputerName,
-    [ValidateRange(1,10)][int]$Cycles=3
+    [ValidateRange(1,10)][int]$Cycles=3,
+    [switch]$ExperimentalBreakOnConnect
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -36,7 +37,8 @@ try {
         Write-Host "Cycle $cycle of $Cycles; profile=$Profile; guest=$ExpectedComputerName"
         $testExit=1
         try {
-            & cargo test --locked --test mcp_smoke a_live_hypervisor_detaches_at_the_initial_break -- --ignored --exact --nocapture --test-threads=1
+            $testName=if($ExperimentalBreakOnConnect){'a_live_hypervisor_announcement_attach_detaches_at_the_first_stop'}else{'a_live_hypervisor_detaches_at_the_initial_break'}
+            & cargo test --locked --test mcp_smoke $testName -- --ignored --exact --nocapture --test-threads=1
             $testExit=$LASTEXITCODE
         } finally {
             # Check health even if cargo/test failed. No second controller or reset on failure.
