@@ -8928,12 +8928,12 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // module table per jump would be a round trip for a question whose answer does not move.
     let loaded = e.modules().unwrap_or_default();
     let layout = ioctl_layout(set);
-    let mut resolve_jump = |block: &[Instruction], at: u64| -> Vec<u64> {
+    let mut resolve_jump = |block: &[Instruction]| -> crate::driver::JumpTables {
         if !set_reads_operands {
-            return Vec::new();
+            return crate::driver::JumpTables::default();
         }
         let Some(entry) = block.first().map(|first| first.address) else {
-            return Vec::new();
+            return crate::driver::JumpTables::default();
         };
         // The module holding *this* listing rather than the seed's: a walk that has crossed into
         // another driver must read that driver's bytes, and a reader bounded to the wrong module
@@ -8942,46 +8942,42 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
             .iter()
             .find(|module| entry >= module.base && entry < module.end())
         else {
-            return Vec::new();
+            return crate::driver::JumpTables::default();
         };
         let read = |address: u64, len: usize| {
             within_module(module.base, module.size, address, len)
                 .then(|| e.read_memory(address, len).ok())?
         };
-        // The same question `ioctl_map`'s own wiring asks, and for the same reason: the loader's
-        // extent admits `.rdata` and the headers, so a table of module-relative *data* addresses
-        // would pass and be followed. Only this module's executable sections are code.
+        // The same two questions `ioctl_map`'s own wiring asks, and for the same reasons: where a
+        // table entry may land (executable sections only -- the loader's extent admits `.rdata` and
+        // the headers) and where a literal pool may be read from (readable, not writable).
         let executable = executable_ranges(e, module);
         let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
         let constant = constant_ranges(e, module);
         let is_constant = |address: u64| constant.iter().any(|range| range.contains(&address));
-        let (targets, stopped) =
-            ioctl::jump_targets(entry, block, layout, read, in_image, is_constant, || {
-                if let Some(why) = halted.get() {
-                    return Some(why);
-                }
-                if matches!(e.interrupted(), Ok(true)) {
-                    Some(walk::Halt::Interrupted)
-                } else if Instant::now() >= deadline {
-                    Some(walk::Halt::Deadline)
-                } else {
-                    None
-                }
-            });
-        // **A halt inside the resolver is the walk's halt.** Filed in the same cell the decoder
-        // uses, which the walk's own poll reads on its next step -- so a verdict reached after this
-        // carries "cut short" rather than reading as a graph that was fully explored. Without it a
-        // resolver that timed out mid-table would hand back nothing and the walk would report an
-        // ordinary NOT REACHABLE, or reach its goal through an earlier edge and report a clean
-        // REACHABLE. Both are verdicts about an analysis that stopped.
-        if let Some(why) = stopped {
+        let found = ioctl::jump_targets(entry, block, layout, read, in_image, is_constant, || {
+            if let Some(why) = halted.get() {
+                return Some(why);
+            }
+            if matches!(e.interrupted(), Ok(true)) {
+                Some(walk::Halt::Interrupted)
+            } else if Instant::now() >= deadline {
+                Some(walk::Halt::Deadline)
+            } else {
+                None
+            }
+        });
+        // **Filed as well as returned.** The walk merges `stopped` into its own report, and this
+        // cell is what the *decoder's* poll reads -- so a halt seen here also stops the next
+        // function being disassembled rather than only being reported once the walk ends.
+        if let Some(why) = found.stopped {
             halted.set(Some(why));
         }
-        targets
-            .into_iter()
-            .find(|(site, _)| *site == at)
-            .map(|(_, targets)| targets)
-            .unwrap_or_default()
+        crate::driver::JumpTables::new(
+            found.targets.into_iter().collect(),
+            found.stopped,
+            found.bounded,
+        )
     };
 
     let rpt = reachability(

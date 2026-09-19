@@ -64,18 +64,73 @@ use dbgscope::dbgeng::{Effect, Flow, Instruction};
 /// two-variant enum would only make a caller translate between them.
 use crate::walk::Halt;
 
+/// Where a listing's indirect jumps go, resolved **once for the whole listing**.
+///
+/// **This replaces a per-site closure, and the shape is the fix rather than a tidy-up.** Asking
+/// "where does the jump at this address go" per site produced four review findings on
+/// [#351](https://github.com/glslang/windbg-mcp/pull/351), and each was the same two properties
+/// missing from a one-address answer:
+///
+/// - **It could not say it was incomplete.** The resolver runs [`crate::ioctl::map`], which stops on
+///   a deadline or an interrupt and also at its own `MAX_CASES` bound, in both cases returning a
+///   *prefix*. Handed over as "the targets", a prefix reads as the whole table: a goal past it gets
+///   a clean `NOT REACHABLE`, and a walk stopped by a Ctrl+Break reports a verdict about a graph it
+///   did not finish exploring. Worse, the interrupt poll behind it is `GetInterrupt`, a **consuming**
+///   read -- so a halt seen inside the resolver is one no later poll can find, and every fix that
+///   added another poll somewhere else left the next caller uncovered.
+/// - **It cost a full analysis per site.** Each call ran a complete `map` over the entire listing,
+///   so a function with *n* indirect jumps paid *n* × every literal-pool and jump-table engine read
+///   -- quadratic DbgEng work over a link where each read is tens of milliseconds, and paid for
+///   unreachable jumps too.
+///
+/// So the answer is the whole listing's tables plus why it might be short, computed once and then
+/// only *read*. [`Self::stopped`] and [`Self::bounded`] are what the callers merge into their
+/// report; nothing downstream polls anything.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct JumpTables {
+    /// Indirect jump site -> the targets its table selects. Absent means unresolved, which leaves
+    /// the walk ending at that jump exactly as it did before any of this existed.
+    targets: HashMap<u64, Vec<u64>>,
+    /// The deadline or interrupt the resolver observed, which it consumed and no later poll will
+    /// see. Whoever reads these tables owns reporting it.
+    stopped: Option<Halt>,
+    /// Whether the resolver stopped at a bound of its own, so the tables are a prefix. Reported as
+    /// the walk's own `bound_hit`: the verdict is then about part of the graph, and saying so is
+    /// the difference between a short answer and a wrong one.
+    bounded: bool,
+}
+
+impl JumpTables {
+    /// The tables for one listing, with the resolver's own incompleteness carried alongside.
+    pub(crate) fn new(
+        targets: HashMap<u64, Vec<u64>>,
+        stopped: Option<Halt>,
+        bounded: bool,
+    ) -> Self {
+        Self {
+            targets,
+            stopped,
+            bounded,
+        }
+    }
+
+    /// Where the jump at `site` goes, or nothing.
+    fn at(&self, site: u64) -> &[u64] {
+        self.targets.get(&site).map_or(&[], Vec::as_slice)
+    }
+}
+
 /// Instructions reachable from `start` by walking *inside* one function — following
 /// fall-through, direct conditional branches, direct `jmp`s that stay in the function, and a
 /// **resolved** jump table's targets — and stopping at `ret` or at an indirect `jmp` nothing could
 /// resolve. This keeps a mid-function start (a handler scoped past a switch) from spuriously
 /// treating sibling switch cases as reachable.
 ///
-/// `resolve` answers what an indirect jump's targets are, and is how `FOLLOWUPS.md` item 83 was
+/// `tables` says where this listing's indirect jumps go, and is how `FOLLOWUPS.md` item 83 was
 /// closed: the walk used to end at every such jump, so a handler a switch selects read as NOT
-/// REACHABLE while `ioctl_map` named it. It takes the listing as well as the site because the
-/// resolver works over a whole function, and it is a closure rather than a call into
-/// [`crate::ioctl`] because this module is deliberately free of the engine — the worker wires the
-/// two tools together.
+/// REACHABLE while `ioctl_map` named it. Resolved once by the caller and only read here — see
+/// [`JumpTables`] for why that is the shape — and produced outside this module, which is
+/// deliberately free of the engine: the worker wires the two tools together.
 ///
 /// **An empty answer keeps today's behaviour exactly**, which is what makes this safe to add: the
 /// path ends at the jump, and the verdict is the one it was. The walk's contract is that REACHABLE
@@ -96,11 +151,7 @@ struct FnWalk {
 
 /// Returns `None` if `start` is not an instruction boundary in `block` (the caller
 /// then falls back to the function entry).
-fn walk_function(
-    block: &[Instruction],
-    start: u64,
-    resolve: &mut impl FnMut(&[Instruction], u64) -> Vec<u64>,
-) -> Option<FnWalk> {
+fn walk_function(block: &[Instruction], start: u64, tables: &JumpTables) -> Option<FnWalk> {
     let idx: HashMap<u64, usize> = block
         .iter()
         .enumerate()
@@ -154,11 +205,7 @@ fn walk_function(
                 // `ioctl_map` was resolving the same table three functions away.
                 leave(insn.address, t, "jmp");
                 if t.is_none() {
-                    // Collected before the loop because `leave` borrows `external` mutably and the
-                    // resolver borrows nothing of this walk -- two mutable borrows of the frame
-                    // otherwise, for a call that cannot touch either.
-                    let targets = resolve(block, insn.address);
-                    for target in targets {
+                    for &target in tables.at(insn.address) {
                         leave(insn.address, Some(target), "jmp");
                     }
                 }
@@ -469,24 +516,16 @@ fn branch_relation(jcc: &str, taken: bool) -> Option<&'static str> {
 /// without teaching this the same thing would reproduce that defect exactly, for every handler a
 /// switch selects.
 ///
-/// The targets are resolved **once, up front**, rather than per visit: this DFS backtracks, so a
-/// resolver called from inside it would re-read the same table for every route tried.
+/// The tables are resolved by the caller and only read here, which is what keeps this DFS from
+/// re-resolving on every backtrack -- and, since the resolver runs a whole analysis per call, from
+/// running one per jump site. See [`JumpTables`].
 fn find_path(
     block: &[Instruction],
     idx: &HashMap<u64, usize>,
     start: u64,
     goal: u64,
-    resolve: &mut impl FnMut(&[Instruction], u64) -> Vec<u64>,
+    tables: &JumpTables,
 ) -> Option<Vec<(u64, bool)>> {
-    let mut tables: HashMap<u64, Vec<u64>> = HashMap::new();
-    for insn in block {
-        if matches!(insn.flow, Flow::Jmp(None)) {
-            let targets = resolve(block, insn.address);
-            if !targets.is_empty() {
-                tables.insert(insn.address, targets);
-            }
-        }
-    }
     fn dfs(
         block: &[Instruction],
         idx: &HashMap<u64, usize>,
@@ -494,7 +533,7 @@ fn find_path(
         goal: u64,
         visited: &mut HashSet<usize>,
         acc: &mut Vec<(u64, bool)>,
-        tables: &HashMap<u64, Vec<u64>>,
+        tables: &JumpTables,
     ) -> bool {
         let insn = &block[i];
         if insn.address == goal {
@@ -517,11 +556,9 @@ fn find_path(
                 // state -- the gate is the bounds check above it, and which slot was taken is the
                 // control code itself -- so no step is pushed for the jump, exactly as none is
                 // pushed for a call.
-                None => tables.get(&insn.address).is_some_and(|targets| {
-                    targets.iter().any(|target| {
-                        idx.get(target)
-                            .is_some_and(|&j| dfs(block, idx, j, goal, visited, acc, tables))
-                    })
+                None => tables.at(insn.address).iter().any(|target| {
+                    idx.get(target)
+                        .is_some_and(|&j| dfs(block, idx, j, goal, visited, acc, tables))
                 }),
             },
             Flow::Branch(t) => {
@@ -570,7 +607,7 @@ fn find_path(
     let start_i = *idx.get(&start)?;
     let mut visited = HashSet::new();
     let mut acc = Vec::new();
-    dfs(block, idx, start_i, goal, &mut visited, &mut acc, &tables).then_some(acc)
+    dfs(block, idx, start_i, goal, &mut visited, &mut acc, tables).then_some(acc)
 }
 
 /// Classifies one on-path branch decision into a [`BranchStep`]: the concrete direction the
@@ -651,7 +688,7 @@ pub(crate) fn path_recipe(
     seed_start: Option<u64>,
     rpt: &Report,
     mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
-    mut resolve_jump: impl FnMut(&[Instruction], u64) -> Vec<u64>,
+    mut resolve_jump: impl FnMut(&[Instruction]) -> JumpTables,
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> (Vec<SegmentRecipe>, Option<Halt>) {
     let Some(from_entry) = rpt.from_entry else {
@@ -727,7 +764,14 @@ pub(crate) fn path_recipe(
         let textmap = instruction_text(&block);
         // A route the search could not reconstruct is the same defect one level down: the branches
         // on the way to the goal are unknown, and an empty list of them claims there are none.
-        let route = find_path(&block, &idx, start, goal, &mut resolve_jump);
+        // Once per listing, and its halt stops the recipe rather than being lost: without this a
+        // cancelled reconstruction is `gates_unknown` with no reason, which reads as an ordinary
+        // route this walk does not support.
+        let tables = resolve_jump(&block);
+        if let Some(why) = tables.stopped {
+            return (recipes, Some(why));
+        }
+        let route = find_path(&block, &idx, start, goal, &tables);
         let gates_unknown = route.is_none();
         let mut steps: Vec<BranchStep> = route
             .unwrap_or_default()
@@ -903,9 +947,11 @@ pub(crate) struct Report {
 /// or a bound is hit. `uf` returns the raw `uf <arg>` text or `None` (bad address /
 /// forwarded export / disassembly failure) to prune that branch.
 ///
-/// `resolve_jump` answers where an indirect `jmp` goes, and is what lets the walk cross the IOCTL
-/// dispatch switch (`FOLLOWUPS.md` item 83). Returning nothing for a jump leaves the walk ending
-/// there, which is what it did before this existed.
+/// `resolve_jump` answers where a listing's indirect `jmp`s go, and is what lets the walk cross the
+/// IOCTL dispatch switch (`FOLLOWUPS.md` item 83). Called **once per function**, and its
+/// [`JumpTables`] carries why the answer might be short -- a halt it consumed, or a bound it hit --
+/// which this merges into the report rather than polling for. Nothing for a jump leaves the walk
+/// ending there, which is what it did before this existed.
 ///
 /// `seed_start` is the resolved numeric VA of `from` (the caller resolves symbols /
 /// backtick / `module!sym+off` forms). When it points *inside* the seed function — a
@@ -920,7 +966,7 @@ pub(crate) fn reachability(
     max_functions: usize,
     max_depth: usize,
     mut uf: impl FnMut(&str) -> Option<Vec<Instruction>>,
-    mut resolve_jump: impl FnMut(&[Instruction], u64) -> Vec<u64>,
+    mut resolve_jump: impl FnMut(&[Instruction]) -> JumpTables,
     mut halt: impl FnMut() -> Option<Halt>,
 ) -> Report {
     let mut visited: HashSet<u64> = HashSet::new(); // walk start addresses already done
@@ -969,12 +1015,21 @@ pub(crate) fn reachability(
         // seed at its resolved address, or the entry if `from` was a symbol. Fall back
         // to the entry if the requested address isn't an instruction boundary.
         let desired = token.or(seed_start).unwrap_or(entry);
-        let (start_used, walk) = match walk_function(&block, desired, &mut resolve_jump) {
+        // Once per function, before either walk of it. The tables are the same whichever address
+        // the walk starts from, and the resolver runs a whole analysis per call.
+        let tables = resolve_jump(&block);
+        // **Merged here rather than polled for.** The resolver's interrupt poll consumes what it
+        // sees, so a halt inside it is one `halt()` will never answer -- and a bound it hit is not a
+        // halt at all. Both make the verdict below a statement about part of the graph.
+        if rpt.halted.is_none() {
+            rpt.halted = tables.stopped;
+        }
+        rpt.bound_hit |= tables.bounded;
+        let (start_used, walk) = match walk_function(&block, desired, &tables) {
             Some(w) => (desired, w),
             None => (
                 entry,
-                walk_function(&block, entry, &mut resolve_jump)
-                    .expect("entry is always an instruction"),
+                walk_function(&block, entry, &tables).expect("entry is always an instruction"),
             ),
         };
         if !visited.insert(start_used) {
@@ -1275,8 +1330,13 @@ mod tests {
     /// A resolver that follows nothing, which is the behaviour the walk had before
     /// `FOLLOWUPS.md` item 83: every indirect jump ends its path. Used by every test that is not
     /// about a jump table, so each of them still pins what it pinned.
-    fn no_tables(_: &[Instruction], _: u64) -> Vec<u64> {
-        Vec::new()
+    fn no_tables(_: &[Instruction]) -> JumpTables {
+        JumpTables::default()
+    }
+
+    /// A resolver answering with one listing's tables, and nothing about incompleteness.
+    fn tables_of(sites: &[(u64, Vec<u64>)]) -> JumpTables {
+        JumpTables::new(sites.iter().cloned().collect(), None, false)
     }
 
     fn never() -> Option<Halt> {
@@ -1554,7 +1614,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             .collect();
 
         assert_eq!(
-            find_path(&block, &idx, 0x1000, 0x1008, &mut no_tables),
+            find_path(&block, &idx, 0x1000, 0x1008, &JumpTables::default()),
             None,
             "the recipe invented a route through an instruction whose flow is not known"
         );
@@ -1562,7 +1622,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         // And a goal reached without crossing one is still routed to, so the line above is a
         // refusal rather than a DFS that finds nothing.
         assert_eq!(
-            find_path(&block, &idx, 0x1000, 0x1004, &mut no_tables),
+            find_path(&block, &idx, 0x1000, 0x1004, &JumpTables::default()),
             Some(Vec::new())
         );
     }
@@ -2187,8 +2247,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         assert_eq!(block[1].address, 0x1004);
         assert_eq!(block[1].flow, Flow::Unreadable);
 
-        let walk =
-            walk_function(&block, 0x1000, &mut no_tables).expect("the entry is an instruction");
+        let walk = walk_function(&block, 0x1000, &JumpTables::default())
+            .expect("the entry is an instruction");
         assert!(
             !walk.reachable.contains(&0x1008),
             "the walk must stop at the hole, not step over it: {walk:?}",
@@ -2202,8 +2262,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             insn(0x1000, Flow::Fallthrough, "nop"),
             insn(0x1008, Flow::Return, "ret"),
         ];
-        let joined =
-            walk_function(&spliced, 0x1000, &mut no_tables).expect("the entry is an instruction");
+        let joined = walk_function(&spliced, 0x1000, &JumpTables::default())
+            .expect("the entry is an instruction");
         assert!(
             joined.reachable.contains(&0x1008),
             "the spliced block is what the barrier exists to prevent"
@@ -2361,8 +2421,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
                 0x1000,
                 vec![insn(0x1004, flow, "x"), insn(0x1008, Flow::Return, "ret")],
             );
-            let walk =
-                walk_function(&block, 0x1000, &mut no_tables).expect("entry is an instruction");
+            let walk = walk_function(&block, 0x1000, &JumpTables::default())
+                .expect("entry is an instruction");
             (
                 walk.reachable.contains(&0x1008),
                 walk.external.iter().map(|e| (e.1, e.2)).collect::<Vec<_>>(),
@@ -2646,10 +2706,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         // for `ioctl::jump_targets`: the walk reaches `br x8` at `0x1004`, asks where it goes, and
         // crosses to the case the switch selects. Before item 83 this was NOT REACHABLE while
         // `ioctl_map` was naming that same handler from the same table.
-        let mut resolved = |_: &[Instruction], at: u64| match at {
-            0x1004 => vec![0x1008, 0x1010],
-            _ => Vec::new(),
-        };
+        let resolved = tables_of(&[(0x1004, vec![0x1008, 0x1010])]);
+        let mut resolved = |_: &[Instruction]| resolved.clone();
         assert!(
             reachability(
                 "0x1000",
@@ -2682,10 +2740,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         // **A target the resolver does not name stays unreachable**, so the walk follows the table
         // rather than opening the function up: an edge it invented would make REACHABLE unsound,
         // which is the one direction this walk may not be wrong in.
-        let mut only_first = |_: &[Instruction], at: u64| match at {
-            0x1004 => vec![0x1008],
-            _ => Vec::new(),
-        };
+        let only_first = tables_of(&[(0x1004, vec![0x1008])]);
+        let mut only_first = |_: &[Instruction]| only_first.clone();
         assert!(
             !reachability(
                 "0x1000",
@@ -2727,15 +2783,15 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             ],
         );
         let mut uf = |a: &str| (a == "0x1000").then(|| func.clone());
-        // Consumes the halt the way the worker's resolver does -- files it and answers nothing.
-        let stopped = std::cell::Cell::new(false);
-        let mut resolve = |_: &[Instruction], at: u64| {
-            if at == 0x1008 {
-                stopped.set(true);
-            }
-            Vec::new()
+        // Consumes the halt the way the worker's resolver does: it reports the reason in the tables
+        // rather than leaving it for a poll, because the poll behind it is a consuming read.
+        let asked = std::cell::Cell::new(false);
+        let mut resolve = |_: &[Instruction]| {
+            asked.set(true);
+            JumpTables::new(HashMap::new(), Some(Halt::Deadline), false)
         };
-        let mut halt = || stopped.get().then_some(Halt::Deadline);
+        // Answers nothing, which is the point: the halt must arrive from the tables.
+        let mut halt = || None;
 
         let r = reachability(
             "0x1000",
@@ -2753,13 +2809,64 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "the branch reaches the goal on its own"
         );
         assert!(
-            stopped.get(),
+            asked.get(),
             "and the resolver was asked, so a halt was consumed"
         );
         assert_eq!(
             r.halted,
             Some(Halt::Deadline),
             "a verdict reached after a halt has to say so: {r:?}"
+        );
+    }
+
+    /// **A recipe cut short by the resolver says so, rather than reading as an unsupported route.**
+    ///
+    /// `find_path` answering `None` is rendered as `gates_unknown` -- "this walk could not
+    /// reconstruct the branches" -- which is an ordinary outcome. A resolver that consumed a
+    /// deadline or an interrupt produces the same `None`, and with no reason attached the two are
+    /// indistinguishable: a cancelled pass reads as a route the tool does not handle. The resolver's
+    /// poll is a consuming read, so there is no later poll that could tell them apart either.
+    ///
+    /// So the halt comes out of `JumpTables` and stops the recipe with that reason. Raised on review
+    /// of #351, and it is the fourth finding on this one seam -- which is why the resolver now
+    /// answers per listing with its incompleteness attached rather than per site with nothing.
+    #[test]
+    fn a_recipe_reports_a_halt_the_resolver_consumed() {
+        let func = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Jmp(None), "jmp qword ptr [tbl]"),
+                insn(0x1008, Flow::Return, "ret"),
+            ],
+        );
+        let m = functions(&[("start", func.clone()), ("0x1000", func)]);
+        // Reachable without the table, so the recipe is attempted at all.
+        let rpt = reachability(
+            "start",
+            None,
+            0x1004,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
+        assert!(rpt.verdict_reachable, "{rpt:?}");
+
+        // Now the recipe, with a resolver that stops.
+        let (recipes, stopped) = path_recipe(
+            "start",
+            None,
+            &rpt,
+            |a| m.get(a).cloned(),
+            |_: &[Instruction]| JumpTables::new(HashMap::new(), Some(Halt::Interrupted), false),
+            never,
+        );
+
+        assert_eq!(
+            stopped,
+            Some(Halt::Interrupted),
+            "the reason has to reach the caller: {recipes:?}"
         );
     }
 
