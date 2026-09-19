@@ -1310,9 +1310,10 @@ pub(crate) fn format_report(r: &Report) -> String {
             None if r.tables_bounded => out.push_str(
                 "  Bound hit: the jump-table resolver stopped at a limit of its own — this path \n\
                  \x20          is real, but a switch's edges may be missing, so a shorter one may \n\
-                 \x20          exist. max_functions/max_depth do not reach it, and neither does\n\
-                 \x20          scoping `from` within the same routine: the resolver reads a whole\n\
-                 \x20          function. A `from` in another function avoids it.\n",
+                 \x20          exist. max_functions/max_depth do not reach it. A handler VA as \n\
+                 \x20          `from` does, if that handler holds no switch\n\
+                 \x20          of its own — the resolver reads a whole function. A `from` in \n\
+                 \x20          another function always avoids it.\n",
             ),
             None => {}
         }
@@ -1352,13 +1353,13 @@ pub(crate) fn format_report(r: &Report) -> String {
             None if r.tables_bounded => out.push_str(
                 "  Bound hit: yes — the jump-table resolver stopped at a limit of its own, so a\n\
                  \x20          switch's edges may be missing. max_functions/max_depth do not \
-                 reach it,\n\
-                 \x20          and neither does scoping `from` within the same routine: the \
-                 resolver\n\
-                 \x20          reads a whole function, so a handler holding a switch of its own \
-                 still\n\
-                 \x20          pays for the dispatch's. A `from` in another function avoids \
-                 it.\n",
+                 reach it.\n\
+                 \x20          A handler VA as `from` does, if that handler holds no switch\n\
+                 \x20          of its own — the resolver reads a whole function, so one that \
+                 has a\n\
+                 \x20          switch still pays for this routine's tables. A `from` in \
+                 another\n\
+                 \x20          function always avoids it.\n",
             ),
             None => out.push_str(&format!(
                 "  Bound hit: {}\n",
@@ -3163,10 +3164,13 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "an ordinary bound must not claim the resolver's: {text}"
         );
 
-        // The resolver's own: the arguments are named as *not* reaching it, and so is scoping
-        // `from` within the routine -- the resolver reads a whole function, so a handler that
-        // holds its own switch still pays for the dispatch's, and the advice used to send readers
-        // round that loop. Raised on review of #351.
+        // The resolver's own: the arguments are named as *not* reaching it, and the scoping
+        // remedy is given **with its condition**. Both flat answers were wrong here in successive
+        // rounds of #351. "Pass a handler VA" alone sends a reader round a loop when that handler
+        // holds a switch of its own, the resolver reading a whole function; "scoping never helps"
+        // then denied the case the probe guard exists for -- a handler reaching no indirect jump
+        // is never resolved at all, which is the ordinary shape and the one the guard was added
+        // for one round earlier. The message states the condition instead of picking a side.
         //
         // **Asserted on a phrase the boilerplate does not carry.** The check here was
         // `contains("handler VA")`, which every report satisfies: the caveats block printed under
@@ -3187,8 +3191,8 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "the advice has to say the arguments will not help: {text}"
         );
         assert!(
-            text.contains("scoping `from` within the same routine"),
-            "and say why scoping `from` is not the way out either: {text}"
+            text.contains("holds no switch"),
+            "and qualify the scoping remedy rather than granting or denying it flatly: {text}"
         );
 
         // **And on a REACHABLE verdict too**, which the halt already qualified and this did not: the
@@ -3207,10 +3211,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             text.contains("jump-table resolver stopped at a limit of its own"),
             "a reachable verdict from a partial graph has to say so: {text}"
         );
-        assert!(
-            text.contains("scoping `from` within the same routine"),
-            "{text}"
-        );
+        assert!(text.contains("holds no switch"), "{text}");
 
         // A halt outranks it, naming a different remedy for a different cause.
         let halted = Report {
