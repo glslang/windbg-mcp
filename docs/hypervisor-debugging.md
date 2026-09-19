@@ -2,7 +2,9 @@
 
 **Experimental: safe hypervisor detach is not yet validated.** The first MCP probe left the
 guest unresponsive despite reporting a successful resume/detach; native KD subsequently
-recovered it without a reset. See [Validation](#validation) before attempting a live session.
+recovered it without a reset. The candidate passed one independently checked detach cycle,
+but its second cycle lost WinRM reachability despite passing MCP assertions.
+See [Validation](#validation) before attempting a live session.
 
 Use `attach_kernel` with a profile for the **hypervisor's** KDNET endpoint. The existing
 DbgEng kernel transport handles this; no EXDI backend, separate attach tool, or Secure Kernel
@@ -115,7 +117,8 @@ leaving a disposable attached user-mode process alive. A later lab diagnostic st
 initial KDNET synchronization **before testing any candidate detach sequence**. WinRM stopped
 answering; native KD's explicit-target retry crashed, and passive reconnection did not reach a
 session. No reboot or target/outer-host configuration change was made. A temporary workspace-only
-firewall rule for the diagnostic was removed. Guest recovery and live validation remain pending.
+firewall rule for the diagnostic was removed. Guest recovery and live validation remained pending
+at that point.
 
 Further recovery on the same day narrowed the connection failure:
 
@@ -140,10 +143,29 @@ The candidate dbgscope revision also passed its manually dispatched
 [Miri workflow](https://github.com/glslang/dbgscope/actions/runs/35441987860); that does not
 validate live kernel transport or recovery.
 
+The owner subsequently approved and performed a reset of the lab guest. After the owner confirmed
+a responsive console, WinRM initially timed out, then became reachable without a debugger attach.
+Preflight verified guest identity, the current debugger host address, hypervisor launch/debug
+settings, and the endpoint key by hash. The candidate server was rebuilt from `c0032f0`, pinning
+dbgscope `16403fae3db026df7896bdd17ea0af80323c6527`.
+
+The detach-only live test then ran twice, sequentially, against the recovered guest:
+
+- The first cycle passed the MCP assertions. Independent WinRM checks answered twice afterward,
+  with unchanged boot time and advancing uptime. This was a confirmed pass for that cycle.
+- The second cycle also passed the MCP assertions, but its post-detach WinRM check timed out.
+  A later TCP reachability check timed out too. The wrapper stopped; the planned third cycle
+  did not run. No MCP process or hypervisor-port listener remained after the failure.
+
+This does **not** validate reliable safe detach. The second cycle's console state and whether
+the guest halted, stopped again, or only lost management networking still need investigation.
+Do not treat the passing Rust test alone as an independently confirmed resume, or attribute this
+failure to the earlier packet-ID mismatch without a new transport trace.
+
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
-summary regression before the teardown change. Neither new live test below has run: further live
-checks require guest recovery and validation of the candidate teardown. Hypervisor stepping and breakpoint
-management are not yet validated by this implementation run.
+summary regression before the teardown change. The broader live test below has not run; hypervisor
+stepping and breakpoint management remain unvalidated by this implementation run. Live NT and
+owning-engine-drop validation of the candidate teardown also remain outstanding.
 
 The detach-only regression preserves the original failure shape: it ends at the initial break
 without stepping first. After recovering the lab, use its independent WinRM health wrapper:
@@ -156,7 +178,8 @@ without stepping first. After recovering the lab, use its independent WinRM heal
 Verify beforehand that the profile names that guest's hypervisor endpoint and its debugger host
 address matches this workspace. The wrapper checks guest identity, stable boot time, and advancing
 uptime after each of three cycles. It stops on failure and performs no reset or automatic recovery.
-It has been syntax-checked but has not yet run against the recovered lab.
+The measured runs above used one cycle, followed by a two-cycle invocation that stopped after
+its first failed health check; there were two attaches in total, not three successful cycles.
 
 The broader regression test is also opt-in and ignored by normal `cargo test`:
 
