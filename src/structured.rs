@@ -2613,7 +2613,7 @@ pub struct IoctlCase {
     /// Where the code is recognised — the compare, or the indirect jump whose table holds it.
     pub at: CodeLocation,
     /// The length checks found in the case block, including the ones that are not sizes.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub evidence: Vec<LengthCheck>,
 }
 
@@ -2653,7 +2653,7 @@ pub struct IoctlMap {
     /// How many were found, exact however many are listed.
     pub case_count: usize,
     /// The jump tables that were followed.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tables: Vec<JumpTable>,
     /// Indirect **jumps** that were not followed: a switch whose table could not be resolved.
     ///
@@ -2665,7 +2665,7 @@ pub struct IoctlMap {
     /// This is what stops a short list reading as a complete one. Every entry is a place a code
     /// could be recognised and was not, so a map with entries here is a lower bound on what the
     /// driver accepts rather than the set.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub unresolved: Vec<CodeLocation>,
     /// Where the control code stopped being followable.
     ///
@@ -3030,7 +3030,7 @@ pub struct AccessEntry {
     pub mask: String,
     /// The rights that mask names, as a **device**'s: `FILE_READ_DATA` rather than the same bit's
     /// meaning on a registry key. An unnamed bit is in `mask` and not here.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rights: Vec<String>,
     /// Whether the mask carries `FILE_READ_DATA` and `FILE_WRITE_DATA` -- the two the I/O manager
     /// checks a control code's `RequiredAccess` against.
@@ -3181,7 +3181,7 @@ pub struct DeviceSecurity {
     /// The directory searched for symbolic links.
     pub link_directory: String,
     /// The links found there pointing at this device, in the order the directory holds them.
-    #[serde(skip_serializing_if = "Vec::is_empty")]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub links: Vec<DeviceLink>,
     /// Whether that search saw the whole directory. See [`LinkSearch`].
     pub link_search: LinkSearch,
@@ -4093,6 +4093,63 @@ fn ms(d: std::time::Duration) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A field serde may leave out is one the schema must not call required.
+    ///
+    /// **The two are decided by different attributes and nothing makes them agree.** `schemars`
+    /// reads a field as optional when it is an `Option` or carries `#[serde(default)]`;
+    /// `#[serde(skip_serializing_if = ...)]` is what decides whether the key is *written*. A
+    /// field with the second and neither of the first is required in the declared schema and
+    /// absent from the payload, and a client that validates `structuredContent` against the
+    /// `outputSchema` the same server handed it refuses the whole result -- not the field.
+    ///
+    /// Found by running `ioctl_map` against HEVD on a live ARM64 kernel: a dispatch routine that
+    /// is a pure compare chain has no jump tables and nothing unresolved, and each of its cases
+    /// has no length checks, so all three of `tables`, `unresolved` and `IoctlCase::evidence`
+    /// were skipped and the answer -- 29 correctly recovered control codes -- was thrown away by
+    /// the client with a schema error. `AccessEntry::rights` and `DeviceSecurity::links` were the
+    /// same defect two tools away, found by this scan rather than by tripping over them.
+    ///
+    /// Scanned from the source because that is where the mistake is made and where the sixth one
+    /// would be. Runtime cannot answer it: a skipped field is *absent*, and no value proves that
+    /// some other value would not have skipped it.
+    #[test]
+    fn a_field_serde_may_skip_is_never_required_by_the_schema() {
+        let source = include_str!("structured.rs");
+        let (mut attribute, mut depth) = (String::new(), 0usize);
+        let mut offenders = Vec::new();
+        for line in source.lines() {
+            let trimmed = line.trim();
+            // Attributes wrap, so accumulate one until its brackets balance rather than assuming
+            // rustfmt kept it on a line -- a wrapped one read as two is a silent pass.
+            if depth > 0 || trimmed.starts_with("#[") {
+                attribute.push_str(trimmed);
+                depth += trimmed.matches('[').count();
+                depth = depth.saturating_sub(trimmed.matches(']').count());
+                continue;
+            }
+            let held = std::mem::take(&mut attribute);
+            let Some(field) = trimmed.strip_prefix("pub ") else {
+                continue;
+            };
+            let Some((name, rest)) = field.split_once(':') else {
+                continue;
+            };
+            // An `Option` is optional to `schemars` however it is skipped, so it is exempt.
+            if held.contains("skip_serializing_if")
+                && !held.contains("default")
+                && !rest.trim_start().starts_with("Option<")
+            {
+                offenders.push(name.to_string());
+            }
+        }
+        assert!(
+            offenders.is_empty(),
+            "these fields are skipped when empty and required by the schema, so a result \
+             without them fails its own outputSchema -- give each one `#[serde(default, ...)]`: \
+             {offenders:?}"
+        );
+    }
 
     /// One address representation, and it is the lossless one.
     ///
