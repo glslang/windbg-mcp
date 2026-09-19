@@ -224,6 +224,19 @@ second with `0xD0000048 STATUS_PORT_ALREADY_SET` — but it was worth nothing un
 and the probe is what could be put in the code beside the rule for the next round to find. A
 dismissal you have not measured is indistinguishable, to you, from one you have.
 
+**And a red is not proof either — read *which* assertion produced it.** The measurement that
+retired a P1 on [#351](https://github.com/glslang/windbg-mcp/pull/351) was a fixture where two
+paths reach one indirect jump disagreeing about how far the index was bounded, checked by backing
+the meet out of `ioctl::Facts::join`. It went red on the first run, which is what a mutation check
+is for — and it went red on the **last** assertion, the reader's call count, while the three that
+state the rule stayed green. The fixture served only the control's twelve bytes, so the mutated
+walk asked for six slots, was refused for want of *bytes*, and left the switch unresolved for a
+reason with nothing to do with the bound: every assertion that mattered would have passed with the
+rule deleted. Serving whatever length is asked for moved the failure onto the first assertion and
+turned the check into six fabricated edges — the finding's own scenario, reproduced. So name the
+**assertion** you expect to fail, not only the test, and be most suspicious when the one that went
+red is the incidental one you added last.
+
 ## A class fix closes the class only if it can express the whole rule
 
 The rule above says to delete the choice generating a run of findings rather than fix them one at a
