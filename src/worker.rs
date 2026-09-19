@@ -8795,6 +8795,36 @@ fn image_ranges(e: &DebugEngine, module: &dbgscope::dbgeng::Module) -> ImageRang
 /// Shared by the IOCTL map and by the reachability walk's table resolver (`FOLLOWUPS.md` item 83)
 /// rather than written twice: the two tools now follow the same tables, and a second copy of this
 /// predicate is how they would come to disagree about which entries are code.
+/// Whether a failed module enumeration is what a reachability answer should report.
+///
+/// Three facts decide it, and the order is this crate's, not this function's.
+///
+/// A **halt outranks everything**. The walk was cut short by the caller's own interrupt or by the
+/// clock, `Report::halted` carries which, and `format_report` already withholds the claim that the
+/// graph was explored -- so the answer is honest without this, and replacing it with an
+/// enumeration error would hide a cancellation the caller asked for and send them to a module
+/// inventory instead of to their own request. The same precedence the `from_entry` check below
+/// states ("a halt outranks the symbol"), the `halt` closure's interrupt-before-deadline order,
+/// and `format_report`'s arms. Raised on review of #351, against the version one commit earlier
+/// that read only the first two.
+///
+/// A **`REACHABLE` stands**, halt or no halt: it names a concrete path, and a path that exists is
+/// not unmade by edges nobody could look for.
+///
+/// What is left is a `NOT REACHABLE` that ran to completion with a switch unresolved because the
+/// debugger could not say which image to bound its reads to -- an answer whose four incompleteness
+/// fields are all clear and which is therefore a false claim of a full exploration.
+///
+/// A free function so the rule can be tested: everything around it needs a `DebugEngine` whose
+/// `modules()` fails while its disassembly works, which nothing here can stage.
+fn enumeration_decided_the_answer(
+    needed_modules: bool,
+    verdict_reachable: bool,
+    halted: Option<walk::Halt>,
+) -> bool {
+    needed_modules && !verdict_reachable && halted.is_none()
+}
+
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
     // Refused outright on an instruction set whose **flow** this build does not decode. Every
     // instruction there decodes to `Flow::Unknown`, and the walk stops at those, so the answer
@@ -8998,6 +9028,17 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // rather than the round trip, and a cache that must also carry an error out of an `FnMut`
     // returning `JumpTables` is machinery for a saving of one engine call on a walk that made
     // hundreds of them.
+    //
+    // **Deferring the call as well was raised twice more, and is declined on the mechanism rather
+    // than on the scope.** The argument each time was a slow transport: that the enumeration can
+    // spend the deadline before `uf` starts. It cannot, because it never reads the target.
+    // `dbgscope`'s `modules()` is `GetNumberModules` plus **one** `GetModuleParameters` for the
+    // whole range and a name read per module -- the engine's own bookkeeping, as its source says in
+    // as many words -- with no `ReadVirtual` among them, so a KD wire that is slow does not make it
+    // slower. What *is* transport-bound is `pe::read_image` under `image_ranges`, which is why that
+    // one was halved rather than cached around. Read from the pinned checkout `cargo metadata`
+    // names (`.claude/rules/cross-target-check.md`); re-check it there rather than reasoning from
+    // the call's name again.
     let loaded = e.modules();
     let needed_modules = std::cell::Cell::new(false);
     let layout = ioctl_layout(set);
@@ -9105,7 +9146,10 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // for tables. Anything else would be a `NOT REACHABLE` whose four incompleteness fields are all
     // clear while a switch it met went unresolved for a reason none of them names, so it is refused
     // and the reason is the enumeration rather than the walk.
-    if needed_modules.get() && !rpt.verdict_reachable {
+    //
+    // **And a halt outranks it**, which the first version of this did not do. See
+    // [`enumeration_decided_the_answer`].
+    if enumeration_decided_the_answer(needed_modules.get(), rpt.verdict_reachable, rpt.halted) {
         return Err(Failed::categorised(
             structured::ErrorCategory::Debugger,
             format!(
@@ -10275,6 +10319,46 @@ mod tests {
              loader's, so a jump-table entry can land in the next module and be published as this \
              driver's case -- for `ioctl_map` and for the reachability walk alike."
         );
+    }
+
+    /// A halt outranks a failed module enumeration, and a proven path outranks both.
+    ///
+    /// The enumeration error exists for one answer: a `NOT REACHABLE` that ran to completion with a
+    /// switch unresolved, whose four incompleteness fields are therefore all clear while the graph
+    /// was not fully explored. Every other combination has something truer to say. A walk the
+    /// caller **interrupted** says so in `Report::halted`, and `format_report` already withholds
+    /// the full-exploration claim -- replacing that with a module-inventory error would hide a
+    /// cancellation the caller asked for. A `REACHABLE` names a concrete path, which edges nobody
+    /// could look for cannot unmake.
+    ///
+    /// Pinned here because the branch it guards cannot be: it needs a `DebugEngine` whose
+    /// `modules()` fails while its disassembly works.
+    #[test]
+    fn a_halt_outranks_a_failed_module_enumeration() {
+        // The one case the error is for.
+        assert!(enumeration_decided_the_answer(true, false, None));
+
+        // A halt says what happened, and says it better.
+        assert!(
+            !enumeration_decided_the_answer(true, false, Some(walk::Halt::Interrupted)),
+            "an interrupted walk must report the interrupt, not the module table"
+        );
+        assert!(
+            !enumeration_decided_the_answer(true, false, Some(walk::Halt::Deadline)),
+            "and a walk that ran out of time must send the caller to the clock"
+        );
+
+        // A path that exists is not unmade by edges nobody could look for -- with or without a
+        // halt, which is the pair that says the verdict decides this on its own.
+        assert!(!enumeration_decided_the_answer(true, true, None));
+        assert!(!enumeration_decided_the_answer(
+            true,
+            true,
+            Some(walk::Halt::Interrupted)
+        ));
+
+        // And nothing to report where the resolver never wanted the enumeration.
+        assert!(!enumeration_decided_the_answer(false, false, None));
     }
 
     /// **A namespace refusal is categorised by whose fault it is**, which is what a caller does
