@@ -8265,6 +8265,7 @@ fn an_open_summarises_the_target_instead_of_listing_its_modules() {
         .find(|module| module["name"] == "nt")
         .unwrap_or_else(|| panic!("a kernel dump loads `nt`: {modules}"));
     assert_eq!(summary["primary_module"]["name"], "nt", "{summary}");
+    assert_eq!(summary["kernel_target"], "windows", "{summary}");
     assert_eq!(
         summary["primary_module"]["start"], kernel["start"],
         "the base an open reports is the one `modules` reports: {summary}"
@@ -15261,11 +15262,19 @@ fn with_live_kernel_session<R>(
     connection: &str,
     body: impl FnOnce(&mut Server, &str) -> R,
 ) -> R {
-    let attached = server.call_tool(
-        "attach_kernel",
+    with_live_kernel_selector(
+        server,
         json!({ "connection": connection }),
-        TARGET_STEP,
-    );
+        |server, session, _| body(server, session),
+    )
+}
+
+fn with_live_kernel_selector<R>(
+    server: &mut Server,
+    selector: Value,
+    body: impl FnOnce(&mut Server, &str, &Value) -> R,
+) -> R {
+    let attached = server.call_tool("attach_kernel", selector, TARGET_STEP);
     let report = text_of(&attached["result"]);
     // The handle decides whether there is anything to clean up, not `isError`: an attach that
     // claimed its target and then failed the wait comes back as a tool error carrying a live,
@@ -15284,7 +15293,7 @@ fn with_live_kernel_session<R>(
             !is_tool_error(&attached),
             "the attach claimed its target and then failed:\n{report}"
         );
-        body(server, &session)
+        body(server, &session, &attached["result"]["structuredContent"])
     }));
     let ended = server.call_tool("end_session", json!({ "session_id": session }), TARGET_STEP);
     let ended_text = text_of(&ended["result"]);
@@ -15297,6 +15306,145 @@ fn with_live_kernel_session<R>(
         (Ok(_), Some(why)) => panic!("{why}"),
         (Ok(value), None) => value,
     }
+}
+
+/// Preserve the original failure shape: detach at the initial break without stepping over it.
+/// The wrapper in examples/hypervisor_detach_regression.ps1 checks guest health afterward.
+#[test]
+#[ignore = "halts a disposable hypervisor; use the independent guest-health wrapper"]
+fn a_live_hypervisor_detaches_at_the_initial_break() {
+    let profile = std::env::var("WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE")
+        .expect("set WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE to a configured hypervisor profile");
+    assert!(!profile.trim().is_empty(), "empty hypervisor profile");
+    let mut server = Server::started();
+    with_live_kernel_selector(
+        &mut server,
+        json!({ "profile": profile }),
+        |_, _, attached| {
+            assert_eq!(attached["summary"]["kernel_target"], "hypervisor");
+        },
+    );
+}
+
+/// A separate gate from the NT tier: no driver, process, pool or NT-symbol assumptions.
+/// Only target-independent inspection, one step, breakpoint management, and active detach.
+#[test]
+#[ignore = "halts a disposable hypervisor; set WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE and run alone"]
+fn a_live_hypervisor_session_inspects_steps_and_detaches() {
+    let Ok(profile) = std::env::var("WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE") else {
+        skip("set WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE to a configured hypervisor profile name");
+        return;
+    };
+    assert!(
+        !profile.trim().is_empty(),
+        "the hypervisor profile name must not be empty"
+    );
+    let mut server = Server::started();
+    with_live_kernel_selector(
+        &mut server,
+        json!({ "profile": profile }),
+        |server, session, attached| {
+            assert_eq!(
+                attached["summary"]["kernel_target"], "hypervisor",
+                "wrong target: {attached}"
+            );
+            assert!(
+                attached["report"]
+                    .as_str()
+                    .unwrap()
+                    .contains("Microsoft Hypervisor")
+            );
+            assert!(
+                attached["summary"]["limitation"]
+                    .as_str()
+                    .unwrap()
+                    .contains("not the Windows NT kernel")
+            );
+
+            let modules =
+                server.tool_data("modules", json!({ "session_id": session }), TARGET_STEP);
+            assert!(
+                modules["modules"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|m| m["name"] == "hv")
+            );
+            let registers =
+                server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
+            let pc = registers["instruction_pointer"]
+                .as_str()
+                .expect("a stopped hypervisor has a PC");
+            let memory = server.tool_data(
+                "read_memory",
+                json!({ "session_id": session, "address": pc, "size": 8 }),
+                TARGET_STEP,
+            );
+            assert_eq!(memory["read_size"], 8, "{memory}");
+            let code = server.tool_data(
+                "disassemble",
+                json!({ "session_id": session, "count": 3 }),
+                TARGET_STEP,
+            );
+            assert!(
+                !code["instructions"].as_array().unwrap().is_empty(),
+                "{code}"
+            );
+
+            let stepped =
+                server.tool_data("step_into", json!({ "session_id": session }), TARGET_STEP);
+            assert_eq!(stepped["timed_out"], false, "{stepped}");
+            assert_eq!(stepped["target_gone"], false, "{stepped}");
+            assert_eq!(stepped["interrupted"], false, "{stepped}");
+            let after =
+                server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
+            let next_pc = after["instruction_pointer"]
+                .as_str()
+                .expect("a step leaves a readable PC");
+            assert_ne!(next_pc, pc, "the single step did not move the hypervisor");
+
+            // This is a new session. Refuse to clear any breakpoints it did not create.
+            let before =
+                server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
+            assert!(
+                before["breakpoints"].as_array().unwrap().is_empty(),
+                "{before}"
+            );
+            let breakpoint_result = catch_unwind(AssertUnwindSafe(|| {
+                let set = server.tool_data(
+                    "set_breakpoint",
+                    json!({ "session_id": session, "address": next_pc }),
+                    TARGET_STEP,
+                );
+                assert_eq!(set["breakpoint"]["deferred"], false, "{set}");
+                let listed =
+                    server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
+                assert_eq!(
+                    listed["breakpoints"].as_array().unwrap().len(),
+                    1,
+                    "{listed}"
+                );
+            }));
+            server.tool_text(
+                "execute",
+                json!({ "session_id": session, "command": "bc *" }),
+                TARGET_STEP,
+            );
+            if let Err(panic) = breakpoint_result {
+                resume_unwind(panic);
+            }
+            let cleared =
+                server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
+            assert!(
+                cleared["breakpoints"].as_array().unwrap().is_empty(),
+                "{cleared}"
+            );
+            println!(
+                "hypervisor: modules, registers, memory, disassembly, single-step and breakpoint set/clear passed"
+            );
+        },
+    );
+    println!("hypervisor: resumed and detached (verify guest responsiveness separately)");
 }
 
 /// [`with_live_kernel_session`], for a body that only means anything against an **x64** target.

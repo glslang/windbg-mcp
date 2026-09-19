@@ -2438,7 +2438,9 @@ impl WindbgServer {
         .await
     }
 
-    /// Attach to a kernel target over a connection string (e.g. KDNET).
+    /// Attach to a Windows kernel or hypervisor over a connection string (e.g. KDNET).
+    /// For hypervisor debugging, use its own port/key profile, not the NT kernel endpoint.
+    /// Stopping a hypervisor pauses its guests; the debugger must run outside that hypervisor.
     /// Takes exactly one of `profile` (a connection configured on this host, which the server
     /// resolves locally — the target's debug key never enters this request) or `connection` (the
     /// raw string, key and all). Prefer `profile`; call it with neither to be told which profiles
@@ -2446,7 +2448,7 @@ impl WindbgServer {
     /// Opens a new session in its own engine process — sessions already open are left alone —
     /// and returns a `session_id` that routes later calls to it.
     /// A live kernel attach waits for the target to dial in, and that wait has no timeout and
-    /// cannot be interrupted: if the guest is powered off, not booted with `/debug on`, or
+    /// cannot be interrupted: if the target is powered off, its selected debug endpoint is disabled, or
     /// pointed at the wrong host/port/key, this call reports a timeout and the attach keeps
     /// waiting forever. That costs only this session — other sessions and the server are
     /// unaffected — and `session_status` says how long it has been waiting. Recover with

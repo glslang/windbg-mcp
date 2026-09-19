@@ -17,6 +17,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`reachable_from_dispatch` and `ioctl_map` disagreed about the same driver.** Since #345 the map resolves A64 switch tables and the reachability walk did not, so the map named a handler the walk called NOT REACHABLE -- with the tool's own advice being to pass that handler's address by hand to scope past the switch. The walk now crosses a table through `ioctl::jump_targets`, which runs the map's own walk and returns what its tables select, so a target the walk admits is one `ioctl_map` publishes and neither tool can contradict the other. Every bound comes with it, and a table that does not resolve contributes no edges -- the walk ends at the jump exactly as before, which is what keeps REACHABLE sound and leaves NOT REACHABLE the best-effort verdict it already was. The path recipe follows the same edges, because a verdict the recipe cannot reconstruct is rendered as a segment with *no conditions at all* presented as the complete set of them -- the defect its `Flow::Call` arm already records. Two rules the review rounds added, both about an address the walk did not compute itself. A **discovered** edge -- a call target, a tail jump, or now a table slot -- is entered at its own address or dropped: one that is not an instruction boundary used to widen to the containing function's entry and explore code no execution reaches, which is the single direction a REACHABLE verdict may not be wrong in. And the resolver's module lookup **propagates** a failed enumeration instead of reading it as a target with no modules -- the second degrades correctly, ending the walk at each indirect jump as it did before, while the first left every switch unresolved and the report saying the graph had been fully explored. And a table slot going to the switch's **default** is an edge although it is not a case -- `Map::cases` is a list of codes, and exporting it unchanged as a list of edges inherited an exclusion that was never about control flow, so a walk beginning past the bounds check (which carries the indices the switch *refused*) could not reach the default block at all. `FOLLOWUPS.md` item 83.
 
+### Added
+
+- Microsoft hypervisor KDNET workflow through the existing `attach_kernel` tool. Attach summaries
+  distinguish known Windows and hypervisor kernel images with `kernel_target`, and hypervisor
+  summaries warn about NT-only inspection and the scope of a hypervisor halt. Includes a separate
+  opt-in live hypervisor smoke test and [runbook](docs/hypervisor-debugging.md).
+
+### Changed
+
+- Experimental live-kernel teardown uses dbgscope's guarded quit-and-detach path before passive
+  cleanup, checks breakpoint-removal errors, and requires the engine to release its target before
+  reporting resume. Local regressions pass; live NT/hypervisor validation is still pending.
+
 ## [0.18.0] - 2026-09-17
 
 ### Fixed
