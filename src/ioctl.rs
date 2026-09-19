@@ -2310,10 +2310,19 @@ struct Fold {
 /// refused, so the scale is not a detail that fails safe.
 ///
 /// **The shift sits on the last register operand, and that is what says which of the two is the
-/// entry**: the other one is the base. A modifier this does not read -- `lsr`, `asr`, an
-/// extension -- refuses the table rather than dropping it, dropping one being how an address
-/// nobody computed gets published.
-fn folded_base(instruction: &Instruction, wanted: &str, layout: Layout) -> Option<(String, u64)> {
+/// entry**: the other one is the base, and the *destination* has nothing to do with it. A64 is
+/// not destructive, so `add x10,x9,x8,lsl #2` / `br x10` is as ordinary as the aliasing
+/// `add x8,x9,x8,lsl #2` `mountmgr` happens to use, and requiring the entry to be the destination
+/// refuses it -- raised on review of windbg-mcp#345. So this answers with the register the walk
+/// should go on following rather than assuming it already has it.
+///
+/// A modifier this does not read -- `lsr`, `asr`, an extension -- refuses the table rather than
+/// dropping it, dropping one being how an address nobody computed gets published.
+fn folded_base(
+    instruction: &Instruction,
+    wanted: &str,
+    layout: Layout,
+) -> Option<(String, u64, String)> {
     let operands = &instruction.operands;
     let Some(Operand::Register(written)) = operands.first() else {
         return None;
@@ -2329,7 +2338,7 @@ fn folded_base(instruction: &Instruction, wanted: &str, layout: Layout) -> Optio
             return None;
         };
         let plain = instruction.effect == Effect::Add && source.width >= layout.pointer;
-        return plain.then(|| (source.full.clone(), 1));
+        return plain.then(|| (source.full.clone(), 1, wanted.to_string()));
     }
     // A64: `add xD,xA,xB`, with the shift -- when there is one -- on `xB`.
     let shift = match operands.len() {
@@ -2351,11 +2360,20 @@ fn folded_base(instruction: &Instruction, wanted: &str, layout: Layout) -> Optio
     if first.width < layout.pointer || second.width < layout.pointer {
         return None;
     }
+    // **A shift settles it outright**, whatever the destination is: the operand carrying it is
+    // the entry and the other is the base.
+    if operands.len() == 4 {
+        return Some((
+            first.full.clone(),
+            1u64.checked_shl(shift)?,
+            second.full.clone(),
+        ));
+    }
+    // Unshifted, the sum is the same either way round and nothing in the instruction says which
+    // side is the table's. What is left to go on is which one the walk arrived following.
     match (first.full == wanted, second.full == wanted) {
-        // The shifted operand is the entry, so the other one is the base.
-        (false, true) => Some((first.full.clone(), 1u64.checked_shl(shift)?)),
-        // Unshifted, the sum is the same either way round.
-        (true, false) if shift == 0 => Some((second.full.clone(), 1)),
+        (false, true) => Some((first.full.clone(), 1, second.full.clone())),
+        (true, false) => Some((second.full.clone(), 1, first.full.clone())),
         // Neither is the register being followed, or both are: `add x8,x8,x8` is a doubling and
         // not a fold, and reading it as one measures the entries from themselves.
         _ => None,
@@ -2406,7 +2424,17 @@ fn entry_width(memory: &MemoryOperand) -> Option<u32> {
 /// an unsigned `0xa2` is 162 entries forward where the signed one is 94 back, and 162 forward is
 /// still inside the function. Which of the two it is comes from the decoder's own classification
 /// of the load rather than from its spelling.
-fn entry_value(raw: &[u8], effect: Effect) -> Option<i64> {
+///
+/// **And the extension stops at the register the load writes**, which is a second question and
+/// was answered wrong: `ldrsb w8,[...]` sign-extends to *32* bits, and writing `w8` zero-extends
+/// `x8`, so a fold reading `x8` gets `0x00000000fffffffe` where extending straight to 64 bits
+/// gives `-2`. On a table scaled by four that is `base + 0x3fffffff8` against `base - 8` -- and
+/// since only the reconstructed target is checked against the image, the wrong one is *inside* it
+/// and gets published as a control code the driver accepts, while the right one is far outside
+/// and refuses the table. Raised on review of windbg-mcp#345. `destination` is that register's
+/// width in bytes, absent where the load has no register destination at all, which is the 32-bit
+/// form that jumps through the table itself.
+fn entry_value(raw: &[u8], effect: Effect, destination: Option<u32>) -> Option<i64> {
     let bits = u32::try_from(raw.len().checked_mul(8)?).ok()?;
     if bits == 0 || bits > 64 {
         return None;
@@ -2414,10 +2442,19 @@ fn entry_value(raw: &[u8], effect: Effect) -> Option<i64> {
     let mut extended = [0u8; 8];
     extended.get_mut(..raw.len())?.copy_from_slice(raw);
     let value = u64::from_le_bytes(extended);
-    match effect == Effect::MoveSigned && bits < 64 {
-        true => Some(((value << (64 - bits)) as i64) >> (64 - bits)),
-        false => i64::try_from(value).ok(),
+    let value = match effect == Effect::MoveSigned && bits < 64 {
+        true => ((value << (64 - bits)) as i64) >> (64 - bits),
+        false => i64::try_from(value).ok()?,
+    };
+    let kept = match destination {
+        Some(width) if width < 8 => width.checked_mul(8)?,
+        _ => return Some(value),
+    };
+    if kept < bits {
+        // The load reads more than it can write, which is not a shape this reads.
+        return None;
     }
+    Some((value as u64 & (u64::MAX >> (64 - kept))) as i64)
 }
 
 /// Follows an indirect jump's table, when every part of it was recovered from **this block**.
@@ -2523,7 +2560,9 @@ fn follow_table(
                         // recorded**, because that -- and not the load's base -- is what execution
                         // adds to every entry, and so is what one entry is *worth*, which A64
                         // folds into the same instruction.
-                        if let Some((base, scale)) = folded_base(instruction, &wanted, layout) {
+                        if let Some((base, scale, entry)) =
+                            folded_base(instruction, &wanted, layout)
+                        {
                             // **One fold, and not several.** `add rcx,rdx` / `add rcx,r8` makes
                             // the target the sum of the entry and *both*, and keeping one of them
                             // reconstructs addresses nobody computed -- published as cases
@@ -2537,6 +2576,9 @@ fn follow_table(
                                 at: position,
                                 scale,
                             });
+                            // **And the walk goes on following the entry**, which the fold named
+                            // and which need not be what it wrote into.
+                            wanted = entry;
                             continue;
                         }
                         // **And copied at the target's width.** Everything from the `add` to the
@@ -2604,8 +2646,13 @@ fn follow_table(
         // the address and multiplying it by anything is not what execution did.
         None => (None, 1),
     };
-    // What the entries are read at, which the load settled and the guard above admitted.
+    // What the entries are read at, which the load settled and the guard above admitted, and how
+    // far the register it writes carries the result.
     let width = entry_width(memory)? as usize;
+    let destination = match load.operands.first() {
+        Some(Operand::Register(register)) => Some(register.width),
+        _ => None,
+    };
 
     // **MSVC's dense switch has two tables**: a byte per index saying which case it is, then a
     // dword per case holding its RVA. It reuses one register for both, so the dword load's index
@@ -2677,7 +2724,11 @@ fn follow_table(
     let mut found = Vec::new();
     for (position, case) in cases.iter().enumerate() {
         let slot = case.checked_mul(width)?;
-        let entry = entry_value(bytes.get(slot..slot.checked_add(width)?)?, load.effect)?;
+        let entry = entry_value(
+            bytes.get(slot..slot.checked_add(width)?)?,
+            load.effect,
+            destination,
+        )?;
         let target = match entry_base {
             Some(base) => base.wrapping_add_signed(entry.checked_mul(entry_scale)?),
             None => u64::try_from(entry).ok()?,
@@ -7445,6 +7496,188 @@ mod tests {
             missing(case_schema, &written["cases"][0]).is_empty(),
             "a case with no length checks: {}",
             written["cases"][0]
+        );
+    }
+
+    /// The shift names the entry; the destination it is written into has nothing to say.
+    ///
+    /// A64 is not destructive, so `add x10,x9,x8,lsl #2` / `br x10` is as ordinary as the
+    /// aliasing form `mountmgr` happens to emit, and the first draft of this reader required the
+    /// entry to be the `add`'s own destination -- which refuses it, leaving a switch this change
+    /// claims to read in `unresolved`. Raised on review; the remedy is to follow the register the
+    /// **shift** identifies rather than the one that was written.
+    ///
+    /// The fixture puts the table's base in the register the destination *would* alias, so a
+    /// reader that guessed from the destination does not merely refuse: `x9` holds an address and
+    /// `x8` holds the entry, and swapping them measures the table from itself.
+    #[test]
+    fn an_a64_fold_names_its_entry_by_the_shift_not_by_the_destination() {
+        const TABLE: u64 = IMAGE_BASE + 0x9000;
+        const ENTRIES: u64 = IMAGE_BASE + 0x4000;
+        const DEFAULT: u64 = ENTRIES + 0x400;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "sub",
+                vec![reg("w11"), reg("w9"), imm(0x6dc040)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w11"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "b.hi",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "adr",
+                vec![reg("x9"), adr_to(TABLE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "ldrsw",
+                vec![reg("x8"), table_load("x9", "w11", 4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "adr",
+                vec![reg("x9"), adr_to(ENTRIES)],
+                Flow::Fallthrough,
+            ),
+            // Neither source is the destination, which is the whole point.
+            insn(
+                DISPATCH + 0x20,
+                "add",
+                vec![reg("x10"), reg("x9"), reg("x8"), lsl(2)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x24, "br", vec![reg("x10")], Flow::Jmp(None)),
+        ];
+        let read = |at: u64, len: usize| {
+            (at == TABLE && len == 8).then(|| {
+                [0x40i32, 0x80]
+                    .iter()
+                    .flat_map(|entry| entry.to_le_bytes())
+                    .collect()
+            })
+        };
+
+        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x6dc040, ENTRIES + 0x100), (0x6dc041, ENTRIES + 0x200)],
+            "the shifted operand is the entry however the sum is stored: {:?}",
+            found.cases
+        );
+    }
+
+    /// A signed load extends only as far as the register it writes.
+    ///
+    /// `ldrsb w8,[...]` sign-extends to **32** bits, and writing `w8` zero-extends `x8` -- so a
+    /// fold reading `x8` gets `0x00000000fffffffe` where extending the byte straight to 64 bits
+    /// gives `-2`. Scaled by four that is `base + 0x3fffffff8` against `base - 8`.
+    ///
+    /// **Only the reconstructed target is checked against the image**, which is what makes this
+    /// the dangerous direction rather than a missed case: the wrong answer is a few bytes inside
+    /// the function and is published as a control code the driver accepts, while the right one is
+    /// sixteen gigabytes away and refuses the table. So the fixture asserts the *refusal*, and
+    /// the entry is chosen so the 64-bit reading lands on a real instruction boundary inside the
+    /// routine. Raised on review of windbg-mcp#345.
+    #[test]
+    fn a_signed_load_is_extended_only_as_far_as_the_register_it_writes() {
+        const TABLE: u64 = IMAGE_BASE + 0x9000;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "sub",
+                vec![reg("w11"), reg("w9"), imm(0x6dc040)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w11"), imm(0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "b.hi",
+                Vec::new(),
+                Flow::Branch(Some(TABLE + 0x400)),
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "adr",
+                vec![reg("x9"), adr_to(TABLE)],
+                Flow::Fallthrough,
+            ),
+            // **A 32-bit destination**, which is the one thing this differs from the byte-table
+            // test in.
+            insn(
+                DISPATCH + 0x18,
+                "ldrsb",
+                vec![reg("w8"), table_load("x9", "w11", 1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "add",
+                vec![reg("x8"), reg("x9"), reg("x8"), lsl(2)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x20, "br", vec![reg("x8")], Flow::Jmp(None)),
+        ];
+        // 0xfe: -2 extended to 64 bits, and 0xfffffffe extended only as far as `w8` goes.
+        let read = |at: u64, len: usize| (at == TABLE && len == 1).then(|| vec![0xfeu8]);
+
+        let found = map(DISPATCH, &block, Layout::ARM64, read, in_image, never);
+
+        assert!(
+            found.cases.is_empty(),
+            "`base - 8` is inside the image and is not where this jump goes: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.unresolved,
+            vec![DISPATCH + 0x20],
+            "and a table that was refused leaves its jump recorded as a loss"
         );
     }
 
