@@ -173,6 +173,19 @@ pub(crate) struct Table {
     /// switch's **default** -- a dense table covers every index in its range, and a compiler fills
     /// the ones it has no case for with the block the bounds check jumps to.
     pub(crate) followed: usize,
+    /// Where the slots with no case of their own go, **when at least one slot went there**.
+    ///
+    /// Not [`Bound::default`] copied across: that is where an *out-of-range* index goes, and the
+    /// bounds check's own branch is the edge for it. This says an **in-range** index reaches the
+    /// same block through the table, which is a different edge with a different predecessor -- and
+    /// the only one a walk that started past the bounds check can take. `None` where every admitted
+    /// index has a case of its own, because then nothing in range reaches the default and claiming
+    /// the edge would be claiming a path execution has not got.
+    ///
+    /// Recorded rather than inferred from `entries - followed`. The two agree today, that
+    /// difference being the default slots and nothing else, and they would stop agreeing the moment
+    /// a second reason to skip a slot is added -- silently, in the direction that publishes an edge.
+    pub(crate) default: Option<u64>,
 }
 
 /// What a dispatch routine accepts.
@@ -676,6 +689,33 @@ fn jump_targets_within(
         match by_site.iter_mut().find(|(site, _)| *site == case.site) {
             Some((_, targets)) => targets.push(case.lands),
             None => by_site.push((case.site, vec![case.lands])),
+        }
+    }
+    // **A slot with no case of its own is still an edge, and `cases` is a list of *codes*.** A
+    // dense table covers every index its bounds admit and a compiler fills the ones it has no case
+    // for with the default block -- `mountmgr`'s two 81-entry tables hold 21 codes each -- so
+    // `follow_table` drops those slots, correctly: a code the driver *rejects*, published as one it
+    // accepts, is what a reader would go and test. The walk is asking a different question, and
+    // reading the code list as an edge list inherits an exclusion that was never about control flow.
+    //
+    // The bounds check's own `ja default` is **not** the same edge. It carries an index the switch
+    // refused, and a walk that began past it -- a scoped `from`, or a discovered edge landing in the
+    // switch tail -- never traverses it, so that route supplies nothing. An in-range index landing
+    // in a default slot is the only way to the block from there. Raised on review of #351.
+    //
+    // Added where a slot actually went there and nowhere else, which is what `Table::default`
+    // records: with every admitted index carrying a case, nothing in range reaches the default and
+    // an edge here would be one execution cannot take -- the single direction this walk may not be
+    // wrong in.
+    for table in &found.tables {
+        let Some(default) = table.default else {
+            continue;
+        };
+        match by_site.iter_mut().find(|(site, _)| *site == table.at) {
+            Some((_, targets)) => targets.push(default),
+            // A table whose every slot is the default produces no case at all, so the site is not
+            // in the list yet -- and it is exactly the site with the most to say.
+            None => by_site.push((table.at, vec![default])),
         }
     }
     // A switch's slots routinely share a landing -- several codes handled by one block -- and an
@@ -3084,6 +3124,8 @@ fn follow_table(
     let bytes = (reader.read)(table, slots.checked_mul(width)?)?;
 
     let mut found = Vec::new();
+    // Set by the skip below rather than derived from the counts afterwards -- see `Table::default`.
+    let mut reached_default = None;
     for (position, case) in cases.iter().enumerate() {
         let slot = case.checked_mul(width)?;
         let entry = entry_value(
@@ -3099,6 +3141,7 @@ fn follow_table(
         // its range, and a compiler fills the ones it has no case for with the block the bounds
         // check jumps to -- so `mountmgr`'s two 81-entry tables hold 13 codes each.
         if bound.default == Some(target) {
+            reached_default = Some(target);
             continue;
         }
         // **Every entry has to be code in this image, or the table is not this table.** A shape
@@ -3117,6 +3160,7 @@ fn follow_table(
             table,
             entries,
             followed: found.len(),
+            default: reached_default,
         },
         cases: found,
         proved: bound.proved,
@@ -7777,6 +7821,7 @@ mod tests {
                 table: table_at,
                 entries: 3,
                 followed: 3,
+                default: None,
             }]
         );
         assert!(found.unresolved.is_empty(), "{:?}", found.unresolved);
@@ -8108,8 +8153,132 @@ mod tests {
                 table: table_at,
                 entries: 4,
                 followed: 2,
+                default: Some(DEFAULT),
             }],
             "the table is four entries long and two of them are cases"
+        );
+    }
+
+    /// ...and it **is** an edge, which is the same slot answering two different questions.
+    ///
+    /// `Map::cases` is a list of codes, so a slot going to the default belongs nowhere in it. The
+    /// reachability walk reads the same resolution as a list of *edges*, where that slot is an
+    /// ordinary one: an in-range index lands there and execution follows it. Exporting the case
+    /// list unchanged inherited an exclusion that was never about control flow.
+    ///
+    /// The bounds check's own `ja default` does not cover it. That edge carries an index the switch
+    /// **refused**, and a walk beginning past the check -- a `from` scoped into the switch tail, or
+    /// a discovered edge landing there -- never traverses it, so the table slot is the only route.
+    ///
+    /// The control is the half that keeps this sound: the same routine with a case in every
+    /// admitted slot reaches the default from nowhere in range, and no edge is published for it.
+    #[test]
+    fn a_slot_that_goes_to_the_default_is_still_an_edge() {
+        const TABLE: i64 = 0x9000;
+        const DEFAULT: u64 = IMAGE_BASE + 0x500;
+        let mut block = prologue(DISPATCH);
+        block.extend([
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("eax"), reg("r13d")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xb,
+                "sub",
+                vec![reg("eax"), imm(0x222000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x11,
+                "cmp",
+                vec![reg("eax"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "ja",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(
+                DISPATCH + 0x1a,
+                "lea",
+                vec![reg("rcx"), at_address(IMAGE_BASE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x21,
+                "mov",
+                vec![reg("eax"), indexed(Some("rcx"), "rax", TABLE, None)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "add",
+                vec![reg("rax"), reg("rcx")],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2b, "jmp", vec![reg("rax")], Flow::Jmp(None)),
+        ]);
+        let table_at = IMAGE_BASE.wrapping_add(TABLE as u64);
+        let slots = |entries: [u32; 4]| {
+            move |at: u64, len: usize| {
+                (at == table_at && len == 16).then(|| {
+                    entries
+                        .iter()
+                        .flat_map(|rva| rva.to_le_bytes())
+                        .collect::<Vec<u8>>()
+                })
+            }
+        };
+
+        // Two of the four slots are the default, as in the test above.
+        let holed = jump_targets(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            slots([0x1000, 0x500, 0x500, 0x2000]),
+            in_image,
+            constant_data,
+            never,
+        );
+        assert_eq!(
+            holed.targets,
+            vec![(
+                DISPATCH + 0x2b,
+                vec![DEFAULT, IMAGE_BASE + 0x1000, IMAGE_BASE + 0x2000],
+            )],
+            "the default is where two admitted indices go, so it is an edge: {:?}",
+            holed.targets
+        );
+        assert!(holed.stopped.is_none() && !holed.bounded);
+
+        // **The control**: every admitted index has a case of its own, so nothing in range reaches
+        // the default and the walk must not be told it does.
+        let dense = jump_targets(
+            DISPATCH,
+            &block,
+            Layout::X64,
+            slots([0x1000, 0x1100, 0x1200, 0x2000]),
+            in_image,
+            constant_data,
+            never,
+        );
+        assert_eq!(
+            dense.targets,
+            vec![(
+                DISPATCH + 0x2b,
+                vec![
+                    IMAGE_BASE + 0x1000,
+                    IMAGE_BASE + 0x1100,
+                    IMAGE_BASE + 0x1200,
+                    IMAGE_BASE + 0x2000,
+                ],
+            )],
+            "no slot goes to the default here, so no edge to it: {:?}",
+            dense.targets
         );
     }
 

@@ -3822,7 +3822,7 @@ probes **once with no tables first** -- pure graph work -- so a `from` scoped pa
 already proven, pays nothing for a resolver it does not need, which is what makes the report's own
 advice to scope past the dispatch true.
 
-**And two soundness rules the later rounds drove out, both about an address the walk did not
+**And three rules the later rounds drove out, the first two about an address the walk did not
 compute itself.** A **discovered** edge is entered at its own address or not at all: a table slot, a
 call target or a tail jump that is not an instruction boundary in the listing `uf` returns is
 dropped, where it used to widen to the function entry and explore code no path reaches. The entry
@@ -3831,7 +3831,13 @@ about where to begin -- and the table slots only made it reachable from a second
 is wider than the report. And the resolver's module lookup **propagates** a failed enumeration
 rather than defaulting to an empty one: `Ok(vec![])` is a target with no modules and degrades
 correctly, while an `Err` left every switch in the walk unresolved and the report saying the graph
-was fully explored.
+was fully explored. And a table slot that goes to the switch's **default** is an edge although it is
+not a case: `Map::cases` is a list of *codes*, so `follow_table` drops those slots -- rightly, a
+rejected code published as an accepted one being what a reader would go and test -- and exporting
+that list unchanged inherited an exclusion that was never about control flow. The bounds check's own
+`ja default` is a different edge, carrying an index the switch **refused**, and a walk beginning past
+it never traverses one. Added only where a slot actually went there, since with every admitted index
+carrying a case nothing in range reaches the default.
 
 **One round was declined, and the reason is in the code because the next one will ask again.** The
 resolver propagates from a listing's entry while the walk may begin past a prologue, which reads as
