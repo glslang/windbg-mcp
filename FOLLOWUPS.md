@@ -258,11 +258,12 @@ the generation the client end speaks is the one that is in a released schema.
 - **What tasks would genuinely buy, which is one thing and not the openers.** A call that outlives
   the budget has its **answer thrown away while the work completes**: `reader`'s
   `WorkerMessage::Done` arm sends the result into a `oneshot` whose receiver went with the
-  timed-out caller, and acts on the failed send for `OPENER_JOB` alone. A `pool_census` past 300 s
-  therefore runs to the end in the worker and is reported as a timeout with nothing to collect.
-  The openers already escape this — their timeout hands back a `session_id` and `session_status`
-  resolves it — and **item 88 is what would close the rest**, with `continue_async`'s filing task
-  rather than a protocol extension.
+  timed-out caller, and acts on the failed send for `OPENER_JOB` alone. A refreshing `modules` past
+  300 s therefore runs to the end in the worker and is reported as a timeout with nothing to
+  collect — item 88 enumerates which jobs can reach that state, the allocator walks having a budget
+  of their own that stops them first. The openers already escape this — their timeout hands back a
+  `session_id` and `session_status` resolves it — and **item 88 is what would close the rest**,
+  with `continue_async`'s filing task rather than a protocol extension.
 
 - **Three things to get right, not plumbing** — the durable half of the original entry, carried
   over (the third is compressed, and its reference to item 10's worker teardown dropped now that
@@ -1807,14 +1808,35 @@ failure as expected. Which it is, and the comment there says so: *"For an ordina
 fine — removing the entry above is what mattered, and it is how the session stops counting as
 busy."*
 
-**It is fine for the session and not for the work.** A `pool_census`, a `heap_census`, a
-`crash_triage` fetching symbols or a `modules { "refresh": true }` past the 300 s
-`ENGINE_CALL_TIMEOUT` runs to completion in the worker, produces the whole answer, and has it
-dropped on the floor — the caller is told the call timed out and has no way to ask for what it
-computed. Re-running it pays the same minutes again, against a target that may have moved in
-between. The **openers** already escape this, and by exactly the mechanism worth copying: their
-timeout hands back a `session_id`, the same `Done` arm special-cases `OPENER_JOB` so the state
-settles with nobody waiting, and `session_status` answers afterwards.
+**It is fine for the session and not for the work.** A job that outruns the 300 s
+`ENGINE_CALL_TIMEOUT` and finishes anyway produces the whole answer and has it dropped on the
+floor — the caller is told the call timed out and has no way to ask for what it computed.
+Re-running it pays the same minutes again, against a target that may have moved in between. The
+**openers** already escape this, and by exactly the mechanism worth copying: their timeout hands
+back a `session_id`, the same `Done` arm special-cases `OPENER_JOB` so the state settles with
+nobody waiting, and `session_status` answers afterwards.
+
+**Which jobs can actually get there is a much shorter list than it looks, and this entry first
+named the wrong ones.** Review caught `pool_census` and `heap_census` as its headline examples:
+both go through `worker::walk_budget`, which takes the caller's remaining patience less
+`WATCHDOG_HEADROOM` and has **no floor**, so the walk stops itself and returns an *incomplete but
+delivered* answer rather than running past the deadline. That is deliberate and documented — the
+budget exists, in its own words, to prevent "a walk still running after its caller gave up", and a
+truncated walk is not even cached, so there is nothing to collect. Enumerated over `worker.rs`
+rather than argued one example at a time:
+
+  - **Bounded by `walk_budget`, so out of scope**: `EngineOp::Walk`, `IoctlMap`, `DriverSurface`,
+    `DeviceSecurity`, `DriverHazards`, `Reachability`, `Pool`, `Heap` — the eight call sites of it.
+  - **Bounded by dbgscope's watchdog**: every `BoundedCommand`. These can overrun, but only by the
+    `watchdog_budget_ms` floor — one `WATCHDOG_HEADROOM`, and deliberately, since "freeing the
+    worker 15s late still beats never".
+  - **Genuinely unbounded, and therefore what this item is about**: the typed ops that are direct
+    engine calls with nothing able to cut them short — `Modules` (item 54: `Reload("")` has no
+    wall-clock bound, and is a wait with no upper bound on 115200-baud serial), `Backtrace`,
+    `Registers`, `Disassemble` — plus `index_trace`, the one `UnboundedCommand` the coverage rule
+    exempts. `crash_triage` is the mixed case and the sharpest one: its `!analyze` is bounded, and
+    the stack walk *after* it is not, which is why `TRIAGE_READ_RESERVE` reserves time for it
+    rather than bounding it — a reservation a symbol server can still outlast.
 
 **The pattern to build it from is already here**, which is why this is worth doing without the tasks
 extension (`FOLLOWUPS.md` item 8, where the measurement says no client on this wire can drive one
@@ -1832,16 +1854,16 @@ call is the same shape with a different payload.
 - **How much of it to keep.** A stop is one `StopReport`, while these are the largest answers this
   server gives — `docs/token-budget.md`'s *Results* section and
   `tool_results_stay_within_their_budget` are where their sizes are recorded, and item 27's
-  baseline column measures one `modules` listing at 53,897 B model-visible. A per-session ring of them is a memory bound with no natural
-  size, so the store wants to be small and to **say what it dropped** rather than silently keeping
-  the last one.
+  baseline column measures one `modules` listing at 53,897 B model-visible. A per-session ring of
+  them is a memory bound with no natural size, so the store wants to be small and to **say what it
+  dropped** rather than silently keeping the last one.
 - **A late answer describes a moment, and a stale one read as current is worse than none.** This is
-  the asymmetry with a stop, which *is* a moment by construction. A census describes the target's
-  memory when the job ran, and between then and the collection an `execute`, a `go` or a
-  `continue_async` may have moved it — so the record has to carry when it was taken and what
-  happened to the session since, or a caller reads last-minute memory as present state. The
-  conservative answer may well be that a late answer is invalidated by any intervening mutation,
-  which is a rule the session already has the information to apply.
+  the asymmetry with a stop, which *is* a moment by construction. A `backtrace` or a `modules`
+  listing describes the target as it stood when the job ran, and between then and the collection an
+  `execute`, a `go` or a `continue_async` may have moved it — so the record has to carry when it
+  was taken and what happened to the session since, or a caller reads a minutes-old stack as the
+  present one. The conservative answer may well be that a late answer is invalidated by any
+  intervening mutation, which is a rule the session already has the information to apply.
 - **It must not keep the session alive.** `Session::busy` reads the waiter map *and* the execution
   slot, and `last_used` is what reclamation reads. A late-answer store that either of those noticed
   would make a session un-reclaimable for holding a result nobody asked for — the opposite of the
