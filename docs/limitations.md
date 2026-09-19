@@ -39,8 +39,11 @@
   escapes a resolver bound in the ordinary case, because the walk probes with no tables first and
   asks the resolver only where a path from the scoped start reaches an indirect jump: a handler
   past the dispatch reaches none, so nothing is resolved and no bound of the resolver's can fire.
-  Where the handler holds a switch of **its own** the resolver runs over the whole routine again and
-  the scoping buys nothing; a `from` in another function always does. `FOLLOWUPS.md` item 90. **A walk scoped that way says so**, in
+  Where the handler holds a switch of **its own** the resolver runs over the whole routine again, so
+  a cap the *dispatch's* tables spend is reported against the scoped walk — but it no longer takes
+  the handler's own switch with it: a pass that hit a cap hands over the edges it proved and says the
+  set is short, rather than discarding all of them (`FOLLOWUPS.md` item 90). A `from` in another
+  function does not pay this routine's tables at all. **A walk scoped that way says so**, in
   both channels, because the verdict depends on where it began: from one case block a sibling case
   is not reachable, so the same question asked from the function's entry is a different question.
 - That walk is bounded by **what is left of the caller's own timeout**

@@ -62,7 +62,7 @@ lost at the `add`, and an ARM64 surface a second implementation has already agre
 figure without either ever being diffed against the other. That run filed two more, both now in
 [`DONE.md`](./DONE.md) -- the literal pool the fact walk could not read (item 82, which was the
 whole of why 235 codes carried no proven size or refusal) and the switch tables the reachability
-walk did not follow while the map resolved them (item 83) — and item **89** is what item 83's own fourteen review rounds left behind, the one way a `NOT REACHABLE` can be short that the report still does not count: a switch the resolver ran on and could not answer prints *the reachable call graph was fully explored*, and item **90** from its fourth round on that same seam: the resolver reads a whole function, so the advice to scope `from` past a dispatch switch is no escape from a resolver bound. And item 87 from verifying one of the review findings on
+walk did not follow while the map resolved them (item 83) — and item **89** is what item 83's own fourteen review rounds left behind, the one way a `NOT REACHABLE` can be short that the report still does not count: a switch the resolver ran on and could not answer prints *the reachable call graph was fully explored*. And item 87 from verifying one of the review findings on
 [#347](https://github.com/glslang/windbg-mcp/pull/347), where checking which `untracked` entries
 `volmgr` actually had turned up a code the map loses beside three identical ones it keeps
 (2026-09-19).
@@ -1898,45 +1898,3 @@ difference between "resolved nothing" and "never asked".
 the prose goes — the fourth already describes an uncounted unseen edge (a branch class the decoder
 does not know) and says *"nothing in the report says so"*, which is this entry's sentence about a
 different cause.
-
-## 90. [windbg-mcp] The resolver reads a whole function, so scoping `from` does not narrow it
-
-`driver::reachability` probes with no tables first and asks `resolve_jump` only where a path from
-`start_used` met an indirect jump (`FOLLOWUPS.md` item 83). That guard is all-or-nothing: once any
-indirect jump is reached, the **whole listing** goes to `ioctl::jump_targets`, which walks it from
-the function entry. So a `from` scoped past a large dispatch switch into a handler that holds a
-switch of its own still pays for the dispatch's literal pool and tables — and if those exhaust
-`MAX_POOL_READS`, `MAX_CASES`, `MAX_TABLES` or `MAX_TABLE_ENTRIES`, `jump_targets_within` discards
-**every** target and reports `bounded`, taking the handler's own resolvable switch with it.
-
-**The advice was the visible half and is fixed; the scoping is not.** `format_report`'s two
-resolver-cap arms and `docs/limitations.md` told the reader to scope `from` past the dispatch, which
-is exactly the loop above — measured against the code rather than a target, and the test that was
-supposed to pin that advice asserted `contains("handler VA")`, a phrase the caveats boilerplate
-prints under every report, so it passed whatever those arms rendered. Both arms now say scoping
-within the routine is no escape and that a `from` in another function is, and the assertion names a
-phrase only those arms carry.
-
-**Why the rest was deferred, and why two obvious fixes are not it.** Resolving only the sites the
-probe reached needs the reachable set threaded into `jump_targets` and `follow_table` called
-selectively — but `with_pool_immediates` runs over the whole listing *before* the walk, which is
-where `MAX_POOL_READS` is spent, so site filtering does not reach the cap most likely to fire. And
-narrowing the fact propagation to `start_used` is not available at all: it is the meet over every
-entry-to-site path that makes an entry-derived table sound for a scoped start
-(`a_bound_on_one_path_is_not_a_bound_at_the_join`), and starting the walk later would take that
-away.
-
-**Not reachable on any target measured here.** `MAX_POOL_READS` is documented as far past any real
-dispatch routine, and `mountmgr`'s two 81-entry tables are the largest seen. So this is a latent
-limit whose only symptom today was the advice, and the entry exists so the next person to raise it
-finds the argument rather than the code. Raised on review of
-[#351](https://github.com/glslang/windbg-mcp/pull/351), the fourth round on this seam.
-
-**What would close it.** Either a pool phase bounded per *reachable* region rather than per listing,
-or a `cap_hit` that keeps the targets it did recover — the retained cases are a sound subset and
-`bounded` already says the set is short, so the discard is conservative beyond what soundness needs.
-The second is the smaller change and reverses a condition three review rounds put there, so it wants
-its own reading of why each of `halted`, `cap_hit` and `unsettled` discards rather than reports.
-
-**Picks up at** `ioctl::jump_targets_within`'s `bounded` early return, `ioctl::map_within`'s
-`with_pool_immediates` call, and `driver::reachability`'s `probe.met_indirect` match.
