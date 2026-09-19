@@ -1073,6 +1073,45 @@ pub(crate) fn reachability(
                 walk_function(&block, entry, &empty).expect("entry is always an instruction"),
             ),
         };
+        if !visited.insert(start_used) {
+            continue; // this (function, start) was already explored (dedupe cycles)
+        }
+        if token.is_none() {
+            rpt.from_entry = Some(entry);
+            // **Where the walk actually began, which is not always the entry.** A `from` naming a
+            // handler inside a dispatch routine scopes the intra-function walk past the switch,
+            // and the verdict depends on it: from one case block, a sibling case is *not*
+            // reachable. Reported only as the entry, an answer cannot be reproduced — a consumer
+            // re-running it from there would explore the sibling cases this walk excluded and get
+            // a different, weaker result with nothing to say why.
+            rpt.seed_start = Some(start_used);
+        }
+        rpt.funcs_explored += 1;
+        rpt.max_depth_seen = rpt.max_depth_seen.max(depth);
+
+        // **The target before the tables, because a proven path needs none.** The probe may reach
+        // the goal *and* leave another branch at an indirect jump, and resolving then spends PE,
+        // literal-pool and table reads -- up to `MAX_POOL_READS` engine round trips over KD -- on a
+        // verdict already available without the switch. Worse, it could report a resolver bound
+        // against an answer that is complete: `REACHABLE` is sound, and more edges cannot unmake a
+        // path that exists. Raised on review of #351, against the two-phase walk added one commit
+        // earlier.
+        //
+        // **After the bookkeeping above, and that ordering is the whole of getting this right.**
+        // Returned before it, the report would carry no `from_entry` -- which `worker::reachable`
+        // reads as "could not disassemble `from`" and reports as a bad symbol, sending someone to
+        // check a name that was fine. The first draft of this fix did exactly that.
+        if probe.reachable.contains(&target) {
+            rpt.blind += probe.blind;
+            rpt.verdict_reachable = true;
+            rpt.containing_fn = Some(entry);
+            rpt.path = reconstruct(&parent, token);
+            if rpt.halted.is_none() {
+                rpt.halted = halt();
+            }
+            return rpt;
+        }
+
         let walk = match probe.met_indirect {
             false => probe,
             true => {
@@ -1089,27 +1128,17 @@ pub(crate) fn reachability(
                 // Both, and the pair is the point: `bound_hit` says the graph is partial, which is
                 // true however it happened, and `tables_bounded` says the remedy is not the one
                 // `bound_hit` is rendered with.
+                // Both: `bound_hit` is the typed signal that the graph is partial -- true however it
+                // happened, and the only one this payload carries -- and `tables_bounded` decides
+                // which remedy the text gives.
                 rpt.bound_hit |= tables.bounded;
                 rpt.tables_bounded |= tables.bounded;
                 walk_function(&block, start_used, &tables)
                     .expect("the first walk proved this is an instruction")
             }
         };
-        if !visited.insert(start_used) {
-            continue; // this (function, start) was already explored (dedupe cycles)
-        }
-        if token.is_none() {
-            rpt.from_entry = Some(entry);
-            // **Where the walk actually began, which is not always the entry.** A `from` naming a
-            // handler inside a dispatch routine scopes the intra-function walk past the switch,
-            // and the verdict depends on it: from one case block, a sibling case is *not*
-            // reachable. Reported only as the entry, an answer cannot be reproduced — a consumer
-            // re-running it from there would explore the sibling cases this walk excluded and get
-            // a different, weaker result with nothing to say why.
-            rpt.seed_start = Some(start_used);
-        }
-        rpt.funcs_explored += 1;
-        rpt.max_depth_seen = rpt.max_depth_seen.max(depth);
+        // The final walk's, once: the probe's instructions are a subset of this one's, so adding
+        // both would count the unreadable ones twice.
         rpt.blind += walk.blind;
 
         if walk.reachable.contains(&target) {
@@ -3237,6 +3266,63 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             1,
             "asked once for the listing, not once per site"
         );
+    }
+
+    /// **A path proven without tables does not pay for them**, even where the function has a switch
+    /// in it.
+    ///
+    /// The probe can reach the goal *and* leave another branch at an indirect jump, and resolving
+    /// then spends PE, literal-pool and table reads -- up to `MAX_POOL_READS` engine round trips over
+    /// KD -- on a verdict already available. It could also report a resolver bound against an answer
+    /// that is complete. `REACHABLE` is sound and more edges cannot unmake a path that exists, so the
+    /// target is checked first. Raised on review of #351.
+    #[test]
+    fn a_path_proven_without_tables_does_not_resolve_any() {
+        // The entry branches: one edge is the goal, the other ends at an indirect jump.
+        let func = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Branch(Some(0x1010)), "jne 1010h"),
+                insn(0x1008, Flow::Jmp(None), "jmp qword ptr [tbl]"),
+                insn(0x1010, Flow::Return, "ret"), // the goal
+            ],
+        );
+        let m = functions(&[("start", func)]);
+        let asked = std::cell::Cell::new(0usize);
+        let mut counting = |_: &[Instruction]| {
+            asked.set(asked.get() + 1);
+            JumpTables::new(HashMap::new(), None, true)
+        };
+
+        let r = reachability(
+            "start",
+            None,
+            0x1010,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            &mut counting,
+            never,
+        );
+
+        assert!(r.verdict_reachable, "{r:?}");
+        assert_eq!(
+            asked.get(),
+            0,
+            "a proven path must not pay for a switch it did not need"
+        );
+        assert!(
+            !r.tables_bounded && !r.bound_hit,
+            "nor inherit a bound from a resolver that was never asked: {r:?}"
+        );
+        // **The bookkeeping this return skips is what makes it dangerous.** Returned before
+        // `from_entry` is set, `worker::reachable` reads the report as "could not disassemble
+        // `from`" and sends someone to check a symbol that was fine -- which the first draft of the
+        // early return did. So the fields the ordinary success path fills are asserted here too.
+        assert_eq!(r.from_entry, Some(0x1000), "{r:?}");
+        assert_eq!(r.seed_start, Some(0x1000), "{r:?}");
+        assert_eq!(r.funcs_explored, 1, "{r:?}");
+        assert_eq!(r.containing_fn, Some(0x1000), "{r:?}");
     }
 
     #[test]
