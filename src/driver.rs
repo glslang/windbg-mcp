@@ -1136,6 +1136,29 @@ pub(crate) fn format_report(r: &Report) -> String {
     out.push_str(&format!("  target : {}\n", fmt_addr(r.target)));
     if r.verdict_reachable {
         out.push_str("VERDICT: REACHABLE\n");
+        // **A stop is rendered here too, and the reason it was missing is instructive.** A halt used
+        // to be impossible on this branch: the walk polled before each function and after the queue
+        // drained, and neither poll could fire on the way to a success. Item 83's jump-table resolver
+        // changed that -- it may consume a deadline or an interrupt and return no targets, after
+        // which another branch reaches the goal on its own -- so `halted` now reaches `Report` with
+        // the verdict true, and this text said nothing about it. The structured payload carried
+        // `stopped` while the prose read as an unqualified REACHABLE, which hides a cancellation the
+        // caller asked for. Raised on review of #351.
+        //
+        // The verdict itself still stands: REACHABLE is a concrete path, and a path found is found
+        // whenever the walk stopped. What the stop qualifies is everything *else* the report implies
+        // -- that the graph was explored, and that a shorter path does not exist.
+        match r.halted {
+            Some(Halt::Deadline) => out.push_str(
+                "  Stopped: the call ran out of time — this path is real, but the graph was NOT \n\
+                 \x20          fully explored, so a shorter one may exist.\n",
+            ),
+            Some(Halt::Interrupted) => out.push_str(
+                "  Stopped: interrupted — this path is real, but the graph was NOT fully \n\
+                 \x20          explored, so a shorter one may exist.\n",
+            ),
+            None => {}
+        }
         if let Some(f) = r.containing_fn {
             out.push_str(&format!("  Containing function entry: {}\n", fmt_addr(f)));
         }
@@ -2868,6 +2891,51 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             Some(Halt::Interrupted),
             "the reason has to reach the caller: {recipes:?}"
         );
+    }
+
+    /// **A REACHABLE verdict reached after a halt says so in the text, not only in the payload.**
+    ///
+    /// `format_report` printed `Stopped` in its not-reachable branch alone, which was right for as
+    /// long as a halt could not land on the way to a success. Item 83's resolver changed that: it may
+    /// consume a deadline and return no targets while another branch reaches the goal. The structured
+    /// payload then carried `stopped` and the prose read as an unqualified `VERDICT: REACHABLE`,
+    /// hiding a cancellation the caller asked for. Raised on review of #351.
+    ///
+    /// What the stop qualifies is not the verdict -- a concrete path is real whenever the walk
+    /// stopped -- but everything else the report implies, so the assertion is that both appear.
+    #[test]
+    fn a_reachable_report_renders_a_halt() {
+        let mut r = Report {
+            verdict_reachable: true,
+            from_entry: Some(0x1000),
+            target: 0x1004,
+            containing_fn: Some(0x1000),
+            path: Vec::new(),
+            funcs_explored: 1,
+            max_depth_seen: 0,
+            bound_hit: false,
+            max_functions: 256,
+            max_depth: 32,
+            halted: Some(Halt::Interrupted),
+            blind: 0,
+            seed_start: None,
+        };
+        let text = format_report(&r);
+        assert!(text.contains("VERDICT: REACHABLE"), "{text}");
+        assert!(
+            text.contains("Stopped: interrupted"),
+            "a cancelled walk must say so on the reachable path too: {text}"
+        );
+
+        // And a deadline reads as its own reason, since the two send a caller to different places.
+        r.halted = Some(Halt::Deadline);
+        let text = format_report(&r);
+        assert!(text.contains("ran out of time"), "{text}");
+
+        // With nothing to report, nothing is added -- the ordinary answer is unchanged.
+        r.halted = None;
+        let text = format_report(&r);
+        assert!(!text.contains("Stopped:"), "{text}");
     }
 
     #[test]

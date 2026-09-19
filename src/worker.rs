@@ -8314,7 +8314,7 @@ fn ioctl_map_of(
     let constant: Vec<std::ops::Range<u64>> = holding
         .map(|module| constant_ranges(e, module))
         .unwrap_or_default();
-    let is_constant = |address: u64| constant.iter().any(|range| range.contains(&address));
+    let is_constant = |address: u64| spans_one(&constant, address, ioctl::FIELD_WIDTH.into());
     let layout = ioctl_layout(set);
     let found = ioctl::map(entry, &block, layout, read, in_image, is_constant, || {
         if let Some(why) = halted.get() {
@@ -8678,6 +8678,31 @@ fn function_listing(
     Some(in_listing_order(&listing, &mut decoded))
 }
 
+/// Whether a `len`-byte read starting at `address` lies **wholly** inside one of `ranges`.
+///
+/// **The whole span, and not its first byte.** A four-byte A64 literal beginning in the last one to
+/// three bytes of a read-only section continues into whatever follows it, and the reader is bounded
+/// to the *module* rather than to the section -- so all four bytes come back and the tail of the
+/// value is memory the driver may write. Folded, that publishes part of a runtime value as a fixed
+/// control code or refusal status, which is the whole failure this predicate exists to prevent,
+/// reached through a span the section table permits. Raised on review of #351.
+///
+/// **In one range rather than across several**, because two adjacent read-only sections are two
+/// mappings: a span that leaves the first has left the extent something vouched for, whatever
+/// happens to sit next to it in a listing of headers this module does not trust.
+///
+/// Shared by the IOCTL map and by the reachability walk's resolver, which each had their own copy of
+/// the start-address test -- and a duplicated predicate is how the two would come to disagree about
+/// which reads are constant.
+fn spans_one(ranges: &[std::ops::Range<u64>], address: u64, len: u64) -> bool {
+    let Some(end) = address.checked_add(len) else {
+        return false;
+    };
+    ranges
+        .iter()
+        .any(|range| range.contains(&address) && end <= range.end)
+}
+
 /// One module's **constant** ranges: sections the loader maps readable and the driver cannot write.
 ///
 /// What a value read out of the image has to sit in before it may be folded as a constant -- an A64
@@ -8972,7 +8997,7 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         let executable = executable_ranges(e, module);
         let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
         let constant = constant_ranges(e, module);
-        let is_constant = |address: u64| constant.iter().any(|range| range.contains(&address));
+        let is_constant = |address: u64| spans_one(&constant, address, ioctl::FIELD_WIDTH.into());
         let found = ioctl::jump_targets(entry, block, layout, read, in_image, is_constant, || {
             if let Some(why) = halted.get() {
                 return Some(why);
@@ -10068,6 +10093,44 @@ mod tests {
             stopped.get(),
             Some(structured::WalkHalt::Interrupted),
             "the break is what stopped this, and a clock reading later does not replace it"
+        );
+    }
+
+    /// **A constant read is the whole span, not its first byte.**
+    ///
+    /// A four-byte A64 literal beginning in the last one to three bytes of a read-only section
+    /// continues into whatever follows, and the reader is bounded to the *module* rather than to the
+    /// section -- so all four bytes come back and the tail is memory the driver may write. Folded,
+    /// part of a runtime value is published as a fixed control code. Raised on review of #351.
+    ///
+    /// The second case is the one a start-address test gets wrong, so both are here: a span wholly
+    /// inside is admitted, and one that begins inside and ends past the end is not. And a span
+    /// crossing from one range into an adjacent one is refused too -- two sections are two mappings,
+    /// and leaving the first means leaving the extent something vouched for.
+    #[test]
+    fn a_constant_read_must_lie_wholly_in_one_range() {
+        let ranges = vec![0x1000..0x2000, 0x2000..0x3000];
+
+        assert!(spans_one(&ranges, 0x1000, 4), "wholly inside");
+        assert!(
+            spans_one(&ranges, 0x1ffc, 4),
+            "and ending exactly at the end"
+        );
+        assert!(
+            !spans_one(&ranges, 0x1ffd, 4),
+            "a span that runs past the end is not inside it, whatever follows"
+        );
+        assert!(
+            !spans_one(&ranges, 0x1ffe, 4),
+            "including where the next range is adjacent: two sections are two mappings"
+        );
+        assert!(
+            !spans_one(&ranges, 0x0fff, 4),
+            "and one that starts before it"
+        );
+        assert!(
+            !spans_one(&ranges, u64::MAX - 1, 4),
+            "an address whose span overflows is not inside anything"
         );
     }
 
