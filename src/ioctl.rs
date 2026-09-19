@@ -572,6 +572,25 @@ const MAX_SWEEPS: usize = 32;
 /// analysis that ran out of sweeps answered with no edges and `bounded: false` -- a clean
 /// `NOT REACHABLE` about a graph whose tables were never resolved. Raised on review of #351.
 ///
+/// **Those three are the whole list, enumerated rather than discovered.** They arrived one review
+/// round at a time -- `halted`, then `cap_hit`, then `unsettled` -- which is three rounds spent on
+/// one question, so the remaining ten fields of [`Map`] were read against it in one pass. Two look
+/// relevant and are already conveyed, and saying why is the point of writing this down:
+///
+/// - [`Map::unresolved`] is a jump this pass could not follow, which is not a bound and not an
+///   error: it is the ordinary answer, and the absence of an entry for that site conveys it exactly
+///   -- the walk ends at the jump, which is what it did before any of this existed. Where an
+///   *internal limit* is what left it unresolved, `follow_table` sets `capped` on the way out
+///   (`entries > MAX_TABLE_ENTRIES`, and again on `slots`), so that case arrives as `cap_hit`.
+/// - [`Map::blind`] counts instructions that would not read or decode, each "a place a compare or a
+///   dispatch jump may be" -- so a table can be missed for want of bytes. It needs nothing here
+///   because the reachability walk reads the **same listing** and counts its own `blind` over the
+///   same instructions, reporting it in its own reply. Adding it would be the same fact twice.
+///
+/// The rest -- `cases`, `case_count`, `tables`, `untracked`, `unproved`, `code_proved`, `examined`,
+/// `dispatch` -- are about which *codes* were recovered and how well, which is a different question
+/// from where a jump goes. A code this pass could not name does not move the jump.
+///
 /// The edges in such a prefix are individually sound -- the resolver proved each one -- but a
 /// prefix is not the table, and handing one over silently lets a goal *past* it read as a clean
 /// `NOT REACHABLE`, or lets the walk reach its goal through it and answer `REACHABLE` with nothing
