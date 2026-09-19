@@ -1650,46 +1650,49 @@ literal, its `Server::started_with`, and `Server::open_session` / `tool_data`, w
 `status == "ok"` assertion that actually fired lives -- plus `main::call_timeout` and
 `ENGINE_CALL_TIMEOUT` (`src/main.rs`) for the default it is being measured against.
 
-## 87. [windbg-mcp] One `movk`-built code in four is lost, and the three beside it are not
+## 87. [windbg-mcp] A code materialised in the previous block is lost at the join
 
 **Repo:** `windbg-mcp`.
 
 `volmgr!VmDeviceControl` on the live ARM64 target compares the traced control code against four
-constants in twenty bytes, each built the same way -- `mov w9,#<low>` / `movk w9,#0x76,lsl #0x10` /
-`cmp w8,w9` / `b.eq`. Three are recovered and the fourth is not:
+constants in twenty bytes, each built the same way -- `mov w9,#<low>` /
+`movk w9,#0x76,lsl #0x10` / `cmp w8,w9` / `b.eq`. Three are recovered and the fourth is not:
 
-| site | constant | result |
-|---|---|---|
-| `volmgr+0x1cf0` | -- | case |
-| `volmgr+0x1d04` | `0x764328` | case |
-| `volmgr+0x1d18` | `0x760320` | case |
-| `volmgr+0x1d28` | `0x764324` | **absent**, site in `untracked` |
+| site | constant | branch target? | result |
+|---|---|---|---|
+| `volmgr+0x1d04` | `0x764328` | no | case |
+| `volmgr+0x1d18` | `0x760320` | no | case |
+| `volmgr+0x1d28` | `0x764324` | **yes** | **absent**, site in `untracked` |
 
-So a code this driver accepts is not in the map. It is not silently short -- `untracked` carries
-the site, which is what item 82 is about -- but the code is not named, and `volmgr` reports five
-such sites against 63 recovered cases.
+**The third column is the cause.** Something else in the routine branches to `+0x1d28`, so the
+`cmp` *begins a basic block* and the `mov`/`movk` that build `w9` are in the block before it. What
+a block knows is what every path into it agrees on, and the other path does not carry that literal
+-- so `w9` is unresolved at the compare, `compare` answers `code: None` with an `index`, and the
+site is filed in `untracked`. Measured from `uf volmgr!VmDeviceControl`: `+0x1d28` appears as a
+branch target in the listing and `+0x1d04`, `+0x1d10`, `+0x1d18` and `+0x1d20` do not.
 
-**What this is not.** Three explanations are ruled out by the table itself rather than by argument:
-it is not `movk` folding, since `0x764328` twelve bytes earlier is the same two instructions with a
-different low half; it is not the `cmp` / `b.hi` / `b.eq` split that
-`tools/ghidra_oracle/README.md` records finding on x64 `mountmgr`, because the site that *uses*
-that shape (`+0x1d04`) is one of the three that work and the failing one is a plain `cmp` / `b.eq`;
-and it is not the branch target, since `+0x1d28`'s `b.eq` goes to `+0x1ef8`, which `+0x1cf8` also
-reaches from a recovered site.
+So this is the **mirror** of the defect `tools/ghidra_oracle/README.md` records finding on x64
+`mountmgr` -- there a `cmp` / `ja` / `je` put the compare in one block and the equality in the
+next; here the compare and its branch are together and the *operand's materialisation* is in the
+block before. Same seam, opposite side, and this one is A64-shaped because A64 needs two
+instructions to build the constant at all, which gives the join something to fall between.
 
-**Why deferred:** the asymmetry is the finding and the diagnosis is the work. Nothing about the
-four sites differs in the disassembly, so this needs the walk instrumented -- what `Facts` holds
-for `w9` at each `cmp`, and which of `compare`'s guards returns `code: None` -- rather than more
-reading. That is a debugger-free experiment against a fixture, but the fixture has to be built from
-the real block sequence first, because a hand-written four-compare chain is exactly the shape that
-already passes.
+**Not silently short.** `untracked` carries the site, which is what item 82 is about, and `volmgr`
+reports five of them against 63 recovered cases. What is missing is the code's *value*.
+
+**Why deferred, and what the decision is.** The current behaviour is conservative rather than
+wrong: control really can reach `+0x1d28` by another path, and on that path `w9` may hold something
+else. The fix is not "keep the literal" -- it is deciding whether a value **every** predecessor
+sets identically may survive the join, which is a question about the merge and not about `movk`.
+Doing it wrong invents a code the driver does not accept, which is the failure mode this module
+refuses above all others. Worth doing beside item 82, which opens the same walk.
 
 **How it was found:** verifying a review finding on
 [#347](https://github.com/glslang/windbg-mcp/pull/347) that item 82 overstated its diagnostic gap.
-The finding was right, and checking *which* `untracked` entries `volmgr` had turned up a second,
-unrelated defect underneath it.
+The finding was right, and checking *which* `untracked` entries `volmgr` had turned up this
+underneath it.
 
-**Where it picks up:** `ioctl::compare` and `ioctl::movk_literal` (`src/ioctl.rs`), the
-`(Condition::Equal | Condition::NotEqual, None)` arm that files an `untracked` entry, and
-`Value::Literal`'s lifetime across a block boundary -- each of the four sites begins a block that
-the previous `b.eq` falls through into.
+**Where it picks up:** `ioctl::compare` and `scalar_of` (`src/ioctl.rs`), the
+`(Condition::Equal | Condition::NotEqual, None)` arm that files an `untracked` entry, and the
+block-entry merge that decides what `Facts` a block starts with. A fixture has to be built from the
+real block sequence -- a hand-written four-compare chain has no join in it and already passes.
