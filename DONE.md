@@ -3822,6 +3822,24 @@ probes **once with no tables first** -- pure graph work -- so a `from` scoped pa
 already proven, pays nothing for a resolver it does not need, which is what makes the report's own
 advice to scope past the dispatch true.
 
+**And two soundness rules the later rounds drove out, both about an address the walk did not
+compute itself.** A **discovered** edge is entered at its own address or not at all: a table slot, a
+call target or a tail jump that is not an instruction boundary in the listing `uf` returns is
+dropped, where it used to widen to the function entry and explore code no path reaches. The entry
+fallback is pre-existing and belongs to the *seed* -- a `from` spelled as a symbol is a question
+about where to begin -- and the table slots only made it reachable from a second source, so the fix
+is wider than the report. And the resolver's module lookup **propagates** a failed enumeration
+rather than defaulting to an empty one: `Ok(vec![])` is a target with no modules and degrades
+correctly, while an `Err` left every switch in the walk unresolved and the report saying the graph
+was fully explored.
+
+**One round was declined, and the reason is in the code because the next one will ask again.** The
+resolver propagates from a listing's entry while the walk may begin past a prologue, which reads as
+an unsound `REACHABLE` and is not one: `ioctl::Facts::join` is a **meet**, so a jump site's facts
+are the ones every entry-to-site path agrees on and a scoped start's paths are a subset of those. A
+meet over more paths drops facts rather than inventing them. `a_bound_on_one_path_is_not_a_bound_at_the_join`
+is the measurement -- backing the bound out of `join` publishes six fabricated edges.
+
 **Where it landed:** `ioctl::jump_targets` and `ioctl::Tables` (`src/ioctl.rs`),
 `driver::JumpTables`, `driver::walk_function`'s `Flow::Jmp` arm and `FnWalk::met_indirect`,
 `driver::find_path` (which needed the same edges, its own `Flow::Call` comment recording what
