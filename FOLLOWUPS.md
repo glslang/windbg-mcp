@@ -1822,21 +1822,35 @@ both go through `worker::walk_budget`, which takes the caller's remaining patien
 `WATCHDOG_HEADROOM` and has **no floor**, so the walk stops itself and returns an *incomplete but
 delivered* answer rather than running past the deadline. That is deliberate and documented — the
 budget exists, in its own words, to prevent "a walk still running after its caller gave up", and a
-truncated walk is not even cached, so there is nothing to collect. Enumerated over `worker.rs`
-rather than argued one example at a time:
+truncated walk is not even cached, so there is nothing to collect.
 
-  - **Bounded by `walk_budget`, so out of scope**: `EngineOp::Walk`, `IoctlMap`, `DriverSurface`,
-    `DeviceSecurity`, `DriverHazards`, `Reachability`, `Pool`, `Heap` — the eight call sites of it.
-  - **Bounded by dbgscope's watchdog**: every `BoundedCommand`. These can overrun, but only by the
-    `watchdog_budget_ms` floor — one `WATCHDOG_HEADROOM`, and deliberately, since "freeing the
-    worker 15s late still beats never".
-  - **Genuinely unbounded, and therefore what this item is about**: the typed ops that are direct
-    engine calls with nothing able to cut them short — `Modules` (item 54: `Reload("")` has no
-    wall-clock bound, and is a wait with no upper bound on 115200-baud serial), `Backtrace`,
-    `Registers`, `Disassemble` — plus `index_trace`, the one `UnboundedCommand` the coverage rule
-    exempts. `crash_triage` is the mixed case and the sharpest one: its `!analyze` is bounded, and
-    the stack walk *after* it is not, which is why `TRIAGE_READ_RESERVE` reserves time for it
-    rather than bounding it — a reservation a symbol server can still outlast.
+**So the set is derived rather than listed, because a list in prose drifts and `EngineOp` grows.**
+The starting point is `EngineOp::patience_slot`, which is already this crate's enumeration of what
+carries the caller's clock: the fifteen arms it returns `Some` for spend it, through
+`watchdog_budget_ms` for a command or `walk_budget` for a walk. **Two corrections to it**, and
+neither is optional — this is where a first pass at the enumeration went wrong by reading a doc
+comment's example list instead of the dispatcher:
+
+  - **It answers about a field, not about the work.** Four ops carry a clock under another name and
+    are bounded: `CommandAndWait` and `RunToAddress` (`timeout_ms`), `Resume` (`max_run_ms`, plus
+    the execution slot), `EndSession` (`END_SESSION_TIMEOUT`, 20s). `Interrupt` is answered ahead of
+    the worker's queue on `INTERRUPT_TIMEOUT`. And the six **openers** are out of scope for the
+    other reason — their timeout hands back a `session_id`.
+  - **And an op can carry a patience and still have an unbounded tail.** `CrashTriage` is that case
+    and is the sharpest example here: its `!analyze` is bounded, the stack walk *after* it is not,
+    and `TRIAGE_READ_RESERVE` therefore *reserves* time for those reads rather than bounding them —
+    a reservation a symbol server can outlast. `patience_slot` calls it bounded; half of it is.
+
+What is left is **eight of `EngineOp`'s thirty-four** arms (34 less the 15, the 6, the 4 and
+`Interrupt` — counted from `proto.rs` on 2026-09-19, and re-derivable from it rather than from this
+sentence), and they are what this item is about: `Modules`
+(item 54 — `Reload("")` has no wall-clock bound and is a wait with no upper bound on 115200-baud
+serial), `SymbolPath` (`reload_symbols` plus a raw `.sympath`, and the tool you reach for
+*because* symbols are not resolving, i.e. against the slow source), `ExceptionTriage`,
+`Backtrace`, `Registers`, `Disassemble`, `CurrentLocation`, and `UnboundedCommand` —
+`index_trace`, the one the coverage rule exempts. Review found `SymbolPath` and `ExceptionTriage`
+missing from the first version of this paragraph, which is the argument for deriving the set here
+rather than naming it.
 
 **The pattern to build it from is already here**, which is why this is worth doing without the tasks
 extension (`FOLLOWUPS.md` item 8, where the measurement says no client on this wire can drive one
