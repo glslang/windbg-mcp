@@ -8305,16 +8305,20 @@ fn ioctl_map_of(
     // out of `unresolved` and the map reading as complete. The image's own section table answers
     // it instead, and an image whose headers will not read answers `false` for everything -- no
     // table is followed there rather than every one being trusted, and the jumps say so.
-    let executable: Vec<std::ops::Range<u64>> = holding
-        .map(|module| executable_ranges(e, module))
+    //
+    // Read together with the pool's ranges, from one parse of the section table: the two questions
+    // are different -- see `image_ranges` -- and the image that answers them is the same.
+    let ranges = holding
+        .map(|module| image_ranges(e, module))
         .unwrap_or_default();
-    let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
-    // Where a literal pool may be read from, which is not the same question as where a jump-table
-    // entry may land. See `constant_ranges`.
-    let constant: Vec<std::ops::Range<u64>> = holding
-        .map(|module| constant_ranges(e, module))
-        .unwrap_or_default();
-    let is_constant = |address: u64| spans_one(&constant, address, ioctl::FIELD_WIDTH.into());
+    let in_image = |address: u64| {
+        ranges
+            .executable
+            .iter()
+            .any(|range| range.contains(&address))
+    };
+    let is_constant =
+        |address: u64| spans_one(&ranges.constant, address, ioctl::FIELD_WIDTH.into());
     let layout = ioctl_layout(set);
     let found = ioctl::map(entry, &block, layout, read, in_image, is_constant, || {
         if let Some(why) = halted.get() {
@@ -8720,10 +8724,31 @@ fn spans_one(ranges: &[std::ops::Range<u64>], address: u64, len: u64) -> bool {
 /// `IMAGE_SCN_MEM_READ` and not `IMAGE_SCN_MEM_WRITE`, spelled here because `dbgscope`'s `Section`
 /// exposes `characteristics` and an accessor for neither. The same clamp as its neighbour, for the
 /// same reason.
-fn constant_ranges(
-    e: &DebugEngine,
-    module: &dbgscope::dbgeng::Module,
-) -> Vec<std::ops::Range<u64>> {
+///
+/// Answered from the **same** read of the section table as the executable ranges below, which is
+/// what [`ImageRanges`] is for.
+#[derive(Default)]
+struct ImageRanges {
+    /// Where a jump-table entry may land: executable sections only.
+    executable: Vec<std::ops::Range<u64>>,
+    /// Where a literal pool may be read from: readable and not writable.
+    constant: Vec<std::ops::Range<u64>>,
+}
+
+/// Both range sets a table walk needs, from **one** read of the image's section table.
+///
+/// They were two functions, and each parsed the headers itself -- so every caller that needed both
+/// paid for the image twice, and every x86/x64 `ioctl_map` paid for a `constant` set that
+/// `Layout::literal_pool` guarantees nothing will read. Over KD that is engine round trips against
+/// the caller's deadline on the serialised engine thread, and in the reachability resolver it
+/// repeated per switch-bearing listing. Raised on review of #351, whose own item 82 added the
+/// second of the two.
+///
+/// Computing the unused half from sections already in hand costs nothing, which is why this is one
+/// reader rather than a gate on `literal_pool`: a gate leaves the duplicate parse standing on
+/// ARM64, where the pool is the whole point, and adds a condition to get wrong. It also leaves one
+/// clamp instead of two -- and only one of those two was ever guarded.
+fn image_ranges(e: &DebugEngine, module: &dbgscope::dbgeng::Module) -> ImageRanges {
     /// `IMAGE_SCN_MEM_READ`.
     const READ: u32 = 0x4000_0000;
     /// `IMAGE_SCN_MEM_WRITE`.
@@ -8732,10 +8757,10 @@ fn constant_ranges(
         within_module(module.base, module.size, at, len).then(|| e.read_memory(at, len).ok())?
     };
     let Ok(mut image) = pe::read_image(module.base, &mut headers) else {
-        return Vec::new();
+        return ImageRanges::default();
     };
     image.size_of_image = smaller_extent(image.size_of_image, module.size);
-    image
+    let constant = image
         .sections
         .iter()
         .filter(|section| {
@@ -8747,7 +8772,11 @@ fn constant_ranges(
             (end <= module.base.saturating_add(u64::from(image.size_of_image)))
                 .then_some(start..end)
         })
-        .collect()
+        .collect();
+    ImageRanges {
+        executable: image.executable_ranges(),
+        constant,
+    }
 }
 
 /// One module's **executable** ranges, read from the image's own section table.
@@ -8766,20 +8795,6 @@ fn constant_ranges(
 /// Shared by the IOCTL map and by the reachability walk's table resolver (`FOLLOWUPS.md` item 83)
 /// rather than written twice: the two tools now follow the same tables, and a second copy of this
 /// predicate is how they would come to disagree about which entries are code.
-fn executable_ranges(
-    e: &DebugEngine,
-    module: &dbgscope::dbgeng::Module,
-) -> Vec<std::ops::Range<u64>> {
-    let mut headers = |at: u64, len: usize| {
-        within_module(module.base, module.size, at, len).then(|| e.read_memory(at, len).ok())?
-    };
-    let Ok(mut image) = pe::read_image(module.base, &mut headers) else {
-        return Vec::new();
-    };
-    image.size_of_image = smaller_extent(image.size_of_image, module.size);
-    image.executable_ranges()
-}
-
 fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result<Output, Failed> {
     // Refused outright on an instruction set whose **flow** this build does not decode. Every
     // instruction there decodes to `Flow::Unknown`, and the walk stops at those, so the answer
@@ -9036,10 +9051,15 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         // The same two questions `ioctl_map`'s own wiring asks, and for the same reasons: where a
         // table entry may land (executable sections only -- the loader's extent admits `.rdata` and
         // the headers) and where a literal pool may be read from (readable, not writable).
-        let executable = executable_ranges(e, module);
-        let in_image = |address: u64| executable.iter().any(|range| range.contains(&address));
-        let constant = constant_ranges(e, module);
-        let is_constant = |address: u64| spans_one(&constant, address, ioctl::FIELD_WIDTH.into());
+        let ranges = image_ranges(e, module);
+        let in_image = |address: u64| {
+            ranges
+                .executable
+                .iter()
+                .any(|range| range.contains(&address))
+        };
+        let is_constant =
+            |address: u64| spans_one(&ranges.constant, address, ioctl::FIELD_WIDTH.into());
         let found = ioctl::jump_targets(entry, block, layout, read, in_image, is_constant, || {
             if let Some(why) = halted.get() {
                 return Some(why);
@@ -10248,7 +10268,7 @@ mod tests {
         //
         // One assertion now covers both readers, so the floor is the small body's rather than two
         // large ones'.
-        let walk = bodies_of(&["executable_ranges"], 300);
+        let walk = bodies_of(&["image_ranges"], 300);
         assert!(
             walk.contains("image.size_of_image = smaller_extent("),
             "the shared executable-range reader no longer clamps the image's extent to the \

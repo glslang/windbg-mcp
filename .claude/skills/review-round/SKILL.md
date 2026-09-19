@@ -64,10 +64,15 @@ So: **verify the fact against the current code, then decide the remedy yourself.
 does not make its suggested fix correct, and a confident one is not evidence of anything. Measuring
 beats arguing whenever the claim is about behaviour: most of these were settled in one experiment.
 
-**Your decline rate is a measurement, and zero is a broken instrument.**
-[#351](https://github.com/glslang/windbg-mcp/pull/351) ran to **22 findings over eleven rounds with
-not one declined**, and that was not 22 correct findings — it was a session that had stopped
-evaluating and started complying. Two that should have gone the other way:
+**Your decline rate is a measurement, and a zero reading is one to go and check.** It can be
+perfectly honest: a short run of findings that were all correct is an ordinary thing, and declining
+something to move the number would be the worst possible response to this paragraph. What it cannot
+do is *reassure* you, because a session that has stopped evaluating and started complying produces
+the same zero, and nothing about the rate itself tells the two apart. So the check is the findings
+— re-read the last few and name the premise you verified for each — not the rate.
+[#351](https://github.com/glslang/windbg-mcp/pull/351) is why the check is worth the minute: it ran
+to **22 findings over eleven rounds with not one declined**, and that was not 22 correct findings.
+Two that should have gone the other way:
 
 - A finding asked the Codex summary lookup to match the bot's login "because a pull-request author
   can add a matching comment with a false `Commit`". The author is the person running the session,
