@@ -8966,7 +8966,25 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // seven other `modules()` reads in this file do. And it is the same judgement the flow gate at
     // the top of this function makes -- an honest refusal beats a verdict shaped like an answer --
     // where a new channel would be the fourth one this PR has had to explain the remedy for.
-    let loaded = e.modules().map_err(failed)?;
+    //
+    // **But it fails only a call the failure could have changed**, which the `?` here did not: this
+    // walk needed no module table before item 83, so failing every `reachable` on an enumeration
+    // that a table-free graph never reads makes the resolver's arrival cost answers it has nothing
+    // to do with. Raised on review of #351, against the propagation added one commit earlier -- and
+    // both rounds are right about different halves, which is why this is neither the `?` nor the
+    // `unwrap_or_default` it replaced.
+    //
+    // So the `Result` is kept and consulted **where the resolver would read it**, past the guards
+    // that decide there is nothing to resolve -- a listing with no `Flow::Jmp(None)` never looks.
+    // `needed_modules` is set only where one did, and is answered after the walk: a `REACHABLE`
+    // stands whatever the resolver could not do, a concrete path being sound on its own, while a
+    // `NOT REACHABLE` would be the false completeness claim above and is refused instead. Deferring
+    // the *call* was the other way offered and buys less: the cost complained of is the failure
+    // rather than the round trip, and a cache that must also carry an error out of an `FnMut`
+    // returning `JumpTables` is machinery for a saving of one engine call on a walk that made
+    // hundreds of them.
+    let loaded = e.modules();
+    let needed_modules = std::cell::Cell::new(false);
     let layout = ioctl_layout(set);
     let mut resolve_jump = |block: &[Instruction]| -> crate::driver::JumpTables {
         if !set_reads_operands {
@@ -8993,6 +9011,15 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         {
             return crate::driver::JumpTables::default();
         }
+        // Past every guard, so this is the first point at which the enumeration is load-bearing:
+        // a listing that reaches here has an indirect jump and would have had its table read.
+        let loaded = match &loaded {
+            Ok(loaded) => loaded,
+            Err(_) => {
+                needed_modules.set(true);
+                return crate::driver::JumpTables::default();
+            }
+        };
         // The module holding *this* listing rather than the seed's: a walk that has crossed into
         // another driver must read that driver's bytes, and a reader bounded to the wrong module
         // refuses every address -- which would look like a table that would not resolve.
@@ -9048,6 +9075,29 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
         &mut resolve_jump,
         &mut halt,
     );
+
+    // **The enumeration the resolver wanted and did not get.** Read here rather than at the call
+    // above, because whether it mattered is a fact about the graph the walk found: a listing with
+    // an indirect jump had to be reached for the flag to be set at all.
+    //
+    // A `REACHABLE` stands. It names a concrete path, and a path that exists is not unmade by edges
+    // nobody could look for -- the same argument that made the walk check the target before asking
+    // for tables. Anything else would be a `NOT REACHABLE` whose four incompleteness fields are all
+    // clear while a switch it met went unresolved for a reason none of them names, so it is refused
+    // and the reason is the enumeration rather than the walk.
+    if needed_modules.get() && !rpt.verdict_reachable {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "the walk reached a jump table and the debugger could not enumerate this target's                  modules, which is what bounds a table's reads to the image holding it — so the                  switch went unresolved and a NOT REACHABLE here would not be about the whole                  graph. On a live kernel this is usually a stale module inventory: run `modules`                  with `refresh: true` and ask again. The enumeration failed with: {why}",
+                why = match &loaded {
+                    Err(why) => why.to_string(),
+                    // Unreachable: the flag is set only on the `Err` arm above.
+                    Ok(_) => "no error was recorded".to_string(),
+                },
+            ),
+        ));
+    }
 
     if rpt.from_entry.is_none() {
         // A halt outranks the symbol. The seed's own disassembly can be cut short by the deadline

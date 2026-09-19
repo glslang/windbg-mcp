@@ -3831,7 +3831,11 @@ about where to begin -- and the table slots only made it reachable from a second
 is wider than the report. And the resolver's module lookup **propagates** a failed enumeration
 rather than defaulting to an empty one: `Ok(vec![])` is a target with no modules and degrades
 correctly, while an `Err` left every switch in the walk unresolved and the report saying the graph
-was fully explored. And a table slot that goes to the switch's **default** is an edge although it is
+was fully explored. The round after that one narrowed *which* calls it fails: the enumeration is
+consulted past the guards that decide there is nothing to resolve, so a table-free walk never looks
+at it, and a `REACHABLE` stands whatever the resolver could not do. Both rounds are right about
+different halves -- do not swallow the error, and do not charge it to a walk that never needed
+one. And a table slot that goes to the switch's **default** is an edge although it is
 not a case: `Map::cases` is a list of *codes*, so `follow_table` drops those slots -- rightly, a
 rejected code published as an accepted one being what a reader would go and test -- and exporting
 that list unchanged inherited an exclusion that was never about control flow. The bounds check's own
