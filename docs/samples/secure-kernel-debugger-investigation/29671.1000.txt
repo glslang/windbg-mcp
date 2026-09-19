@@ -1,0 +1,158 @@
+Offline securekernel.exe function excerpts, file version 10.0.29671.1000
+Addresses are offline image addresses, not captured live target addresses.
+Headers, local paths, prompts and unrelated disassembly have been omitted.
+
+securekernel!SkdInitSystem:
+00000001`400a387c 4883ec28        sub     rsp,28h
+00000001`400a3880 85c9            test    ecx,ecx
+00000001`400a3882 7505            jne     securekernel!SkdInitSystem+0xd (00000001`400a3889)
+
+securekernel!SkdInitSystem+0x8:
+00000001`400a3884 e8b3fdffff      call    securekernel!SkdInitDebuggerDataBlock (00000001`400a363c)
+
+securekernel!SkdInitSystem+0xd:
+00000001`400a3889 33c0            xor     eax,eax
+00000001`400a388b 4883c428        add     rsp,28h
+00000001`400a388f c3              ret
+
+securekernel!SkdInitDebuggerDataBlock:
+00000001`400a363c 488d057df50900  lea     rax,[securekernel!KdDebuggerDataBlock (00000001`40142bc0)]
+00000001`400a3643 c70583f509004b444247 mov dword ptr [securekernel!KdDebuggerDataBlock+0x10 (00000001`40142bd0)],4742444Bh
+00000001`400a364d 4889054cf50900  mov     qword ptr [securekernel!KdpDebuggerDataListHead (00000001`40142ba0)],rax
+00000001`400a3654 488d0d45f50900  lea     rcx,[securekernel!KdpDebuggerDataListHead (00000001`40142ba0)]
+00000001`400a365b 48890546f50900  mov     qword ptr [securekernel!KdpDebuggerDataListHead+0x8 (00000001`40142ba8)],rax
+00000001`400a3662 4533db          xor     r11d,r11d
+00000001`400a3665 488d05543e0600  lea     rax,[securekernel!SkBuildLab (00000001`401074c0)]
+00000001`400a366c c7055ef50900a8030000 mov dword ptr [securekernel!KdDebuggerDataBlock+0x14 (00000001`40142bd4)],3A8h
+00000001`400a3676 4889054bf70900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x208 (00000001`40142dc8)],rax
+00000001`400a367d 8b05a1890b00    mov     eax,dword ptr [securekernel!SkmiPteSwizzleBit (00000001`4015c024)]
+00000001`400a3683 48890d36f50900  mov     qword ptr [securekernel!KdDebuggerDataBlock (00000001`40142bc0)],rcx
+00000001`400a368a 48890d37f50900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x8 (00000001`40142bc8)],rcx
+00000001`400a3691 85c0            test    eax,eax
+00000001`400a3693 740f            je      securekernel!SkdInitDebuggerDataBlock+0x68 (00000001`400a36a4)
+
+securekernel!SkdInitDebuggerDataBlock+0x59:
+00000001`400a3695 8805e7f70900    mov     byte ptr [securekernel!KdDebuggerDataBlock+0x2c2 (00000001`40142e82)],al
+00000001`400a369b c605e1f7090002  mov     byte ptr [securekernel!KdDebuggerDataBlock+0x2c3 (00000001`40142e83)],2
+00000001`400a36a2 eb08            jmp     securekernel!SkdInitDebuggerDataBlock+0x70 (00000001`400a36ac)
+
+securekernel!SkdInitDebuggerDataBlock+0x68:
+00000001`400a36a4 6644891dd6f70900 mov     word ptr [securekernel!KdDebuggerDataBlock+0x2c2 (00000001`40142e82)],r11w
+
+securekernel!SkdInitDebuggerDataBlock+0x70:
+00000001`400a36ac 8b05a6570900    mov     eax,dword ptr [securekernel!SkBuildNumber (00000001`40138e58)]
+00000001`400a36b2 4c8d15b7320900  lea     r10,[securekernel!SkLoadedModuleList (00000001`40136970)]
+00000001`400a36b9 668905c2f80900  mov     word ptr [securekernel!KdVersionBlock+0x2 (00000001`40142f82)],ax
+00000001`400a36c0 41b950000000    mov     r9d,50h
+00000001`400a36c6 c1e81c          shr     eax,1Ch
+00000001`400a36c9 668905b0f80900  mov     word ptr [securekernel!KdVersionBlock (00000001`40142f80)],ax
+00000001`400a36d0 488d05895ef8ff  lea     rax,[securekernel!DbgBreakPointWithStatus (00000001`40029560)]
+00000001`400a36d7 48890502f50900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x20 (00000001`40142be0)],rax
+00000001`400a36de 488b05abf80900  mov     rax,qword ptr [securekernel!KdVersionBlock+0x10 (00000001`40142f90)]
+00000001`400a36e5 488905ecf40900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x18 (00000001`40142bd8)],rax
+00000001`400a36ec 488d054d0c0a00  lea     rax,[securekernel!SkiBugCheckData (00000001`40144340)]
+00000001`400a36f3 4889054ef50900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x88 (00000001`40142c48)],rax
+00000001`400a36fa b8780a0000      mov     eax,0A78h
+00000001`400a36ff 6689056ef70900  mov     word ptr [securekernel!KdDebuggerDataBlock+0x2b4 (00000001`40142e74)],ax
+00000001`400a3706 b8e8030000      mov     eax,3E8h
+00000001`400a370b 668905e6f70900  mov     word ptr [securekernel!KdDebuggerDataBlock+0x338 (00000001`40142ef8)],ax
+00000001`400a3712 488d056f570900  lea     rax,[securekernel!SkmmHighestUserAddress (00000001`40138e88)]
+00000001`400a3719 48890568f60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x1c8 (00000001`40142d88)],rax
+00000001`400a3720 488d0559570900  lea     rax,[securekernel!SkmmSystemRangeStart (00000001`40138e80)]
+00000001`400a3727 48890562f60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x1d0 (00000001`40142d90)],rax
+00000001`400a372e 488d0543570900  lea     rax,[securekernel!SkmmUserProbeAddress (00000001`40138e78)]
+00000001`400a3735 4889055cf60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x1d8 (00000001`40142d98)],rax
+00000001`400a373c 488d05add40b00  lea     rax,[securekernel!SkeProcessorBlock (00000001`40160bf0)]
+00000001`400a3743 4889058ef60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x218 (00000001`40142dd8)],rax
+00000001`400a374a 488d05efbb0b00  lea     rax,[securekernel!SkmmPhysicalMemoryBlock (00000001`4015f340)]
+00000001`400a3751 48890d48f80900  mov     qword ptr [securekernel!KdVersionBlock+0x20 (00000001`40142fa0)],rcx
+00000001`400a3758 418d4950        lea     ecx,[r9+50h]
+00000001`400a375c 488905cdf60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x270 (00000001`40142e30)],rax
+00000001`400a3763 c70517f8090006020700 mov dword ptr [securekernel!KdVersionBlock+0x4 (00000001`40142f84)],70206h
+00000001`400a376d c70511f8090064860c03 mov dword ptr [securekernel!KdVersionBlock+0x8 (00000001`40142f88)],30C8664h
+00000001`400a3777 c6050ef8090033  mov     byte ptr [securekernel!KdVersionBlock+0xc (00000001`40142f8c)],33h
+00000001`400a377e 4c891513f80900  mov     qword ptr [securekernel!KdVersionBlock+0x18 (00000001`40142f98)],r10
+00000001`400a3785 4c89157cf40900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x48 (00000001`40142c08)],r10
+00000001`400a378c c705c6f6090080007000 mov dword ptr [securekernel!KdDebuggerDataBlock+0x29c (00000001`40142e5c)],700080h
+00000001`400a3796 6644890dc2f60900 mov     word ptr [securekernel!KdDebuggerDataBlock+0x2a0 (00000001`40142e60)],r9w
+00000001`400a379e 66890db5f60900  mov     word ptr [securekernel!KdDebuggerDataBlock+0x29a (00000001`40142e5a)],cx
+00000001`400a37a5 c705b9f60900f000a000 mov dword ptr [securekernel!KdDebuggerDataBlock+0x2a8 (00000001`40142e68)],0A000F0h
+00000001`400a37af c705b5f609004000400d mov dword ptr [securekernel!KdDebuggerDataBlock+0x2ae (00000001`40142e6e)],0D400040h
+00000001`400a37b9 c705b9f609000005b400 mov dword ptr [securekernel!KdDebuggerDataBlock+0x2bc (00000001`40142e7c)],0B40500h
+00000001`400a37c3 48c705d2f60900400d0000 mov qword ptr [securekernel!KdDebuggerDataBlock+0x2e0 (00000001`40142ea0)],0D40h
+00000001`400a37ce c705daf60900f0031000 mov dword ptr [securekernel!KdDebuggerDataBlock+0x2f2 (00000001`40142eb2)],1003F0h
+00000001`400a37d8 48c70515f5090000100000 mov qword ptr [securekernel!KdDebuggerDataBlock+0x138 (00000001`40142cf8)],1000h
+00000001`400a37e3 48b80000000080f6ffff mov rax,0FFFFF68000000000h
+00000001`400a37ed 4889052cf70900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x360 (00000001`40142f20)],rax
+00000001`400a37f4 418d51c0        lea     edx,[r9-40h]
+00000001`400a37f8 0fb705f7f30900  movzx   eax,word ptr [securekernel!KdDebuggerDataBlock+0x36 (00000001`40142bf6)]
+00000001`400a37ff b9d3ff0000      mov     ecx,0FFD3h
+00000001`400a3804 6623c1          and     ax,cx
+00000001`400a3807 c705a5f6090018000000 mov dword ptr [securekernel!KdDebuggerDataBlock+0x2f6 (00000001`40142eb6)],18h
+00000001`400a3811 660bc2          or      ax,dx
+00000001`400a3814 48c7059bf6090030002800 mov qword ptr [securekernel!KdDebuggerDataBlock+0x2fa (00000001`40142eba)],280030h
+00000001`400a381f 668905d0f30900  mov     word ptr [securekernel!KdDebuggerDataBlock+0x36 (00000001`40142bf6)],ax
+00000001`400a3826 488b0543310900  mov     rax,qword ptr [securekernel!SkLoadedModuleList (00000001`40136970)]
+00000001`400a382d c7058bf6090040002000 mov dword ptr [securekernel!KdDebuggerDataBlock+0x302 (00000001`40142ec2)],200040h
+00000001`400a3837 6644890d87f60900 mov     word ptr [securekernel!KdDebuggerDataBlock+0x306 (00000001`40142ec6)],r9w
+00000001`400a383f 6644891df5f60900 mov     word ptr [securekernel!KdDebuggerDataBlock+0x37c (00000001`40142f3c)],r11w
+00000001`400a3847 4c891df2f60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x380 (00000001`40142f40)],r11
+00000001`400a384e 4c891df3f60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x388 (00000001`40142f48)],r11
+00000001`400a3855 4c891df4f60900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x390 (00000001`40142f50)],r11
+00000001`400a385c 493bc2          cmp     rax,r10
+00000001`400a385f 7412            je      securekernel!SkdInitDebuggerDataBlock+0x237 (00000001`400a3873)
+
+securekernel!SkdInitDebuggerDataBlock+0x225:
+00000001`400a3861 488b4030        mov     rax,qword ptr [rax+30h]
+00000001`400a3865 48890524f70900  mov     qword ptr [securekernel!KdVersionBlock+0x10 (00000001`40142f90)],rax
+00000001`400a386c 48890565f30900  mov     qword ptr [securekernel!KdDebuggerDataBlock+0x18 (00000001`40142bd8)],rax
+
+securekernel!SkdInitDebuggerDataBlock+0x237:
+00000001`400a3873 c3              ret
+
+securekernel!IumpReadSecureKernelDebuggerInfo:
+00000001`4002c464 44884c2420      mov     byte ptr [rsp+20h],r9b
+00000001`4002c469 4883ec38        sub     rsp,38h
+00000001`4002c46d 498bc0          mov     rax,r8
+00000001`4002c470 4533c0          xor     r8d,r8d
+00000001`4002c473 664489442448    mov     word ptr [rsp+48h],r8w
+00000001`4002c479 448844244a      mov     byte ptr [rsp+4Ah],r8b
+00000001`4002c47e 41b803000000    mov     r8d,3
+00000001`4002c484 4885c0          test    rax,rax
+00000001`4002c487 7403            je      securekernel!IumpReadSecureKernelDebuggerInfo+0x28 (00000001`4002c48c)
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x25:
+00000001`4002c489 448900          mov     dword ptr [rax],r8d
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x28:
+00000001`4002c48c 413bd0          cmp     edx,r8d
+00000001`4002c48f 7307            jae     securekernel!IumpReadSecureKernelDebuggerInfo+0x34 (00000001`4002c498)
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x2d:
+00000001`4002c491 b8040000c0      mov     eax,0C0000004h
+00000001`4002c496 eb22            jmp     securekernel!IumpReadSecureKernelDebuggerInfo+0x56 (00000001`4002c4ba)
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x34:
+00000001`4002c498 488d542448      lea     rdx,[rsp+48h]
+00000001`4002c49d 4584c9          test    r9b,r9b
+00000001`4002c4a0 7407            je      securekernel!IumpReadSecureKernelDebuggerInfo+0x45 (00000001`4002c4a9)
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x3e:
+00000001`4002c4a2 e801990c00      call    securekernel!RtlCopyToUser (00000001`400f5da8)
+00000001`4002c4a7 eb05            jmp     securekernel!IumpReadSecureKernelDebuggerInfo+0x4a (00000001`4002c4ae)
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x45:
+00000001`4002c4a9 e8820e0c00      call    securekernel!RtlCopyVolatileMemory (00000001`400ed330)
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x4a:
+00000001`4002c4ae 33c0            xor     eax,eax
+00000001`4002c4b0 89442424        mov     dword ptr [rsp+24h],eax
+00000001`4002c4b4 eb04            jmp     securekernel!IumpReadSecureKernelDebuggerInfo+0x56 (00000001`4002c4ba)
+
+securekernel!IumpReadSecureKernelDebuggerInfo+0x56:
+00000001`4002c4ba 4883c438        add     rsp,38h
+00000001`4002c4be c3              ret
+
+securekernel!IumpDebugBreakRequestedByVtl0:
+00000001`4002ed60 33c0            xor     eax,eax
+00000001`4002ed62 c3              ret
