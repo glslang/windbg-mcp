@@ -866,6 +866,11 @@ pub struct ConnectionArgs {
     /// exist, so guessing costs one call rather than a leaked key.
     #[serde(default)]
     pub profile: Option<String>,
+    /// Experimental KDNET lab mode: request one break on DbgEng's English connection
+    /// announcement, without INITIAL_BREAK or the extra attach resume. Only for a known-running
+    /// hypervisor target; text-dependent, not a readiness guarantee. Default false.
+    #[serde(default)]
+    pub experimental_break_on_connect: bool,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2480,11 +2485,27 @@ impl WindbgServer {
                 return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
             }
         };
+        if args.experimental_break_on_connect
+            && !selected
+                .connection
+                .expose()
+                .as_bytes()
+                .get(..4)
+                .is_some_and(|p| p.eq_ignore_ascii_case(b"net:"))
+        {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                "experimental_break_on_connect requires a KDNET connection".into(),
+                None,
+                TargetCreated::No,
+            );
+        }
         self.opened(
             SessionKind::Kernel,
             selected.label,
             EngineOp::AttachKernel {
                 connection: selected.connection,
+                experimental_break_on_connect: args.experimental_break_on_connect,
             },
         )
         .await
@@ -5356,6 +5377,18 @@ fn text_of(result: &CallToolResult) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kernel_announcement_attach_requires_explicit_opt_in() {
+        let default: ConnectionArgs =
+            serde_json::from_value(serde_json::json!({"profile":"lab"})).unwrap();
+        assert!(!default.experimental_break_on_connect);
+        let experimental: ConnectionArgs = serde_json::from_value(
+            serde_json::json!({"profile":"lab", "experimental_break_on_connect":true}),
+        )
+        .unwrap();
+        assert!(experimental.experimental_break_on_connect);
+    }
 
     /// A reachability bound is capped and never raised.
     ///

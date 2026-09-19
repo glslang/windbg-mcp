@@ -1596,7 +1596,10 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             || kernel_report(e),
         ),
 
-        EngineOp::AttachKernel { connection } => open(
+        EngineOp::AttachKernel {
+            connection,
+            experimental_break_on_connect,
+        } => open(
             e,
             id,
             |commit| {
@@ -1607,9 +1610,13 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // This `wait` is the one that can never return: `SetInterrupt` cannot reach a
                 // wait still establishing the link, so a guest that never dials in parks here
                 // for good. It parks *this process*, which the supervisor can kill.
-                // The one place the key is unwrapped, and the last: it goes straight into
-                // DbgEng. Everything else that touches this value renders it redacted.
-                let pending = e.attach_kernel_begin(connection.expose()).map_err(es)?;
+                // Unwrap only for the typed attach call; never log the exposed connection.
+                let pending = if experimental_break_on_connect {
+                    e.attach_kernel_announcement_begin(connection.expose())
+                } else {
+                    e.attach_kernel_begin(connection.expose())
+                }
+                .map_err(es)?;
                 commit();
                 pending.wait().map_err(es)
             },
@@ -10576,6 +10583,7 @@ mod tests {
             (
                 EngineOp::AttachKernel {
                     connection: crate::kdconn::Connection::new("net:port=50000,key=1.2.3.4"),
+                    experimental_break_on_connect: false,
                 },
                 Some(TargetOrigin::Kernel),
             ),

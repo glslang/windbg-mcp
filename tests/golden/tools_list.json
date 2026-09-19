@@ -35,6 +35,7 @@
       },
       "params": [
         "connection: string|null",
+        "experimental_break_on_connect: boolean",
         "profile: string|null"
       ],
       "required": [],
