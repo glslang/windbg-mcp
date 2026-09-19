@@ -179,6 +179,14 @@ acknowledged continue from the candidate itself, followed by additional stops on
 Two sequential native recovery sessions were needed for that run. This narrows the investigation
 to break-in/stop handling but does not establish a safe replacement sequence.
 
+Further [post-synchronization comparisons](hypervisor-detach-trace.md#post-synchronization-break-comparison)
+passed twice with native KD and three times with the same candidate's typed teardown. Each run
+connected without requesting an initial break, verified synchronization and guest health, then
+requested one break before detaching. Independent WinRM checks confirmed stable boot time and
+advancing uptime after every run. These comparisons bypassed the server's automatic attach helper
+and its unconditional artifact-absorption `g`; that production path is unchanged and still requires
+a fix and validation. No reset, reboot, or VELKO configuration change was needed for the comparisons.
+
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
 stepping and breakpoint management remain unvalidated by this implementation run. Live NT and

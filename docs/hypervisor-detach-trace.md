@@ -3,6 +3,9 @@
 The candidate **does send a continue packet**. In this reproduction the hypervisor acknowledged
 it, yet the guest remained unavailable until additional stops were released. Safe detach remains
 unresolved; the working hypothesis is repeated break-in stops, not an omitted continue.
+Later controlled comparisons below passed twice with native KD and three times with the
+candidate's typed teardown when a single break was requested **after synchronization**. Those
+comparisons bypassed the server's automatic attach helper; they do not validate that helper.
 
 ## Scope and instrumentation
 
@@ -62,11 +65,73 @@ behavior. The packet trace shows that this does not establish a clean final stop
 hypervisor run. The test name means the initial stop *returned by the attach helper*, not that
 no resume happened inside attach.
 
-Next, isolate the initial-break requests from the target's subsequent stops: compare attach-time
-initial break with a controlled post-synchronization break, and retain event/processor evidence
-through resume. Do not implement a fixed count of resumes from this four-CPU observation, skip
+The follow-up below isolates initial-break requests from subsequent stops by comparing attach-time
+initial break with a controlled post-synchronization break. Do not implement a fixed count of resumes from this four-CPU observation, skip
 unknown exception events, patch PCs by an assumed RVA, or add an unbounded teardown wait. Live
 NT behavior and owning-engine drop still require separate validation before changing shared code.
+
+## Post-synchronization break comparison
+
+The same guest and boot were retained. Native KD was started without `-bonc` and without an
+explicit-target poke. Its trace reached `Target synchronized successfully`, then waited for a
+state-change packet. WinRM still answered at that point: synchronizing alone had not made the
+guest unavailable. One Ctrl+F request was then sent through the controller's stdin. At the resulting
+prompt, `.lastevent;bl;qd` recorded the event and breakpoint list before detaching. This was repeated
+with a fresh controller only after independent guest-health checks passed.
+
+Both native runs logged exactly one `Send Break in ...`. Their stop was the same first-chance
+`0x80000003` at `hv+0x404a60`; each `qd` produced an acknowledged `DbgKdContinue(10002)` and
+exited 0. The trace's earlier `Kd sync initial break: on` message also appeared **without**
+`-bonc`; that text alone is not evidence that a break-in packet was sent.
+
+A local Rust probe then tested the candidate teardown without the native KD frontend. It linked
+the pinned dbgscope `16403fa` artifact and loaded the same DbgEng 10.0.29617.1000. Its sequence was:
+
+1. Create the client and a borrowed `DebugEngine`, install diagnostic output, and remove
+   `DEBUG_ENGOPT_INITIAL_BREAK` on the engine thread.
+2. Call `AttachKernel(DEBUG_ATTACH_KERNEL_CONNECTION, ...)`, retaining the connection buffer
+   through teardown, and call `engine.wait_for_event(u32::MAX)` on that thread. This intentionally
+   bypasses `attach_kernel` and its artifact-absorption `g`.
+3. After manually observing transport synchronization and checking WinRM, create a one-use local
+   control file. A reader thread calls the existing `InterruptHandle::interrupt()` once and exits.
+   Only `SetInterrupt` crosses the engine thread boundary, as permitted by its
+   [documented threading contract](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugcontrol-setinterrupt).
+4. Record the typed wait outcome, execution status, processor, instruction pointer, last event,
+   and breakpoint list. Call the unchanged candidate `engine.end_session()` on the engine thread.
+5. Check guest identity, unchanged boot time, and advancing uptime twice through WinRM before
+   opening another controller.
+
+The first probe initially received no packets because its new executable path had inbound block
+rules on the workspace's Public profile. The owner approved its network-access prompt; the same
+waiting probe then synchronized. No agent-created firewall rule or VELKO change was needed. This
+pre-connection wait is not a detach failure.
+
+| Controller | Stop CPU | Break-in sends | Post-detach uptime samples (seconds) |
+|---|---|---|---|
+| Native KD, first comparison | 0 | 1 | 2899.17 → 2902.49 |
+| Native KD, second comparison | 2 | 1 | 2984.48 → 2987.78 |
+| Typed teardown probe, first comparison | 0 | 1 | 3245.93 → 3249.24 |
+| Typed teardown probe, second comparison | 1 | 1 | 3318.32 → 3321.61 |
+| Typed teardown probe, third comparison | 3 | 1 | 3371.17 → 3374.48 |
+
+Each typed probe returned `OnRequest` from the wait, `DEBUG_STATUS_BREAK` before teardown, an
+empty breakpoint list, `Ok(KernelRunning)` from `end_session`, and `DEBUG_STATUS_NO_DEBUGGEE`
+afterward. All three stopped at the same first-chance exception address as the native comparisons.
+Their independent health checks passed; no reboot or recovery attachment was needed. No controller
+remained on the hypervisor endpoint afterward.
+
+This strengthens the hypothesis that attach-time break delivery contributes to the failure. It
+does not prove a one-to-one relationship between sent packets and later processor stops. The
+comparison also bypassed the attach helper's automatic `g`, so initial-break timing and artifact
+absorption have not yet been isolated from each other. The typed probes' console callbacks were
+replaced internally during teardown: their recorded teardown result is API-level evidence plus
+independent health, not an additional complete packet trace of `qd`.
+
+**The production attach path is unchanged and remains unvalidated.** A next implementation needs
+an explicit break policy and a defensible connection-readiness signal; this manual experiment
+does not justify a fixed sleep, a fixed number of resumes, or parsing diagnostic text as a shipped
+transport contract. The probe's infinite wait is a controlled diagnostic, not a new bounded-wait
+guarantee. Stepping, breakpoint hits, live NT teardown, and owning-engine drop remain separate tests.
 
 ## Local evidence index
 
@@ -76,3 +141,9 @@ These filenames identify the retained bench artifacts, not portable repository i
 - `traced-detach-20260919-143832.jsonl`: MCP reports for that candidate session.
 - `native-hv-recovery-20260919-143913.log`: CPU-1 recovery, followed by failed WinRM check.
 - `native-hv-recovery-20260919-144042.log`: CPU-2 recovery without `-bonc`, followed by successful health checks.
+- `native-hv-recovery-20260919-144633.log`: first synchronized-then-break native comparison.
+- `native-hv-recovery-20260919-145033.log`: second native comparison.
+- `hv_synchronized_detach_probe.rs` and `run-synchronized-detach-probe.ps1`: local diagnostic source and redacting runner.
+- `synchronized-detach-probe-20260919-145358.log`: first typed comparison, including the firewall delay.
+- `synchronized-detach-probe-20260919-145628.log`: second typed comparison.
+- `synchronized-detach-probe-20260919-145720.log`: third typed comparison.
