@@ -2897,55 +2897,56 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
     ///
     /// The success path is a `return` of its own, so the poll at the top of the queue loop is behind
     /// it and the poll after the queue drains is never reached from it. A halt landing *during* the
-    /// walk that finds the target therefore produced `verdict_reachable: true` with `halted: None` --
-    /// a report saying the reachable call graph was explored when it had been stopped.
+    /// walk therefore produced `verdict_reachable: true` with `halted: None` -- a report saying the
+    /// reachable call graph was explored when it had been stopped.
     ///
-    /// The path that makes it reachable rather than theoretical is item 83's jump-table resolver: it
-    /// may consume a deadline or an interrupt, file it, and return no targets, after which another
-    /// branch of the same function reaches the goal on its own. So the resolver here halts and
-    /// resolves nothing, while a plain conditional branch leads to the target. Raised on review of
-    /// #351.
+    /// **The scenario is across two functions, and that is not a detail.** It was one function
+    /// originally -- a halting resolver beside a branch that reached the goal -- and the target is
+    /// now checked *before* the tables, so that walk returns without ever asking the resolver and
+    /// there is no halt to lose. Correct, and it left the test asserting a state the code can no
+    /// longer reach. What remains reachable is the cross-function case: the resolver halts on the
+    /// seed's own tables, the walk follows a call out of it, and the callee reaches the goal on its
+    /// own. That is the shape here.
     #[test]
     fn a_reachable_verdict_reports_a_halt_the_resolver_consumed() {
-        // Entry falls through to a branch; the taken edge reaches the goal, and the block after it
-        // ends in an indirect jump the resolver is asked about.
-        let func = uf_fn(
+        // The seed: calls a helper, and ends at an indirect jump the resolver is asked about. The
+        // goal is in the helper, so the seed's own walk cannot find it.
+        let seed = uf_fn(
             0x1000,
             vec![
-                insn(0x1004, Flow::Branch(Some(0x1010)), "jne 1010h"),
+                insn(0x1004, Flow::Call(Some(0x2000)), "call 2000h"),
                 insn(0x1008, Flow::Jmp(None), "jmp qword ptr [tbl]"),
-                insn(0x1010, Flow::Return, "ret"), // the goal
             ],
         );
-        let mut uf = |a: &str| (a == "0x1000").then(|| func.clone());
+        let helper = uf_fn(0x2000, vec![insn(0x2004, Flow::Return, "ret")]);
+        let m = functions(&[("start", seed), ("0x2000", helper)]);
+
         // Consumes the halt the way the worker's resolver does: it reports the reason in the tables
         // rather than leaving it for a poll, because the poll behind it is a consuming read.
-        let asked = std::cell::Cell::new(false);
+        let asked = std::cell::Cell::new(0usize);
         let mut resolve = |_: &[Instruction]| {
-            asked.set(true);
+            asked.set(asked.get() + 1);
             JumpTables::new(HashMap::new(), Some(Halt::Deadline), false)
         };
         // Answers nothing, which is the point: the halt must arrive from the tables.
         let mut halt = || None;
 
         let r = reachability(
-            "0x1000",
-            Some(0x1000),
-            0x1010,
+            "start",
+            None,
+            0x2004,
             256,
             32,
-            &mut uf,
+            |a| m.get(a).cloned(),
             &mut resolve,
             &mut halt,
         );
 
-        assert!(
-            r.verdict_reachable,
-            "the branch reaches the goal on its own"
-        );
-        assert!(
+        assert!(r.verdict_reachable, "the helper reaches the goal: {r:?}");
+        assert_eq!(
             asked.get(),
-            "and the resolver was asked, so a halt was consumed"
+            1,
+            "the seed's indirect jump is what the resolver was asked about"
         );
         assert_eq!(
             r.halted,
