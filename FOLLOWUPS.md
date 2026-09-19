@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-five clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, in twenty-six clusters: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9 and 11 from surveying this server against
 the MCP `2026-07-28` extensions (tasks, apps), item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
@@ -60,7 +60,9 @@ resolves, an `adrp`+`add` table base lost at the `add`, and an ARM64 surface a s
 implementation has already agreed with figure for figure without either ever being diffed against
 the other. And item 86 from that PR's own CI, where a
 Markdown-only diff went red on a test that caps the whole server to 60s and then opens a dump
-under it (2026-09-19).
+under it (2026-09-19). And item 87 from verifying one of that PR's review
+findings, where checking which `untracked` entries `volmgr` actually had turned up a code the map
+loses beside three identical ones it keeps (2026-09-19).
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1647,3 +1649,47 @@ allowance means a second env var, which is surface added to make a test pass.
 literal, its `Server::started_with`, and `Server::open_session` / `tool_data`, where the
 `status == "ok"` assertion that actually fired lives -- plus `main::call_timeout` and
 `ENGINE_CALL_TIMEOUT` (`src/main.rs`) for the default it is being measured against.
+
+## 87. [windbg-mcp] One `movk`-built code in four is lost, and the three beside it are not
+
+**Repo:** `windbg-mcp`.
+
+`volmgr!VmDeviceControl` on the live ARM64 target compares the traced control code against four
+constants in twenty bytes, each built the same way -- `mov w9,#<low>` / `movk w9,#0x76,lsl #0x10` /
+`cmp w8,w9` / `b.eq`. Three are recovered and the fourth is not:
+
+| site | constant | result |
+|---|---|---|
+| `volmgr+0x1cf0` | -- | case |
+| `volmgr+0x1d04` | `0x764328` | case |
+| `volmgr+0x1d18` | `0x760320` | case |
+| `volmgr+0x1d28` | `0x764324` | **absent**, site in `untracked` |
+
+So a code this driver accepts is not in the map. It is not silently short -- `untracked` carries
+the site, which is what item 82 is about -- but the code is not named, and `volmgr` reports five
+such sites against 63 recovered cases.
+
+**What this is not.** Three explanations are ruled out by the table itself rather than by argument:
+it is not `movk` folding, since `0x764328` twelve bytes earlier is the same two instructions with a
+different low half; it is not the `cmp` / `b.hi` / `b.eq` split that
+`tools/ghidra_oracle/README.md` records finding on x64 `mountmgr`, because the site that *uses*
+that shape (`+0x1d04`) is one of the three that work and the failing one is a plain `cmp` / `b.eq`;
+and it is not the branch target, since `+0x1d28`'s `b.eq` goes to `+0x1ef8`, which `+0x1cf8` also
+reaches from a recovered site.
+
+**Why deferred:** the asymmetry is the finding and the diagnosis is the work. Nothing about the
+four sites differs in the disassembly, so this needs the walk instrumented -- what `Facts` holds
+for `w9` at each `cmp`, and which of `compare`'s guards returns `code: None` -- rather than more
+reading. That is a debugger-free experiment against a fixture, but the fixture has to be built from
+the real block sequence first, because a hand-written four-compare chain is exactly the shape that
+already passes.
+
+**How it was found:** verifying a review finding on
+[#347](https://github.com/glslang/windbg-mcp/pull/347) that item 82 overstated its diagnostic gap.
+The finding was right, and checking *which* `untracked` entries `volmgr` had turned up a second,
+unrelated defect underneath it.
+
+**Where it picks up:** `ioctl::compare` and `ioctl::movk_literal` (`src/ioctl.rs`), the
+`(Condition::Equal | Condition::NotEqual, None)` arm that files an `untracked` entry, and
+`Value::Literal`'s lifetime across a block boundary -- each of the four sites begins a block that
+the previous `b.eq` falls through into.
