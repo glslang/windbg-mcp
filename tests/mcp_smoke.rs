@@ -12436,11 +12436,22 @@ fn a_failed_debugger_operation_is_a_tool_error_not_a_protocol_error() {
 #[test]
 fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
     let Some(dump) = target_tier() else { return };
-    // 60s of call budget: enough that the 15s headroom leaves a distinctive 45s, and short enough
+    // 90s of call budget: enough that the 15s headroom leaves a distinctive 75s, and short enough
     // that taking the walker's 120s default would be the bug this pins — a walk outliving its
     // caller.
+    //
+    // **It has to outlast the open as well, which is what it did not.** The budget is the
+    // *server's* and is read on every call, so it governs the `open_dump` on the next line too —
+    // against a default of 300s (`ENGINE_CALL_TIMEOUT`, `src/main.rs`), and that open is no
+    // cheaper here than in the dump tests that run under it: it resolves symbols over the network,
+    // so how long it takes is the symbol server's to decide rather than this bench's. At 60s it
+    // exceeded the budget twice on 2026-09-19 — on both the x64 and the ARM64 tier, on code
+    // neither run touched — and the test then failed inside the open, having measured nothing
+    // whatever about the budget it exists to pin. Sized for the open now, at the same 90s
+    // `a_running_command_is_interrupted_on_request_and_frees_its_session` was raised to for this
+    // exact failure; 75s is as distinctively not the walker's 120s as 45s was.
     let mut server = Server::started_with(&[
-        ("WINDBG_MCP_CALL_TIMEOUT_SECS", "60"),
+        ("WINDBG_MCP_CALL_TIMEOUT_SECS", "90"),
         ("RUST_LOG", "windbg_mcp=debug"),
     ]);
     let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
@@ -12465,7 +12476,7 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
         .find_map(|line| line.split("pool walk budget ").nth(1))
         .and_then(|rest| rest.split_whitespace().next())
         .unwrap_or_else(|| panic!("no budget on the line that carries it:\n{log}"));
-    // A range, not the exact figure: the patience the supervisor sends is what is left of the 60s
+    // A range, not the exact figure: the patience the supervisor sends is what is left of the 90s
     // when the request is *written*, so the milliseconds already spent come off it. Wide enough to
     // ignore those, narrow enough that neither the 15s floor nor the walker's 120s default is
     // inside it. Parsed from `Duration`'s own rendering, so a budget in milliseconds or
@@ -12475,9 +12486,9 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
         .and_then(|n| n.parse().ok())
         .unwrap_or_else(|| panic!("`{budget}` is not a whole-seconds walk budget"));
     assert!(
-        (40.0..=46.0).contains(&seconds),
-        "the worker derived a {seconds}s walk budget; the 60s call timeout less the 15s headroom \
-         the reply needs is ~45s. 120s means the walker's default, 15s means no patience arrived."
+        (70.0..=76.0).contains(&seconds),
+        "the worker derived a {seconds}s walk budget; the 90s call timeout less the 15s headroom \
+         the reply needs is ~75s. 120s means the walker's default, 15s means no patience arrived."
     );
     server.tool_text("end_session", json!({ "session_id": session }), TARGET_STEP);
 }
