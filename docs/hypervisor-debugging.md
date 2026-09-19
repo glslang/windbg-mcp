@@ -229,8 +229,12 @@ The later [live timeout probe](hypervisor-detach-trace.md#live-timeout-and-recov
 remained blocked beyond 60 seconds despite transport synchronization. Reclaiming the probe while
 the guest was independently verified running, then attaching afresh, passed. A second attempt
 using one explicit break on the same controller remained blocked and lost WinRM reachability;
-it was held for console inspection without another break or reset. This does not establish safe
-timeout recovery. Keep the recovery cases distinct from the passing normal attach/detach cycles.
+the owner confirmed a black/frozen console. After reclaiming only that verified stalled probe
+and checking the endpoint was free, native KD without an initial-break request collected a
+pending CPU-0 breakpoint. One `qd` was acknowledged, and independent checks confirmed the same
+boot with advancing uptime. This validates one manual native-KD recovery, not same-controller
+or automatic timeout recovery. No reset was needed. Keep these recovery cases distinct from
+the passing normal attach/detach cycles.
 
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
