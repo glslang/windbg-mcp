@@ -10,6 +10,11 @@ and the recorded terminal session [`docs/flareauthenticator.cast`](../docs/flare
 
 ## Example drivers
 
+For the experimental hypervisor detach regression, use
+[`hypervisor_detach_regression.ps1`](hypervisor_detach_regression.ps1). It runs the dedicated
+Cargo smoke test and independently checks the guest over WinRM; it does not use the release
+executable described below. See the [lab runbook](../docs/hypervisor-debugging.md#validation).
+
 Throwaway stdio JSON-RPC drivers written while developing the live-kernel support,
 kept for re-use in future debugging. They are plain PowerShell (`.ps1`) — Cargo does
 not build them.

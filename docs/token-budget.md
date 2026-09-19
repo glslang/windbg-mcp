@@ -335,13 +335,13 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-09-17** and move with any edit to a description.
+   Both tables are measurements of **2026-09-19** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,457 | 17.9% |
    | `inspect` | 10 | 13,152 | 14.3% |
-   | `session` | 10 | 12,817 | 14% |
+   | `session` | 10 | 13,019 | 14.2% |
    | `ioctl` | 10 | 12,435 | 13.5% |
    | `exec` | 8 | 12,652 | 13.8% |
    | `batch` | 1 | 10,021 | 10.9% |
@@ -350,19 +350,19 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 61 | 91,790 |
-   | `session,inspect,exec,crash` | 31 | 45,127 |
-   | `session,inspect,crash` | 23 | 32,322 |
-   | `crash` | 13 | 19,078 |
+   | *(absent)* | 61 | 91,992 |
+   | `session,inspect,exec,crash` | 31 | 45,329 |
+   | `session,inspect,crash` | 23 | 32,524 |
+   | `crash` | 13 | 19,280 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 19,078 rather than the 20,244 its two rows sum to, because the cross-references leave with
+   is 19,280 rather than the 20,446 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
-   the only issuer of — 11,714 B is the floor, and `crash` is thirteen tools rather than three. The
+   the only issuer of — 11,916 B is the floor, and `crash` is thirteen tools rather than three. The
    flag is a **run's** choice, and on a listener it is the *default*: a named client may be
    configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
    client rather than per server — which is what lets a local model and a hosted client share one

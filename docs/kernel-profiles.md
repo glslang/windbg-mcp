@@ -2,6 +2,9 @@
 
 *Keeping the KDNET key out of the transcript.*
 
+Profiles also work for [Microsoft hypervisor debugging](hypervisor-debugging.md). Use a separate
+profile for the hypervisor endpoint; an NT kernel connection does not select the hypervisor.
+
 A KDNET connection string carries the target's debug key — `net:port=50000,key=<w.x.y.z>` — and that
 key is all anyone on the same network needs to take the debug link. Passing it as a tool argument
 puts it somewhere this server does not control: an MCP client keeps a transcript, and a key handed
