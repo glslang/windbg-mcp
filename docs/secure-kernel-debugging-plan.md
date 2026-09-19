@@ -351,8 +351,9 @@ documented alternatives, and implementing another debugger backend is outside th
 
 ## Minimum MCP integration
 
-Only the successful route gets built. The sites below are current as of the pinned dbgscope revision
-`59d48a008f87fe2f99370c2a4984117637d1f4a7`; re-read them before editing, since line numbers move.
+Only the successful route gets built. Locate the integration sites by the file and symbol names
+below; re-read them and check the dbgscope pin in `Cargo.toml` before editing. The revision in the
+bench-state table is the historical 2026-09-13 measurement, not the current dependency pin.
 
 ### If native KDNET works
 
@@ -360,12 +361,12 @@ Try the existing `attach_kernel` tool first, naming the target through a **conne
 Profiles are the machine-local mechanism: the key is resolved on this host and never appears in the
 request. See [kernel-profiles.md](kernel-profiles.md).
 
-- `attach_kernel` is at `src/server.rs:2364` and takes `ConnectionArgs` (`src/server.rs:855`), whose
+- `attach_kernel` in `src/server.rs` takes `ConnectionArgs` in the same file, whose
   `connection` and `profile` fields are mutually exclusive, enforced at runtime by `kdconn::select`
-  (`src/kdconn.rs:860`). The worker already hands the resolved string to DbgEng at
-  `src/worker.rs:1585`, which reaches `AttachKernel(DEBUG_ATTACH_KERNEL_CONNECTION, ...)` in
+  (`src/kdconn.rs`). The `EngineOp::AttachKernel` dispatch arm in `src/worker.rs` already hands the
+  resolved string to `attach_kernel_begin`, which reaches `AttachKernel(DEBUG_ATTACH_KERNEL_CONNECTION, ...)` in
   dbgscope. No new public API is planned for this route.
-- **Do not use `attach_kernel_local`.** It takes no arguments (`src/server.rs:2331`) and attaches to
+- **Do not use `attach_kernel_local`.** It takes no arguments (`src/server.rs`) and attaches to
   this host's own kernel through `DEBUG_ATTACH_LOCAL_KERNEL`. Local kernel debugging cannot set
   breakpoints, single-step, or control execution, so it can never satisfy the success criteria in
   this plan. The repo already excludes it from the live-kernel test tier on the related ground that a
@@ -381,26 +382,27 @@ Add an optional **`transport: "kdnet" | "exdi"`** argument to `attach_kernel`, d
   heap or pool allocator backend such as LFH, VS, Segment or Large. "kernel" would also be a poor
   label for one arm, since EXDI is kernel debugging too.
 - **Prefer a field on the existing op over a new variant.** `EngineOp::AttachKernel`
-  (`src/proto.rs:46`) currently carries only `connection`, so the selection does not exist on the
-  wire yet. A new `EngineOp` variant would have to be added to three matches: `is_opener`
-  (`src/proto.rs:531`), `opening` (`src/proto.rs:549`) and `target_origin` (`src/proto.rs:564`).
+  (`src/proto.rs`) currently carries only `connection`, so the selection does not exist on the
+  wire yet. A new `EngineOp` variant would require reviewing three classification methods in that
+  file: `is_opener`, `opening` and `target_origin`. `opening` deliberately returns `None` for
+  kernel attaches; `is_opener` and `target_origin` explicitly match `AttachKernel`.
   **`target_origin` ends in a wildcard that returns `None`**, so a forgotten arm silently suppresses
   OS questions instead of failing the build. A field on the existing variant keeps all three correct
   by construction.
 - The threading path either way is `ConnectionArgs` -> `kdconn::select` and `Selected`
-  (`src/kdconn.rs:842`) -> `EngineOp` -> the worker dispatch arm (`src/worker.rs:1572`) -> a new
-  typed dbgscope method.
+  (`src/kdconn.rs`) -> `EngineOp` -> the `EngineOp::AttachKernel` dispatch arm (`src/worker.rs`)
+  -> a new typed dbgscope method.
 - Add that dbgscope method as a sibling of `attach_kernel_begin` and `attach_local_kernel_begin`,
   using `DEBUG_ATTACH_EXDI_DRIVER`. That constant was confirmed present in `windows` 0.62.2, the
   version dbgscope pins, so the binding is reachable rather than hypothetical. Follow the house rule
   that a new DbgEng primitive is a typed dbgscope method returning `Result<_, DbgEngError>`, never
   the `execute` text hatch.
   [AttachKernel API](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/dbgeng/nf-dbgeng-idebugclient-attachkernel)
-- **Less new work than it looks.** `SessionKind` (`src/engine.rs:364`) and `waits_indefinitely`
-  (`src/engine.rs:388`) already treat kernel sessions as indefinite, and dbgscope's `is_live_kernel`
+- **Less new work than it looks.** `SessionKind::waits_indefinitely` (`src/engine.rs`)
+  already treats kernel sessions as indefinite, and dbgscope's `is_live_kernel`
   already counts EXDI as a live-kernel connection for wait-timeout purposes. Classification works
   once such a target exists; only construction is missing.
-- **Preserve the redaction invariant.** `Connection` (`src/kdconn.rs:79`) renders redacted through
+- **Preserve the redaction invariant.** `Connection` (`src/kdconn.rs`) renders redacted through
   both `Debug` and `Display`, and `expose()` has exactly one call site. An EXDI connection string
   must travel through the same type and must not introduce a second unguarded exposure.
 
