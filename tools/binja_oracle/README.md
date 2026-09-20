@@ -143,8 +143,11 @@ The surplus itself is **whatever did not pair**, and that is a decision rather t
 implementation detail: four rounds of review found records falling between the parts of a surplus
 assembled from placed records plus companion-only codes — one with no address, then one with no
 address whose code was shared. Every record is paired now, addressed ones on their destination and
-addressless ones against each other by code, so what is left over is the whole of the difference by
-construction rather than by enumeration.
+an addressless one against a leftover of the same code, so what is left over is the whole of the
+difference by construction rather than by enumeration. A record the other side attributed and this
+one did not still pairs — they agree about the code and one of them cannot say where it lands —
+and the count of such pairs is printed, so "routed the same" never quietly means "agreed about the
+code and nothing else".
 
 And one thing the lane prints because the *absence* of a difference is easy to over-read: **what a
 fixture cannot decide.** Two implementations both proving no buffer size is correct behaviour

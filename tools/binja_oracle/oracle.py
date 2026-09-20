@@ -183,8 +183,9 @@ def ask_companion(checkout: pathlib.Path, python: pathlib.Path, fixture: pathlib
 #      walk drops a table slot that goes to the default, and the companion publishes it.
 #   3. A code **routed elsewhere**. Inside the forward window it is the two case-address
 #      conventions; outside it, a finding.
-#   4. A code with **no address** on one side or both. Compared as a code, never as a route, and
-#      the count of such cases is printed.
+#   4. A code with **no address** on one side or both. The records still pair -- one of them
+#      could not attribute a landing site, which is not a claim the other contradicts -- and the
+#      pair is counted as having no comparable destination rather than read as a route.
 #   5. A **length** both sides prove differently **on a paired route**. A finding. A length on a
 #      record that did not pair, or carries no address, has no counterpart to compare against.
 #
@@ -261,22 +262,32 @@ def pair_routes(ours: dict, theirs: dict, window: int, slotted=lambda case: Fals
     record is the one left over, and the lane calls it a difference rather than hiding it behind
     its switch-derived twin.
 
-    **Records with no address pair with each other**, by code and in order, once the addressed
-    ones are done. They cannot pair on a destination, and refusing to pair them at all would make
-    every such case a difference on both sides at once; leaving them out of the pairing entirely
-    -- which is what two review rounds of this function did -- loses the case where one side has
-    one and the other does not.
+    **A record with no address pairs with a leftover of the same code**, once the addressed ones
+    are done, whenever either of the two lacks an address: they agree about the code and one of
+    them cannot say where it lands, which is an attribution this side failed rather than a
+    disagreement between them. Two leftovers that both carry an address never pair -- that is a
+    route disagreement, and the window is what decides it. The count of such pairs is returned, so
+    "agreed" never silently means "agreed about the code and nothing else".
 
     Returns the matched pairs, the displacement spread, and the **records** each side has left.
     """
     paired, spread = [], collections.Counter()
-    unpaired_ours, unpaired_theirs = [], []
+    unpaired_ours, unpaired_theirs, unattributed = [], [], 0
     for code in sorted(set(ours) | set(theirs)):
-        mine, yours = list(ours.get(code, [])), list(theirs.get(code, []))
-        yours = sorted(yours, key=lambda row: (row[0] is None, not slotted(row[1]), row[0] or 0))
-        taken = set()
+        mine = list(ours.get(code, []))
+        # **Address first, provenance only as a tie-break.** Sorting by provenance across the
+        # whole code put every switch record before every comparison one, so the greedy match
+        # could take a far switch record inside the window and strand the comparison sitting at
+        # the exact address -- inventing a surplus on one side and a loss on the other. Raised on
+        # review of #354, against the preference added two rounds earlier.
+        yours = sorted(
+            theirs.get(code, []),
+            key=lambda row: (row[0] is None, row[0] or 0, not slotted(row[1])),
+        )
+        taken, mine_left = set(), []
         for where, mine_case in mine:
             if where is None:
+                mine_left.append((None, mine_case))
                 continue
             hit = next(
                 (
@@ -289,22 +300,33 @@ def pair_routes(ours: dict, theirs: dict, window: int, slotted=lambda case: Fals
                 None,
             )
             if hit is None:
-                unpaired_ours.append(mine_case)
+                mine_left.append((where, mine_case))
                 continue
             taken.add(hit)
             spread[yours[hit][0] - where] += 1
             paired.append((mine_case, yours[hit][1]))
-        # Then the addressless ones, against each other, in order.
-        spare = [index for index, (other, _) in enumerate(yours) if other is None]
-        for _, mine_case in [row for row in mine if row[0] is None]:
-            if spare:
-                index = spare.pop(0)
-                taken.add(index)
-                paired.append((mine_case, yours[index][1]))
-            else:
+        # **A destination one side could not attribute is not a disagreement.** `case_rva` is
+        # absent for a landing site in no module the session knows, so a leftover pairs with a
+        # leftover of the same code whenever *either* has no address: they agree about the code
+        # and one of them cannot say where it lands. Two leftovers that both carry an address do
+        # **not** pair -- that is a route disagreement, and it is the thing the window is for.
+        for where, mine_case in mine_left:
+            hit = next(
+                (
+                    index
+                    for index, (other, _) in enumerate(yours)
+                    if index not in taken and (where is None or other is None)
+                ),
+                None,
+            )
+            if hit is None:
                 unpaired_ours.append(mine_case)
+                continue
+            taken.add(hit)
+            paired.append((mine_case, yours[hit][1]))
+            unattributed += 1
         unpaired_theirs += [case for index, (_, case) in enumerate(yours) if index not in taken]
-    return paired, spread, unpaired_theirs, unpaired_ours
+    return paired, spread, unpaired_theirs, unpaired_ours, unattributed
 
 
 def identity_of(result: dict, module: str):
@@ -419,6 +441,13 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     # same way, as the registered function's RVA, so the narrowing is a comparison rather than a
     # guess -- and it is applied here rather than to the capture, because what the capture holds
     # is not this lane's to trim. Raised on review of #354.
+    # **`dispatch_rva` does not mean the same thing on the two sides**, and only the companion's
+    # is read here. Its `core.ioctl_case` fills it with the registered **root**, one value for the
+    # whole answer; `structured::IoctlCase` documents this side's as the downstream routine a case
+    # reaches, which is many values and is never compared against anything below. Measured on all
+    # three fixtures: the companion's is a single RVA equal to this side's `dispatch.rva`, while
+    # this side's cases carry handler RVAs. Declined on review of #354, which read this side's
+    # meaning onto the companion's records.
     our_dispatch = rva((ours.get("dispatch") or {}).get("rva"))
     if agreed and our_dispatch is not None:
         elsewhere = [
@@ -514,7 +543,7 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     # this reports a deliberate difference in *naming a case's address* as disagreement, once per
     # record -- 29 times on HEVD, where every case is a constant 0x18 apart.
     shared = set(our_routes) & set(their_routes)
-    paired, spread, extra, lost = pair_routes(
+    paired, spread, extra, lost, unattributed = pair_routes(
         our_routes, their_routes, window, lambda case: from_a_table(case, sites, agreed)
     )
     print()
@@ -528,6 +557,9 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     unpaired = {norm(case["code"]) for case in extra + lost}
     routed = sorted(code for code in shared if code not in unpaired)
     print(f"  codes routed the same   : {len(routed)} of {len(shared)}")
+    if unattributed:
+        print(f"  pairs with no comparable destination: {unattributed} -- one side could not "
+              "attribute the landing site, so the code agrees and the route was not read")
     # **The surplus is every companion record that did not pair, and nothing is assembled.**
     # Four review rounds of #354 were this set being built from parts -- placed records only, then
     # placed plus the companion-only codes -- and each round found a record that fell between the
@@ -725,6 +757,18 @@ def selftest() -> int:
          tool([dict(case("0x1", 0x100), dispatch_rva="0x10")], dispatch=0x10),
          companion([dict(case("0x1", 0x100), dispatch_rva="0x10"),
                     dict(case("0x2", 0x200), dispatch_rva="0x20")]), 0),
+        # Round six: an address on one side only. The two agree about the code and one of them
+        # could not attribute the landing site, which the contract calls compared-as-a-code.
+        ("an address on one side only is not a disagreement",
+         tool([case("0x1", 0x100)]), companion([case("0x1", None)]), 0),
+        ("but two addresses that do not pair still are",
+         tool([case("0x1", 0x100)]), companion([case("0x1", 0x140)]), 1),
+        # And provenance must break ties *within* an address, not reorder across them: the switch
+        # record here is farther away than the comparison sitting at the exact address.
+        ("a far switch record does not strand the exact comparison",
+         tool([case("0x1", 0x100), case("0x1", 0x110)], [table(0x500, 2, 1)]),
+         companion([case("0x1", 0x100, compare_at), case("0x1", 0x110, switch),
+                    case("0x2", 0x900, switch)]), 0),
         ("a build mismatch refuses to compare",
          tool([case("0x1", 0x100)]),
          companion([case("0x1", 0x100)], {"timestamp": 9, "size": 2}), 2),
