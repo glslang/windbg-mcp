@@ -1536,19 +1536,29 @@ never an argument.
 **Its positive control is the half that makes the postcondition mean anything.** A KDNET break-in
 halts the whole machine, so the guest must go *unreachable* while the test holds it: without
 checking that, a run where the attach never landed passes trivially -- up before, up after, never
-debugged. A background job knocks on the guest's WinRM port every 250 ms with a one-second
-timeout, and the run fails if no probe was ever refused. That guard earned itself immediately: the
-first version collected its samples into a list and returned them when its loop ended, which for a
-job that is always stopped early is nothing at all, and the script refused to call the run a pass.
+debugged. A background job knocks on the guest's WinRM port every 50 ms with a half-second
+timeout, and the run fails unless it was refused on **consecutive** knocks spanning at least half
+a second. One refusal is a network blip on any network worth testing over; a run of them is a
+machine that stopped.
+
+Two things that guard caught, both in this script rather than in the server. Its first version
+collected samples into a list and returned them when its loop ended -- and the loop is always
+ended early, so it returned nothing, and the script refused to call that run a pass although the
+health checks had passed. And **the probe has a resolution**: an unanswered knock costs its own
+timeout, so a halt shorter than roughly twice that cannot be seen at all. A *warm* detach-only run
+holds the target for only a few hundred milliseconds and falls under it, which the script reports
+as "the test does not hold the target long enough to be seen" rather than passing on one sample.
+Measure with a test that holds it -- `a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable`
+walks every committed pool page over the wire with the target halted throughout.
 
 **Measured 2026-09-20** on a disposable four-processor NT guest, build 26100, against this
 branch's debug build with DbgEng `10.0.29617.1000` -- the same engine the hypervisor
-demonstrations used. Three consecutive attach/detach cycles, each `attach_kernel` landing (the
-module inventory going 1 to 158 across a `modules { "refresh": true }`) and each `end_session`
-reporting a completed quit-and-detach. The first cycle held the target for 32 seconds and the
-probe recorded **26 silent samples of 30**; the two short cycles recorded one each. After every
-one of them the guest answered WinRM twice with the uptime advancing and the boot identity
-unchanged, and it was still up on that same boot afterwards.
+demonstrations used. Two pool-walk cycles, each `attach_kernel` landing and each `end_session`
+reporting a completed quit-and-detach: the guest was unreachable for **209 consecutive samples
+over 117.7 s** and then **212 over 119.5 s**, and after each one it answered WinRM twice with the
+uptime advancing and the boot identity unchanged. Three shorter detach-only cycles beforehand
+agreed on the postcondition, one of them with a 32-second window of 26 silent samples out of 30.
+The guest was still up on that same boot afterwards, with its driver running.
 
 So `qd` leaves an NT kernel executing on this build, and on four processors -- which is where the
 hypervisor's own four-processor behaviour differs (`FOLLOWUPS.md` item 93). One guest, one engine
