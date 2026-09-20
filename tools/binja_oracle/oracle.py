@@ -401,26 +401,31 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     print(f"    from a compare, so a real difference    : {len(unexplained)}")
     for case in unexplained[:8]:
         print(f"      {norm(case['code'])} at {case.get('case_rva')}")
-    # **Attribution first, then the count.** Equal counts are not provenance: one missed compare
-    # beside one dropped slot balances, and suppressing that would hide exactly the finding this
-    # lane exists to make. So a surplus record is set aside only when the companion's own evidence
-    # says it came from a switch this walk resolved -- and the count still has to match, because
-    # a table slot that is *not* one of the ones dropped here is also a difference. Raised on
-    # review of #354.
-    accounted = not unexplained and len(slotted) == dropped
-    if accounted and dropped:
-        print("  -- every surplus record is a table slot, and their count is what this side")
-        print("     dropped, so the code-set difference is reporting rather than a miss.")
-    elif unrouted or dropped:
-        print("  -- these do NOT account for each other.")
+    # **Attribution here, the count at route level.** Equal counts are not provenance: one missed
+    # compare beside one dropped slot balances, and suppressing that would hide exactly the finding
+    # this lane exists to make. So a surplus record is set aside only when the companion's own
+    # evidence says it came from a switch this walk resolved.
+    #
+    # **What is deliberately not checked here is `dropped`**, because these two count different
+    # things: `dropped` counts table *slots*, and `unrouted` counts only the records whose code is
+    # absent from this side's set. A driver whose dropped slots carry codes it also handles
+    # elsewhere has no unrouted records at all and a non-zero `dropped`, and comparing them would
+    # call that a difference while the route level correctly accounts for it. Both raised on review
+    # of #354, the second against the fix for the first.
+    if unexplained:
+        print("  -- those are records the companion took from a compare, so they are a real")
+        print("     difference rather than this side's default-slot reporting.")
         verdict = 1
+    elif unrouted:
+        print("  -- every one carries switch evidence, so the code-set difference is reporting;")
+        print("     whether their *number* is the slots dropped here is the route check below.")
 
     if not agreed:
         print()
         print("  Across two builds that is consistent-with rather than evidence-of: the counts")
         print("  come from different compiles of the same source, and no RVA below was read.")
         return 2
-    if only_ours or (only_theirs and not accounted):
+    if only_ours:
         verdict = 1
 
     # **The routes, read through the convention between them.** Comparing destinations without
@@ -554,6 +559,12 @@ def selftest() -> int:
         ("a missed compare is a finding although the count balances",
          tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
          companion([case("0x1", 0x100), case("0x2", 0x900, compare_at)]), 1),
+        # And the round after that: dropped slots whose codes this side *does* recover elsewhere
+        # leave nothing unrouted, so a code-level check against `dropped` would call the shape a
+        # difference. The route level is where that count belongs.
+        ("dropped slots reusing a shared code are accounted for at route level",
+         tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
+         companion([case("0x1", 0x100), case("0x1", 0x900, switch)]), 0),
         # And its P2: a case whose landing site is in no known module has no `case_rva` at all.
         ("a code with no case_rva is still compared",
          tool([case("0x1", 0x100)]), companion([case("0x1", 0x100), case("0x2", None)]), 1),

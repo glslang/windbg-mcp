@@ -262,7 +262,11 @@ def recover_roots(view, config, report, save):
 
     taken = registered = None
     seen = set()
-    for hop in range(int(config.get("entry_hops") or 3) + 1):
+    # `or 3` would throw away an explicit 0, which is the caller asking for the entry routine and
+    # nothing beyond it -- the one setting that keeps a prototype off functions it was not meant
+    # for. Raised on review of #354.
+    hops = config.get("entry_hops")
+    for hop in range(int(3 if hops is None else hops) + 1):
         frontier = [f for f in frontier if f.start not in seen]
         if not frontier:
             break
