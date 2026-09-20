@@ -14,6 +14,11 @@ full, every time, and length here is paid for by every other instruction competi
 
 ## What this is
 
+**Unresolved remote kernel workers intentionally survive automatic cleanup and supervisor loss.**
+Never bulk-kill them to unlock a development executable. Use the exact session/PID recovery handoff
+while its supervisor still owns it, or inspect orphan ownership and target health out of band.
+Worker termination does not resume/detach a target; see `docs/sessions.md`.
+
 `windbg-mcp` is a Rust MCP server (`rmcp`; stdio, or HTTP under `--listen`) exposing
 **WinDbg/DbgEng** for live user-mode,
 kernel, crash-dump, and Time Travel Debugging (TTD) work. The low-level DbgEng bindings come from

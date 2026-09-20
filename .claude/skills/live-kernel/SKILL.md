@@ -195,15 +195,19 @@ at resumed and stopped again; one found seconds later ran on.
 
 **KDNET attach is a blocking wait, by design.** A live kernel needs `WaitForEvent(INFINITE)` (a finite
 timeout returns `E_NOTIMPL` and never drives the link). So if the target isn't reachable, the
-`attach_kernel` MCP call reports a *timeout* while its **worker process** stays parked in the wait —
-it self-heals and completes the attach the moment the target actually connects. Consequences:
+`attach_kernel` MCP call reports a *timeout* while its **worker process** can remain parked in the
+wait. The session becomes `kernel_unresolved`; late completion does not reopen it. Consequences:
 - The park costs **that session only**. Other sessions and every other tool keep working, so an
   attach that is going nowhere is no longer a reason to restart the server. `session_status` says
   how long it has been waiting and whether that is past the point a healthy link takes;
-  `end_session` reclaims it, terminating the worker process if the wait will not unwind (it won't —
-  `SetInterrupt` cannot reach a wait that has not yet connected).
+  ordinary `end_session` preserves it and reports `recovery_required`. Never send ACTIVE as a
+  timeout-recovery attempt. Inspect target health out of band before an explicit session ID and
+  `kernel_handoff_pid` authorizes termination of the exact owned worker. This is NOT resume/detach.
 - **Do not re-run the attach while it is still waiting.** The connection was already claimed, so a
-  retry dials a second time. End it first, or fix the target and let the original attach land.
+  retry risks a second controller. Supervisor-local endpoint reservations block it, but another
+  server/native debugger is outside that registry. Verify the old worker has exited and the
+  endpoint is free before starting one recovery controller. Supervisor-loss orphans need manual
+  recovery; restarting the server does not adopt them. See `docs/sessions.md`.
 - Diagnosing why nothing dialed in is still out-of-band work (PowerShell): check the debugger is
   listening (`Get-NetUDPEndpoint -LocalPort 50000` → owned by `windbg-mcp.exe`, which will be the
   *worker* process) and whether any VM is running.

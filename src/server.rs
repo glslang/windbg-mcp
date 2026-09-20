@@ -65,7 +65,7 @@ const STOP_WAIT_MARGIN: Duration = Duration::from_secs(5);
 /// A KDNET link that is coming up resyncs in ~25s; a guest that is not booted in debug mode
 /// never dials at all, and the two look identical from here except for how long they have taken.
 /// Past this the report says so, because the advice diverges completely — "wait" versus "this
-/// will not return; `end_session` reclaims it".
+/// may not return; preserve its controller for explicit recovery".
 const OPEN_TAKING_TOO_LONG: Duration = Duration::from_secs(120);
 
 #[derive(Clone)]
@@ -729,6 +729,17 @@ pub struct SessionArgs {
     /// session and be refused if its target was replaced or closed.
     #[serde(default)]
     pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct EndSessionArgs {
+    #[serde(default)]
+    pub session_id: Option<String>,
+    /// Explicit recovery handoff ONLY: acknowledge killing an unresolved remote kernel's
+    /// controller without resume/detach. Requires session_id and the exact engine_pid from
+    /// session_status. Verify target state out of band and prepare recovery first.
+    #[serde(default)]
+    pub kernel_handoff_pid: Option<u32>,
 }
 
 /// Parameters for `continue_async`.
@@ -1719,6 +1730,9 @@ fn describe_session(s: &SessionSnapshot) -> String {
     );
     let waited = fmt_duration(s.in_state_for);
     match &s.state {
+        SessionState::KernelUnresolved(why) => out.push_str(&format!(
+            "  UNRESOLVED KERNEL CONTROLLER for {waited}: {why}\n"
+        )),
         SessionState::Opening => {
             out.push_str(&format!(
                 "  opening for {waited}. Nothing has been created or claimed yet, so a failure \
@@ -1739,8 +1753,9 @@ fn describe_session(s: &SessionSnapshot) -> String {
                          and cannot be interrupted — it will not return on its own. The usual \
                          causes are a guest that is powered off, not booted with debugging \
                          enabled, or pointed at a different host/port/key. Fix the target and it \
-                         will still connect; otherwise reclaim the session with `end_session \
-                         {{ \"session_id\": \"{}\" }}`, which terminates its engine process. \
+                         may still connect. `end_session \
+                         {{ \"session_id\": \"{}\" }}` preserves an unresolved controller; \
+                         termination requires an explicit recovery handoff, not another break. \
                          Nothing else on this server is affected in the meantime.\n",
                         s.id
                     ));
@@ -2456,9 +2471,9 @@ impl WindbgServer {
     /// cannot be interrupted: if the target is powered off, its selected debug endpoint is disabled, or
     /// pointed at the wrong host/port/key, this call reports a timeout and the attach keeps
     /// waiting forever. That costs only this session — other sessions and the server are
-    /// unaffected — and `session_status` says how long it has been waiting. Recover with
-    /// `end_session`, which terminates the session's engine process; do NOT re-attach while it
-    /// is still waiting.
+    /// unaffected — and `session_status` reports the worker PID and unresolved state. Timeout
+    /// preserves controller ownership; ordinary `end_session` does not kill it. Do NOT break in
+    /// or re-attach. Inspect the target out of band before an explicit recovery handoff.
     #[rmcp::tool(
         annotations(
             title = "Attach to kernel target",
@@ -3152,7 +3167,7 @@ impl WindbgServer {
     /// wait cannot be interrupted. The state here separates the two cases that look identical
     /// from the outside: an open that is progressing normally, and one that has been waiting far
     /// longer than a healthy one ever takes and is not going to finish. They need opposite
-    /// responses — wait, versus `end_session` to reclaim it — and re-running an attach or a
+    /// responses — wait, versus explicit recovery handoff — and re-running an attach or a
     /// launch on a guess connects or spawns a second time.
     ///
     /// Answers even while a session is parked: it reads this server's own bookkeeping and never
@@ -3288,8 +3303,8 @@ impl WindbgServer {
     ///
     /// Two things it cannot reach, both properties of the debugger rather than of this server: an
     /// operation that never polls for the break, and a live-kernel `attach_kernel` whose target has
-    /// not connected yet (the documented case — see `session_status`). `end_session` is what ends
-    /// those, at the cost of the target.
+    /// not connected yet (see `session_status`). Pending or unresolved remote kernel controllers
+    /// refuse interrupts; inspect them out of band and use explicit recovery handoff if needed.
     // `idempotent_hint = false`, which is not the intuitive reading: raising the same Ctrl+Break
     // twice on the same operation plainly has no second effect. But the hint is about *repeating
     // the call*, and what a repeat addresses is whichever job is running when it arrives — which
@@ -3324,13 +3339,13 @@ impl WindbgServer {
     ///
     /// What releasing does depends on the opener: a process this server attached to is detached
     /// and left running, one it launched is terminated, a live kernel is resumed and detached, a
-    /// dump or trace is closed. A client disconnect and a lease expiry run the same release — but
-    /// a session that will not let go is terminated instead, and that takes its target.
+    /// dump or trace is closed. A client disconnect and a lease expiry run the same release.
     ///
-    /// This is also the recovery for a session that is stuck. If the session does not let go
-    /// within a short grace period — a live-kernel attach whose target never dialed in cannot,
-    /// since nothing can interrupt that wait — its engine process is terminated outright. The
-    /// session ends either way, and no other session is affected.
+    /// Unresolved remote kernels are preserved, never automatically killed: recovery_required
+    /// is true, released and worker_terminated are false. After out-of-band inspection, explicit
+    /// session_id plus kernel_handoff_pid (exact engine_pid) authorizes worker termination, NOT
+    /// target resume/detach. Verify endpoint release before a recovery controller attaches.
+    /// Stuck non-kernel workers are terminated after a short grace; no other session is affected.
     #[rmcp::tool(
         annotations(
             title = "End debug session",
@@ -3343,9 +3358,14 @@ impl WindbgServer {
     )]
     async fn end_session(
         &self,
-        Parameters(args): Parameters<SessionArgs>,
+        Parameters(args): Parameters<EndSessionArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let session_id = args.session_id.as_deref();
+        if args.kernel_handoff_pid.is_some() && session_id.is_none() {
+            return engine_result(Err(EngineError::InvalidArgument(
+                "Kernel recovery handoff requires an explicit session_id.".into(),
+            )));
+        }
         // `resolve_for_teardown`, not `resolve`: a **retired** handle still names this session,
         // and releasing a session is not touching the target retirement is about. Refusing it was
         // `FOLLOWUPS.md` item 55 — with anything newer open, a caller whose handle a raw
@@ -3354,6 +3374,12 @@ impl WindbgServer {
             Ok(session) => session,
             Err(e) => return engine_result_for(session_id, Err(e)),
         };
+        if let Some(pid) = args.kernel_handoff_pid {
+            return engine_result_for(
+                session_id,
+                self.sessions.kernel_handoff(&session, pid).await,
+            );
+        }
         engine_result_for(
             session_id,
             self.sessions.end(&session, session_id.is_some()).await,
@@ -4103,7 +4129,7 @@ impl WindbgServer {
     ///
     /// Two targets cannot be reached this way, both properties of `SetInterrupt` rather than of
     /// this: a command that never polls, and a live-kernel attach whose target has never
-    /// connected. `end_session` is what ends those, at the cost of the target.
+    /// connected. Pending or unresolved kernels refuse breaks; inspect them out of band.
     #[rmcp::tool(annotations(
         title = "Break a run in",
         read_only_hint = false,
@@ -4907,7 +4933,7 @@ its module table. If an open reports a timeout, ask `session_status` rather than
 open again - a second open attaches or launches a second time. To stop a call that is \
 overrunning, `interrupt` its session while it is still outstanding: the interrupt returns at \
 once, and the partial result comes back on the original call. A live kernel attach cannot be \
-interrupted - it waits indefinitely, and `end_session` reclaims that session alone.";
+interrupted safely. Timeout preserves its worker; inspect out of band before explicit recovery handoff.";
 
 /// One fragment per group, in the order they are assembled, **paired with the tools it names**.
 ///
@@ -6340,7 +6366,7 @@ mod tests {
             "the caller must not be left waiting on it:\n{out}"
         );
         assert!(
-            out.contains("end_session") && out.contains("terminates its engine process"),
+            out.contains("end_session") && out.contains("explicit recovery handoff"),
             "the recovery must be named, and it is a process kill:\n{out}"
         );
         assert!(

@@ -83,6 +83,13 @@ restriction on the raw command interface.
 
 Always call `end_session`. For a connected live target, require `released: true` and
 `target_left_running: true`; a terminated worker alone is not proof of a graceful detach.
+
+Attach timeout or unconfirmed release now preserves the worker in `kernel_unresolved`.
+Ordinary teardown, lease expiry, and shutdown do not kill it. Follow the
+[explicit recovery handoff](sessions.md#unresolved-remote-kernel-controllers), not another break-in
+or competing attach. This applies to remote NT kernel sessions too: target subtype is not known
+while the initial attach is blocked. The [Microsoft report draft](dbgeng-exit-report.md) separates
+the two-build unconnected reproduction from the single-build synchronized evidence.
 Then check the target console and management channel independently. A successful debugger resume
 does not prove that Windows services recovered or that the target did not immediately stop again.
 
@@ -92,6 +99,20 @@ first. Do not forcibly terminate a connected debugger or reset the target to cle
 Keep console access available and investigate the reported state first.
 
 ## Validation
+
+The 2026-09-20 preservation change passed five explicitly enabled, synthetic-endpoint DbgEng
+regressions: parked attach with PID-confirmed handoff, graceful/abrupt supervisor loss, lease
+expiry with same-credential recovery, stateless overlapping requests, and profile-key redaction.
+The supervisor-loss test first exposed a runtime shutdown hang from the retained worker's stdout;
+moving that drain to an unjoined OS thread fixed it, and both shutdown modes then passed.
+Unit coverage includes sticky late replies, confirmed/refused release, cross-client reservation
+isolation, cancellation-safe handoff, and automatic-cleanup refusal. Removing the kill guard made
+its regression fail; restoring it passed. These checks establish controller bookkeeping and
+process lifetime, **not live guest health or native cancellation**. No guest, hardened-host
+configuration, or installed release binary was changed for this implementation.
+
+The older-engine synchronized comparison remains deferred to a disposable nested lab. The
+[Microsoft report draft](dbgeng-exit-report.md) is prepared but not submitted.
 
 On 2026-09-19, the existing development server at `9a664e0` attached through MCP to the
 already-configured 29671.1000 x64 lab hypervisor. Module enumeration identified `hvix64.exe`;

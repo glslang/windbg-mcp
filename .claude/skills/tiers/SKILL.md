@@ -87,8 +87,10 @@ $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke
 ```
 
 That tier now also covers the process-per-session behaviour end to end: two sessions coexisting, a
-kernel attach parked on a dead port being reclaimed by `end_session`, and no worker process
-outliving the connection. It opens the **dump matching this host's architecture** — an ARM64 one is
+kernel attach parked on a dead port being preserved until explicit PID-confirmed handoff, and
+ordinary dump workers not outliving the connection. Unresolved remote kernels intentionally
+survive automatic cleanup; synthetic dead-port tests must own and clean up their exact worker
+handles, never use broad process-name kills. It opens the **dump matching this host's architecture** — an ARM64 one is
 checked in beside the two x64 samples, and each architecture also has a **driver** crash — and the
 four assertions that read a *target* rather than
 the dump's structure check first that this host can: `nt`'s base has to read, plus a resolved PDB

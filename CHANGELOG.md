@@ -31,6 +31,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- Remote kernel timeouts and unconfirmed releases now retain their worker and endpoint reservation
+  in `kernel_unresolved`, including across automatic cleanup and supervisor loss. Ordinary
+  `end_session` reports `recovery_required`; explicit session ID plus `kernel_handoff_pid` permits
+  verified worker termination without claiming resume/detach. Reservations are supervisor-local.
+  See [recovery handoff](docs/sessions.md#unresolved-remote-kernel-controllers).
+
 - Experimental live-kernel teardown uses dbgscope's guarded quit-and-detach path before passive
   cleanup, checks breakpoint-removal errors, and requires the engine to release its target before
   reporting resume. Local regressions pass; live NT/hypervisor validation is still pending.

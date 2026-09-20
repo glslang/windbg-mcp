@@ -11,11 +11,12 @@
 //! happens when that thread cannot be freed: a live-kernel attach whose target never dials in
 //! blocks in `WaitForEvent(INFINITE)` with no cancellation path (dbgscope's `SetInterrupt`
 //! watchdog cannot reach a wait that is still establishing the link). That used to park the
-//! server's only engine thread; here it parks this process, which the supervisor can kill.
+//! server's only engine thread; here it parks only this process. A timeout preserves that
+//! controller. Only explicit recovery handoff may kill an unresolved remote-kernel worker.
 //!
-//! Which is why the request reader lives on the *main* thread and exits the process outright on
-//! EOF instead of joining the engine thread: at EOF the engine thread may be parked forever,
-//! and waiting for it would recreate the very wedge this design removes.
+//! The request reader lives on the *main* thread. EOF attempts bounded cleanup for ordinary
+//! sessions; unresolved remote kernels retain their worker and engine for operator recovery.
+//! No other session or supervisor is held waiting for that retained worker.
 //!
 //! **The one call that crosses that line, and why it is not a hole in it.** `SetInterrupt` is the
 //! single DbgEng entry point Microsoft documents as safe from any thread, and it is the only one
@@ -268,6 +269,67 @@ fn walk_budget(patience: Duration, queued: Duration) -> Option<Duration> {
 /// will never end. Long enough for an idle engine to resume and detach a live kernel, which is
 /// the case that matters: exiting without it leaves the target machine halted.
 const ABRUPT_EXIT_RELEASE: Duration = Duration::from_secs(5);
+
+/// Only metadata crosses threads. No DbgEng call is made by these guards.
+struct KernelSafety {
+    remote: AtomicBool,
+    pending: AtomicBool,
+    preserved: AtomicBool,
+}
+
+impl KernelSafety {
+    const fn new() -> Self {
+        Self {
+            remote: AtomicBool::new(false),
+            pending: AtomicBool::new(false),
+            preserved: AtomicBool::new(false),
+        }
+    }
+
+    fn begin(&self) {
+        self.remote.store(true, Ordering::SeqCst);
+        self.pending.store(true, Ordering::SeqCst);
+    }
+
+    fn hold(&self) -> bool {
+        self.remote.load(Ordering::SeqCst)
+            && (self.pending.load(Ordering::SeqCst) || self.preserved.load(Ordering::SeqCst))
+    }
+
+    fn finished_attach(&self) {
+        self.pending.store(false, Ordering::SeqCst);
+    }
+
+    fn preserve(&self) {
+        if self.remote.load(Ordering::SeqCst) {
+            self.preserved.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn released(&self) {
+        self.remote.store(false, Ordering::SeqCst);
+    }
+}
+
+static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
+
+fn kernel_recovery_required() -> Failed {
+    Failed::categorised(
+        crate::structured::ErrorCategory::RecoveryRequired,
+        "Remote kernel controller is unresolved; no further break, queued work, or automatic teardown is permitted. Explicit recovery handoff is required.",
+    )
+}
+
+fn retain_orphaned_kernel() -> ! {
+    tracing::error!(
+        "worker {}: retaining unresolved remote kernel controller after supervisor loss; target liveness is unknown. Operator recovery handoff required.",
+        std::process::id()
+    );
+    crate::logbridge::flush(LOG_FLUSH);
+    loop {
+        thread::park();
+    }
+}
 
 /// Whether the batch on this worker's engine thread has been told to stop, and — the part a
 /// teardown actually needs — how long it can still be running.
@@ -673,7 +735,7 @@ enum Job {
     /// A request from the supervisor, stamped when it was read.
     Run(Instant, WorkerRequest),
     /// The supervisor is gone: release the target and acknowledge.
-    Release(mpsc::Sender<()>),
+    Release(mpsc::Sender<bool>),
 }
 
 /// Runs this process as an engine worker. Never returns.
@@ -759,6 +821,23 @@ pub fn run(args: &[String]) -> ! {
         }
         match serde_json::from_str::<WorkerRequest>(&line) {
             Ok(request) => {
+                if matches!(request.op, EngineOp::PreserveKernel) {
+                    KERNEL_SAFETY.preserve();
+                    emit(&WorkerMessage::Done {
+                        id: request.id,
+                        result: Ok(Output::text("kernel controller preservation recorded")),
+                    });
+                    continue;
+                }
+                if matches!(request.op, EngineOp::AttachKernel { .. }) {
+                    KERNEL_SAFETY.begin();
+                } else if KERNEL_SAFETY.hold() {
+                    emit(&WorkerMessage::Done {
+                        id: request.id,
+                        result: Err(kernel_recovery_required()),
+                    });
+                    continue;
+                }
                 // Acted on here, before it is queued, because the thread that will run it is the
                 // one it is about: a batch on that thread has to be told to stop *now* if the
                 // release behind it is not to wait out every step it has left. This loop is never
@@ -807,19 +886,21 @@ pub fn run(args: &[String]) -> ! {
     // engine has nothing left to do. On the other one — Ctrl+C, a crash, anything that kills the
     // supervisor without it running its own shutdown — nobody has, and exiting here would leave a
     // live kernel *halted*, because DbgEng needs an explicit resume-and-detach. So ask for one,
-    // bounded: an idle engine obliges in milliseconds, a parked one never will, and either way
-    // this process is gone within `ABRUPT_EXIT_RELEASE` — or, when a batch is being unwound first,
-    // within that plus what the batch itself has left to run.
+    // bounded: an idle engine usually obliges quickly. A remote kernel whose release is not
+    // confirmed stays alive for operator recovery; non-kernel workers still exit after the grace.
     //
     // Ctrl+C only reaches this path because a worker is spawned into its own process group
     // (`engine::CREATE_NEW_PROCESS_GROUP`). Without that it would be delivered here too, and the
     // default console handler would end this process where it stands — no EOF, no release.
     //
-    // Bounded and then abandoned, never joined: the engine thread may be blocked in DbgEng
-    // forever, and this is precisely the case where that must not hold anything up.
+    // Never join the engine thread: it may be blocked in DbgEng forever. Retaining a remote
+    // controller must not hold up other workers or the supervisor's shutdown.
     //
     // Logged because it is otherwise invisible: this is the teardown nobody asked for, and an
     // operator looking at a target that came back fine wants to see which path did it.
+    if KERNEL_SAFETY.hold() {
+        retain_orphaned_kernel();
+    }
     tracing::info!("worker: supervisor is gone; releasing the target before exit");
     // Same signal, sent to ourselves. A batch still running would otherwise hold the release
     // behind every step it has left, on the one path where nobody is left to have asked for
@@ -852,12 +933,17 @@ pub fn run(args: &[String]) -> ! {
         tracing::error!(
             "worker: the engine thread is gone, so nothing was asked to release the target"
         );
+        if KERNEL_SAFETY.remote.load(Ordering::SeqCst) {
+            retain_orphaned_kernel();
+        }
     } else {
-        // Whichever way this ends the process does, but *which* way is the difference between a
-        // target let go and a target still attached to a debugger that no longer exists. Silence
-        // here would leave that to be inferred from a guest that never came back.
+        // Failed remote-kernel release retains ownership rather than treating a deadline as
+        // evidence that the target was detached.
         match released.recv_timeout(grace) {
-            Ok(()) => {}
+            Ok(true) => {}
+            Ok(false) if KERNEL_SAFETY.remote.load(Ordering::SeqCst) => retain_orphaned_kernel(),
+            Ok(false) => {}
+            Err(_) if KERNEL_SAFETY.remote.load(Ordering::SeqCst) => retain_orphaned_kernel(),
             Err(mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
                 "worker: the engine did not finish releasing within {grace:?} (parked in DbgEng, \
                  most likely); exiting anyway, so a live kernel target may be left halted"
@@ -1041,15 +1127,20 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         let (arrived, request) = match job {
             Job::Run(arrived, request) => (arrived, request),
             // The supervisor is gone. Let go of the target before this process does, so a live
-            // kernel is left running rather than halted, then acknowledge so the main thread can
-            // stop waiting. Best-effort by nature: if the engine never reaches this, the main
-            // thread times out and exits anyway.
+            // kernel is left running rather than halted. Unresolved remote controllers stay
+            // alive instead: neither failure nor a deadline is permission to discard ownership.
             Job::Release(ack) => {
-                // Reported here rather than handed back: the main thread's only move is to exit
-                // either way, and this is where the reason still exists. So the ack means
-                // "finished trying", not "succeeded" — what the main thread waits for is
-                // permission to stop waiting.
-                match catch_unwind(AssertUnwindSafe(|| engine.end_session())) {
+                // An attach or earlier teardown may have failed after EOF queued this job.
+                if KERNEL_SAFETY.hold() {
+                    let _ = ack.send(false);
+                    continue;
+                }
+                let result = catch_unwind(AssertUnwindSafe(|| engine.end_session()));
+                let confirmed = matches!(&result, Ok(Ok(_)));
+                if confirmed {
+                    KERNEL_SAFETY.released();
+                }
+                match result {
                     // The disposition, not just "released": on this path there is no reply to put
                     // it on, so the log is the only place a halted kernel can be said at all.
                     Ok(Ok(dbgscope::dbgeng::TargetLeft::KernelHalted)) => tracing::error!(
@@ -1070,7 +1161,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                          rather than detached"
                     ),
                 }
-                let _ = ack.send(());
+                let _ = ack.send(confirmed);
                 continue;
             }
         };
@@ -1078,6 +1169,16 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         // and the bounded path needs it to size the watchdog.
         let queued = arrived.elapsed();
         let id = request.id;
+        // The request may have queued before preservation was recorded.
+        if KERNEL_SAFETY.preserved.load(Ordering::SeqCst) {
+            emit(&WorkerMessage::Done {
+                id,
+                result: Err(kernel_recovery_required()),
+            });
+            continue;
+        }
+        let kernel_attach = matches!(request.op, EngineOp::AttachKernel { .. });
+        let ending_kernel = matches!(request.op, EngineOp::EndSession);
         // Claimed around the whole op, so an interrupt arriving while it runs names *this* job.
         // Outside the `catch_unwind` below, so a panicking op gives the claim back too.
         claim(id);
@@ -1096,6 +1197,15 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
             execute(&engine, id, request.op, queued)
         }))
         .unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
+        if kernel_attach {
+            KERNEL_SAFETY.finished_attach();
+        }
+        if ending_kernel && result.is_ok() {
+            KERNEL_SAFETY.released();
+        }
+        if (kernel_attach || ending_kernel) && result.is_err() {
+            KERNEL_SAFETY.preserve();
+        }
         let result = if release(id) {
             // The engine may have consumed the Ctrl+Break, or the request may have been lodged as
             // the operation was already returning — in which case it is still pending with nothing
@@ -2038,7 +2148,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
         EngineOp::Batch(op) => run_batch(e, id, op, queued).map_err(Failed::from),
         // Answered by the request reader, which is the only way it could reach a busy engine at
         // all, so it is never queued and never arrives here. See [`EngineOp::Interrupt`].
-        EngineOp::Interrupt { .. } => Err(Failed::from(
+        EngineOp::Interrupt { .. } | EngineOp::PreserveKernel => Err(Failed::from(
             "an interrupt reached the engine thread, which cannot act on one; this is a bug in \
              the worker's request reader",
         )),
@@ -9275,6 +9385,29 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn non_kernel_cleanup_failure_does_not_quarantine_the_worker() {
+        let safety = super::KernelSafety::new();
+        safety.preserve();
+        assert!(!safety.preserved.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(!safety.hold());
+    }
+
+    #[test]
+    fn unresolved_kernel_eof_is_not_permission_to_exit_or_send_another_break() {
+        let safety = super::KernelSafety::new();
+        assert!(!safety.hold());
+        safety.begin();
+        assert!(safety.hold());
+        safety.preserve();
+        safety.finished_attach();
+        assert!(
+            safety.hold(),
+            "late attach completion must not undo preservation"
+        );
+        safety.released();
+        assert!(!safety.hold(), "a confirmed release permits exit");
+    }
 
     /// The IRP a dispatch routine was entered with is **wherever this target puts a second
     /// argument**, and it was `@rdx` on every target until #340.

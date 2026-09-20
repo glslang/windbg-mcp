@@ -44,6 +44,8 @@ use crate::walk::WalkOp;
 /// thread, which is exactly the guarantee the single queued closure used to provide.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum EngineOp {
+    /// Reader-side control only: retain a remote kernel controller on supervisor loss.
+    PreserveKernel,
     // ---- openers: the first op sent to a freshly spawned worker ----
     OpenDump {
         path: String,

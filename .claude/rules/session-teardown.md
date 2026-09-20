@@ -7,6 +7,14 @@ paths:
 
 ## What ending a session does to its target (`FOLLOWUPS.md` item 51)
 
+**Remote-kernel uncertainty is now a preservation boundary.** A timed-out attach or unconfirmed
+release becomes `KernelUnresolved`; late replies cannot reopen it. Do not kill its worker during
+end, idle/capacity reclamation, lease expiry, shutdown, or worker EOF. Only explicit
+`end_session { session_id, kernel_handoff_pid }` may terminate it, using the owned child handle and
+verifying exit before releasing its endpoint reservation. That result is NOT a detach/resume.
+Reservations are supervisor-local; orphan workers require operator recovery before another
+server/controller attaches. Non-kernel forced cleanup is unchanged. See `docs/sessions.md`.
+
 **The hypervisor-development branch uses a candidate quit path, not the old GO/active-EndSession
 sequence.** Checked breakpoint removal, the engine's fixed `qd`, a no-target postcondition, then
 passive session cleanup. Explicit teardown and owning-engine drop share it. Local regressions do

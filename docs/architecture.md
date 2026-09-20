@@ -40,18 +40,17 @@ process. Two things follow, and they are why it is built this way:
 - **`main.rs`** — role selection (supervisor or worker) and, for the supervisor, which transport it
   serves on: tokio with stdio, or HTTP when `--listen` names an address. **Logs go to
   stderr** (under stdio, stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
-  lands in the same place. Workers never outlive the connection: a disconnect asks every session
-  to release its target — all of them concurrently — waits **five seconds**, and terminates only
-  the workers that have not finished by then; a worker also exits on its own once its request
-  channel closes. A session running a `debug_batch` is told to abandon it by that same request, and
+  lands in the same place. A disconnect attempts concurrent release with a **five-second** grace.
+  Non-kernel workers that do not finish are terminated. **Unresolved remote kernel controllers
+  survive**, including after their request channel closes; only explicit operator handoff may
+  terminate them. Their stdout is drained by an unjoined OS thread rather than Tokio's Windows
+  blocking pipe reader, so an orphan's open pipe cannot prevent the supervisor from exiting.
+  A session running a `debug_batch` is told to abandon it by that same request, and
   then gets as long as the batch says it still needs on top of the grace — the only case where a
   disconnect waits longer, and never longer than the batch's own budget allowed.
-  Which of those two endings a session gets matters for a live kernel. DbgEng leaves a
-  detached-but-halted kernel *frozen*, so a worker that releases its target leaves the machine
-  running, while a worker that is terminated leaves it stopped. Five seconds is enough for an
-  idle session and for most busy ones, but a session in the middle of long work may not make it,
-  so end a live kernel session with `end_session` — which allows considerably longer — rather
-  than relying on the disconnect.
+  End a live kernel session explicitly with `end_session`, which allows a longer grace, and
+  verify its result and target health out of band. Worker termination proves neither resume nor
+  detach. See [unresolved-controller recovery](sessions.md#unresolved-remote-kernel-controllers).
 
 **MCP protocol revision:** built on `rmcp` 3.x, this server accepts every revision that SDK knows —
 `2026-07-28` and the `initialize`-handshake ("legacy") era before it (`2025-11-25`, `2025-06-18`,

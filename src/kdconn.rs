@@ -80,6 +80,19 @@ const NAME_LIMIT: usize = 64;
 #[serde(transparent)]
 pub struct Connection(String);
 
+/// A transport reservation, never a key or a profile name. Unknown forms conflict with all.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) enum Endpoint {
+    Net(u16),
+    Unknown,
+}
+
+impl Endpoint {
+    pub(crate) fn conflicts(&self, other: &Self) -> bool {
+        matches!(self, Self::Unknown) || matches!(other, Self::Unknown) || self == other
+    }
+}
+
 impl Connection {
     /// Wraps a raw connection string, and **remembers its secrets** so they can be masked by value
     /// wherever they later turn up — see [`KNOWN_SECRETS`].
@@ -105,6 +118,26 @@ impl Connection {
     /// The connection as it is safe to report: shape intact, secrets masked.
     pub fn redacted(&self) -> String {
         redact(&self.0)
+    }
+
+    pub(crate) fn endpoint(&self) -> Endpoint {
+        let parsed = Parsed::of(&self.0);
+        if !parsed.prefix.eq_ignore_ascii_case("net:") {
+            return Endpoint::Unknown;
+        }
+        let ports: Vec<_> = parsed
+            .params
+            .iter()
+            .filter(|p| p.name.eq_ignore_ascii_case("port"))
+            .collect();
+        match ports.as_slice() {
+            [port] => port
+                .value
+                .and_then(|p| p.parse::<u16>().ok())
+                .filter(|p| *p != 0)
+                .map_or(Endpoint::Unknown, Endpoint::Net),
+            _ => Endpoint::Unknown,
+        }
     }
 }
 
@@ -992,6 +1025,25 @@ fn referred_to_as(name: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn kernel_endpoint_ignores_keys_and_profile_spelling() {
+        use super::*;
+        let first = Connection::new("net:port=50194,key=1.2.3.4").endpoint();
+        assert_eq!(
+            first,
+            Connection::new("NET:key=5.6.7.8;PORT=050194").endpoint()
+        );
+        assert!(!first.conflicts(&Connection::new("net:port=50195,key=1.2.3.4").endpoint()));
+        for raw in [
+            "net:port=50194,port=50195",
+            "net:port=0",
+            "net:port=65536",
+            "com:port=com1",
+            "net:key=1.2.3.4",
+        ] {
+            assert!(first.conflicts(&Connection::new(raw).endpoint()));
+        }
+    }
     use super::*;
 
     /// Every test here uses this. A real key is `w.x.y.z` dotted decimal; this is the same shape

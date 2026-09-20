@@ -7,6 +7,13 @@ paths:
 
 ## A worker of the target's architecture (`src/target.rs`, `engine::worker_images`)
 
+**Preserved workers must not hold the supervisor runtime open.** Windows Tokio `ChildStdout`
+reads occupy its blocking pool; an unresolved kernel worker intentionally keeps that pipe open
+after supervisor loss. `start_stray_output_reader` transfers the unread handle to an unjoined OS
+thread with bounded line buffering, like the protocol reader. Returning it to `tokio::spawn`
+restores the shutdown hang. The synthetic-endpoint supervisor-loss smoke test checks both
+graceful and abrupt exit, while retaining the worker; no DbgEng call moves off its owning thread.
+
 A 32-bit .NET target cannot be read from this server's own process, and the reason is not a missing
 DLL. An extension is loaded into the debugger's process, so its architecture is the *host's*: the
 32-bit `sos.dll` will not load into an x64 host (`0n193`), and the 64-bit one loads and then fails
