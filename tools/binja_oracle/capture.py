@@ -14,6 +14,7 @@ already exited leaving children behind -- and a second copy of it would be a sec
 """
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -140,6 +141,23 @@ def main() -> None:
 
     # An owned probe must not adopt, or close, a GUI somebody is using: `BN_USER_DIRECTORY` makes
     # the profile disposable but a second instance still shares the licence seat.
+    #
+    # **The check and the launch are one critical section.** Reading the process list and then
+    # launching leaves a window in which a second capture reads the same empty list and launches
+    # too, so both proceed against a single-seat licence. `bn_followup_probe.main` holds an
+    # `flock` across the whole of its own launch for this reason, and this takes **the same lock
+    # file** rather than one of its own -- the resource being serialised is the seat, which the
+    # two probes share. Raised on review of #354.
+    lock_path = Path(os.environ.get("TMPDIR", "/tmp")) / f"windbg-bn-probe-{os.getuid()}.lock"
+    with lock_path.open("a") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            parser.error("another owned Binary Ninja probe holds the licence seat")
+        run(args, parser)
+
+
+def run(args, parser) -> None:
     listing = os.popen("ps -axo comm=").read()
     if any(Path(line.strip()).name == "binaryninja" for line in listing.splitlines()):
         parser.error("close the running Binary Ninja GUI before this isolated probe")
