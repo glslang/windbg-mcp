@@ -123,10 +123,14 @@ there is none, and each is handled explicitly rather than absorbed.
   it took from a table and `{"kind": "comparison", …}` on one it took from a compare, and the
   switch site has to be one this walk resolved too. Measured 2026-09-20: `mountmgr`'s 45 all carry
   switch evidence at `0x1940c`, `0x1944c` and `0x19730` — exactly this side's three tables — while
-  `rdyboost`'s two carry `comparison` and are real misses. *Then* the count has to match `entries`
-  minus `followed`, because a table slot that is not one of the ones dropped here is a difference
-  too. Both conditions, in that order: equal counts are not provenance, and one missed compare
-  beside one dropped slot balances perfectly while hiding the finding this lane exists to make.
+  `rdyboost`'s two carry `comparison` and are real misses. The **count** is checked separately,
+  against `entries` minus `followed`, and only where the records are counted — at route level.
+  Both, in that order, and neither alone: equal counts are not provenance, since one missed
+  compare beside one dropped slot balances perfectly while hiding the finding this lane exists to
+  make; and attribution is not a licence either, since a table slot that is not one of the ones
+  dropped here is a difference too. Keeping the count out of the *code* comparison matters for a
+  third shape — a driver whose dropped slots carry codes it also handles elsewhere leaves no
+  unrouted code at all, and comparing the two numbers there would report that as a disagreement.
 
 And one thing the lane prints because the *absence* of a difference is easy to over-read: **what a
 fixture cannot decide.** Two implementations both proving no buffer size is correct behaviour
