@@ -1531,10 +1531,13 @@ rather than on which kernel, so an ordinary NT target takes the same `clear_all_
 It reads the guest's boot identity and uptime over WinRM before the test and twice after, and
 fails if the boot moved or the uptime did not. The connection string is resolved from the named
 profile inside the script and passed to the test through the environment, so the debug key is
-never an argument -- and the profile name is normalized exactly as `kdconn::normalize` does it,
-because `lab-vm` and `labvm` are *different* profiles to the server and picking the wrong one
-attaches to one kernel while the rest of the script checks another's health. Two entries that
-normalize alike are refused rather than resolved. `-PreflightOnly` does the resolution and the
+never an argument. **The resolution follows the server's, deliberately**: a
+`WINDBG_MCP_PROFILE_<NAME>` variable takes precedence over the file, as `Profiles::from_host`
+gives it, and the name is normalized exactly as `kdconn::normalize` does it -- so `lab-vm` and
+`lab_vm` are one profile and `labvm` is another. Every way of getting that wrong ends the same
+way: attaching to one kernel while the rest of the script checks another's health. Two file
+entries that normalize alike are refused rather than resolved, and the entry or variable a profile
+came from is printed -- the name, never the value. `-PreflightOnly` does the resolution and the
 health read and stops without attaching, which is the cheap way to check that wiring first.
 
 **Its positive control is the half that makes the postcondition mean anything.** A KDNET break-in
