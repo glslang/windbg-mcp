@@ -85,9 +85,32 @@ function Normalize-ProfileName([string]$name) {
 }
 
 function Resolve-Connection {
+    $wanted=Normalize-ProfileName $Profile
+    # **The environment first, because that is what the server does.** `Profiles::from_host`
+    # admits `WINDBG_MCP_PROFILE_<NAME>` entries before the file's and keeps the one already
+    # there, so an operator who defined a profile that way is naming the environment's target --
+    # and a resolver that read only the file would halt whatever the file's stale entry of the
+    # same name points at, while the WinRM checks below watched the one they meant. The prefix
+    # matches case-insensitively, as Windows variable names do; `WINDBG_MCP_PROFILES` names the
+    # file and is not a profile, which the trailing underscore already excludes.
+    foreach($variable in Get-ChildItem Env:){
+        if($variable.Name.Length -le 19){continue}
+        if(-not $variable.Name.Substring(0,19).Equals('WINDBG_MCP_PROFILE_',[StringComparison]::OrdinalIgnoreCase)){continue}
+        $suffix=$variable.Name.Substring(19)
+        if([string]::IsNullOrWhiteSpace($suffix) -or [string]::IsNullOrWhiteSpace($variable.Value)){continue}
+        if((Normalize-ProfileName $suffix) -eq $wanted){
+            Write-Host "Profile '$Profile' resolved from the environment ($($variable.Name))"
+            $fromEnv=$variable.Value.Trim()
+            if(-not [string]::IsNullOrWhiteSpace($env:WINDBG_MCP_SMOKE_KERNEL) -and
+               $env:WINDBG_MCP_SMOKE_KERNEL -ne $fromEnv) {
+                throw "WINDBG_MCP_SMOKE_KERNEL is set and does not match profile '$Profile'. One of them names a different target from the one this script is checking over WinRM, and attaching would halt that one instead. Clear the variable or correct the profile; neither value is printed here because both carry the debug key."
+            }
+            return $fromEnv
+        }
+    }
     $path=Join-Path $env:USERPROFILE '.windbg-mcp\profiles.json'
     if($env:WINDBG_MCP_PROFILES){$path=$env:WINDBG_MCP_PROFILES}
-    if(-not (Test-Path -LiteralPath $path)){throw "No profile file at $path, so '$Profile' cannot be resolved"}
+    if(-not (Test-Path -LiteralPath $path)){throw "No profile file at $path and no WINDBG_MCP_PROFILE_ variable, so '$Profile' cannot be resolved"}
     $profiles=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
     # **The server's rule, character for character**: lowercase, and every non-alphanumeric
     # character becomes `_` (`kdconn::normalize`). Separators are *translated*, not deleted --
@@ -95,7 +118,6 @@ function Resolve-Connection {
     # instead collapses that third name onto the first two, and the collapse is not a naming
     # nicety here: picking the wrong entry attaches to one kernel while everything below checks
     # the health of another.
-    $wanted=Normalize-ProfileName $Profile
     $matched=@($profiles.PSObject.Properties | Where-Object { (Normalize-ProfileName $_.Name) -eq $wanted })
     if($matched.Count -gt 1){
         # Refused rather than resolved, like every other ambiguity in this script: two file keys
@@ -103,7 +125,7 @@ function Resolve-Connection {
         throw ("Profile '$Profile' matches more than one entry in {0}: {1}. They normalize to the same name, so which kernel this would halt is ambiguous; rename one." -f $path, (($matched | ForEach-Object { $_.Name }) -join ', '))
     }
     if($matched.Count -eq 0){throw "Profile '$Profile' is not in $path"}
-    Write-Host "Profile '$Profile' resolved from entry '$($matched[0].Name)'"
+    Write-Host "Profile '$Profile' resolved from entry '$($matched[0].Name)' in the profile file"
     $resolved=$matched[0].Value
     if(-not [string]::IsNullOrWhiteSpace($env:WINDBG_MCP_SMOKE_KERNEL) -and
        $env:WINDBG_MCP_SMOKE_KERNEL -ne $resolved) {
