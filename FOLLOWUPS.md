@@ -55,19 +55,25 @@ what a record contributes by testing the backend again in each field that needs 
 [#341](https://github.com/glslang/windbg-mcp/pull/341)'s breakpoint-command guard, where both
 review bots independently reached the same finding — a command scanner that reads the first token
 of a segment cannot see `.opendump` inside an `.if`, a `.foreach` or an alias that resolves only
-when it runs (2026-09-18). And items **84–85** from running
+when it runs (2026-09-18). And item **84** from running
 `ioctl_map` against a live **ARM64** target for the first time
 ([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): an `adrp`+`add` table base
-lost at the `add`, and an ARM64 surface a second implementation has already agreed with figure for
-figure without either ever being diffed against the other. That run filed four more, all now in
+lost at the `add`. That run filed five more, all now in
 [`DONE.md`](./DONE.md) -- the literal pool the fact walk could not read (item 82, which was the
 whole of why 235 codes carried no proven size or refusal), the switch tables the reachability
-walk did not follow while the map resolved them (item 83), and the two things item 83's own
-fourteen review rounds left behind: a resolver cap discarding the targets it had proved (item 90)
-and the last uncounted way a `NOT REACHABLE` can be short of the graph (item 89). And item 87 from verifying one of the review findings on
+walk did not follow while the map resolved them (item 83), the two things item 83's own
+fourteen review rounds left behind -- a resolver cap discarding the targets it had proved (item 90)
+and the last uncounted way a `NOT REACHABLE` can be short of the graph (item 89) -- and the ARM64
+second opinion that had never been diffed (item 85), whose lane, once written, found the published
+`mountmgr` agreement to have been between two different builds. And item 87 from verifying one of the review findings on
 [#347](https://github.com/glslang/windbg-mcp/pull/347), where checking which `untracked` entries
 `volmgr` actually had turned up a code the map loses beside three identical ones it keeps
-(2026-09-19).
+(2026-09-19), and item 91 from the one-sided half of that diff (2026-09-20): after item 82's
+literal-pool read landed, `rdyboost`'s thirteen length checks are all still `exact: false`, because
+the refusal they branch to returns through a shared epilogue the walk stops at the head of. And
+item 92 from item 85's lane finding a driver the two implementations disagree about (2026-09-20):
+A64 writes `a || b || c` as three compares feeding one branch, and this walk reads the last of them
+and files the rest in `untracked`.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1604,68 +1610,6 @@ large one.
 **Where it picks up:** `ioctl::update`'s `Effect::Add` arm (`src/ioctl.rs`), where the
 `_ => set(facts, &destination, None)` fall-through is.
 
-## 85. [windbg-mcp] The ARM64 second opinion exists and has never been diffed
-
-**Repo:** `windbg-mcp`.
-
-`tools/ghidra_oracle/` exists because everything else checking the driver tools was derived from my
-own reading of the same drivers, and it paid for itself on its first run by finding
-`IOCTL_MOUNTMGR_CREATE_POINT` missing from `ioctl_map`. Every run of *that* lane has been x64, and
-neither Ghidra nor Driver Buddy Revolutions is installed on this bench (checked 2026-09-19).
-
-**But a second implementation has already answered on ARM64, and it agrees.** This item first
-claimed otherwise and was wrong; review caught it. The Binary Ninja companion
-([`binja-windbg-mcp`](https://github.com/glslang/binja-windbg-mcp)) records, in
-[`docs/binja-windbg-mcp-validation.md`](./docs/binja-windbg-mcp-validation.md):
-
-| fixture | companion | `ioctl_map` on the live ARM64 target |
-|---|---|---|
-| ARM64 HEVD | all **29** cases, no unresolved entries | **29** cases |
-| ARM64 `mountmgr` 10.0.26100.1 | **93** code/site records: **48** routes for **24** recognised codes, **three** jump tables | **48** records, **24** distinct codes, **three** tables |
-
-Independently derived, and identical **where the two report the same thing** -- the companion
-admits a branch whose `input` is `Parameters.DeviceIoControl.IoControlCode`, which is Binary
-Ninja's type propagation over the IO stack location, where this walk traces a displacement through
-`Facts`.
-
-**The 93 has no counterpart here, and a record-level diff would report 45 phantom discrepancies.**
-The companion's 93 is those 48 routes plus **45 explicit default-rejection table slots**; this
-implementation drops a slot whose target is the bounds check's own branch (`src/ioctl.rs`, "a slot
-that goes to the default is not a case"), so it emits the 48 and never the 45. A lane that diffs
-records without saying so measures a deliberate difference in *reporting* and calls it
-disagreement. It has to compare the accepted routes, or normalise the default slots explicitly --
-part of writing the lane rather than a detail of it. Raised on review.
-
-**So the gap is narrower than "unchecked", and more specific.** Three parts:
-
-- **No diff is run as a lane.** The agreement above was read out of two documents by hand. Nothing
-  fails when they diverge, which is the whole point of `tools/ghidra_oracle/` and the reason it
-  exists for x64.
-- **The two fixtures that agree are the two that cannot separate the implementations.** The
-  companion's own record says *"Exact buffer sizes remain unproven"* for ARM64 `mountmgr` -- and on
-  that driver **no size is provable**, because its length checks are in callees rather than in the
-  dispatch routine's case blocks (measured: the block at `mountmgr+0x192ac` is `mov w20,#0` and a
-  branch to the epilogue). Both implementations reporting none is correct behaviour agreeing with
-  correct behaviour, so it says nothing about item 82.
-- **The driver that would separate them has not been run.** `rdyboost` is where the literal pool
-  bites: 13 cases carrying length-check evidence, every one `exact: false`, because the refusal it
-  branches to is `ldr w20,<pool>` over `STATUS_INVALID_PARAMETER`. Whether a decompiler that
-  constant-folds a read-only PC-relative load proves those sizes is the measurement to take, and it
-  is the one that would answer item 82 before either implementation is changed.
-
-**Why deferred:** the Ghidra lane needs a host stood up. The Binary Ninja route needs no install --
-it needs the diff written, a decision about which lane `tools/ghidra_oracle/` grows to hold, and
-the companion pointed at a driver neither implementation has published figures for.
-
-**Where it picks up:** `tools/ghidra_oracle/README.md` -- its bench table, and its third trap about
-the cached image having to be the one the dump mapped, which on a live ARM64 target is a different
-question again -- plus
-[`docs/binja-windbg-mcp-plan.md`](./docs/binja-windbg-mcp-plan.md) and
-[`docs/binja-windbg-mcp-validation.md`](./docs/binja-windbg-mcp-validation.md) for the figures
-above, `binja_windbg_mcp.analysis.ioctl_map` for the counterpart tool, and
-`structured::IoctlCase`'s doc comment for the shared shape the two answer in. Its `traverse`
-already walks dispatch to sink, which is item 71 here.
-
 ## 87. [windbg-mcp] A code materialised in the previous block is lost at the join
 
 **Repo:** `windbg-mcp`.
@@ -1726,6 +1670,102 @@ underneath it.
 `(Condition::Equal | Condition::NotEqual, None)` arm that files an `untracked` entry, and the
 block-entry merge that decides what `Facts` a block starts with. A fixture has to be built from the
 real block sequence -- a hand-written four-compare chain has no join in it and already passes.
+
+## 91. [windbg-mcp] A refusal that returns through a shared epilogue is not recognised
+
+**Repo:** `windbg-mcp`.
+
+`rdyboost!SmdDispatchDeviceControl` on the live ARM64 target answers 17 cases, **13** of which
+carry an `input` length check and **every one** of those reports `exact: false`. Measured
+2026-09-20 against `windbg-mcp 0.18.0+gfb1d1a28`, which carries item 82's literal-pool read -- so
+this is what is left after that landed, not a restatement of it.
+
+The condition half is right, and so is the value. `rdyboost+0xf2f4` is `cmp w2,#4` /
+`bne rdyboost+0xf068`, which is the `Condition::NotEqual` the `exact` rule wants; the branch target
+is `ldr w20,<rdyboost+0xf3d8>` / `b rdyboost+0xef84`, and that pool entry holds `0xc000000d`
+(`STATUS_INVALID_PARAMETER`), read off the target. What the refusal never does is write the return
+register **in that block**: it parks the status in `w20` and jumps to the routine's shared
+epilogue, where `mov w0,w20` / `ret` is what returns it.
+
+**The blocker is one line of policy, and it is a defensible line.** `ioctl::refuses_in`
+(`src/ioctl.rs`) follows up to three hops of tail jump and follows **only unconditional** ones --
+*"a block that decides something is deciding it, and whatever it reaches is not simply this block's
+answer"*. `rdyboost`'s epilogue begins `cbnz w23,rdyboost+0xf37c`, so hop one lands on a block that
+decides something, the walk stops, and the `mov w0,w20` one instruction further on is never read. The
+facts are carried along tail edges rather than joined (`carried` in the same function), so the
+`w20` the refusal set would still be in hand if the walk got there.
+
+**Why this is not just "raise the hop count".** Following a conditional means choosing an edge, and
+choosing the wrong one reports a refusal on a path that accepts -- which takes a handler away from
+a code the driver serves, the failure this module is arranged against. What might be sound is
+narrower: a block whose *only* work is a conditional branch decides nothing about the status, so
+both its successors continue the same status, and the walk could follow the edge that returns.
+That is a claim about this shape rather than a general one, and it needs the mutation test before
+it is believed -- back the rule out and watch an existing assertion fail
+(`.claude/rules/measurement-provenance.md`).
+
+**Why deferred:** it is a change to the one function every case's `accepted` and `exact` flow
+through, in a module whose IOCTL recovery drew thirty-nine review findings over fourteen rounds
+(items 66--67), and the
+payoff is sizes on drivers nobody has asked this of yet. **And the second opinion does not help
+here**, which item 85 expected it to: its lane now runs `rdyboost` through the Binary Ninja
+companion (2026-09-20) and that implementation proves **no** size on any of the three ARM64
+fixtures, so there is no independent answer to check a fix against -- only the driver's own
+instructions, which is what the paragraph above reads.
+
+**Where it picks up:** `ioctl::refuses_in` and `failure_block` (`src/ioctl.rs`), the
+`(true, [next])` arm that decides which tail jump is followed, and `sizes_in`'s fourth rule --
+*"only the branch target being a refusal says the fall-through is the accepted path"* -- which is
+what consumes the answer.
+
+## 92. [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read
+
+**Repo:** `windbg-mcp`.
+
+A64 has `ccmp`, so a compiler writes `if (code == A || code == B || code == C)` as **one** branch
+fed by three compares. `ioctl_map` reads the instruction before the branch and files the rest in
+`untracked`, so every code in such a chain is lost. Measured on `rdyboost` on the live ARM64
+target, 2026-09-20, against `windbg-mcp 0.18.0+g30c4af94`:
+
+```
+rdyboost+0xef00  mov    w11,#0xC008 / movk w11,#0x56,lsl #0x10   ; w11 = 0x0056c008
+rdyboost+0xef08  mov    w10,#0xA0   / movk w10,#7,lsl #0x10      ; w10 = 0x000700a0
+rdyboost+0xef10  cmp    w8,w11
+rdyboost+0xef14  ccmpne w8,w12,#4
+rdyboost+0xef18  ccmpne w8,w10,#4
+rdyboost+0xef1c  beq    rdyboost+0xef7c
+```
+
+Three codes, one handler. The map reports **`untracked` at `0xef18`** -- the last `ccmp` -- and
+names none of them. The second chain is the same shape: `rdyboost+0xf00c` is `cmp w8,#0` /
+`ccmpne w8,w10,#0` / `bne`, with `w10 = 0x00224194` built two instructions earlier, and
+`untracked` carries `0xf010`. So on this driver the map's 17 cases are short by at least
+**`0x0056c008`**, **`0x000700a0`** and **`0x00224194`** -- `w12`'s value was not read and is left
+out rather than guessed at.
+
+**This is the mirror of the x64 defect that made `tools/ghidra_oracle/` worth building.** There,
+`cmp` / `ja` / `je` was *one* compare feeding two branches, which put the compare in one basic
+block and the equality in the next. Here it is several compares feeding one branch, inside a single
+block. Same seam, opposite side, and this one is A64-shaped because x86 has no `ccmp`.
+
+**Not silently short**, which is the one thing already right: both sites are in `untracked`, so the
+answer says it is a lower bound and points at the instruction. What is missing is the values.
+
+**How it was found, and what that says about the fix.** The ARM64 diff lane (item 85, now in
+[`DONE.md`](./DONE.md)) reported two codes only the Binary Ninja companion had, at exactly the two
+sites this walk had filed as `untracked` -- so the two implementations agreed about *where* they
+could not read something, and reading the target settled what was there. The companion is **also**
+wrong here, differently: it publishes the chain's *first* operand as a case, which is how a
+meaningless `0x00000000` reached its map, and misses the `ccmp` operands. So there is no
+implementation to copy, and a fix here cannot be validated by agreeing with that one.
+
+**Where it picks up:** `ioctl::compare` and the `Condition` it derives (`src/ioctl.rs`), which
+pairs a branch with the comparison before it. A `ccmp` carries its own condition and an `nzcv`
+immediate for the not-taken case, so reading a chain means folding several comparisons into one
+branch's condition -- `ccmpne w8,w10,#4` continues the chain only while the previous compare was
+*not* equal, which is what makes the whole thing a disjunction. A fixture has to be the real
+instruction sequence: a hand-written chain of ordinary `cmp`s has no `ccmp` in it and already
+passes.
 
 ## 88. [windbg-mcp] A call that outlives its budget finishes its work and has the answer discarded
 
