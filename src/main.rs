@@ -281,7 +281,7 @@ fn render_cast(args: &[String]) -> Result<()> {
 }
 
 /// stdout is the JSON-RPC transport, so all logging must go to stderr. A worker's stderr is
-/// inherited from the supervisor, so both roles' logs land in the same place an MCP client
+/// forwarded by the supervisor, so both roles' logs land in the same place an MCP client
 /// already reads — when the client is on this machine.
 ///
 /// Targets stay on for both, which is what tells them apart: a worker's records carry

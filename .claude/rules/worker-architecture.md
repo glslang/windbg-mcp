@@ -13,6 +13,8 @@ after supervisor loss. `start_stray_output_reader` transfers the unread handle t
 thread with bounded line buffering, like the protocol reader. Returning it to `tokio::spawn`
 restores the shutdown hang. The synthetic-endpoint supervisor-loss smoke test checks both
 graceful and abrupt exit, while retaining the worker; no DbgEng call moves off its owning thread.
+Worker stderr is also privately piped and forwarded on an unjoined OS thread. Inheriting the
+MCP host's stderr would keep its EOF open after the supervisor exits; the same test checks EOF.
 
 A 32-bit .NET target cannot be read from this server's own process, and the reason is not a missing
 DLL. An extension is loaded into the debugger's process, so its architecture is the *host's*: the

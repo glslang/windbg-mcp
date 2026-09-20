@@ -185,14 +185,14 @@ use windows_sys::Win32::System::Threading::CREATE_NEW_PROCESS_GROUP;
 /// desktop nobody can work at ([#273](https://github.com/glslang/windbg-mcp/issues/273)).
 ///
 /// **It is conditional because the flag does not suppress a console — it suppresses the window,
-/// by giving the child a console of its own**, and a worker's stderr is *inherited*
-/// ([`spawn_worker`]). A console handle handed to a process attached to a different console is
+/// by giving the child a console of its own**. Worker stderr was originally inherited
+/// (now privately piped by [`spawn_worker`]); other children still inherit it.
+/// A console handle handed to a process attached to a different console is
 /// re-bound to that one: measured on this bench, such a child's `WriteFile` reports success —
 /// bytes written, no error — and the text lands in its own invisible console instead of in the
 /// terminal, while a child that inherits the console writes where the operator is looking.
-/// Applied unconditionally this would therefore delete every worker log line from a terminal-run
-/// server, silently, and make [`crate::logbridge`]'s "they are still on the server's stderr"
-/// untrue.
+/// The private worker pipe avoids that log loss, but console sharing remains the policy for
+/// this helper, which is also used by the TTD recorder.
 ///
 /// So it goes on exactly where it changes something. With no console there is nothing to inherit
 /// and nothing for stderr to lose — it is a pipe or a file, which is inherited unchanged
@@ -643,6 +643,8 @@ pub struct Session {
 #[derive(Debug)]
 struct Waiting {
     done: oneshot::Sender<Result<Output, EngineError>>,
+    /// An EndSession reply is authoritative even after its caller times out.
+    ending: bool,
     /// Where this call reports what it is doing, when its client asked to be told
     /// ([`crate::progress`]). `None` for the overwhelming majority: no `progressToken`, or no
     /// client at all — the shutdown sweep and reclamation call through here too.
@@ -1883,6 +1885,7 @@ impl Sessions {
                     id,
                     Waiting {
                         done: tx,
+                        ending: matches!(call.op, EngineOp::EndSession),
                         progress: crate::progress::current(),
                         resumed,
                         unwound: false,
@@ -3771,6 +3774,11 @@ async fn start_worker(
         let _ = child.start_kill();
         return Err(format!("could not start a reader for worker stdout: {e}"));
     }
+    let stderr = child.stderr.take().ok_or("engine worker has no stderr")?;
+    if let Err(e) = start_worker_stderr_reader(id, stderr) {
+        let _ = child.start_kill();
+        return Err(format!("could not start a reader for worker stderr: {e}"));
+    }
     let unwinding: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let mut messages = match read_messages(id.to_string(), channel.messages, Arc::clone(&unwinding))
     {
@@ -3882,6 +3890,26 @@ fn inheritable(handle: &impl AsRawHandle) -> std::io::Result<()> {
     Ok(())
 }
 
+/// The host may hand us inheritable stdio handles. Even with `Stdio::piped()`, Windows
+/// would copy those original handles as well as the new child-specific handles.
+/// `Command` makes inheritable duplicates for explicit stdio inheritance when needed.
+fn isolate_host_stdio() -> std::io::Result<()> {
+    for handle in [
+        std::io::stdin().as_raw_handle(),
+        std::io::stdout().as_raw_handle(),
+        std::io::stderr().as_raw_handle(),
+    ] {
+        if handle.is_null() || handle == windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: borrowed standard handles; only inheritance changes, never ownership.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 /// Starts a worker process with a protocol channel of its own.
 ///
 /// Marking, spawning and closing all happen under [`SPAWN_LOCK`], which is the whole of what
@@ -3899,6 +3927,7 @@ fn spawn_worker(
     let (our_messages, their_messages) = std::io::pipe()?;
 
     let _one_spawn_at_a_time = spawn_guard();
+    isolate_host_stdio()?;
     inheritable(&their_requests)?;
     inheritable(&their_messages)?;
     let mut command = Command::new(exe);
@@ -3940,8 +3969,9 @@ fn spawn_worker(
         // that prints to the console lands, and it is now only a log: nothing of the protocol
         // comes this way.
         .stdout(Stdio::piped())
-        // Worker logs join the server's own, which is where an MCP client looks for them.
-        .stderr(Stdio::inherit())
+        // Forwarded by the supervisor: a preserved orphan must not keep the MCP host's
+        // stderr write handle alive after the supervisor exits.
+        .stderr(Stdio::piped())
         // Deliberately **not** `kill_on_drop`, and the absence is load-bearing. Dropping the
         // request channel — or the whole process exiting — closes the worker's end of it, and a
         // worker reads that EOF as "the supervisor is gone" and asks its engine to release the
@@ -4109,13 +4139,25 @@ fn clipped(line: &str) -> String {
     out
 }
 
-/// Drains a worker's stdout into the log.
-///
-/// Nothing of ours writes there — the protocol has its own channel — so anything that arrives was
-/// printed by something else inside that process: an extension DLL writing to the console is the
-/// case that motivated all of this. Logged rather than discarded because it is the only place
-/// that output can now be seen, and drained rather than left because an unread pipe fills at a
-/// few dozen KiB and the *next* write blocks the engine thread inside DbgEng.
+/// Forwards worker stderr without giving the worker a handle to the MCP host's stream.
+fn start_worker_stderr_reader(
+    id: &str,
+    stderr: tokio::process::ChildStderr,
+) -> std::io::Result<()> {
+    let mut stderr = std::fs::File::from(stderr.into_owned_handle()?);
+    std::thread::Builder::new()
+        .name(format!("stderr-{id}"))
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            // Bounded byte copying preserves formatting/levels, without duplicating the
+            // worker's separate structured log records or locking stderr across a read.
+            let _ = std::io::copy(&mut stderr, &mut std::io::stderr());
+        })?;
+    Ok(())
+}
+
+/// Drains extension/DLL stdout into the log with bounded buffering, so a full pipe cannot
+/// block the engine thread. The worker protocol travels on separate anonymous pipes.
 fn start_stray_output_reader(id: String, stdout: ChildStdout) -> std::io::Result<()> {
     // Tokio's Windows anonymous-pipe reads occupy its blocking pool. A preserved child keeps
     // stdout open forever, so dropping that runtime would wait forever too. As with the protocol
@@ -4451,9 +4493,25 @@ async fn reader(
                 // Taken out of the map, so nothing can report a milestone for this job again: the
                 // only reporter reachable by its id went with it. A call that has an answer is
                 // done saying what it is doing.
-                let Some(Waiting { done: waiter, .. }) = waiter else {
+                let Some(Waiting {
+                    done: waiter,
+                    ending,
+                    ..
+                }) = waiter
+                else {
                     continue;
                 };
+                let confirmed_kernel_release =
+                    ending && session.kind == SessionKind::Kernel && result.is_ok();
+                if confirmed_kernel_release {
+                    // Publish before waking the caller or any racing timeout/preservation.
+                    session.released.store(true, Ordering::SeqCst);
+                    session.update_state(|_| {
+                        Some(SessionState::Closed(
+                            "worker confirmed kernel release".into(),
+                        ))
+                    });
+                }
                 // A failed send means the receiver is gone: the caller's timeout fired and
                 // nobody is left to act on this result. For an ordinary call that is fine —
                 // removing the entry above is what mattered, and it is how the session stops
@@ -4469,6 +4527,10 @@ async fn reader(
                     // It settled *live*, so it owes the slot it took — the same reconciliation
                     // `open` runs, which nobody is left here to run for it.
                     sessions.reconcile_capacity(&session);
+                }
+                if confirmed_kernel_release {
+                    session.fail_outstanding(&format!("session `{}` was ended", session.id));
+                    session.kill();
                 }
             }
             // `Ready` and `Fatal` belong to the spawn handshake, which has already happened.
@@ -6042,6 +6104,7 @@ mod tests {
             7,
             Waiting {
                 done: oneshot::channel().0,
+                ending: false,
                 progress: None,
                 resumed: None,
                 unwound: false,
@@ -6559,6 +6622,7 @@ mod tests {
             1,
             Waiting {
                 done: oneshot::channel().0,
+                ending: false,
                 progress: None,
                 resumed: None,
                 unwound: false,
@@ -6778,6 +6842,88 @@ mod tests {
             assert_eq!(data["recovery_required"], !confirmed);
             assert_eq!(kernel.kernel_unresolved(), !confirmed);
             assert_eq!(kernel.released.load(Ordering::SeqCst), confirmed);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_late_kernel_release_is_reconciled_without_its_caller() {
+        for ending in [false, true] {
+            for success in [false, true] {
+                let kernel = kernel_with_child("late-release");
+                kernel.reach(OpenPhase::Opened);
+                kernel.set_state(SessionState::Open);
+                let (jobs, _queue) = mpsc::unbounded_channel();
+                let kernel = Arc::new(Session {
+                    tx: jobs,
+                    ..Arc::into_inner(kernel).unwrap()
+                });
+                let sessions = registry_of(std::slice::from_ref(&kernel));
+                // Use the real submission path: the job's identity, not the result text,
+                // distinguishes a release from a late successful ordinary operation.
+                let answer = sessions
+                    .submit(
+                        &kernel,
+                        Call::new(if ending {
+                            EngineOp::EndSession
+                        } else {
+                            EngineOp::UnboundedCommand {
+                                command: "r".into(),
+                            }
+                        }),
+                        42,
+                        None,
+                    )
+                    .unwrap();
+                drop(answer);
+                kernel.preserve_kernel("caller timed out");
+                let (messages, rx) = mpsc::unbounded_channel();
+                let reading = tokio::spawn(reader(
+                    Arc::downgrade(&kernel),
+                    rx,
+                    kernel.waiters.clone(),
+                    sessions.clone(),
+                ));
+                messages
+                    .send(WorkerMessage::Done {
+                        id: 42,
+                        result: if success {
+                            Ok(Output::released("confirmed release", Some(true)))
+                        } else {
+                            Err(crate::proto::Failed::from("release refused"))
+                        },
+                    })
+                    .unwrap();
+                // This current-thread runtime cannot observe a half-run Done handler:
+                // it has no await between removing the waiter and completing cleanup.
+                tokio::time::timeout(Duration::from_secs(5), async {
+                    while !kernel.waiters.lock().unwrap().is_empty() {
+                        tokio::task::yield_now().await;
+                    }
+                })
+                .await
+                .unwrap();
+                let confirmed = ending && success;
+                assert_eq!(kernel.released.load(Ordering::SeqCst), confirmed);
+                assert_eq!(kernel.kernel_unresolved(), !confirmed);
+                assert_eq!(
+                    kernel.child.lock().unwrap().is_none(),
+                    confirmed,
+                    "only a successful EndSession reply permits controller cleanup"
+                );
+                // A timeout that was scheduled late must not undo confirmed release.
+                kernel.preserve_kernel("racing timeout");
+                assert_eq!(kernel.kernel_unresolved(), !confirmed);
+                assert_eq!(
+                    sessions
+                        .admit(&kernel_double("retry", SessionState::Opening, 50194))
+                        .is_ok(),
+                    confirmed
+                );
+                reading.abort();
+                // The stand-in is our ping child, not a debugger or a live target.
+                kernel.released.store(true, Ordering::SeqCst);
+                kernel.kill();
+            }
         }
     }
 
@@ -7031,6 +7177,7 @@ mod tests {
                 3,
                 Waiting {
                     done,
+                    ending: false,
                     progress: None,
                     resumed: None,
                     unwound: false,
@@ -7411,6 +7558,7 @@ mod tests {
             7,
             Waiting {
                 done: tx,
+                ending: false,
                 progress: Some(reporter),
                 resumed: None,
                 unwound: false,
@@ -7442,6 +7590,7 @@ mod tests {
             7,
             Waiting {
                 done: tx,
+                ending: false,
                 progress: Some(reporter),
                 resumed: None,
                 unwound: false,
@@ -7480,6 +7629,7 @@ mod tests {
                 1,
                 Waiting {
                     done: tx,
+                    ending: false,
                     progress: None,
                     resumed: None,
                     unwound: false,

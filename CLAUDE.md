@@ -41,13 +41,13 @@ worker supervision, routing), `src/worker.rs` (the child process and the engine 
 
 Practical consequences when debugging this server: a stack trace or log line can come from either
 role (both write to the supervisor's stderr, told apart by `tracing` target — `windbg_mcp::worker`
-against `windbg_mcp::engine` and friends), and killing the supervisor leaves no workers behind —
-they exit when their request channel closes.
+against `windbg_mcp::engine` and friends). Request-channel EOF initiates cleanup, except for
+unresolved remote kernel controllers, which remain for operator recovery.
 
 The same records are also readable **through the tool surface**: `server_log` serves a bounded ring
 of them (`src/logbridge.rs`), with a worker's tagged by session, which is the only way to see them
 when the client is not on this machine (`--listen`). It is a copy of the stderr stream, not a
-replacement — worker stderr is untouched — so it holds nothing below the level the server was
+replacement — worker stderr is forwarded through a private pipe — so it holds nothing below the level the server was
 started with; `RUST_LOG` widens both together. The ring is bounded, so it holds the run-up to a
 failure rather than a session's history — a transcript (below) is what keeps history.
 

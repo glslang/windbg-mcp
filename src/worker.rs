@@ -275,6 +275,7 @@ struct KernelSafety {
     remote: AtomicBool,
     pending: AtomicBool,
     preserved: AtomicBool,
+    committed: AtomicBool,
 }
 
 impl KernelSafety {
@@ -283,6 +284,7 @@ impl KernelSafety {
             remote: AtomicBool::new(false),
             pending: AtomicBool::new(false),
             preserved: AtomicBool::new(false),
+            committed: AtomicBool::new(false),
         }
     }
 
@@ -296,7 +298,19 @@ impl KernelSafety {
             && (self.pending.load(Ordering::SeqCst) || self.preserved.load(Ordering::SeqCst))
     }
 
-    fn finished_attach(&self) {
+    fn committed(&self) {
+        self.committed.store(true, Ordering::SeqCst);
+    }
+
+    fn finished_attach(&self, failed: bool, panicked: bool) {
+        if failed {
+            if panicked || self.committed.load(Ordering::SeqCst) {
+                self.preserve();
+            } else {
+                // A returned pre-commit failure claimed no target, even if a timeout raced it.
+                self.released();
+            }
+        }
         self.pending.store(false, Ordering::SeqCst);
     }
 
@@ -1195,15 +1209,16 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                 apply_symbol_path(&engine, &setting).map_err(Failed::from)?;
             }
             execute(&engine, id, request.op, queued)
-        }))
-        .unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
+        }));
+        let panicked = result.is_err();
+        let result = result.unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
         if kernel_attach {
-            KERNEL_SAFETY.finished_attach();
+            KERNEL_SAFETY.finished_attach(result.is_err(), panicked);
         }
         if ending_kernel && result.is_ok() {
             KERNEL_SAFETY.released();
         }
-        if (kernel_attach || ending_kernel) && result.is_err() {
+        if ending_kernel && result.is_err() {
             KERNEL_SAFETY.preserve();
         }
         let result = if release(id) {
@@ -1727,6 +1742,7 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                     e.attach_kernel_begin(connection.expose())
                 }
                 .map_err(es)?;
+                KERNEL_SAFETY.committed();
                 commit();
                 pending.wait().map_err(es)
             },
@@ -9399,14 +9415,45 @@ mod tests {
         assert!(!safety.hold());
         safety.begin();
         assert!(safety.hold());
+        safety.committed();
         safety.preserve();
-        safety.finished_attach();
+        safety.finished_attach(false, false);
         assert!(
             safety.hold(),
             "late attach completion must not undo preservation"
         );
         safety.released();
         assert!(!safety.hold(), "a confirmed release permits exit");
+    }
+
+    #[test]
+    fn kernel_attach_failures_preserve_only_a_committed_target() {
+        for committed in [false, true] {
+            for timed_out in [false, true] {
+                let safety = super::KernelSafety::new();
+                safety.begin();
+                if committed {
+                    safety.committed();
+                }
+                if timed_out {
+                    safety.preserve();
+                }
+                safety.finished_attach(true, false);
+                assert_eq!(
+                    safety.hold(),
+                    committed,
+                    "EOF preservation must follow target ownership (timed_out={timed_out})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn a_panicking_kernel_attach_does_not_prove_nothing_was_claimed() {
+        let safety = super::KernelSafety::new();
+        safety.begin();
+        safety.finished_attach(true, true);
+        assert!(safety.hold(), "panic is not a returned pre-commit failure");
     }
 
     /// The IRP a dispatch routine was entered with is **wherever this target puts a second
