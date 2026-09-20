@@ -60,8 +60,8 @@
       "inputSchema": 691,
       "modelVisible": 1080,
       "name": "clear_breakpoints",
-      "outputSchema": 2728,
-      "wire": 3956
+      "outputSchema": 2768,
+      "wire": 3996
     },
     {
       "annotations": 124,
@@ -574,10 +574,10 @@
     "inputSchema": 55021,
     "instructions": 2003,
     "modelVisible": 94773,
-    "outputSchema": 159539,
-    "payload": 262771,
+    "outputSchema": 159579,
+    "payload": 262811,
     "tools": 63,
-    "wire": 262697,
+    "wire": 262737,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

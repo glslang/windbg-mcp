@@ -2073,17 +2073,19 @@ const MODEL_VISIBLE_CEILING: usize = 96_500;
 /// says where it is today.
 ///
 /// **256,000 -> 268,000 for the breakpoint inventory** (2026-09-20). The payload went 255,243 ->
-/// 262,771, a difference of 7,528: `breakpoints` is 3,399 B of wire and `clear_breakpoints`
-/// 3,956, `set_breakpoint` grew 171 by the cross-reference recorded under the other ceiling, and
+/// 262,811, a difference of 7,568: `breakpoints` is 3,399 B of wire and `clear_breakpoints`
+/// 3,996, `set_breakpoint` grew 171 by the cross-reference recorded under the other ceiling, and
 /// the two remaining bytes are the array's own commas. Nothing else moved, checked against the
 /// per-tool golden keyed by **name** -- the diff for a surface that just grew by two entries is
 /// the case `a-rendering-is-not-an-identifier` is about, and a positional one blames whichever
 /// tools sit where the new ones were inserted.
 ///
-/// **5,124 B of that 7,528 is `outputSchema`, and the sharing question again answers no.**
+/// **5,164 B of that 7,568 is `outputSchema`, and the sharing question again answers no.**
 /// `BreakpointInfo` is now inlined in three closures rather than one, which is a copy each and not
-/// a product: 2,396 B for a listing of them and 2,728 for a removal's pair of lists beside one.
-/// The new figure leaves 5,229 B, 2.0%, which is the headroom every raise here has left.
+/// a product: 2,396 B for a listing of them and 2,768 for a removal's pair of lists beside one --
+/// the 40 B between that and its first recording being the `still_set` a review round added to
+/// each failed row, which is what this ceiling's headroom is for.
+/// The new figure leaves 5,189 B, 1.9%, which is the headroom every raise here has left.
 // 2026-09-20: unresolved-kernel state, one error enum variant per output closure, and the
 // explicit handoff field make the measured payload 254,925 B. No schema descriptions added.
 const WIRE_CEILING: usize = 268_000;
@@ -6275,6 +6277,47 @@ fn breakpoints_are_listed_and_cleared_through_their_own_tools() {
         after["breakpoints"].as_array().map(Vec::len),
         Some(0),
         "and the tool that only reads agrees:\n{after}"
+    );
+
+    // **A removal that failed is not the same fact as a breakpoint that is still armed**, and the
+    // mixed call is where the two come apart: one id names a breakpoint and is taken, the other
+    // names nothing at all. Reporting the second as "still set" would say the target is dirty
+    // while `remaining` — right there in the same result — says it is clean. Which of the two a
+    // caller must act on is the whole question this tool is asked before a detach, so it is
+    // answered from the post-removal inventory rather than from the fact that a call failed.
+    // Reported by Codex on #360.
+    let again = server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "ntdll!NtCreateFile" }),
+        TARGET_STEP,
+    );
+    let second = again["breakpoint"]["id"].as_u64().expect("an id");
+    let bogus = second + 1000;
+    let mixed = server.tool_data(
+        "clear_breakpoints",
+        json!({ "session_id": &session, "ids": [second, bogus] }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        mixed["removed"].as_array(),
+        Some(&vec![json!(second)]),
+        "the id that named a breakpoint was taken:\n{mixed}"
+    );
+    let failed = mixed["not_removed"]
+        .as_array()
+        .expect("the id that named nothing is reported");
+    assert_eq!(failed.len(), 1, "one id failed:\n{mixed}");
+    assert_eq!(failed[0]["id"], json!(bogus), "{mixed}");
+    assert_eq!(
+        failed[0]["still_set"],
+        json!(false),
+        "an id that names nothing is not a breakpoint left armed, and the inventory is what says \
+         so:\n{mixed}"
+    );
+    assert_eq!(
+        mixed["remaining"].as_array().map(Vec::len),
+        Some(0),
+        "the session is clean, and the row above must not contradict it:\n{mixed}"
     );
 
     // An id the engine no longer has is a failure this call *reports* rather than one it hides:

@@ -579,9 +579,9 @@ them. The model ceiling moves from 93,000 to 96,500 B -- 3,500 rather than the 2
 the headroom left at the previous raise was 335 B and a ceiling with no room in it fails the next
 reworded description rather than the next tool.
 
-The payload goes from 255,243 to **262,771 B** (`breakpoints` 3,399 B of wire, `clear_breakpoints`
-3,956, `set_breakpoint` +171, and two bytes of the array's own commas), moving the wire ceiling from
-256,000 to 268,000 B. Of that, 5,124 B is `outputSchema`: `BreakpointInfo` is inlined in three
+The payload goes from 255,243 to **262,811 B** (`breakpoints` 3,399 B of wire, `clear_breakpoints`
+3,996, `set_breakpoint` +171, and two bytes of the array's own commas), moving the wire ceiling from
+256,000 to 268,000 B. Of that, 5,164 B is `outputSchema`: `BreakpointInfo` is inlined in three
 closures rather than one, which is a copy each and not a product. Both schemas use
 `constraints_of`, so no output descriptions were added, and the per-tool golden records the cost --
 diffed by tool **name**, since a positional diff of a surface that just grew by two entries blames
