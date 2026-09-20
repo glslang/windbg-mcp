@@ -240,6 +240,18 @@ The 60-second exit-only watchdog cannot be treated as a cancellation guarantee e
 transport has printed synchronization success. These diagnostic runs did not change the server
 binary, target boot settings, or VELKO configuration.
 
+## Local-only watchdog follow-up, 2026-09-20
+
+The follow-up [dbgscope watchdog investigation](https://github.com/glslang/dbgscope/blob/fix/safe-kernel-detach/docs/kernel-exit-watchdog.md)
+used the same DbgEng build but a synthetic key and unused endpoint, not the recovered guest.
+Native-call tracing observed repeated `SetInterrupt(EXIT)` requests returning `S_OK`, with the
+exit bit set and the engine thread still in the KDNET socket receive path. The completed extended
+run recorded 150 successful requests, no wait return, and neither instrumented outer exit check
+reached with the bit set before the local probe was terminated at about 91 seconds. This excludes a
+missing watchdog or rejected request in those local runs, not in the earlier live run, whose
+watchdog HRESULT was not captured. Local-process deadline and callback-restoration tests passed
+with the same engine. Automatic recovery remains unimplemented and unvalidated.
+
 ## Local evidence index
 
 These filenames identify the retained bench artifacts, not portable repository inputs:
