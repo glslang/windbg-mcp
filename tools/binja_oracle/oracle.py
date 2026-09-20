@@ -97,6 +97,11 @@ def drive(server: list, dispatch: str, profile=None, dump=None, module=None) -> 
     # **The build that answered, recorded beside the figures it gave.** A number measured against
     # the VM is a reading of the binary that answered rather than of the checkout beside it, and
     # nothing else in this result says which (`.claude/rules/measurement-provenance.md`).
+    # `call` returns whatever reply carries the matching id, an error object included, so this
+    # would otherwise be a `KeyError: 'result'` where the server's own refusal is the useful
+    # report -- a rejected protocol revision, most likely. Raised on review of #354.
+    if "error" in started:
+        raise SystemExit("initialize failed: " + json.dumps(started["error"])[:400])
     info = started["result"]["serverInfo"]
     call("notifications/initialized", {}, notify=True)
     # A live kernel **by profile, never by connection string**: the target's debug key stays on the
@@ -365,7 +370,12 @@ def table_sites(result: dict) -> set:
     }
 
 
-def from_a_table(case: dict, sites: set, same_build: bool) -> bool:
+# A companion record whose switch site cannot be matched to one of this walk's tables, because
+# the two halves answered for different builds and an RVA from one means nothing in the other.
+ANY_SITE = -1
+
+
+def table_site(case: dict, sites: set, same_build: bool):
     """Whether a companion record is a jump-table slot, **by its own evidence**.
 
     The companion publishes `{"kind": "switch", "site": ...}` beside `goto_target` on a record it
@@ -381,11 +391,33 @@ def from_a_table(case: dict, sites: set, same_build: bool) -> bool:
         if evidence.get("kind") != "switch":
             continue
         if not same_build:
-            return True
+            return ANY_SITE
         site = rva(evidence.get("site"))
         if site is not None and site in sites:
-            return True
-    return False
+            return site
+    return None
+
+
+def from_a_table(case: dict, sites: set, same_build: bool) -> bool:
+    return table_site(case, sites, same_build) is not None
+
+
+def dropped_by_site(result: dict) -> dict:
+    """Per switch site, the table entries this walk read and did not turn into a case.
+
+    **Per site rather than one total**, because a total lets a surplus at one table stand in for a
+    slot dropped at another: a driver with a table fully followed and a second with drops would
+    reconcile a missed route at the first against the second's drops and exit 0. `mountmgr`'s three
+    tables drop 16, 16 and 13, and the companion's surplus carries exactly those counts at those
+    sites -- so the finer check is satisfied by the same data the coarse one was. Raised on review
+    of #354.
+    """
+    per_site = collections.Counter()
+    for table in result.get("tables") or []:
+        site = rva((table.get("at") or {}).get("rva"))
+        if site is not None:
+            per_site[site] += (table.get("entries") or 0) - (table.get("followed") or 0)
+    return per_site
 
 
 def dropped_slots(result: dict) -> int:
@@ -580,15 +612,40 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
         where = case.get("case_rva")
         print(f"    {norm(case['code'])} at {where or 'no address'}")
 
+    # **Reconciled per switch site.** One total lets a surplus at one table stand in for a slot
+    # dropped at another, so a missed route at a fully-followed table reconciles against a
+    # different table's drops and the lane exits 0. Raised on review of #354; `mountmgr`'s three
+    # tables drop 16, 16 and 13 and the companion's surplus carries exactly those counts at those
+    # sites, so the finer check is satisfied by the same data the coarse one was.
+    per_site = dropped_by_site(ours)
+    surplus_by_site = collections.Counter(
+        table_site(case, sites, agreed) for case in surplus_slotted
+    )
+    if agreed:
+        short = {
+            (f"{site:#x}" if site != ANY_SITE else "unmatched"): [
+                surplus_by_site.get(site, 0),
+                per_site.get(site, 0),
+            ]
+            for site in set(per_site) | set(surplus_by_site)
+            if surplus_by_site.get(site, 0) != per_site.get(site, 0)
+        }
+    else:
+        short = (
+            {}
+            if len(surplus_slotted) == sum(per_site.values())
+            else {"total": [len(surplus_slotted), sum(per_site.values())]}
+        )
     print()
-    if len(surplus) == len(surplus_slotted) == dropped and dropped:
-        print(f"  all {len(surplus)} companion-only record(s) carry switch evidence, and {dropped}")
-        print("  is what this side dropped -- so at route level too the two differ in what they")
-        print("  report rather than in what they recovered.")
-    elif surplus or dropped:
+    if not short and len(surplus) == len(surplus_slotted) and surplus:
+        print(f"  all {len(surplus)} companion-only record(s) carry switch evidence, and each")
+        print("  table's count is what this side dropped there -- so at route level too the two")
+        print("  differ in what they report rather than in what they recovered.")
+    elif surplus or sum(per_site.values()):
         print(f"  {len(surplus)} companion-only record(s), {len(surplus_slotted)} of them from a")
-        print(f"  jump table, against {dropped} dropped slot(s): the route-level surplus is not")
-        print("  accounted for by the default slots.")
+        print("  jump table; per site [surplus, dropped] where they disagree: "
+              + (json.dumps(short) if short else "none"))
+        print("  -- the route-level surplus is not accounted for by the default slots.")
         verdict = 1
     if lost:
         verdict = 1
@@ -612,9 +669,14 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     # `(32, 64)` against `(16, 64)` then ends at `64` on both sides and reads as agreement.
     # Comparing on the pairs is the only place a case of one side has a counterpart in the other.
     # Raised on review of #354, against the check added the round before.
+    # **Destination-paired records only.** A pair formed to absorb a one-sided attribution
+    # failure agrees about the code and about nothing else, and the report says its destinations
+    # are not comparable -- so comparing its lengths would contradict the contract above. Raised
+    # on review of #354, as the interaction of two earlier rounds' changes.
     disputed = [
         (norm(mine["code"]), field, mine[field], yours[field])
         for mine, yours in paired
+        if mine.get("case_rva") and yours.get("case_rva")
         for field in ("in_size", "out_size")
         if mine.get(field) is not None
         and yours.get(field) is not None
@@ -623,7 +685,8 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     for code, field, mine, yours in disputed:
         print(f"    {code} {field}: `ioctl_map` {mine}, companion {yours}  <-- differs")
     if proved or theirs_proved:
-        print(f"    compared on {len(paired)} paired route(s); a size on a record with no address,"
+        routable = sum(1 for m, y in paired if m.get("case_rva") and y.get("case_rva"))
+        print(f"    compared on {routable} paired route(s); a size on a record with no address,"
               " or on one that did not pair, has no counterpart to compare against")
     if disputed:
         verdict = 1
@@ -769,6 +832,20 @@ def selftest() -> int:
          tool([case("0x1", 0x100), case("0x1", 0x110)], [table(0x500, 2, 1)]),
          companion([case("0x1", 0x100, compare_at), case("0x1", 0x110, switch),
                     case("0x2", 0x900, switch)]), 0),
+        # Round seven: two tables, only one of which dropped anything. A single total let the
+        # surplus at the fully-followed table reconcile against the other's drop.
+        ("a surplus at a table that dropped nothing is a finding",
+         tool([case("0x1", 0x100)], [table(0x500, 2, 1), table(0x600, 3, 3)]),
+         companion([case("0x1", 0x100),
+                    case("0x2", 0x900, [{"kind": "switch", "site": "0x600"}])]), 1),
+        ("and at the table that did drop one, it is not",
+         tool([case("0x1", 0x100)], [table(0x500, 2, 1), table(0x600, 3, 3)]),
+         companion([case("0x1", 0x100), case("0x2", 0x900, switch)]), 0),
+        # A size on a pair formed only to absorb a one-sided attribution failure has no
+        # comparable destination, which is what the contract says and what the report prints.
+        ("a size across an unattributed pair is not compared",
+         tool([dict(case("0x1", 0x100), in_size=32)]),
+         companion([dict(case("0x1", None), in_size=64)]), 0),
         ("a build mismatch refuses to compare",
          tool([case("0x1", 0x100)]),
          companion([case("0x1", 0x100)], {"timestamp": 9, "size": 2}), 2),
