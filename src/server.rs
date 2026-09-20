@@ -338,7 +338,9 @@ fn describe_log(tail: &crate::logbridge::Tail, query: &crate::logbridge::Query) 
 fn opened_session(outcome: &Result<OpenReport, OpenError>) -> Option<&str> {
     match outcome {
         Ok(report) => Some(&report.id),
-        Err(OpenError::PostCommit { id, .. }) | Err(OpenError::Timeout { id, .. }) => Some(id),
+        Err(OpenError::PostCommit { id, .. })
+        | Err(OpenError::Timeout { id, .. })
+        | Err(OpenError::RecoveryRequired { id, .. }) => Some(id),
         // Nothing was created, so there is no session to name.
         Err(OpenError::Unavailable(_) | OpenError::NoRoom(_) | OpenError::Clean(_)) => None,
     }
@@ -2174,6 +2176,12 @@ impl WindbgServer {
             Err(OpenError::Clean(m)) => {
                 open_failure(ErrorCategory::Debugger, m, None, TargetCreated::No)
             }
+            Err(OpenError::RecoveryRequired { id, message }) => open_failure(
+                ErrorCategory::RecoveryRequired,
+                format!("{message}\n\nsession_id: {id}"),
+                Some(id),
+                TargetCreated::Unknown,
+            ),
             Err(OpenError::PostCommit {
                 id,
                 message,

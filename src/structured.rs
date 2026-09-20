@@ -448,6 +448,9 @@ pub enum TargetCreated {
     /// The wait was abandoned but the open was not: it is still running and may still land.
     /// `session_status` on the handle says which it became.
     Pending,
+    /// Controller ownership is unresolved; late completion cannot make the handle usable.
+    /// Inspect the target out of band and follow the explicit recovery handoff instructions.
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]

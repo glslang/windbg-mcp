@@ -323,6 +323,15 @@ impl KernelSafety {
     fn released(&self) {
         self.remote.store(false, Ordering::SeqCst);
     }
+
+    fn wait_until_released(&self) {
+        // EOF can beat the engine's result. A returned pre-commit failure or successful
+        // release can still prove ownership ended after the request reader starts parking.
+        // Late attach success is not release; keep waiting without another DbgEng call.
+        while self.remote.load(Ordering::SeqCst) {
+            thread::park_timeout(Duration::from_secs(1));
+        }
+    }
 }
 
 static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
@@ -340,9 +349,8 @@ fn retain_orphaned_kernel() -> ! {
         std::process::id()
     );
     crate::logbridge::flush(LOG_FLUSH);
-    loop {
-        thread::park();
-    }
+    KERNEL_SAFETY.wait_until_released();
+    std::process::exit(0);
 }
 
 /// Whether the batch on this worker's engine thread has been told to stop, and — the part a
@@ -9445,6 +9453,37 @@ mod tests {
                     "EOF preservation must follow target ownership (timed_out={timed_out})"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn an_orphan_observes_ownership_ending_after_it_starts_waiting() {
+        for pre_commit_failure in [false, true] {
+            let safety = std::sync::Arc::new(super::KernelSafety::new());
+            safety.begin();
+            safety.preserve();
+            let (done, observed) = std::sync::mpsc::channel();
+            let waiting = std::thread::spawn({
+                let safety = safety.clone();
+                move || {
+                    safety.wait_until_released();
+                    let _ = done.send(());
+                }
+            });
+            let early = observed.recv_timeout(std::time::Duration::from_millis(20));
+            if pre_commit_failure {
+                safety.finished_attach(true, false);
+            } else {
+                safety.released();
+            }
+            assert!(
+                early.is_err(),
+                "unresolved ownership must keep the orphan alive"
+            );
+            observed
+                .recv_timeout(std::time::Duration::from_secs(3))
+                .expect("orphan did not observe confirmed end of ownership");
+            waiting.join().unwrap();
         }
     }
 
