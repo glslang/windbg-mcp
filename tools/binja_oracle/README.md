@@ -132,6 +132,13 @@ there is none, and each is handled explicitly rather than absorbed.
   third shape — a driver whose dropped slots carry codes it also handles elsewhere leaves no
   unrouted code at all, and comparing the two numbers there would report that as a disagreement.
 
+**The whole list of difference classes is in `oracle.py`'s diff section**, written after three
+review rounds had landed on one of them: the build, a code only one side has, a code routed
+elsewhere, a code with no address, and a length both sides prove differently. The last of those
+was found by writing the list rather than by a review round — the sizes were counted on each side
+and never compared, so two implementations proving one length each, differently, read as `1, 1`.
+It is what the lane checks, not a proof that nothing else can differ.
+
 And one thing the lane prints because the *absence* of a difference is easy to over-read: **what a
 fixture cannot decide.** Two implementations both proving no buffer size is correct behaviour
 agreeing with correct behaviour whenever the driver's length checks are not in the dispatch

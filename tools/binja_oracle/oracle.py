@@ -171,6 +171,26 @@ def ask_companion(checkout: pathlib.Path, python: pathlib.Path, fixture: pathlib
 
 
 # ---- the diff ------------------------------------------------------------------------------
+#
+# **Every way these two answers can differ, and which side of the line it is on.** Written after
+# three review rounds landed on one of them (#354), because enumerating the cases once is cheaper
+# than meeting them one at a time -- and the fifth below was found by doing it.
+#
+#   1. The **build** the two halves answered for. Gated first; a mismatch ends the run at exit 2,
+#      because no RVA in one build is an RVA in the other.
+#   2. A **code only one side has**. This side's alone is a finding. The companion's alone is one
+#      too, unless every record carrying it came from a jump table by its own evidence -- this
+#      walk drops a table slot that goes to the default, and the companion publishes it.
+#   3. A code **routed elsewhere**. Inside the forward window it is the two case-address
+#      conventions; outside it, a finding.
+#   4. A code with **no address** on one side or both. Compared as a code, never as a route, and
+#      the count of such cases is printed.
+#   5. A **length** both sides prove, differently. A finding.
+#
+# Everything else these answers carry is either derived from the code (`device_type`, `function`,
+# `method`, `required_access` -- identical whenever the codes are) or has no counterpart on the
+# other side (`accepted`, `proved`, `untracked`, `unresolved`), and those are printed rather than
+# compared. This list is what the lane checks, not a proof that nothing else can differ.
 
 
 def norm(code) -> str:
@@ -491,6 +511,15 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     def proves(cases):
         return sum(1 for case in cases if case.get("in_size") or case.get("out_size"))
 
+    def sizes_of(cases):
+        """code -> the lengths it proves, for the cases that prove one."""
+        claimed = {}
+        for case in cases:
+            for field in ("in_size", "out_size"):
+                if case.get(field) is not None:
+                    claimed.setdefault(norm(case["code"]), {})[field] = case[field]
+        return claimed
+
     # A length check this side *saw* and could not call exact is the tier below a proved size, and
     # it is the one worth printing beside the zero: `null` is "not proven" rather than "no
     # requirement", so a fixture where both answer null has asked the two implementations nothing.
@@ -499,6 +528,24 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     print()
     print(f"  sizes proved: `ioctl_map` {proved} (length checks seen: {checked}), "
           f"companion {theirs_proved}")
+    # **A size both sides prove is a claim they can disagree about**, and counting them says
+    # nothing about that: two implementations proving one length each, differently, reads as
+    # `1, 1`. Found by enumerating the ways these answers can differ rather than by waiting for
+    # the next review round; no ARM64 fixture proves a size on either side, so this is unexercised
+    # against a real driver and is here because the count was not a comparison.
+    ours_sized, theirs_sized = sizes_of(our_cases), sizes_of(their_cases)
+    disputed = [
+        (code, field, ours_sized[code][field], theirs_sized[code][field])
+        for code in sorted(set(ours_sized) & set(theirs_sized))
+        for field in ("in_size", "out_size")
+        if field in ours_sized[code]
+        and field in theirs_sized[code]
+        and ours_sized[code][field] != theirs_sized[code][field]
+    ]
+    for code, field, mine, yours in disputed:
+        print(f"    {code} {field}: `ioctl_map` {mine}, companion {yours}  <-- differs")
+    if disputed:
+        verdict = 1
     if not proved and not theirs_proved:
         print("  -- neither proves one here, which separates the two implementations not at all.")
 
@@ -586,6 +633,18 @@ def selftest() -> int:
         ("a code with no case_rva on both sides agrees",
          tool([case("0x1", 0x100), case("0x2", None)]),
          companion([case("0x1", 0x100), case("0x2", None)]), 0),
+        # Found by enumerating rather than by a review round: the sizes were counted on each
+        # side and never compared, so two implementations proving one length each, differently,
+        # read as `1, 1`.
+        ("a length both sides prove differently is a finding",
+         tool([dict(case("0x1", 0x100), in_size=32)]),
+         companion([dict(case("0x1", 0x100), in_size=64)]), 1),
+        ("the same length on both sides is not",
+         tool([dict(case("0x1", 0x100), in_size=32)]),
+         companion([dict(case("0x1", 0x100), in_size=32)]), 0),
+        ("a length only one side proves is not a finding",
+         tool([dict(case("0x1", 0x100), in_size=32)]),
+         companion([case("0x1", 0x100)]), 0),
         ("a build mismatch refuses to compare",
          tool([case("0x1", 0x100)]),
          companion([case("0x1", 0x100)], {"timestamp": 9, "size": 2}), 2),
