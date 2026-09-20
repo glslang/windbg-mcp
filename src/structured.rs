@@ -1372,10 +1372,12 @@ pub struct BreakpointsCleared {
     /// removal by an id the engine has since handed to a different breakpoint. So a partial
     /// removal succeeds, with the rest named in [`Self::not_removed`].
     pub removed: Vec<u32>,
-    /// The ones this call named, could not remove, and has therefore left armed.
+    /// The ones this call named and could not remove.
     ///
-    /// Normally empty. Non-empty on a live target means an `int 3` is still patched into it: read
-    /// it before resuming or detaching.
+    /// Normally empty. **Not the same as "left armed"**, which is the question a caller has before
+    /// resuming or detaching: an id that named nothing at all fails here too, and that target is
+    /// clean. [`BreakpointRemoval::still_set`] is the fact, read from the inventory afterwards
+    /// rather than inferred from the failure.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub not_removed: Vec<BreakpointRemoval>,
     /// What the session holds afterwards — or `null` where the listing itself could not be read.
@@ -1396,6 +1398,19 @@ pub struct BreakpointRemoval {
     /// The engine's own reason, carried rather than summarised: "no such breakpoint" and a link
     /// that dropped mid-removal are the same shape here and want different next moves.
     pub reason: String,
+    /// Whether the session **still holds** a breakpoint with this id, read from the listing taken
+    /// after the removals — `null` where that listing could not be read.
+    ///
+    /// **A removal that failed and a breakpoint that is armed are two different facts**, and only
+    /// this one is worth acting on. The obvious reading of a failure — that the breakpoint is
+    /// still there — is wrong in the ordinary case: an id naming nothing at all fails exactly like
+    /// one the engine refused to remove, and leaves a target that is clean. Reporting them alike
+    /// had this result contradict itself, saying a breakpoint was still set beside a
+    /// [`BreakpointsCleared::remaining`] that was empty.
+    ///
+    /// `Some(true)` is the case to act on before resuming or detaching a live target: an `int 3`
+    /// the debugger patched in and could not take out.
+    pub still_set: Option<bool>,
 }
 
 // **The prose on the two types below is `//` and not `///` wherever a caller does not need it**,

@@ -4851,11 +4851,12 @@ fn distinct_ids(ids: Vec<u32>) -> Vec<u32> {
 /// **Empty `ids` and `None` are not the same request**, which is why the tool refuses to let an
 /// omitted field mean "all": `None` here has already been chosen by a caller who passed `all`.
 ///
-/// Failing only when *nothing* was removed is deliberate. A call that removed some of what it
-/// named has mutated the target, so reporting it as an error — the shape a caller retries — would
-/// send that retry at ids the engine may since have handed to different breakpoints, the engine
-/// reusing the ids of removed ones. A call that removed nothing has not, and that is a failure
-/// with nothing to undo.
+/// Failing only when every id it named failed is deliberate — and that is not the same as "nothing
+/// was removed", which an explicitly empty `ids` also satisfies while having asked for nothing. A
+/// call that removed some of what it named has mutated the target, so reporting it as an error —
+/// the shape a caller retries — would send that retry at ids the engine may since have handed to
+/// different breakpoints, the engine reusing the ids of removed ones. A call where every attempt
+/// failed has mutated nothing, and that is a failure with nothing to undo.
 fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, Failed> {
     // The listing is a `?` on this path too, and for a sharper reason than the tool above: it is
     // not an inspection here but the *request* — "all of them" cannot be turned into ids any other
@@ -4875,6 +4876,8 @@ fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, F
             Err(why) => not_removed.push(structured::BreakpointRemoval {
                 id,
                 reason: why.to_string(),
+                // Filled in below, from the inventory rather than from this failure.
+                still_set: None,
             }),
         }
     }
@@ -4896,6 +4899,15 @@ fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, F
     // happened, and an inspection that fails after them must not read as their having failed.
     // `None` is what keeps that distinguishable from the empty list a cleared session has.
     let remaining = held_breakpoints(e).ok();
+    // **The fact, rather than the inference from the failure.** A removal that failed says nothing
+    // on its own about whether anything is armed: an id naming nothing at all fails exactly like
+    // one the engine refused, and leaves a clean target. The listing just taken is what separates
+    // them, and where it could not be read the answer is `None` — unknown, not "no".
+    for failure in &mut not_removed {
+        failure.still_set = remaining
+            .as_ref()
+            .map(|held| held.iter().any(|breakpoint| breakpoint.id == failure.id));
+    }
     let mut text = match removed.len() {
         0 => "No breakpoints were removed.\n".to_string(),
         1 => format!("Removed breakpoint {}.\n", removed[0]),
@@ -4909,11 +4921,20 @@ fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, F
         ),
     };
     for failure in &not_removed {
-        // Named one per line rather than counted, because each is a breakpoint still armed in the
-        // target and the id is what a caller needs to try again or to go and look.
+        // Named one per line rather than counted, because the id is what a caller needs to try
+        // again or to go and look — and said **neutrally**, with the armed claim made only where
+        // the inventory supports it. Saying "still set" of an id that named nothing put this text
+        // at odds with the listing printed directly beneath it.
         text.push_str(&format!(
-            "Breakpoint {} is **still set**: {}\n",
-            failure.id, failure.reason,
+            "Breakpoint {} was not removed: {}{}\n",
+            failure.id,
+            failure.reason,
+            match failure.still_set {
+                Some(true) => " — and the session still holds it, so it is armed in the target",
+                Some(false) =>
+                    " — the session holds no such breakpoint, so nothing is armed for it",
+                None => "",
+            },
         ));
     }
     match &remaining {
