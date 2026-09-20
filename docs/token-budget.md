@@ -339,19 +339,19 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,457 | 17.4% |
+   | `allocator` | 10 | 16,457 | 17.3% |
    | `inspect` | 10 | 13,152 | 13.9% |
    | `session` | 10 | 13,682 | 14.4% |
    | `ioctl` | 10 | 12,435 | 13.1% |
-   | `exec` | 10 | 14,770 | 15.6% |
+   | `exec` | 10 | 14,876 | 15.7% |
    | `batch` | 1 | 10,021 | 10.6% |
    | `crash` | 3 | 7,427 | 7.8% |
    | `ttd` | 9 | 6,829 | 7.2% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 63 | 94,773 |
-   | `session,inspect,exec,crash` | 33 | 48,110 |
+   | *(absent)* | 63 | 94,879 |
+   | `session,inspect,exec,crash` | 33 | 48,216 |
    | `session,inspect,crash` | 23 | 33,187 |
    | `crash` | 13 | 19,943 |
 
@@ -573,21 +573,24 @@ the cost, including 47 B per affected error-schema closure.
 ## Breakpoint inventory (2026-09-20)
 
 `breakpoints` and `clear_breakpoints` take the surface from 61 tools and 92,665 B model-visible to
-63 and **94,773 B**, a difference of 2,108: 857 B for the listing, 1,080 for the removal, and 171
+63 and **94,879 B**, a difference of 2,214: 857 B for the listing, 1,186 for the removal, and 171
 on `set_breakpoint`, which was not touched and grew by a `TOOL_NOTES` cross-reference to both of
-them. The model ceiling moves from 93,000 to 96,500 B -- 3,500 rather than the 2,108 spent, because
+them. The model ceiling moves from 93,000 to 96,500 B -- 3,500 rather than the 2,214 spent, because
 the headroom left at the previous raise was 335 B and a ceiling with no room in it fails the next
-reworded description rather than the next tool.
+reworded description rather than the next tool. A review round then spent 106 B of that headroom on
+`clear_breakpoints`' description, which had to stop saying that a failed removal leaves a
+breakpoint armed -- so the ceiling absorbed a correction rather than a tool, which is the case it
+was sized for.
 
-The payload goes from 255,243 to **262,811 B** (`breakpoints` 3,399 B of wire, `clear_breakpoints`
-3,996, `set_breakpoint` +171, and two bytes of the array's own commas), moving the wire ceiling from
+The payload goes from 255,243 to **262,917 B** (`breakpoints` 3,399 B of wire, `clear_breakpoints`
+4,102, `set_breakpoint` +171, and two bytes of the array's own commas), moving the wire ceiling from
 256,000 to 268,000 B. Of that, 5,164 B is `outputSchema`: `BreakpointInfo` is inlined in three
 closures rather than one, which is a copy each and not a product. Both schemas use
 `constraints_of`, so no output descriptions were added, and the per-tool golden records the cost --
 diffed by tool **name**, since a positional diff of a surface that just grew by two entries blames
 whichever tools sit where they were inserted.
 
-Both tools are in the `exec` group, which goes from 8 tools and 12,662 B to 10 and 14,770 -- 15.6%
+Both tools are in the `exec` group, which goes from 8 tools and 12,662 B to 10 and 14,876 -- 15.7%
 of the surface, up from 13.7%. A client served `session,exec` is what they exist for: `execute` is
 in `inspect`, so that surface could arm a breakpoint and had no typed way to list or remove one.
 
