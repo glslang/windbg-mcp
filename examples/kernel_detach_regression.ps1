@@ -43,7 +43,11 @@ param(
     # (`-TestName a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` walks every
     # committed pool page over the wire, with the target halted throughout).
     [ValidateRange(1,100)][int]$MinSilentSamples=2,
-    [ValidateRange(0.0,600.0)][double]$MinSilentSeconds=0.5
+    [ValidateRange(0.0,600.0)][double]$MinSilentSeconds=0.5,
+    # Resolve the profile and read the guest's health, then stop -- without attaching to
+    # anything. For checking the wiring before committing to a halt, which is the moment the
+    # mistakes this script guards against are cheapest to find.
+    [switch]$PreflightOnly
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -76,18 +80,31 @@ function Read-GuestHealth {
 # frozen-window probe are aimed at `-ComputerName`, so a stale variable would halt one machine
 # while this script certified another. Neither value is printed on the mismatch; which of the two
 # is wrong is the operator's to work out from where they came from.
+function Normalize-ProfileName([string]$name) {
+    return ($name.ToLowerInvariant() -replace '[^a-z0-9]','_')
+}
+
 function Resolve-Connection {
     $path=Join-Path $env:USERPROFILE '.windbg-mcp\profiles.json'
     if($env:WINDBG_MCP_PROFILES){$path=$env:WINDBG_MCP_PROFILES}
     if(-not (Test-Path -LiteralPath $path)){throw "No profile file at $path, so '$Profile' cannot be resolved"}
     $profiles=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
-    # Names match the server's own rule: case-insensitive, with - _ . equivalent.
-    $wanted=$Profile.ToLowerInvariant() -replace '[-_.]',''
-    $resolved=$null
-    foreach($named in $profiles.PSObject.Properties){
-        if(($named.Name.ToLowerInvariant() -replace '[-_.]','') -eq $wanted){$resolved=$named.Value}
+    # **The server's rule, character for character**: lowercase, and every non-alphanumeric
+    # character becomes `_` (`kdconn::normalize`). Separators are *translated*, not deleted --
+    # `lab-vm` and `lab_vm` are the same profile and `labvm` is a different one. Deleting them
+    # instead collapses that third name onto the first two, and the collapse is not a naming
+    # nicety here: picking the wrong entry attaches to one kernel while everything below checks
+    # the health of another.
+    $wanted=Normalize-ProfileName $Profile
+    $matched=@($profiles.PSObject.Properties | Where-Object { (Normalize-ProfileName $_.Name) -eq $wanted })
+    if($matched.Count -gt 1){
+        # Refused rather than resolved, like every other ambiguity in this script: two file keys
+        # that normalize alike are two targets, and nothing here can tell which was meant.
+        throw ("Profile '$Profile' matches more than one entry in {0}: {1}. They normalize to the same name, so which kernel this would halt is ambiguous; rename one." -f $path, (($matched | ForEach-Object { $_.Name }) -join ', '))
     }
-    if($null -eq $resolved){throw "Profile '$Profile' is not in $path"}
+    if($matched.Count -eq 0){throw "Profile '$Profile' is not in $path"}
+    Write-Host "Profile '$Profile' resolved from entry '$($matched[0].Name)'"
+    $resolved=$matched[0].Value
     if(-not [string]::IsNullOrWhiteSpace($env:WINDBG_MCP_SMOKE_KERNEL) -and
        $env:WINDBG_MCP_SMOKE_KERNEL -ne $resolved) {
         throw "WINDBG_MCP_SMOKE_KERNEL is set and does not match profile '$Profile'. One of them names a different target from the one this script is checking over WinRM, and attaching would halt that one instead. Clear the variable or correct the profile; neither value is printed here because both carry the debug key."
@@ -130,6 +147,10 @@ try {
     for($cycle=1;$cycle -le $Cycles;$cycle++) {
         $before=Read-GuestHealth
         Write-Host "Cycle $cycle of $Cycles; profile=$Profile; guest=$ExpectedComputerName; processors=$($before.LogicalProcessors); test=$TestName"
+        if($PreflightOnly){
+            Write-Host 'PREFLIGHT ONLY: the profile resolved and the guest answered; nothing was attached.'
+            continue
+        }
         # Started before the test and given a generous window: it is stopped as soon as the test
         # returns, so a long budget costs nothing and a short one would end mid-attach. The
         # interval is short because the window it has to land inside is short -- a detach-only
