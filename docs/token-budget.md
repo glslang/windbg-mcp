@@ -570,6 +570,27 @@ output closure, unresolved-state schema, and explicit handoff input/result. Thes
 use `constraints_of`; no output descriptions were added. The reviewed per-tool golden records
 the cost, including 47 B per affected error-schema closure.
 
+## Breakpoint inventory (2026-09-20)
+
+`breakpoints` and `clear_breakpoints` take the surface from 61 tools and 92,665 B model-visible to
+63 and **94,773 B**, a difference of 2,108: 857 B for the listing, 1,080 for the removal, and 171
+on `set_breakpoint`, which was not touched and grew by a `TOOL_NOTES` cross-reference to both of
+them. The model ceiling moves from 93,000 to 96,500 B -- 3,500 rather than the 2,108 spent, because
+the headroom left at the previous raise was 335 B and a ceiling with no room in it fails the next
+reworded description rather than the next tool.
+
+The payload goes from 255,243 to **262,771 B** (`breakpoints` 3,399 B of wire, `clear_breakpoints`
+3,956, `set_breakpoint` +171, and two bytes of the array's own commas), moving the wire ceiling from
+256,000 to 268,000 B. Of that, 5,124 B is `outputSchema`: `BreakpointInfo` is inlined in three
+closures rather than one, which is a copy each and not a product. Both schemas use
+`constraints_of`, so no output descriptions were added, and the per-tool golden records the cost --
+diffed by tool **name**, since a positional diff of a surface that just grew by two entries blames
+whichever tools sit where they were inserted.
+
+Both tools are in the `exec` group, which goes from 8 tools and 12,662 B to 10 and 14,770 -- 15.6%
+of the surface, up from 13.7%. A client served `session,exec` is what they exist for: `execute` is
+in `inspect`, so that surface could arm a breakpoint and had no typed way to list or remove one.
+
 ## Binary Ninja bridge surface (2026-09-05)
 
 After rebasing onto `2f9cce0`, the Windows ARM64 protocol run measures the 57-tool
