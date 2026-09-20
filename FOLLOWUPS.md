@@ -1907,9 +1907,24 @@ Tracked in [windbg-mcp #355](https://github.com/glslang/windbg-mcp/issues/355). 
 server and DbgEng identities, packet-event order, successful and failed recoveries, static
 callback analysis, live caller-context capture, limitations, and local evidence hashes.
 
-**What remains open:** on the four-processor hypervisor lab, an actual temporary breakpoint hit
-could be followed by further processor stops after successful breakpoint removal and reported
-detach. Delivery order does not determine whether those exceptions were raised before or after
+**The mechanism was found and fixed on 2026-09-20, for the case that could be measured.** A
+`DEBUG_ENGOPT_INITIAL_BREAK` attach leaves a pending host break-in behind it, and dbgscope's
+`absorb_initial_break_artifact` consumes exactly one -- right for NT, one short on this
+hypervisor. The leftover is invisible in the attach's result and is spent at teardown: `qd` sends
+one `DbgKdContinue`, the pending break-in takes it, and the target stops again with no debugger
+attached. `worker::drain_pending_break_ins` now spends them before the release instead, resuming
+until two consecutive resumes run free. Measured on the one-vCPU lab: the plain attach-and-detach
+froze the guest 2 times out of 2 before, and survived 5 out of 5 after, with WinRM confirming the
+same boot and advancing uptime each time. NT is unaffected (two pool-walk cycles on a
+four-processor guest, unchanged). Stepping past the hypervisor's own `int 3` before detaching does
+**not** help, which is what rules out the instruction pointer as the cause.
+
+**What remains open:** the four-processor lab specifically. That guest is now configured with one
+processor, so the case this item was filed for -- an actual temporary breakpoint hit followed by
+further *per-processor* stops after removal and reported detach -- has not been re-run against the
+fix. The drain consumes up to five break-ins, which is more than one processor can owe, but
+whether four processors owe one each is unmeasured. Re-running it needs the owner's topology
+change, not more investigation here. The original observation stands as recorded: Delivery order does not determine whether those exceptions were raised before or after
 resume. The breakpoint site is in a recurring callback and is reachable even when its native
 debug-break check is false; a hypercall-resume origin has not been established. Neither a fixed
 number of continues nor explicit per-processor resumes is a validated remedy.

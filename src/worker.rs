@@ -336,6 +336,87 @@ impl KernelSafety {
 
 static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
 
+/// Whether this worker's kernel target was attached through the **`INITIAL_BREAK`** path, and so
+/// may still owe a break-in that the teardown has to consume.
+///
+/// **Measured on a Microsoft hypervisor, 2026-09-20.** `DEBUG_ENGOPT_INITIAL_BREAK` leaves a
+/// pending host break-in behind it; dbgscope's `absorb_initial_break_artifact` consumes *one* with
+/// a single `g`, which is right for NT and one short on that target. What is left over is not
+/// visible in the attach's result — the session looks ordinary — and it is spent at the worst
+/// possible moment: the teardown's `qd` sends one `DbgKdContinue`, the pending break-in takes it,
+/// and the target stops again with no debugger attached. The guest is then frozen while this
+/// server reports `released: true, target_left_running: true`, which is
+/// [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md)'s whole shape.
+///
+/// How it was pinned down, because the obvious reading is wrong: a plain attach leaves the
+/// hypervisor halted *on its own* `int 3` at `hv+0x404a60`, and stepping past that before
+/// detaching still froze it — so it is not where the instruction pointer sits. What does show the
+/// leftover is a resume: the first `go` after a completed attach returns **immediately** with
+/// DbgEng's CTRL+BREAK banner, while every later one runs to its bound and has to be broken in.
+/// One pending break-in, exactly.
+///
+/// The announcement attach removes `INITIAL_BREAK` and leaves none, which is why it detaches
+/// cleanly, and why this is `false` for it rather than unconditional.
+static INITIAL_BREAK_ATTACH: AtomicBool = AtomicBool::new(false);
+
+/// How long each drain resume gives a leftover break-in to show itself.
+///
+/// It fires on the *first instruction* of the resume, so this is a bound on a thing that either
+/// happens at once or not at all rather than a budget for work. When nothing is pending the target
+/// simply runs for this long and is broken back in, which is measurably harmless — a forced break
+/// leaves no artifact of its own.
+const KERNEL_DRAIN_MS: u32 = 500;
+
+/// How many resumes the drain will spend, and how many consecutive *free* ones end it.
+///
+/// **Two in a row, because one is not evidence.** A resume that reaches its deadline says the
+/// target ran for that window without stopping — but a break-in that is merely slow to arrive
+/// produces the same reading, and stopping there leaves it pending for `qd` to spend. Draining
+/// until two consecutive resumes run free is the state that was measured safe by hand: one
+/// delivered break, then two that had to be broken in, then a detach the guest survived.
+///
+/// The attempt cap is what keeps a target that breaks on every resume — its own `int 3` in a
+/// loop, say — from turning a teardown into an unbounded one. Reaching it is not an error: the
+/// release runs regardless, exactly as it did before any of this.
+const KERNEL_DRAIN_ATTEMPTS: usize = 5;
+const KERNEL_DRAIN_FREE_RUNS: usize = 2;
+
+/// Spends the break-ins an `INITIAL_BREAK` attach left over, before the teardown's `qd` can.
+///
+/// Returns how many resumes were answered by a delivered break, for the log — a number that is
+/// zero on NT and was one per attach on the hypervisor this was measured against.
+fn drain_pending_break_ins(e: &DebugEngine) -> usize {
+    let mut delivered = 0;
+    let mut free_runs = 0;
+    for _ in 0..KERNEL_DRAIN_ATTEMPTS {
+        let Ok(run) = e.execute_and_wait("g", KERNEL_DRAIN_MS) else {
+            // The engine refused the resume — a target that has gone, most likely. There is
+            // nothing left to drain and nothing to report about it.
+            break;
+        };
+        if run.target_gone {
+            break;
+        }
+        match run.cut_short {
+            // The deadline stopped it, so the target was running freely: nothing was pending in
+            // this window.
+            Some(_) => {
+                free_runs += 1;
+                if free_runs >= KERNEL_DRAIN_FREE_RUNS {
+                    break;
+                }
+            }
+            // It came back on its own, which for a resume this short means a break was waiting.
+            // That is one fewer for `qd` to lose, and the count starts again.
+            None => {
+                delivered += 1;
+                free_runs = 0;
+            }
+        }
+    }
+    delivered
+}
+
 fn kernel_recovery_required() -> Failed {
     Failed::categorised(
         crate::structured::ErrorCategory::RecoveryRequired,
@@ -1744,6 +1825,11 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // wait still establishing the link, so a guest that never dials in parks here
                 // for good. It parks *this process*, which the supervisor can kill.
                 // Unwrap only for the typed attach call; never log the exposed connection.
+                // Recorded for the teardown, which has to undo what this path leaves behind —
+                // see [`INITIAL_BREAK_ATTACH`]. One session per worker, so one flag is the whole
+                // bookkeeping, and it is set before the attach rather than after because a wait
+                // that fails still leaves whatever the engine armed on its way in.
+                INITIAL_BREAK_ATTACH.store(!experimental_break_on_connect, Ordering::SeqCst);
                 let pending = if experimental_break_on_connect {
                     e.attach_kernel_announcement_begin(connection.expose())
                 } else {
@@ -2188,6 +2274,20 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // session. Naming no tool, per `FOLLOWUPS.md` item 43: this is built in the worker,
             // which has never heard of the client's surface.
             let detaching = e.attached_to_a_live_process();
+            // **Spend the leftover break-in here, where it costs a bounded resume, rather than
+            // letting `qd` spend it on the target's only continue.** See [`INITIAL_BREAK_ATTACH`]
+            // for what leaves one and how it was measured. Best-effort and deliberately not a
+            // `?`: this is a teardown, and a session that will not close is worse than a resume
+            // that did not happen — the release below still runs, and still reports what it did.
+            if INITIAL_BREAK_ATTACH.load(Ordering::SeqCst) && matches!(e.has_target(), Ok(true)) {
+                let delivered = drain_pending_break_ins(e);
+                if delivered > 0 {
+                    tracing::info!(
+                        delivered,
+                        "consumed break-ins left over from the attach before releasing the target"
+                    );
+                }
+            }
             let ended = e
                 .end_session()
                 .map(|left| {
