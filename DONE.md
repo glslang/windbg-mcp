@@ -3698,6 +3698,16 @@ saying *why* rather than only what: the budget governs the open on the next line
 open resolves symbols over the network, so how long it takes is the symbol server's to decide
 rather than this bench's.
 
+**And 90s did not hold** (2026-09-20). The same failure came back on the ARM64 tier, again on a
+Markdown-only diff — [run 35521847427](https://github.com/glslang/windbg-mcp/actions/runs/35521847427),
+`open_dump` timing out at the cap. Three occurrences in two days at two different figures is the
+answer to which of the two precedents was the right one: the number was never the variable, since
+the open's cost is the symbol server's to decide, and this entry picked the remedy that moves it.
+The test now **skips** when the open does not land, which is what
+`a_pool_query_with_no_time_to_walk_is_refused_rather_than_run` had been doing all along; 90s stays
+to make that skip rare rather than to make it unnecessary. What this entry got right is that the
+budget governs the open — what it got wrong is that sizing it is a fix.
+
 **What the item got wrong, and it is the half worth keeping.** "90s here derives a 75s walk budget,
 still distinctively not the walker's 120s default, so the assertion survives that fix" is true of
 the *property* and false of the *code*. The assertion is a literal range -- `(40.0..=46.0)` -- and

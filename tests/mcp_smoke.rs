@@ -12652,14 +12652,32 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
     // so how long it takes is the symbol server's to decide rather than this bench's. At 60s it
     // exceeded the budget twice on 2026-09-19 — on both the x64 and the ARM64 tier, on code
     // neither run touched — and the test then failed inside the open, having measured nothing
-    // whatever about the budget it exists to pin. Sized for the open now, at the same 90s
+    // whatever about the budget it exists to pin. 90s is sized for the open, at the same figure
     // `a_running_command_is_interrupted_on_request_and_frees_its_session` was raised to for this
     // exact failure; 75s is as distinctively not the walker's 120s as 45s was.
+    //
+    // **And 90s did not hold either, so the size is no longer what this rests on.** The same
+    // failure came back on 2026-09-20 on the ARM64 tier, again on a Markdown-only diff
+    // ([run 35521847427](https://github.com/glslang/windbg-mcp/actions/runs/35521847427)): the
+    // open ran the budget out and the test reported a timed-out `open_dump`. Three times in two
+    // days at two different figures says the number is not the variable — how long the open takes
+    // is the symbol server's to decide, and no budget this test can name is proof against it. So
+    // it now does what its sibling
+    // `a_pool_query_with_no_time_to_walk_is_refused_rather_than_run` has always done and **skips**
+    // when the open does not land: a runner too slow to stage the test cannot run it, and saying
+    // so is honest where failing is a report about the wrong thing. The 90s stays, to make that
+    // skip rare rather than to make it unnecessary.
     let mut server = Server::started_with(&[
         ("WINDBG_MCP_CALL_TIMEOUT_SECS", "90"),
         ("RUST_LOG", "windbg_mcp=debug"),
     ]);
-    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    let opened = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
+    assert_no_error(&opened, "open_dump");
+    if is_tool_error(&opened) {
+        skip("the sample dump did not open inside the 90s call budget this test imposes");
+        return;
+    }
+    let session = session_id_of(&opened["result"]);
 
     // Not `tool_text`: whether the walk itself succeeds depends on symbols this tier does not
     // require, and the budget is derived before the first pool page is read either way.
