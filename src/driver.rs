@@ -1464,6 +1464,16 @@ pub(crate) fn format_report(r: &Report) -> String {
     // 11 of them on `nt!ObpLookupObjectName` within 24 functions. Both are an edge the graph did
     // not cross, and calling them all switches would describe most of them wrongly.
     //
+    // **So the remedies are qualified by case, and this refuses to guess which case a jump is.**
+    // Both review bots raised the first half independently: a handler VA and a module refresh reach
+    // a table that would not read, and reach nothing at all in a destination computed at run time,
+    // so an unqualified pair promises every reader something that cannot work for some of them --
+    // which is the defect `tables_bounded` exists for, one field along. The second half was the
+    // remedy they offered and is not available: `ioctl::Tables` answers per **listing**, and per
+    // site it has targets or nothing. Telling a switch whose table would not read from a jump that
+    // was never a switch is precisely the analysis that did not answer, so a field separating them
+    // would be inventing the distinction rather than reporting it.
+    //
     // **Outside the verdict branches, unlike [`Report::blind`], because it is true of both.** On a
     // NOT REACHABLE it is why the verdict may be wrong; on a REACHABLE it is why a shorter path may
     // exist -- the same argument that put `tables_bounded` on both, one review round of #351 after
@@ -1474,12 +1484,14 @@ pub(crate) fn format_report(r: &Report) -> String {
         out.push_str(&format!(
             "  Jumps not followed: the walk ended at {} indirect jump(s) whose targets it did \
              not\n           have, so whatever they reach — a switch's case blocks, or a callee a \
-             tail jump\n           goes to — is missing from the graph this verdict is about. A \
-             jump table is\n           crossed where it can be read; where it cannot, pass a \
-             specific handler VA as\n           `from` to ask about that block directly. On a live \
-             kernel run `modules` with\n           `refresh: true` first — a table's entries are \
-             checked against the image's\n           executable ranges, and a fresh attach has no \
-             image.\n",
+             tail jump\n           goes to — is missing from the graph this verdict is about. For \
+             a jump table this\n           could not read: pass a specific handler VA as `from` to \
+             ask about that block\n           directly, and on a live kernel run `modules` with \
+             `refresh: true` first, since a\n           table's entries are checked against the \
+             image's executable ranges. For a\n           destination computed at run time no \
+             static argument reaches it, and a\n           breakpoint and `go` is what answers it. \
+             Which of the two any of these is,\n           this cannot say: deciding that is the \
+             analysis that did not answer.\n",
             r.unresolved_jumps.len()
         ));
     }
@@ -3582,6 +3594,12 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             text.contains("refresh: true"),
             "a stale module inventory is the live-kernel cause, and naming it is the point of \
              saying anything: {text}"
+        );
+        assert!(
+            text.contains("computed at run time"),
+            "and each remedy says which case it is for: a handler VA and a module refresh reach a \
+             table that would not read, and reach nothing in a jump that was never a table -- \
+             which this count holds too: {text}"
         );
         assert_eq!(
             structured_report(&neither, None, located).unresolved_jumps,

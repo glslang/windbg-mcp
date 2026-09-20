@@ -2542,10 +2542,16 @@ pub struct Reachability {
     /// threw it away, so a `not_reachable` that stopped at a dispatch switch reported
     /// `bound_hit: false`, `stopped` absent and `blind_stops: 0` — the shape of a graph that was
     /// fully explored. Whatever each of these reaches — a switch's case blocks, a callee — is
-    /// missing from the graph the verdict is about. The remedy is the scoping one: pass a specific
-    /// handler address as `from`. On a live kernel, run a module refresh first — a table's entries
-    /// are checked against the image's executable ranges, and a fresh attach has no image to check
-    /// against.
+    /// missing from the graph the verdict is about.
+    ///
+    /// **The remedies are per case, and this field does not say which case a jump is.** For a jump
+    /// table that would not read they are the scoping one — pass a specific handler address as
+    /// `from` — and, on a live kernel, a module refresh first, a table's entries being checked
+    /// against the image's executable ranges that a fresh attach has no image for. For a
+    /// destination computed at run time neither reaches it and nothing static will; a breakpoint
+    /// answers that one. Separating the two is not available rather than unbuilt: the resolver
+    /// answers per listing, and per site it has targets or nothing, so deciding that a jump *was*
+    /// a switch is the analysis that did not answer.
     ///
     /// **Not all of them are switches**, which the ARM64 kernel dump is what says: ordinary `nt`
     /// routines end at indirect jumps that are tail calls through a register, 11 of them on
