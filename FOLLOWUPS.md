@@ -1,6 +1,6 @@
 # Follow-ups
 
-Deferred work, in twenty-five clusters: items 2–6 come from the reachability-confirmation effort (path
+Deferred work, grouped by origin: items 2–6 come from the reachability-confirmation effort (path
 recipe + `run_to_address`, merged 2026-07-04), items 8–9, 11 and 88 from surveying this server
 against the MCP `2026-07-28` extensions (tasks, apps) and then re-measuring the tasks half of it
 (2026-09-19) — where rmcp and the reference TypeScript SDK turn out to implement two
@@ -73,7 +73,9 @@ literal-pool read landed, `rdyboost`'s thirteen length checks are all still `exa
 the refusal they branch to returns through a shared epilogue the walk stops at the head of. And
 item 92 from item 85's lane finding a driver the two implementations disagree about (2026-09-20):
 A64 writes `a || b || c` as three compares feeding one branch, and this walk reads the last of them
-and files the rest in `untracked`.
+and files the rest in `untracked`. Item 93 records the multiprocessor hypervisor breakpoint/detach
+investigation (2026-09-20): debugger-reported release could leave further processor stops, while
+inspection without a temporary breakpoint or step detached with independently healthy execution.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1889,3 +1891,34 @@ no one constant fits a small dump and a live kernel both.
 **Picks up at** `engine::reader`'s `WorkerMessage::Done` arm, `Sessions::call_within`'s timeout
 path, and `continue_async`'s filing task as the worked example. Independent of item 8, and cheaper:
 no capability negotiation, no extension, and it works for the client item 8 measured.
+
+## 93. [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach
+
+Tracked in [windbg-mcp #355](https://github.com/glslang/windbg-mcp/issues/355). The
+[investigation record](./docs/hypervisor-demonstration-20260920.md) preserves the exact measured
+server and DbgEng identities, packet-event order, successful and failed recoveries, static
+callback analysis, live caller-context capture, limitations, and local evidence hashes.
+
+**What remains open:** on the four-processor hypervisor lab, an actual temporary breakpoint hit
+could be followed by further processor stops after successful breakpoint removal and reported
+detach. Delivery order does not determine whether those exceptions were raised before or after
+resume. The breakpoint site is in a recurring callback and is reachable even when its native
+debug-break check is false; a hypercall-resume origin has not been established. Neither a fixed
+number of continues nor explicit per-processor resumes is a validated remedy.
+
+**Why deferred:** the guest has recovered without rebooting, but the mechanism and dependable
+post-breakpoint teardown remain unproven. The owner plans a one-vCPU disposable-VM comparison
+so the live demonstration can proceed independently; the CPU change and demonstration are not
+yet measured. No host-wide security/scheduler change is part of this follow-up.
+
+**What closes it:** preserve a portable bounded reproducer; obtain each post-breakpoint stop's
+caller/exception context with correct processor-specific memory context; compare one and four
+vCPUs with controlled breakpoint placement and stepping; establish the cause; and, if warranted,
+validate an engine-thread implementation with repeated four-vCPU breakpoint-hit/detach runs
+and independent same-boot guest health. A passing one-vCPU run alone does not close the item.
+
+**Picks up at:** the investigation's live/static follow-up sections and #355's checklist. The
+temporary local runner is evidence, not a portable shipped regression. Keep this distinct from
+[dbgscope #173](https://github.com/glslang/dbgscope/issues/173)'s shared live-kernel `qd` validation
+and [WinDbg-Feedback #396](https://github.com/microsoft/WinDbg-Feedback/issues/396)'s unconnected
+KDNET EXIT-interrupt cancellation report.
