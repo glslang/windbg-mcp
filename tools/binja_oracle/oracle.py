@@ -192,23 +192,29 @@ def codes(cases: list) -> set:
     return {norm(case["code"]) for case in cases}
 
 
-def routes(cases: list) -> dict:
-    """code -> sorted destinations, as integers, for the cases that carry one.
+def placed(cases: list) -> dict:
+    """code -> [(destination, record)], sorted, for the cases that carry an address.
 
-    Both implementations answer per *record*, and a code legitimately has more than one:
-    `mountmgr` routes each of its codes from a host context and a silo one. A case with no
-    `case_rva` is absent here **and present in [`codes`]**, which is the whole of the split: it can
-    be compared as a code and not as a route.
+    The **record** travels with its address on purpose. Classifying a surplus by a `(code, rva)`
+    key instead means several records collapse into one question, and the answer is then the most
+    permissive of them: a switch slot and a missed comparison converging on one handler would both
+    read as switch-derived, and the comparison miss disappears. Raised on review of #354, against
+    the fix for the round before it.
+
+    Both implementations answer per record, and a code legitimately has more than one: `mountmgr`
+    routes each of its codes from a host context and a silo one. A case with no `case_rva` is
+    absent here **and present in [`codes`]**, which is the whole of the split: it can be compared
+    as a code and not as a route.
     """
     by_code = collections.defaultdict(list)
     for case in cases:
         where = rva(case.get("case_rva"))
         if where is not None:
-            by_code[norm(case["code"])].append(where)
-    return {code: sorted(where) for code, where in by_code.items()}
+            by_code[norm(case["code"])].append((where, case))
+    return {code: sorted(rows, key=lambda row: row[0]) for code, rows in by_code.items()}
 
 
-def pair_routes(ours: dict, theirs: dict, window: int):
+def pair_routes(ours: dict, theirs: dict, window: int, slotted=lambda case: False):
     """Pair each code's destinations across the two conventions, within a stated window.
 
     The companion names *"the first source-mapped statement"* of a case and this walk names the
@@ -222,16 +228,26 @@ def pair_routes(ours: dict, theirs: dict, window: int):
     displacement chosen to make the most records line up would be a parameter tuned to hide
     disagreement; a stated window is a property of the two conventions, applied uniformly, and
     anything outside it is reported.
+
+    **Table-derived records are paired first**, which only matters when two companion records sit
+    at one address with different provenance and one of them must be the surplus. Either choice is
+    arbitrary on the addresses alone, so it is made in the direction that reports: the comparison
+    record is the one left over, and the lane calls it a difference rather than hiding it behind
+    its switch-derived twin.
+
+    `extra` is the companion's unpaired **records**; `lost` is this side's unpaired (code,
+    address).
     """
     matched, spread, extra, lost = 0, collections.Counter(), [], []
     for code in sorted(set(ours) & set(theirs)):
-        mine, yours = sorted(ours[code]), sorted(theirs[code])
+        mine = ours[code]
+        yours = sorted(theirs[code], key=lambda row: (row[0], not slotted(row[1])))
         taken = set()
-        for one in mine:
+        for one, _ in mine:
             hit = next(
                 (
                     index
-                    for index, other in enumerate(yours)
+                    for index, (other, _) in enumerate(yours)
                     if index not in taken and 0 <= other - one <= window
                 ),
                 None,
@@ -240,9 +256,9 @@ def pair_routes(ours: dict, theirs: dict, window: int):
                 lost.append((code, one))
                 continue
             taken.add(hit)
-            spread[yours[hit] - one] += 1
+            spread[yours[hit][0] - one] += 1
             matched += 1
-        extra += [(code, other) for index, other in enumerate(yours) if index not in taken]
+        extra += [case for index, (_, case) in enumerate(yours) if index not in taken]
     return matched, spread, extra, lost
 
 
@@ -323,10 +339,10 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     our_cases, their_cases = ours.get("cases") or [], theirs.get("cases") or []
     print(f"module {module}")
     print(f"  ioctl_map  : {tool['server'].get('name')} {tool['server'].get('version')}, "
-          f"{len(our_cases)} record(s), {len(routes(our_cases))} code(s), "
+          f"{len(our_cases)} record(s), {len(codes(our_cases))} code(s), "
           f"{len(ours.get('tables') or [])} table(s)")
     print(f"  companion  : Binary Ninja {companion.get('analysis_version')} capture, "
-          f"{len(their_cases)} record(s), {len(routes(their_cases))} code(s)")
+          f"{len(their_cases)} record(s), {len(codes(their_cases))} code(s)")
 
     # **The identity gate, which is this lane's whole claim to be comparing anything.** The x64
     # lane's third trap is that the image has to be the one the dump mapped; here the two halves
@@ -352,7 +368,7 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
             return 2
 
     our_codes, their_codes = codes(our_cases), codes(their_cases)
-    our_routes, their_routes = routes(our_cases), routes(their_cases)
+    our_routes, their_routes = placed(our_cases), placed(their_cases)
     unplaced = [
         (name, sum(1 for case in cases if not case.get("case_rva")))
         for name, cases in (("ioctl_map", our_cases), ("companion", their_cases))
@@ -432,12 +448,9 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     # this reports a deliberate difference in *naming a case's address* as disagreement, once per
     # record -- 29 times on HEVD, where every case is a constant 0x18 apart.
     shared = set(our_routes) & set(their_routes)
-    matched, spread, extra, lost = pair_routes(our_routes, their_routes, window)
-    by_route = collections.defaultdict(list)
-    for case in their_cases:
-        where = rva(case.get("case_rva"))
-        if where is not None:
-            by_route[(norm(case["code"]), where)].append(case)
+    matched, spread, extra, lost = pair_routes(
+        our_routes, their_routes, window, lambda case: from_a_table(case, sites, agreed)
+    )
     print()
     print("routes")
     print(f"  window applied          : 0x0 to {window:#x}, forward only")
@@ -446,20 +459,12 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
               f"not a disagreement")
     elif spread:
         print(f"  displacements           : {dict(sorted(spread.items()))}")
-    routed = sorted(
-        code for code in shared
-        if not any(c == code for c, _ in lost) and not any(c == code for c, _ in extra)
-    )
+    unpaired = {norm(case["code"]) for case in extra} | {code for code, _ in lost}
+    routed = sorted(code for code in shared if code not in unpaired)
     print(f"  codes routed the same   : {len(routed)} of {len(shared)}")
-    surplus = extra + [
-        (code, where) for code in only_theirs for where in their_routes.get(code, [])
-    ]
-    surplus_slotted = [
-        pair
-        for pair in surplus
-        if any(from_a_table(case, sites, agreed) for case in by_route.get(pair, []))
-    ]
-    grouped = collections.Counter(where for _, where in surplus)
+    surplus = extra + [case for code in only_theirs for _, case in their_routes.get(code, [])]
+    surplus_slotted = [case for case in surplus if from_a_table(case, sites, agreed)]
+    grouped = collections.Counter(rva(case["case_rva"]) for case in surplus)
     print(f"  companion-only records  : {len(surplus)}")
     for where, count in sorted(grouped.items(), key=lambda kv: -kv[1])[:12]:
         print(f"    -> {where:#x}  {count} record(s)")
@@ -565,6 +570,16 @@ def selftest() -> int:
         ("dropped slots reusing a shared code are accounted for at route level",
          tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
          companion([case("0x1", 0x100), case("0x1", 0x900, switch)]), 0),
+        # And the round after that: two companion records at one address with different
+        # provenance. Either can be the surplus on the addresses alone, so the table-derived one
+        # is paired first and the compare is what is left over -- in **both** input orders, or the
+        # classification would depend on the capture's record order.
+        ("a compare sharing an address with a slot is still a finding",
+         tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
+         companion([case("0x1", 0x100, switch), case("0x1", 0x100, compare_at)]), 1),
+        ("the same, with the records the other way round",
+         tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
+         companion([case("0x1", 0x100, compare_at), case("0x1", 0x100, switch)]), 1),
         # And its P2: a case whose landing site is in no known module has no `case_rva` at all.
         ("a code with no case_rva is still compared",
          tool([case("0x1", 0x100)]), companion([case("0x1", 0x100), case("0x2", None)]), 1),
