@@ -12,6 +12,12 @@ This lane runs the *other* implementations over the same bytes and diffs the ans
 It is manual: a run takes about a minute per driver and needs Ghidra on the host, so it belongs
 nowhere near `cargo test`.
 
+**This lane is x64, and there is a second one for ARM64.** `tools/binja_oracle/` diffs the same
+tool against the Binary Ninja companion, and is a separate directory rather than a mode of this
+one because the two benches are disjoint -- that one needs a Python checkout and no disassembler,
+this one needs Ghidra, a JDK, PyGhidra and Driver Buddy on a Windows host. What they share is the
+reading discipline in *"What to read"* below, which that README points at rather than repeating.
+
 It has already paid for itself. On its first run it found `0x6dc000`
 (`IOCTL_MOUNTMGR_CREATE_POINT`) missing from `ioctl_map` — a code `mountmgr` accepts, with a name
 string and a handler, at two sites. The cause was `cmp` / `ja` / `je`: one compare feeding two
