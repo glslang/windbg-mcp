@@ -283,6 +283,7 @@ pub const KERNEL_MODE_NO_EXCEPTION: &str = "this is a kernel session, whose faul
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub enum ErrorCategory {
+    RecoveryRequired,
     /// The call was refused here, before it reached a debugger: a malformed number, an operand
     /// carrying a command separator, two arguments that cannot both be given. Fix the argument.
     InvalidArgument,
@@ -332,6 +333,7 @@ impl ErrorCategory {
             EngineError::NotRun(_) => Self::NotRun,
             EngineError::InvalidArgument(_) => Self::InvalidArgument,
             EngineError::TargetRunning(_) => Self::TargetRunning,
+            EngineError::RecoveryRequired(_) => Self::RecoveryRequired,
         }
     }
 }
@@ -546,7 +548,7 @@ pub struct SessionInfo {
     pub age_ms: u64,
     /// Whether a call that names no session is routed here.
     pub current: bool,
-    /// Whether it will still accept work.
+    /// Whether it still occupies a session slot (unresolved kernel reservations do too).
     pub live: bool,
     /// The run this session has outstanding, if any — started by `continue_async` and held until
     /// something starts another.
@@ -563,6 +565,8 @@ pub struct SessionInfo {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "state", rename_all = "snake_case")]
 pub enum SessionStateInfo {
+    /// Controller retained; target state is unknown and ordinary operations are refused.
+    KernelUnresolved { why: String },
     /// The open has started; nothing has been created or claimed yet.
     Opening,
     /// The target has been created or claimed and the debugger is waiting for it to break in.
@@ -589,6 +593,7 @@ impl SessionStateInfo {
     /// Builds the state, given the two facts only the server knows.
     pub fn of(state: &SessionState, waits_indefinitely: bool, overdue: bool) -> Self {
         match state {
+            SessionState::KernelUnresolved(why) => Self::KernelUnresolved { why: why.clone() },
             SessionState::Opening => Self::Opening,
             SessionState::Attaching => Self::Attaching {
                 waits_indefinitely,
@@ -605,6 +610,9 @@ impl SessionStateInfo {
 /// What `end_session` did.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SessionEnded {
+    /// Requires out-of-band verification/recovery; this response is not a confirmed detach.
+    #[serde(default)]
+    pub recovery_required: bool,
     pub session_id: String,
     /// Whether the worker let go of the target itself. False when it had to be killed holding
     /// it — the live-kernel attach that cannot be interrupted is the case this exists for.
@@ -4248,6 +4256,7 @@ mod tests {
     #[test]
     fn an_outcome_is_discriminated_on_status() {
         let ok = serde_json::to_value(Outcome::Ok(SessionEnded {
+            recovery_required: false,
             session_id: "sess-1".into(),
             released: true,
             worker_terminated: false,

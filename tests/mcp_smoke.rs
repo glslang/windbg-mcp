@@ -2051,7 +2051,9 @@ const MODEL_VISIBLE_CEILING: usize = 93_000;
 /// The new figure left 5,318 B at the raise, 2.1% -- the same headroom the last three raises did.
 /// Past tense on purpose: the payload moves under a ceiling that does not, and the golden is what
 /// says where it is today.
-const WIRE_CEILING: usize = 254_000;
+// 2026-09-20: unresolved-kernel state, one error enum variant per output closure, and the
+// explicit handoff field make the measured payload 254,925 B. No schema descriptions added.
+const WIRE_CEILING: usize = 256_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -11197,6 +11199,40 @@ fn process_alive(pid: u32) -> bool {
     String::from_utf8_lossy(&out.stdout).contains(&pid.to_string())
 }
 
+/// Only for workers opened by this test on a synthetic, unconnected endpoint. Hold the process
+/// object before assertions so panic cleanup cannot kill a reused PID or leak a parked worker.
+struct SyntheticKernelWorker(std::os::windows::io::OwnedHandle);
+
+impl SyntheticKernelWorker {
+    fn retain(pid: u32) -> Self {
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::System::Threading::{
+            OpenProcess, PROCESS_SYNCHRONIZE, PROCESS_TERMINATE,
+        };
+        // SAFETY: the PID came from this test server's synthetic kernel session. The returned
+        // owned handle pins that process object; Drop never reopens a PID.
+        let handle = unsafe { OpenProcess(PROCESS_TERMINATE | PROCESS_SYNCHRONIZE, 0, pid) };
+        assert!(
+            !handle.is_null(),
+            "retain synthetic worker {pid}: {}",
+            std::io::Error::last_os_error()
+        );
+        Self(unsafe { std::os::windows::io::OwnedHandle::from_raw_handle(handle) })
+    }
+}
+
+impl Drop for SyntheticKernelWorker {
+    fn drop(&mut self) {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::Threading::{TerminateProcess, WaitForSingleObject};
+        // SAFETY: valid owned process handle for our synthetic-only worker, not a live target.
+        unsafe {
+            TerminateProcess(self.0.as_raw_handle(), 1);
+            WaitForSingleObject(self.0.as_raw_handle(), 5000);
+        }
+    }
+}
+
 /// Reads one of this server's addresses back to a number, checking the representation on the way.
 ///
 /// Every address in a structured result is documented as a `0x`-prefixed, lowercase, 16-digit
@@ -11573,6 +11609,20 @@ fn a_stateless_client_can_work_while_one_of_its_own_calls_is_parked() {
         return;
     };
 
+    let status = server.stateless_at(
+        id,
+        "tools/call",
+        json!({
+            "name": "session_status", "arguments": { "session_id": attaching }
+        }),
+    );
+    id += 1;
+    let worker = engine_pid_of(
+        &status.result("tools/call")["structuredContent"],
+        &attaching,
+    );
+    let _cleanup = SyntheticKernelWorker::retain(worker);
+
     // The plain case, now that the park is established rather than assumed.
     let listed = server.stateless_at(id, "tools/list", json!({}));
     id += 1;
@@ -11606,6 +11656,24 @@ fn a_stateless_client_can_work_while_one_of_its_own_calls_is_parked() {
         "end_session reported a tool error while reclaiming the parked attach: {}",
         ended.body
     );
+    assert_eq!(
+        payload["result"]["structuredContent"]["recovery_required"],
+        true
+    );
+    assert!(process_alive(worker));
+    let handed = server.stateless_at(
+        id + 1,
+        "tools/call",
+        json!({
+            "name": "end_session", "arguments": {
+                "session_id": attaching, "kernel_handoff_pid": worker
+            }
+        }),
+    );
+    assert_eq!(
+        handed.result("tools/call")["structuredContent"]["worker_terminated"],
+        true
+    );
 }
 
 /// Issue #61, end to end: a kernel attach whose target never dials in waits forever, and that
@@ -11615,10 +11683,10 @@ fn a_stateless_client_can_work_while_one_of_its_own_calls_is_parked() {
 /// reach a wait that is still establishing the KD link — so the only way it ends is the process
 /// ending. Before process-per-session that process was the server: every later tool call queued
 /// behind the parked wait, `end_session` included, and the only recovery was restarting the
-/// server. This asserts the two things that changed: other sessions still work, and
-/// `end_session` actually ends it.
+/// server. Other sessions still work; ordinary cleanup preserves the uncertain controller,
+/// and an explicit PID-confirmed handoff can terminate this synthetic worker.
 #[test]
-fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
+fn a_kernel_attach_that_never_connects_requires_explicit_handoff() {
     let Some(dump) = target_tier() else { return };
     let mut server = Server::started();
 
@@ -11665,6 +11733,8 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         .and_then(|s| s["session_id"].as_str())
         .expect("the kernel session should be listed")
         .to_string();
+    let worker = engine_pid_of(&status, &kernel_session);
+    let _cleanup = SyntheticKernelWorker::retain(worker);
 
     // The point. A parked session used to be the *server's* engine thread; now it is one worker,
     // and everything else carries on.
@@ -11695,9 +11765,7 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         "a live kernel attach is the wait that cannot end on its own: {asked}"
     );
 
-    // The recovery that did not exist before: `end_session` cannot be answered by a worker that
-    // is parked, so the worker is killed. It has to come back, and the process has to be gone.
-    let worker = engine_pid_of(&status, &kernel_session);
+    // No implicit kill and no second break. Only the following explicit handoff may kill it.
     let ended = server.tool_data(
         "end_session",
         json!({ "session_id": kernel_session }),
@@ -11708,9 +11776,20 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
         "a parked worker cannot let go of its target: {ended}"
     );
     assert_eq!(
-        ended["worker_terminated"], true,
-        "a parked session ends by terminating its worker: {ended}"
+        ended["worker_terminated"], false,
+        "ordinary teardown must preserve the unresolved worker: {ended}"
     );
+    assert_eq!(ended["recovery_required"], true);
+    assert!(process_alive(worker));
+    let handed = server.tool_data(
+        "end_session",
+        json!({
+            "session_id": kernel_session, "kernel_handoff_pid": worker
+        }),
+        STEP,
+    );
+    assert_eq!(handed["worker_terminated"], true);
+    assert_eq!(handed["released"], false);
     assert!(
         !process_alive(worker),
         "the parked engine worker (pid {worker}) is still running after end_session"
@@ -11750,7 +11829,7 @@ fn a_kernel_attach_that_never_connects_costs_one_session_and_can_be_ended() {
 /// engine worker takes to come up (30s). Shrinking the budget to a second is what makes the floor
 /// small enough to wait out; nothing here needs a longer one, since the attach is meant to park.
 #[test]
-fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
+fn a_lease_that_runs_out_preserves_an_unresolved_kernel_controller() {
     if target_tier().is_none() {
         return;
     }
@@ -11793,7 +11872,7 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|s| s["kind"] == "kernel" && s["state"]["state"] == "attaching")
+            .find(|s| s["kind"] == "kernel" && s["state"]["state"] == "kernel_unresolved")
             .and_then(|s| s["session_id"].as_str().map(str::to_string));
         if found.is_some() {
             break found;
@@ -11814,6 +11893,7 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
         .as_u64()
         .unwrap_or_else(|| panic!("the parked session reports no engine pid"))
         as u32;
+    let _cleanup = SyntheticKernelWorker::retain(worker);
     assert!(
         process_alive(worker),
         "the parked engine worker (pid {worker}) should be running before the lease expires"
@@ -11835,18 +11915,11 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
         server.stderr()
     );
 
-    // The half that matters: the worker is gone. `release_leased` is `shutdown` without closing
-    // the registry, so a parked attach ends the only way it can — its process terminated.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    while process_alive(worker) {
-        assert!(
-            Instant::now() < deadline,
-            "the lease expired but the parked engine worker (pid {worker}) is still running\n\
-             --- stderr ---\n{}",
-            server.stderr()
-        );
-        std::thread::sleep(Duration::from_millis(250));
-    }
+    assert!(server.wait_for_stderr("Controller reservation", Duration::from_secs(30)));
+    assert!(
+        process_alive(worker),
+        "lease expiry killed an unresolved controller"
+    );
 
     // The old session id is not honoured after the sweep closed it. Without this the service
     // would keep it resident and every reconnect cycle would leave another behind.
@@ -11857,16 +11930,64 @@ fn a_lease_that_runs_out_releases_what_the_absent_client_left() {
         stale.body
     );
 
-    // And the server is takeable again, with nothing left over. Both halves: a lease that
-    // released the sessions but stayed `releasing` would refuse every client for ever, and one
-    // that handed over sessions it had just closed would be worse.
+    // The same credential can reconnect and explicitly hand off its retained controller.
     let next = server.initialize();
     assert_ne!(next, client);
     let status = server.tool(&next, "session_status", json!({}));
     assert!(
-        status["sessions"].as_array().is_none_or(Vec::is_empty),
-        "the next client inherited a session the sweep should have released: {status}"
+        status["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|s| s["session_id"] == parked && s["state"]["state"] == "kernel_unresolved")
     );
+    let handed = server.tool(
+        &next,
+        "end_session",
+        json!({
+            "session_id": parked, "kernel_handoff_pid": worker
+        }),
+    );
+    assert_eq!(handed["worker_terminated"], true);
+    assert_eq!(handed["released"], false);
+}
+
+#[test]
+fn an_unresolved_kernel_worker_survives_supervisor_loss() {
+    if target_tier().is_none() {
+        return;
+    }
+    for abrupt in [false, true] {
+        let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "1")]);
+        // An unused synthetic endpoint only, never a configured guest/profile.
+        let reply = server.call_tool(
+            "attach_kernel",
+            json!({
+                "connection": format!("net:port={},key=1.1.1.1", free_port())
+            }),
+            TARGET_STEP,
+        );
+        let status = server.tool_data("session_status", json!({}), STEP);
+        let session = status["sessions"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|s| s["state"]["state"] == "kernel_unresolved")
+            .unwrap_or_else(|| panic!("synthetic attach did not reach unresolved state: {reply}"));
+        let worker = session["engine_pid"].as_u64().unwrap() as u32;
+        let _cleanup = SyntheticKernelWorker::retain(worker);
+        if abrupt {
+            server.kill_supervisor();
+        } else {
+            assert_eq!(server.shutdown(), Some(0));
+        }
+        // Past the worker's ordinary five-second EOF grace. This deliberately asserts survival.
+        std::thread::sleep(Duration::from_secs(6));
+        assert!(
+            process_alive(worker),
+            "unresolved worker exited after supervisor loss"
+        );
+    }
 }
 
 /// The handle an `open_dump` through the listener minted, named by whose it is.
@@ -12148,10 +12269,24 @@ fn a_profile_attach_names_its_target_without_disclosing_the_key() {
         .find(|l| l.contains("kernel target"))
         .map(|l| l.split_whitespace().next().unwrap_or_default().to_string())
         .expect("the kernel session should be listed");
+    let structured = server.tool_data(
+        "session_status",
+        json!({ "session_id": kernel_session }),
+        STEP,
+    );
+    let worker = engine_pid_of(&structured, &kernel_session);
+    let _cleanup = SyntheticKernelWorker::retain(worker);
     server.tool_text(
         "end_session",
         json!({ "session_id": kernel_session }),
         Duration::from_secs(120),
+    );
+    server.tool_text(
+        "end_session",
+        json!({
+            "session_id": kernel_session, "kernel_handoff_pid": worker
+        }),
+        STEP,
     );
     // The abandoned attach is still outstanding; its session is gone, so it has to be answered.
     server.await_id(attaching, "attach_kernel", Duration::from_secs(60));

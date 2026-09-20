@@ -335,29 +335,29 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-09-19** and move with any edit to a description.
+   Both tables are measurements of **2026-09-20** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,457 | 17.8% |
    | `inspect` | 10 | 13,152 | 14.2% |
-   | `session` | 10 | 13,348 | 14.5% |
-   | `ioctl` | 10 | 12,435 | 13.5% |
-   | `exec` | 8 | 12,652 | 13.7% |
-   | `batch` | 1 | 10,021 | 10.9% |
+   | `session` | 10 | 13,682 | 14.8% |
+   | `ioctl` | 10 | 12,435 | 13.4% |
+   | `exec` | 8 | 12,662 | 13.7% |
+   | `batch` | 1 | 10,021 | 10.8% |
    | `crash` | 3 | 7,427 | 8.0% |
    | `ttd` | 9 | 6,829 | 7.4% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 61 | 92,321 |
-   | `session,inspect,exec,crash` | 31 | 45,658 |
-   | `session,inspect,crash` | 23 | 32,853 |
-   | `crash` | 13 | 19,609 |
+   | *(absent)* | 61 | 92,665 |
+   | `session,inspect,exec,crash` | 31 | 46,002 |
+   | `session,inspect,crash` | 23 | 33,187 |
+   | `crash` | 13 | 19,943 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 19,609 rather than the 20,775 its two rows sum to, because the cross-references leave with
+   is 19,943 rather than the 21,109 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
@@ -560,6 +560,15 @@ The experimental attach option added on 2026-09-19 costs 329 model-visible bytes
 text-dependency and lab-only cautions. The measured surface is 92,321 B model-visible and
 252,226 B on the wire. The model ceiling moves from 92,000 to 93,000 B; the wire and per-tool
 ceilings are unchanged. This is one optional input field, not a new tool.
+
+## Unresolved kernel recovery (2026-09-20)
+
+Measured after the preservation changes: 92,665 B model-visible, 254,925 B serialized payload,
+and 2,003 B of instructions. The model/per-tool ceilings remain unchanged. The wire ceiling rises
+from 254,000 to 256,000 B for the new recovery error variant repeated in each tool's existing
+output closure, unresolved-state schema, and explicit handoff input/result. These schemas still
+use `constraints_of`; no output descriptions were added. The reviewed per-tool golden records
+the cost, including 47 B per affected error-schema closure.
 
 ## Binary Ninja bridge surface (2026-09-05)
 

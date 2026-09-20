@@ -11,8 +11,9 @@
 //! * **A session that cannot be unwound costs a process, not the server.** A live-kernel attach
 //!   whose target never dials in blocks in `WaitForEvent(INFINITE)` with no cancellation path
 //!   (dbgscope's `SetInterrupt` watchdog cannot reach a wait that is still establishing the
-//!   link). Confined to its own process, that is one worker the supervisor can kill —
-//!   `end_session` does exactly that — instead of the one engine thread every tool queued on.
+//!   link). Confined to its own process, it is one retained controller rather than the one
+//!   engine thread every tool queues on. Unresolved remote kernels need explicit recovery
+//!   handoff before worker termination; ordinary `end_session` preserves them.
 //! * **`session_id` routes rather than merely detects.** The old handle existed to notice that
 //!   the single target had been *replaced* underneath a caller. Here it names a worker, so an
 //!   `open_dump` cannot disturb a kernel attach at all, and an `end_session` for session A can
@@ -24,7 +25,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::fmt;
-use std::io::{BufRead, PipeReader, PipeWriter, Write};
+use std::io::{BufRead, BufReader, PipeReader, PipeWriter, Write};
 use std::os::windows::io::AsRawHandle;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
@@ -32,7 +33,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::{Child, ChildStdout, Command};
 use tokio::sync::{mpsc, oneshot};
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
@@ -65,10 +65,10 @@ const CLOSED_HISTORY: usize = 8;
 /// going to become usable.
 pub(crate) const WORKER_READY_TIMEOUT: Duration = Duration::from_secs(30);
 
-/// How long `end_session` gives the worker to release its target cleanly before the process is
-/// killed instead.
+/// How long `end_session` gives the worker to confirm native release. Unresolved remote kernels
+/// are preserved after the grace; non-kernel workers are killed instead.
 ///
-/// It is a bound on *politeness*, not on the teardown: the session ends either way. Long enough
+/// It is a bound on waiting, not proof of release. Long enough
 /// that a live target with real teardown work (a detach that has to resume threads) finishes
 /// gracefully, short enough that recovering a parked attach is not a wait.
 const END_SESSION_TIMEOUT: Duration = Duration::from_secs(20);
@@ -297,6 +297,8 @@ pub enum EngineError {
     /// be answered whenever the target next stopped, which may be an hour, and the caller would
     /// have no way to tell that from a debugger that had hung.
     TargetRunning(String),
+    /// Target/controller state is unresolved; ordinary operations and cleanup are refused.
+    RecoveryRequired(String),
 }
 
 // Note what is *not* here any more: an "engine is unusable" variant. Under process-per-session
@@ -316,7 +318,8 @@ impl fmt::Display for EngineError {
             | Self::Interrupted(m)
             | Self::NotRun(m)
             | Self::InvalidArgument(m)
-            | Self::TargetRunning(m) => f.write_str(m),
+            | Self::TargetRunning(m)
+            | Self::RecoveryRequired(m) => f.write_str(m),
         }
     }
 }
@@ -339,6 +342,7 @@ impl fmt::Display for EngineError {
 fn engine_error(failed: crate::proto::Failed) -> EngineError {
     use crate::structured::ErrorCategory;
     match failed.category {
+        Some(ErrorCategory::RecoveryRequired) => EngineError::RecoveryRequired(failed.message),
         Some(ErrorCategory::Interrupted) => EngineError::Interrupted(failed.message),
         Some(ErrorCategory::NotRun) => EngineError::NotRun(failed.message),
         Some(ErrorCategory::InvalidArgument) => EngineError::InvalidArgument(failed.message),
@@ -435,6 +439,8 @@ impl OpenPhase {
 /// sat there is the signal.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum SessionState {
+    /// Sticky until confirmed release or an explicitly acknowledged recovery handoff.
+    KernelUnresolved(String),
     /// The opener is running and has not created or claimed anything yet. Opening again is the
     /// correct recovery from a failure here.
     Opening,
@@ -487,7 +493,7 @@ impl SessionState {
     /// "may this handle end its session" — and a state that ever wants one without the other
     /// should be a change here rather than a surprise there.
     fn accepts_teardown(&self) -> bool {
-        self.accepts_handle() || matches!(self, Self::Retired(_))
+        self.accepts_handle() || matches!(self, Self::Retired(_) | Self::KernelUnresolved(_))
     }
 
     /// Whether the session still owns a worker process.
@@ -498,6 +504,7 @@ impl SessionState {
     /// The state's name on its own, for a transcript that records a transition as a value.
     pub fn name(&self) -> &'static str {
         match self {
+            Self::KernelUnresolved(_) => "kernel_unresolved",
             Self::Opening => "opening",
             Self::Attaching => "attaching",
             Self::Open => "open",
@@ -510,6 +517,7 @@ impl SessionState {
     /// Why it is in this state, for the three that carry a reason.
     pub fn detail(&self) -> Option<&str> {
         match self {
+            Self::KernelUnresolved(why) => Some(why),
             Self::Opening | Self::Attaching | Self::Open => None,
             Self::Failed(why) | Self::Retired(why) | Self::Closed(why) => Some(why),
         }
@@ -519,6 +527,7 @@ impl SessionState {
 /// One session: a worker process, its queue, and the outstanding calls against it.
 #[derive(Debug)]
 pub struct Session {
+    kernel_endpoint: Option<kdconn::Endpoint>,
     pub id: String,
     pub kind: SessionKind,
     /// What was opened — the path, connection string, pid, or command line. Reported so a
@@ -567,6 +576,8 @@ pub struct Session {
     /// from the worker having crashed. This is what tells those two apart, and the difference is
     /// "the target was let go" versus "a live kernel may be sitting halted".
     released: AtomicBool,
+    /// Verified explicit worker exit, deliberately distinct from native target release.
+    kernel_handoff_complete: AtomicBool,
     /// How long this session's worker said a transaction it was told to unwind still needs, or
     /// `None` while it has said nothing. Set from [`WorkerMessage::RollingBack`] and read by the
     /// teardown whose own request provoked it; see [`Sessions::release`].
@@ -835,6 +846,35 @@ fn mint_execution_id() -> String {
 static EXECUTION_SEQ: AtomicU64 = AtomicU64::new(1);
 
 impl Session {
+    fn kernel_unresolved(&self) -> bool {
+        matches!(self.state(), SessionState::KernelUnresolved(_))
+    }
+
+    fn preserve_kernel(&self, why: &str) -> String {
+        let message = format!(
+            "Remote kernel session `{}` is unresolved: {why}. Controller reservation for worker PID {} is retained; \
+             target liveness and detach are unconfirmed. Do not break in or attach another \
+             controller. Inspect the target out of band. An explicit recovery handoff requires \
+             end_session with this session_id and kernel_handoff_pid={} and does NOT resume \
+             or detach the target.",
+            self.id, self.pid, self.pid
+        );
+        self.update_state(|state| {
+            (!self.kernel_handoff_complete.load(Ordering::SeqCst)
+                && !self.released.load(Ordering::SeqCst)
+                && !matches!(state, SessionState::KernelUnresolved(_)))
+            .then(|| SessionState::KernelUnresolved(message.clone()))
+        });
+        let _ = self.tx.send(Job {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            op: EngineOp::PreserveKernel,
+            startup_symbol_path: None,
+            submitted: Instant::now(),
+            gate: Call::supervisor(EngineOp::PreserveKernel).gate,
+        });
+        message
+    }
+
     fn state(&self) -> SessionState {
         self.state
             .lock()
@@ -847,7 +887,15 @@ impl Session {
     /// already stopped owning a worker, so a milestone arriving from a worker being torn down
     /// cannot undo or relabel the teardown.
     fn set_state(&self, next: SessionState) {
-        self.update_state(|state| state.is_live().then_some(next));
+        self.update_state(|state| {
+            if matches!(state, SessionState::KernelUnresolved(_))
+                && !self.released.load(Ordering::SeqCst)
+                && !matches!(next, SessionState::KernelUnresolved(_))
+            {
+                return None;
+            }
+            state.is_live().then_some(next)
+        });
     }
 
     /// Replaces the dispatch-time reason for an explicit `end_session` with its final outcome.
@@ -887,6 +935,9 @@ impl Session {
             let mut slot = self.state.lock().unwrap_or_else(|e| e.into_inner());
             let proposed = next(&slot.0);
             let allowed = slot.0.is_live()
+                || (self.kind == SessionKind::Kernel
+                    && !self.released.load(Ordering::SeqCst)
+                    && matches!(proposed, Some(SessionState::KernelUnresolved(_))))
                 || matches!(
                     (&slot.0, &proposed),
                     (SessionState::Closed(_), Some(SessionState::Closed(_)))
@@ -964,7 +1015,7 @@ impl Session {
     }
 
     fn busy(&self) -> bool {
-        !self.delivered.load(Ordering::Acquire)
+        self.kernel_unresolved() || !self.delivered.load(Ordering::Acquire)
             || !self
                 .waiters
                 .lock()
@@ -1150,6 +1201,14 @@ impl Session {
 
     /// Kills the worker process. Idempotent.
     fn kill(&self) {
+        if self.kernel_unresolved() && !self.released.load(Ordering::SeqCst) {
+            tracing::error!(
+                "session {}: refusing automatic termination of unresolved kernel worker {}",
+                self.id,
+                self.pid
+            );
+            return;
+        }
         let child = self.child.lock().unwrap_or_else(|e| e.into_inner()).take();
         if let Some(mut child) = child {
             // `start_kill` is enough: tokio's process driver reaps the child once it is dropped,
@@ -1377,6 +1436,8 @@ impl Drop for Slot {
 /// How a worker took being told to let go of its target.
 #[derive(Debug)]
 enum Release {
+    /// No confirmed release: retain ownership and require an operator recovery handoff.
+    Preserved(String),
     /// It released the target and said so — the whole reply, because what became of the target is
     /// the worker's answer and is on the reply beside the text (`Output::target_left_running`).
     Released(Box<Output>),
@@ -1645,6 +1706,9 @@ impl Sessions {
                 crate::record::routed_to(&session.id);
                 Ok(session)
             }
+            Some(session) if session.kernel_unresolved() => Err(EngineError::RecoveryRequired(
+                stale_handle(want, &session.state()),
+            )),
             Some(session) => Err(EngineError::Stale(stale_handle(want, &session.state()))),
             None => Err(EngineError::Stale(unknown_handle(want))),
         }
@@ -1780,6 +1844,12 @@ impl Sessions {
         id: u64,
         resumed: Option<oneshot::Sender<()>>,
     ) -> Result<oneshot::Receiver<Result<Output, EngineError>>, EngineError> {
+        if session.kernel_unresolved() && !matches!(call.op, EngineOp::PreserveKernel) {
+            return Err(EngineError::RecoveryRequired(stale_handle(
+                &session.id,
+                &session.state(),
+            )));
+        }
         // Refused rather than queued while the target is moving — see
         // [`Sessions::refuse_while_running`]. Under the gate above, so the answer cannot go stale
         // between here and the enqueue below.
@@ -1933,6 +2003,11 @@ impl Sessions {
             session: session.id.clone(),
             budget_ms: budget.as_millis().min(u128::from(u64::MAX)) as u64,
         });
+        if session.kind == SessionKind::Kernel && !session.released.load(Ordering::SeqCst) {
+            return Err(EngineError::RecoveryRequired(session.preserve_kernel(
+                "the caller's deadline expired without confirmed completion",
+            )));
+        }
         Err(EngineError::Timeout(format!(
             "engine call timed out (the target may still be running). The session `{}` is still \
              holding this call; `session_status` reports it, and `end_session` ends it outright — \
@@ -1960,7 +2035,14 @@ impl Sessions {
         // Read before the worker exists, because the architecture of the target decides which
         // process that worker's engine lives in — see `worker::TARGET_FLAG`.
         let opening = op.opening();
-        let session = match self.spawn(&id, kind, what, opening.as_ref()).await {
+        let endpoint = match &op {
+            EngineOp::AttachKernel { connection, .. } => Some(connection.endpoint()),
+            _ => None,
+        };
+        let session = match self
+            .spawn(&id, kind, what, opening.as_ref(), endpoint)
+            .await
+        {
             Ok(session) => session,
             // The slot goes back and no existing session was touched: a worker that would not
             // start must not cost the caller a target they already had.
@@ -2045,7 +2127,9 @@ impl Sessions {
                     summary: report.summary.unwrap_or_default(),
                 })
             }
-            Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
+            Err(EngineError::Timeout(message) | EngineError::RecoveryRequired(message)) => {
+                Err(OpenError::Timeout { id, message })
+            }
             Err(e) => {
                 let message = e.to_string();
                 let state = session.state();
@@ -2071,6 +2155,17 @@ impl Sessions {
                     // opening again — that is now the only way forward.
                     Err(OpenError::Clean(message))
                 } else {
+                    if kind == SessionKind::Kernel && session.phase() != OpenPhase::Opened {
+                        let message = session.preserve_kernel(
+                            "the attach returned without a confirmed initial stop",
+                        );
+                        session.delivered.store(true, Ordering::Release);
+                        return Err(OpenError::PostCommit {
+                            id,
+                            message,
+                            report_only: false,
+                        });
+                    }
                     // The target exists and the wait failed; or it opened and only the diagnostic
                     // failed. Either way the session stays: making the caller re-open to get a
                     // handle is how they end up with two processes.
@@ -2474,11 +2569,25 @@ impl Sessions {
             .releasing(named)
             .closing(END_SESSION_CLOSING);
         let outcome = self.release(session, call, END_SESSION_TIMEOUT).await;
+        if let Release::Preserved(why) = outcome {
+            return Ok(Output::typed(
+                why,
+                crate::structured::SessionEnded {
+                    session_id: session.id.clone(),
+                    released: false,
+                    worker_terminated: false,
+                    waited_ms: None,
+                    target_left_running: None,
+                    recovery_required: true,
+                },
+            ));
+        }
         // Read before the rendering, from the outcome rather than from the message it produces:
         // "did the worker let go, or was it killed still holding the target?" is the question a
         // caller has to act on, and it was previously only answerable by reading which paragraph
         // came back.
         let ended = crate::structured::SessionEnded {
+            recovery_required: false,
             session_id: session.id.clone(),
             released: matches!(outcome, Release::Released(_)),
             worker_terminated: !matches!(outcome, Release::AlreadyGone | Release::Stale(_)),
@@ -2503,10 +2612,11 @@ impl Sessions {
                     matches!(session.kind, SessionKind::Process | SessionKind::Launch)
                         .then_some(false)
                 }
-                Release::AlreadyGone | Release::Stale(_) => None,
+                Release::AlreadyGone | Release::Stale(_) | Release::Preserved(_) => None,
             },
         };
         let (reason, message) = match outcome {
+            Release::Preserved(why) => return Err(EngineError::RecoveryRequired(why)),
             // A refused handle is the mechanism working, not a session to tear down.
             Release::Stale(why) => return Err(EngineError::Stale(why)),
             Release::Released(out) => (
@@ -2573,6 +2683,44 @@ impl Sessions {
         Ok(Output::typed(message, ended))
     }
 
+    /// Explicit operator handoff, not a detach. Keep the reservation until process exit is verified.
+    pub async fn kernel_handoff(
+        &self,
+        session: &Arc<Session>,
+        pid: u32,
+    ) -> Result<Output, EngineError> {
+        if session.kind != SessionKind::Kernel || !session.kernel_unresolved() || pid != session.pid
+        {
+            return Err(EngineError::InvalidArgument("Kernel handoff requires an unresolved remote kernel session and its exact engine_pid.".into()));
+        }
+        let child = session
+            .child
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let Some(mut child) = child else {
+            return Err(EngineError::RecoveryRequired("No owned worker handle is available to verify exit; reservation retained. Inspect the process out of band.".into()));
+        };
+        // The process handle AND final state belong to this task, even if the caller cancels.
+        let session = Arc::clone(session);
+        tokio::spawn(async move {
+            if let Err(e) = child.kill().await {
+                *session.child.lock().unwrap_or_else(|e| e.into_inner()) = Some(child);
+                return Err(EngineError::RecoveryRequired(format!("Worker exit could not be verified: {e}; reservation retained.")));
+            }
+            session.kernel_handoff_complete.store(true, Ordering::SeqCst);
+            session.fail_outstanding("explicit kernel recovery handoff; target state remains unknown");
+            session.update_state(|_| Some(SessionState::Closed("explicit kernel recovery handoff; NOT a confirmed detach".into())));
+            session.rec.write(crate::record::Event::SessionEnd {
+                session: session.id.clone(), released: false, worker_terminated: true, waited_ms: None,
+            });
+            Ok(Output::typed("Worker exit verified for the explicit recovery handoff. Target liveness is UNKNOWN; no resume or detach was performed. Verify the endpoint is free before starting a recovery controller.", crate::structured::SessionEnded {
+                session_id: session.id.clone(), released: false, worker_terminated: true,
+                waited_ms: None, target_left_running: None, recovery_required: true,
+            }))
+        }).await.map_err(|e| EngineError::RecoveryRequired(format!("Handoff task failed: {e}")))?
+    }
+
     /// Asks a worker to release its target and then terminates it, without deciding *why* the
     /// session is closing — `end_session` and reclamation share the teardown but not the reason,
     /// and the reason is what the caller reads afterwards.
@@ -2594,6 +2742,16 @@ impl Sessions {
     /// it), and every request that *does* reach it is followed by [`Session::kill`] a few lines
     /// down. Nothing can tell a batch to stop except a teardown that then ends the session.
     async fn release(&self, session: &Arc<Session>, call: Call, grace: Duration) -> Release {
+        if session.kind == SessionKind::Kernel
+            && !session.released.load(Ordering::SeqCst)
+            && (session.kernel_unresolved() || session.phase() != OpenPhase::Opened)
+        {
+            return Release::Preserved(
+                session.preserve_kernel(
+                    "release is unsafe while attach/controller state is unresolved",
+                ),
+            );
+        }
         let waited = Instant::now();
         let id = session.next_id.fetch_add(1, Ordering::Relaxed);
         let out = match self
@@ -2604,12 +2762,25 @@ impl Sessions {
             other => other,
         };
         let waited = waited.elapsed();
+        if session.kind == SessionKind::Kernel
+            && out.is_err()
+            && !session.released.load(Ordering::SeqCst)
+        {
+            return Release::Preserved(session.preserve_kernel(
+                "the worker did not confirm release; automatic termination was refused",
+            ));
+        }
         // Recorded **before** `fail_outstanding`, and the order is the whole point: that call is
         // what turns another teardown's wait on this same session into `Lost`, so the flag has to
         // be visible by the time anyone is failed out of it. Reordering these two lines silently
         // restores a warning that says a target may be halted when it was just released.
         if out.is_ok() {
             session.released.store(true, Ordering::SeqCst);
+            if session.kind == SessionKind::Kernel {
+                session.set_state(SessionState::Closed(
+                    "worker confirmed kernel release".into(),
+                ));
+            }
         }
         session.fail_outstanding(&format!("session `{}` was ended", session.id));
         session.kill();
@@ -2648,8 +2819,8 @@ impl Sessions {
         outcome
     }
 
-    /// Ends every session, then terminates any worker that did not let go. Called when the client
-    /// disconnects, so a debugger process — or a debuggee — never outlives the connection.
+    /// Attempts release for every session. Unresolved remote kernel workers survive disconnect;
+    /// non-kernel workers that do not let go are terminated after the grace.
     ///
     /// A disconnect is treated as `end_session` on everything, which is both the simplest rule to
     /// explain and the only safe one: see [`SHUTDOWN_RELEASE_TIMEOUT`] for what killing a live
@@ -2786,7 +2957,9 @@ impl Sessions {
                 // Marked first so nothing new is routed to a session on its way out; the release
                 // runs as the supervisor's own teardown and so passes the gate that closes. A
                 // session already closed keeps the reason it closed for.
-                session.set_state(SessionState::Closed(teardown.state_reason().to_string()));
+                if session.kind != SessionKind::Kernel {
+                    session.set_state(SessionState::Closed(teardown.state_reason().to_string()));
+                }
                 let outcome = sessions
                     .release(
                         &session,
@@ -2989,6 +3162,22 @@ impl Sessions {
         if registry.revoked.contains(&session.owner) {
             return Err(revoked(&session.owner));
         }
+        if let Some(endpoint) = &session.kernel_endpoint
+            && registry.all.iter().any(|held| {
+                (held.state().is_live()
+                    || held
+                        .child
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some())
+                    && held
+                        .kernel_endpoint
+                        .as_ref()
+                        .is_some_and(|other| endpoint.conflicts(other))
+            })
+        {
+            return Err("This kernel endpoint is already reserved by a controller. No second attach was sent. Resolve the existing controller before retrying.".into());
+        }
         registry.all.push_back(Arc::clone(session));
         registry.trim();
         Ok(())
@@ -3008,6 +3197,7 @@ impl Sessions {
         kind: SessionKind,
         what: String,
         target: Option<&crate::target::Opening>,
+        kernel_endpoint: Option<kdconn::Endpoint>,
     ) -> Result<Arc<Session>, String> {
         let images = worker_images(target)?;
         let mut started = None;
@@ -3046,6 +3236,7 @@ impl Sessions {
         let (tx, rx) = mpsc::unbounded_channel();
         let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
         let session = Arc::new(Session {
+            kernel_endpoint,
             id: id.to_string(),
             kind,
             what,
@@ -3061,6 +3252,7 @@ impl Sessions {
             delivered: AtomicBool::new(false),
             phase: AtomicU8::new(OpenPhase::Started as u8),
             released: AtomicBool::new(false),
+            kernel_handoff_complete: AtomicBool::new(false),
             unwinding,
             execution: Mutex::new(None),
             submit_gate: Mutex::new(()),
@@ -3103,6 +3295,7 @@ impl Sessions {
 /// The message for a handle whose session will not accept it.
 fn stale_handle(want: &str, state: &SessionState) -> String {
     match state {
+        SessionState::KernelUnresolved(why) => why.clone(),
         SessionState::Failed(why) => format!(
             "session `{want}` never opened:\n  {why}\n\nOpening again is how you get a target — \
              but read the reason first, since some failures leave one behind."
@@ -3179,7 +3372,10 @@ fn unknown_handle(want: &str) -> String {
 /// something the caller explicitly asked for. So a retired session keeps its worker and its
 /// (retired) handle; only the open's own caller is told the slate is clean, which it is.
 fn settle_uncommitted(session: &Session, why: &str) -> bool {
-    if matches!(session.state(), SessionState::Retired(_)) {
+    if matches!(
+        session.state(),
+        SessionState::Retired(_) | SessionState::KernelUnresolved(_)
+    ) {
         return true;
     }
     session.set_state(SessionState::Failed(why.to_string()));
@@ -3193,6 +3389,17 @@ fn settle_uncommitted(session: &Session, why: &str) -> bool {
 /// Returns whether the session was left **live**: its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
 fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool {
+    if session.kernel_unresolved() {
+        return true;
+    }
+    if session.kind == SessionKind::Kernel
+        && result.is_err()
+        && session.phase().committed()
+        && session.phase() != OpenPhase::Opened
+    {
+        session.preserve_kernel("late attach reply did not confirm an initial stop");
+        return true;
+    }
     // The same discriminator `open` uses, and for the same reason: the *phase* says whether a
     // target was created, while the state may since have been retired by a command queued behind
     // the open.
@@ -3273,6 +3480,7 @@ impl Teardown {
 /// which mean the target is still attached.
 #[derive(Debug, PartialEq, Eq)]
 enum ShutdownNote<'a> {
+    Preserved(&'a str),
     /// This attempt released the target.
     Released,
     /// This attempt released the target and the target is a live kernel that is **still halted**:
@@ -3312,6 +3520,7 @@ enum ShutdownNote<'a> {
 /// of the same `match`, so the next path that reclaims a session cannot quietly answer differently.
 fn note_release(label: &str, session: &Arc<Session>, outcome: &Release) {
     match shutdown_note(outcome, session.released.load(Ordering::SeqCst)) {
+        ShutdownNote::Preserved(why) => tracing::error!("{label}: {why}"),
         ShutdownNote::Released => {
             tracing::info!("{label}: session {} released its target", session.id)
         }
@@ -3366,6 +3575,7 @@ fn note_release(label: &str, session: &Arc<Session>, outcome: &Release) {
 /// not, because the next real one gets ignored.
 fn shutdown_note(outcome: &Release, released: bool) -> ShutdownNote<'_> {
     match outcome {
+        Release::Preserved(why) => ShutdownNote::Preserved(why),
         // **Read out of the reply rather than discarded with it.** `Release::Released` carries the
         // worker's `Output`, and `target_left_running` is where the disposition now is -- this arm
         // matched `Released(_)` and threw it away, so a live kernel left halted logged "released
@@ -3557,7 +3767,10 @@ async fn start_worker(
     let pid = child.id().unwrap_or(0);
     // Drained from the start, before the handshake: a worker that prints during startup must
     // not be able to block on a full pipe on its way to `Ready`.
-    tokio::spawn(log_stray_output(id.to_string(), stdout));
+    if let Err(e) = start_stray_output_reader(id.to_string(), stdout) {
+        let _ = child.start_kill();
+        return Err(format!("could not start a reader for worker stdout: {e}"));
+    }
     let unwinding: Arc<Mutex<Option<Instant>>> = Arc::new(Mutex::new(None));
     let mut messages = match read_messages(id.to_string(), channel.messages, Arc::clone(&unwinding))
     {
@@ -3903,10 +4116,22 @@ fn clipped(line: &str) -> String {
 /// case that motivated all of this. Logged rather than discarded because it is the only place
 /// that output can now be seen, and drained rather than left because an unread pipe fills at a
 /// few dozen KiB and the *next* write blocks the engine thread inside DbgEng.
-async fn log_stray_output(id: String, stdout: ChildStdout) {
+fn start_stray_output_reader(id: String, stdout: ChildStdout) -> std::io::Result<()> {
+    // Tokio's Windows anonymous-pipe reads occupy its blocking pool. A preserved child keeps
+    // stdout open forever, so dropping that runtime would wait forever too. As with the protocol
+    // reader, use an unjoined OS thread; process exit, not worker exit, bounds its lifetime.
+    let stdout = std::fs::File::from(stdout.into_owned_handle()?);
+    std::thread::Builder::new()
+        .name(format!("stdout-{id}"))
+        .stack_size(256 * 1024)
+        .spawn(move || log_stray_output(id, stdout))?;
+    Ok(())
+}
+
+fn log_stray_output(id: String, stdout: std::fs::File) {
     let mut stdout = BufReader::new(stdout);
     let mut line = Vec::new();
-    while let Some(dropped) = next_capped_line(&mut stdout, &mut line).await {
+    while let Some(dropped) = next_capped_line(&mut stdout, &mut line) {
         // A lossy decode, not `lines()`. Whatever prints here is not ours and owes us no encoding
         // — an extension writing in the console's code page is not UTF-8 — and a decode error
         // must not be able to end this loop. Stopping the drain is the one outcome that matters:
@@ -3938,17 +4163,14 @@ async fn log_stray_output(id: String, stdout: ChildStdout) {
 /// never comes would let one session's noisy extension grow this buffer until the whole server
 /// runs out of memory, and take every other session with it. [`clipped`] bounds what is *logged*,
 /// which is a different thing and too late.
-async fn next_capped_line<R: tokio::io::AsyncBufRead + Unpin>(
-    stdout: &mut R,
-    line: &mut Vec<u8>,
-) -> Option<usize> {
+fn next_capped_line<R: BufRead>(stdout: &mut R, line: &mut Vec<u8>) -> Option<usize> {
     line.clear();
     let mut dropped = 0usize;
     loop {
         // `fill_buf`/`consume` rather than `read_until`, because this has to decide what to keep
         // *before* it is buffered.
         let (consumed, complete) = {
-            let chunk = stdout.fill_buf().await.ok()?;
+            let chunk = stdout.fill_buf().ok()?;
             if chunk.is_empty() {
                 // EOF. A last line with no terminator is still a line worth logging.
                 return (!line.is_empty() || dropped > 0).then_some(dropped);
@@ -4006,6 +4228,13 @@ fn pump(
 
         // The gate, at the front of the queue. See `Gate`.
         let state = session.state();
+        if session.kernel_unresolved() && !matches!(job.op, EngineOp::PreserveKernel) {
+            answer(Err(EngineError::RecoveryRequired(stale_handle(
+                &session.id,
+                &state,
+            ))));
+            continue;
+        }
         if !job.gate.admits(&state) {
             answer(Err(EngineError::Stale(stale_handle(&session.id, &state))));
             continue;
@@ -4014,7 +4243,13 @@ fn pump(
             session.set_state(SessionState::Retired(why.clone()));
         }
         if let Some(why) = &job.gate.closes {
-            session.set_state(SessionState::Closed(why.clone()));
+            session.set_state(if session.kind == SessionKind::Kernel {
+                SessionState::KernelUnresolved(
+                    "kernel release is in progress; completion is unconfirmed".into(),
+                )
+            } else {
+                SessionState::Closed(why.clone())
+            });
         }
 
         let mut op = job.op;
@@ -4256,9 +4491,15 @@ async fn reader(
     // line after every successful `end_session`, describing a failure that did not happen.
     let unexpected = session.state().is_live();
     if unexpected {
-        session.set_state(SessionState::Closed(
-            "the engine worker process exited".to_string(),
-        ));
+        if session.kind == SessionKind::Kernel && !session.released.load(Ordering::SeqCst) {
+            session.preserve_kernel(
+                "the worker exited without confirming release; endpoint reservation retained",
+            );
+        } else {
+            session.set_state(SessionState::Closed(
+                "the engine worker process exited".to_string(),
+            ));
+        }
         // Beside the state transition rather than instead of it: the transition says the session
         // is closed, and this says the calls it owed replies to are being answered with a failure
         // nobody asked for. A reader looking at a result that never arrived needs the second one.
@@ -4911,8 +5152,8 @@ mod tests {
     ///
     /// Read through an 8-byte buffer, so the cap has to hold across many small chunks — a pipe
     /// hands over whatever has arrived, not whole lines.
-    #[tokio::test]
-    async fn a_line_from_a_worker_is_capped_before_it_is_buffered() {
+    #[test]
+    fn a_line_from_a_worker_is_capped_before_it_is_buffered() {
         let mut input = b"short\n".to_vec();
         let overrun = LOGGED_LINE_LIMIT * 3;
         input.extend(std::iter::repeat_n(b'x', overrun));
@@ -4921,12 +5162,10 @@ mod tests {
         let mut stdout = BufReader::with_capacity(8, &input[..]);
         let mut line = Vec::new();
 
-        assert_eq!(next_capped_line(&mut stdout, &mut line).await, Some(0));
+        assert_eq!(next_capped_line(&mut stdout, &mut line), Some(0));
         assert_eq!(line, b"short\n");
 
-        let dropped = next_capped_line(&mut stdout, &mut line)
-            .await
-            .expect("the long line");
+        let dropped = next_capped_line(&mut stdout, &mut line).expect("the long line");
         assert_eq!(
             line.len(),
             LOGGED_LINE_LIMIT,
@@ -4939,10 +5178,10 @@ mod tests {
         );
 
         // EOF ends a line rather than losing it: an unterminated last line is still output.
-        assert_eq!(next_capped_line(&mut stdout, &mut line).await, Some(0));
+        assert_eq!(next_capped_line(&mut stdout, &mut line), Some(0));
         assert_eq!(line, b"a last line, unterminated");
         assert_eq!(
-            next_capped_line(&mut stdout, &mut line).await,
+            next_capped_line(&mut stdout, &mut line),
             None,
             "the drain must end at EOF"
         );
@@ -6428,6 +6667,258 @@ mod tests {
         dormant_recording(id, state, crate::record::Recorder::disabled())
     }
 
+    fn kernel_double(id: &str, state: SessionState, port: u16) -> Arc<Session> {
+        let mut session = Arc::into_inner(dormant(id, state)).unwrap();
+        session.kind = SessionKind::Kernel;
+        session.kernel_endpoint = Some(kdconn::Endpoint::Net(port));
+        Arc::new(session)
+    }
+
+    fn kernel_with_child(id: &str) -> Arc<Session> {
+        let _spawn = spawn_guard();
+        let child = Command::new("ping.exe")
+            .args(["-t", "127.0.0.1"])
+            .creation_flags(without_a_console_window())
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .unwrap();
+        let mut session =
+            Arc::into_inner(kernel_double(id, SessionState::Attaching, 50194)).unwrap();
+        session.pid = child.id().unwrap();
+        session.child = Mutex::new(Some(child));
+        Arc::new(session)
+    }
+
+    #[tokio::test]
+    async fn unresolved_kernel_survives_end_lease_shutdown_and_explicit_kill() {
+        let kernel = kernel_with_child("kernel-preserve");
+        let sessions = registry_of(std::slice::from_ref(&kernel));
+        let ended = sessions.end(&kernel, true).await.unwrap();
+        let data = ended.data.unwrap();
+        assert_eq!(data["released"], false);
+        assert_eq!(data["worker_terminated"], false);
+        assert_eq!(data["recovery_required"], true);
+        assert!(data.get("target_left_running").is_none());
+        assert!(kernel.kernel_unresolved());
+        kernel.kill();
+        assert!(
+            kernel
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        sessions.release_leased(&kernel.owner).await;
+        assert_eq!(sessions.release_idle(Duration::ZERO).await, 0);
+        sessions.shutdown().await;
+        assert!(
+            kernel
+                .child
+                .lock()
+                .unwrap()
+                .as_mut()
+                .unwrap()
+                .try_wait()
+                .unwrap()
+                .is_none()
+        );
+        assert!(kernel.kernel_unresolved());
+        assert!(matches!(
+            sessions.kernel_handoff(&kernel, kernel.pid + 1).await,
+            Err(EngineError::InvalidArgument(_))
+        ));
+        assert!(kernel.child.lock().unwrap().is_some());
+        let handoff = sessions
+            .kernel_handoff(&kernel, kernel.pid)
+            .await
+            .unwrap()
+            .data
+            .unwrap();
+        assert_eq!(handoff["released"], false);
+        assert_eq!(handoff["worker_terminated"], true);
+        assert_eq!(handoff["recovery_required"], true);
+        assert!(matches!(kernel.state(), SessionState::Closed(_)));
+        kernel.preserve_kernel("late worker EOF racing the verified handoff");
+        assert!(matches!(kernel.state(), SessionState::Closed(_)));
+    }
+
+    #[tokio::test]
+    async fn kernel_release_requires_a_confirmed_worker_reply() {
+        for confirmed in [false, true] {
+            let kernel = kernel_double("kernel-release", SessionState::Open, 50194);
+            kernel.reach(OpenPhase::Opened);
+            let (tx, mut queue) = mpsc::unbounded_channel();
+            let kernel = Arc::new(Session {
+                tx,
+                ..Arc::into_inner(kernel).unwrap()
+            });
+            let sessions = registry_of(std::slice::from_ref(&kernel));
+            let responding = kernel.clone();
+            let reply = tokio::spawn(async move {
+                let job = queue.recv().await.unwrap();
+                assert!(matches!(job.op, EngineOp::EndSession));
+                let waiter = responding.waiters.lock().unwrap().remove(&job.id).unwrap();
+                let result = if confirmed {
+                    Ok(Output::released("confirmed release", Some(true)))
+                } else {
+                    Err(EngineError::Debugger("release refused".into()))
+                };
+                waiter.done.send(result).unwrap();
+            });
+            let data = sessions.end(&kernel, true).await.unwrap().data.unwrap();
+            reply.await.unwrap();
+            assert_eq!(data["released"], confirmed);
+            assert_eq!(data["recovery_required"], !confirmed);
+            assert_eq!(kernel.kernel_unresolved(), !confirmed);
+            assert_eq!(kernel.released.load(Ordering::SeqCst), confirmed);
+        }
+    }
+
+    #[tokio::test]
+    async fn kernel_reservation_crosses_client_boundaries_without_disclosing_owner() {
+        let kernel = kernel_double("private-kernel-id", SessionState::Attaching, 50194);
+        kernel.preserve_kernel("private recovery reason");
+        let sessions = registry_of(std::slice::from_ref(&kernel));
+        crate::client::as_client(crate::client::Client::new("other"), async {
+            assert!(sessions.resolve_for_teardown(Some(&kernel.id)).is_err());
+            let error = sessions
+                .admit(&kernel_double("other-kernel", SessionState::Opening, 50194))
+                .expect_err("another client must not compete for the endpoint");
+            assert!(!error.contains("private-kernel-id"));
+            assert!(!error.contains("private recovery reason"));
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn kernel_handoff_finishes_even_when_its_caller_is_cancelled() {
+        let kernel = kernel_with_child("kernel-handoff");
+        kernel.preserve_kernel("test timeout");
+        let sessions = registry_of(std::slice::from_ref(&kernel));
+        let caller = tokio::spawn({
+            let kernel = kernel.clone();
+            async move { sessions.kernel_handoff(&kernel, kernel.pid).await }
+        });
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while kernel.child.lock().unwrap().is_some() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        caller.abort();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while kernel.state().is_live() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(matches!(kernel.state(), SessionState::Closed(_)));
+    }
+
+    #[tokio::test]
+    async fn kernel_timeout_is_sticky_across_late_success_and_failure() {
+        let kernel = kernel_double("kernel-timeout", SessionState::Attaching, 50194);
+        let (tx, mut queue) = mpsc::unbounded_channel();
+        let kernel = Arc::new(Session {
+            tx,
+            ..Arc::into_inner(kernel).unwrap()
+        });
+        let sessions = registry_of(std::slice::from_ref(&kernel));
+        let result = sessions
+            .call_as(
+                &kernel,
+                Call::new(EngineOp::AttachKernel {
+                    connection: kdconn::Connection::new("net:port=50194,key=1.2.3.4"),
+                    experimental_break_on_connect: true,
+                }),
+                Duration::from_millis(1),
+                OPENER_JOB,
+                Wait::Fixed,
+            )
+            .await;
+        assert!(matches!(result, Err(EngineError::RecoveryRequired(_))));
+        assert!(matches!(
+            queue.try_recv().unwrap().op,
+            EngineOp::AttachKernel { .. }
+        ));
+        assert!(matches!(
+            queue.try_recv().unwrap().op,
+            EngineOp::PreserveKernel
+        ));
+        kernel.reach(OpenPhase::Opened);
+        promote_opened(&kernel);
+        for result in [
+            Ok(Output::text("late success")),
+            Err(EngineError::Debugger("late failure".into())),
+        ] {
+            assert!(settle_open(&kernel, &result));
+            assert!(kernel.kernel_unresolved());
+        }
+        kernel.set_state(SessionState::Closed("racing reclamation".into()));
+        assert!(kernel.kernel_unresolved());
+        assert!(kernel.busy());
+        assert!(matches!(
+            sessions.resolve(Some(&kernel.id)),
+            Err(EngineError::RecoveryRequired(_))
+        ));
+        assert!(sessions.resolve_for_teardown(Some(&kernel.id)).is_ok());
+        assert!(matches!(
+            sessions.submit(
+                &kernel,
+                Call::new(EngineOp::Interrupt { job: None }),
+                17,
+                None
+            ),
+            Err(EngineError::RecoveryRequired(_))
+        ));
+        assert!(queue.try_recv().is_err());
+    }
+
+    #[test]
+    fn kernel_endpoint_reservation_blocks_competing_and_unknown_transports() {
+        let first = kernel_double("first", SessionState::Attaching, 50194);
+        let sessions = registry_of(std::slice::from_ref(&first));
+        assert!(
+            sessions
+                .admit(&kernel_double("same", SessionState::Opening, 50194))
+                .is_err()
+        );
+        assert!(
+            sessions
+                .admit(&kernel_double("different", SessionState::Opening, 50195))
+                .is_ok()
+        );
+        first.preserve_kernel("test");
+        assert!(
+            sessions
+                .admit(&kernel_double("retry", SessionState::Opening, 50194))
+                .is_err()
+        );
+        let mut unknown =
+            Arc::into_inner(kernel_double("opaque", SessionState::Opening, 0)).unwrap();
+        unknown.kernel_endpoint = Some(kdconn::Endpoint::Unknown);
+        assert!(sessions.admit(&Arc::new(unknown)).is_err());
+        first.update_state(|_| Some(SessionState::Closed("verified test handoff".into())));
+        assert!(
+            sessions
+                .admit(&kernel_double(
+                    "after-handoff",
+                    SessionState::Opening,
+                    50194
+                ))
+                .is_ok()
+        );
+    }
+
     /// [`dormant`] with a transcript, for the one test that is about what gets recorded.
     fn dormant_recording(
         id: &str,
@@ -6443,6 +6934,7 @@ mod tests {
             _ => OpenPhase::Opened,
         };
         Arc::new(Session {
+            kernel_endpoint: None,
             id: id.to_string(),
             kind: SessionKind::Dump,
             what: "test".to_string(),
@@ -6458,6 +6950,7 @@ mod tests {
             delivered: AtomicBool::new(true),
             phase: AtomicU8::new(phase as u8),
             released: AtomicBool::new(false),
+            kernel_handoff_complete: AtomicBool::new(false),
             unwinding: Arc::new(Mutex::new(None)),
             execution: Mutex::new(None),
             submit_gate: Mutex::new(()),

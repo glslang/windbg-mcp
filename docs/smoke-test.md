@@ -631,7 +631,8 @@ processes, so they need real ones:
 - *A kernel attach that never connects costs one session.* An `attach_kernel` at a dead port parks
   exactly as a guest that is not in debug mode would; the test then opens a dump **while it is
   parked** (the regression test for [#61](https://github.com/glslang/windbg-mcp/issues/61)) and
-  reclaims the parked session with `end_session`, checking by pid that the worker process is gone.
+  checks that ordinary `end_session` preserves it, then explicitly hands it off with its session
+  ID and exact worker PID. Only that handoff may terminate it; the result must not claim detach.
   It skips itself if the attach fails outright instead of parking (a busy UDP port), because there
   is nothing to assert about a park that did not happen.
 - *A profile-named attach opens a session and discloses no key.* The same dead-port park, opened by
@@ -639,9 +640,12 @@ processes, so they need real ones:
   as `key=<redacted>`, and the key is absent from the transport and the log for the whole life of
   the session. The unit tests prove the resolution and the redaction; only this proves they hold
   over the wire, which is where [#81](https://github.com/glslang/windbg-mcp/issues/81) was.
-- *No worker outlives the connection.* Reads the engine pid out of `session_status`, disconnects,
+- *Ordinary dump workers do not outlive the connection.* Reads the engine pid out of `session_status`, disconnects,
   and checks the process is gone — otherwise every disconnect leaks a debugger process, and for a
   launch or an attach, a debuggee with it.
+- *Unresolved kernel workers survive supervisor loss.* Synthetic dead-port attaches must survive
+  both orderly shutdown and forced supervisor exit beyond the ordinary EOF grace. Tests pin the
+  exact synthetic child process handle for panic-safe cleanup; they do not touch a live guest.
 - *No worker opens a console window of its own.* Reads the same engine pid and checks it is in
   **this harness's** console process list. A console child of a console-*less* parent is given a
   brand-new visible console, which is what a GUI MCP client's server spawns for every session
@@ -954,18 +958,18 @@ nothing parked to contend with. The mechanism that made it contend is gone with 
 property is the client's, so the test stays. It lives here rather than above because without `dbgeng.dll` the
 attach fails during initialisation instead of parking, which would quietly turn a test about a call
 that does not return into one about a call that failed. Budget ~21s, most of it the worker coming
-up and the `end_session` that terminates it.
+up. Ordinary `end_session` preserves the worker; explicit PID-confirmed handoff cleans it up.
 
 The second is the sweep meeting a real engine worker: *a lease
-that runs out releases what the absent client left*. The target is **a kernel attach nothing will
-answer**, deliberately — a parked attach is the worst case in one move, since the session exists,
-holds a worker, and cannot be interrupted, so releasing it means terminating a process rather than
-asking politely. The test then goes silent for a real grace period (32s, nearly the floor the
+that runs out preserves an unresolved kernel controller*. The target is **a kernel attach nothing
+will answer**, deliberately. It must retain its worker rather than treating a release deadline as
+permission to kill. The test then goes silent for a real grace period (32s, nearly the floor the
 listener enforces: the grace must outlast the call budget plus the 30s an engine worker may take to
 come up, so the budget is shrunk to a second) and watches **stderr**, not HTTP — every admitted
 request renews the lease, so a test that polled would hold open the very thing it is waiting to
-expire. It asserts the worker process is gone, the swept session id is no longer served, and the
-next client gets a server with nothing left over. Budget ~40s.
+expire. It asserts the worker survives and the old MCP session is no longer served. A fresh MCP
+session using the same credential can see its retained controller and explicitly hand it off.
+An owned process-handle guard cleans up only this synthetic worker if an assertion fails.
 
 ### Two clients, two of everything
 

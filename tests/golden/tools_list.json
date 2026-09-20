@@ -608,6 +608,7 @@
         "root": "object"
       },
       "params": [
+        "kernel_handoff_pid: integer|null/uint32",
         "session_id: string|null"
       ],
       "required": [],

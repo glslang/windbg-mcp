@@ -8,11 +8,10 @@ as an optional argument, and it is what **routes** the call to the right worker.
 Sessions are independent. Opening a second target does not disturb the first, a call against one
 does not queue behind work in another, and ending one leaves the rest alone. Up to `4` at once; at
 the limit a new open reclaims the oldest **idle** session, and if every session has a call in flight
-the open is refused with the list rather than picking a victim. Sessions end when you `end_session`
-them or when the client disconnects — a disconnect is treated as `end_session` on everything, so no
-debugger process is left behind. It gives each session a shorter grace than `end_session` does,
-though, so end a live kernel session explicitly if you can: one still busy at disconnect is
-terminated, and a terminated kernel session leaves its target halted.
+the open is refused with the list rather than picking a victim. A disconnect attempts the same
+release as `end_session`, with a shorter grace. **Unresolved remote kernel controllers are an
+exception: their workers and session slots are retained**, including after lease expiry or
+supervisor loss. End a healthy live kernel session explicitly and check its release result.
 
 **What ending a session does to its target depends on which tool opened it.** A dump or a trace is
 simply closed. A live kernel is resumed and detached, so the machine is left running rather than
@@ -23,14 +22,10 @@ created. So a target that must survive the debugger is one to attach to, not to 
 a disconnect and a lease expiry run the same release, that holds for a client that simply goes away
 as much as for one that calls `end_session`. `end_session`'s own result says which ending it was.
 
-**With one exception, and it is the same exception as everywhere else here: a session that does not
-let go is terminated.** Releasing asks the worker to detach and then shuts it down; a worker that
-does not answer within the grace is killed while it still owns the debug port, and the kernel takes
-its debuggees with it. That is what already happens to a parked kernel attach, and it is the reason
-`end_session` exists as a recovery at all — but it means "attached processes survive" is a promise
-about a worker that answers, which is every worker that is not wedged. A disconnect and a lease
-expiry give a **shorter** grace than `end_session` does, so a session doing something long-running
-is the one to end explicitly.
+**Stuck non-kernel workers are terminated after the release grace.** Consequently, "attached
+processes survive" requires successful native detach; a killed debugger can take its attached
+processes with it. Remote kernel workers are instead preserved when release is unconfirmed.
+Terminating a kernel debugger does not establish either target resume or detach.
 
 **And a process added through the raw `execute` hatch is not covered by any of this.**
 `execute { "command": ".attach 1234" }` reaches DbgEng without going through `attach_process`, so
@@ -146,15 +141,43 @@ worker up before its own budget starts. Nothing is sent to a call that did not a
 most over `--listen`, where `session_status` and `server_log` are on the other machine and both are
 pull — see [`remote-listener.md`](./remote-listener.md).
 
-**Recovering a session that is stuck.** A per-call timeout abandons the *wait*, not the job, so a
-call that reports a timeout may still be running. The case that matters is `attach_kernel`: it waits
-for the target to dial in with no timeout, and DbgEng cannot interrupt a wait that has not yet
-connected — so a guest that is powered off, not booted with debugging enabled, or pointed at the
-wrong host/port/key never arrives, and that wait never ends. `session_status` distinguishes a link
-that is still coming up (normal, ~25s for a KDNET resync) from one that has been waiting far longer
-than a healthy attach ever takes. For the second, `end_session` is the recovery: it asks the worker
-to let go, and terminates the worker process if it will not. Do **not** re-run the open while it is
-still waiting — the target was already claimed, so that would attach a second time.
+## Unresolved remote kernel controllers
+
+A per-call timeout abandons the *wait*, not the native job. A remote kernel timeout, failed release,
+or unconfirmed worker loss becomes `kernel_unresolved`, with the reason and `engine_pid` in
+`session_status`. This is sticky: a late attach result does not make the session usable again.
+Target liveness and detach remain unknown. Pending attaches and unresolved controllers refuse
+additional interrupts; an ACTIVE interrupt is not a safe timeout-recovery mechanism.
+
+Ordinary `end_session` reports `released: false`, `worker_terminated: false`, and
+`recovery_required: true`. No native teardown is queued for an unresolved controller. Idle/capacity
+reclamation, client lease expiry, and server shutdown cannot kill it automatically. On supervisor
+loss, the worker retains its engine rather than exiting after an unsuccessful cleanup grace.
+
+Within one supervisor, a KDNET port stays reserved across timeout and worker loss; profile aliases,
+different keys, and alternate target addresses do not permit a second owner. Unrecognized
+connection forms conservatively conflict with every remote kernel reservation. This is **not a
+machine-wide lock**: another server process or native debugger is outside this registry. Do not
+restart the server or start another controller as a workaround. An orphan worker cannot be adopted
+by a new supervisor; inspect its PID and endpoint out of band before manual recovery.
+
+After inspecting the target console and preparing an out-of-band recovery route, explicitly hand
+off ownership using the **same session's exact reported PID**:
+
+```jsonc
+end_session { "session_id": "sess-…", "kernel_handoff_pid": 1234 }
+```
+
+This is permission to terminate that owned worker, **not** permission to reset a VM and **not** a
+successful detach. The reservation is removed only after worker exit is verified using its owned
+process handle. Cancelling the request does not cancel the handoff task. The result still reports
+`released: false` and `recovery_required: true`, with no claim that the target is running. Verify
+that the endpoint is free before starting one recovery controller. If exit cannot be verified,
+the reservation remains. A lost supervisor or revoked client requires operator recovery, not a
+different client taking over the handle.
+
+These safeguards do not resolve the underlying DbgEng wait behavior; see the
+[Microsoft report draft](dbgeng-exit-report.md) for evidence and limitations.
 
 Two caveats, both in the command hatches, and both now confined to a single session. The typed tools
 announce their own transitions, but `execute` can replace its session's target directly
