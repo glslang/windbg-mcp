@@ -375,8 +375,8 @@
       "inputSchema": 2008,
       "modelVisible": 2628,
       "name": "reachable_from_dispatch",
-      "outputSchema": 4557,
-      "wire": 7306
+      "outputSchema": 4623,
+      "wire": 7372
     },
     {
       "annotations": 64,
@@ -556,10 +556,10 @@
     "inputSchema": 53503,
     "instructions": 1983,
     "modelVisible": 91790,
-    "outputSchema": 150932,
-    "payload": 250885,
+    "outputSchema": 150998,
+    "payload": 250951,
     "tools": 61,
-    "wire": 250813,
+    "wire": 250879,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
