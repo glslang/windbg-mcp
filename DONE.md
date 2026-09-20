@@ -3938,7 +3938,7 @@ call graph was fully explored"** over a graph missing that switch's every case.
 **What landed is the entry's proposal, plus one thing it did not see.** `FnWalk::met_indirect` is
 now `FnWalk::unresolved_jumps`, the **sites** rather than a flag; `Report` accumulates them into a
 `HashSet<u64>`; `format_report` counts them, withholds the "fully explored" claim as `blind`
-already does, and prints a `Jumps not followed` paragraph naming both remedies; and
+already does, and prints a `Jumps not followed` paragraph naming a remedy per case; and
 `structured::Reachability::unresolved_jumps` carries the count, skipped when zero beside
 `tables_bounded`. The two other silent arms the entry named — an instruction set whose operands go
 unread, and a listing in no loaded module — need no code of their own: both leave the resolver
@@ -3968,6 +3968,16 @@ come back with counts that are mostly **not** switches — 11 on `nt!ObpLookupOb
 paragraph says *whatever they reach: a switch's case blocks, or a callee a tail jump goes to*; the
 first draft called all of them switches and would have described most of them wrongly. The
 dispatch switch is the case the item was filed for and is not the only thing the count holds.
+
+**Which made the remedies wrong until both bots said so, in the same round and independently.** A
+handler VA and a module refresh reach a table that would not read; they reach nothing at all in a
+destination computed at run time, so an unqualified pair promises every reader something that
+cannot work for some of them -- the defect `tables_bounded` exists for, one field along. They are
+given per case now. What was *not* taken is the alternative both offered, separating the two causes
+in the result: `ioctl::Tables` answers per listing, and per site it has targets or nothing, so
+deciding that a jump was a switch whose table would not read -- rather than one that was never a
+table -- is exactly the analysis that did not answer. A field for it would invent the distinction
+rather than report it, and the report says so instead.
 
 **Counted per site, which is what the set is for.** `visited` is keyed by the *start* address, so a
 routine entered at two boundaries is walked twice and the two walks overlap; summing what each

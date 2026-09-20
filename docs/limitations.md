@@ -70,11 +70,16 @@
   follow is counted the same way** (`FOLLOWUPS.md` item 89): an indirect jump whose targets the walk
   did not have ends that path where it is, and whatever it reaches — a switch's case blocks, or a
   callee a tail jump goes to — is missing from the graph the verdict is about, so the report counts
-  the jumps, withholds the same claim, and gives the two remedies the resolver's own cap gives. Not
-  all of them are switches: measured on the ARM64 kernel dump, ordinary `nt` routines end at
-  indirect jumps that are tail calls through a register — **11** on `nt!ObpLookupObjectName` inside
-  24 explored functions — so the dispatch switch is the case this was filed for rather than the
-  only thing it counts. The count is of **jumps** rather
+  the jumps and withholds the same claim. Not all of them are switches: measured on the ARM64 kernel
+  dump, ordinary `nt` routines end at indirect jumps that are tail calls through a register —
+  **11** on `nt!ObpLookupObjectName` inside 24 explored functions — so the dispatch switch is the
+  case this was filed for rather than the only thing it counts. **The remedies are therefore given
+  per case, and the report does not say which case a jump is.** For a jump table that would not
+  read they are the resolver cap's own — a specific handler VA as `from`, and on a live kernel a
+  module refresh first. For a destination computed at run time neither reaches it and nothing
+  static will, so that one is a breakpoint and `go`. Separating the two is not available rather
+  than unbuilt: the resolver answers per listing, and per site it has targets or nothing, so
+  deciding that a jump *was* a switch is the analysis that did not answer. The count is of **jumps** rather
   than of functions, and it is the walk's rather than the probe's: a switch the resolver answered
   is not among them, and neither is one on a `REACHABLE` proved with no tables at all — those were
   never offered to a resolver, which is the ordinary success inside a dispatch routine. It is
