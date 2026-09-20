@@ -4821,6 +4821,25 @@ fn breakpoints(e: &DebugEngine) -> Result<Output, Failed> {
     ))
 }
 
+/// The ids a removal will attempt, each once, in the order the caller gave them.
+///
+/// **`ids` names breakpoints, not operations**, and until it did the result could contradict
+/// itself: `[7, 7]` took breakpoint 7 and then asked for it again, which the engine refused
+/// because the id no longer named anything — so 7 came back in `removed` *and* in `not_removed`,
+/// with the text saying it was still set while `remaining` showed it gone. Measured against a real
+/// engine, which answers `No such interface supported (0x80004002)` for the second ask.
+///
+/// Deduplicated rather than refused, because a repeat is not an ambiguity: a caller filtering a
+/// listing can produce one, and what they meant by it is not in doubt. The ambiguities this tool
+/// does refuse are in `clear_breakpoints` itself, where there are two possible answers rather than
+/// one restated.
+///
+/// Order is the caller's, not sorted: `removed` reads back against the list that was sent.
+fn distinct_ids(ids: Vec<u32>) -> Vec<u32> {
+    let mut seen = std::collections::BTreeSet::new();
+    ids.into_iter().filter(|id| seen.insert(*id)).collect()
+}
+
 /// Removes the breakpoints `ids` names, or every one the session holds — `bc`.
 ///
 /// **A removal is asked of the engine one id at a time and reported the same way.** dbgscope's
@@ -4842,7 +4861,7 @@ fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, F
     // not an inspection here but the *request* — "all of them" cannot be turned into ids any other
     // way, and a failed read would otherwise remove nothing and report a session it had cleared.
     let ids = match ids {
-        Some(ids) => ids,
+        Some(ids) => distinct_ids(ids),
         None => held_breakpoints(e)?
             .iter()
             .map(|breakpoint| breakpoint.id)
@@ -9559,6 +9578,21 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    /// A repeated id is one breakpoint, and the order the caller sent is kept.
+    ///
+    /// **Pinned here *and* at the call site**, deliberately: this function is a list transform and
+    /// a test of it says nothing about whether `clear_breakpoints` calls it — the rule that
+    /// shipped the defect lives on that line, so `breakpoints_are_listed_and_cleared_through_\
+    /// their_own_tools` asserts the same property through the tool against a real engine. Backing
+    /// the call out leaves this green and turns that red, which is the experiment that says which
+    /// of the two is pinning the site.
+    #[test]
+    fn a_removal_attempts_each_id_once_in_the_order_it_was_given() {
+        assert_eq!(super::distinct_ids(vec![7, 7]), vec![7]);
+        assert_eq!(super::distinct_ids(vec![3, 1, 3, 2, 1]), vec![3, 1, 2]);
+        assert_eq!(super::distinct_ids(vec![]), Vec::<u32>::new());
+    }
+
     #[test]
     fn non_kernel_cleanup_failure_does_not_quarantine_the_worker() {
         let safety = super::KernelSafety::new();
