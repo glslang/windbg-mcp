@@ -15888,9 +15888,22 @@ fn a_live_hypervisor_session_inspects_steps_and_detaches() {
                 "{listed}"
             );
         }));
-        // The cleanup the `catch_unwind` above exists for, and it runs whatever that returned:
-        // a breakpoint left armed here is an `int 3` patched into a hypervisor that the detach
-        // below is about to resume.
+        // The cleanup the `catch_unwind` above exists for, and it runs whatever that returned.
+        //
+        // **What it is not is the last line of defence, and saying otherwise invites a fix that
+        // would weaken it.** `with_live_kernel_selector` detaches on every path, including the one
+        // where these assertions panic — so a reader reaches for a fallback removal here. The
+        // teardown underneath already is one: dbgscope's `quit_and_detach_target` calls
+        // `clear_all_breakpoints()?` and only then `qd`, so a failed removal returns **before** the
+        // resume and the kernel is left halted rather than run with an `int 3` in it. The caller is
+        // told so — `released` is not confirmed, and `ungraceful_detach` reports that *ahead* of
+        // whatever failed in this body, which is the ordering that comment at the top of the
+        // wrapper is about. Read 2026-09-20 at dbgscope `1767cf2c`, `src/dbgeng.rs:8115` (`clear_all_breakpoints` at `:8123`).
+        //
+        // So what these assertions are for is the **tool**: that a clear which answers `ok` really
+        // cleared, checked while a target is there to check it against. A retry here would ask an
+        // engine that has just refused a removal to do it twice, and could mask the one condition
+        // the teardown reports.
         let cleared = server.tool_data(
             "clear_breakpoints",
             json!({ "session_id": session, "all": true }),
@@ -15903,7 +15916,8 @@ fn a_live_hypervisor_session_inspects_steps_and_detaches() {
             cleared["not_removed"]
                 .as_array()
                 .is_none_or(|left| left.is_empty()),
-            "a breakpoint left armed on a hypervisor about to be resumed:\n{cleared}"
+            "`clear_breakpoints` answered ok and left a breakpoint armed; the teardown below \
+             refuses to resume a kernel it cannot clear, so expect a halted target:\n{cleared}"
         );
         assert_eq!(
             cleared["remaining"].as_array().map(Vec::len),
