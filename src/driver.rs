@@ -147,16 +147,26 @@ struct FnWalk {
     /// could not see past, and they are the difference between a graph that was explored and one
     /// that merely ran out.
     blind: usize,
-    /// Whether the walk reached an indirect `jmp` whose targets these tables did not hold.
+    /// The indirect `jmp` sites the walk **ended at**, because these tables held no targets for
+    /// them. Each appears once: an instruction is processed only on the visit that inserts it into
+    /// [`Self::reachable`].
     ///
-    /// What decides whether resolving them is worth an engine round trip at all. A `from` scoped to
-    /// a handler *past* a dispatch switch reaches no such jump — the switch is behind it — so a
-    /// walk from there needs no tables, and asking for them would spend the caller's clock on
-    /// literal and table reads whose answers nothing in this walk can use. It would also make the
-    /// report's own advice untrue: "pass a handler VA as `from` to scope past the dispatch" is no
-    /// escape from a resolver cap if the resolver runs anyway. `FOLLOWUPS.md` item 83's resolver is
-    /// what made that reachable, and it was raised on review of #351.
-    met_indirect: bool,
+    /// Two things read it, and the second is why it is a list of sites rather than the flag it was.
+    ///
+    /// It decides whether resolving is worth an engine round trip at all. A `from` scoped to a
+    /// handler *past* a dispatch switch reaches no such jump — the switch is behind it — so a walk
+    /// from there needs no tables, and asking for them would spend the caller's clock on literal
+    /// and table reads whose answers nothing in this walk can use. It would also make the report's
+    /// own advice untrue: "pass a handler VA as `from` to scope past the dispatch" is no escape
+    /// from a resolver cap if the resolver runs anyway. `FOLLOWUPS.md` item 83's resolver is what
+    /// made that reachable, and it was raised on review of #351.
+    ///
+    /// And it is the walk's own incompleteness, which is `FOLLOWUPS.md` item 89: a path that ended
+    /// at a switch nothing could answer for explored a graph short of that switch's cases, and
+    /// until this reached [`Report`] the final walk's copy was computed and dropped. Sites rather
+    /// than a count, because `reachability` walks one listing once per *start* and two such walks
+    /// overlap — summing their counts reports one jump twice, and what a reader acts on is jumps.
+    unresolved_jumps: Vec<u64>,
 }
 
 /// Returns `None` if `start` is not an instruction boundary in `block` (the caller
@@ -171,7 +181,7 @@ fn walk_function(block: &[Instruction], start: u64, tables: &JumpTables) -> Opti
     let mut reachable: HashSet<u64> = HashSet::new();
     let mut external: Vec<(u64, u64, &'static str)> = Vec::new();
     let mut blind = 0usize;
-    let mut met_indirect = false;
+    let mut unresolved_jumps: Vec<u64> = Vec::new();
     let mut stack = vec![start_i];
     while let Some(i) = stack.pop() {
         let insn = &block[i];
@@ -217,9 +227,13 @@ fn walk_function(block: &[Instruction], start: u64, tables: &JumpTables) -> Opti
                 leave(insn.address, t, "jmp");
                 if t.is_none() {
                     let targets = tables.at(insn.address);
-                    // Recorded whether or not anything follows, because the question this answers is
-                    // "would tables have helped here", asked of a walk that ran without them.
-                    met_indirect |= targets.is_empty();
+                    // Recorded whether or not anything follows, because the two questions this
+                    // answers are asked of walks with and without tables: "would tables have helped
+                    // here", of the probe that ran without them, and "what did this graph not
+                    // cross", of the walk the verdict is about.
+                    if targets.is_empty() {
+                        unresolved_jumps.push(insn.address);
+                    }
                     for &target in targets {
                         leave(insn.address, Some(target), "jmp");
                     }
@@ -248,7 +262,7 @@ fn walk_function(block: &[Instruction], start: u64, tables: &JumpTables) -> Opti
         reachable,
         external,
         blind,
-        met_indirect,
+        unresolved_jumps,
     })
 }
 
@@ -978,6 +992,33 @@ pub(crate) struct Report {
     /// reading the typed answer for whether the graph was fully explored gets the right answer from
     /// the field that has always meant that. What this changes is the advice.
     tables_bounded: bool,
+    /// The indirect `jmp` sites the walk **ended at** without following, across every function it
+    /// explored.
+    ///
+    /// The fifth way to be incomplete, and until `FOLLOWUPS.md` item 89 the one that was computed
+    /// and thrown away: [`FnWalk::unresolved_jumps`] was read once, to decide whether resolving was
+    /// worth a round trip, and the final walk's copy was dropped. A walk that ran the resolver over
+    /// a switch and got nothing back — as against one [`Self::tables_bounded`] covers, which
+    /// stopped *short* of it — therefore carried no signal at all: [`Self::blind`] counts only
+    /// instructions that would not read, so `format_report` printed "the reachable call graph was
+    /// fully explored" over a graph missing a switch's every case.
+    ///
+    /// **"Unresolved" includes "could not be asked", and deliberately.** The resolver answers
+    /// nothing for an instruction set whose operands this build does not read, and nothing for a
+    /// listing in no loaded module — the honest degradations, honest about the *target* and, until
+    /// this field, silent about the report. A caller cannot act on the difference between
+    /// resolving nothing and having nothing to resolve with — the graph is short of the same edges
+    /// either way — so both report here.
+    ///
+    /// The one thing that does **not** is the probe: a walk that reached the goal with no tables
+    /// never offered its jumps to the resolver, and counting them would mark every `REACHABLE`
+    /// inside a dispatch routine as a switch this could not follow. The early return in
+    /// [`reachability`] says why at length.
+    ///
+    /// A **set**, because `reachability` walks one listing once per start address and two such
+    /// walks overlap: a jump both of them end at is one jump. Bounded by the instructions the walk
+    /// explored, which `max_functions` bounds.
+    unresolved_jumps: HashSet<u64>,
 }
 
 /// Walks the call/branch graph from `from`, running `uf(arg)` for each discovered
@@ -1041,6 +1082,7 @@ pub(crate) fn reachability(
         max_depth,
         halted: None,
         blind: 0,
+        unresolved_jumps: HashSet::new(),
         seed_start: None,
     };
 
@@ -1134,6 +1176,19 @@ pub(crate) fn reachability(
         // check a name that was fine. The first draft of this fix did exactly that.
         if probe.reachable.contains(&target) {
             rpt.blind += probe.blind;
+            // **And deliberately nothing from `probe.unresolved_jumps`**, which is the one place
+            // that count would be dishonest. The probe ran with *no tables* on purpose, so its
+            // list is every indirect jump on the way to the goal rather than the ones that would
+            // not resolve -- and the goal was reached, so the resolver was never asked about any of
+            // them. Merged here, every `REACHABLE` found inside a dispatch routine would report its
+            // own switch as a switch the walk could not follow: the ordinary success on the most
+            // ordinary target, carrying the one signal that says a graph has holes in it.
+            //
+            // Nothing is lost by the silence. The verdict is sound -- a path found is found -- and
+            // what the count qualifies elsewhere, that a *shorter* path may exist, is already true
+            // of every walk that stops early and is what `path` reports by being the path this one
+            // found. The success below is different: it ran the tables, so what it has left over is
+            // what they could not answer.
             rpt.verdict_reachable = true;
             rpt.containing_fn = Some(entry);
             rpt.path = reconstruct(&parent, token);
@@ -1143,9 +1198,9 @@ pub(crate) fn reachability(
             return rpt;
         }
 
-        let walk = match probe.met_indirect {
-            false => probe,
-            true => {
+        let walk = match probe.unresolved_jumps.is_empty() {
+            true => probe,
+            false => {
                 // Once per function, and only now. The tables are the same whichever address the
                 // walk starts from, so the second walk uses the start the first settled on.
                 //
@@ -1194,6 +1249,10 @@ pub(crate) fn reachability(
         // The final walk's, once: the probe's instructions are a subset of this one's, so adding
         // both would count the unreadable ones twice.
         rpt.blind += walk.blind;
+        // The final walk's for the same reason and one more: the probe's list holds every indirect
+        // jump, including the ones the resolver then answered, so merging it would report a switch
+        // the walk *crossed* as one it stopped at. This one is what is left after the tables.
+        rpt.unresolved_jumps.extend(&walk.unresolved_jumps);
 
         if walk.reachable.contains(&target) {
             rpt.verdict_reachable = true;
@@ -1365,9 +1424,11 @@ pub(crate) fn format_report(r: &Report) -> String {
                 "  Bound hit: {}\n",
                 if r.bound_hit {
                     "yes — raise max_functions/max_depth and retry"
-                } else if r.blind > 0 {
+                } else if r.blind > 0 || !r.unresolved_jumps.is_empty() {
                     // The claim of a full exploration is withheld rather than qualified below,
-                    // because it is the sentence a reader stops at.
+                    // because it is the sentence a reader stops at. Both of the paragraphs below
+                    // withhold it, and for the same reason: each is a hole in the graph this
+                    // verdict is about, with a remedy that is not a larger bound.
                     "no"
                 } else {
                     "no — the reachable call graph was fully explored"
@@ -1390,6 +1451,31 @@ pub(crate) fn format_report(r: &Report) -> String {
                 r.blind
             ));
         }
+    }
+    // The fourth way to be short of the graph, and `FOLLOWUPS.md` item 89: a switch the walk ended
+    // at. Distinct from the resolver's own cap above, which stopped *short* of a table -- this is
+    // one it read and could not answer for, one it had no image to ask about, and one this build's
+    // decoder cannot supply the operands for. Counted per **jump** rather than per function,
+    // because that is the unit the remedy applies to: one of these is one switch's worth of case
+    // blocks, and everything past them, missing from the graph.
+    //
+    // **Outside the verdict branches, unlike [`Report::blind`], because it is true of both.** On a
+    // NOT REACHABLE it is why the verdict may be wrong; on a REACHABLE it is why a shorter path may
+    // exist -- the same argument that put `tables_bounded` on both, one review round of #351 after
+    // it shipped on one. The sentence is written to say the one thing that holds either way, so
+    // there is no second rendering to keep in step. A REACHABLE proven *without* tables reaches
+    // this with nothing to print: see the early return in `reachability`.
+    if !r.unresolved_jumps.is_empty() {
+        out.push_str(&format!(
+            "  Switch not followed: the walk ended at {} indirect jump(s) whose targets it did \
+             not\n           have, so a switch's case blocks are missing from the graph this \
+             verdict is\n           about. A jump table is crossed where it can be read; where it \
+             cannot, pass a\n           specific handler VA as `from` to ask about that case block \
+             directly. On a live\n           kernel run `modules` with `refresh: true` first — a \
+             table's entries are checked\n           against the image's executable ranges, and a \
+             fresh attach has no image.\n",
+            r.unresolved_jumps.len()
+        ));
     }
     out.push_str(&format!(
         "  Functions explored: {} (bound {})   Max depth reached: {} (bound {})\n",
@@ -1469,6 +1555,12 @@ pub(crate) fn structured_report(
         max_depth: r.max_depth,
         bound_hit: r.bound_hit,
         tables_bounded: r.tables_bounded,
+        // A count, where the walk holds the sites. What a caller does with this is decide whether
+        // the `not_reachable` is about the target or about the switch, which the number answers;
+        // the remedy it points at is a **handler** address, which these are not. Listing them as
+        // locations -- `ioctl_map`'s `unresolved` does -- would put an `ImageRef` and a `locate`
+        // call on each, and that tool lists them because its answer *is* the set of cases.
+        unresolved_jumps: r.unresolved_jumps.len(),
         stopped: r.halted.map(halt),
         blind_stops: r.blind,
         recipe: recipe.map(|(segments, _)| {
@@ -3100,6 +3192,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             halted: Some(Halt::Interrupted),
             blind: 0,
             seed_start: None,
+            unresolved_jumps: HashSet::new(),
         };
         let text = format_report(&r);
         assert!(text.contains("VERDICT: REACHABLE"), "{text}");
@@ -3147,6 +3240,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             halted: None,
             blind: 0,
             seed_start: None,
+            unresolved_jumps: HashSet::new(),
             tables_bounded: false,
         };
 
@@ -3251,6 +3345,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             halted: None,
             blind: 0,
             seed_start: None,
+            unresolved_jumps: HashSet::new(),
             tables_bounded: true,
         };
         let typed = structured_report(&r, None, located);
@@ -3412,6 +3507,278 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             calls.get(),
             1,
             "one listing, one resolution -- the second entry into it reuses the first's tables"
+        );
+    }
+
+    /// **A switch the walk ended at is counted, and a NOT REACHABLE that met one does not claim a
+    /// clean sweep** — `FOLLOWUPS.md` item 89.
+    ///
+    /// [`FnWalk::unresolved_jumps`] has always been computed, because it is what decides whether
+    /// resolving is worth an engine round trip, and the *final* walk's copy was thrown away. So a
+    /// walk that ran the resolver over a dispatch switch and got nothing back carried no signal at
+    /// all: `blind` counts only instructions that would not read, `tables_bounded` is the resolver
+    /// stopping *short* of a table rather than failing on one, and the report printed
+    /// "Bound hit: no — the reachable call graph was fully explored" over a graph missing that
+    /// switch's every case.
+    ///
+    /// Three claims, the count being the interesting half. **It is of jumps**, so two in one
+    /// function are two rather than one function's worth. **It is the final walk's**, so a jump the
+    /// tables answered is not among them — merging the probe's list instead, which is the
+    /// mutation this fix could have been, reports a switch the walk *crossed* as one it stopped
+    /// at. And **a graph that meets none still gets the clean sweep**, so the sentence is withheld
+    /// for this rather than for every NOT REACHABLE.
+    #[test]
+    fn a_switch_the_walk_could_not_follow_is_counted_and_costs_the_clean_sweep() {
+        // Two indirect jumps, both reachable: the branch's target and its fall-through.
+        let func = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Branch(Some(0x1010)), "jne 1010h"),
+                insn(0x1008, Flow::Jmp(None), "jmp qword ptr [tbl]"),
+                insn(0x1010, Flow::Jmp(None), "br x8"),
+            ],
+        );
+        let m = functions(&[("start", func)]);
+
+        // Neither resolves, which is what every walk did before `FOLLOWUPS.md` item 83 and what a
+        // set whose operands this build cannot read still does.
+        let neither = reachability(
+            "start",
+            None,
+            0x9999,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
+        assert!(!neither.verdict_reachable, "{neither:?}");
+        assert_eq!(
+            neither.unresolved_jumps.len(),
+            2,
+            "two jumps in one function are two: {neither:?}"
+        );
+        assert!(
+            !neither.bound_hit && neither.halted.is_none() && neither.blind == 0,
+            "and none of the three older channels fires, which is what made this invisible: \
+             {neither:?}"
+        );
+        let text = format_report(&neither);
+        assert!(
+            !text.contains("fully explored"),
+            "a graph missing a switch's cases was not fully explored: {text}"
+        );
+        assert!(
+            text.contains("Switch not followed: the walk ended at 2 indirect jump(s)"),
+            "{text}"
+        );
+        assert!(
+            text.contains("refresh: true"),
+            "a stale module inventory is the live-kernel cause, and naming it is the point of \
+             saying anything: {text}"
+        );
+        assert_eq!(
+            structured_report(&neither, None, located).unresolved_jumps,
+            2,
+            "and the typed half carries it, or a structured consumer reads the same clean sweep"
+        );
+
+        // One of the two answered. The probe meets **both** -- it runs with no tables at all -- so
+        // a count taken from it rather than from the final walk would still say two.
+        let one = reachability(
+            "start",
+            None,
+            0x9999,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            |_: &[Instruction]| tables_of(&[(0x1008, vec![0x1010])]),
+            never,
+        );
+        assert_eq!(
+            one.unresolved_jumps.len(),
+            1,
+            "the count is what the tables left, not what the probe met: {one:?}"
+        );
+        assert!(
+            format_report(&one).contains("1 indirect jump(s)"),
+            "{}",
+            format_report(&one)
+        );
+
+        // Both answered: nothing is left, and the clean sweep is the report's again. The second
+        // table leaves the listing, which is an ordinary external edge and not a jump this ended at.
+        let both = reachability(
+            "start",
+            None,
+            0x9999,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            |_: &[Instruction]| tables_of(&[(0x1008, vec![0x1010]), (0x1010, vec![0x1014])]),
+            never,
+        );
+        assert!(
+            both.unresolved_jumps.is_empty(),
+            "every jump was followed: {both:?}"
+        );
+        let text = format_report(&both);
+        assert!(
+            text.contains("the reachable call graph was fully explored"),
+            "{text}"
+        );
+        assert!(!text.contains("Switch not followed"), "{text}");
+    }
+
+    /// **One switch two walks end at is one switch**, which is what counting sites buys over
+    /// summing counts.
+    ///
+    /// `visited` is keyed by the *start* address, so a routine entered at two boundaries is walked
+    /// twice — deliberately, two starts having two reachable sets — and the two walks overlap. A
+    /// sum reports the jump they share as two, and the only consumer this count has is a reader
+    /// sizing how much of the graph is missing.
+    #[test]
+    fn one_switch_reached_from_two_starts_is_counted_once() {
+        // The same two-boundary shape as `a_function_entered_at_two_boundaries_is_resolved_once`,
+        // with a resolver that answers nothing: both walks run through the jump at 0x200c.
+        let seed = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Call(Some(0x2000)), "call"),
+                insn(0x1008, Flow::Call(Some(0x2008)), "call"),
+                insn(0x100c, Flow::Return, "ret"),
+            ],
+        );
+        let shared = uf_fn(
+            0x2000,
+            vec![
+                insn(0x2004, Flow::Fallthrough, "nop"),
+                insn(0x2008, Flow::Fallthrough, "nop"),
+                insn(0x200c, Flow::Jmp(None), "jmp rax"),
+            ],
+        );
+        let graph = functions(&[
+            ("start", seed),
+            ("0x2000", shared.clone()),
+            ("0x2008", shared),
+        ]);
+
+        let rpt = reachability(
+            "start",
+            None,
+            0x9999,
+            256,
+            32,
+            |a| graph.get(a).cloned(),
+            no_tables,
+            never,
+        );
+        assert!(!rpt.verdict_reachable, "{rpt:?}");
+        assert_eq!(
+            rpt.funcs_explored, 3,
+            "the routine is walked from both boundaries, which is the premise: {rpt:?}"
+        );
+        assert_eq!(
+            rpt.unresolved_jumps.len(),
+            1,
+            "both walks end at 0x200c, and 0x200c is one jump: {rpt:?}"
+        );
+        assert!(
+            format_report(&rpt).contains("1 indirect jump(s)"),
+            "{}",
+            format_report(&rpt)
+        );
+    }
+
+    /// **A path proven without tables counts no switch; one proven through them still counts what
+    /// they could not answer.**
+    ///
+    /// The probe runs with no tables by design, so every indirect jump on the way to a goal it
+    /// finds is one the resolver was never offered — and the commonest success there is is a
+    /// handler reached from inside its own dispatch routine, whose switch resolves perfectly well.
+    /// Counting the probe's jumps would report that answer, and every answer like it, as a walk
+    /// that met a switch it could not follow. The verdict is sound either way, so the silence
+    /// costs nothing.
+    ///
+    /// What it must not cost is the case the count is for, so the second half is a REACHABLE the
+    /// tables *were* run for: the seed's switch is crossed, the goal is behind the helper's first
+    /// jump, and the helper's second is left unanswered. There the rendering says so on the
+    /// reachable side too — the argument that put `tables_bounded` on both sides one review round
+    /// of #351 after it shipped on one.
+    #[test]
+    fn a_verdict_proven_without_tables_counts_no_unresolved_switch() {
+        // The entry branches: one edge is the goal, the other ends at an indirect jump.
+        let quick = uf_fn(
+            0x1000,
+            vec![
+                insn(0x1004, Flow::Branch(Some(0x1010)), "jne 1010h"),
+                insn(0x1008, Flow::Jmp(None), "jmp qword ptr [tbl]"),
+                insn(0x1010, Flow::Return, "ret"), // the goal
+            ],
+        );
+        let m = functions(&[("start", quick)]);
+        let proven = reachability(
+            "start",
+            None,
+            0x1010,
+            256,
+            32,
+            |a| m.get(a).cloned(),
+            no_tables,
+            never,
+        );
+        assert!(proven.verdict_reachable, "{proven:?}");
+        assert!(
+            proven.unresolved_jumps.is_empty(),
+            "the probe's jumps were never offered to a resolver, so nothing here went unresolved: \
+             {proven:?}"
+        );
+        let text = format_report(&proven);
+        assert!(!text.contains("Switch not followed"), "{text}");
+
+        // Now one that did run them. The seed's switch reaches the helper; the helper's first jump
+        // reaches the goal and its second answers to nothing.
+        let seed = uf_fn(
+            0x1000,
+            vec![insn(0x1004, Flow::Jmp(None), "jmp qword ptr [tbl]")],
+        );
+        let helper = uf_fn(
+            0x2000,
+            vec![
+                insn(0x2004, Flow::Branch(Some(0x2010)), "jne 2010h"),
+                insn(0x2008, Flow::Jmp(None), "jmp qword ptr [tbl2]"),
+                insn(0x2010, Flow::Jmp(None), "br x8"),
+                insn(0x2014, Flow::Return, "ret"), // the goal
+            ],
+        );
+        let graph = functions(&[("start", seed), ("0x2000", helper)]);
+        let crossed = reachability(
+            "start",
+            None,
+            0x2014,
+            256,
+            32,
+            |a| graph.get(a).cloned(),
+            |block: &[Instruction]| match block.first().map(|first| first.address) {
+                Some(0x1000) => tables_of(&[(0x1004, vec![0x2000])]),
+                _ => tables_of(&[(0x2008, vec![0x2014])]),
+            },
+            never,
+        );
+        assert!(
+            crossed.verdict_reachable,
+            "the tables cross into the helper and reach the goal: {crossed:?}"
+        );
+        assert_eq!(
+            crossed.unresolved_jumps.len(),
+            1,
+            "the helper's second switch is the one the tables did not answer: {crossed:?}"
+        );
+        let text = format_report(&crossed);
+        assert!(text.contains("VERDICT: REACHABLE"), "{text}");
+        assert!(
+            text.contains("Switch not followed: the walk ended at 1 indirect jump(s)"),
+            "a path found in a partial graph says so on this side too: {text}"
         );
     }
 
