@@ -124,7 +124,9 @@ there is none, and each is handled explicitly rather than absorbed.
   switch site has to be one this walk resolved too. Measured 2026-09-20: `mountmgr`'s 45 all carry
   switch evidence at `0x1940c`, `0x1944c` and `0x19730` — exactly this side's three tables — while
   `rdyboost`'s two carry `comparison` and are real misses. The **count** is checked separately,
-  against `entries` minus `followed`, and only where the records are counted — at route level.
+  against `entries` minus `followed` **per switch site**, and only where the records are counted —
+  at route level. Per site rather than in total, because one total lets a surplus at a table that
+  dropped nothing reconcile against a different table's drops.
   Both, in that order, and neither alone: equal counts are not provenance, since one missed
   compare beside one dropped slot balances perfectly while hiding the finding this lane exists to
   make; and attribution is not a licence either, since a table slot that is not one of the ones
