@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.19.0] - 2026-09-20
+
 ### Fixed
 
 - Remote-kernel cleanup now reconciles late confirmed releases and does not preserve returned
@@ -3824,7 +3826,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.18.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.19.0...HEAD
+[0.19.0]: https://github.com/glslang/windbg-mcp/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/glslang/windbg-mcp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/glslang/windbg-mcp/compare/v0.16.0...v0.17.0
 [0.16.0]: https://github.com/glslang/windbg-mcp/compare/v0.15.0...v0.16.0
