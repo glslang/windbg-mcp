@@ -242,6 +242,11 @@ thread remained in packet reception. No ACTIVE interrupt was sent, and independe
 passed before and after reclaiming the probe. This points to a cancellation gap in the tested
 DbgEng/KDNET build, not a proven cross-version limitation or safe automatic-recovery procedure.
 
+A later [direct-COM comparison](hypervisor-detach-trace.md#direct-com-cross-build-follow-up-2026-09-20)
+reproduced the unconnected cancellation failure without dbgscope on both `10.0.29617.1000` and
+`10.0.26100.1`: 150 accepted EXIT requests per run, no wait return before the 100-second outer
+limit. This extends the unconnected evidence across two builds, not the synchronized live claim.
+
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
 stepping and breakpoint management remain unvalidated by this implementation run. Live NT and
