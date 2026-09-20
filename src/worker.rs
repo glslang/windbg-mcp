@@ -4821,6 +4821,12 @@ fn breakpoints(e: &DebugEngine) -> Result<Output, Failed> {
     ))
 }
 
+/// How many failed removals are rendered as lines before the rest become a count.
+///
+/// The cap on `ids` bounds this already — 256 failures is a result nobody reads and a result
+/// budget this server does have. The structured half is never truncated.
+const RENDERED_FAILURES: usize = 20;
+
 /// The ids a removal will attempt, each once, in the order the caller gave them.
 ///
 /// **`ids` names breakpoints, not operations**, and until it did the result could contradict
@@ -4920,7 +4926,7 @@ fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, F
                 .join(", "),
         ),
     };
-    for failure in &not_removed {
+    for failure in not_removed.iter().take(RENDERED_FAILURES) {
         // Named one per line rather than counted, because the id is what a caller needs to try
         // again or to go and look — and said **neutrally**, with the armed claim made only where
         // the inventory supports it. Saying "still set" of an id that named nothing put this text
@@ -4935,6 +4941,19 @@ fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, F
                     " — the session holds no such breakpoint, so nothing is armed for it",
                 None => "",
             },
+        ));
+    }
+    if let Some(beyond) = not_removed
+        .len()
+        .checked_sub(RENDERED_FAILURES)
+        .filter(|n| *n > 0)
+    {
+        // The rendering is bounded and the data is not: every one of them is in `not_removed`,
+        // and a structured-aware client reads that rather than this. Said rather than truncated
+        // silently, because a caller counting lines here would undercount what is still armed.
+        text.push_str(&format!(
+            "… and {beyond} more, each in `not_removed` — read `still_set` there for which of \
+             them the session actually holds.\n",
         ));
     }
     match &remaining {

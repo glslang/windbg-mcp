@@ -509,6 +509,23 @@ fn walk_bound(asked: Option<usize>, default: usize, ceiling: usize) -> usize {
 const MAX_WALK_FUNCTIONS: usize = 4096;
 const MAX_WALK_DEPTH: usize = 256;
 
+/// The most breakpoint ids one `clear_breakpoints` may name.
+///
+/// **A bound on work this session's engine would do one wire round trip at a time.** Each id is a
+/// `RemoveBreakpoint2`, which on a live kernel is a packet to the target, and a call that outruns
+/// its caller's deadline is *not* cancelled — only the wait for it is (`Engine::call_as`) — so an
+/// unbounded list pins the session for as long as the list is long, with the caller already gone.
+///
+/// **Refused rather than clamped, unlike [`MAX_WALK_DEPTH`] and friends.** Those bound a *search*,
+/// where taking fewer results is a smaller answer to the same question. This is a mutation: a
+/// caller who named 500 breakpoints and silently had 256 removed is a caller told the target is
+/// clean while it is armed, which is this tool's one job to get right.
+///
+/// 256 costs no capability, which is what makes the refusal cheap: it is eight times the 32 a
+/// kernel target can hold at all, and `all: true` derives its ids from the session's own inventory
+/// rather than from the caller, so clearing a larger user-mode inventory is still one call.
+const MAX_CLEAR_IDS: usize = 256;
+
 /// Parses a decimal or `0x`-prefixed hex integer.
 pub(crate) fn parse_u64(s: &str) -> Result<u64, String> {
     let t = s.trim();
@@ -4062,8 +4079,9 @@ impl WindbgServer {
 
     /// Remove breakpoints by id, or all of them (`bc`), and report what the session is left
     /// holding. Pass `ids` or `all: true` — a call naming neither is refused rather than treated
-    /// as "everything". Each removal is reported separately: one that failed leaves that
-    /// breakpoint armed in the target, and is named rather than counted.
+    /// as "everything". Each removal is reported separately, and a failed one does **not** mean
+    /// the breakpoint is still armed: an id naming nothing fails the same way. Read `still_set`
+    /// on that row, or `remaining`, before deciding a target is unsafe to resume.
     #[rmcp::tool(
         annotations(
             title = "Clear breakpoints",
@@ -4112,6 +4130,26 @@ impl WindbgServer {
             // removed, which is what it asked for and is not worth a refusal of its own.
             (ids, _) => ids,
         };
+        // Bounded before the engine is reached, for [`MAX_CLEAR_IDS`]' reason: the work is one
+        // wire round trip per id and a call that outruns its caller is not cancelled. Counted on
+        // what the caller sent rather than on what survives deduplication, because the bound is on
+        // the request — a list this long is a mistake whatever is in it.
+        if let Some(ids) = &ids
+            && ids.len() > MAX_CLEAR_IDS
+        {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                format!(
+                    "`ids` names {} breakpoints, and at most {MAX_CLEAR_IDS} may be removed in \
+                     one call: each is a separate request to the engine, which on a live kernel \
+                     is a packet to the target. Use `all: true` to clear the session's whole \
+                     inventory in one call — it reads the ids from the session rather than from \
+                     this list — or send the ids in batches.",
+                    ids.len(),
+                ),
+                args.session_id,
+            );
+        }
         let out = self
             .run(
                 args.session_id.as_deref(),

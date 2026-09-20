@@ -1964,14 +1964,20 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// rounds that moved `device_security`'s figure moved it by 119 B in total.
 ///
 /// **93,000 -> 96,500 for the breakpoint inventory** (2026-09-20), which is two tools rather than
-/// one and so has a term for each: the model-visible surface went 92,665 -> 94,773 across 61 ->
-/// 63 tools, and of those 2,108 B, `breakpoints` is 857 and `clear_breakpoints` is 1,080. The
+/// one and so has a term for each: the model-visible surface went 92,665 -> 94,879 across 61 ->
+/// 63 tools, and of those 2,214 B, `breakpoints` is 857 and `clear_breakpoints` is 1,186. The
 /// remaining 171 B is `set_breakpoint`, untouched and grown by a `TOOL_NOTES` cross-reference to
 /// both of them — the `interrupt` case this comment records above, arriving the same way a second
 /// time. `breakpoints` carries a note of its own, inside its 857. They are *cheap* tools by this
-/// surface's standards (the mean is 1,504 B) and the raise is still 3,500, because the headroom
+/// surface's standards (the mean is 1,506 B) and the raise is still 3,500, because the headroom
 /// left at the last raise was 335 B and a ceiling with no room in it fails the next reworded
-/// description rather than the next tool. The new figure leaves 1,727 B, 1.8%.
+/// description rather than the next tool. The new figure leaves 1,621 B, 1.7%.
+///
+/// **That headroom was spent on a correction, which is what it is for.** `clear_breakpoints` went
+/// 1,080 -> 1,186 when a review round found its description still asserting that a failed removal
+/// leaves a breakpoint armed -- the one copy of that claim a model reads, after the same claim had
+/// been corrected in the type, in the rendering and in three documents. A ceiling sized to the
+/// tools as first written would have failed on fixing them.
 ///
 /// What the two are *for* is a gap `--tools` made visible: `execute` is in the `inspect` group and
 /// `set_breakpoint` in `exec`, so a client served `session,exec` could arm a breakpoint on a live
@@ -2073,19 +2079,19 @@ const MODEL_VISIBLE_CEILING: usize = 96_500;
 /// says where it is today.
 ///
 /// **256,000 -> 268,000 for the breakpoint inventory** (2026-09-20). The payload went 255,243 ->
-/// 262,811, a difference of 7,568: `breakpoints` is 3,399 B of wire and `clear_breakpoints`
-/// 3,996, `set_breakpoint` grew 171 by the cross-reference recorded under the other ceiling, and
+/// 262,917, a difference of 7,674: `breakpoints` is 3,399 B of wire and `clear_breakpoints`
+/// 4,102, `set_breakpoint` grew 171 by the cross-reference recorded under the other ceiling, and
 /// the two remaining bytes are the array's own commas. Nothing else moved, checked against the
 /// per-tool golden keyed by **name** -- the diff for a surface that just grew by two entries is
 /// the case `a-rendering-is-not-an-identifier` is about, and a positional one blames whichever
 /// tools sit where the new ones were inserted.
 ///
-/// **5,164 B of that 7,568 is `outputSchema`, and the sharing question again answers no.**
+/// **5,164 B of that 7,674 is `outputSchema`, and the sharing question again answers no.**
 /// `BreakpointInfo` is now inlined in three closures rather than one, which is a copy each and not
 /// a product: 2,396 B for a listing of them and 2,768 for a removal's pair of lists beside one --
 /// the 40 B between that and its first recording being the `still_set` a review round added to
 /// each failed row, which is what this ceiling's headroom is for.
-/// The new figure leaves 5,189 B, 1.9%, which is the headroom every raise here has left.
+/// The new figure leaves 5,083 B, 1.9%, which is the headroom every raise here has left.
 // 2026-09-20: unresolved-kernel state, one error enum variant per output closure, and the
 // explicit handoff field make the measured payload 254,925 B. No schema descriptions added.
 const WIRE_CEILING: usize = 268_000;
@@ -3496,6 +3502,55 @@ fn clearing_breakpoints_without_a_selector_is_refused() {
     assert!(
         is_tool_error(&typo) || typo["error"]["code"].is_number(),
         "an unknown field must not be dropped: {typo}"
+    );
+}
+
+/// A list of ids longer than one call may remove is refused before the engine is reached.
+///
+/// **The bound is on work, not on ambition.** Each id is one `RemoveBreakpoint2`, which over KDNET
+/// is a packet to the target, and a call that outruns its caller's deadline is not cancelled —
+/// only the wait for it is — so a long enough list pins the session with nobody left waiting. It
+/// is **refused** rather than clamped, which is where this differs from the walk bounds beside it:
+/// a search truncated is a smaller answer, and a removal truncated is a caller told a target is
+/// clean while it is armed.
+///
+/// It costs no capability, which is the half worth asserting: `all: true` takes its ids from the
+/// session's own inventory rather than from the caller, so it is unaffected by the cap — checked
+/// here on a server with no session at all, where it reaches the *session* refusal rather than
+/// this one. Reported by Codex on #360.
+#[test]
+fn clearing_more_breakpoint_ids_than_one_call_may_remove_is_refused() {
+    let mut server = Server::started();
+    let too_many: Vec<u32> = (0..257).collect();
+    let refused = server.call_tool("clear_breakpoints", json!({ "ids": too_many }), STEP);
+    assert!(is_tool_error(&refused), "{refused}");
+    let text = text_of(&refused["result"]);
+    assert!(
+        text.contains("257") && text.contains("256"),
+        "the refusal names what was asked for and what is allowed, got:\n{text}"
+    );
+    // **The category is what says this is an argument fault rather than the missing-session one**,
+    // and it is the assertion to make: the message names the session's inventory in pointing at
+    // `all: true`, so searching its text for the word would fail on prose that is doing its job.
+    // The `assert_ne` below is the other half — at the cap, the category is *not* this one.
+    assert_eq!(
+        refused["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+        "{refused}"
+    );
+
+    // The boundary itself is not refused, so the message above cannot be read as "256 is too
+    // many": with no session open this takes the session refusal instead, which is the next thing
+    // in its way rather than an argument fault.
+    let at_the_cap = server.call_tool(
+        "clear_breakpoints",
+        json!({ "ids": (0..256).collect::<Vec<u32>>() }),
+        STEP,
+    );
+    assert_ne!(
+        at_the_cap["result"]["structuredContent"]["error"]["category"],
+        json!("invalid_argument"),
+        "at the cap the list is accepted, and what stops the call is the missing session rather \
+         than the argument: {at_the_cap}"
     );
 }
 
