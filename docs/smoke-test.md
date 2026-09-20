@@ -1518,6 +1518,43 @@ than measuring a patch that never landed.
   same full `nt` symbols the pool tier does. Either pool answer is correct (a chunk, or an address
   the walk did not cover) and they are different facts, so both are accepted by name.
 
+## Checking a live-kernel detach from outside the debugger
+
+`end_session` on a live kernel answers `released: true` and `target_left_running: true` from the
+debugger's side of the wire, and on 2026-09-20 a hypervisor target answered exactly that while the
+guest was frozen. The teardown is shared -- dbgscope's `end_session` branches on `is_live_kernel()`
+rather than on which kernel, so an ordinary NT target takes the same `clear_all_breakpoints` then
+`qd` path -- and that path had never been measured on NT
+([dbgscope #173](https://github.com/glslang/dbgscope/issues/173)).
+
+[`examples/kernel_detach_regression.ps1`](../examples/kernel_detach_regression.ps1) measures it.
+It reads the guest's boot identity and uptime over WinRM before the test and twice after, and
+fails if the boot moved or the uptime did not. The connection string is resolved from the named
+profile inside the script and passed to the test through the environment, so the debug key is
+never an argument.
+
+**Its positive control is the half that makes the postcondition mean anything.** A KDNET break-in
+halts the whole machine, so the guest must go *unreachable* while the test holds it: without
+checking that, a run where the attach never landed passes trivially -- up before, up after, never
+debugged. A background job knocks on the guest's WinRM port every 250 ms with a one-second
+timeout, and the run fails if no probe was ever refused. That guard earned itself immediately: the
+first version collected its samples into a list and returned them when its loop ended, which for a
+job that is always stopped early is nothing at all, and the script refused to call the run a pass.
+
+**Measured 2026-09-20** on a disposable four-processor NT guest, build 26100, against this
+branch's debug build with DbgEng `10.0.29617.1000` -- the same engine the hypervisor
+demonstrations used. Three consecutive attach/detach cycles, each `attach_kernel` landing (the
+module inventory going 1 to 158 across a `modules { "refresh": true }`) and each `end_session`
+reporting a completed quit-and-detach. The first cycle held the target for 32 seconds and the
+probe recorded **26 silent samples of 30**; the two short cycles recorded one each. After every
+one of them the guest answered WinRM twice with the uptime advancing and the boot identity
+unchanged, and it was still up on that same boot afterwards.
+
+So `qd` leaves an NT kernel executing on this build, and on four processors -- which is where the
+hypervisor's own four-processor behaviour differs (`FOLLOWUPS.md` item 93). One guest, one engine
+version, one transport: it does not generalise to serial or 1394, to another DbgEng, or to a
+target that had breakpoints armed when the teardown ran.
+
 ## The live-hypervisor tier
 
 Three variables, and only the first is a gate. `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE` names a
