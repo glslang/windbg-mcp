@@ -214,29 +214,34 @@ def codes(cases: list) -> set:
 
 
 def placed(cases: list) -> dict:
-    """code -> [(destination, record)], sorted, for the cases that carry an address.
+    """code -> [(destination or None, record)], sorted, addressless records last.
 
-    The **record** travels with its address on purpose. Classifying a surplus by a `(code, rva)`
-    key instead means several records collapse into one question, and the answer is then the most
-    permissive of them: a switch slot and a missed comparison converging on one handler would both
-    read as switch-derived, and the comparison miss disappears. Raised on review of #354, against
-    the fix for the round before it.
+    **Every record is here, whether or not it carries an address.** `case_rva` is optional on both
+    sides -- `structured::IoctlCase` documents it absent for a landing site in no module the
+    session knows -- and a map that dropped those would leave them out of the reconciliation as
+    well, which is where a record one side has and the other does not is caught. They cannot pair
+    on an address, so they pair on the code, positionally, against the other side's addressless
+    records for that code.
+
+    The **record** travels with its address on purpose. Classifying by a `(code, rva)` key instead
+    means several records collapse into one question, and the answer is then the most permissive of
+    them: a switch slot and a missed comparison converging on one handler would both read as
+    switch-derived, and the comparison miss disappears.
 
     Both implementations answer per record, and a code legitimately has more than one: `mountmgr`
-    routes each of its codes from a host context and a silo one. A case with no `case_rva` is
-    absent here **and present in [`codes`]**, which is the whole of the split: it can be compared
-    as a code and not as a route.
+    routes each of its codes from a host context and a silo one.
     """
     by_code = collections.defaultdict(list)
     for case in cases:
-        where = rva(case.get("case_rva"))
-        if where is not None:
-            by_code[norm(case["code"])].append((where, case))
-    return {code: sorted(rows, key=lambda row: row[0]) for code, rows in by_code.items()}
+        by_code[norm(case["code"])].append((rva(case.get("case_rva")), case))
+    return {
+        code: sorted(rows, key=lambda row: (row[0] is None, row[0] or 0))
+        for code, rows in by_code.items()
+    }
 
 
 def pair_routes(ours: dict, theirs: dict, window: int, slotted=lambda case: False):
-    """Pair each code's destinations across the two conventions, within a stated window.
+    """Pair the two sides' records per code, and hand back what did not pair.
 
     The companion names *"the first source-mapped statement"* of a case and this walk names the
     block the branch enters, so on A64 -- where a case block opens by materialising an address --
@@ -256,32 +261,50 @@ def pair_routes(ours: dict, theirs: dict, window: int, slotted=lambda case: Fals
     record is the one left over, and the lane calls it a difference rather than hiding it behind
     its switch-derived twin.
 
-    `paired` is the (this side, companion) record pairs it matched -- the only place a per-case
-    field of one can be compared against the other's. `extra` is the companion's unpaired
-    **records**; `lost` is this side's unpaired (code, address).
+    **Records with no address pair with each other**, by code and in order, once the addressed
+    ones are done. They cannot pair on a destination, and refusing to pair them at all would make
+    every such case a difference on both sides at once; leaving them out of the pairing entirely
+    -- which is what two review rounds of this function did -- loses the case where one side has
+    one and the other does not.
+
+    Returns the matched pairs, the displacement spread, and the **records** each side has left.
     """
-    paired, spread, extra, lost = [], collections.Counter(), [], []
-    for code in sorted(set(ours) & set(theirs)):
-        mine = ours[code]
-        yours = sorted(theirs[code], key=lambda row: (row[0], not slotted(row[1])))
+    paired, spread = [], collections.Counter()
+    unpaired_ours, unpaired_theirs = [], []
+    for code in sorted(set(ours) | set(theirs)):
+        mine, yours = list(ours.get(code, [])), list(theirs.get(code, []))
+        yours = sorted(yours, key=lambda row: (row[0] is None, not slotted(row[1]), row[0] or 0))
         taken = set()
-        for one, mine_case in mine:
+        for where, mine_case in mine:
+            if where is None:
+                continue
             hit = next(
                 (
                     index
                     for index, (other, _) in enumerate(yours)
-                    if index not in taken and 0 <= other - one <= window
+                    if index not in taken
+                    and other is not None
+                    and 0 <= other - where <= window
                 ),
                 None,
             )
             if hit is None:
-                lost.append((code, one))
+                unpaired_ours.append(mine_case)
                 continue
             taken.add(hit)
-            spread[yours[hit][0] - one] += 1
+            spread[yours[hit][0] - where] += 1
             paired.append((mine_case, yours[hit][1]))
-        extra += [case for index, (_, case) in enumerate(yours) if index not in taken]
-    return paired, spread, extra, lost
+        # Then the addressless ones, against each other, in order.
+        spare = [index for index, (other, _) in enumerate(yours) if other is None]
+        for _, mine_case in [row for row in mine if row[0] is None]:
+            if spare:
+                index = spare.pop(0)
+                taken.add(index)
+                paired.append((mine_case, yours[index][1]))
+            else:
+                unpaired_ours.append(mine_case)
+        unpaired_theirs += [case for index, (_, case) in enumerate(yours) if index not in taken]
+    return paired, spread, unpaired_theirs, unpaired_ours
 
 
 def identity_of(result: dict, module: str):
@@ -389,6 +412,27 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
             print("  the target is actually running is what makes the rest of this lane run.")
             return 2
 
+    # **The companion is asked about the same dispatch routine this side was.** `ioctl_map`
+    # answers for one `--dispatch`; `analysis.ioctl_map` takes the union of majors 14 and 15, so a
+    # driver registering a different callback for *internal* device control would have every code
+    # from that second routine read as one only the companion found. Both sides name the root the
+    # same way, as the registered function's RVA, so the narrowing is a comparison rather than a
+    # guess -- and it is applied here rather than to the capture, because what the capture holds
+    # is not this lane's to trim. Raised on review of #354.
+    our_dispatch = rva((ours.get("dispatch") or {}).get("rva"))
+    if agreed and our_dispatch is not None:
+        elsewhere = [
+            case
+            for case in their_cases
+            if case.get("dispatch_rva") is not None
+            and rva(case["dispatch_rva"]) != our_dispatch
+        ]
+        if elsewhere:
+            roots = sorted({case["dispatch_rva"] for case in elsewhere})
+            print(f"  companion records from another dispatch: {len(elsewhere)} at {roots}"
+                  f" -- set aside; this side answered for {(ours.get('dispatch') or {}).get('rva')}")
+            their_cases = [case for case in their_cases if case not in elsewhere]
+
     our_codes, their_codes = codes(our_cases), codes(their_cases)
     our_routes, their_routes = placed(our_cases), placed(their_cases)
     unplaced = [
@@ -481,14 +525,15 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
               f"not a disagreement")
     elif spread:
         print(f"  displacements           : {dict(sorted(spread.items()))}")
-    unpaired = {norm(case["code"]) for case in extra} | {code for code, _ in lost}
+    unpaired = {norm(case["code"]) for case in extra + lost}
     routed = sorted(code for code in shared if code not in unpaired)
     print(f"  codes routed the same   : {len(routed)} of {len(shared)}")
-    # **`unrouted`, not `their_routes`.** A companion-only record with no `case_rva` is absent
-    # from the route map, and the code level defers its verdict to this reconciliation -- so
-    # taking the placed ones only would drop it from both, and a lane with nothing to subtract it
-    # from would exit 0 over a code one side alone has. Raised on review of #354.
-    surplus = extra + unrouted
+    # **The surplus is every companion record that did not pair, and nothing is assembled.**
+    # Four review rounds of #354 were this set being built from parts -- placed records only, then
+    # placed plus the companion-only codes -- and each round found a record that fell between the
+    # parts: one with no address, then one with no address whose code was shared. `pair_routes`
+    # pairs every record now, so what is left over is the whole of the difference by construction.
+    surplus = extra
     surplus_slotted = [case for case in surplus if from_a_table(case, sites, agreed)]
     grouped = collections.Counter(
         rva(case.get("case_rva")) for case in surplus if case.get("case_rva")
@@ -499,8 +544,9 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     for where, count in sorted(grouped.items(), key=lambda kv: -kv[1])[:12]:
         print(f"    -> {where:#x}  {count} record(s)")
     print(f"  `ioctl_map`-only records: {len(lost)}")
-    for code, where in lost[:12]:
-        print(f"    {code} at {where:#x}")
+    for case in lost[:12]:
+        where = case.get("case_rva")
+        print(f"    {norm(case['code'])} at {where or 'no address'}")
 
     print()
     if len(surplus) == len(surplus_slotted) == dropped and dropped:
@@ -568,11 +614,11 @@ def selftest() -> int:
     build = {"timestamp": 1, "size": 2}
     images = [{"module": "d", "identity": build}]
 
-    def tool(cases, tables=()):
-        return {
-            "server": {"name": "x", "version": "0"},
-            "result": {"cases": list(cases), "tables": list(tables), "images": images},
-        }
+    def tool(cases, tables=(), dispatch=None):
+        result = {"cases": list(cases), "tables": list(tables), "images": images}
+        if dispatch is not None:
+            result["dispatch"] = {"rva": hex(dispatch)}
+        return {"server": {"name": "x", "version": "0"}, "result": result}
 
     def companion(cases, identity=build):
         return {"result": {"cases": list(cases)}, "identity": identity, "analysis_version": "t"}
@@ -663,6 +709,22 @@ def selftest() -> int:
          tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
          companion([case("0x1", 0x100), case("0x2", 0x900, switch),
                     case("0x3", None, switch)]), 1),
+        # Round five: an extra addressless record for a code **both** sides have. It was in
+        # neither half of the assembled surplus -- `placed()` dropped it and its code was not
+        # companion-only -- so the lane printed the count and exited 0.
+        ("an extra addressless record for a shared code is a finding",
+         tool([case("0x1", 0x100)]),
+         companion([case("0x1", 0x100), case("0x1", None, compare_at)]), 1),
+        ("and the same record on this side is one too",
+         tool([case("0x1", 0x100), case("0x1", None)]),
+         companion([case("0x1", 0x100)]), 1),
+        # And the companion answering for a *second* dispatch routine: `analysis.ioctl_map` takes
+        # majors 14 and 15, so a driver with a separate internal-device-control handler hands back
+        # the union while this side answered for one routine.
+        ("codes from another dispatch routine are set aside, not reported",
+         tool([dict(case("0x1", 0x100), dispatch_rva="0x10")], dispatch=0x10),
+         companion([dict(case("0x1", 0x100), dispatch_rva="0x10"),
+                    dict(case("0x2", 0x200), dispatch_rva="0x20")]), 0),
         ("a build mismatch refuses to compare",
          tool([case("0x1", 0x100)]),
          companion([case("0x1", 0x100)], {"timestamp": 9, "size": 2}), 2),
