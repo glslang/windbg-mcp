@@ -2536,15 +2536,21 @@ pub struct Reachability {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tables_bounded: bool,
     /// How many indirect jumps the walk **ended at** without following — a `switch` whose table it
-    /// could not read, could not ask about, or never asked about.
+    /// could not read or had nothing to read it with, and equally a tail jump through a register.
     ///
     /// A fourth independent reason, and the one that used to be invisible: the walk computed it and
     /// threw it away, so a `not_reachable` that stopped at a dispatch switch reported
     /// `bound_hit: false`, `stopped` absent and `blind_stops: 0` — the shape of a graph that was
-    /// fully explored. Each of these is a case block, and everything past it, missing from the
-    /// graph the verdict is about. The remedy is the scoping one: pass a specific handler address
-    /// as `from`. On a live kernel, run a module refresh first — a table's entries are checked
-    /// against the image's executable ranges, and a fresh attach has no image to check against.
+    /// fully explored. Whatever each of these reaches — a switch's case blocks, a callee — is
+    /// missing from the graph the verdict is about. The remedy is the scoping one: pass a specific
+    /// handler address as `from`. On a live kernel, run a module refresh first — a table's entries
+    /// are checked against the image's executable ranges, and a fresh attach has no image to check
+    /// against.
+    ///
+    /// **Not all of them are switches**, which the ARM64 kernel dump is what says: ordinary `nt`
+    /// routines end at indirect jumps that are tail calls through a register, 11 of them on
+    /// `nt!ObpLookupObjectName` inside 24 explored functions. The dispatch switch is the case this
+    /// was filed for and not the only thing it counts.
     ///
     /// Distinct from [`Self::tables_bounded`], which is the resolver stopping *short* of a table;
     /// this is one it did not answer for. And deliberately **not** distinct between "answered

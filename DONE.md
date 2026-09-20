@@ -3938,7 +3938,7 @@ call graph was fully explored"** over a graph missing that switch's every case.
 **What landed is the entry's proposal, plus one thing it did not see.** `FnWalk::met_indirect` is
 now `FnWalk::unresolved_jumps`, the **sites** rather than a flag; `Report` accumulates them into a
 `HashSet<u64>`; `format_report` counts them, withholds the "fully explored" claim as `blind`
-already does, and prints a `Switch not followed` paragraph naming both remedies; and
+already does, and prints a `Jumps not followed` paragraph naming both remedies; and
 `structured::Reachability::unresolved_jumps` carries the count, skipped when zero beside
 `tables_bounded`. The two other silent arms the entry named — an instruction set whose operands go
 unread, and a listing in no loaded module — need no code of their own: both leave the resolver
@@ -3959,6 +3959,15 @@ in a graph missing a switch's edges is the case #351's review had already ruled 
 `tables_bounded` — the path is real and a *shorter* one may have been omitted with the switch — so
 one paragraph is emitted for both verdicts, written to say the thing that is true either way. With
 the probe excluded there is no ordinary answer it fires on.
+
+**And "switch" was the wrong word for the rendering, which only a real target said.** Driven
+against the ARM64 kernel dump on the build under test (`0.18.0+ga8e42816`), ordinary `nt` routines
+come back with counts that are mostly **not** switches — 11 on `nt!ObpLookupObjectName` and on
+`nt!KiDispatchException` inside 24 explored functions, 3 on `nt!NtQuerySystemInformation`, 2 on
+`nt!NtSetSystemInformation` — because a tail call through a register is an indirect jump too. The
+paragraph says *whatever they reach: a switch's case blocks, or a callee a tail jump goes to*; the
+first draft called all of them switches and would have described most of them wrongly. The
+dispatch switch is the case the item was filed for and is not the only thing the count holds.
 
 **Counted per site, which is what the set is for.** `visited` is keyed by the *start* address, so a
 routine entered at two boundaries is walked twice and the two walks overlap; summing what each
