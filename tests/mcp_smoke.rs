@@ -6229,21 +6229,34 @@ fn breakpoints_are_listed_and_cleared_through_their_own_tools() {
         "the listing reads the same engine object the set reported:\n{listed}"
     );
 
+    // **Named twice, and it is one breakpoint either way.** `ids` names breakpoints, not
+    // operations, so a repeat is not a second removal to attempt — and attempting it produced a
+    // result that contradicted itself: the first take succeeded, the second was refused because
+    // the id no longer named anything, and the same id came back in `removed` *and* in
+    // `not_removed`, with the text saying it was still set while `remaining` showed it gone.
+    // Reported by Codex on #360.
+    //
+    // **`not_removed` is the assertion that catches it, not `removed`** — worth saying because the
+    // obvious one does not: the second attempt fails, so `removed` reads `[id]` whether the ids
+    // are deduplicated or not, and a test resting on it would pass with the fix backed out.
+    // Checked by backing it out, which leaves `worker::tests::a_removal_attempts_each_id_once_\
+    // in_the_order_it_was_given` green and turns this red.
     let cleared = server.tool_data(
         "clear_breakpoints",
-        json!({ "session_id": &session, "ids": [id.clone()] }),
+        json!({ "session_id": &session, "ids": [id.clone(), id.clone()] }),
         TARGET_STEP,
-    );
-    assert_eq!(
-        cleared["removed"].as_array(),
-        Some(&vec![id.clone()]),
-        "the removal names what it took:\n{cleared}"
     );
     assert!(
         cleared["not_removed"]
             .as_array()
             .is_none_or(|left| left.is_empty()),
-        "nothing should have been left armed:\n{cleared}"
+        "a repeated id is one breakpoint, attempted once — nothing should be reported as left \
+         armed:\n{cleared}"
+    );
+    assert_eq!(
+        cleared["removed"].as_array(),
+        Some(&vec![id.clone()]),
+        "and it is taken once:\n{cleared}"
     );
     // `remaining` is nullable, and `null` here would mean the listing failed rather than that the
     // session is clean. Read as an array, so the two cannot be confused by an assertion either.
