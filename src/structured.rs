@@ -2469,10 +2469,11 @@ pub struct RecipeSegment {
 /// What a reachability walk found, as values.
 ///
 /// The text rendering is unchanged and travels beside this. Two things about reading it. The
-/// verdict is asymmetric — see [`ReachabilityVerdict`] — and there are **three** independent
+/// verdict is asymmetric — see [`ReachabilityVerdict`] — and there are **four** independent
 /// reasons a `not_reachable` may be incomplete, each with its own remedy: a work bound
-/// ([`Self::bound_hit`]), a time or interrupt stop ([`Self::stopped`]), and instructions the walk
-/// could not see past ([`Self::blind_stops`]).
+/// ([`Self::bound_hit`], whose remedy is [`Self::tables_bounded`]'s when that is set too), a time
+/// or interrupt stop ([`Self::stopped`]), instructions the walk could not see past
+/// ([`Self::blind_stops`]), and switches it could not follow ([`Self::unresolved_jumps`]).
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Reachability {
     pub verdict: ReachabilityVerdict,
@@ -2534,6 +2535,33 @@ pub struct Reachability {
     /// [`CodeLocation::attribution_failed`] and the half that makes the omission legible was not.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub tables_bounded: bool,
+    /// How many indirect jumps the walk **ended at** without following — a `switch` whose table it
+    /// could not read, could not ask about, or never asked about.
+    ///
+    /// A fourth independent reason, and the one that used to be invisible: the walk computed it and
+    /// threw it away, so a `not_reachable` that stopped at a dispatch switch reported
+    /// `bound_hit: false`, `stopped` absent and `blind_stops: 0` — the shape of a graph that was
+    /// fully explored. Each of these is a case block, and everything past it, missing from the
+    /// graph the verdict is about. The remedy is the scoping one: pass a specific handler address
+    /// as `from`. On a live kernel, run a module refresh first — a table's entries are checked
+    /// against the image's executable ranges, and a fresh attach has no image to check against.
+    ///
+    /// Distinct from [`Self::tables_bounded`], which is the resolver stopping *short* of a table;
+    /// this is one it did not answer for. And deliberately **not** distinct between "answered
+    /// nothing" and "could not be asked" — an instruction set whose operands this build does not
+    /// read resolves nothing, and neither does a listing in no loaded module — because the graph is
+    /// short of the same edges either way and no caller can act on the difference.
+    ///
+    /// On a `reachable` verdict it says a *shorter* path may have been missed, the verdict itself
+    /// being sound. It is **zero** for a path proved without any tables at all, which is the
+    /// ordinary success inside a dispatch routine: those jumps were never offered to the resolver,
+    /// so counting them would report every such answer as one that met a switch it could not
+    /// follow.
+    ///
+    /// Absent rather than `0` on the ordinary answer, with `default` beside the skip for the reason
+    /// [`Self::tables_bounded`] gives.
+    #[serde(default, skip_serializing_if = "usize_is_zero")]
+    pub unresolved_jumps: usize,
     /// Why the walk stopped early, when it did. Outranks [`Self::bound_hit`] in what it means:
     /// a walk that ran out of time did not explore the graph it was *bounded* to either.
     #[serde(skip_serializing_if = "Option::is_none")]

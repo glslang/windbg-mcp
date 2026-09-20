@@ -66,10 +66,22 @@
   walk where it is; the report counts those, withholds the claim that the reachable call graph was
   fully explored, and names the remedy. Such an instruction is a **barrier** and is never stepped
   over — skipping it would join the instruction before it to whatever follows and invent an edge,
-  which is the one thing a sound `REACHABLE` verdict must never rest on.
-- **One kind of unseen edge is not counted, and on ARM64 it is reachable in principle.** The count
-  above is of instructions that stopped the walk. A *branch class the decoder does not know* does
-  not stop it: it reads as an ordinary instruction and the walk continues along the fall-through,
+  which is the one thing a sound `REACHABLE` verdict must never rest on. **A switch it could not
+  follow is counted the same way** (`FOLLOWUPS.md` item 89): an indirect jump whose table did not
+  resolve ends that path where it is, and each one is a case block — and everything past it —
+  missing from the graph the verdict is about, so the report counts the jumps, withholds the same
+  claim, and gives the two remedies the resolver's own cap gives. The count is of **jumps** rather
+  than of functions, and it is the walk's rather than the probe's: a switch the resolver answered
+  is not among them, and neither is one on a `REACHABLE` proved with no tables at all — those were
+  never offered to a resolver, which is the ordinary success inside a dispatch routine. It is
+  deliberately one count for three causes, because none of them is a difference a caller can act
+  on: a table read and not recovered, an instruction set whose operands this build does not decode
+  (so the resolver answers nothing), and a listing in no loaded module (so there is nothing to
+  bound a table's reads to) all leave the graph short of the same edges.
+- **One kind of unseen edge is not counted, and on ARM64 it is reachable in principle.** The counts
+  above are of instructions that stopped the walk and of jumps it ended at. A *branch class the
+  decoder does not know* does not stop it: it reads as an ordinary instruction and the walk
+  continues along the fall-through,
   which is a real edge, having silently lost the taken one. A64's six branch classes are the Armv8
   baseline, and Armv9.6's FEAT_CMPBR adds a seventh that
   [dbgscope](https://github.com/glslang/dbgscope) does not decode — so on a target using it the

@@ -111,6 +111,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 82](#82-windbg-mcp-a64-puts-constants-in-a-literal-pool-and-the-walk-cannot-read-one--done-2026-09-19) — [windbg-mcp] A64 puts constants in a literal pool, and the walk cannot read one — done (2026-09-19)
 - [Item 83](#83-windbg-mcp-reachable_from_dispatch-does-not-follow-the-jump-tables-ioctl_map-now-reads--done-2026-09-19) — [windbg-mcp] `reachable_from_dispatch` does not follow the jump tables `ioctl_map` now reads — done (2026-09-19)
 - [Item 90](#90-windbg-mcp-the-resolver-reads-a-whole-function-so-scoping-from-does-not-narrow-it--done-2026-09-19) — [windbg-mcp] The resolver reads a whole function, so scoping `from` does not narrow it — done (2026-09-19)
+- [Item 89](#89-windbg-mcp-a-switch-that-would-not-resolve-is-the-one-incompleteness-the-report-does-not-count--done-2026-09-20) — [windbg-mcp] A switch that would not resolve is the one incompleteness the report does not count — done (2026-09-20)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3918,3 +3919,56 @@ against.
 **Where it landed:** `ioctl::jump_targets_within`'s early return and its `Tables` doc comment
 (`src/ioctl.rs`), with `a_resolver_cap_keeps_the_targets_it_recovered` as the test, and the third
 reachability bullet of `docs/limitations.md`.
+
+## 89. [windbg-mcp] A switch that would not resolve is the one incompleteness the report does not count — **done** (2026-09-20)
+
+**Repo:** `windbg-mcp`.
+
+`reachable_from_dispatch` named four ways a `NOT REACHABLE` could be short of the graph, each with
+a remedy the others do not reach: `halted` (the clock or an interrupt), `bound_hit` (raise
+`max_functions`/`max_depth`), `blind_stops` (bytes that would not read — get the image), and since
+item 83 `tables_bounded` (the resolver's own caps, which those arguments do not reach). A fifth was
+computed and thrown away. `driver::walk_function` set `FnWalk::met_indirect` where a
+`Flow::Jmp(None)` had no targets and `reachability` read it **once**, to decide whether resolving
+was worth the engine round trips; the final walk's copy was discarded. So a walk that ended at a
+switch the resolver ran on and could not answer carried no signal at all — `blind` counts only
+`Flow::Unreadable` and `Flow::Unknown` — and the report printed **"Bound hit: no — the reachable
+call graph was fully explored"** over a graph missing that switch's every case.
+
+**What landed is the entry's proposal, plus one thing it did not see.** `FnWalk::met_indirect` is
+now `FnWalk::unresolved_jumps`, the **sites** rather than a flag; `Report` accumulates them into a
+`HashSet<u64>`; `format_report` counts them, withholds the "fully explored" claim as `blind`
+already does, and prints a `Switch not followed` paragraph naming both remedies; and
+`structured::Reachability::unresolved_jumps` carries the count, skipped when zero beside
+`tables_bounded`. The two other silent arms the entry named — an instruction set whose operands go
+unread, and a listing in no loaded module — need no code of their own: both leave the resolver
+answering an empty `JumpTables`, so the walk ends at the jump and the site lands in the same count.
+
+**What the entry did not see is the probe**, and it is the one place the count would have been
+worse than the silence. `reachability` walks each function once with no tables to decide whether
+resolving is worth a round trip, and a walk that reaches the target on that pass returns straight
+away — so its unresolved list is *every* indirect jump on the way, none of which was ever offered
+to a resolver. Merged, every `REACHABLE` found inside a dispatch routine would have reported its
+own switch as one the walk could not follow: the ordinary success on the ordinary target, carrying
+the one signal that says a graph has holes in it. That early return therefore contributes nothing,
+and the field's meaning is "what the tables did not answer" rather than "what the walk met".
+
+**And the rendering is outside the verdict branches, unlike `blind`'s.** The entry asked only for
+the `NOT REACHABLE` sentence, that being where "fully explored" is printed. But a `REACHABLE` found
+in a graph missing a switch's edges is the case #351's review had already ruled on for
+`tables_bounded` — the path is real and a *shorter* one may have been omitted with the switch — so
+one paragraph is emitted for both verdicts, written to say the thing that is true either way. With
+the probe excluded there is no ordinary answer it fires on.
+
+**Counted per site, which is what the set is for.** `visited` is keyed by the *start* address, so a
+routine entered at two boundaries is walked twice and the two walks overlap; summing what each
+ended at reports one switch as two. `one_switch_reached_from_two_starts_is_counted_once` is that
+assertion, and `a_switch_the_walk_could_not_follow_is_counted_and_costs_the_clean_sweep` pins the
+other two properties of the count — two jumps in one function are two, and a jump the tables
+answered is not among them, which is the mutation this fix could have been.
+
+**Where it landed:** `driver::walk_function`'s `Flow::Jmp` arm and `FnWalk::unresolved_jumps`,
+`driver::reachability`'s probe guard, early return and merge, `driver::format_report`'s new
+paragraph and its `Bound hit: no` arm, `structured::Reachability::unresolved_jumps`, and the third
+and fourth reachability bullets of `docs/limitations.md` with the `reachable_from_dispatch` row of
+`docs/structured-results.md`.
