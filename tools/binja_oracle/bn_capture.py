@@ -249,6 +249,7 @@ def recover_roots(view, config, report, save):
         return Budget(seconds=seconds)
 
     attempts = []
+    wanted = int(config["dispatch_rva"], 16) if config.get("dispatch_rva") else None
     entry = view.get_function_at(view.entry_point)
     if entry is None:
         raise RuntimeError("no function at the entry point")
@@ -286,7 +287,12 @@ def recover_roots(view, config, report, save):
         report["entry_attempts"] = attempts
         report["registrations"] = registered["roots"]
         save()
-        if roots:
+        # **Stopping at any root is not stopping at the right one.** With `--dispatch-rva` given,
+        # an early hop that recovers some *other* device-control registration -- major 15 in a
+        # wrapper, say, while the requested handler is registered deeper -- would end the walk and
+        # the cross-check would then reject the capture, with the remaining hops and the
+        # address-referrer fallback never tried. Raised on review of #354.
+        if roots and (wanted is None or any(int(rva, 16) == wanted for rva in roots)):
             report["dispatch_source"] = attempts[-1]["typed"]
             return taken, registered, roots
         frontier = [callee for f in frontier for callee in f.callees]
@@ -330,7 +336,7 @@ def recover_roots(view, config, report, save):
             report["entry_attempts"] = attempts
             report["registrations"] = registered["roots"]
             save()
-            if roots:
+            if roots and (wanted is None or any(int(rva, 16) == wanted for rva in roots)):
                 report["dispatch_source"] = attempts[-1]["typed"]
                 return taken, registered, roots
 
@@ -363,7 +369,7 @@ def recover_roots(view, config, report, save):
             report["entry_attempts"] = attempts
             report["registrations"] = registered["roots"]
             save()
-            if roots:
+            if roots and (wanted is None or any(int(rva, 16) == wanted for rva in roots)):
                 report["dispatch_source"] = attempts[-1]["typed"]
                 return taken, registered, roots
     # Nothing worked: record what the routines this typed actually look like, because the next
