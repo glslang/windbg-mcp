@@ -288,17 +288,27 @@ uptime after each of three cycles. It stops on failure and performs no reset or 
 The original default-path runs used one cycle, followed by a two-cycle invocation that stopped
 after its first failed health check. The later opt-in run passed all three requested cycles.
 
-The broader regression test is also opt-in and ignored by normal `cargo test`:
+The broader regression test is also opt-in, and the same wrapper runs it with the health checks
+around it:
 
 ```powershell
-$env:WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE = 'lab-hypervisor'
-cargo test --test mcp_smoke -- --ignored --nocapture --test-threads=1 a_live_hypervisor_session
+.\examples\hypervisor_detach_regression.ps1 -Profile lab-hypervisor `
+    -ComputerName '<guest-address>' -ExpectedComputerName '<guest-computer-name>' `
+    -ExperimentalBreakOnConnect -Session
 ```
 
 It requires a separately configured profile and disposable target. It checks the hypervisor
 summary, modules, registers, memory reads, typed disassembly, one single-step, breakpoint
-creation/removal, and explicit detach. The breakpoint check tests management, **not a breakpoint
-hit**. Cleanup runs even when a test-body assertion fails. It does not establish Secure Kernel
-access, boot tracing, symbol availability, or guest responsiveness; verify the latter out of band.
+creation/removal through the typed `breakpoints`/`clear_breakpoints` tools, and explicit detach.
+By default the breakpoint check tests management, **not a breakpoint hit**. Cleanup runs even when
+a test-body assertion fails. It does not establish Secure Kernel access, boot tracing, symbol
+availability, or guest responsiveness; verify the latter out of band.
+
+Adding `-BreakpointHit` also runs to a return address read off the stopped processor's stack and
+asserts execution reached it. That is the sequence whose four-processor run left the guest frozen
+(`FOLLOWUPS.md` item 93), so the wrapper refuses it unless the guest reports exactly one logical
+processor, and the refusal is checked before every cycle rather than once. `docs/smoke-test.md`
+has the three environment variables, for a run made without the wrapper — which is a run with no
+independent postcondition, and the 2026-09-20 measurements are what says why that matters.
 Do not run the NT live-kernel tier against this profile: that tier deliberately expects NT and
 Windows driver/pool structures.

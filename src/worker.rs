@@ -1862,6 +1862,8 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 watchdog_budget_ms(Duration::from_millis(u64::from(patience_ms)), spent()),
             )
         }
+        EngineOp::Breakpoints => breakpoints(e),
+        EngineOp::ClearBreakpoints { ids } => clear_breakpoints(e, ids),
         EngineOp::IrpStack { irp, patience_ms } => {
             // The caller's own expression wins outright: they may have an IRP from a queue, a
             // completion routine or a crash dump, none of which is the one in a register.
@@ -4608,10 +4610,7 @@ fn set_breakpoint(
     let done = e.set_breakpoint_bounded(&spec, budget_ms).map_err(failed)?;
     // Best-effort and deliberately not a `?`: the breakpoint is set, and a session whose list
     // cannot be read must not have that reported as the set having failed.
-    let breakpoints = e
-        .breakpoints()
-        .map(|held| held.iter().map(structured::BreakpointInfo::from).collect())
-        .unwrap_or_default();
+    let breakpoints = held_breakpoints(e).unwrap_or_default();
     let set = structured::BreakpointSet {
         breakpoint: structured::BreakpointInfo::from(&done.breakpoint),
         replaced: done.replaced,
@@ -4735,12 +4734,24 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
         "\nThe session now holds {} breakpoint(s) (this call's marked *):\n",
         set.breakpoints.len(),
     ));
-    for breakpoint in &set.breakpoints {
+    out.push_str(&breakpoint_rows(&set.breakpoints, Some(set.breakpoint.id)));
+    out
+}
+
+/// The table of breakpoints, one row each, with `marked` starred.
+///
+/// Shared by every tool that prints a breakpoint listing rather than copied into each, because a
+/// caller reading `breakpoints` after a `set_breakpoint` is reading the same inventory and a
+/// second renderer is a second set of columns for it to be surprised by. `None` stars nothing,
+/// which is the listing tools' case: no row is *this call's*.
+fn breakpoint_rows(breakpoints: &[structured::BreakpointInfo], marked: Option<u32>) -> String {
+    let mut out = String::new();
+    for breakpoint in breakpoints {
         // Trimmed at the end, because the columns are padded for alignment and the last one on a
         // row is usually empty — trailing spaces on every line of a tool result are noise.
         let row = format!(
             "{} {:<3} {:<18} {:<9}{}{}",
-            if breakpoint.id == set.breakpoint.id {
+            if marked == Some(breakpoint.id) {
                 "*"
             } else {
                 " "
@@ -4769,6 +4780,145 @@ fn render_breakpoints(set: &structured::BreakpointSet) -> String {
         out.push('\n');
     }
     out
+}
+
+/// The engine's breakpoints as this server's records, or why they could not be read.
+///
+/// One conversion for the three callers rather than three, and it returns the failure rather than
+/// swallowing it: what each caller does about an unreadable list differs — [`set_breakpoint`]
+/// carries on, the two tools below do not — and that is a decision each makes, not one this can
+/// make for them.
+fn held_breakpoints(e: &DebugEngine) -> Result<Vec<structured::BreakpointInfo>, Failed> {
+    Ok(e.breakpoints()
+        .map_err(failed)?
+        .iter()
+        .map(structured::BreakpointInfo::from)
+        .collect())
+}
+
+/// Every breakpoint the session holds, as values — the read half of `bl`.
+///
+/// **`?` rather than the best-effort read [`set_breakpoint`] takes**, and the asymmetry is the
+/// whole design. There the listing accompanies a mutation that has already happened, so a failed
+/// inspection must not be reported as a failed set; here it *is* the answer, and an empty list
+/// standing in for an engine that could not be asked is a caller told the target is clean.
+fn breakpoints(e: &DebugEngine) -> Result<Output, Failed> {
+    let breakpoints = held_breakpoints(e)?;
+    let text = if breakpoints.is_empty() {
+        // Said in a sentence rather than rendered as an empty table, because this answer is acted
+        // on: it is what a caller checks before resuming or detaching a live target.
+        "The session holds no breakpoints.\n".to_string()
+    } else {
+        format!(
+            "The session holds {} breakpoint(s):\n{}",
+            breakpoints.len(),
+            breakpoint_rows(&breakpoints, None),
+        )
+    };
+    Ok(Output::typed(
+        text,
+        structured::BreakpointList { breakpoints },
+    ))
+}
+
+/// Removes the breakpoints `ids` names, or every one the session holds — `bc`.
+///
+/// **A removal is asked of the engine one id at a time and reported the same way.** dbgscope's
+/// `remove_breakpoint` fails per breakpoint — an id that names nothing, a link that dropped
+/// partway — so a call naming five can leave three gone and two armed, and the only honest result
+/// is the pair of lists. Rounding that to a bool would report a target with an `int 3` still
+/// patched into it as one that had been cleaned.
+///
+/// **Empty `ids` and `None` are not the same request**, which is why the tool refuses to let an
+/// omitted field mean "all": `None` here has already been chosen by a caller who passed `all`.
+///
+/// Failing only when *nothing* was removed is deliberate. A call that removed some of what it
+/// named has mutated the target, so reporting it as an error — the shape a caller retries — would
+/// send that retry at ids the engine may since have handed to different breakpoints, the engine
+/// reusing the ids of removed ones. A call that removed nothing has not, and that is a failure
+/// with nothing to undo.
+fn clear_breakpoints(e: &DebugEngine, ids: Option<Vec<u32>>) -> Result<Output, Failed> {
+    // The listing is a `?` on this path too, and for a sharper reason than the tool above: it is
+    // not an inspection here but the *request* — "all of them" cannot be turned into ids any other
+    // way, and a failed read would otherwise remove nothing and report a session it had cleared.
+    let ids = match ids {
+        Some(ids) => ids,
+        None => held_breakpoints(e)?
+            .iter()
+            .map(|breakpoint| breakpoint.id)
+            .collect(),
+    };
+    let mut removed = Vec::new();
+    let mut not_removed = Vec::new();
+    for id in ids {
+        match e.remove_breakpoint(id) {
+            Ok(()) => removed.push(id),
+            Err(why) => not_removed.push(structured::BreakpointRemoval {
+                id,
+                reason: why.to_string(),
+            }),
+        }
+    }
+    if removed.is_empty() && !not_removed.is_empty() {
+        return Err(Failed::categorised(
+            structured::ErrorCategory::Debugger,
+            format!(
+                "none of the breakpoints named could be removed, so the target is exactly as it \
+                 was: {}",
+                not_removed
+                    .iter()
+                    .map(|failure| format!("{} ({})", failure.id, failure.reason))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ),
+        ));
+    }
+    // Best-effort, unlike the read above, and for [`set_breakpoint`]'s reason: the removals have
+    // happened, and an inspection that fails after them must not read as their having failed.
+    // `None` is what keeps that distinguishable from the empty list a cleared session has.
+    let remaining = held_breakpoints(e).ok();
+    let mut text = match removed.len() {
+        0 => "No breakpoints were removed.\n".to_string(),
+        1 => format!("Removed breakpoint {}.\n", removed[0]),
+        n => format!(
+            "Removed {n} breakpoints ({}).\n",
+            removed
+                .iter()
+                .map(u32::to_string)
+                .collect::<Vec<_>>()
+                .join(", "),
+        ),
+    };
+    for failure in &not_removed {
+        // Named one per line rather than counted, because each is a breakpoint still armed in the
+        // target and the id is what a caller needs to try again or to go and look.
+        text.push_str(&format!(
+            "Breakpoint {} is **still set**: {}\n",
+            failure.id, failure.reason,
+        ));
+    }
+    match &remaining {
+        None => text.push_str(
+            "\nThe session's breakpoint list could not be read afterwards, which says nothing \
+             about the removals above.\n",
+        ),
+        Some(remaining) if remaining.is_empty() => {
+            text.push_str("\nThe session now holds no breakpoints.\n")
+        }
+        Some(remaining) => text.push_str(&format!(
+            "\nThe session still holds {} breakpoint(s):\n{}",
+            remaining.len(),
+            breakpoint_rows(remaining, None),
+        )),
+    }
+    Ok(Output::typed(
+        text,
+        structured::BreakpointsCleared {
+            removed,
+            not_removed,
+            remaining,
+        },
+    ))
 }
 
 /// Resolve and act in the same engine job; no cached pairing address is trusted.

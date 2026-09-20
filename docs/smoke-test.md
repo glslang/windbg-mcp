@@ -42,7 +42,7 @@ clock says *some* tier had work to do; which one is a `RAN:`/`SKIPPED` line, not
 | **Debugger** | `WINDBG_MCP_SMOKE_DUMP=1` | `dbgeng.dll`, the checked-in sample dump, and a live user-mode target for the eleven that want one — `cmd.exe` for the ten that launch, `ping` for the one that attaches | `dbgscope` / DbgEng regressions, a lease expiry releasing a real engine worker, driving execution on a live user-mode target synchronously and asynchronously, what ending a session does to it, and — over a seeded randomised sequence — that a session is always in one of its three states and never half-answering |
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
-| **Live hypervisor** | `--ignored` + `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE` | a disposable Microsoft hypervisor target, reached by its own configured profile | separate detach-only tests for default and experimental announcement attach; broader identity, inspection, step, and breakpoint-management test; [runbook, independent health checks, and limits](hypervisor-debugging.md#validation) |
+| **Live hypervisor** | `--ignored` + `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE`; two more variables below | a disposable Microsoft hypervisor target, reached by its own configured profile | separate detach-only tests for default and experimental announcement attach; broader identity, inspection, step, and breakpoint-management test; [runbook, independent health checks, and limits](hypervisor-debugging.md#validation) |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and a WinDbg engine payload beside the binary to replay what it records — both benches' came from `setup.md`'s unpacked `.msixbundle` rather than from an installed package, the ARM64 one as of 2026-08-29 | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
 | **32-bit managed target** | a 32-bit `dbgeng.dll` in an `x86` directory beside the binary under test | that engine, `x86\windbg-mcp.exe` beside it, and the `csc.exe` every stock Windows ships — it compiles and dumps its own fixture | that a 32-bit dump **and** a 32-bit live process are each opened by a worker of *their* architecture, so 32-bit SOS loads — which this server's own engine cannot do at all |
@@ -1517,6 +1517,35 @@ than measuring a patch that never landed.
   The test captures `@$proc` with an `eval` step and asks `pool_chunk` about `{{proc}}`; it needs the
   same full `nt` symbols the pool tier does. Either pool answer is correct (a chunk, or an address
   the walk did not cover) and they are different facts, so both are accepted by name.
+
+## The live-hypervisor tier
+
+Three variables, and only the first is a gate. `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE` names a
+configured profile pointing at a **disposable** hypervisor target; without it every test here
+skips.
+
+- `WINDBG_MCP_SMOKE_HYPERVISOR_BREAK_ON_CONNECT=1` makes
+  `a_live_hypervisor_session_inspects_steps_and_detaches` attach with
+  `experimental_break_on_connect`. A hypervisor that is *running* has nothing to break into, so
+  this is what the 2026-09-20 measurements used and what that lab needs; the two detach-only tests
+  carry their own attach shape and ignore it.
+- `WINDBG_MCP_SMOKE_HYPERVISOR_BREAKPOINT_HIT=1` adds the half that reads a return address off the
+  stopped processor's stack, checks it is inside the `hv` image this session attached to, runs to
+  it and asserts `verdict: hit` with an empty breakpoint inventory afterwards. **Opt-in on
+  purpose**: [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md) is open, and on the four-processor lab that
+  sequence was followed by further processor stops after a successful removal and a reported
+  detach, leaving the guest frozen until a separately authorised recovery connection released
+  them. One vCPU passed with independently healthy execution afterwards -- one run, not a remedy,
+  and the topology is not established as the cause.
+
+**Run it through
+[`examples/hypervisor_detach_regression.ps1`](../examples/hypervisor_detach_regression.ps1)
+rather than through `cargo test` directly**, because the postcondition is not the debugger's to
+report: a detach that answers `released: true` is not evidence the guest is executing, which is
+exactly what the 2026-09-20 four-processor run demonstrated. The wrapper reads the guest's boot
+identity and uptime over WinRM before and twice after, fails if either moved the wrong way, and
+refuses `-BreakpointHit` on a guest reporting more than one logical processor -- checked per
+cycle, since a VM's processor count changes with a restart.
 
 ## MessageManager CTF regression
 

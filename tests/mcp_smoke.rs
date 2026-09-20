@@ -1962,8 +1962,23 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// is the tightest headroom any of these raises has left. That is deliberate: this is the last
 /// tool the driver plan adds, so there is no next one to be quietly sized for, and the five review
 /// rounds that moved `device_security`'s figure moved it by 119 B in total.
+///
+/// **93,000 -> 96,500 for the breakpoint inventory** (2026-09-20), which is two tools rather than
+/// one and so has a term for each: the model-visible surface went 92,665 -> 94,773 across 61 ->
+/// 63 tools, and of those 2,108 B, `breakpoints` is 857 and `clear_breakpoints` is 1,080. The
+/// remaining 171 B is `set_breakpoint`, untouched and grown by a `TOOL_NOTES` cross-reference to
+/// both of them — the `interrupt` case this comment records above, arriving the same way a second
+/// time. `breakpoints` carries a note of its own, inside its 857. They are *cheap* tools by this
+/// surface's standards (the mean is 1,504 B) and the raise is still 3,500, because the headroom
+/// left at the last raise was 335 B and a ceiling with no room in it fails the next reworded
+/// description rather than the next tool. The new figure leaves 1,727 B, 1.8%.
+///
+/// What the two are *for* is a gap `--tools` made visible: `execute` is in the `inspect` group and
+/// `set_breakpoint` in `exec`, so a client served `session,exec` could arm a breakpoint on a live
+/// kernel and had no typed way to list or remove one. `bl` and `bc` through the raw hatch were the
+/// whole answer, and a surface that narrow does not have it.
 // 2026-09-19: the opt-in attach field adds 329 B; retain its experimental safety qualifiers.
-const MODEL_VISIBLE_CEILING: usize = 93_000;
+const MODEL_VISIBLE_CEILING: usize = 96_500;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2056,9 +2071,22 @@ const MODEL_VISIBLE_CEILING: usize = 93_000;
 /// The new figure left 5,318 B at the raise, 2.1% -- the same headroom the last three raises did.
 /// Past tense on purpose: the payload moves under a ceiling that does not, and the golden is what
 /// says where it is today.
+///
+/// **256,000 -> 268,000 for the breakpoint inventory** (2026-09-20). The payload went 255,243 ->
+/// 262,771, a difference of 7,528: `breakpoints` is 3,399 B of wire and `clear_breakpoints`
+/// 3,956, `set_breakpoint` grew 171 by the cross-reference recorded under the other ceiling, and
+/// the two remaining bytes are the array's own commas. Nothing else moved, checked against the
+/// per-tool golden keyed by **name** -- the diff for a surface that just grew by two entries is
+/// the case `a-rendering-is-not-an-identifier` is about, and a positional one blames whichever
+/// tools sit where the new ones were inserted.
+///
+/// **5,124 B of that 7,528 is `outputSchema`, and the sharing question again answers no.**
+/// `BreakpointInfo` is now inlined in three closures rather than one, which is a copy each and not
+/// a product: 2,396 B for a listing of them and 2,728 for a removal's pair of lists beside one.
+/// The new figure leaves 5,229 B, 2.0%, which is the headroom every raise here has left.
 // 2026-09-20: unresolved-kernel state, one error enum variant per output closure, and the
 // explicit handoff field make the measured payload 254,925 B. No schema descriptions added.
-const WIRE_CEILING: usize = 256_000;
+const WIRE_CEILING: usize = 268_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,021
 /// bytes, because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary from
@@ -2900,6 +2928,11 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             json!({ "expression": "nt!KeBugCheckEx" }),
             "error",
         ),
+        ("breakpoints", json!({}), "error"),
+        // Well formed — `all` is one of the two selectors — so this takes the session refusal like
+        // every row here rather than the argument one, which answers before a session is looked
+        // for and is covered by `clearing_breakpoints_without_a_selector_is_refused`.
+        ("clear_breakpoints", json!({ "all": true }), "error"),
         // Reachable here despite needing a live driver target to do anything useful, because what
         // this test asks is whether a tool that declares an `outputSchema` answers with
         // `structuredContent` — and a refusal is an answer. It installs a breakpoint through the
@@ -3413,6 +3446,57 @@ fn a_malformed_walk_is_refused_before_a_session_is_needed() {
     );
 }
 
+/// `clear_breakpoints` refuses a call that names no selector, and one that names both.
+///
+/// **The neither case is the one worth a test**, and it is a decision rather than a validation
+/// detail: serde would happily hand the tool two `None`s, and the reading that suggests itself —
+/// "no ids given, so all of them" — turns a typo in one field into every breakpoint on a live
+/// kernel being removed. So an omitted selector is refused, and it is refused **before a session
+/// is chosen**, because it is a fact about the request: a check made after the session lookup
+/// would answer "no session" to a caller whose call was also malformed, sending them to open a
+/// target rather than to fix the call.
+///
+/// The both case is refused for the opposite reason — there *is* something to do and no way to
+/// tell which of the two was meant, and a removal is not the place to guess.
+#[test]
+fn clearing_breakpoints_without_a_selector_is_refused() {
+    let mut server = Server::started();
+
+    for (arguments, expected) in [
+        (json!({}), "name what to remove"),
+        (json!({ "ids": [1], "all": true }), "not both"),
+        // `all: false` is not a selector either: it names nothing to remove, which is the first
+        // case wearing an explicit `false`. Worth pinning, because reading the field as a bool
+        // rather than as one of two selectors makes this the "remove by ids" branch with no ids.
+        (json!({ "all": false }), "name what to remove"),
+    ] {
+        let refused = server.call_tool("clear_breakpoints", arguments.clone(), STEP);
+        assert!(is_tool_error(&refused), "{arguments} must be refused");
+        let text = text_of(&refused["result"]);
+        assert!(
+            text.contains(expected),
+            "the refusal must say which half is wrong, got:\n{text}"
+        );
+        assert!(
+            !text.contains("session"),
+            "this is refused before any session is needed, got:\n{text}"
+        );
+        assert_eq!(
+            refused["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+            "a caller branches on the category, not the wording: {refused}"
+        );
+    }
+
+    // And a misspelt field is refused rather than dropped, which is `BreakpointArgs`' rule and is
+    // here for the same currency: a `ids` that serde quietly ignored would be answered as the
+    // `all` branch it is not, on a target the caller is about to resume.
+    let typo = server.call_tool("clear_breakpoints", json!({ "id": [1] }), STEP);
+    assert!(
+        is_tool_error(&typo) || typo["error"]["code"].is_number(),
+        "an unknown field must not be dropped: {typo}"
+    );
+}
+
 /// Both of `reachable_from_dispatch`'s own refusals happen **before a session is chosen**, and
 /// both now carry `structuredContent`.
 ///
@@ -3864,7 +3948,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 61 tools (session, crash)"),
+        log.contains("serving 13 of 63 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -3896,7 +3980,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 61 tools (session, inspect) — except bench serves 13 of 61 tools \
+            "serving 20 of 63 tools (session, inspect) — except bench serves 13 of 63 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -6075,6 +6159,135 @@ fn a_second_breakpoint_at_one_address_replaces_the_first_and_says_so() {
     assert_eq!(
         at_address, 1,
         "one breakpoint should be left at {address}, not {at_address}:\n{second}"
+    );
+}
+
+/// **The inventory is a round trip against a real engine, which is the only thing that settles
+/// it.** A listing built from the same values a set returned would pass with nothing behind it:
+/// what this asserts is that `breakpoints` reads the *engine's* objects and `clear_breakpoints`
+/// takes them off it — one call's answer checked by the next call's, never by the field that made
+/// the claim.
+///
+/// **And that an empty listing here is a reading rather than a failure**, which is the distinction
+/// the two results are shaped around: `BreakpointSet::breakpoints` empty means the inspection
+/// could not be read, `BreakpointList::breakpoints` empty means there are none. The clear at the
+/// end is where the second meaning has to hold, so it is asserted from both sides — `removed`
+/// names the id, and the listing after it is empty rather than unavailable.
+///
+/// `ntdll!NtCreateFile` for [`a_second_breakpoint_at_one_address_replaces_the_first_and_says_so`]'s
+/// reason: present in every process and resolved at the initial break, so the breakpoint has an
+/// address and the test is not measuring the deferred path.
+#[test]
+fn breakpoints_are_listed_and_cleared_through_their_own_tools() {
+    if !launch_tier() {
+        return;
+    }
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": LIVE_TARGET }),
+        TARGET_STEP,
+    );
+
+    // A fresh session holds none, and that is the empty listing this tool has to be able to
+    // report as a fact — the assertion below on the cleared session cannot distinguish "none"
+    // from "unreadable" on its own.
+    let before = server.tool_data(
+        "breakpoints",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        before["breakpoints"].as_array().map(Vec::len),
+        Some(0),
+        "a session that has set nothing holds nothing:\n{before}"
+    );
+
+    let set = server.tool_data(
+        "set_breakpoint",
+        json!({ "session_id": &session, "expression": "ntdll!NtCreateFile" }),
+        TARGET_STEP,
+    );
+    let id = set["breakpoint"]["id"].clone();
+    assert!(id.is_number(), "the engine names what it created:\n{set}");
+
+    let listed = server.tool_data(
+        "breakpoints",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    let rows = listed["breakpoints"]
+        .as_array()
+        .expect("the listing is an array");
+    assert_eq!(rows.len(), 1, "one breakpoint was set:\n{listed}");
+    assert_eq!(
+        rows[0]["id"], id,
+        "and it is the one this session set:\n{listed}"
+    );
+    assert_eq!(
+        rows[0]["address"], set["breakpoint"]["address"],
+        "the listing reads the same engine object the set reported:\n{listed}"
+    );
+
+    let cleared = server.tool_data(
+        "clear_breakpoints",
+        json!({ "session_id": &session, "ids": [id.clone()] }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        cleared["removed"].as_array(),
+        Some(&vec![id.clone()]),
+        "the removal names what it took:\n{cleared}"
+    );
+    assert!(
+        cleared["not_removed"]
+            .as_array()
+            .is_none_or(|left| left.is_empty()),
+        "nothing should have been left armed:\n{cleared}"
+    );
+    // `remaining` is nullable, and `null` here would mean the listing failed rather than that the
+    // session is clean. Read as an array, so the two cannot be confused by an assertion either.
+    assert_eq!(
+        cleared["remaining"].as_array().map(Vec::len),
+        Some(0),
+        "the session should hold nothing afterwards, and should be readable:\n{cleared}"
+    );
+
+    let after = server.tool_data(
+        "breakpoints",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        after["breakpoints"].as_array().map(Vec::len),
+        Some(0),
+        "and the tool that only reads agrees:\n{after}"
+    );
+
+    // An id the engine no longer has is a failure this call *reports* rather than one it hides:
+    // nothing was removed, so there is nothing to undo and the error branch is right.
+    let stale = server.call_tool(
+        "clear_breakpoints",
+        json!({ "session_id": &session, "ids": [id] }),
+        TARGET_STEP,
+    );
+    assert!(
+        is_tool_error(&stale),
+        "removing a breakpoint that is already gone removed nothing, and says so:\n{}",
+        text_of(&stale["result"])
+    );
+
+    // Clearing a session that holds nothing is not that case: it asked for nothing, so nothing
+    // failed.
+    let nothing = server.tool_data(
+        "clear_breakpoints",
+        json!({ "session_id": &session, "all": true }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        nothing["removed"].as_array().map(Vec::len),
+        Some(0),
+        "`all` on an empty session removes nothing and succeeds:\n{nothing}"
     );
 }
 
@@ -15552,6 +15765,16 @@ fn experimental_announcement_attach_refuses_non_kdnet_before_claiming_a_target()
 
 /// A separate gate from the NT tier: no driver, process, pool or NT-symbol assumptions.
 /// Only target-independent inspection, one step, breakpoint management, and active detach.
+///
+/// **What it does by default is the shape that passed on both labs** on 2026-09-20 — inspect,
+/// step, set a breakpoint, take it off, detach — and what it does *not* do is hit one. That half
+/// is [`hypervisor_breakpoint_hit`], behind [`HYPERVISOR_BREAKPOINT_HIT`], for the reason recorded
+/// there. Running this is halting somebody's hypervisor either way; the difference is that the
+/// default half has never been seen to leave one halted.
+///
+/// The independent postcondition is not in here and cannot be: a detach this server reports as
+/// successful is not evidence the guest is executing, which is what
+/// `examples/hypervisor_detach_regression.ps1` exists to check over WinRM afterwards.
 #[test]
 #[ignore = "halts a disposable hypervisor; set WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE and run alone"]
 fn a_live_hypervisor_session_inspects_steps_and_detaches() {
@@ -15563,112 +15786,244 @@ fn a_live_hypervisor_session_inspects_steps_and_detaches() {
         !profile.trim().is_empty(),
         "the hypervisor profile name must not be empty"
     );
+    // **The attach shape is the lab's to choose, and the default is not always the one that
+    // lands.** A hypervisor that is running rather than halted has nothing to break into, so
+    // every one of the 2026-09-20 runs attached with `experimental_break_on_connect` — and this
+    // test, which had only the default path, could not have reached a stopped target on that lab
+    // at all. The two detach-only tests above are one each; this one takes whichever it is told,
+    // because the rest of what it asserts is the same either way.
+    let selector = match std::env::var_os(HYPERVISOR_BREAK_ON_CONNECT) {
+        Some(_) => json!({ "profile": profile, "experimental_break_on_connect": true }),
+        None => json!({ "profile": profile }),
+    };
     let mut server = Server::started();
-    with_live_kernel_selector(
-        &mut server,
-        json!({ "profile": profile }),
-        |server, session, attached| {
+    with_live_kernel_selector(&mut server, selector, |server, session, attached| {
+        assert_eq!(
+            attached["summary"]["kernel_target"], "hypervisor",
+            "wrong target: {attached}"
+        );
+        assert!(
+            attached["report"]
+                .as_str()
+                .unwrap()
+                .contains("Microsoft Hypervisor")
+        );
+        assert!(
+            attached["summary"]["limitation"]
+                .as_str()
+                .unwrap()
+                .contains("not the Windows NT kernel")
+        );
+
+        let modules = server.tool_data("modules", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            modules["modules"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["name"] == "hv")
+        );
+        let registers =
+            server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
+        let pc = registers["instruction_pointer"]
+            .as_str()
+            .expect("a stopped hypervisor has a PC");
+        let memory = server.tool_data(
+            "read_memory",
+            json!({ "session_id": session, "address": pc, "size": 8 }),
+            TARGET_STEP,
+        );
+        assert_eq!(memory["read_size"], 8, "{memory}");
+        let code = server.tool_data(
+            "disassemble",
+            json!({ "session_id": session, "count": 3 }),
+            TARGET_STEP,
+        );
+        assert!(
+            !code["instructions"].as_array().unwrap().is_empty(),
+            "{code}"
+        );
+
+        let stepped = server.tool_data("step_into", json!({ "session_id": session }), TARGET_STEP);
+        assert_eq!(stepped["timed_out"], false, "{stepped}");
+        assert_eq!(stepped["target_gone"], false, "{stepped}");
+        assert_eq!(stepped["interrupted"], false, "{stepped}");
+        let after = server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
+        let next_pc = after["instruction_pointer"]
+            .as_str()
+            .expect("a step leaves a readable PC");
+        assert_ne!(next_pc, pc, "the single step did not move the hypervisor");
+
+        // This is a new session. Refuse to clear any breakpoints it did not create.
+        let before = server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            before["breakpoints"].as_array().unwrap().is_empty(),
+            "{before}"
+        );
+        let breakpoint_result = catch_unwind(AssertUnwindSafe(|| {
+            let set = server.tool_data(
+                "set_breakpoint",
+                json!({ "session_id": session, "expression": next_pc }),
+                TARGET_STEP,
+            );
+            assert_eq!(set["breakpoint"]["deferred"], false, "{set}");
+            let listed =
+                server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
             assert_eq!(
-                attached["summary"]["kernel_target"], "hypervisor",
-                "wrong target: {attached}"
+                listed["breakpoints"].as_array().unwrap().len(),
+                1,
+                "{listed}"
             );
-            assert!(
-                attached["report"]
-                    .as_str()
-                    .unwrap()
-                    .contains("Microsoft Hypervisor")
-            );
-            assert!(
-                attached["summary"]["limitation"]
-                    .as_str()
-                    .unwrap()
-                    .contains("not the Windows NT kernel")
-            );
+        }));
+        // The cleanup the `catch_unwind` above exists for, and it runs whatever that returned:
+        // a breakpoint left armed here is an `int 3` patched into a hypervisor that the detach
+        // below is about to resume.
+        let cleared = server.tool_data(
+            "clear_breakpoints",
+            json!({ "session_id": session, "all": true }),
+            TARGET_STEP,
+        );
+        if let Err(panic) = breakpoint_result {
+            resume_unwind(panic);
+        }
+        assert!(
+            cleared["not_removed"]
+                .as_array()
+                .is_none_or(|left| left.is_empty()),
+            "a breakpoint left armed on a hypervisor about to be resumed:\n{cleared}"
+        );
+        assert_eq!(
+            cleared["remaining"].as_array().map(Vec::len),
+            Some(0),
+            "the session must hold nothing before the detach, and it must be readable:\n\
+                 {cleared}"
+        );
+        println!(
+            "hypervisor: modules, registers, memory, disassembly, single-step and breakpoint set/clear passed"
+        );
 
-            let modules =
-                server.tool_data("modules", json!({ "session_id": session }), TARGET_STEP);
-            assert!(
-                modules["modules"]
-                    .as_array()
-                    .unwrap()
-                    .iter()
-                    .any(|m| m["name"] == "hv")
-            );
-            let registers =
-                server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
-            let pc = registers["instruction_pointer"]
-                .as_str()
-                .expect("a stopped hypervisor has a PC");
-            let memory = server.tool_data(
-                "read_memory",
-                json!({ "session_id": session, "address": pc, "size": 8 }),
-                TARGET_STEP,
-            );
-            assert_eq!(memory["read_size"], 8, "{memory}");
-            let code = server.tool_data(
-                "disassemble",
-                json!({ "session_id": session, "count": 3 }),
-                TARGET_STEP,
-            );
-            assert!(
-                !code["instructions"].as_array().unwrap().is_empty(),
-                "{code}"
-            );
-
-            let stepped =
-                server.tool_data("step_into", json!({ "session_id": session }), TARGET_STEP);
-            assert_eq!(stepped["timed_out"], false, "{stepped}");
-            assert_eq!(stepped["target_gone"], false, "{stepped}");
-            assert_eq!(stepped["interrupted"], false, "{stepped}");
-            let after =
-                server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
-            let next_pc = after["instruction_pointer"]
-                .as_str()
-                .expect("a step leaves a readable PC");
-            assert_ne!(next_pc, pc, "the single step did not move the hypervisor");
-
-            // This is a new session. Refuse to clear any breakpoints it did not create.
-            let before =
-                server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
-            assert!(
-                before["breakpoints"].as_array().unwrap().is_empty(),
-                "{before}"
-            );
-            let breakpoint_result = catch_unwind(AssertUnwindSafe(|| {
-                let set = server.tool_data(
-                    "set_breakpoint",
-                    json!({ "session_id": session, "address": next_pc }),
-                    TARGET_STEP,
-                );
-                assert_eq!(set["breakpoint"]["deferred"], false, "{set}");
-                let listed =
-                    server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
-                assert_eq!(
-                    listed["breakpoints"].as_array().unwrap().len(),
-                    1,
-                    "{listed}"
-                );
-            }));
-            server.tool_text(
-                "execute",
-                json!({ "session_id": session, "command": "bc *" }),
-                TARGET_STEP,
-            );
-            if let Err(panic) = breakpoint_result {
-                resume_unwind(panic);
-            }
-            let cleared =
-                server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
-            assert!(
-                cleared["breakpoints"].as_array().unwrap().is_empty(),
-                "{cleared}"
-            );
-            println!(
-                "hypervisor: modules, registers, memory, disassembly, single-step and breakpoint set/clear passed"
-            );
-        },
-    );
+        if std::env::var_os(HYPERVISOR_BREAKPOINT_HIT).is_none() {
+            skip(&format!(
+                "set {HYPERVISOR_BREAKPOINT_HIT}=1 on a **one-vCPU** lab to also run the \
+                     breakpoint-hit half; FOLLOWUPS.md item 93 is open and that sequence froze \
+                     the four-processor lab on 2026-09-20"
+            ));
+            return;
+        }
+        hypervisor_breakpoint_hit(server, session);
+    });
     println!("hypervisor: resumed and detached (verify guest responsiveness separately)");
+}
+
+/// The env var that opts in to the half of the hypervisor tier that hits a breakpoint.
+const HYPERVISOR_BREAKPOINT_HIT: &str = "WINDBG_MCP_SMOKE_HYPERVISOR_BREAKPOINT_HIT";
+
+/// The env var that makes the hypervisor tier attach with `experimental_break_on_connect`.
+///
+/// Not a default, and not a flag to set because a run did not land: it is explicitly experimental
+/// on the tool, and what it does to a target that *is* halted already is not what this tier is
+/// for. Set it where the lab's hypervisor is running, which is where the 2026-09-20 measurements
+/// were taken.
+const HYPERVISOR_BREAK_ON_CONNECT: &str = "WINDBG_MCP_SMOKE_HYPERVISOR_BREAK_ON_CONNECT";
+
+/// Runs to a return address taken off the stopped hypervisor's own stack, and checks it got there.
+///
+/// **This is the half of the 2026-09-20 demonstration that the tier could not carry**, and the
+/// reason it is opt-in rather than part of the run above is
+/// [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md): the same sequence on the **four-processor** lab was
+/// followed by further processor stops after a successful breakpoint removal and a reported
+/// detach, and left the guest frozen until a separately authorised recovery connection released
+/// them. One vCPU passed with independently healthy execution afterwards; that is one run, not a
+/// remedy, and nothing here establishes the topology was the cause. So the gate is a deliberate
+/// act by whoever knows what the lab is, and `examples/hypervisor_detach_regression.ps1` will not
+/// pass it to a guest reporting more than one logical processor.
+///
+/// **The address comes off the target rather than out of this file.** The demonstration's
+/// `hv+0x312024` was a return address on the stopped processor's stack, and the image base moves
+/// with every restart of the guest — so a literal here would be a breakpoint at whatever now sits
+/// at an address from another boot. It is read, checked to be inside the `hv` image this session
+/// actually attached to, and only then run to.
+fn hypervisor_breakpoint_hit(server: &mut Server, session: &str) {
+    let registers = server.tool_data("registers", json!({ "session_id": session }), TARGET_STEP);
+    let sp = registers["registers"]
+        .as_array()
+        .expect("a register set")
+        .iter()
+        .find(|register| register["name"] == "rsp")
+        .and_then(|register| register["value"].as_str())
+        .expect("a stopped x64 hypervisor has an rsp")
+        .to_string();
+
+    // Eight bytes at the stack pointer: the return address of the callback the initial break
+    // lands in. `data` is plain hex, two characters a byte, little-endian as the target holds it.
+    let stack = server.tool_data(
+        "read_memory",
+        json!({ "session_id": session, "address": sp, "size": 8 }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        stack["read_size"], 8,
+        "the stack read came up short:\n{stack}"
+    );
+    let bytes = stack["data"].as_str().expect("the read's bytes");
+    let mut value: u64 = 0;
+    for index in (0..8).rev() {
+        let byte = u8::from_str_radix(&bytes[index * 2..index * 2 + 2], 16)
+            .unwrap_or_else(|_| panic!("`data` is hex: {bytes}"));
+        value = (value << 8) | u64::from(byte);
+    }
+
+    // Inside the image this session attached to, checked rather than assumed: a stack slot that
+    // happens to hold something else is a breakpoint armed at an address nothing executes, and
+    // the run below would then report TIMEOUT as though the hypervisor had not reached its own
+    // callback.
+    let modules = server.tool_data("modules", json!({ "session_id": session }), TARGET_STEP);
+    let hv = modules["modules"]
+        .as_array()
+        .expect("a module table")
+        .iter()
+        .find(|module| module["name"] == "hv")
+        .expect("the hypervisor image")
+        .clone();
+    let bound = |field: &str| -> u64 {
+        let text = hv[field].as_str().expect("a module bound");
+        u64::from_str_radix(text.trim_start_matches("0x"), 16).expect("a hex bound")
+    };
+    let (start, end) = (bound("start"), bound("end"));
+    assert!(
+        (start..end).contains(&value),
+        "the return address {value:#018x} is not inside `hv` ({start:#018x}..{end:#018x}), so it \
+         is not a place to arm a breakpoint:\n{stack}"
+    );
+    let address = format!("{value:#018x}");
+
+    // The demonstration's budget, kept because the number is part of what was measured.
+    let run = server.tool_data(
+        "run_to_address",
+        json!({ "session_id": session, "address": &address, "timeout_ms": 5000 }),
+        TARGET_STEP,
+    );
+    assert_eq!(
+        run["verdict"], "hit",
+        "execution did not reach the return address on its own stack:\n{run}"
+    );
+    assert_eq!(
+        run["stopped_at"],
+        json!(address),
+        "a hit stops at the address it ran to:\n{run}"
+    );
+
+    // And it took its temporary breakpoint off again. This is the postcondition the 2026-09-20
+    // runs read out of `bl` text; it is a value now, and an empty listing here is a reading rather
+    // than an inspection that failed — which is exactly the distinction that matters before a
+    // detach.
+    let after = server.tool_data("breakpoints", json!({ "session_id": session }), TARGET_STEP);
+    assert_eq!(
+        after["breakpoints"].as_array().map(Vec::len),
+        Some(0),
+        "`run_to_address` must not leave its breakpoint behind:\n{after}"
+    );
+    println!("hypervisor: ran to {address} and hit it, with an empty breakpoint inventory after");
 }
 
 /// [`with_live_kernel_session`], for a body that only means anything against an **x64** target.

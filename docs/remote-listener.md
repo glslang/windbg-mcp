@@ -296,7 +296,7 @@ setx WINDBG_MCP_TOOLS_BENCH        "session,inspect,crash"    # …and what it i
 ```
 
 This is what lets one listener serve a local model that can hold twenty-three tools beside a hosted
-client that can hold sixty-one, against the same debug sessions on the same box. A client with no spec of
+client that can hold sixty-three, against the same debug sessions on the same box. A client with no spec of
 its own is served whatever the run serves — `--tools` on the listener's command line, or every tool
 if it has none — so **the run's flag is the default rather than a ceiling**: a client's own spec
 replaces it, wider or narrower, because an intersection would produce a surface neither of you

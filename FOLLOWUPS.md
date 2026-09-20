@@ -76,6 +76,8 @@ A64 writes `a || b || c` as three compares feeding one branch, and this walk rea
 and files the rest in `untracked`. Item 93 records the multiprocessor hypervisor breakpoint/detach
 investigation (2026-09-20): debugger-reported release could leave further processor stops, while
 inspection without a temporary breakpoint or step detached with independently healthy execution.
+And item 94 from giving that investigation's harness the tools it was written against (2026-09-20):
+a typed breakpoint listing and removal landed, and `bd`/`be` deliberately did not.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1924,8 +1926,33 @@ vCPUs with controlled breakpoint placement and stepping; establish the cause; an
 validate an engine-thread implementation with repeated four-vCPU breakpoint-hit/detach runs
 and independent same-boot guest health. A passing one-vCPU run alone does not close the item.
 
-**Picks up at:** the investigation's live/static follow-up sections and #355's checklist. The
-temporary local runner is evidence, not a portable shipped regression. Keep this distinct from
+**Picks up at:** the investigation's live/static follow-up sections and #355's checklist. **The
+reproducer half is no longer the temporary local runner**: since 2026-09-20 the hypervisor tier's
+`a_live_hypervisor_session_inspects_steps_and_detaches` carries the breakpoint-hit sequence behind
+`WINDBG_MCP_SMOKE_HYPERVISOR_BREAKPOINT_HIT`, and `examples/hypervisor_detach_regression.ps1`
+drives it with the independent WinRM health checks and refuses that gate on a guest reporting more
+than one logical processor. That is a shipped way to *repeat* the one-vCPU run, not evidence about
+four, and it re-measures nothing recorded here. What is still open is everything above it: the
+cause, the controlled one-vs-four comparison, and the four-vCPU validation. Keep this distinct from
 [dbgscope #173](https://github.com/glslang/dbgscope/issues/173)'s shared live-kernel `qd` validation
 and [WinDbg-Feedback #396](https://github.com/microsoft/WinDbg-Feedback/issues/396)'s unconnected
 KDNET EXIT-interrupt cancellation report.
+
+## 94. [windbg-mcp] Disabling a breakpoint has no typed tool
+
+`clear_breakpoints` removes; nothing arms or disarms one in place. dbgscope has had
+`DebugEngine::enable_breakpoint` since its typed breakpoint API landed, so this is a tool-surface
+gap rather than a missing primitive -- the same shape item 2 records for `ba`, which was
+*reported* for weeks before `set_breakpoint` grew a `watch` to set it.
+
+- **Why deferred:** no consumer asked for it. The two tools added on 2026-09-20 were filed against
+  a measured need -- a hypervisor regression calling a listing tool that did not exist, and a
+  narrowed `session,exec` surface that could arm a breakpoint on a live kernel and had no typed
+  way to take it off -- and `bd`/`be` has neither half of that. `execute` still reaches it.
+- **What closes it:** a consumer, then `enabled` on the existing removal tool or a tool of its
+  own, plus the debugger-tier round trip the other two have. Decide which *before* writing it: a
+  disable that shares `clear_breakpoints`' argument shape would make `ids` mean two different
+  mutations depending on a second field, which is the combination that tool refuses to guess at
+  today.
+- **Picks up at:** `worker::clear_breakpoints` and `ClearBreakpointsArgs`, and
+  `breakpoints_are_listed_and_cleared_through_their_own_tools` for the round trip.

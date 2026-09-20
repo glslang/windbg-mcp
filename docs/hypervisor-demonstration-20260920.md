@@ -311,9 +311,19 @@ calls a nonexistent `breakpoints` tool, and passes `address` rather than `expres
 `execute`/`bl` for the text-only listing, and the returned breakpoint ID for removal.
 Its initial stale-call failure is retained above rather than counted as a passing test.
 
+**Those three defects have since been repaired, and the tool the first one named now exists.**
+The server grew `breakpoints` and `clear_breakpoints` -- a typed inventory and a typed removal, the
+operations this harness could reach only through `execute`/`bl`/`bc` -- and the tier test takes its
+attach shape from `WINDBG_MCP_SMOKE_HYPERVISOR_BREAK_ON_CONNECT`, sets its breakpoint by
+`expression`, and clears through the typed tool. The breakpoint-hit sequence is behind
+`WINDBG_MCP_SMOKE_HYPERVISOR_BREAKPOINT_HIT`, which
+[`examples/hypervisor_detach_regression.ps1`](../examples/hypervisor_detach_regression.ps1) refuses
+to pass to a guest reporting more than one logical processor. **Nothing above was re-measured**:
+that is a repeatable way to run this sequence again, against the same open questions, and no run
+of it is recorded in this file.
+
 Both failed demonstrations have now been recovered, with independent same-boot health checks.
-Next: preserve a corrected, reusable regression and investigate
-post-breakpoint pending-stop handling separately
+Next: investigate post-breakpoint pending-stop handling separately
 from the already reported EXIT cancellation failure. Ordinary live-NT `qd` support remains tracked
 in [dbgscope #173](https://github.com/glslang/dbgscope/issues/173).
 
