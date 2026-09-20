@@ -1757,17 +1757,23 @@ answer says it is a lower bound and points at the instruction. What is missing i
 [`DONE.md`](./DONE.md)) reported two codes only the Binary Ninja companion had, at exactly the two
 sites this walk had filed as `untracked` -- so the two implementations agreed about *where* they
 could not read something, and reading the target settled what was there. The companion is **also**
-wrong here, differently: it publishes the chain's *first* operand as a case, which is how a
-meaningless `0x00000000` reached its map, and misses the `ccmp` operands. So there is no
-implementation to copy, and a fix here cannot be validated by agreeing with that one.
+wrong here, differently: it publishes the chain's *first* operand as a case and misses the `ccmp`
+operands -- and on the second chain that first operand is the arm the routine **rejects**, so its
+map carries `0x00000000` and not the `0x00224194` the block actually accepts. Filed as
+[`binja-windbg-mcp` issue 14](https://github.com/glslang/binja-windbg-mcp/issues/14). So there is
+no implementation to copy, and a fix here cannot be validated by agreeing with that one.
 
 **Where it picks up:** `ioctl::compare` and the `Condition` it derives (`src/ioctl.rs`), which
 pairs a branch with the comparison before it. A `ccmp` carries its own condition and an `nzcv`
 immediate for the not-taken case, so reading a chain means folding several comparisons into one
-branch's condition -- `ccmpne w8,w10,#4` continues the chain only while the previous compare was
-*not* equal, which is what makes the whole thing a disjunction. A fixture has to be the real
-instruction sequence: a hand-written chain of ordinary `cmp`s has no `ccmp` in it and already
-passes.
+branch's condition -- and **the immediate is what decides the shape**, which the two chains above
+demonstrate in opposite directions. `ccmpne w8,w10,#4` leaves `Z` *set* when the previous compare
+already matched, so a match at any link reaches the `beq` and the chain is a disjunction of three
+accepted codes. `ccmpne w8,w10,#0` leaves `Z` *clear*, so `w8 == 0` takes the `bne` away from the
+case and only the `ccmp`'s own operand falls into it -- one accepted code, and the first compare's
+operand is the rejected one. An earlier draft of this entry read the first of those onto both,
+which would have had a fix accept `0x00000000`. A fixture has to be the real instruction sequence:
+a hand-written chain of ordinary `cmp`s has no `ccmp` in it and already passes.
 
 ## 88. [windbg-mcp] A call that outlives its budget finishes its work and has the answer discarded
 
