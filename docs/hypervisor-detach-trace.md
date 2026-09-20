@@ -252,6 +252,28 @@ missing watchdog or rejected request in those local runs, not in the earlier liv
 watchdog HRESULT was not captured. Local-process deadline and callback-restoration tests passed
 with the same engine. Automatic recovery remains unimplemented and unvalidated.
 
+## Synchronized watchdog follow-up, 2026-09-20
+
+A later no-ACTIVE run traced the native watchdog against the responsive guest. After reported
+transport synchronization, three EXIT calls returned `S_OK` and set the internal exit bit.
+The engine thread remained inside `WaitForEvent` through KDNET packet reception and `recvfrom`.
+Neither instrumented exit-check marker nor the wait-return marker appeared before the outer
+debugger held the local probe after the third call. The post-deadline observation was only about
+0.4 seconds; the earlier 143-second wait is separate evidence, not this trace's duration.
+
+The [full watchdog investigation](https://github.com/glslang/dbgscope/blob/fix/safe-kernel-detach/docs/kernel-exit-watchdog.md#synchronized-live-measurement)
+records the build-specific RVAs and branch caveats. The synchronized packet receiver differs
+from the unconnected backend, and some receive results bypass the instrumented exit check.
+This supports a DbgEng/KDNET cancellation limitation or defect in `10.0.29617.1000`; it does not
+prove a universal limitation, the exact failing branch, or the complete post-ACTIVE freeze cause.
+
+A fresh independent guest-health check passed before only the verified local probe was reclaimed.
+Both debugger processes exited and the endpoint became free. Two further checks on the same boot
+showed uptime advancing from 65070.157 to 65072.473 seconds. No target break, recovery attach,
+reboot/reset, installed-server replacement, or VELKO change was made. This was process reclamation
+with a verified-running guest, not successful cancellation or detach. Automatic recovery remains
+unimplemented and unvalidated.
+
 ## Local evidence index
 
 These filenames identify the retained bench artifacts, not portable repository inputs:
@@ -277,3 +299,5 @@ These filenames identify the retained bench artifacts, not portable repository i
 - `synchronized-detach-probe-20260919-171404.log`: second injected timeout; one manual break-in send, wait still blocked and WinRM unavailable at the recorded checkpoint.
 - `native-hv-recovery-20260919-173050.log`: recovery after the owner confirmed the frozen console; no break-in send, CPU-0 stop, acknowledged `qd`, native KD exit 0.
 - `timeout-recovery-health-20260919-1732.md`: independent same-boot uptime checks and free endpoint after that recovery.
+- `exit-watchdog-live-20260920-080437.log`: synchronized no-ACTIVE watchdog trace, native return values, thread stacks, and guarded probe reclamation.
+- `exit-watchdog-live-health-20260920.md`: independent post-reclamation health and process checks.

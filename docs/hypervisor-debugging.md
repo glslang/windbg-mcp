@@ -236,6 +236,12 @@ boot with advancing uptime. This validates one manual native-KD recovery, not sa
 or automatic timeout recovery. No reset was needed. Keep these recovery cases distinct from
 the passing normal attach/detach cycles.
 
+The subsequent [synchronized watchdog trace](hypervisor-detach-trace.md#synchronized-watchdog-follow-up-2026-09-20)
+captured three native EXIT requests returning `S_OK` and setting the exit bit while the engine
+thread remained in packet reception. No ACTIVE interrupt was sent, and independent guest health
+passed before and after reclaiming the probe. This points to a cancellation gap in the tested
+DbgEng/KDNET build, not a proven cross-version limitation or safe automatic-recovery procedure.
+
 The reporting changes passed the default unit/protocol suite and the real-debugger NT crash-dump
 summary regression before the teardown change. The broader live test below has not run; hypervisor
 stepping and breakpoint management remain unvalidated by this implementation run. Live NT and
