@@ -67,10 +67,14 @@
   fully explored, and names the remedy. Such an instruction is a **barrier** and is never stepped
   over — skipping it would join the instruction before it to whatever follows and invent an edge,
   which is the one thing a sound `REACHABLE` verdict must never rest on. **A switch it could not
-  follow is counted the same way** (`FOLLOWUPS.md` item 89): an indirect jump whose table did not
-  resolve ends that path where it is, and each one is a case block — and everything past it —
-  missing from the graph the verdict is about, so the report counts the jumps, withholds the same
-  claim, and gives the two remedies the resolver's own cap gives. The count is of **jumps** rather
+  follow is counted the same way** (`FOLLOWUPS.md` item 89): an indirect jump whose targets the walk
+  did not have ends that path where it is, and whatever it reaches — a switch's case blocks, or a
+  callee a tail jump goes to — is missing from the graph the verdict is about, so the report counts
+  the jumps, withholds the same claim, and gives the two remedies the resolver's own cap gives. Not
+  all of them are switches: measured on the ARM64 kernel dump, ordinary `nt` routines end at
+  indirect jumps that are tail calls through a register — **11** on `nt!ObpLookupObjectName` inside
+  24 explored functions — so the dispatch switch is the case this was filed for rather than the
+  only thing it counts. The count is of **jumps** rather
   than of functions, and it is the walk's rather than the probe's: a switch the resolver answered
   is not among them, and neither is one on a `REACHABLE` proved with no tables at all — those were
   never offered to a resolver, which is the ordinary success inside a dispatch routine. It is

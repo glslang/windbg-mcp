@@ -1452,12 +1452,17 @@ pub(crate) fn format_report(r: &Report) -> String {
             ));
         }
     }
-    // The fourth way to be short of the graph, and `FOLLOWUPS.md` item 89: a switch the walk ended
-    // at. Distinct from the resolver's own cap above, which stopped *short* of a table -- this is
-    // one it read and could not answer for, one it had no image to ask about, and one this build's
-    // decoder cannot supply the operands for. Counted per **jump** rather than per function,
-    // because that is the unit the remedy applies to: one of these is one switch's worth of case
-    // blocks, and everything past them, missing from the graph.
+    // The fourth way to be short of the graph, and `FOLLOWUPS.md` item 89: an indirect jump the
+    // walk ended at. Distinct from the resolver's own cap above, which stopped *short* of a table
+    // -- this is one it read and could not answer for, one it had no image to ask about, and one
+    // this build's decoder cannot supply the operands for. Counted per **jump** rather than per
+    // function, because that is the unit the remedy applies to.
+    //
+    // **And the sentence says "whatever they reach" rather than "a switch"**, which a real target
+    // is what settled: the dispatch switch is the case this was filed for, and on the ARM64 kernel
+    // dump ordinary `nt` routines end at indirect jumps that are tail calls through a register --
+    // 11 of them on `nt!ObpLookupObjectName` within 24 functions. Both are an edge the graph did
+    // not cross, and calling them all switches would describe most of them wrongly.
     //
     // **Outside the verdict branches, unlike [`Report::blind`], because it is true of both.** On a
     // NOT REACHABLE it is why the verdict may be wrong; on a REACHABLE it is why a shorter path may
@@ -1467,13 +1472,14 @@ pub(crate) fn format_report(r: &Report) -> String {
     // this with nothing to print: see the early return in `reachability`.
     if !r.unresolved_jumps.is_empty() {
         out.push_str(&format!(
-            "  Switch not followed: the walk ended at {} indirect jump(s) whose targets it did \
-             not\n           have, so a switch's case blocks are missing from the graph this \
-             verdict is\n           about. A jump table is crossed where it can be read; where it \
-             cannot, pass a\n           specific handler VA as `from` to ask about that case block \
-             directly. On a live\n           kernel run `modules` with `refresh: true` first — a \
-             table's entries are checked\n           against the image's executable ranges, and a \
-             fresh attach has no image.\n",
+            "  Jumps not followed: the walk ended at {} indirect jump(s) whose targets it did \
+             not\n           have, so whatever they reach — a switch's case blocks, or a callee a \
+             tail jump\n           goes to — is missing from the graph this verdict is about. A \
+             jump table is\n           crossed where it can be read; where it cannot, pass a \
+             specific handler VA as\n           `from` to ask about that block directly. On a live \
+             kernel run `modules` with\n           `refresh: true` first — a table's entries are \
+             checked against the image's\n           executable ranges, and a fresh attach has no \
+             image.\n",
             r.unresolved_jumps.len()
         ));
     }
@@ -3569,7 +3575,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             "a graph missing a switch's cases was not fully explored: {text}"
         );
         assert!(
-            text.contains("Switch not followed: the walk ended at 2 indirect jump(s)"),
+            text.contains("Jumps not followed: the walk ended at 2 indirect jump(s)"),
             "{text}"
         );
         assert!(
@@ -3627,7 +3633,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             text.contains("the reachable call graph was fully explored"),
             "{text}"
         );
-        assert!(!text.contains("Switch not followed"), "{text}");
+        assert!(!text.contains("Jumps not followed"), "{text}");
     }
 
     /// **One switch two walks end at is one switch**, which is what counting sites buys over
@@ -3734,7 +3740,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
              {proven:?}"
         );
         let text = format_report(&proven);
-        assert!(!text.contains("Switch not followed"), "{text}");
+        assert!(!text.contains("Jumps not followed"), "{text}");
 
         // Now one that did run them. The seed's switch reaches the helper; the helper's first jump
         // reaches the goal and its second answers to nothing.
@@ -3777,7 +3783,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
         let text = format_report(&crossed);
         assert!(text.contains("VERDICT: REACHABLE"), "{text}");
         assert!(
-            text.contains("Switch not followed: the walk ended at 1 indirect jump(s)"),
+            text.contains("Jumps not followed: the walk ended at 1 indirect jump(s)"),
             "a path found in a partial graph says so on this side too: {text}"
         );
     }
