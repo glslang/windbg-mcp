@@ -185,7 +185,8 @@ def ask_companion(checkout: pathlib.Path, python: pathlib.Path, fixture: pathlib
 #      conventions; outside it, a finding.
 #   4. A code with **no address** on one side or both. Compared as a code, never as a route, and
 #      the count of such cases is printed.
-#   5. A **length** both sides prove, differently. A finding.
+#   5. A **length** both sides prove differently **on a paired route**. A finding. A length on a
+#      record that did not pair, or carries no address, has no counterpart to compare against.
 #
 # Everything else these answers carry is either derived from the code (`device_type`, `function`,
 # `method`, `required_access` -- identical whenever the codes are) or has no counterpart on the
@@ -255,15 +256,16 @@ def pair_routes(ours: dict, theirs: dict, window: int, slotted=lambda case: Fals
     record is the one left over, and the lane calls it a difference rather than hiding it behind
     its switch-derived twin.
 
-    `extra` is the companion's unpaired **records**; `lost` is this side's unpaired (code,
-    address).
+    `paired` is the (this side, companion) record pairs it matched -- the only place a per-case
+    field of one can be compared against the other's. `extra` is the companion's unpaired
+    **records**; `lost` is this side's unpaired (code, address).
     """
-    matched, spread, extra, lost = 0, collections.Counter(), [], []
+    paired, spread, extra, lost = [], collections.Counter(), [], []
     for code in sorted(set(ours) & set(theirs)):
         mine = ours[code]
         yours = sorted(theirs[code], key=lambda row: (row[0], not slotted(row[1])))
         taken = set()
-        for one, _ in mine:
+        for one, mine_case in mine:
             hit = next(
                 (
                     index
@@ -277,9 +279,9 @@ def pair_routes(ours: dict, theirs: dict, window: int, slotted=lambda case: Fals
                 continue
             taken.add(hit)
             spread[yours[hit][0] - one] += 1
-            matched += 1
+            paired.append((mine_case, yours[hit][1]))
         extra += [case for index, (_, case) in enumerate(yours) if index not in taken]
-    return matched, spread, extra, lost
+    return paired, spread, extra, lost
 
 
 def identity_of(result: dict, module: str):
@@ -468,13 +470,13 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     # this reports a deliberate difference in *naming a case's address* as disagreement, once per
     # record -- 29 times on HEVD, where every case is a constant 0x18 apart.
     shared = set(our_routes) & set(their_routes)
-    matched, spread, extra, lost = pair_routes(
+    paired, spread, extra, lost = pair_routes(
         our_routes, their_routes, window, lambda case: from_a_table(case, sites, agreed)
     )
     print()
     print("routes")
     print(f"  window applied          : 0x0 to {window:#x}, forward only")
-    if len(spread) == 1 and matched:
+    if len(spread) == 1 and paired:
         print(f"  every paired record lands {next(iter(spread)):+#x} from ours -- one convention, "
               f"not a disagreement")
     elif spread:
@@ -482,10 +484,18 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     unpaired = {norm(case["code"]) for case in extra} | {code for code, _ in lost}
     routed = sorted(code for code in shared if code not in unpaired)
     print(f"  codes routed the same   : {len(routed)} of {len(shared)}")
-    surplus = extra + [case for code in only_theirs for _, case in their_routes.get(code, [])]
+    # **`unrouted`, not `their_routes`.** A companion-only record with no `case_rva` is absent
+    # from the route map, and the code level defers its verdict to this reconciliation -- so
+    # taking the placed ones only would drop it from both, and a lane with nothing to subtract it
+    # from would exit 0 over a code one side alone has. Raised on review of #354.
+    surplus = extra + unrouted
     surplus_slotted = [case for case in surplus if from_a_table(case, sites, agreed)]
-    grouped = collections.Counter(rva(case["case_rva"]) for case in surplus)
-    print(f"  companion-only records  : {len(surplus)}")
+    grouped = collections.Counter(
+        rva(case.get("case_rva")) for case in surplus if case.get("case_rva")
+    )
+    unplaced_surplus = sum(1 for case in surplus if not case.get("case_rva"))
+    print(f"  companion-only records  : {len(surplus)}"
+          + (f" ({unplaced_surplus} with no address)" if unplaced_surplus else ""))
     for where, count in sorted(grouped.items(), key=lambda kv: -kv[1])[:12]:
         print(f"    -> {where:#x}  {count} record(s)")
     print(f"  `ioctl_map`-only records: {len(lost)}")
@@ -511,15 +521,6 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     def proves(cases):
         return sum(1 for case in cases if case.get("in_size") or case.get("out_size"))
 
-    def sizes_of(cases):
-        """code -> the lengths it proves, for the cases that prove one."""
-        claimed = {}
-        for case in cases:
-            for field in ("in_size", "out_size"):
-                if case.get(field) is not None:
-                    claimed.setdefault(norm(case["code"]), {})[field] = case[field]
-        return claimed
-
     # A length check this side *saw* and could not call exact is the tier below a proved size, and
     # it is the one worth printing beside the zero: `null` is "not proven" rather than "no
     # requirement", so a fixture where both answer null has asked the two implementations nothing.
@@ -528,22 +529,24 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     print()
     print(f"  sizes proved: `ioctl_map` {proved} (length checks seen: {checked}), "
           f"companion {theirs_proved}")
-    # **A size both sides prove is a claim they can disagree about**, and counting them says
-    # nothing about that: two implementations proving one length each, differently, reads as
-    # `1, 1`. Found by enumerating the ways these answers can differ rather than by waiting for
-    # the next review round; no ARM64 fixture proves a size on either side, so this is unexercised
-    # against a real driver and is here because the count was not a comparison.
-    ours_sized, theirs_sized = sizes_of(our_cases), sizes_of(their_cases)
+    # **Per paired route, not per code.** One code can be routed from more than one site with a
+    # different length proved at each, and keying by code alone keeps whichever record came last:
+    # `(32, 64)` against `(16, 64)` then ends at `64` on both sides and reads as agreement.
+    # Comparing on the pairs is the only place a case of one side has a counterpart in the other.
+    # Raised on review of #354, against the check added the round before.
     disputed = [
-        (code, field, ours_sized[code][field], theirs_sized[code][field])
-        for code in sorted(set(ours_sized) & set(theirs_sized))
+        (norm(mine["code"]), field, mine[field], yours[field])
+        for mine, yours in paired
         for field in ("in_size", "out_size")
-        if field in ours_sized[code]
-        and field in theirs_sized[code]
-        and ours_sized[code][field] != theirs_sized[code][field]
+        if mine.get(field) is not None
+        and yours.get(field) is not None
+        and mine[field] != yours[field]
     ]
     for code, field, mine, yours in disputed:
         print(f"    {code} {field}: `ioctl_map` {mine}, companion {yours}  <-- differs")
+    if proved or theirs_proved:
+        print(f"    compared on {len(paired)} paired route(s); a size on a record with no address,"
+              " or on one that did not pair, has no counterpart to compare against")
     if disputed:
         verdict = 1
     if not proved and not theirs_proved:
@@ -645,6 +648,21 @@ def selftest() -> int:
         ("a length only one side proves is not a finding",
          tool([dict(case("0x1", 0x100), in_size=32)]),
          companion([case("0x1", 0x100)]), 0),
+        # Round four: the same code at two sites with different lengths. Keying by code kept the
+        # last, so (32, 64) against (16, 64) ended at 64 on both sides and read as agreement.
+        ("one site's length disagreeing is a finding although the other's agrees",
+         tool([dict(case("0x1", 0x100), in_size=32), dict(case("0x1", 0x200), in_size=64)]),
+         companion([dict(case("0x1", 0x100), in_size=16),
+                    dict(case("0x1", 0x200), in_size=64)]), 1),
+        # And a companion-only record with no address at all: absent from the route map, so the
+        # code level's deferral to the route reconciliation would have lost it entirely. It has to
+        # be **attributable** — switch evidence at a table this side resolved — or the code level
+        # catches it first and the reconciliation is never asked, which is how the first draft of
+        # this case passed with the reconciliation mutated out.
+        ("an unplaced switch record still counts against the slots dropped",
+         tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
+         companion([case("0x1", 0x100), case("0x2", 0x900, switch),
+                    case("0x3", None, switch)]), 1),
         ("a build mismatch refuses to compare",
          tool([case("0x1", 0x100)]),
          companion([case("0x1", 0x100)], {"timestamp": 9, "size": 2}), 2),

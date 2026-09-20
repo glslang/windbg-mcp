@@ -413,6 +413,17 @@ def capture(config, report, save):
                 f"recovered device-control roots {roots} do not include the live driver "
                 f"object's {config['dispatch_rva']}"
             )
+        roots = [rva for rva in roots if int(rva, 16) == wanted]
+    elif len(roots) > 1:
+        raise RuntimeError(
+            f"this driver registers {len(roots)} device-control routines ({roots}); pass "
+            "--dispatch-rva to say which one to capture"
+        )
+    # **One dispatch routine, because that is what the diff compares.** The tool half asks
+    # `ioctl_map` about a single `--dispatch`, while `analysis.ioctl_map` takes the union of
+    # majors 14 and 15 -- so a driver registering different callbacks for device control and
+    # *internal* device control would have both typed here and the companion would answer for
+    # both, every code from the second reading as one only it found. Raised on review of #354.
     report["dispatch_rvas"] = roots
     save()
 
