@@ -14,6 +14,9 @@ end, idle/capacity reclamation, lease expiry, shutdown, or worker EOF. Only expl
 verifying exit before releasing its endpoint reservation. That result is NOT a detach/resume.
 Reservations are supervisor-local; orphan workers require operator recovery before another
 server/controller attaches. Non-kernel forced cleanup is unchanged. See `docs/sessions.md`.
+A late successful reply to an already-submitted `EndSession` is confirmed release, not unresolved
+ownership: the reader records it and cleans up even if the original caller is gone. A returned
+pre-commit attach failure claimed no target and must not retain an orphan either.
 
 **The hypervisor-development branch uses a candidate quit path, not the old GO/active-EndSession
 sequence.** Checked breakpoint removal, the engine's fixed `qd`, a no-target postcondition, then

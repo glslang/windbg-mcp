@@ -7,6 +7,11 @@ paths:
 
 ## The console a spawned child is given (`engine::without_a_console_window`)
 
+Worker stderr now travels through a private pipe forwarded by the supervisor, so the inherited
+stderr failure below is historical for workers. Console sharing remains unchanged, and this
+helper is also used by the TTD recorder. Do not restore inherited worker stderr: an unresolved
+orphan would hold the MCP host's stream open after supervisor exit.
+
 **A console-subsystem child of a console-*less* parent gets a brand-new, visible console**, and a
 GUI MCP client starts a stdio server without a console — so until #273 every worker spawn put a
 window on the desktop, titled with the exe's path, taking the foreground as it appeared. Measured

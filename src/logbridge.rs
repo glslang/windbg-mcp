@@ -1,7 +1,7 @@
 //! Every log record either role produces, in one place a client can read.
 //!
 //! On stdio this was free, and nobody had to build it. A worker's stderr is the supervisor's
-//! (`engine::spawn_worker` inherits it), the supervisor's is the MCP client's, and an operator
+//! (forwarded by the supervisor), the supervisor's is the MCP client's, and an operator
 //! asking "why did that session die" finds both in the log file their client already keeps.
 //! `--listen` takes that away: the server is on another machine, and its stderr goes to a console
 //! on that machine. Nothing about HTTP requires that, so it is a regression against stdio rather
@@ -40,10 +40,9 @@
 //! The supervisor stamps it with the session id on arrival, which is the one thing the worker does
 //! not know and the reader most wants.
 //!
-//! A worker keeps writing to its inherited stderr as well. That copy is not redundant: it is what
-//! an operator standing at the server machine reads, it survives a channel that has already
-//! failed, and — because it is unchanged — the stdio behaviour this module exists to preserve is
-//! preserved by *not touching it*.
+//! A worker also writes formatted records to a private stderr pipe. The supervisor forwards
+//! those bytes to its own stderr independently of this protocol channel. Only the supervisor
+//! owns the MCP host's write handle, so a preserved orphan cannot hold that host's EOF open.
 
 use std::cell::Cell;
 use std::collections::VecDeque;

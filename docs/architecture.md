@@ -39,12 +39,13 @@ process. Two things follow, and they are why it is built this way:
 - **`ttd.rs`** — locates `TTD.exe` and launches trace recording.
 - **`main.rs`** — role selection (supervisor or worker) and, for the supervisor, which transport it
   serves on: tokio with stdio, or HTTP when `--listen` names an address. **Logs go to
-  stderr** (under stdio, stdout is the JSON-RPC channel); workers inherit the supervisor's stderr, so everything
-  lands in the same place. A disconnect attempts concurrent release with a **five-second** grace.
+  stderr** (under stdio, stdout is the JSON-RPC channel); worker stderr is piped through the
+  supervisor, so both roles' records land in the same place. A disconnect attempts concurrent release with a **five-second** grace.
   Non-kernel workers that do not finish are terminated. **Unresolved remote kernel controllers
   survive**, including after their request channel closes; only explicit operator handoff may
-  terminate them. Their stdout is drained by an unjoined OS thread rather than Tokio's Windows
-  blocking pipe reader, so an orphan's open pipe cannot prevent the supervisor from exiting.
+  terminate them unless a late reply confirms release. Their stdout and stderr are drained by
+  unjoined OS threads rather than Tokio's Windows blocking pipe readers. An orphan's open pipes
+  therefore neither keep the supervisor runtime alive nor hold the MCP host's stderr open.
   A session running a `debug_batch` is told to abandon it by that same request, and
   then gets as long as the batch says it still needs on top of the grace — the only case where a
   disconnect waits longer, and never longer than the batch's own budget allowed.

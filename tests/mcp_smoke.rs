@@ -373,6 +373,7 @@ struct Server {
     rx: Receiver<Option<String>>,
     stdout_log: Arc<Mutex<Vec<String>>>,
     stderr_log: Arc<Mutex<Vec<String>>>,
+    stderr_eof: Arc<std::sync::atomic::AtomicBool>,
     /// Messages read while waiting for some other id (notifications, out-of-order replies).
     pending: VecDeque<Value>,
     next_id: i64,
@@ -435,10 +436,13 @@ impl Server {
         // the server mid-test, which would look like a protocol hang.
         let err = BufReader::new(child.stderr.take().expect("piped stderr"));
         let log = Arc::clone(&stderr_log);
+        let stderr_eof = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let eof = Arc::clone(&stderr_eof);
         std::thread::spawn(move || {
             for line in err.lines().map_while(Result::ok) {
                 log.lock().unwrap().push(line);
             }
+            eof.store(true, std::sync::atomic::Ordering::SeqCst);
         });
 
         Self {
@@ -447,6 +451,7 @@ impl Server {
             rx,
             stdout_log,
             stderr_log,
+            stderr_eof,
             pending: VecDeque::new(),
             next_id: 1,
         }
@@ -11976,6 +11981,7 @@ fn an_unresolved_kernel_worker_survives_supervisor_loss() {
             .unwrap_or_else(|| panic!("synthetic attach did not reach unresolved state: {reply}"));
         let worker = session["engine_pid"].as_u64().unwrap() as u32;
         let _cleanup = SyntheticKernelWorker::retain(worker);
+        let stderr_eof = Arc::clone(&server.stderr_eof);
         if abrupt {
             server.kill_supervisor();
         } else {
@@ -11986,6 +11992,10 @@ fn an_unresolved_kernel_worker_survives_supervisor_loss() {
         assert!(
             process_alive(worker),
             "unresolved worker exited after supervisor loss"
+        );
+        assert!(
+            stderr_eof.load(std::sync::atomic::Ordering::SeqCst),
+            "retained worker kept the MCP host's stderr open after supervisor exit (abrupt={abrupt})"
         );
     }
 }
@@ -16436,6 +16446,12 @@ fn ungraceful_detach(ended: &Value, text: &str) -> Option<String> {
             "end_session reported a failure, so no graceful detach was confirmed:\n{text}"
         ));
     }
+    let data = &ended["result"]["structuredContent"];
+    if data["released"] != true || data["recovery_required"] == true {
+        return Some(format!(
+            "end_session did not confirm a clean release; stop before another attach:\n{data}"
+        ));
+    }
     if text.contains("terminated") {
         return Some(format!(
             "the worker was killed instead of detaching, and DbgEng leaves a detached-but-halted \
@@ -16443,6 +16459,27 @@ fn ungraceful_detach(ended: &Value, text: &str) -> Option<String> {
         ));
     }
     None
+}
+
+#[test]
+fn detach_cleanup_requires_an_explicit_release_without_recovery() {
+    for data in [
+        json!({"released": false, "recovery_required": true}),
+        json!({"released": false}),
+        json!({"released": true, "recovery_required": true}),
+        json!({}),
+    ] {
+        let reply = json!({"result": {"isError": false, "structuredContent": data}});
+        assert!(
+            ungraceful_detach(&reply, "controller retained").is_some(),
+            "{reply}"
+        );
+    }
+    let reply = json!({"result": {"isError": false, "structuredContent": {
+        "released": true, "recovery_required": false, "worker_terminated": true
+    }}});
+    // Normal cleanup terminates the worker *after* confirmed native release.
+    assert!(ungraceful_detach(&reply, "released").is_none());
 }
 
 // ---- tier 5: recording a TTD trace, and reading it back -----------------------

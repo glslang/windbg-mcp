@@ -149,6 +149,9 @@ or unconfirmed worker loss becomes `kernel_unresolved`, with the reason and `eng
 Target liveness and detach remain unknown. Pending attaches and unresolved controllers refuse
 additional interrupts; an ACTIVE interrupt is not a safe timeout-recovery mechanism.
 
+An already-submitted release is different: a late successful `EndSession` reply confirms release,
+closes the session, and permits worker cleanup and endpoint reuse without a recovery handoff.
+
 Ordinary `end_session` reports `released: false`, `worker_terminated: false`, and
 `recovery_required: true`. No native teardown is queued for an unresolved controller. Idle/capacity
 reclamation, client lease expiry, and server shutdown cannot kill it automatically. On supervisor
