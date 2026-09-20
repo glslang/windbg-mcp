@@ -112,6 +112,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 83](#83-windbg-mcp-reachable_from_dispatch-does-not-follow-the-jump-tables-ioctl_map-now-reads--done-2026-09-19) — [windbg-mcp] `reachable_from_dispatch` does not follow the jump tables `ioctl_map` now reads — done (2026-09-19)
 - [Item 90](#90-windbg-mcp-the-resolver-reads-a-whole-function-so-scoping-from-does-not-narrow-it--done-2026-09-19) — [windbg-mcp] The resolver reads a whole function, so scoping `from` does not narrow it — done (2026-09-19)
 - [Item 89](#89-windbg-mcp-a-switch-that-would-not-resolve-is-the-one-incompleteness-the-report-does-not-count--done-2026-09-20) — [windbg-mcp] A switch that would not resolve is the one incompleteness the report does not count — done (2026-09-20)
+- [Item 85](#85-windbg-mcp-the-arm64-second-opinion-exists-and-has-never-been-diffed--done-2026-09-20) — [windbg-mcp] The ARM64 second opinion exists and has never been diffed — done (2026-09-20)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -3991,3 +3992,101 @@ answered is not among them, which is the mutation this fix could have been.
 paragraph and its `Bound hit: no` arm, `structured::Reachability::unresolved_jumps`, and the third
 and fourth reachability bullets of `docs/limitations.md` with the `reachable_from_dispatch` row of
 `docs/structured-results.md`.
+
+## 85. [windbg-mcp] The ARM64 second opinion exists and has never been diffed — **done** (2026-09-20)
+
+**Repo:** `windbg-mcp`.
+
+`tools/ghidra_oracle/` runs Ghidra and Driver Buddy over an x64 driver and diffs their control
+codes against `ioctl_map`'s. Nothing did that on **ARM64**, although a second implementation --
+the Binary Ninja companion [`binja-windbg-mcp`](https://github.com/glslang/binja-windbg-mcp) -- had
+already published figures for two ARM64 drivers that agreed with this server's. The agreement had
+been read out of two documents by hand, and nothing failed when they diverged.
+
+**`tools/binja_oracle/` is the lane**, in two halves that each run on the machine that can run
+them. `oracle.py` replays a companion capture through `binja_windbg_mcp.analysis.ioctl_map`, takes
+this server's answer over stdio -- locally on Windows, or through `ssh` from the Mac, which is what
+makes it runnable from the bench this repo is edited on -- and diffs them by code and by route,
+exiting non-zero when they disagree. `capture.py` makes the captures, because the second half of
+this item turned out to need them.
+
+**Three differences are reporting rather than disagreement, and each is subtracted where it can be
+seen.** The **build**, compared as `timestamp`+`size`+PDB before anything else; the **case address
+convention**, the companion naming *"the first source-mapped statement"* and this walk the block
+the branch enters, paired inside a stated forward window rather than a fitted constant; and the
+**default-rejection table slots**, which the companion publishes and this walk drops, accounted for
+by `entries` minus `followed`, a count this side already gives, so no arm has to be guessed to be
+the default. `--selftest` pins all three against the cases where the lane must still fail.
+
+**The first run retired this item's own table.** It claimed the two agreed on ARM64 `mountmgr`
+figure for figure. Measured 2026-09-20: the companion's capture pinned `timestamp 2826447139`,
+`size 0x21000`, PDB `93E8BD6D...` and the driver the debuggee runs is `timestamp 1169727331`,
+`size 0x22000`, PDB `60A98336...`, both calling themselves `10.0.26100.1` with different file
+hashes. **The two halves had never been compared on the same binary**, and no RVA in one is an RVA
+in the other -- which is why the identity gate is the lane's first act, and why nothing in that
+table could have been checked by hand.
+
+**So the second half of this item was making the captures**, and Binary Ninja **Personal has no
+headless API**. `capture.py` starts the real GUI in a disposable `BN_USER_DIRECTORY` with a
+generated plugin, the mechanism `tools/bn_followup_probe.py` already used for the CLRBHB probes.
+What it cost beyond that mechanism was three things the plan did not have:
+
+- **The NT types.** The adapter reads `_DRIVER_OBJECT`, `_IO_STACK_LOCATION` and `_UNICODE_STRING`
+  out of the view, and the companion's own fixture got them from a PDB. They are declared in the
+  probe instead, and every offset was checked against the live ARM64 kernel with `dt`:
+  `Parameters` at 8 and `DeviceObject` at 0x28, `MajorFunction` at 0x70 in a 0x150-wide struct,
+  `_IRP` 0xd0 wide with `Tail.Overlay.CurrentStackLocation` at 0xb8. All five agree with the
+  layouts the companion's `mountmgr` fixture recorded from the PDB, and the probe refuses if the
+  view parses them into anything else.
+- **`__security_push_cookie` destroys the parameter binding.** Applying `DriverEntry`'s prototype
+  is not enough on ARM64: the helper really does preserve the argument registers and is not
+  declared to, so Binary Ninja models it as *returning* `x0` and `x1` and the typed parameter dies
+  at the first call. Measured on `rdyboost`: the signature applies and the table fill still reads
+  `*(x0 + 0x70) = SmdDispatchGeneric`. The probe types the **entry register** as well, which is
+  the same claim the prototype makes, and then checks the recovered `MajorFunction[14]` against
+  the live driver object's -- so a mistyped variable is a refusal rather than a published reading.
+- **A driver's dispatch is not always registered near its entry.** The prototype is applied
+  outward from the entry a call at a time, bounded, and the routine that takes the dispatch
+  address is the last resort. `rdyboost` needed all of it.
+
+**Measured 2026-09-20, all three against `windbg-mcp 0.18.0+g30c4af94` and the live ARM64 target:**
+
+| fixture | identity | codes | routes | verdict |
+|---|---|---|---:|---|
+| ARM64 HEVD | matches | 29 = 29 | 29 of 29, every one `+0x18` | agree |
+| ARM64 `mountmgr` 10.0.26100.1 | matches | 24 = 24 | 24 of 24, 48 records | agree |
+| ARM64 `rdyboost` | matches | 17 agreed, **2 only the companion** | 17 of 17 | **differ** |
+
+`mountmgr`'s 45 companion-only records are exactly the 45 table slots this side dropped
+(`21-5`, `21-5`, `17-4`), landing on the two destinations no route reaches -- so at route level
+too the difference is reporting.
+
+**`rdyboost` is the fixture that separates them, and it found a defect on both sides.** The lane
+pointed at two codes only the companion has, at `0xf010` and `0xef14` -- which are the two sites
+`ioctl_map` reports in `untracked`, so the two implementations agree about *where* they could not
+read something. Reading the target settles what is there, and it is an A64 **conditional-compare
+chain**: `rdyboost+0xef10` is `cmp w8,w11` / `ccmpne w8,w12,#4` / `ccmpne w8,w10,#4` / `beq` with
+`w11 = 0x0056c008` and `w10 = 0x000700a0`, and `rdyboost+0xf00c` is `cmp w8,#0` / `ccmpne w8,w10,#0`
+/ `bne` with `w10 = 0x00224194`. **Neither implementation reads one**, and they fail differently:
+the companion publishes the chain's *first* operand as a case -- including a meaningless
+`0x00000000` -- and misses the `ccmp` operands, while this walk publishes neither and records the
+site. So `ioctl_map` is missing at least `0x000700a0` and `0x00224194` on this driver, which is
+[item 92](./FOLLOWUPS.md#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read).
+The companion's half is a finding for its own repository and is not filed here.
+
+**What the entry expected and did not get.** It expected the Ghidra lane to grow an ARM64 mode and
+a host to be stood up for it. Neither happened: the benches are disjoint -- Ghidra needs a Windows
+host with a JDK and PyGhidra, this needs a Python checkout and no disassembler at all -- so the
+second lane is a second directory, and the reading discipline is shared by pointing at the x64
+README rather than by sharing code. It also expected `rdyboost` to answer whether a decompiler
+proves the buffer sizes item 82 was about. It does not: the companion proves **no** size on any of
+the three fixtures, and this side proves none either while seeing 13 length checks on `rdyboost` --
+so the sizes question is untouched by the second opinion and remains item 91's.
+
+**Where it landed:** `tools/binja_oracle/oracle.py` (the diff and `--selftest`),
+`tools/binja_oracle/bn_capture.py` and `capture.py` (the owned-GUI capture), and
+`tools/binja_oracle/README.md`, which carries the bench, the three normalisations and the figures
+above. The captures themselves are **not** checked in: each is a reading of the build the debuggee
+is running at the time, and a stale one would be the exact failure this lane's identity gate
+exists to catch.
+
