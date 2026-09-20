@@ -12671,9 +12671,21 @@ fn a_pool_walk_takes_this_servers_deadline_not_the_walkers_default() {
         ("WINDBG_MCP_CALL_TIMEOUT_SECS", "90"),
         ("RUST_LOG", "windbg_mcp=debug"),
     ]);
+    // A **top-level** JSON-RPC error is deliberately still fatal here: `OpenError::Unavailable`
+    // is the only open failure shaped that way (`server.rs`), and it means no worker could be
+    // started at all -- a broken host or a broken server, which is the last thing a test should
+    // stand down over. Only the tool-level timeout below is a reason not to run.
     let opened = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&opened, "open_dump");
     if is_tool_error(&opened) {
+        // **Only a timeout stands this test down.** `is_tool_error` alone would also swallow a
+        // debugger regression opening the checked-in fixture, and a test that reports "too slow
+        // to stage" over that has given up the coverage it was protecting. Raised on review.
+        let error = &opened["result"]["structuredContent"]["error"];
+        assert_eq!(
+            error["category"], "timeout",
+            "`open_dump` failed for a reason this test must not stand down over: {error}"
+        );
         skip("the sample dump did not open inside the 90s call budget this test imposes");
         return;
     }
@@ -12737,6 +12749,13 @@ fn a_pool_query_with_no_time_to_walk_is_refused_rather_than_run() {
     let opened = server.call_tool("open_dump", json!({ "path": dump }), TARGET_STEP);
     assert_no_error(&opened, "open_dump");
     if is_tool_error(&opened) {
+        // Narrowed with its sibling's, and for the same reason: a stand-down that also covers a
+        // debugger regression on the checked-in fixture costs more than the flake it prevents.
+        let error = &opened["result"]["structuredContent"]["error"];
+        assert_eq!(
+            error["category"], "timeout",
+            "`open_dump` failed for a reason this test must not stand down over: {error}"
+        );
         skip("the sample dump did not open inside a 10s call budget on this machine");
         return;
     }
