@@ -274,6 +274,22 @@ reboot/reset, installed-server replacement, or VELKO change was made. This was p
 with a verified-running guest, not successful cancellation or detach. Automatic recovery remains
 unimplemented and unvalidated.
 
+## Direct-COM cross-build follow-up, 2026-09-20
+
+The retained dbgscope diagnostic now includes a raw Windows-binding example with no dbgscope
+API calls, callbacks, or engine-option changes. Against unused synthetic endpoints, the same
+executable on DbgEng `10.0.29617.1000` and System32 `10.0.26100.1` each recorded 150 EXIT calls
+returning `S_OK` without `WaitForEvent` returning before an external 100-second deadline.
+The harness verified actual loaded modules, reclaimed only its synthetic children, and checked
+both processes and endpoints were gone. No live profile, target break, or guest was used.
+
+This establishes that dbgscope's callback/watchdog implementation is not required for the
+unconnected cancellation failure, and that the failure is not unique to the newer engine.
+It does not establish synchronized behavior on the older build or explain the full post-ACTIVE
+freeze. The [direct-COM comparison](https://github.com/glslang/dbgscope/blob/fix/safe-kernel-detach/docs/kernel-exit-watchdog.md#direct-com-comparison-across-two-engine-builds)
+records the reproduction, hashes, measurements, and test scope. Production library/server code
+and the consumer dependency pin are unchanged by this diagnostic.
+
 ## Local evidence index
 
 These filenames identify the retained bench artifacts, not portable repository inputs:
@@ -301,3 +317,4 @@ These filenames identify the retained bench artifacts, not portable repository i
 - `timeout-recovery-health-20260919-1732.md`: independent same-boot uptime checks and free endpoint after that recovery.
 - `exit-watchdog-live-20260920-080437.log`: synchronized no-ACTIVE watchdog trace, native return values, thread stacks, and guarded probe reclamation.
 - `exit-watchdog-live-health-20260920.md`: independent post-reclamation health and process checks.
+- `raw-kernel-exit-bundled-20260920-082923.log` and `raw-kernel-exit-system-20260920-082938.log`: direct-COM unconnected comparison on two loaded engine versions.
