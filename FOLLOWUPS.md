@@ -1935,9 +1935,10 @@ than one logical processor. That is a shipped way to *repeat* the one-vCPU run, 
 four, and it re-measures nothing recorded here. What is still open is everything above it: the
 cause, the controlled one-vs-four comparison, and the four-vCPU validation. Keep this distinct from
 [dbgscope #173](https://github.com/glslang/dbgscope/issues/173)'s shared live-kernel `qd`
-validation -- which now has its NT half: on 2026-09-20 three attach/detach cycles against a
-disposable four-processor NT guest left it executing on the same boot every time, with the frozen
-window measured from outside the debugger rather than inferred
+validation -- which now has its NT half: on 2026-09-20 five attach/detach cycles against a
+disposable four-processor NT guest left it executing on the same boot every time, two of them
+holding it unreachable for close to two minutes, with the frozen window measured from outside the
+debugger rather than inferred
 ([`docs/smoke-test.md`](./docs/smoke-test.md), `examples/kernel_detach_regression.ps1`). That says
 nothing about the hypervisor case below it --
 and [WinDbg-Feedback #396](https://github.com/microsoft/WinDbg-Feedback/issues/396)'s unconnected

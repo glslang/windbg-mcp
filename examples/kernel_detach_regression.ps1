@@ -30,7 +30,20 @@ param(
     [ValidateRange(1,10)][int]$Cycles=1,
     [string]$TestName='a_live_kernel_session_attaches_coexists_and_detaches_cleanly',
     # The guest's WinRM port, which is what the frozen-window probe knocks on.
-    [ValidateRange(1,65535)][int]$ProbePort=5985
+    [ValidateRange(1,65535)][int]$ProbePort=5985,
+    # What counts as "the target was halted": consecutive refused knocks, and how long they must
+    # span. One is a network blip on any network worth testing over; two in a row is a machine
+    # that stopped.
+    #
+    # **This is an instrument, and it has a resolution.** A knock costs its own timeout when it
+    # goes unanswered, so a halt shorter than about twice that cannot be seen however the bar is
+    # set -- and a *warm* detach-only run holds the target for only a few hundred milliseconds,
+    # which is under it. That is reported rather than papered over: the run fails saying the test
+    # does not hold the target long enough to be seen, and the fix is to run one that does
+    # (`-TestName a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` walks every
+    # committed pool page over the wire, with the target halted throughout).
+    [ValidateRange(1,100)][int]$MinSilentSamples=2,
+    [ValidateRange(0.0,600.0)][double]$MinSilentSeconds=0.5
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -56,18 +69,30 @@ function Read-GuestHealth {
 
 # Resolved here rather than taken as a parameter: the string holds the debug key, and anything on
 # a command line is readable by every process on this machine.
+#
+# **`-Profile` wins, and a leftover `WINDBG_MCP_SMOKE_KERNEL` that disagrees with it stops the
+# run.** Taking the variable first looks harmless -- it is what the tier's own documentation tells
+# you to set -- and it is the one mistake this script must not make: the health checks and the
+# frozen-window probe are aimed at `-ComputerName`, so a stale variable would halt one machine
+# while this script certified another. Neither value is printed on the mismatch; which of the two
+# is wrong is the operator's to work out from where they came from.
 function Resolve-Connection {
-    if(-not [string]::IsNullOrWhiteSpace($env:WINDBG_MCP_SMOKE_KERNEL)){return $env:WINDBG_MCP_SMOKE_KERNEL}
     $path=Join-Path $env:USERPROFILE '.windbg-mcp\profiles.json'
     if($env:WINDBG_MCP_PROFILES){$path=$env:WINDBG_MCP_PROFILES}
-    if(-not (Test-Path -LiteralPath $path)){throw "No WINDBG_MCP_SMOKE_KERNEL set and no profile file at $path"}
+    if(-not (Test-Path -LiteralPath $path)){throw "No profile file at $path, so '$Profile' cannot be resolved"}
     $profiles=Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
     # Names match the server's own rule: case-insensitive, with - _ . equivalent.
     $wanted=$Profile.ToLowerInvariant() -replace '[-_.]',''
+    $resolved=$null
     foreach($named in $profiles.PSObject.Properties){
-        if(($named.Name.ToLowerInvariant() -replace '[-_.]','') -eq $wanted){return $named.Value}
+        if(($named.Name.ToLowerInvariant() -replace '[-_.]','') -eq $wanted){$resolved=$named.Value}
     }
-    throw "Profile '$Profile' is not in $path"
+    if($null -eq $resolved){throw "Profile '$Profile' is not in $path"}
+    if(-not [string]::IsNullOrWhiteSpace($env:WINDBG_MCP_SMOKE_KERNEL) -and
+       $env:WINDBG_MCP_SMOKE_KERNEL -ne $resolved) {
+        throw "WINDBG_MCP_SMOKE_KERNEL is set and does not match profile '$Profile'. One of them names a different target from the one this script is checking over WinRM, and attaching would halt that one instead. Clear the variable or correct the profile; neither value is printed here because both carry the debug key."
+    }
+    return $resolved
 }
 
 # One TCP knock with its own short clock. Deliberately not Test-NetConnection: that takes seconds
@@ -79,14 +104,14 @@ function Resolve-Connection {
 # collects nothing at all. That is not hypothetical: it is what the first run of this script did,
 # and the guard below correctly refused to call the result a pass.
 $probeSource=@'
-param($Target,$Port,$Seconds,$Interval,$Path)
+param($Target,$Port,$Seconds,$Interval,$Timeout,$Path)
 $deadline=[DateTime]::UtcNow.AddSeconds($Seconds)
 while([DateTime]::UtcNow -lt $deadline){
     $client=New-Object Net.Sockets.TcpClient
     $answered=$false
     try{
         $async=$client.BeginConnect($Target,$Port,$null,$null)
-        $answered=$async.AsyncWaitHandle.WaitOne(1000) -and $client.Connected
+        $answered=$async.AsyncWaitHandle.WaitOne($Timeout) -and $client.Connected
     }catch{
         $answered=$false
     }finally{
@@ -110,7 +135,7 @@ try {
         # interval is short because the window it has to land inside is short -- a detach-only
         # test holds the target for a couple of seconds.
         $probeLog=Join-Path ([IO.Path]::GetTempPath()) ("windbg-mcp-frozen-probe-{0}.csv" -f [Guid]::NewGuid())
-        $probe=Start-Job -ScriptBlock $probeBlock -ArgumentList $ComputerName,$ProbePort,600,250,$probeLog
+        $probe=Start-Job -ScriptBlock $probeBlock -ArgumentList $ComputerName,$ProbePort,600,50,500,$probeLog
         $testExit=1
         $samples=@()
         try {
@@ -149,17 +174,36 @@ try {
 
         $answered=@($samples | Where-Object { $_.Answered })
         $silent=@($samples | Where-Object { -not $_.Answered })
-        Write-Host "Probe: $($samples.Count) samples, $($answered.Count) answered, $($silent.Count) silent"
+        # **The longest *consecutive* run, not the count.** One refused connection is a network
+        # blip on any network worth testing over, and taking `silent.Count > 0` as proof of a halt
+        # would let a blip certify an experiment whose whole claim is that the target stopped. A
+        # halt is a run of them -- the 32-second one measured here was 26 consecutive -- so what
+        # has to clear the bar is a sustained window.
+        $longest=@()
+        $current=@()
+        foreach($sample in $samples) {
+            if($sample.Answered) {
+                if($current.Count -gt $longest.Count){$longest=$current}
+                $current=@()
+            } else {
+                $current+=$sample
+            }
+        }
+        if($current.Count -gt $longest.Count){$longest=$current}
+        $span=0.0
+        if($longest.Count -gt 1) {
+            $span=($longest[-1].At - $longest[0].At).TotalSeconds
+        }
+        Write-Host ("Probe: {0} samples, {1} answered, {2} silent; longest silent run {3} samples over {4:N1}s" -f $samples.Count, $answered.Count, $silent.Count, $longest.Count, $span)
         if($samples.Count -eq 0) {
             throw 'The frozen-window probe collected nothing, so this run cannot say the target was ever halted. The health check above is not evidence on its own.'
         }
-        if($silent.Count -eq 0) {
+        if($longest.Count -lt $MinSilentSamples -or $span -lt $MinSilentSeconds) {
             # The postcondition is vacuous without this: a guest that was never halted is up before
             # and after whatever the debugger did, including nothing at all.
-            throw "The guest answered on every probe, so it was never halted and this run says nothing about detaching from a halted kernel. Check that the attach landed."
+            throw "The guest was never silent for a sustained window ($($longest.Count) consecutive samples over $([math]::Round($span,1))s, wanted $MinSilentSamples over $MinSilentSeconds s), so this run says nothing about detaching from a halted kernel. Check that the attach landed, or that the test holds the target long enough to be seen."
         }
-        $window=($silent | Measure-Object -Property At -Minimum -Maximum)
-        Write-Host ("PASS: halted from {0:HH:mm:ss} to {1:HH:mm:ss} UTC, then released; WinRM answered twice and uptime advanced without a reboot." -f $window.Minimum, $window.Maximum)
+        Write-Host ("PASS: halted from {0:HH:mm:ss} to {1:HH:mm:ss} UTC ({2:N1}s unreachable), then released; WinRM answered twice and uptime advanced without a reboot." -f $longest[0].At, $longest[-1].At, $span)
     }
 } finally {
     $env:WINDBG_MCP_SMOKE_KERNEL=$previousKernel
