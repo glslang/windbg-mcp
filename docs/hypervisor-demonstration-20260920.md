@@ -6,8 +6,9 @@ guest-health check.** It is not a successful end-to-end recovery demonstration.
 
 Open work is tracked in [windbg-mcp #355](https://github.com/glslang/windbg-mcp/issues/355)
 and [FOLLOWUPS.md item 93](../FOLLOWUPS.md#93-windbg-mcp--dbgscope-multiprocessor-hypervisor-stops-after-a-temporary-breakpoint-and-detach).
-The guest has since recovered. The owner plans to switch the disposable VM to one vCPU for a
-separate demonstration; that change and its result are not part of these measurements.
+The guest has since recovered. The owner's later one-vCPU change and successful demonstration
+are recorded [separately](./hypervisor-demonstration-single-vcpu-20260920.md); they do not alter
+the four-vCPU measurements or close the follow-up below.
 
 ## Measured artifacts
 

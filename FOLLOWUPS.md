@@ -1907,9 +1907,10 @@ debug-break check is false; a hypercall-resume origin has not been established. 
 number of continues nor explicit per-processor resumes is a validated remedy.
 
 **Why deferred:** the guest has recovered without rebooting, but the mechanism and dependable
-post-breakpoint teardown remain unproven. The owner plans a one-vCPU disposable-VM comparison
-so the live demonstration can proceed independently; the CPU change and demonstration are not
-yet measured. No host-wide security/scheduler change is part of this follow-up.
+post-breakpoint teardown remain unproven. After the owner changed the disposable VM to one vCPU,
+the [one-vCPU demonstration](./docs/hypervisor-demonstration-single-vcpu-20260920.md) passed one
+breakpoint-hit/detach run with independently healthy same-boot execution. This does not close
+the multiprocessor investigation. No host-wide security/scheduler change is part of this follow-up.
 
 **What closes it:** preserve a portable bounded reproducer; obtain each post-breakpoint stop's
 caller/exception context with correct processor-specific memory context; compare one and four
