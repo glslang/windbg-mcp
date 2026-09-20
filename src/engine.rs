@@ -1410,6 +1410,8 @@ pub enum OpenError {
     },
     /// The wait was abandoned. The open may still be running and may still land.
     Timeout { id: String, message: String },
+    /// Remote controller ownership is unresolved; ordinary teardown cannot recover it.
+    RecoveryRequired { id: String, message: String },
 }
 
 /// A slot taken for an open that has not registered its session yet.
@@ -2130,8 +2132,9 @@ impl Sessions {
                     summary: report.summary.unwrap_or_default(),
                 })
             }
-            Err(EngineError::Timeout(message) | EngineError::RecoveryRequired(message)) => {
-                Err(OpenError::Timeout { id, message })
+            Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
+            Err(EngineError::RecoveryRequired(message)) => {
+                Err(OpenError::RecoveryRequired { id, message })
             }
             Err(e) => {
                 let message = e.to_string();
@@ -2163,11 +2166,7 @@ impl Sessions {
                             "the attach returned without a confirmed initial stop",
                         );
                         session.delivered.store(true, Ordering::Release);
-                        return Err(OpenError::PostCommit {
-                            id,
-                            message,
-                            report_only: false,
-                        });
+                        return Err(OpenError::RecoveryRequired { id, message });
                     }
                     // The target exists and the wait failed; or it opened and only the diagnostic
                     // failed. Either way the session stays: making the caller re-open to get a

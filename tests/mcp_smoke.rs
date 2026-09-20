@@ -11982,6 +11982,14 @@ fn an_unresolved_kernel_worker_survives_supervisor_loss() {
         let worker = session["engine_pid"].as_u64().unwrap() as u32;
         let _cleanup = SyntheticKernelWorker::retain(worker);
         let stderr_eof = Arc::clone(&server.stderr_eof);
+        let failure = &reply["result"]["structuredContent"];
+        assert_eq!(failure["error"]["category"], "recovery_required");
+        assert_eq!(failure["target"], "unknown");
+        assert_eq!(failure["error"]["session_id"], session["session_id"]);
+        let advice = text_of(&reply["result"]);
+        assert!(advice.contains("kernel_handoff_pid"));
+        assert!(!advice.contains("may still land"));
+        assert!(!advice.contains("ends it outright"));
         if abrupt {
             server.kill_supervisor();
         } else {

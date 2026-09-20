@@ -146,6 +146,8 @@ pull — see [`remote-listener.md`](./remote-listener.md).
 A per-call timeout abandons the *wait*, not the native job. A remote kernel timeout, failed release,
 or unconfirmed worker loss becomes `kernel_unresolved`, with the reason and `engine_pid` in
 `session_status`. This is sticky: a late attach result does not make the session usable again.
+The failed opener returns `error.category: "recovery_required"`, its session ID, and
+`target: "unknown"`, not advice that an ordinary pending open may still become usable.
 Target liveness and detach remain unknown. Pending attaches and unresolved controllers refuse
 additional interrupts; an ACTIVE interrupt is not a safe timeout-recovery mechanism.
 
