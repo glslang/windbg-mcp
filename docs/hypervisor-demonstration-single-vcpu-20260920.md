@@ -70,3 +70,10 @@ Raw logs remain local and are not public attachments. SHA-256 identifiers:
 The temporary local harness passed Windows PowerShell 5.1 parsing and ran with
 `-BreakpointHit -ExpectedProcessors 1`, exiting zero. Its machine-specific wiring remains
 uncommitted; this is a recorded demonstration, not a new portable regression test.
+
+**The sequence is a committed one since 2026-09-20**, in the hypervisor tier behind
+`WINDBG_MCP_SMOKE_HYPERVISOR_BREAKPOINT_HIT` and driven by
+[`examples/hypervisor_detach_regression.ps1 -BreakpointHit`](../examples/hypervisor_detach_regression.ps1),
+which reads the processor count over WinRM rather than taking it as a parameter and refuses the
+gate above one. That makes this run repeatable; it does not make it a second measurement, and
+nothing on this page was re-taken.

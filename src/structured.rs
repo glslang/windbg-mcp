@@ -662,7 +662,11 @@ pub struct RunToReport {
     pub verdict: RunToVerdict,
     /// The address asked for, after resolution.
     pub target: String,
-    /// Where the target actually stopped, when it stopped somewhere else.
+    /// Where the target actually stopped.
+    ///
+    /// Equal to [`Self::target`] on a `hit`, the other address on a `stopped_elsewhere`, and
+    /// **absent** on a `timeout` or a `target_gone` — where there is no position to report and
+    /// echoing the address asked for would say execution got there.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<String>,
     /// The wait this verdict was reached under.
@@ -1341,6 +1345,57 @@ pub enum BreakpointKind {
     Data,
     /// A type this build does not name. `kind_code` is the engine's own value.
     Other { kind_code: u32 },
+}
+
+/// Every breakpoint a session holds — what `bl` renders, as data.
+///
+/// **A read that failed is the `error` branch, not an empty list**, which is the one way this
+/// differs from [`BreakpointSet::breakpoints`]. There the listing is an inspection taken after a
+/// mutation that has already happened, so it is best-effort and empty when it could not be read —
+/// an inspection that fails must not be reported as the mutation failing. Here the listing *is*
+/// the answer, and a caller that could not tell "the session holds none" from "nobody could ask"
+/// would clear nothing and conclude the target was clean.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BreakpointList {
+    /// The session's breakpoints, in the engine's own order.
+    pub breakpoints: Vec<BreakpointInfo>,
+}
+
+/// What a `clear_breakpoints` removed, and what the session is left holding.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BreakpointsCleared {
+    /// Ids the engine confirmed it removed.
+    ///
+    /// **This, and not `status`, is what says the target is clean.** A call that asked and was
+    /// refused every removal is an error, but a call that removed *some* of what it named is not —
+    /// it mutated the target, and reporting it as a failure would send a caller to retry a
+    /// removal by an id the engine has since handed to a different breakpoint. So a partial
+    /// removal succeeds, with the rest named in [`Self::not_removed`].
+    pub removed: Vec<u32>,
+    /// The ones this call named, could not remove, and has therefore left armed.
+    ///
+    /// Normally empty. Non-empty on a live target means an `int 3` is still patched into it: read
+    /// it before resuming or detaching.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub not_removed: Vec<BreakpointRemoval>,
+    /// What the session holds afterwards — or `null` where the listing itself could not be read.
+    ///
+    /// **Nullable rather than empty, unlike every other listing here**, because after clearing
+    /// everything an empty list is the success state: the two meanings [`BreakpointSet`] can hold
+    /// apart by context ("this call just set one, so empty is a failed read") collide on this
+    /// result, and collapsing them would report an unreadable session as a clean one.
+    pub remaining: Option<Vec<BreakpointInfo>>,
+}
+
+/// One breakpoint a removal named and did not get.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct BreakpointRemoval {
+    /// The id as it was asked for. It may name nothing at all — the engine reuses the ids of
+    /// removed breakpoints, so an id held across a removal is not an identity.
+    pub id: u32,
+    /// The engine's own reason, carried rather than summarised: "no such breakpoint" and a link
+    /// that dropped mid-removal are the same shape here and want different next moves.
+    pub reason: String,
 }
 
 // **The prose on the two types below is `//` and not `///` wherever a caller does not need it**,

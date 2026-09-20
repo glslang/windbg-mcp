@@ -46,6 +46,24 @@
       "wire": 2837
     },
     {
+      "annotations": 115,
+      "description": 491,
+      "inputSchema": 314,
+      "modelVisible": 857,
+      "name": "breakpoints",
+      "outputSchema": 2396,
+      "wire": 3399
+    },
+    {
+      "annotations": 117,
+      "description": 331,
+      "inputSchema": 691,
+      "modelVisible": 1080,
+      "name": "clear_breakpoints",
+      "outputSchema": 2728,
+      "wire": 3956
+    },
+    {
       "annotations": 124,
       "description": 1292,
       "inputSchema": 640,
@@ -443,12 +461,12 @@
     },
     {
       "annotations": 114,
-      "description": 584,
+      "description": 755,
       "inputSchema": 3445,
-      "modelVisible": 4084,
+      "modelVisible": 4255,
       "name": "set_breakpoint",
       "outputSchema": 2585,
-      "wire": 6814
+      "wire": 6985
     },
     {
       "annotations": 123,
@@ -551,15 +569,15 @@
     }
   ],
   "totals": {
-    "annotations": 6440,
-    "description": 35441,
-    "inputSchema": 54016,
+    "annotations": 6672,
+    "description": 36434,
+    "inputSchema": 55021,
     "instructions": 2003,
-    "modelVisible": 92665,
-    "outputSchema": 154415,
-    "payload": 255243,
-    "tools": 61,
-    "wire": 255171,
+    "modelVisible": 94773,
+    "outputSchema": 159539,
+    "payload": 262771,
+    "tools": 63,
+    "wire": 262697,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

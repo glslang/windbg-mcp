@@ -1048,6 +1048,29 @@ pub struct BreakpointArgs {
     pub session_id: Option<String>,
 }
 
+// **Refuses unknown fields, by [`BreakpointArgs`]' criterion and not by habit.** A dropped field
+// here is a removal that did not happen on a target the caller then resumes or detaches, which is
+// the same currency that struct's comment is denominated in: a wrong answer against a live `int 3`.
+//
+// The two selectors are `Option`s rather than one enum because a tagged union renders as a schema
+// composition clients handle unevenly (the note above [`SessionArgs`]), and the combination the
+// enum would make unspellable is refused in the tool instead — including *neither*, which an enum
+// could not have caught either.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ClearBreakpointsArgs {
+    /// Breakpoint ids to remove, as the debugger numbers them (what `bc` takes).
+    #[serde(default)]
+    pub ids: Option<Vec<u32>>,
+    /// Remove every breakpoint the session holds. Pass this or `ids`, not both and not neither.
+    #[serde(default)]
+    pub all: Option<bool>,
+    /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
+    /// session and be refused if its target was replaced or closed.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 pub struct PositionArgs {
     /// TTD position to travel to, e.g. "12:0" or "0" for the start of the trace.
@@ -4006,6 +4029,98 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
+    /// Every breakpoint this session holds (`bl`), as records: id, where it fires, whether it is
+    /// enabled or still deferred, the command it runs on each hit, and what a data breakpoint
+    /// watches. The inventory to check before resuming or detaching a live target — a breakpoint
+    /// left armed is an `int 3` patched into it. A read that fails is an error rather than an
+    /// empty list, so "none" always means none.
+    #[rmcp::tool(
+        annotations(
+            title = "List breakpoints",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            // **True, by the structural rule the whole surface is annotated on**
+            // (`only_the_tools_that_cannot_reach_the_network_are_closed_world`): anything that
+            // reaches the engine may reach the network, and over KDNET the target is the network.
+            // Reading the engine's breakpoint objects looks local, and "looks local" is not the
+            // criterion — the four tools that say `false` are the ones with no engine behind them
+            // at all.
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::BreakpointList>>()
+    )]
+    async fn breakpoints(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(args.session_id.as_deref(), EngineOp::Breakpoints)
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Remove breakpoints by id, or all of them (`bc`), and report what the session is left
+    /// holding. Pass `ids` or `all: true` — a call naming neither is refused rather than treated
+    /// as "everything". Each removal is reported separately: one that failed leaves that
+    /// breakpoint armed in the target, and is named rather than counted.
+    #[rmcp::tool(
+        annotations(
+            title = "Clear breakpoints",
+            read_only_hint = false,
+            // It unpatches the target's code, which is a write to the debuggee by any other name.
+            destructive_hint = true,
+            // **Not idempotent, and the reason is the engine's and not this tool's**: ids of
+            // removed breakpoints are reused, so a repeat of a by-id call can remove a different
+            // breakpoint than the one it named the first time.
+            idempotent_hint = false,
+            // Not a formality here: on a live kernel a removal is a `DbgKdRestoreBreakPoint`
+            // packet to the target, which is as far outside this process as a call gets.
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::BreakpointsCleared>>()
+    )]
+    async fn clear_breakpoints(
+        &self,
+        Parameters(args): Parameters<ClearBreakpointsArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // **Refused here rather than resolved**, and both halves matter. `all` and `ids` together
+        // is a caller who means two different things, and guessing which would be guessing at a
+        // removal. Neither is the case this refusal exists for: an omitted selector reading as
+        // "all" would make a typo in the one field clear every breakpoint on a live kernel.
+        let ids = match (args.ids, args.all.unwrap_or(false)) {
+            (Some(_), true) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    "pass `ids` or `all: true`, not both: they name different removals and \
+                     nothing here can tell which was meant."
+                        .to_string(),
+                    args.session_id,
+                );
+            }
+            (None, false) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    "name what to remove: `ids` for particular breakpoints, or `all: true` for \
+                     every breakpoint currently set. An omitted selector is not taken as `all` — \
+                     clearing a live target's breakpoints is not what a missing field should mean."
+                        .to_string(),
+                    args.session_id,
+                );
+            }
+            // An explicitly empty `ids` is left alone: it removes nothing and reports nothing
+            // removed, which is what it asked for and is not worth a refusal of its own.
+            (ids, _) => ids,
+        };
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::ClearBreakpoints { ids },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// Continue execution (`g`). Runs to the next breakpoint, or the end of a TTD trace.
     #[rmcp::tool(
         annotations(
@@ -5120,6 +5235,18 @@ const TOOL_NOTES: &[ToolNote] = &[
         names: &["ioctl_map", "driver_hazards"],
         note: "The IOCTL and hazard sections are `ioctl_map`'s and `driver_hazards`' own answers, \
                whole — call those directly to ask about one dispatch routine or one image.",
+    },
+    ToolNote {
+        tool: "set_breakpoint",
+        names: &["breakpoints", "clear_breakpoints"],
+        note: "The result carries the whole inventory, so a `breakpoints` call straight after this \
+               one asks nothing new; `clear_breakpoints` is how one comes off again, by the id \
+               here.",
+    },
+    ToolNote {
+        tool: "breakpoints",
+        names: &["clear_breakpoints"],
+        note: "`clear_breakpoints` removes what this lists — by `ids`, or `all: true` for the lot.",
     },
     ToolNote {
         tool: "continue_async",

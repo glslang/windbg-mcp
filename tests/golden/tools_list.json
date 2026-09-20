@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 61,
+  "toolCount": 63,
   "tools": [
     {
       "hints": {
@@ -180,6 +180,76 @@
         "execution"
       ],
       "title": "Break a run in"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "breakpoints",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/BreakpointList",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "List breakpoints"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "clear_breakpoints",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/BreakpointsCleared",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "all: boolean|null",
+        "ids: array<integer/uint32>",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Clear breakpoints"
     },
     {
       "hints": {

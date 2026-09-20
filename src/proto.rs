@@ -287,6 +287,24 @@ pub enum EngineOp {
         watch: Option<crate::structured::WatchRequest>,
         patience_ms: u32,
     },
+    /// Every breakpoint the session holds — `bl`, as values.
+    ///
+    /// **No `patience_ms`, and that is the rule rather than an omission.** A listing is a walk of
+    /// the engine's own breakpoint objects with nothing in it that can block on a symbol server or
+    /// a KD round trip per row, so there is nothing for a watchdog to break into.
+    /// [`Self::SetBreakpoint`] carries one because resolving a *location* can block; the ops
+    /// around it carry none for this reason, and this is one of them.
+    Breakpoints,
+    /// Remove breakpoints by id, or every one the session holds — `bc`.
+    ///
+    /// `None` is all of them, and the tool never leaves that to a default: `clear_breakpoints`
+    /// refuses a call that names neither ids nor `all`, so "remove everything" is something a
+    /// caller said rather than something an omitted field meant. By the time it is an op, the
+    /// choice has been made.
+    ClearBreakpoints {
+        #[serde(default)]
+        ids: Option<Vec<u32>>,
+    },
     /// A range of target memory, as bytes and as a hex dump.
     ///
     /// **It carries a `patience_ms`, and it did not until
