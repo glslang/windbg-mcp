@@ -118,13 +118,15 @@ there is none, and each is handled explicitly rather than absorbed.
   whichever value lines the most records up would be a parameter tuned to hide disagreement.
 - **The jump-table slots that route to the default.** The companion publishes a record per slot;
   this walk drops a slot whose target is the bounds check's own branch, so it emits fewer records
-  *by design* — on `mountmgr`, 45 fewer. Subtracting them needs no opinion about which arm is the
-  default, which is the inference the x64 README refuses: this side publishes `entries` and
-  `followed` per table, so the slots it dropped are a **count** it already gives, and the question
-  is whether that count accounts for the companion's surplus. Equal is "the two differ in what
-  they report"; unequal is a finding. A code the companion reaches only through those slots is not
-  a finding on its own — and one more record than slots dropped is, which is what stops the
-  subtraction from being a blanket licence.
+  *by design* — on `mountmgr`, 45 fewer. Each surplus record is set aside on **the companion's own
+  evidence**, not on a count: it publishes `{"kind": "switch", …}` beside `goto_target` on a record
+  it took from a table and `{"kind": "comparison", …}` on one it took from a compare, and the
+  switch site has to be one this walk resolved too. Measured 2026-09-20: `mountmgr`'s 45 all carry
+  switch evidence at `0x1940c`, `0x1944c` and `0x19730` — exactly this side's three tables — while
+  `rdyboost`'s two carry `comparison` and are real misses. *Then* the count has to match `entries`
+  minus `followed`, because a table slot that is not one of the ones dropped here is a difference
+  too. Both conditions, in that order: equal counts are not provenance, and one missed compare
+  beside one dropped slot balances perfectly while hiding the finding this lane exists to make.
 
 And one thing the lane prints because the *absence* of a difference is easy to over-read: **what a
 fixture cannot decide.** Two implementations both proving no buffer size is correct behaviour

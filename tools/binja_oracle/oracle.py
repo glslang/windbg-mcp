@@ -181,10 +181,25 @@ def rva(value):
     return None if value is None else int(str(value), 16)
 
 
+def codes(cases: list) -> set:
+    """Every code in the answer, whether or not its landing site has an address.
+
+    **`case_rva` is optional on both sides** -- `structured::IoctlCase` documents it absent for a
+    case whose landing site is in no module the session knows -- so building the code sets out of
+    the routes below would drop such a code from the comparison entirely, and report a code both
+    implementations found as one-sided because one of them could not attribute its address.
+    """
+    return {norm(case["code"]) for case in cases}
+
+
 def routes(cases: list) -> dict:
-    """code -> sorted destinations, as integers. Both implementations answer per *record*, and a
-    code legitimately has more than one: `mountmgr` routes each of its codes from a host context
-    and a silo one."""
+    """code -> sorted destinations, as integers, for the cases that carry one.
+
+    Both implementations answer per *record*, and a code legitimately has more than one:
+    `mountmgr` routes each of its codes from a host context and a silo one. A case with no
+    `case_rva` is absent here **and present in [`codes`]**, which is the whole of the split: it can
+    be compared as a code and not as a route.
+    """
     by_code = collections.defaultdict(list)
     for case in cases:
         where = rva(case.get("case_rva"))
@@ -258,6 +273,38 @@ def same_build(ours, theirs) -> tuple:
     return not differs, differs
 
 
+def table_sites(result: dict) -> set:
+    """The switch sites this walk resolved, as integers."""
+    return {
+        rva((table.get("at") or {}).get("rva"))
+        for table in result.get("tables") or []
+        if (table.get("at") or {}).get("rva") is not None
+    }
+
+
+def from_a_table(case: dict, sites: set, same_build: bool) -> bool:
+    """Whether a companion record is a jump-table slot, **by its own evidence**.
+
+    The companion publishes `{"kind": "switch", "site": ...}` beside `goto_target` on a record it
+    took from a table, and `{"kind": "comparison", ...}` on one it took from a compare. That is
+    provenance; a count is not. Measured 2026-09-20: `mountmgr`'s 45 surplus records all carry
+    `switch` evidence at `0x1940c`, `0x1944c` and `0x19730`, which are exactly the three tables
+    this side resolved -- while `rdyboost`'s two carry `comparison` and are real misses.
+
+    The site is matched against this walk's own tables when the two halves answered for the same
+    binary. Across builds the RVAs mean nothing, so only the kind is read, and the caller says so.
+    """
+    for evidence in case.get("evidence") or []:
+        if evidence.get("kind") != "switch":
+            continue
+        if not same_build:
+            return True
+        site = rva(evidence.get("site"))
+        if site is not None and site in sites:
+            return True
+    return False
+
+
 def dropped_slots(result: dict) -> int:
     """Table entries this implementation read and did **not** turn into a case.
 
@@ -304,25 +351,33 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
             print("  the target is actually running is what makes the rest of this lane run.")
             return 2
 
-    our_codes, their_codes = routes(our_cases), routes(their_cases)
+    our_codes, their_codes = codes(our_cases), codes(their_cases)
+    our_routes, their_routes = routes(our_cases), routes(their_cases)
+    unplaced = [
+        (name, sum(1 for case in cases if not case.get("case_rva")))
+        for name, cases in (("ioctl_map", our_cases), ("companion", their_cases))
+    ]
     print()
     print(f"{'code':<14}{'ioctl_map':<12}{'companion':<12}")
     print("-" * 44)
-    for code in sorted(set(our_codes) | set(their_codes)):
+    for code in sorted(our_codes | their_codes):
         here = [code in our_codes, code in their_codes]
         print(
             f"{code:<14}"
             + "".join(f"{'yes' if flag else 'NO':<12}" for flag in here)
             + ("" if all(here) else "  <-- differs")
         )
-    only_ours = sorted(set(our_codes) - set(their_codes))
-    only_theirs = sorted(set(their_codes) - set(our_codes))
+    only_ours = sorted(our_codes - their_codes)
+    only_theirs = sorted(their_codes - our_codes)
 
     verdict = 0
     print()
-    print(f"  agreed codes            : {len(set(our_codes) & set(their_codes))}")
+    print(f"  agreed codes            : {len(our_codes & their_codes)}")
     print(f"  only `ioctl_map`        : {only_ours or 'none'}")
     print(f"  only the companion      : {only_theirs or 'none'}")
+    for name, count in unplaced:
+        if count:
+            print(f"  {name} cases with no case_rva: {count} -- compared as codes, not as routes")
 
     # **The surplus, accounted for by a number rather than explained away.** The companion
     # publishes a record per jump-table slot, the default's included; this walk drops a slot whose
@@ -332,16 +387,30 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     # default -- naming one from the data is the inference `tools/ghidra_oracle/README.md` refuses
     # on x64 -- and it is a count of records, so it survives the two halves being different builds.
     dropped = dropped_slots(ours)
+    sites = table_sites(ours)
     unrouted = [case for case in their_cases if norm(case["code"]) in set(only_theirs)]
+    slotted = [case for case in unrouted if from_a_table(case, sites, agreed)]
+    unexplained = [case for case in unrouted if case not in slotted]
     print()
     print(f"  table slots `ioctl_map` dropped: {dropped}"
           f"  {[(t.get('entries'), t.get('followed')) for t in ours.get('tables') or []]}")
     print(f"  companion records on codes it does not route: {len(unrouted)}"
           f" over {len(only_theirs)} code(s)")
-    accounted = len(unrouted) == dropped
+    caveat = "" if agreed else " (kind only, since the sites are another build's)"
+    print(f"    from a jump table by their own evidence: {len(slotted)}{caveat}")
+    print(f"    from a compare, so a real difference    : {len(unexplained)}")
+    for case in unexplained[:8]:
+        print(f"      {norm(case['code'])} at {case.get('case_rva')}")
+    # **Attribution first, then the count.** Equal counts are not provenance: one missed compare
+    # beside one dropped slot balances, and suppressing that would hide exactly the finding this
+    # lane exists to make. So a surplus record is set aside only when the companion's own evidence
+    # says it came from a switch this walk resolved -- and the count still has to match, because
+    # a table slot that is *not* one of the ones dropped here is also a difference. Raised on
+    # review of #354.
+    accounted = not unexplained and len(slotted) == dropped
     if accounted and dropped:
-        print("  -- equal, so the code-set difference is the default-slot reporting rather than")
-        print("     a miss on either side.")
+        print("  -- every surplus record is a table slot, and their count is what this side")
+        print("     dropped, so the code-set difference is reporting rather than a miss.")
     elif unrouted or dropped:
         print("  -- these do NOT account for each other.")
         verdict = 1
@@ -357,8 +426,13 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
     # **The routes, read through the convention between them.** Comparing destinations without
     # this reports a deliberate difference in *naming a case's address* as disagreement, once per
     # record -- 29 times on HEVD, where every case is a constant 0x18 apart.
-    shared = set(our_codes) & set(their_codes)
-    matched, spread, extra, lost = pair_routes(our_codes, their_codes, window)
+    shared = set(our_routes) & set(their_routes)
+    matched, spread, extra, lost = pair_routes(our_routes, their_routes, window)
+    by_route = collections.defaultdict(list)
+    for case in their_cases:
+        where = rva(case.get("case_rva"))
+        if where is not None:
+            by_route[(norm(case["code"]), where)].append(case)
     print()
     print("routes")
     print(f"  window applied          : 0x0 to {window:#x}, forward only")
@@ -372,7 +446,14 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
         if not any(c == code for c, _ in lost) and not any(c == code for c, _ in extra)
     )
     print(f"  codes routed the same   : {len(routed)} of {len(shared)}")
-    surplus = extra + [(code, where) for code in only_theirs for where in their_codes[code]]
+    surplus = extra + [
+        (code, where) for code in only_theirs for where in their_routes.get(code, [])
+    ]
+    surplus_slotted = [
+        pair
+        for pair in surplus
+        if any(from_a_table(case, sites, agreed) for case in by_route.get(pair, []))
+    ]
     grouped = collections.Counter(where for _, where in surplus)
     print(f"  companion-only records  : {len(surplus)}")
     for where, count in sorted(grouped.items(), key=lambda kv: -kv[1])[:12]:
@@ -382,13 +463,14 @@ def compare(tool: dict, companion: dict, module: str, window=0x20, allow_mismatc
         print(f"    {code} at {where:#x}")
 
     print()
-    if len(surplus) == dropped and dropped:
-        print(f"  the {len(surplus)} companion-only record(s) are exactly the {dropped} slot(s)")
-        print("  dropped here, so at route level too the two differ in what they report rather")
-        print("  than in what they recovered.")
-    elif len(surplus) != dropped:
-        print(f"  {len(surplus)} companion-only record(s) against {dropped} dropped slot(s): the")
-        print("  route-level surplus is NOT the default slots.")
+    if len(surplus) == len(surplus_slotted) == dropped and dropped:
+        print(f"  all {len(surplus)} companion-only record(s) carry switch evidence, and {dropped}")
+        print("  is what this side dropped -- so at route level too the two differ in what they")
+        print("  report rather than in what they recovered.")
+    elif surplus or dropped:
+        print(f"  {len(surplus)} companion-only record(s), {len(surplus_slotted)} of them from a")
+        print(f"  jump table, against {dropped} dropped slot(s): the route-level surplus is not")
+        print("  accounted for by the default slots.")
         verdict = 1
     if lost:
         verdict = 1
@@ -435,8 +517,17 @@ def selftest() -> int:
     def companion(cases, identity=build):
         return {"result": {"cases": list(cases)}, "identity": identity, "analysis_version": "t"}
 
-    def case(code, where):
-        return {"code": code, "case_rva": hex(where)}
+    def case(code, where, evidence=()):
+        record = {"code": code, "evidence": list(evidence)}
+        if where is not None:
+            record["case_rva"] = hex(where)
+        return record
+
+    def table(site, entries, followed):
+        return {"at": {"rva": hex(site)}, "entries": entries, "followed": followed}
+
+    switch = [{"kind": "switch", "site": "0x500"}, {"kind": "goto_target", "site": "0x500"}]
+    compare_at = [{"kind": "comparison", "site": "0x900"}]
 
     checks = [
         ("agreement", tool([case("0x1", 0x100)]), companion([case("0x1", 0x100)]), 0),
@@ -451,12 +542,24 @@ def selftest() -> int:
          tool([case("0x1", 0x100), case("0x1", 0x180)]),
          companion([case("0x1", 0x100)]), 1),
         ("codes reached only through dropped slots are accounted for",
-         tool([case("0x1", 0x100)], [{"entries": 3, "followed": 1}]),
-         companion([case("0x1", 0x100), case("0x2", 0x900), case("0x3", 0x900)]), 0),
+         tool([case("0x1", 0x100)], [table(0x500, 3, 1)]),
+         companion([case("0x1", 0x100), case("0x2", 0x900, switch),
+                    case("0x3", 0x900, switch)]), 0),
         ("one more companion record than slots dropped is a finding",
-         tool([case("0x1", 0x100)], [{"entries": 3, "followed": 1}]),
-         companion([case("0x1", 0x100), case("0x2", 0x900), case("0x3", 0x900),
-                    case("0x4", 0x900)]), 1),
+         tool([case("0x1", 0x100)], [table(0x500, 3, 1)]),
+         companion([case("0x1", 0x100), case("0x2", 0x900, switch), case("0x3", 0x900, switch),
+                    case("0x4", 0x900, switch)]), 1),
+        # Codex's P1 on #354: with one missed compare beside one dropped slot the counts balance,
+        # and a lane that read equality as provenance would exit 0 over a code only one side has.
+        ("a missed compare is a finding although the count balances",
+         tool([case("0x1", 0x100)], [table(0x500, 2, 1)]),
+         companion([case("0x1", 0x100), case("0x2", 0x900, compare_at)]), 1),
+        # And its P2: a case whose landing site is in no known module has no `case_rva` at all.
+        ("a code with no case_rva is still compared",
+         tool([case("0x1", 0x100)]), companion([case("0x1", 0x100), case("0x2", None)]), 1),
+        ("a code with no case_rva on both sides agrees",
+         tool([case("0x1", 0x100), case("0x2", None)]),
+         companion([case("0x1", 0x100), case("0x2", None)]), 0),
         ("a build mismatch refuses to compare",
          tool([case("0x1", 0x100)]),
          companion([case("0x1", 0x100)], {"timestamp": 9, "size": 2}), 2),
@@ -468,10 +571,11 @@ def selftest() -> int:
         if got != want:
             print(f"  SELFTEST FAILED: {name} answered {got}")
             bad = 1
-    # The two middle cases are the pair worth stating together: a code the companion reaches only
+    # The three middle cases are the set worth stating together: a code the companion reaches only
     # through slots this side dropped is **not** a finding, which is what stops `mountmgr`'s 45
-    # from being reported as 45; one more record than slots dropped **is**, which is what stops
-    # that subtraction from being a blanket licence.
+    # from being reported as 45; one more record than slots dropped **is**; and a surplus record
+    # the companion took from a *compare* is one whatever the count says, which is what stops the
+    # subtraction from being a blanket licence.
     print("\nselftest: " + ("FAILED" if bad else "every case answered as written"))
     return bad
 
