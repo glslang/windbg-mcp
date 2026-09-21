@@ -1981,8 +1981,10 @@ then seen from both ends: NT parked at `nt!HvcallInitiateHypercall` holding inpu
 released, and the hypervisor stopping **714 ms** later with all fifteen general-purpose registers
 that array carries agreeing -- it does not carry `rsp` --
 `rbp` NT's own stack pointer less seven pushes less `0x27`, `rsi` NT's `rsi` with exactly its low
-byte cleared, `rdi`/`r13`/`r10`/`r11` untouched. Those two transformed values identify the
-*instance*, not merely the value.
+byte cleared, `rdi`/`r13`/`r10`/`r11` untouched. Those transformed values are not *unique* -- the
+same thread calling again at the same stack depth would reproduce them -- so what makes it one
+instance is the ordering: NT parked at that call, released, and this the first hypercall matching
+it.
 
 **That breakpoint is hypervisor-side code every processor runs, and on one processor it was
 uneventful** -- no freeze, no stray stops, both sessions answering `released: true`,
@@ -2001,9 +2003,10 @@ however many times the hypervisor is continued -- twelve stop/resume cycles deli
 resume. The conditional form, auto-continuing with `j (cond) ''; 'gc'`, had NT running within a
 second.
 
-**One thing that run did not settle.** `0x8001005D` -- the input value `HvcallInitiateHypercall`
-holds most of the time on this guest, bit 31 set -- never reached the dispatcher in 60 s of free
-running, while the other value from the same wrapper reached it in 714 ms. That does not separate
+**One thing that run did not settle.** `0x8001005D` -- bit 31 set, and the value both of this
+guest's unconditional `HvcallInitiateHypercall` captures held, with excluding it costing 9.6 s to
+reach a second value where the first had come in 7 ms -- never reached the dispatcher in 60 s of
+free running, while that other value from the same wrapper reached it in 714 ms. That does not separate
 "never delivered to this hypervisor" from "answered by `hv+0x247850` before the dispatcher", and
 nothing was instrumented to tell them apart. This lab's guest is itself nested, which makes a
 hypercall aimed at the parent a plausible reading and not a measured one.

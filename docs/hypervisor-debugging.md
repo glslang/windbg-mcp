@@ -474,9 +474,12 @@ through untouched, or transformed exactly as that wrapper's prologue transforms 
 | `r14` | `0` | `0` | `mov r14,rdx` |
 | `r15` | `fffff804ee614420` | `0` | `mov r15,r8` |
 
-`rbp` and `rsi` are the two that make this an instance rather than a value match: `rbp` is NT's own
-stack pointer minus seven pushes minus `0x27`, to the byte, and `rsi` is NT's `rsi` with exactly
-its low byte cleared. Neither is a value the hypervisor could have had from anywhere else.
+`rbp` and `rsi` are the two that lift this above a value match: `rbp` is NT's own stack pointer
+minus seven pushes minus `0x27`, to the byte, and `rsi` is NT's `rsi` with exactly its low byte
+cleared. **Neither is unique**, and it is worth being exact about why not: the same thread calling
+the same wrapper again at the same stack depth would reproduce both, along with `rdi` and `r13`.
+What rules that out here is the ordering rather than the values -- NT was parked at that call,
+released, and this was the first hypercall matching it, 714 ms into the run that followed.
 
 For context on how distinctive that is: sampled with NT parked, four consecutive dispatcher hits
 carried input values `0x12`, `0x6A`, `0x6A`, `0x6A`, and four more while NT's resume was pending
