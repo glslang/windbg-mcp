@@ -113,6 +113,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 90](#90-windbg-mcp-the-resolver-reads-a-whole-function-so-scoping-from-does-not-narrow-it--done-2026-09-19) — [windbg-mcp] The resolver reads a whole function, so scoping `from` does not narrow it — done (2026-09-19)
 - [Item 89](#89-windbg-mcp-a-switch-that-would-not-resolve-is-the-one-incompleteness-the-report-does-not-count--done-2026-09-20) — [windbg-mcp] A switch that would not resolve is the one incompleteness the report does not count — done (2026-09-20)
 - [Item 85](#85-windbg-mcp-the-arm64-second-opinion-exists-and-has-never-been-diffed--done-2026-09-20) — [windbg-mcp] The ARM64 second opinion exists and has never been diffed — done (2026-09-20)
+- [Item 93](#93-windbg-mcp--dbgscope-multiprocessor-hypervisor-stops-after-a-temporary-breakpoint-and-detach--done-2026-09-21) — [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach — done (2026-09-21)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4100,3 +4101,64 @@ above. The captures themselves are **not** checked in: each is a reading of the 
 is running at the time, and a stale one would be the exact failure this lane's identity gate
 exists to catch.
 
+## 93. [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach — **done** (2026-09-21)
+
+Filed on 2026-09-20 after a `run_to_address` hit on the four-processor hypervisor lab was followed
+by further processor stops, a detach this server reported as clean, and a guest black at the
+console -- twice, each released by a separately authorised native-KD connection, the second only
+on a second attempt. Tracked in
+[#355](https://github.com/glslang/windbg-mcp/issues/355); the
+[investigation record](./docs/hypervisor-demonstration-20260920.md) holds that day's packet traces,
+recoveries and evidence hashes, and
+[`docs/hypervisor-debugging.md`](./docs/hypervisor-debugging.md) the four-processor section this
+entry summarises.
+
+**The mechanism, and the entry's own premise was the thing that was wrong.** The item read the
+stops as *per-processor* behaviour of a hypervisor that might resume differently on four
+processors, and weighed "a fixed number of continues" and "explicit per-processor resumes" as
+possible remedies. Neither is what it is. The breakpoint site is in code **every processor runs**,
+so more than one of them reaches the patched instruction before the debugger removes it: measured
+2026-09-21 on the rebuilt four-processor guest, a `run_to_address` that returned `verdict: hit`
+with an **empty** breakpoint inventory left exactly **three** further stops behind it -- processors
+2, 3 and 1 where the hit was reported on 0, each a first-chance `0x80000003` at the breakpoint's
+own address, each on that processor's own stack (the four are 2 MiB apart), delivered one per
+resume in 1-3 ms, after which the target ran free. Nothing about resuming differs; a stop is owed
+per *other* processor, and `qd` has one `DbgKdContinue` to spend. The first queued stop takes it
+and the target stops again with no debugger attached.
+
+**It is a race, which is why it took a rebuilt lab to see at all.** 2 of 4 hit-then-detach runs
+froze; the other two were clean with the same three stops owing. One processor owes nothing, which
+is why every one-vCPU run of the same sequence -- including the 2026-09-20 demonstration that was
+offered as a comparison -- was clean, and why "the topology is the cause" stayed unestablished for
+a day with the evidence already in hand.
+
+**What landed.** [dbgscope#175](https://github.com/glslang/dbgscope/pull/175), pinned here at
+`192e3486`. `spend_pending_break_ins` no longer asks how the session was opened: these stops owe
+nothing to the attach, and the `kd_initial_break_attach` gate left the drain unrun on exactly the
+`experimental_break_on_connect` path a *running* hypervisor has to be attached with -- the flag had
+no other reader and went with the gate. Its attempt count now comes from `GetNumberProcessors` plus
+the two free runs rather than a fixed five, which was three stops plus two free runs and so fitted
+four processors by coincidence; `DRAIN_BUDGET` bounds the wall clock at four seconds where the
+count no longer does. On this side: `examples/hypervisor_detach_regression.ps1`'s one-vCPU refusal
+became `-AllowMultiprocessor` and names the recovery route, and
+`.claude/skills/live-hypervisor/SKILL.md` was rewritten to the shape the other skills have, with
+the stop-per-processor rule as one of its two breakpoint hazards.
+
+**The numbers.** 10 of 10 four-processor hit-then-detach cycles clean against a local build of the
+fix, with the backed-out control interleaved between the two batches of five on the same guest and
+the same boot (2 of 4 froze), then **5 of 5** against the pinned `192e3486`. Every cycle carries an
+independent WinRM boot-identity and advancing-uptime check; the guest never rebooted across any of
+it.
+
+**And recovery turned out to be cheaper than the item assumed.** It recorded a separately
+authorised native-KD connection as the remedy. A plain `attach_kernel` -- no
+`experimental_break_on_connect` -- finds the target stopped at the breakpoint's own address, and
+`end_session`'s drain spends what is owed: done twice, same boot, no reset. That is only true
+because something is still executing to answer a debugger, which is what separates this freeze from
+the hypercall-page freeze the skill records, where both transports go at once and a reset is the
+only route.
+
+**What it does not say.** Four processors is the largest lab measured, so the one-resume-per-
+processor rule is what sizes the drain beyond it rather than a second measurement. The mechanism
+was read off delivery order and per-processor stack pointers; nothing instrumented the KD stub to
+show where the queued exceptions are held. One guest, one engine build, one transport.

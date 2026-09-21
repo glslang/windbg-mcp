@@ -251,12 +251,11 @@ quit, whatever the attach shape: gating it on an `INITIAL_BREAK` attach, which i
 do, left it unrun on the `experimental_break_on_connect` path that every hypervisor run here uses.
 Ten of ten four-processor cycles detached cleanly with it, against 2 of 4 freezing without.
 
-**Check the pin before relying on that**, because the sizing and the ungated drain are
-[dbgscope#175](https://github.com/glslang/dbgscope/pull/175) and `FOLLOWUPS.md` item 93 stays open
-until `Cargo.toml`'s `rev` names a build carrying it. Against a build that does not, a
-break-on-connect attach drains nothing at teardown — so either drain by hand before `end_session`
+**That is dbgscope#175, pinned here at `192e3486` since 2026-09-21** (`DONE.md` item 93). Against
+an **older** engine build — a released `windbg-mcp`, or a checkout whose `rev` predates it — a
+break-on-connect attach drains nothing at teardown, so either drain by hand before `end_session`
 (resume with `continue_async { max_run_ms: 1500 }` and `wait_for_stop` until two runs reach their
-bound), or be ready to recover.
+bound) or be ready to recover.
 
 **Recovering a guest frozen this way takes one attach and one detach**, and it is recoverable
 precisely because something *is* still executing to answer a debugger — unlike the hypercall-page

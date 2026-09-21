@@ -1594,7 +1594,7 @@ skips.
   first and the guest stops with no debugger attached -- 2 of 4 runs froze that way, each released
   again by one attach and one `end_session`. dbgscope's teardown now spends them, sized one resume
   per processor, and **10 of 10** four-processor cycles came back clean with independently healthy
-  execution afterwards ([`FOLLOWUPS.md` item 93](../FOLLOWUPS.md)). It still halts somebody's
+  execution afterwards ([item 93](../DONE.md), closed 2026-09-21). It still halts somebody's
   hypervisor, which is why it stays a deliberate act.
 
 **Run it through

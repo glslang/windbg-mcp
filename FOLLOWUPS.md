@@ -73,11 +73,10 @@ literal-pool read landed, `rdyboost`'s thirteen length checks are all still `exa
 the refusal they branch to returns through a shared epilogue the walk stops at the head of. And
 item 92 from item 85's lane finding a driver the two implementations disagree about (2026-09-20):
 A64 writes `a || b || c` as three compares feeding one branch, and this walk reads the last of them
-and files the rest in `untracked`. Item 93 records the multiprocessor hypervisor breakpoint/detach
-investigation (2026-09-20): debugger-reported release could leave further processor stops, while
-inspection without a temporary breakpoint or step detached with independently healthy execution.
-And item 94 from giving that investigation's harness the tools it was written against (2026-09-20):
-a typed breakpoint listing and removal landed, and `bd`/`be` deliberately did not. And item 95 from
+and files the rest in `untracked`. And item 94 from giving the multiprocessor hypervisor
+investigation's harness the tools it was written against (2026-09-20) -- that investigation is
+item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
+`bd`/`be` deliberately did not. And item 95 from
 debugging a hypervisor alongside the NT kernel it runs (2026-09-21), which needs to know that two
 endpoints are two halves of one guest -- a fact a connection profile has nowhere to put, and which
 cannot safely be read off the names.
@@ -1902,71 +1901,6 @@ no one constant fits a small dump and a live kernel both.
 **Picks up at** `engine::reader`'s `WorkerMessage::Done` arm, `Sessions::call_within`'s timeout
 path, and `continue_async`'s filing task as the worked example. Independent of item 8, and cheaper:
 no capability negotiation, no extension, and it works for the client item 8 measured.
-
-## 93. [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach
-
-Tracked in [windbg-mcp #355](https://github.com/glslang/windbg-mcp/issues/355). The
-[investigation record](./docs/hypervisor-demonstration-20260920.md) preserves the 2026-09-20
-measured server and DbgEng identities, packet-event order, successful and failed recoveries,
-static callback analysis, live caller-context capture and local evidence hashes;
-[`docs/hypervisor-debugging.md`](./docs/hypervisor-debugging.md) carries the 2026-09-21 four-
-processor section this entry summarises.
-
-**The mechanism is established, and it is not about the attach.** Measured on the four-processor
-lab, 2026-09-21, server `0.19.0+g023a294a` read off the binary that answered. The demonstration's
-breakpoint site is in code **every processor runs**, so more than one of them reaches the patched
-instruction before the debugger removes it: a `run_to_address` that returned `verdict: hit` with an
-**empty** breakpoint inventory left exactly **three** further stops behind it -- processors 2, 3
-and 1 where the hit was reported on 0, each a first-chance `0x80000003` at the breakpoint's own
-address, each on that processor's own stack (the four are 2 MiB apart), delivered one per resume in
-1-3 ms, after which the target ran free. `qd` sends one `DbgKdContinue`; the first queued stop
-takes it and the target stops again with no debugger attached, which is the frozen guest reported
-as a clean release. It races the quit, so it is intermittent -- **2 of 4** hit-then-detach runs
-froze -- and one processor owes nothing, which is why every one-vCPU run was clean.
-
-**Recovery is one attach and one detach, in this server.** A plain `attach_kernel` (no
-`experimental_break_on_connect`) finds the target stopped at the breakpoint's own address, and
-`end_session`'s drain spends what is owed. Done twice on 2026-09-21, each time on the same boot
-with uptime advancing and no reset. That supersedes "a separately authorised native-KD connection"
-as the documented remedy for *this* freeze; the hypercall-page freeze recorded in
-`.claude/skills/live-hypervisor/SKILL.md` still has none, because nothing is left executing there
-to answer a debugger.
-
-**The fix is in dbgscope and is what this item is now waiting on.**
-[dbgscope#175](https://github.com/glslang/dbgscope/pull/175): `spend_pending_break_ins` no longer
-asks how the session was opened -- the gate on `kd_initial_break_attach` left the drain unrun on
-exactly the announcement attach every hypervisor run here uses -- and its attempt count comes from
-`GetNumberProcessors` plus the two free runs rather than a fixed five, which was three stops plus
-two free runs and so fitted four processors by coincidence. `DRAIN_BUDGET` bounds the wall clock at
-four seconds where the count no longer does. Validated on the four-processor lab through
-`examples/hypervisor_detach_regression.ps1`, whose `-BreakpointHit` gate is now
-`-AllowMultiprocessor` rather than a refusal: **10 of 10** cycles clean, each with an independent
-WinRM boot-identity and advancing-uptime check, against 2 of 4 freezing with the drain backed out
-on the same guest and the same boot.
-
-**What closes it:** dbgscope#175 merged, the `rev` pin moved here with `cargo update -p dbgscope`,
-and one four-processor run against *that* build -- the ten above were taken against a local
-`[patch]`, which is not what this repository will ship. Nothing else is outstanding: the earlier
-closing conditions (a portable bounded reproducer, each post-breakpoint stop's processor-specific
-context, the one-versus-four comparison, the cause, and repeated four-vCPU validation with
-independent health) are met above and in the doc section.
-
-**Why it is still open rather than moved:** the fix is in review in the other repository, so this
-repository's shipped behaviour is unchanged until the pin moves.
-
-**Picks up at:** `Cargo.toml`'s `dbgscope` `rev`, then
-`examples/hypervisor_detach_regression.ps1 -Cycles 5 -Session -BreakpointHit
--ExperimentalBreakOnConnect -AllowMultiprocessor` against the four-processor lab.
-
-**Two things measured alongside it, neither of which this item is about.** A conditional breakpoint
-whose expression dereferences memory can fault, and a faulting condition stops the hypervisor; and
-an *unconditional* hypervisor breakpoint on a hypercall site deadlocks the NT session, because
-every hypercall stops the world and NT never accumulates enough execution to take its KD resume
-packet off the NIC. Both are in the skill. Keep this item distinct from
-[dbgscope #173](https://github.com/glslang/dbgscope/issues/173)'s shared live-kernel `qd`
-validation -- whose NT half is in [`docs/smoke-test.md`](./docs/smoke-test.md) -- and from
-[WinDbg-Feedback #396](https://github.com/microsoft/WinDbg-Feedback/issues/396)'s unconnected
-KDNET EXIT-interrupt cancellation report.
 
 ## 94. [windbg-mcp] Disabling a breakpoint has no typed tool
 
