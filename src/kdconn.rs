@@ -637,7 +637,9 @@ struct Details {
     /// A name shared by every profile that reaches one machine, which is what makes two endpoints
     /// a *pair* rather than two unrelated targets — the fact debugging a hypervisor alongside its
     /// root partition is built on, and the one that otherwise lives only in the operator's head.
-    /// Name-shaped ([`is_profile_name`]), so it is safe to render wherever a profile name is.
+    ///
+    /// Name-shaped ([`is_profile_name`]) — which is **not** enough to make it safe to render, and
+    /// was assumed to be. Read through [`Details::guest`], like the note beside it.
     guest: Claim<String>,
     /// Free text, exactly as configured. Read through [`Details::note`] and never directly: it is
     /// the one field here that could carry a pasted key, and scrubbing it at every render — by
@@ -650,6 +652,25 @@ impl Details {
     /// The note as it is safe to report. See the field for why this is the only way to read it.
     fn note(&self) -> Option<String> {
         self.note.known().map(|note| scrub(note))
+    }
+
+    /// The guest as it is safe to report — and it needs this as much as the note does, which is
+    /// the part that is not obvious (Codex, PR #367).
+    ///
+    /// Being name-shaped was taken as making it safe to render, and it does stop the two things
+    /// [`is_profile_name`] was written for: a connection string cannot pass (no `=`), and nothing
+    /// can forge a line in a report (no control characters). It does **not** stop a bare KDNET
+    /// key, because a key is dotted decimal and `1.2.3.4` is digits and dots. So an operator who
+    /// pasted one here would have had it rendered verbatim into the listing `attach_kernel {}`
+    /// answers with, into every session label, and into structured output — which is the precise
+    /// disclosure this module exists to prevent, arriving through the one field added to carry a
+    /// *label*.
+    ///
+    /// [`scrub`] masks by **value**, so this costs a legitimate guest nothing: a name that is not
+    /// one of this host's own keys is not one of the strings it masks. A profile named after the
+    /// target's IP address stays readable.
+    fn guest(&self) -> Option<String> {
+        self.guest.known().map(|guest| scrub(guest))
     }
 
     fn is_empty(&self) -> bool {
@@ -687,7 +708,7 @@ impl Details {
         if let Some(role) = self.role.known() {
             parts.push(role.label().to_string());
         }
-        if let Some(guest) = self.guest.known() {
+        if let Some(guest) = self.guest() {
             parts.push(format!("guest \"{guest}\""));
         }
         if let Some(note) = self.note() {
@@ -888,7 +909,7 @@ impl Profile {
         ProfileFacts {
             name: self.name.clone(),
             role: self.details.role.known().copied(),
-            guest: self.details.guest.known().cloned(),
+            guest: self.details.guest(),
             note: self.details.note(),
             ignored: self.ignored.clone(),
         }
@@ -2417,6 +2438,53 @@ mod tests {
         assert!(note.contains(MASK), "{note}");
         assert!(!profiles.listed().contains(FAKE_KEY));
         assert!(!selected.label.contains(FAKE_KEY));
+    }
+
+    /// A key pasted into `guest` does not get out either, and being **name-shaped did not stop
+    /// it** (Codex, PR #367).
+    ///
+    /// `is_profile_name` was taken as making the value safe to render. It stops the two things it
+    /// was written for — a connection string cannot pass and nothing can forge a line — and it
+    /// does not stop a bare KDNET key, because a key is dotted decimal and `1.2.3.4` is digits and
+    /// dots. So the one field added to carry a *label* was a route for the secret this whole
+    /// module exists to contain.
+    #[test]
+    fn a_key_pasted_into_guest_cannot_get_out() {
+        // The charset really does admit it, which is the premise of the whole test.
+        assert!(is_profile_name(FAKE_KEY));
+
+        let leaky = format!("{{ \"connection\": \"{FAKE}\", \"guest\": \"{FAKE_KEY}\" }}");
+        let profiles = Profiles::from_pairs(&[("lab", leaky.as_str())]);
+        let selected = resolve("lab", &profiles).expect("resolves");
+
+        let guest = selected
+            .facts
+            .expect("a profile named it")
+            .guest
+            .expect("it has a guest");
+        assert!(!guest.contains(FAKE_KEY), "{guest}");
+        assert!(guest.contains(MASK), "{guest}");
+        // The label and the listing are the two places a caller would read it from.
+        assert!(!selected.label.contains(FAKE_KEY), "{}", selected.label);
+        assert!(
+            !profiles.listed().contains(FAKE_KEY),
+            "{}",
+            profiles.listed()
+        );
+
+        // And it costs a legitimate guest nothing, because `scrub` masks by value: a name that is
+        // not one of this host's keys is not one of the strings it masks.
+        let ordinary = format!("{{ \"connection\": \"{FAKE}\", \"guest\": \"10.0.26100\" }}");
+        let plain = Profiles::from_pairs(&[("lab", ordinary.as_str())]);
+        assert_eq!(
+            resolve("lab", &plain)
+                .expect("resolves")
+                .facts
+                .expect("a profile named it")
+                .guest
+                .as_deref(),
+            Some("10.0.26100")
+        );
     }
 
     /// The object form is accepted **wherever the string is**, and the environment is the route a
