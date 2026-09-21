@@ -86,8 +86,11 @@ what it always did. What they change is what a caller can see before and after a
 - `attach_kernel` with **neither** selector now describes what it lists —
   `Configured profiles: ctf-vm; lab-hv (hypervisor, guest "lab"); lab-nt (windows, guest "lab",
   "root partition").` — so an agent discovers the *pair* and not only the names.
-- the session describes itself with them: `kernel target: profile "lab-hv" [hypervisor, guest
-  "lab"] (net:port=50001,key=<redacted>)`.
+- the session describes itself with them, on a line under its own: the label stays
+  `profile "lab-hv" (net:port=50001,key=<redacted>)`, with `profile says: hypervisor, guest "lab"`
+  beneath it. The claims are **not** in the label, deliberately: a label is built once at the open
+  and never changes, while a claim can be withdrawn afterwards, so keeping them there would have
+  given two copies of one fact with only one of them correctable.
 - and they arrive as **values** too, in a `profile` object on the open's result and on every
   `session_status` row, beside the `kernel_target` the attach derived for itself. `guest` exists to
   be acted on — pairing two sessions as two endpoints of one machine is something a client does,
@@ -142,8 +145,9 @@ member name a refusal then quotes back. Masking is by value, so an ordinary gues
 untouched.
 
 A `role` the **attach contradicts** is withdrawn rather than annotated: the field goes and the
-reason joins `ignored`, so a `session_status` read on a later turn cannot go on advertising a role
-the target has already disagreed with.
+reason joins `ignored`, so a `session_status` read on a later turn — or by another client — cannot
+go on advertising a role the target has already disagreed with. Both halves of every result render
+that from the same typed facts, which is the copy the withdrawal corrects.
 
 Configured profiles stay in the supervisor: an engine worker is spawned **without** the
 `WINDBG_MCP_PROFILE_*` variables, and is told only the one connection it is opening, over its

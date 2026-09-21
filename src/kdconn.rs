@@ -720,6 +720,11 @@ impl Details {
 
     /// How a profile's claims read beside its name: `hypervisor, guest "lab", "root partition"`.
     /// `None` when it makes none, which is every profile configured as a bare string.
+    ///
+    /// For [`Profiles::listed`] only — the discovery listing, which is built from the
+    /// configuration and has no attach to have contradicted anything. A *session* renders its
+    /// claims from its typed facts instead, so that a withdrawn one disappears from both halves;
+    /// see the label in [`resolve`].
     fn described(&self) -> Option<String> {
         let mut parts = Vec::new();
         if let Some(role) = self.role.known() {
@@ -755,9 +760,27 @@ struct Entry {
 }
 
 impl Entry {
+    /// Takes a configured connection string, and **remembers its secrets** — see
+    /// [`KNOWN_SECRETS`].
+    ///
+    /// Here rather than in [`Profiles::admit`], because registration must not be coupled to
+    /// *admission*. It was, and the gap that opened is the reason this is worth a paragraph: an
+    /// entry the environment shadows, one whose name is not a name, and one whose connection is
+    /// not dialable all return from `admit` before it reaches [`Connection::new`], so their keys
+    /// were never remembered — while their **complaints**, which quote the operator's own text,
+    /// had already been retained. A file entry with key `1.2.3.4` and a stray member *named*
+    /// `1.2.3.4`, shadowed by an environment variable, therefore had nothing to mask it by value
+    /// and nothing for the pattern scan to recognise inside backticks (Codex, PR #367).
+    ///
+    /// So a connection is remembered when it is **read**, whatever later becomes of the entry.
+    /// That is the correct rule on its own terms: [`KNOWN_SECRETS`] is every secret this server
+    /// has been handed, and being handed one in an entry that was then discarded is still being
+    /// handed one.
     fn of(connection: &str) -> Self {
+        let connection = connection.trim().to_string();
+        remember_secrets(&connection);
         Self {
-            connection: connection.trim().to_string(),
+            connection,
             details: Details::default(),
             complaints: Vec::new(),
         }
@@ -1444,15 +1467,14 @@ fn resolve(name: &str, profiles: &Profiles) -> Result<Selected, String> {
             profiles.listed()
         )),
         Some(profile) => Ok(Selected {
-            // The claims go in brackets, ahead of the parenthesised connection, so a profile that
-            // describes nothing renders exactly the line this has always produced.
-            label: match profile.details.described() {
-                Some(detail) => format!(
-                    "profile \"{}\" [{detail}] ({})",
-                    profile.name, profile.connection
-                ),
-                None => format!("profile \"{}\" ({})", profile.name, profile.connection),
-            },
+            // **The claims are deliberately not in here.** A label is built once, at the open,
+            // and a session's is immutable — while a claim can be *withdrawn* after the attach
+            // contradicts it. Baking them in gave two copies of one fact with only one of them
+            // correctable, so a withdrawn `role` went on being advertised by the label in
+            // `session_status` and in `OpenedSession::target` (Codex, PR #367). The typed facts
+            // are the one copy; `server::profile_lines` renders them, after any correction, into
+            // the text that has to say the same thing.
+            label: format!("profile \"{}\" ({})", profile.name, profile.connection),
             facts: Some(profile.facts()),
             connection: profile.connection.clone(),
         }),
@@ -1539,6 +1561,9 @@ mod tests {
     /// so the redaction is exercised the way it will be used, and it is not anyone's key.
     const FAKE: &str = "net:port=50000,key=1.2.3.4";
     const FAKE_KEY: &str = "1.2.3.4";
+    /// A second key, used only by the shadowed-entry test: sharing `FAKE_KEY` would let that test
+    /// pass on some *other* test's registration of it, which is the one way it could not fail.
+    const SHADOWED_KEY: &str = "9.8.7.6";
 
     #[test]
     fn redaction_masks_the_key_and_keeps_the_rest() {
@@ -2385,14 +2410,13 @@ mod tests {
         assert_eq!(facts.role, Some(KernelTarget::Hypervisor));
         assert_eq!(facts.guest.as_deref(), Some("lab"));
         assert_eq!(facts.note.as_deref(), Some("root partition"));
-        // Both halves: a structured-aware client reads the values and drops the text, a person
-        // reads the text. A claim in only one of them is a claim half the readers never get.
-        assert!(
-            selected
-                .label
-                .contains("profile \"lab-hv\" [hypervisor, guest \"lab\", \"root partition\"]"),
-            "{}",
-            selected.label
+        // **The label carries the name and the connection, and not the claims.** It is built
+        // once and never changes, while a claim can be withdrawn after the attach contradicts it
+        // — so the claims are rendered from these facts instead, by `server::profile_lines`, and
+        // there is only ever one copy to correct.
+        assert_eq!(
+            selected.label,
+            format!("profile \"lab-hv\" ({})", redact(FAKE))
         );
         assert!(!selected.label.contains(FAKE_KEY), "{}", selected.label);
 
@@ -2513,6 +2537,38 @@ mod tests {
                 .as_deref(),
             Some("10.0.26100")
         );
+    }
+
+    /// A key in an entry the environment **shadows** is still masked (Codex, PR #367).
+    ///
+    /// Registration used to happen at [`Profiles::admit`]'s insert, which an overridden entry
+    /// never reaches -- while its complaints, which quote the operator's own text, were retained
+    /// before that return. So a file entry with key `1.2.3.4` and a stray member *named*
+    /// `1.2.3.4`, shadowed by an environment variable, had nothing to mask it by value and nothing
+    /// for the pattern scan to find inside backticks. A connection is remembered when it is
+    /// **read** now, whatever becomes of the entry.
+    #[test]
+    fn a_key_in_a_shadowed_entry_is_still_masked() {
+        // The file entry names its own key as a stray member, and the environment overrides it
+        // with a different target -- so nothing about the file entry is ever admitted.
+        let shadowed = format!(
+            "{{ \"connection\": \"net:port=50001,key={SHADOWED_KEY}\", \"{SHADOWED_KEY}\": 1 }}"
+        );
+        let mut profiles = Profiles {
+            entries: BTreeMap::new(),
+            notes: Vec::new(),
+            file: None,
+        };
+        profiles.admit("lab".into(), Entry::of(FAKE), Source::Env);
+        profiles.admit(
+            "lab".into(),
+            configured(&shadowed).expect("a valid object"),
+            Source::File,
+        );
+
+        let advice = profiles.how_to_configure();
+        assert!(advice.contains(MASK), "{advice}");
+        assert!(!advice.contains(SHADOWED_KEY), "{advice}");
     }
 
     /// A key used as an unknown **member name** does not get out either (Codex, PR #367).

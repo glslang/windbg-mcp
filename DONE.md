@@ -4279,7 +4279,25 @@ which is this item's own failure mode surviving the check added to catch it. The
 is **withdrawn** from what the session reports (`kdconn::contradicted`), which reuses `ignored`
 rather than adding a third state for a claim nobody should read.
 
-**Five rounds, four of them on mechanisms the previous round had just added.** The pattern is the
+**A fifth round found the withdrawal incomplete and the scrub still reachable around.** The
+withdrawal removed `role` from the typed facts and left it in the session's **label**, which is
+built once at the open and never changes -- so `session_status` and `OpenedSession::target` went on
+advertising the rejected role, which is the guarantee the previous round had just written down. The
+answer was to stop keeping two copies: the label is back to naming the profile and its redacted
+connection, and both halves of a result render the claims from the typed facts through
+`server::profile_lines`. And secret registration was coupled to **admission**, so an entry the
+environment shadows -- or one whose name or connection is refused -- returned from `admit` before
+reaching `Connection::new` and never had its key remembered, while its complaints, which quote the
+operator's own text, had already been retained. A connection is remembered when it is **read** now,
+in `Entry::of`, whatever later becomes of the entry; that is the correct rule on its own terms,
+since being handed a secret in an entry that was then discarded is still being handed one.
+
+**Six rounds, five of them on mechanisms the previous round had just added.** Every round that
+ended a strand changed a *representation* rather than a behaviour: `Option` to an absorbing
+`Claim`, per-field scrubbing to scrubbing at the render boundary, secret registration moved from
+admission to the read, and two renderings of a claim collapsed to one. Every round that patched a
+case opened the next one. That is `prefer-simplification-over-gap-fixing` measured on a single
+feature, and it is the most reusable thing this item produced. The pattern is the
 one `prefer-simplification-over-gap-fixing` describes, and the round that broke it was the one that
 changed a *type* rather than the fold: `Option` to an absorbing `Claim`.
 
@@ -4290,7 +4308,7 @@ claims travel in `outputSchema`, which
 output schemas grew: +352 B on each of the six openers and +417 B on `session_status`, +2,529 B of
 wire in total, which is why `tests/golden/tool_budget.json` moved and
 `every_documented_surface_figure_matches_the_served_surface` did not. Measured on the ARM64 bench
-2026-09-21 against a worktree at `1c749a9`: 1,019 unit tests and 123 `mcp_smoke` with
+2026-09-21 against a worktree at `1c749a9`: 1,020 unit tests and 123 `mcp_smoke` with
 `WINDBG_MCP_SMOKE_DUMP=1`, 0 failed.
 
 **What it did not do.** `guest` is unverified and will stay so. Nothing was added to the
