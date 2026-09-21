@@ -514,54 +514,73 @@ fn drain_is_owed<E>(attach_owes_a_break_in: bool, target: Result<bool, E>) -> bo
     attach_owes_a_break_in && !matches!(target, Ok(false))
 }
 
-/// Takes this session's breakpoints off the target, and answers whether it is now disarmed.
+/// Takes this session's breakpoints off the target before the drain resumes it, and reports
+/// whether the target came back clean.
 ///
 /// **A resume cannot tell a user's breakpoint from the attach's leftover break-in.** Both stop the
 /// target and both come back with no `cut_short`, so a breakpoint the target reaches can spend
 /// every attempt the drain has, leave the leftover still owing for `qd`, and be counted in the log
 /// as break-ins consumed — reproducing the freeze through the mechanism built to prevent it.
+/// Clearing first is what makes the drain's evidence readable, and it is the teardown's own first
+/// step (`quit_and_detach_target` clears and only then sends `qd`) moved in front of the resume it
+/// has to precede rather than a new one.
 ///
-/// **And resuming at all is the thing the teardown deliberately does not do while a breakpoint
-/// will not come off.** `quit_and_detach_target` runs `clear_all_breakpoints()?` and only then
-/// `qd`, so a failed removal returns *before* any resume and the kernel is left halted rather than
-/// run with an `int 3` still patched into it. A drain resuming ahead of that check took that
-/// property away. So this is the teardown's own first step moved in front of the resume it has to
-/// precede, rather than a new one — and a target it cannot disarm is not resumed. Raised as a
-/// review finding on [#361](https://github.com/glslang/windbg-mcp/pull/361).
+/// **A clearing that fails does not cancel the drain, and the first version of this had that the
+/// other way round.** It skipped, on the reasoning that `GetNumberBreakpoints` is the call the
+/// teardown's own clearing opens with, so an inventory this could not read was one the teardown
+/// could not read either — it would fail there, never send `qd`, and answer
+/// `TargetLeft::KernelHalted`, leaving nothing for a drain to protect. That assumed the failure
+/// was **persistent**, which nothing established: the teardown's clearing is a fresh attempt and
+/// may succeed where this one did not, and then `qd` goes out with the break-in still owed — a
+/// certain freeze, bought to avoid a possible misread. It is not even only a question of
+/// transients: this removes by **id** (`GetBreakpointById`) where the teardown removes by
+/// **index** (`GetBreakpointByIndex2(0)`), so the two can genuinely disagree. Raised as a review
+/// finding on [#361](https://github.com/glslang/windbg-mcp/pull/361), against the commit before
+/// it that introduced the skip.
 ///
-/// The removals are best-effort and the **readback** decides, because the two are different facts:
-/// a removal that reports failure against a breakpoint that is gone anyway is nothing to a resume,
-/// and a removal that reports success is not evidence the target is clean.
-fn disarm_before_draining(e: &DebugEngine) -> Option<Disarmed> {
+/// **And the property that skip was protecting is not about this resume.** The rule
+/// `tests/mcp_smoke.rs` states — a kernel whose breakpoint will not come off is left halted rather
+/// than run with an `int 3` in it — is about the resume that *hands the target back*: `qd` sets it
+/// going and detaches, so a processor reaching a stale `int 3` afterwards takes an exception with
+/// no debugger to answer it. A drain resume is bounded and the debugger stays attached throughout,
+/// so a processor reaching one is an ordinary breakpoint stop. That was over-read once, and the
+/// skip was built on it.
+///
+/// The removals are best-effort and the **readback** decides what is reported, because the two are
+/// different facts: a removal that reports failure against a breakpoint that is gone anyway is
+/// nothing to a resume, and a removal that reports success is not evidence the target is clean.
+fn disarm_before_draining(e: &DebugEngine) -> Disarmed {
     if let Ok(armed) = e.breakpoints() {
         for breakpoint in &armed {
             let _ = e.remove_breakpoint(breakpoint.id);
         }
     }
-    nothing_armed(e.breakpoints().ok().map(|left| left.len())).then_some(Disarmed)
+    Disarmed {
+        confirmed: nothing_armed(e.breakpoints().ok().map(|left| left.len())),
+    }
 }
 
-/// Proof that this session's breakpoints are off the target, which [`drain_pending_break_ins`]
-/// takes because it resumes one.
+/// What the clearing above settled — and the proof that it happened at all, which
+/// [`drain_pending_break_ins`] takes because it resumes the target.
 ///
 /// A token rather than a check inside the drain, because what has to hold is an **ordering**, and
 /// an ordering is what no test here can reach: the drain runs only on a live KD attach, so every
-/// tier this repository can run offline stays green when the disarming is skipped entirely —
+/// tier this repository can run offline stays green when the clearing is skipped entirely —
 /// measured, by skipping it. So the rule goes where the compiler keeps it instead of where a test
-/// would have had to, and a resume that has not been preceded by a disarm cannot be written by
+/// would have had to, and a resume that has not been preceded by a clearing cannot be written by
 /// accident.
-struct Disarmed;
+struct Disarmed {
+    /// The inventory read back **empty**, so a stop during the drain is the attach's leftover
+    /// rather than a breakpoint this session set. Not a permission — the drain runs either way —
+    /// but it is what decides whether the count it reports means anything.
+    confirmed: bool,
+}
 
-/// Whether the target may be resumed, from what it holds *after* [`disarm_before_draining`].
+/// Whether the target came back **confirmed clean** from [`disarm_before_draining`].
 ///
-/// **An unreadable inventory is not an empty one** — and unlike the target-status read in
-/// [`drain_is_owed`], the cautious answer here is also the cheap one, which is why the two lean
-/// opposite ways. `GetNumberBreakpoints` is the call `quit_and_detach_target`'s own
-/// `clear_all_breakpoints` opens with, so an inventory this cannot read is one the teardown cannot
-/// read either: it fails there, never sends `qd`, and answers `TargetLeft::KernelHalted`. There is
-/// then no continue for a leftover break-in to spend and nothing a drain could protect — so
-/// skipping it costs nothing, while resuming would move a target that is on its way to being left
-/// halted anyway.
+/// **An unreadable inventory is not an empty one.** It is not a reason to skip the drain — see
+/// there for why that reasoning was wrong — but it is equally not evidence the target is clean,
+/// and the drain's count is only meaningful on a target that is.
 fn nothing_armed(left: Option<usize>) -> bool {
     left == Some(0)
 }
@@ -582,19 +601,24 @@ fn drain_before_release(e: &DebugEngine) {
     if !drain_is_owed(INITIAL_BREAK_ATTACH.load(Ordering::SeqCst), e.has_target()) {
         return;
     }
-    let Some(disarmed) = disarm_before_draining(e) else {
+    let disarmed = disarm_before_draining(e);
+    // Draining on regardless, and saying so: the release still needs its continue protected, and
+    // the teardown's own clearing is a fresh attempt that may succeed where this one did not.
+    // What is lost is the reading, not the resume — a stop can no longer be attributed to the
+    // attach rather than to a breakpoint this session set.
+    let confirmed = disarmed.confirmed;
+    if !confirmed {
         tracing::warn!(
-            "this session's breakpoints could not be taken off the target, so the attach's \
-             leftover break-ins were not spent before the release: a resume reaching one of them \
-             cannot be told from the break-in it is looking for, and a target that will not \
-             disarm is one this server does not set going"
+            "this session's breakpoints could not be confirmed off the target, so a stop during \
+             the drain cannot be told from a breakpoint this session set; draining anyway, since \
+             the release still owes the target its continue"
         );
-        return;
-    };
+    }
     let delivered = drain_pending_break_ins(e, disarmed);
     if delivered > 0 {
         tracing::info!(
             delivered,
+            confirmed,
             "consumed break-ins left over from the attach before releasing the target"
         );
     }
@@ -13477,25 +13501,21 @@ mod tests {
         assert_eq!(drain.delivered, 0, "nor is it a break-in delivered");
     }
 
-    /// **An unreadable breakpoint inventory is not an empty one, and only an empty one may be
-    /// resumed.**
+    /// **An unreadable breakpoint inventory is not an empty one**, and neither is one with a
+    /// breakpoint left in it.
     ///
-    /// Two rules in one reading. A resume cannot tell a user's breakpoint from the attach's
-    /// leftover break-in, so one left armed can spend every attempt the drain has and leave the
-    /// leftover for `qd` — the freeze, through the mechanism built to stop it. And a target that
-    /// will not disarm must not be set going at all: `quit_and_detach_target` clears breakpoints
-    /// *before* it resumes precisely so a kernel with an `int 3` that would not come off is left
-    /// halted rather than run.
-    ///
-    /// It leans the opposite way to [`drain_is_owed`] on purpose, and the reason is in
-    /// [`nothing_armed`]: this read is the same call the teardown's own clearing opens with, so an
-    /// inventory this cannot read is one that teardown cannot read either — it never reaches `qd`,
-    /// and there is no continue for a leftover to spend.
+    /// What turns on this is what the drain's count *means*, not whether it runs. A resume cannot
+    /// tell a user's breakpoint from the attach's leftover break-in, so on a target that is not
+    /// confirmed clean a stop is not attributable and the figure the log carries is not a count of
+    /// break-ins. The drain runs either way, since the release still owes the target its continue
+    /// and the teardown's own clearing may succeed where this one did not — see
+    /// [`disarm_before_draining`] for the version of this that skipped, and why that was a certain
+    /// freeze bought to avoid a possible misread.
     #[test]
-    fn an_unreadable_breakpoint_inventory_does_not_permit_a_resume() {
+    fn an_unreadable_breakpoint_inventory_is_not_a_clean_target() {
         assert!(
             nothing_armed(Some(0)),
-            "a target confirmed clean is the one that may be resumed"
+            "an inventory that read back empty is the one case a stop can be attributed in"
         );
         assert!(
             !nothing_armed(None),
@@ -13503,7 +13523,7 @@ mod tests {
         );
         assert!(
             !nothing_armed(Some(1)),
-            "a breakpoint that would not come off is what the teardown refuses to resume over"
+            "a breakpoint still on the target is what a drain resume could stop at"
         );
     }
 
