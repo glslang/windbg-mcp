@@ -492,6 +492,27 @@ fn drain_pending_break_ins(e: &DebugEngine) -> usize {
     drain.delivered
 }
 
+/// Whether a teardown owes a drain, given what the attach recorded and what the engine says about
+/// its target.
+///
+/// **An unreadable status is not an absent target, and which way this errs is the decision rather
+/// than a default.** `has_target` propagates `GetExecutionStatus`'s failure, and dbgscope
+/// deliberately leaves each caller to say what to make of that. The two mistakes are not the same
+/// size. Draining an engine that turns out to hold nothing costs one refused command —
+/// `execute_and_wait` opens with `refuse_without_a_debuggee`, which is what stands between this
+/// and an access violation *inside* DbgEng that no `catch_unwind` traps — and the loop stops on
+/// that `Err`. Skipping a drain the engine did owe hands the break-in back to `qd` and leaves the
+/// target halted, which is the whole of what this branch exists to prevent. So only a **confirmed**
+/// `Ok(false)` skips it. Raised as a review finding on
+/// [#361](https://github.com/glslang/windbg-mcp/pull/361), where this asked for `Ok(true)` and so
+/// took the expensive direction on no evidence.
+///
+/// Generic over the error because it never reads one: what decides is that the answer was not a
+/// confirmed absence, and a test can say that without constructing a `DbgEngError`.
+fn drain_is_owed<E>(attach_owes_a_break_in: bool, target: Result<bool, E>) -> bool {
+    attach_owes_a_break_in && !matches!(target, Ok(false))
+}
+
 /// The drain and the one condition it runs under, for **both** teardown paths.
 ///
 /// Shared because the two are reached by different routes and only one of them has a caller: an
@@ -505,7 +526,7 @@ fn drain_pending_break_ins(e: &DebugEngine) -> usize {
 /// is worse than a resume that did not happen. The release runs either way, and still reports what
 /// it did.
 fn drain_before_release(e: &DebugEngine) {
-    if !INITIAL_BREAK_ATTACH.load(Ordering::SeqCst) || !matches!(e.has_target(), Ok(true)) {
+    if !drain_is_owed(INITIAL_BREAK_ATTACH.load(Ordering::SeqCst), e.has_target()) {
         return;
     }
     let delivered = drain_pending_break_ins(e);
@@ -13392,6 +13413,33 @@ mod tests {
         );
         assert_eq!(drain.free_runs, 1, "and it does not reset the count either");
         assert_eq!(drain.delivered, 0, "nor is it a break-in delivered");
+    }
+
+    /// **An engine that cannot say whether it holds a target is not an engine that holds none.**
+    ///
+    /// The asymmetry is the point: draining an engine holding nothing costs one command that
+    /// `execute_and_wait` refuses on its own, while skipping a drain that was owed hands the
+    /// break-in to `qd` and freezes the target. A guard that errs is only as good as the direction
+    /// it errs in, and this one used to err the expensive way.
+    #[test]
+    fn an_unreadable_target_status_does_not_excuse_the_drain() {
+        assert!(
+            drain_is_owed(true, Ok::<bool, ()>(true)),
+            "the ordinary case"
+        );
+        assert!(
+            drain_is_owed(true, Err::<bool, ()>(())),
+            "an unreadable status is no evidence the target is gone, and guessing that it is costs \
+             a halted machine"
+        );
+        assert!(
+            !drain_is_owed(true, Ok::<bool, ()>(false)),
+            "a confirmed absence is the one answer that skips it"
+        );
+        // And the attach's own record still decides first: an announcement attach removes
+        // `INITIAL_BREAK` and leaves nothing owing, whatever the engine says afterwards.
+        assert!(!drain_is_owed(false, Ok::<bool, ()>(true)));
+        assert!(!drain_is_owed(false, Err::<bool, ()>(())));
     }
 
     /// A target that goes during the drain ends it there. Nothing is owed by a target that is
