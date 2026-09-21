@@ -4146,9 +4146,10 @@ the stop-per-processor rule as one of its two breakpoint hazards.
 
 **The numbers.** 10 of 10 four-processor hit-then-detach cycles clean against a local build of the
 fix, with the backed-out control interleaved between the two batches of five on the same guest and
-the same boot (2 of 4 froze), then **5 of 5** against the pinned `192e3486`. Every cycle carries an
-independent WinRM boot-identity and advancing-uptime check; the guest never rebooted across any of
-it.
+the same boot (2 of 4 froze), then **10 of 10** against the merged pin `192e3486` — the last five
+from a clean tree, answering as `0.19.0+g1ac1abc0`, which is the identity to quote, the earlier
+batches having run against trees whose stamp was not read. Every cycle carries an independent WinRM
+boot-identity and advancing-uptime check; the guest never rebooted across any of it.
 
 **And recovery turned out to be cheaper than the item assumed.** It recorded a separately
 authorised native-KD connection as the remedy. A plain `attach_kernel` -- no

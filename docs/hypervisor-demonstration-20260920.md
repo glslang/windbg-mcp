@@ -4,11 +4,16 @@ The merged server demonstrated hypervisor inspection, single-step, breakpoint cr
 and an actual software-breakpoint hit. **The breakpoint-hit run failed its independent post-detach
 guest-health check.** It is not a successful end-to-end recovery demonstration.
 
-Open work is tracked in [windbg-mcp #355](https://github.com/glslang/windbg-mcp/issues/355)
-and [FOLLOWUPS.md item 93](../FOLLOWUPS.md#93-windbg-mcp--dbgscope-multiprocessor-hypervisor-stops-after-a-temporary-breakpoint-and-detach).
+What this day left open was tracked as
+[windbg-mcp #355](https://github.com/glslang/windbg-mcp/issues/355) and item 93, and **item 93 was
+answered on 2026-09-21** on a guest rebuilt with four processors: the stops are one per *other*
+processor, owed by any breakpoint in shared code, and the fix is dbgscope#175. That work is in
+[`DONE.md`](../DONE.md#93-windbg-mcp--dbgscope-multiprocessor-hypervisor-stops-after-a-temporary-breakpoint-and-detach--done-2026-09-21)
+and [`hypervisor-debugging.md`](./hypervisor-debugging.md); **nothing below is restated by it**, and
+the follow-up sections here record what was and was not established on the day.
 The guest has since recovered. The owner's later one-vCPU change and successful demonstration
 are recorded [separately](./hypervisor-demonstration-single-vcpu-20260920.md); they do not alter
-the four-vCPU measurements or close the follow-up below.
+the four-vCPU measurements.
 
 ## Measured artifacts
 

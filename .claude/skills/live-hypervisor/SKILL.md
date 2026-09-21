@@ -249,7 +249,7 @@ breakpoints and sending `qd`, **sized one resume per processor** — so four pro
 attempts where the old fixed five was exactly enough by coincidence. It runs on every live-kernel
 quit, whatever the attach shape: gating it on an `INITIAL_BREAK` attach, which is what it used to
 do, left it unrun on the `experimental_break_on_connect` path that every hypervisor run here uses.
-Ten of ten four-processor cycles detached cleanly with it, against 2 of 4 freezing without.
+Twenty of twenty four-processor cycles detached cleanly with it, against 2 of 4 freezing without.
 
 **That is dbgscope#175, pinned here at `192e3486` since 2026-09-21** (`DONE.md` item 93). Against
 an **older** engine build — a released `windbg-mcp`, or a checkout whose `rev` predates it — a
@@ -390,11 +390,19 @@ memory over a transport NT services only when it is executing, so with the hyper
 block like any other uncached read. Resume the hypervisor, edit NT's breakpoints, then park NT
 again.
 
-**A bounded hypervisor run that expires leaves a break-in owing**, and the next resume spends it:
-an immediate stop at `hv+0x404a60` with the CTRL+BREAK banner and nothing armed. It is harmless,
-and it reads like a breakpoint hit if you are not expecting it. Tell it from a queued per-processor
+**A bounded run that expires can leave a break-in owing**, and the next resume spends it: an
+immediate stop at `hv+0x404a60` with the CTRL+BREAK banner and nothing armed. It is harmless, and
+it reads like a breakpoint hit if you are not expecting it. Tell it from a queued per-processor
 stop by the banner and the address: this one is at the break routine, that one is at your own
 breakpoint's address.
+
+**It is not a rule, and the difference matters to any drain that ends on a bounded run.** It was
+seen twice on one vCPU; on four processors it did not reproduce — two consecutive expired 1500 ms
+runs each ran their whole window, and so did the expired run after the last queued stop, with the
+teardown that followed leaving the guest healthy. Which is what lets a drain treat a run that
+reached its deadline as a *free* run: dbgscope's does, and twenty of twenty four-processor
+teardowns behind it left the guest healthy. Do not add a resume after the second bounded run to be
+safe — an extra one is another bounded run to interpret, not a stop consumed.
 
 ## Teardown
 

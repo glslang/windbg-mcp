@@ -534,10 +534,12 @@ is that this build's own `0x5C`/`0x5D` branch requires that bit set, so it does 
   memory over a transport NT services only when it is executing, so with the hypervisor halted they
   block like any other uncached read. The order is: resume the hypervisor, edit NT's breakpoints,
   then park NT again.
-- **A bounded hypervisor run that expires leaves a break-in owing.** Twice, the next resume stopped
+- **A bounded hypervisor run that expired left a break-in owing, twice.** The next resume stopped
   immediately at `hv+0x404a60` with the CTRL+BREAK banner and nothing armed -- the pending break-in
   being spent. Harmless, and the same leftover the teardown drain exists for, but it costs a cycle
-  and reads like a breakpoint hit.
+  and reads like a breakpoint hit. **Stated as a rule it is too strong**: the four-processor
+  section below did not reproduce it, and a drain that reads a deadline-terminated run as a free
+  one is sound on the evidence there.
 
 ### Teardown and guest health
 
@@ -633,18 +635,22 @@ attempt count no longer does.
 Measured through `examples/hypervisor_detach_regression.ps1` on the four-processor guest, each
 cycle carrying its own WinRM boot-identity and advancing-uptime check:
 
-| Drain | Build | Cycles | Guest healthy afterwards |
+| Drain | Answering binary | Cycles | Guest healthy afterwards |
 |---|---|---|---|
-| Backed out | local | 4 | 2 |
-| Present, sized per processor | local | 10 | 10 |
-| Present, sized per processor | pinned `192e3486` | 5 | 5 |
+| Backed out | local `[patch]`, identity not read | 4 | 2 |
+| Present, sized per processor | local `[patch]`, identity not read | 10 | 10 |
+| Present, sized per processor | **`0.19.0+g1ac1abc0`**, pinned `192e3486` | 5 | 5 |
+| Present, sized per processor | pinned `192e3486`, identity not read | 5 | 5 |
 
-The ten were two batches of five, with the backed-out runs interleaved between them on the same
-guest and the same boot, so the difference is the drain rather than the guest settling. The last
-row is the same sequence after dbgscope#175 merged and `Cargo.toml`'s `rev` moved to it, which is
-what the ten do not cover: they were taken against a local `[patch]`, and a measurement is a
-reading of the binary that answered rather than of the checkout beside it. All nineteen cycles ran
-against the one boot the guest came up on that afternoon.
+The ten `[patch]` cycles were two batches of five with the backed-out runs interleaved between
+them, on the same guest and the same boot, so the difference is the drain rather than the guest
+settling. The third row is the one to quote: it was taken after dbgscope#175 merged and
+`Cargo.toml`'s `rev` moved to it, from a clean tree, and the version is the server's own
+`serverInfo` read out of the binary that answered rather than the checkout beside it. The fourth
+row is the same sequence run before that commit, on a tree dirty with the pin change -- the result
+is real and the identity was not captured, which is exactly the gap the row above closes and the
+reason it is not folded into it. All twenty-four cycles ran against the one boot the guest came up
+on that afternoon.
 
 ### What this does not say
 
