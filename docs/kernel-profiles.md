@@ -134,11 +134,16 @@ result, because a field silently absent from an otherwise ordinary attach is the
 reporting it — and the target still opens. The opposite would mean a typo in a description costs
 the machine it describes.
 
-`note` **and `guest`** are both scrubbed at every render, so a connection string or a key pasted
-into either does not leave this process. Being name-shaped is not what makes `guest` safe: the
-charset stops a connection string and a forged report line, and it admits a bare KDNET key, which
-is dotted decimal. Masking is by value, so a guest that is not one of this host's own keys is
+`note`, `guest` **and the text of every refusal** are scrubbed at each render, so a connection
+string or a key pasted anywhere in a profile does not leave this process. Being name-shaped is not
+what makes a value safe to print: the charset stops a connection string and a forged report line,
+and it admits a bare KDNET key, which is dotted decimal — so it is admitted for a `guest` and for a
+member name a refusal then quotes back. Masking is by value, so an ordinary guest or member name is
 untouched.
+
+A `role` the **attach contradicts** is withdrawn rather than annotated: the field goes and the
+reason joins `ignored`, so a `session_status` read on a later turn cannot go on advertising a role
+the target has already disagreed with.
 
 Configured profiles stay in the supervisor: an engine worker is spawned **without** the
 `WINDBG_MCP_PROFILE_*` variables, and is told only the one connection it is opening, over its

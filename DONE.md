@@ -4268,7 +4268,18 @@ still saw an ordinary attach: `.claude/rules/tool-surface.md`'s rule about annot
 broken in the commit whose own comments cite it. One renderer now feeds the open's report and
 `session_status`'s text.
 
-**Four rounds, three of them on mechanisms the previous round had just added.** The pattern is the
+**A fourth round found the same hole by a second route, and the check outliving its own result.**
+A complaint *quotes* the member it is about, and `a_member` quotes one that is name-shaped -- so the
+text written to help an operator find their typo was itself the disclosure, in the notes, in
+`ignored`, and thus in the listing, the attach result and `session_status`. Every refusal's text is
+scrubbed at render now, not just the two fields. And `role_disagreement`'s answer lived only in the
+*open's* result: the registered session kept the declared role, so a `session_status` on a later
+turn -- or from another client -- went on advertising a role the target had already contradicted,
+which is this item's own failure mode surviving the check added to catch it. The contradicted claim
+is **withdrawn** from what the session reports (`kdconn::contradicted`), which reuses `ignored`
+rather than adding a third state for a claim nobody should read.
+
+**Five rounds, four of them on mechanisms the previous round had just added.** The pattern is the
 one `prefer-simplification-over-gap-fixing` describes, and the round that broke it was the one that
 changed a *type* rather than the fold: `Option` to an absorbing `Claim`.
 
@@ -4279,7 +4290,7 @@ claims travel in `outputSchema`, which
 output schemas grew: +352 B on each of the six openers and +417 B on `session_status`, +2,529 B of
 wire in total, which is why `tests/golden/tool_budget.json` moved and
 `every_documented_surface_figure_matches_the_served_surface` did not. Measured on the ARM64 bench
-2026-09-21 against a worktree at `1c749a9`: 1,017 unit tests and 123 `mcp_smoke` with
+2026-09-21 against a worktree at `1c749a9`: 1,019 unit tests and 123 `mcp_smoke` with
 `WINDBG_MCP_SMOKE_DUMP=1`, 0 failed.
 
 **What it did not do.** `guest` is unverified and will stay so. Nothing was added to the

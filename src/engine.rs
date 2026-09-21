@@ -536,7 +536,11 @@ pub struct Session {
     /// What the connection profile this was opened with claims about the target, if a profile
     /// named it. The same facts [`Session::what`] renders, as values — see
     /// [`crate::structured::ProfileFacts`].
-    pub profile: Option<crate::structured::ProfileFacts>,
+    ///
+    /// Behind a lock because the open can **correct** it: a declared `role` the attach then
+    /// contradicts is withdrawn here, so `session_status` on a later turn cannot go on advertising
+    /// it. Written once at most, by [`Session::withdraw_profile_claim`].
+    profile: Mutex<Option<crate::structured::ProfileFacts>>,
     pub pid: u32,
     created: Instant,
     state: Mutex<(SessionState, Instant)>,
@@ -879,6 +883,23 @@ impl Session {
             gate: Call::supervisor(EngineOp::PreserveKernel).gate,
         });
         message
+    }
+
+    /// What the profile that opened this session claims, as it should now be reported.
+    pub fn profile(&self) -> Option<crate::structured::ProfileFacts> {
+        self.profile
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Withdraws a claim the target contradicted, so nothing reading this session later repeats
+    /// it. See [`crate::kdconn::contradicted`] for why it is withdrawn rather than annotated.
+    pub fn withdraw_profile_claim(&self, why: String) {
+        let mut held = self.profile.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(facts) = held.as_ref() {
+            *held = Some(crate::kdconn::contradicted(facts, why));
+        }
     }
 
     fn state(&self) -> SessionState {
@@ -1778,6 +1799,11 @@ impl Sessions {
         registry.symbol_paths.remove(owner);
     }
 
+    /// The session a just-finished open minted, for the one correction an opener can make to it.
+    pub fn held(&self, id: &str) -> Option<Arc<Session>> {
+        self.registry().find(id)
+    }
+
     pub fn snapshot(&self) -> Vec<SessionSnapshot> {
         let registry = self.registry();
         // A caller is shown its own sessions and told which of *those* is current. Another client's
@@ -1794,7 +1820,7 @@ impl Sessions {
                 id: s.id.clone(),
                 kind: s.kind,
                 what: s.what.clone(),
-                profile: s.profile.clone(),
+                profile: s.profile(),
                 pid: s.pid,
                 state: s.state(),
                 in_state_for: s.in_state_for(),
@@ -3250,7 +3276,7 @@ impl Sessions {
             id: id.to_string(),
             kind,
             what,
-            profile,
+            profile: Mutex::new(profile),
             pid,
             created: Instant::now(),
             owner: crate::client::current(),
@@ -7092,7 +7118,7 @@ mod tests {
             id: id.to_string(),
             kind: SessionKind::Dump,
             what: "test".to_string(),
-            profile: None,
+            profile: Mutex::new(None),
             pid: 0,
             created: Instant::now(),
             owner: crate::client::current(),

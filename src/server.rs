@@ -2259,6 +2259,7 @@ impl WindbgServer {
                 mut report,
                 mut summary,
             }) => {
+                let mut profile = profile;
                 // Both halves again, for the reason below: the worker already appended its own
                 // limitation to the text it built, so a line added to the field alone would be a
                 // warning the text readers never get.
@@ -2273,6 +2274,13 @@ impl WindbgServer {
                         None => disagreement.clone(),
                     });
                     report = format!("{report}\n{disagreement}");
+                    // **And withdrawn from the session**, not only reported here. `session_status`
+                    // reads the session, possibly on a later turn or from another client, and
+                    // would otherwise keep advertising the role the target just contradicted.
+                    if let Some(session) = self.sessions.held(&id) {
+                        session.withdraw_profile_claim(disagreement.clone());
+                    }
+                    profile = self.sessions.held(&id).and_then(|s| s.profile());
                 }
                 // Annotated once, above both halves, because a structured-aware client forwards
                 // `structuredContent` and drops the text: a pointer added to only one of them is
