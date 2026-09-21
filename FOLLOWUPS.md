@@ -1970,6 +1970,15 @@ vCPUs with controlled breakpoint placement and stepping; establish the cause; an
 validate an engine-thread implementation with repeated four-vCPU breakpoint-hit/detach runs
 and independent same-boot guest health. A passing one-vCPU run alone does not close the item.
 
+**The hypercall correlation belongs here too, and not as a separate strand.** Seeing one hypercall
+from both ends means breaking on the hypervisor's own dispatch, which needs its RVA out of the
+static work in [`docs/hypervisor-demonstration-20260920.md`](./docs/hypervisor-demonstration-20260920.md)
+-- and a dispatch breakpoint is hypervisor-side code **every processor runs**, which is precisely
+the shape this item was filed for. The NT half is already measured (2026-09-21): a wrapper
+breakpoint hit with the input value in a register, and the hypervisor attached and broken in while
+NT sat at it. What has never been observed is a single hypercall crossing. Do it on one vCPU
+first, since the four-processor topology is the open hazard above rather than a control.
+
 **Picks up at:** the investigation's live/static follow-up sections and #355's checklist. **The
 reproducer half is no longer the temporary local runner**: since 2026-09-20 the hypervisor tier's
 `a_live_hypervisor_session_inspects_steps_and_detaches` carries the breakpoint-hit sequence behind
