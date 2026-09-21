@@ -285,15 +285,17 @@ sequence does not cover is a second processor.
    7 ms — that is what "keep landing on it" rests on, rather than a count of calls. `0x8001005D`
    never reached the hypervisor's dispatcher in 60 s of free running, while the next value out of
    the same wrapper reached it in 714 ms. Bit 31 marks a hypercall for the parent hypervisor and this lab's guest is
-   itself nested, which is a plausible reading and not a measured one. Re-arm NT to skip it:
+   itself nested, which is a plausible reading and not a measured one. Re-arm NT to skip it — and
+   then **resume NT again**, because `bc`/`bp` only change what is armed and leave NT halted where
+   it was:
 
    ```text
    bc *; bp nt!HvcallInitiateHypercall "j (@rcx != 0x8001005d) ''; 'gc'"
    ```
 
-   That stopped on `rcx = 0x00010068` — call code `0x68`, fast bit, `rdx = 0`. **That** is the value
-   step 5 arms for, and record `rsp`, `rsi`, `rdi` and `r13` with it: they are what identify the
-   instance at the other end.
+   followed by the `continue_async` from step 2. That stopped on `rcx = 0x00010068` — call code
+   `0x68`, fast bit, `rdx = 0`. **That** is the value step 5 arms for, and record `rsp`, `rsi`,
+   `rdi` and `r13` with it: they are what identify the instance at the other end.
 4. **Attach the hypervisor while NT sits there.** This works — it is how the asymmetry above was
    measured — and the summary comes back `kernel_target: "hypervisor"` with `hv`/`hvix64.exe` and
    `symbols: none`. Both sessions are then open, independently routed, and both targets halted.
@@ -312,7 +314,10 @@ sequence does not cover is a second processor.
    simply lodged — then `continue_async` the **hypervisor**, which is what puts the guest back on a
    processor and lets NT take that lodged resume, then `wait_for_stop` on the hypervisor. Releasing
    NT alone changes nothing: this file's own asymmetry says a halted hypervisor stops NT, and a
-   procedure that resumes the hypervisor only at teardown never reaches a stop.
+   procedure that resumes the hypervisor only at teardown never reaches a stop. **NT first rather
+   than the hypervisor first** is deliberate and is the order that was measured: with NT's resume
+   already lodged, it is taken the instant the guest runs, so the first hypercall matching the
+   condition is the released call rather than one another thread slipped in during the gap.
 
    Read the guest register array at that stop — `rcx` points at it. Every register agrees with the
    NT-side capture, transformed as the wrapper's prologue transforms it: `rbp` is NT's `rsp` less
@@ -325,6 +330,25 @@ sequence does not cover is a second processor.
 6. **Resume both, hypervisor first.** Take any hypervisor breakpoint off first or the next
    hypercall re-enters it immediately, then `continue_async` the hypervisor. Only now does NT
    execute: an outstanding NT call unblocks the moment the hypervisor runs.
+
+**Three review findings on this procedure were all one mistake — a step that changes what is armed
+and does not say what to resume — so here is the state both targets are in after each step.** A
+step that leaves something halted where the next step needs it running is visible here and is not
+visible in the prose:
+
+| After step | NT | Hypervisor |
+|---|---|---|
+| 1 arm the wrappers | halted | not attached |
+| 2 resume, trigger from outside | running | not attached |
+| 3 capture, re-arm, **resume again**, capture the crossing value | halted at the chosen value | not attached |
+| 4 attach | halted | halted at `hv+0x404a60` |
+| 5 arm `hv+0x21056D`, lodge NT, **resume the hypervisor** | resumes, then frozen mid-`vmcall` | halted at `hv+0x21056D` |
+| 6 clear the hypervisor breakpoint, resume it | running — clear NT's conditional too, or it stops again at the next match | running |
+
+Two rules fall out of that column pair, and they are the ones the findings kept landing on:
+**arming is not resuming** — `bp`, `bc` and `set_breakpoint` change what is armed and leave the
+target exactly where it was — and **NT's state is only meaningful while the hypervisor runs**, so
+any row where the hypervisor is halted is a row where NT does nothing at all.
 
 **Two ordering traps, both measured 2026-09-21, and each costs a run.**
 
