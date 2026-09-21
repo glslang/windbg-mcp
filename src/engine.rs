@@ -533,6 +533,10 @@ pub struct Session {
     /// What was opened — the path, connection string, pid, or command line. Reported so a
     /// caller looking at several sessions can tell them apart.
     pub what: String,
+    /// What the connection profile this was opened with claims about the target, if a profile
+    /// named it. The same facts [`Session::what`] renders, as values — see
+    /// [`crate::structured::ProfileFacts`].
+    pub profile: Option<crate::structured::ProfileFacts>,
     pub pid: u32,
     created: Instant,
     state: Mutex<(SessionState, Instant)>,
@@ -1368,6 +1372,7 @@ pub struct SessionSnapshot {
     pub id: String,
     pub kind: SessionKind,
     pub what: String,
+    pub profile: Option<crate::structured::ProfileFacts>,
     pub pid: u32,
     pub state: SessionState,
     /// How long the session has been in `state`.
@@ -1789,6 +1794,7 @@ impl Sessions {
                 id: s.id.clone(),
                 kind: s.kind,
                 what: s.what.clone(),
+                profile: s.profile.clone(),
                 pid: s.pid,
                 state: s.state(),
                 in_state_for: s.in_state_for(),
@@ -2026,6 +2032,7 @@ impl Sessions {
         &self,
         kind: SessionKind,
         what: String,
+        profile: Option<crate::structured::ProfileFacts>,
         op: EngineOp,
     ) -> Result<OpenReport, OpenError> {
         debug_assert!(op.is_opener(), "open() needs an opener op");
@@ -2045,7 +2052,7 @@ impl Sessions {
             _ => None,
         };
         let session = match self
-            .spawn(&id, kind, what, opening.as_ref(), endpoint)
+            .spawn(&id, kind, what, profile, opening.as_ref(), endpoint)
             .await
         {
             Ok(session) => session,
@@ -3198,6 +3205,7 @@ impl Sessions {
         id: &str,
         kind: SessionKind,
         what: String,
+        profile: Option<crate::structured::ProfileFacts>,
         target: Option<&crate::target::Opening>,
         kernel_endpoint: Option<kdconn::Endpoint>,
     ) -> Result<Arc<Session>, String> {
@@ -3242,6 +3250,7 @@ impl Sessions {
             id: id.to_string(),
             kind,
             what,
+            profile,
             pid,
             created: Instant::now(),
             owner: crate::client::current(),
@@ -7083,6 +7092,7 @@ mod tests {
             id: id.to_string(),
             kind: SessionKind::Dump,
             what: "test".to_string(),
+            profile: None,
             pid: 0,
             created: Instant::now(),
             owner: crate::client::current(),

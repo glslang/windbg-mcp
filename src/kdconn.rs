@@ -12,7 +12,8 @@
 //! - **Profiles.** `attach_kernel { "profile": "ctf-vm" }` names a connection this process
 //!   resolves from its own environment or a local file. The name is not a secret; the string it
 //!   resolves to never leaves this process except down the private pipe to the session's own
-//!   engine worker.
+//!   engine worker. A profile may also *describe* what it reaches — see [`Details`] — which is
+//!   the half of it that is not about secrecy at all.
 //! - **[`Connection`], a value that cannot be printed.** Its `Debug` and `Display` render the
 //!   redacted form, so the raw string is reachable only through [`Connection::expose`] — one call
 //!   site, in the worker, handing it to DbgEng. Every other route to a log line, an error, or a
@@ -28,6 +29,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
 use serde::{Deserialize, Serialize};
+
+use crate::structured::{KernelTarget, ProfileFacts};
 
 /// Environment prefix for a single profile: `WINDBG_MCP_PROFILE_CTF_VM=net:port=50000,key=…`
 /// defines the profile `ctf-vm`.
@@ -68,6 +71,11 @@ const OPAQUE: &str = "<connection redacted>";
 /// How long a profile name may be. Generous for a name, short enough that nothing anyone would
 /// mistake for a connection string or a pasted secret gets in under it.
 const NAME_LIMIT: usize = 64;
+
+/// How long a profile's free-text note may be. Room for a sentence saying what an endpoint is for,
+/// and no room for a pasted transcript — a note is rendered in every listing that names its
+/// profile, so its length is paid for on every refusal that lists one.
+const NOTE_LIMIT: usize = 200;
 
 /// A kernel connection string, with the secret sealed in.
 ///
@@ -538,6 +546,206 @@ fn is_ambiguous(c: char) -> bool {
     c.is_whitespace() || c.is_control()
 }
 
+/// What a profile says about the target it reaches, beyond how to dial it.
+///
+/// All three are the **operator's claims**, not this server's findings, and that difference is why
+/// they are carried here rather than left as a comment in their config file. [`Details::role`] is
+/// the one that can be checked: an attach derives the same fact from the engine's primary module
+/// (`worker::kernel_target`), so a profile that says `hypervisor` and reaches `nt` is caught and
+/// said out loud rather than believed. `guest` and `note` cannot be checked at all — there is no
+/// debugger question that asks two endpoints whether they are the same machine — so they are
+/// reported as what they are: configuration, and only as good as whoever wrote it.
+///
+/// The alternative to carrying them is reading them off the *names*, which is worse than not
+/// knowing. The wiring here is machine-specific and deliberately untracked, so any convention read
+/// off a name is a guess that looks like knowledge, and a pair that looks matched need not be.
+#[derive(Clone, Default, Debug)]
+struct Details {
+    /// Which kind of kernel this endpoint reaches — the *pre-attach* half of the fact
+    /// [`KernelTarget`] carries afterwards. Worth knowing in advance precisely because attaching
+    /// to the wrong one of a pair costs a session and stops a guest's world.
+    role: Option<KernelTarget>,
+    /// A name shared by every profile that reaches one machine, which is what makes two endpoints
+    /// a *pair* rather than two unrelated targets — the fact debugging a hypervisor alongside its
+    /// root partition is built on, and the one that otherwise lives only in the operator's head.
+    /// Name-shaped ([`is_profile_name`]), so it is safe to render wherever a profile name is.
+    guest: Option<String>,
+    /// Free text, exactly as configured. Read through [`Details::note`] and never directly: it is
+    /// the one field here that could carry a pasted key, and scrubbing it at every render — by
+    /// which time every profile on this host has been admitted, so [`KNOWN_SECRETS`] is complete —
+    /// is what keeps a mistake in a config file out of the transcript.
+    note: Option<String>,
+}
+
+impl Details {
+    /// The note as it is safe to report. See the field for why this is the only way to read it.
+    fn note(&self) -> Option<String> {
+        self.note.as_deref().map(scrub)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.role.is_none() && self.guest.is_none() && self.note.is_none()
+    }
+
+    /// How a profile's claims read beside its name: `hypervisor, guest "lab", "root partition"`.
+    /// `None` when it makes none, which is every profile configured as a bare string.
+    fn described(&self) -> Option<String> {
+        let mut parts = Vec::new();
+        if let Some(role) = self.role {
+            parts.push(role.label().to_string());
+        }
+        if let Some(guest) = &self.guest {
+            parts.push(format!("guest \"{guest}\""));
+        }
+        if let Some(note) = self.note() {
+            parts.push(format!("\"{note}\""));
+        }
+        (!parts.is_empty()).then(|| parts.join(", "))
+    }
+}
+
+/// One configured entry as its source wrote it: how to dial, what it claims, and what could not be
+/// taken from it.
+///
+/// **Deliberately not `Debug`.** It holds the connection *before* it becomes a [`Connection`], so
+/// this is the one shape in this module whose fields are the raw string — and a derive here would
+/// put a key back into every `{:?}` the type reaches, which is the leak [`Connection`] exists to
+/// close. Tests destructure it instead.
+struct Entry {
+    connection: String,
+    details: Details,
+    /// Fields this server could not take, each phrased to follow ``profile `x` in the file: ``.
+    ///
+    /// A complaint costs the **field** and never the profile. Refusing the entry instead would
+    /// mean a typo in a description costs the operator the target it describes — a worse outcome
+    /// than the description simply being absent, because absence claims nothing while a missing
+    /// profile reads as a configuration that was never written.
+    complaints: Vec<String>,
+}
+
+impl Entry {
+    fn of(connection: &str) -> Self {
+        Self {
+            connection: connection.trim().to_string(),
+            details: Details::default(),
+            complaints: Vec::new(),
+        }
+    }
+}
+
+/// Reads a configured value that arrived as **text** — an environment variable, or a test fixture.
+///
+/// A connection string never starts with `{`, so the two accepted forms cannot be confused: the
+/// object form is JSON and everything else is the connection itself. That is what keeps every
+/// variable set before this existed working unchanged.
+fn configured(value: &str) -> Result<Entry, String> {
+    let value = value.trim();
+    if !value.starts_with('{') {
+        return Ok(Entry::of(value));
+    }
+    let parsed: serde_json::Value = serde_json::from_str(value).map_err(|e| {
+        format!(
+            "it starts with `{{`, so it was read as an object, and it is not valid JSON ({e}). \
+             The value is not repeated here, in case it carries a key."
+        )
+    })?;
+    entry_of(&parsed)
+}
+
+/// Reads a configured value in its parsed form: the connection string this has always taken, or
+/// the object that can also say what the endpoint reaches.
+///
+/// Walked by hand rather than deserialized, for the reason [`read_profile_file`] gives — serde's
+/// type errors quote the value they rejected, and the value here is a secret.
+fn entry_of(value: &serde_json::Value) -> Result<Entry, String> {
+    let members = match value {
+        serde_json::Value::String(connection) => return Ok(Entry::of(connection)),
+        serde_json::Value::Object(members) => members,
+        _ => {
+            return Err(
+                "it must be a connection string, or an object with a `connection` member"
+                    .to_string(),
+            );
+        }
+    };
+    let connection = match members.get("connection") {
+        Some(serde_json::Value::String(connection)) => connection,
+        Some(_) => return Err("its `connection` must be a string".to_string()),
+        None => {
+            return Err(
+                "it is an object with no `connection` member, which is the one thing a profile \
+                 cannot do without"
+                    .to_string(),
+            );
+        }
+    };
+    let mut entry = Entry::of(connection);
+    for (member, value) in members {
+        match member.as_str() {
+            "connection" => {}
+            "role" => match value.as_str().and_then(role_of) {
+                Some(role) => entry.details.role = Some(role),
+                None => entry.complaints.push(
+                    "its `role` was ignored: it must be `windows` (or `nt`) or `hypervisor` (or \
+                     `hv`), which are the two an attach can be checked against"
+                        .to_string(),
+                ),
+            },
+            "guest" => match value.as_str().map(str::trim).filter(|g| is_profile_name(g)) {
+                Some(guest) => entry.details.guest = Some(guest.to_string()),
+                None => entry.complaints.push(format!(
+                    "its `guest` was ignored: it must be a name (letters, digits, `-`, `_` or \
+                     `.`, up to {NAME_LIMIT} characters), because it is rendered wherever this \
+                     profile is"
+                )),
+            },
+            "note" => match value.as_str().map(str::trim).filter(|n| is_note(n)) {
+                Some(note) => entry.details.note = Some(note.to_string()),
+                None => entry.complaints.push(format!(
+                    "its `note` was ignored: it must be text of at most {NOTE_LIMIT} characters \
+                     with no line breaks or other control characters, which would let a profile \
+                     forge a line in a session report"
+                )),
+            },
+            other => entry.complaints.push(format!(
+                "{} was ignored: this server knows `connection`, `role`, `guest` and `note`",
+                a_member(other)
+            )),
+        }
+    }
+    Ok(entry)
+}
+
+/// The role a profile declares, or `None` for anything else.
+///
+/// `nt` and `hv` are taken as well as the spelled-out forms, because those are the module names
+/// the same fact is *derived* from — an operator reading a session report has seen them there.
+fn role_of(role: &str) -> Option<KernelTarget> {
+    match role.trim().to_ascii_lowercase().as_str() {
+        "windows" | "nt" => Some(KernelTarget::Windows),
+        "hypervisor" | "hv" => Some(KernelTarget::Hypervisor),
+        _ => None,
+    }
+}
+
+/// Whether this is a note rather than something that has no business being rendered.
+///
+/// A control character is refused for the reason [`is_ambiguous`] gives: a note appears in
+/// `session_status`'s multi-line report, and a line break in one would forge a line there.
+fn is_note(note: &str) -> bool {
+    !note.is_empty() && note.chars().count() <= NOTE_LIMIT && !note.chars().any(char::is_control)
+}
+
+/// How an unknown member is referred to. Named only when the name is one — the same rule, and the
+/// same reason, as [`referred_to_as`].
+fn a_member(name: &str) -> String {
+    if is_profile_name(name) {
+        format!("its member `{name}`")
+    } else {
+        "a member whose name is not a name".to_string()
+    }
+}
+
 /// Which of the two sources a profile came from. Carried so that a name defined twice can say
 /// whether that was the documented environment-over-file override or a collision inside one
 /// source, which are opposite things to tell an operator.
@@ -561,12 +769,31 @@ impl Source {
 struct Profile {
     name: String,
     connection: Connection,
+    /// What this profile says about its target, which for most is nothing at all: a profile
+    /// configured as a bare connection string — the form that has always worked — has
+    /// [`Details::default`].
+    details: Details,
     source: Source,
     /// Other spellings from the same source that normalize to this name and point somewhere
     /// **else**. Non-empty makes this profile unusable, deliberately: the server cannot tell which
     /// target was meant, and the failure mode of guessing is attaching to the wrong kernel while
     /// believing otherwise. A duplicate that agrees is not recorded here — nothing can go wrong.
     conflicts: Vec<String>,
+}
+
+impl Profile {
+    /// This profile's claims, as a result carries them.
+    ///
+    /// The name travels with them because they mean nothing detached from it: a client that finds
+    /// `role` disagreeing with what the attach saw has to be able to say *which* profile to fix.
+    fn facts(&self) -> ProfileFacts {
+        ProfileFacts {
+            name: self.name.clone(),
+            role: self.details.role,
+            guest: self.details.guest.clone(),
+            note: self.details.note(),
+        }
+    }
 }
 
 /// The kernel connection profiles configured on this host.
@@ -600,13 +827,16 @@ impl Profiles {
             notes: Vec::new(),
             file,
         };
-        for (name, connection) in env_entries(std::env::vars()) {
-            profiles.admit(name, &connection, Source::Env);
+        let (from_env, refused) = env_entries(std::env::vars());
+        profiles.notes.extend(refused);
+        for (name, entry) in from_env {
+            profiles.admit(name, entry, Source::Env);
         }
         match profiles.file.as_deref().map(read_profile_file) {
-            Some(Ok(from_file)) => {
-                for (name, connection) in from_file {
-                    profiles.admit(name, &connection, Source::File);
+            Some(Ok((from_file, refused))) => {
+                profiles.notes.extend(refused);
+                for (name, entry) in from_file {
+                    profiles.admit(name, entry, Source::File);
                 }
             }
             Some(Err(why)) => profiles.notes.push(why),
@@ -622,7 +852,13 @@ impl Profiles {
     /// not a name must never reach the map: the likeliest way to get one is an entry written the
     /// wrong way round, which makes the JSON *key* the connection string. A rejection is therefore
     /// counted and located, never quoted.
-    fn admit(&mut self, name: String, connection: &str, source: Source) {
+    fn admit(&mut self, name: String, entry: Entry, source: Source) {
+        let Entry {
+            connection,
+            details,
+            complaints,
+        } = entry;
+        let connection = connection.as_str();
         if is_profile_name(&name) && !is_dialable(connection) {
             // Named, because the name passed its own check and so is safe to print — and the
             // operator needs to know *which* entry to go and fix. The value stays unquoted.
@@ -643,6 +879,15 @@ impl Profiles {
                 source.label()
             ));
             return;
+        }
+        // Reported, and never fatal. A field this server could not take costs that field alone —
+        // see [`Entry::complaints`] — so the profile is admitted either way and these say what it
+        // is missing.
+        for complaint in complaints {
+            self.notes.push(format!(
+                "profile `{name}` in {}: {complaint}",
+                source.label()
+            ));
         }
         match self.entries.entry(normalize(&name)) {
             std::collections::btree_map::Entry::Occupied(mut taken) => {
@@ -666,6 +911,7 @@ impl Profiles {
                 slot.insert(Profile {
                     name,
                     connection: Connection::new(connection),
+                    details,
                     source,
                     conflicts: Vec::new(),
                 });
@@ -682,8 +928,11 @@ impl Profiles {
             notes: Vec::new(),
             file: Some(PathBuf::from(r"C:\Users\test\.windbg-mcp\profiles.json")),
         };
-        for (name, connection) in pairs {
-            profiles.admit((*name).to_string(), connection, Source::File);
+        for (name, value) in pairs {
+            match configured(value) {
+                Ok(entry) => profiles.admit((*name).to_string(), entry, Source::File),
+                Err(why) => profiles.notes.push(why),
+            }
         }
         profiles
     }
@@ -703,7 +952,10 @@ impl Profiles {
     fn how_to_configure(&self) -> String {
         let file = match &self.file {
             Some(path) => format!(
-                "or from a JSON object mapping name to connection string in {}",
+                "or from a JSON object in {} mapping each name to its connection string — or to \
+                 `{{ \"connection\": …, \"role\": \"windows\"|\"hypervisor\", \"guest\": \"<machine>\" }}` \
+                 where it is worth recording what that endpoint reaches and which machine it \
+                 shares with another profile",
                 path.display()
             ),
             None => format!("or from a JSON file named by {PROFILES_FILE_ENV}"),
@@ -732,10 +984,23 @@ impl Profiles {
 
     /// The "which profiles exist" clause, phrased for whichever of the two cases holds.
     fn listed(&self) -> String {
-        match self.names().as_slice() {
-            [] => "No profiles are configured on this host.".to_string(),
-            names => format!("Configured profiles: {}.", names.join(", ")),
+        if self.entries.is_empty() {
+            return "No profiles are configured on this host.".to_string();
         }
+        if self.entries.values().all(|p| p.details.is_empty()) {
+            return format!("Configured profiles: {}.", self.names().join(", "));
+        }
+        // Separated by `;` once anything is described, because a note is free text and a comma
+        // inside one would otherwise read as the start of the next profile.
+        let described: Vec<String> = self
+            .entries
+            .values()
+            .map(|p| match p.details.described() {
+                Some(detail) => format!("{} ({detail})", p.name),
+                None => p.name.clone(),
+            })
+            .collect();
+        format!("Configured profiles: {}.", described.join("; "))
     }
 }
 
@@ -772,24 +1037,43 @@ fn profile_env_suffix(key: &str) -> Option<&str> {
         .then_some(suffix)
 }
 
-/// The (name, connection) pairs a set of environment variables defines.
+/// The entries a set of environment variables defines, and what had to be refused among them.
 ///
 /// Split out from [`Profiles::from_host`] so the mapping is testable: `std::env::set_var` is
 /// `unsafe` in edition 2024 and mutates state every other test in this binary shares, so the only
 /// way to prove `WINDBG_MCP_PROFILE_CTF_VM` defines the profile `ctf-vm` is to hand the scan its
 /// variables rather than the process's.
-fn env_entries(vars: impl Iterator<Item = (String, String)>) -> Vec<(String, String)> {
-    vars.filter_map(|(key, value)| {
-        let suffix = profile_env_suffix(&key)?;
+///
+/// A variable's value is read by [`configured`], so this route takes the object form too. It is
+/// the more awkward of the two to write — the quoting is a shell's — but leaving it out would
+/// make a description something a host that configures its profiles in the MCP client's server
+/// definition simply cannot have.
+fn env_entries(
+    vars: impl Iterator<Item = (String, String)>,
+) -> (Vec<(String, Entry)>, Vec<String>) {
+    let mut out = Vec::new();
+    let mut refused = Vec::new();
+    for (key, value) in vars {
+        let Some(suffix) = profile_env_suffix(&key) else {
+            continue;
+        };
         if suffix.is_empty() || value.trim().is_empty() {
-            return None;
+            continue;
         }
         // The variable's own suffix *is* the profile's name, lowercased — an environment variable
         // cannot carry a hyphen, so `WINDBG_MCP_PROFILE_CTF_VM` lists as `ctf_vm`. Asking for
         // `ctf-vm` still finds it: both normalize to the same key.
-        Some((suffix.to_ascii_lowercase(), value.trim().to_string()))
-    })
-    .collect()
+        let name = suffix.to_ascii_lowercase();
+        match configured(&value) {
+            Ok(entry) if entry.connection.is_empty() => {}
+            Ok(entry) => out.push((name, entry)),
+            Err(why) => refused.push(format!(
+                "{} in the environment was skipped: {why}",
+                referred_to_as(&name)
+            )),
+        }
+    }
+    (out, refused)
 }
 
 /// Where the profile file lives on this host.
@@ -806,17 +1090,23 @@ fn profiles_file() -> Option<PathBuf> {
     })
 }
 
-/// Reads the profile file. A file that is not there is not a problem — configuring no profiles is
-/// the default — so that reads as an empty set rather than an error.
+/// Reads the profile file, and whatever in it had to be refused. A file that is not there is not
+/// a problem — configuring no profiles is the default — so that reads as an empty set rather than
+/// an error.
 ///
 /// Parsed as a generic `Value` and walked by hand rather than deserialized into a typed map,
 /// because the values here are secrets and serde's type errors quote the value they rejected
 /// (`invalid type: integer 5`). Walking it means every message this can produce names a *key*, and
 /// syntax errors from `serde_json` carry a position rather than any content.
-fn read_profile_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
+///
+/// The `Err` is for the **file**: unreadable, not JSON, or not an object. An entry that cannot be
+/// read is refused on its own, in the second half of the `Ok` — see the loop for why.
+fn read_profile_file(path: &Path) -> Result<(BTreeMap<String, Entry>, Vec<String>), String> {
     let text = match std::fs::read_to_string(path) {
         Ok(text) => text,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(BTreeMap::new()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((BTreeMap::new(), Vec::new()));
+        }
         Err(e) => return Err(format!("{} could not be read ({e})", path.display())),
     };
     // **A leading UTF-8 BOM is not a broken file.** This is the one config file a Windows user
@@ -835,19 +1125,24 @@ fn read_profile_file(path: &Path) -> Result<BTreeMap<String, String>, String> {
         )
     })?;
     let mut out = BTreeMap::new();
+    // **Per entry, not per file.** A value of the wrong type used to fail the whole read, which
+    // cost an operator every *other* profile over one typo — and the entry most likely to be
+    // malformed is the one being edited, so that landed hardest exactly mid-change.
+    let mut refused = Vec::new();
     for (name, value) in object {
-        let connection = value.as_str().ok_or_else(|| {
-            format!(
-                "{} in {} must be a string (its connection string)",
+        match entry_of(value) {
+            Ok(entry) if entry.connection.is_empty() => {}
+            Ok(entry) => {
+                out.insert(name.clone(), entry);
+            }
+            Err(why) => refused.push(format!(
+                "{} in {} was skipped: {why}",
                 referred_to_as(name),
                 path.display()
-            )
-        })?;
-        if !connection.trim().is_empty() {
-            out.insert(name.clone(), connection.trim().to_string());
+            )),
         }
     }
-    Ok(out)
+    Ok((out, refused))
 }
 
 /// The form two profile names are compared in: case-insensitive, and `-`/`_`/`.` interchangeable.
@@ -870,14 +1165,24 @@ fn normalize(name: &str) -> String {
 
 /// A resolved kernel target: the string to dial, and how the session may describe itself.
 ///
-/// `Debug`-printable in full, because both fields already are: the label is redacted at
-/// construction and [`Connection`]'s own `Debug` is the redacted one.
+/// `Debug`-printable in full, because every field already is: the label is redacted at
+/// construction, [`Connection`]'s own `Debug` is the redacted one, and a profile's note is
+/// scrubbed by [`Details::note`] before it reaches [`Selected::facts`].
 #[derive(Debug)]
 pub struct Selected {
     pub connection: Connection,
     /// What `session_status` (and the "no room to open another" list) shows for this session.
     /// Redacted at construction, so nothing downstream has to remember to redact it.
     pub label: String,
+    /// What the profile that named this target claims about it — `None` for a raw `connection`,
+    /// which claims nothing at all.
+    ///
+    /// Carried as values rather than left inside [`Selected::label`] because `guest` exists to be
+    /// *acted* on: pairing two sessions as two endpoints of one machine is something a client
+    /// does, not something it reads. A structured-aware client forwards `structuredContent` and
+    /// drops the text, so a claim that lived only in the label would be one those clients never
+    /// see.
+    pub facts: Option<ProfileFacts>,
 }
 
 /// Turns `attach_kernel`'s two selectors into one target, or explains why it cannot.
@@ -915,6 +1220,9 @@ pub fn select(connection: Option<String>, profile: Option<String>) -> Result<Sel
             Ok(Selected {
                 label: connection.redacted(),
                 connection,
+                // A raw connection string is a target and nothing more: there is no configuration
+                // behind it to have said anything about what it reaches.
+                facts: None,
             })
         }
         (None, Some(profile)) => resolve(profile.trim(), &Profiles::from_host()),
@@ -964,7 +1272,16 @@ fn resolve(name: &str, profiles: &Profiles) -> Result<Selected, String> {
             profiles.listed()
         )),
         Some(profile) => Ok(Selected {
-            label: format!("profile \"{}\" ({})", profile.name, profile.connection),
+            // The claims go in brackets, ahead of the parenthesised connection, so a profile that
+            // describes nothing renders exactly the line this has always produced.
+            label: match profile.details.described() {
+                Some(detail) => format!(
+                    "profile \"{}\" [{detail}] ({})",
+                    profile.name, profile.connection
+                ),
+                None => format!("profile \"{}\" ({})", profile.name, profile.connection),
+            },
+            facts: Some(profile.facts()),
             connection: profile.connection.clone(),
         }),
         None => Err(format!(
@@ -1548,11 +1865,16 @@ mod tests {
         ];
         for spelling in spellings {
             let vars = [(spelling.to_string(), FAKE.to_string())];
+            let (defined, refused) = env_entries(vars.into_iter());
             assert_eq!(
-                env_entries(vars.into_iter()),
-                [("ctf".to_string(), FAKE.to_string())],
+                defined
+                    .iter()
+                    .map(|(name, entry)| (name.as_str(), entry.connection.as_str()))
+                    .collect::<Vec<_>>(),
+                [("ctf", FAKE)],
                 "{spelling} should define the profile `ctf`"
             );
+            assert!(refused.is_empty(), "{refused:?}");
             assert_eq!(
                 env_names_in([spelling.to_string()].into_iter()),
                 [spelling],
@@ -1655,8 +1977,10 @@ mod tests {
             notes: Vec::new(),
             file: None,
         };
-        for (name, connection) in env_entries(vars.into_iter()) {
-            profiles.admit(name, &connection, Source::Env);
+        let (defined, refused) = env_entries(vars.into_iter());
+        assert!(refused.is_empty(), "{refused:?}");
+        for (name, entry) in defined {
+            profiles.admit(name, entry, Source::Env);
         }
         assert_eq!(profiles.names(), ["ctf_vm"]);
         for asked in ["ctf-vm", "ctf_vm", "CTF-VM"] {
@@ -1717,8 +2041,12 @@ mod tests {
             notes: Vec::new(),
             file: None,
         };
-        override_case.admit("ctf_vm".into(), FAKE, Source::Env);
-        override_case.admit("ctf-vm".into(), "net:port=1,key=9.9.9.9", Source::File);
+        override_case.admit("ctf_vm".into(), Entry::of(FAKE), Source::Env);
+        override_case.admit(
+            "ctf-vm".into(),
+            Entry::of("net:port=1,key=9.9.9.9"),
+            Source::File,
+        );
         assert_eq!(override_case.entries.len(), 1);
         assert!(
             override_case.notes.is_empty(),
@@ -1800,8 +2128,15 @@ mod tests {
         let dir = std::env::temp_dir().join(format!("windbg-mcp-kdconn-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
 
+        // Destructured rather than unwrapped throughout: `Entry` has no `Debug`, on purpose.
+        let read = |path: &Path| match read_profile_file(path) {
+            Ok((entries, refused)) => (entries, refused),
+            Err(why) => panic!("{} should have been readable: {why}", path.display()),
+        };
+
         let missing = dir.join("does-not-exist.json");
-        assert!(read_profile_file(&missing).unwrap().is_empty());
+        let (entries, refused) = read(&missing);
+        assert!(entries.is_empty() && refused.is_empty());
 
         let good = dir.join("good.json");
         std::fs::write(
@@ -1809,12 +2144,16 @@ mod tests {
             format!("{{ \"ctf-vm\": \"{FAKE}\", \"blank\": \"\" }}"),
         )
         .unwrap();
-        let parsed = read_profile_file(&good).unwrap();
-        assert_eq!(parsed.get("ctf-vm").map(String::as_str), Some(FAKE));
+        let (entries, refused) = read(&good);
+        assert_eq!(
+            entries.get("ctf-vm").map(|e| e.connection.as_str()),
+            Some(FAKE)
+        );
         assert!(
-            !parsed.contains_key("blank"),
+            !entries.contains_key("blank"),
             "an empty value is not a profile"
         );
+        assert!(refused.is_empty(), "{refused:?}");
 
         // Written the way Windows PowerShell 5.1 writes UTF-8: with a BOM in front. Not a
         // hypothetical — it is what `Set-Content -Encoding utf8` produces, and before this was
@@ -1822,29 +2161,195 @@ mod tests {
         let bom = dir.join("bom.json");
         std::fs::write(&bom, format!("\u{feff}{{ \"ctf-vm\": \"{FAKE}\" }}")).unwrap();
         assert_eq!(
-            read_profile_file(&bom)
-                .expect("a UTF-8 BOM is not a broken profile file")
-                .get("ctf-vm")
-                .map(String::as_str),
-            Some(FAKE)
+            read(&bom).0.get("ctf-vm").map(|e| e.connection.as_str()),
+            Some(FAKE),
+            "a UTF-8 BOM is not a broken profile file"
         );
 
         let bad = dir.join("bad.json");
         std::fs::write(&bad, "{ not json").unwrap();
-        assert!(
-            read_profile_file(&bad)
-                .unwrap_err()
-                .contains("not valid JSON")
-        );
+        let Err(why) = read_profile_file(&bad) else {
+            panic!("a file that is not JSON is the file's failure, not an entry's");
+        };
+        assert!(why.contains("not valid JSON"), "{why}");
 
         // A non-string value names the key, never the value — serde's own type error would have
-        // quoted the value, and the values in this file are keys.
+        // quoted the value, and the values in this file are keys. It costs that **entry** and no
+        // other: a second profile in the same file still resolves.
         let typed = dir.join("typed.json");
-        std::fs::write(&typed, "{ \"ctf-vm\": 12345 }").unwrap();
-        let err = read_profile_file(&typed).unwrap_err();
-        assert!(err.contains("`ctf-vm`"), "{err}");
-        assert!(!err.contains("12345"), "{err}");
+        std::fs::write(
+            &typed,
+            format!("{{ \"ctf-vm\": 12345, \"lab\": \"{FAKE}\" }}"),
+        )
+        .unwrap();
+        let (entries, refused) = read(&typed);
+        assert!(entries.contains_key("lab") && !entries.contains_key("ctf-vm"));
+        assert_eq!(refused.len(), 1, "{refused:?}");
+        assert!(refused[0].contains("`ctf-vm`"), "{refused:?}");
+        assert!(!refused[0].contains("12345"), "{refused:?}");
 
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A profile may say **what** it reaches, and the bare string it has always been is still a
+    /// profile (item 95).
+    ///
+    /// The two facts it can carry are of different kinds, and everything below treats them so.
+    /// `role` is checkable — `server::role_disagreement` holds it against what the attach found.
+    /// `guest` is the fact that makes two endpoints a *pair*, which nothing here can check at all
+    /// and which is exactly why it has to be configured rather than inferred from the names.
+    #[test]
+    fn a_profile_can_describe_the_target_it_reaches() {
+        let described = format!(
+            "{{ \"connection\": \"{FAKE}\", \"role\": \"hv\", \"guest\": \"lab\", \
+             \"note\": \"root partition\" }}"
+        );
+        let profiles = Profiles::from_pairs(&[("lab-hv", described.as_str()), ("ctf-vm", FAKE)]);
+        assert!(profiles.notes.is_empty(), "{:?}", profiles.notes);
+
+        let selected = resolve("lab-hv", &profiles).expect("a described profile still resolves");
+        assert_eq!(selected.connection.expose(), FAKE);
+        let facts = selected.facts.expect("its claims travel with it");
+        assert_eq!(facts.role, Some(KernelTarget::Hypervisor));
+        assert_eq!(facts.guest.as_deref(), Some("lab"));
+        assert_eq!(facts.note.as_deref(), Some("root partition"));
+        // Both halves: a structured-aware client reads the values and drops the text, a person
+        // reads the text. A claim in only one of them is a claim half the readers never get.
+        assert!(
+            selected
+                .label
+                .contains("profile \"lab-hv\" [hypervisor, guest \"lab\", \"root partition\"]"),
+            "{}",
+            selected.label
+        );
+        assert!(!selected.label.contains(FAKE_KEY), "{}", selected.label);
+
+        // The form that predates this is untouched, down to the label it renders.
+        let plain = resolve("ctf-vm", &profiles).expect("a bare string is still a profile");
+        let plain_facts = plain.facts.expect("a profile named it");
+        assert!(plain_facts.role.is_none() && plain_facts.guest.is_none());
+        assert_eq!(
+            plain.label,
+            format!("profile \"ctf-vm\" ({})", redact(FAKE))
+        );
+
+        // And the listing `attach_kernel {}` answers with carries them, which is the only way an
+        // agent learns that two of these names are one machine without being told.
+        let listed = profiles.listed();
+        assert!(
+            listed.contains("lab-hv (hypervisor, guest \"lab\", \"root partition\")"),
+            "{listed}"
+        );
+        assert!(listed.contains("ctf-vm"), "{listed}");
+        assert!(!listed.contains(FAKE_KEY), "{listed}");
+    }
+
+    /// A description this server cannot take costs **that field**, never the profile.
+    ///
+    /// The opposite — refusing the entry — would make a typo in a note cost the operator the
+    /// machine the note describes, which is the worse failure: an absent description claims
+    /// nothing, while an absent profile reads as a configuration nobody ever wrote.
+    #[test]
+    fn a_description_it_cannot_take_costs_the_field_and_not_the_target() {
+        let bad = format!(
+            "{{ \"connection\": \"{FAKE}\", \"role\": \"linux\", \"guest\": \"lab vm\", \
+             \"note\": \"two\\nlines\", \"r\u{f4}le\": \"hv\" }}"
+        );
+        let profiles = Profiles::from_pairs(&[("lab", bad.as_str())]);
+
+        let selected = resolve("lab", &profiles).expect("the connection is still dialable");
+        assert_eq!(selected.connection.expose(), FAKE);
+        let facts = selected.facts.expect("a profile named it");
+        assert!(facts.role.is_none() && facts.guest.is_none() && facts.note.is_none());
+
+        let notes = profiles.notes.join("\n");
+        for named in ["`role`", "`guest`", "`note`"] {
+            assert!(notes.contains(named), "{named} should be named: {notes}");
+        }
+        // A member name is quoted only when it is a name, for the reason `referred_to_as` gives.
+        assert!(
+            notes.contains("a member whose name is not a name"),
+            "{notes}"
+        );
+    }
+
+    /// The one field here that could carry a key does not get to keep it.
+    ///
+    /// A note is free text, so the obvious mistake is pasting the connection into it. Scrubbing
+    /// happens at **render**, not at parse: by then every profile on this host has been admitted,
+    /// so `KNOWN_SECRETS` is complete and the mask is by value — which is the half of `scrub`
+    /// that is a guarantee. Nothing about this note matches the pattern half.
+    #[test]
+    fn a_note_cannot_carry_a_key_out() {
+        let leaky =
+            format!("{{ \"connection\": \"{FAKE}\", \"note\": \"same key as {FAKE_KEY}\" }}");
+        let profiles = Profiles::from_pairs(&[("lab", leaky.as_str())]);
+        let selected = resolve("lab", &profiles).expect("resolves");
+        let note = selected
+            .facts
+            .expect("a profile named it")
+            .note
+            .expect("it has a note");
+        assert!(!note.contains(FAKE_KEY), "{note}");
+        assert!(note.contains(MASK), "{note}");
+        assert!(!profiles.listed().contains(FAKE_KEY));
+        assert!(!selected.label.contains(FAKE_KEY));
+    }
+
+    /// The object form is accepted **wherever the string is**, and the environment is the route a
+    /// host that keeps its profiles in the MCP client's server definition has to use.
+    ///
+    /// A connection string never starts with `{`, so nothing set before this existed changes
+    /// meaning — and a value that does start with one and is not JSON costs that variable alone.
+    #[test]
+    fn the_environment_takes_the_object_form_too() {
+        let vars = [
+            (
+                "WINDBG_MCP_PROFILE_LAB_HV".to_string(),
+                format!("{{\"connection\":\"{FAKE}\",\"role\":\"hypervisor\",\"guest\":\"lab\"}}"),
+            ),
+            ("WINDBG_MCP_PROFILE_LAB_NT".to_string(), FAKE.to_string()),
+            (
+                "WINDBG_MCP_PROFILE_BROKEN".to_string(),
+                "{ not json".to_string(),
+            ),
+        ];
+        let (defined, refused) = env_entries(vars.into_iter());
+        let mut profiles = Profiles {
+            entries: BTreeMap::new(),
+            notes: refused,
+            file: None,
+        };
+        for (name, entry) in defined {
+            profiles.admit(name, entry, Source::Env);
+        }
+
+        assert_eq!(profiles.names(), ["lab_hv", "lab_nt"]);
+        let hv = resolve("lab-hv", &profiles).expect("resolves");
+        assert_eq!(
+            hv.facts.expect("a profile named it").role,
+            Some(KernelTarget::Hypervisor)
+        );
+        let nt = resolve("lab-nt", &profiles).expect("resolves");
+        assert!(nt.facts.expect("a profile named it").role.is_none());
+
+        let notes = profiles.notes.join("\n");
+        assert!(notes.contains("`broken`"), "{notes}");
+        assert!(notes.contains("not valid JSON"), "{notes}");
+        assert!(
+            !notes.contains("not json"),
+            "the value is not echoed: {notes}"
+        );
+    }
+
+    /// An object is still a *profile*, so it has to say how to dial one. That refusal is the
+    /// entry's and not the file's — every other profile beside it still resolves.
+    #[test]
+    fn an_object_with_no_connection_is_not_a_profile() {
+        let profiles =
+            Profiles::from_pairs(&[("lab", "{ \"role\": \"hypervisor\" }"), ("ctf-vm", FAKE)]);
+        assert_eq!(profiles.names(), ["ctf-vm"]);
+        let notes = profiles.notes.join("\n");
+        assert!(notes.contains("`connection`"), "{notes}");
     }
 }

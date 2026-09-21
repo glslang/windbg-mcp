@@ -190,6 +190,7 @@ fn sessions_report(
                 session_id: s.id.clone(),
                 kind: s.kind.into(),
                 target: s.what.clone(),
+                profile: s.profile.clone(),
                 engine_pid: s.pid,
                 // The two derived facts a caller cannot compute: whether this wait can end on its
                 // own, and whether it has already gone on longer than a healthy one ever does.
@@ -369,6 +370,37 @@ fn open_failure(
     Ok(with_structured(
         CallToolResult::error(vec![ContentBlock::text(message)]),
         payload(structured),
+    ))
+}
+
+/// What to say when a profile's declared `role` is not what the attach found.
+///
+/// **Only when both are known**, which is narrower than it looks: a freshly attached kernel can
+/// have nothing but `nt` in the engine's inventory yet, and an inventory this cannot read leaves
+/// `kernel_target` absent. Absent is *not* disagreement — reporting one would turn "this server
+/// could not tell" into "your configuration is wrong", which is the failure this whole check
+/// exists to avoid, aimed at the operator instead of the target.
+///
+/// Said rather than refused. By the time there is anything to compare, the session is open and the
+/// target is whatever it is; what is wrong is the configuration describing it, and closing the
+/// session would cost the attach without fixing the file.
+fn role_disagreement(
+    profile: Option<&structured::ProfileFacts>,
+    summary: &structured::TargetSummary,
+) -> Option<String> {
+    let profile = profile?;
+    let (declared, found) = (profile.role?, summary.kernel_target?);
+    if declared == found {
+        return None;
+    }
+    Some(format!(
+        "The profile \"{}\" says this endpoint reaches {}, and the attach found {}. The profile \
+         describes a different target from the one it dials, so ask the user to fix its `role` — \
+         and treat its `guest` and any note as equally unchecked, because this server cannot \
+         verify those at all.",
+        profile.name,
+        declared.described(),
+        found.described(),
     ))
 }
 
@@ -2166,10 +2198,28 @@ impl WindbgServer {
         what: String,
         op: EngineOp,
     ) -> Result<CallToolResult, ErrorData> {
+        self.opened_as(kind, what, None, op).await
+    }
+
+    /// [`Self::opened`] for an opener that was given a *connection profile*, which is only
+    /// `attach_kernel`.
+    ///
+    /// The profile's claims come back beside the target's own facts, and its `role` is checked
+    /// against them here — in the supervisor, because this is the only side that has both. The
+    /// worker derives `kernel_target` and has never heard of a profile; the profile is resolved
+    /// before a worker exists. Checking it is what keeps `role` from being one more label that
+    /// can quietly disagree with the target it names.
+    async fn opened_as(
+        &self,
+        kind: SessionKind,
+        what: String,
+        profile: Option<structured::ProfileFacts>,
+        op: EngineOp,
+    ) -> Result<CallToolResult, ErrorData> {
         // Kept for the typed answer, which describes what was asked for rather than re-deriving
         // it from the report the debugger printed.
         let target = what.clone();
-        let outcome = self.sessions.open(kind, what, op).await;
+        let outcome = self.sessions.open(kind, what, profile.clone(), op).await;
         // An opener does not route to a session, it *mints* one — and the transcript wants the
         // same field filled in either way, so the call that created a target can be joined to the
         // events about it.
@@ -2185,9 +2235,19 @@ impl WindbgServer {
         match outcome {
             Ok(OpenReport {
                 id,
-                report,
-                summary,
+                mut report,
+                mut summary,
             }) => {
+                // Both halves again, for the reason below: the worker already appended its own
+                // limitation to the text it built, so a line added to the field alone would be a
+                // warning the text readers never get.
+                if let Some(disagreement) = role_disagreement(profile.as_ref(), &summary) {
+                    summary.limitation = Some(match summary.limitation.take() {
+                        Some(existing) => format!("{existing}\n{disagreement}"),
+                        None => disagreement.clone(),
+                    });
+                    report = format!("{report}\n{disagreement}");
+                }
                 // Annotated once, above both halves, because a structured-aware client forwards
                 // `structuredContent` and drops the text: a pointer added to only one of them is
                 // a pointer half the clients never see, and a pointer *removed* from only one is
@@ -2205,6 +2265,7 @@ impl WindbgServer {
                         target,
                         report,
                         summary,
+                        profile: profile.map(Box::new),
                     }),
                 )
             }
@@ -2563,9 +2624,10 @@ impl WindbgServer {
                 TargetCreated::No,
             );
         }
-        self.opened(
+        self.opened_as(
             SessionKind::Kernel,
             selected.label,
+            selected.facts,
             EngineOp::AttachKernel {
                 connection: selected.connection,
                 experimental_break_on_connect: args.experimental_break_on_connect,
@@ -6484,6 +6546,60 @@ mod tests {
         );
     }
 
+    /// Item 95's answer to its own objection — *"a role the server does not verify is a label
+    /// that can disagree with the target it names"*. It is verified, against the fact the worker
+    /// already derives from the engine's primary module, and a disagreement is said out loud.
+    #[test]
+    fn a_profiles_role_is_checked_against_what_the_attach_found() {
+        let claiming = |role| structured::ProfileFacts {
+            name: "lab-hv".to_string(),
+            role: Some(role),
+            guest: Some("lab".to_string()),
+            note: None,
+        };
+        let found = |kernel_target| structured::TargetSummary {
+            kernel_target,
+            ..Default::default()
+        };
+
+        let wrong = role_disagreement(
+            Some(&claiming(structured::KernelTarget::Hypervisor)),
+            &found(Some(structured::KernelTarget::Windows)),
+        )
+        .expect("a profile that names the wrong kind of kernel is worth saying out loud");
+        assert!(wrong.contains("lab-hv"), "{wrong}");
+        // Named as what each *is*, not as the word a profile spells it with: a hypervisor is not
+        // a kernel, and a message calling it one is wrong about what it is correcting.
+        assert!(wrong.contains("a hypervisor (`hv`)"), "{wrong}");
+        assert!(wrong.contains("the Windows kernel (`nt`)"), "{wrong}");
+        // Aimed at the configuration rather than at the target: by the time there is anything to
+        // compare, the session is open and the target is whatever it is.
+        assert!(wrong.contains("`role`"), "{wrong}");
+
+        assert!(
+            role_disagreement(
+                Some(&claiming(structured::KernelTarget::Windows)),
+                &found(Some(structured::KernelTarget::Windows)),
+            )
+            .is_none(),
+            "a profile that is right about its target has nothing to report"
+        );
+
+        // **Unknown is not disagreement.** A freshly attached kernel can have nothing but `nt` in
+        // the engine's inventory yet, and an inventory this could not read leaves the field
+        // absent — so reporting one here would turn "this server could not tell" into "your
+        // configuration is wrong", which is this item's own failure mode aimed at the operator.
+        assert!(
+            role_disagreement(
+                Some(&claiming(structured::KernelTarget::Hypervisor)),
+                &found(None)
+            )
+            .is_none()
+        );
+        // A raw `connection` claims nothing, so it can be wrong about nothing.
+        assert!(role_disagreement(None, &found(Some(structured::KernelTarget::Windows))).is_none());
+    }
+
     // ---- What `session_status` says ------------------------------------
     //
     // The routing rules themselves live in `engine.rs`, with the registry that enforces them.
@@ -6495,6 +6611,7 @@ mod tests {
             id: "sess-1".to_string(),
             kind,
             what: "net:port=50000,key=1.2.3.4".to_string(),
+            profile: None,
             pid: 4242,
             state,
             in_state_for: waited,

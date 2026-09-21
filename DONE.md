@@ -114,6 +114,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 89](#89-windbg-mcp-a-switch-that-would-not-resolve-is-the-one-incompleteness-the-report-does-not-count--done-2026-09-20) — [windbg-mcp] A switch that would not resolve is the one incompleteness the report does not count — done (2026-09-20)
 - [Item 85](#85-windbg-mcp-the-arm64-second-opinion-exists-and-has-never-been-diffed--done-2026-09-20) — [windbg-mcp] The ARM64 second opinion exists and has never been diffed — done (2026-09-20)
 - [Item 93](#93-windbg-mcp--dbgscope-multiprocessor-hypervisor-stops-after-a-temporary-breakpoint-and-detach--done-2026-09-21) — [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach — done (2026-09-21)
+- [Item 95](#95-windbg-mcp-a-connection-profile-carries-a-name-and-a-string-and-nothing-about-the-target--done-2026-09-21) — [windbg-mcp] A connection profile carries a name and a string, and nothing about the target — done (2026-09-21)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4163,3 +4164,78 @@ only route.
 processor rule is what sizes the drain beyond it rather than a second measurement. The mechanism
 was read off delivery order and per-processor stack pointers; nothing instrumented the KD stub to
 show where the queued exceptions are held. One guest, one engine build, one transport.
+## 95. [windbg-mcp] A connection profile carries a name and a string, and nothing about the target — **done** (2026-09-21)
+
+**What it was filed for.** `profiles.json` mapped a name to a connection string, and
+`WINDBG_MCP_PROFILE_<NAME>` did the same through the environment. Neither form could say **what**
+an endpoint reaches: that this one is a hypervisor rather than an NT kernel, or that two of them
+are two endpoints of the *same* guest. That second fact is what debugging a hypervisor alongside
+its root partition is built on -- the two sessions interact only through the guest underneath them,
+so a pair pointing at different guests is two sessions that never interact, which reads as a bug
+for a long time. It lived only in the operator's head, and reading it off the *names* is worse than
+not knowing, the wiring being machine-specific and deliberately untracked.
+
+**What landed.** A profile's value may be an object -- `{ "connection": …, "role": …, "guest": …,
+"note": … }` -- wherever the string was accepted, which includes the environment: a connection
+string never starts with `{`, so the two forms cannot be confused and every variable and file that
+predates this keeps its meaning. `role` is `windows`/`nt` or `hypervisor`/`hv`, `guest` is a
+name-shaped label shared by every endpoint of one machine, `note` is free text to 200 characters.
+They reach the listing `attach_kernel {}` answers with (`ctf-vm; lab-hv (hypervisor, guest "lab");
+lab-nt (windows, guest "lab", "root partition")`), the session's own label, and -- as values -- a
+`profile` object on the open's result and on every `session_status` row, beside the `kernel_target`
+the attach derived for itself.
+
+**The entry's own objection dissolved, and that is the finding.** It warned that *"a role the
+server does not verify is a label that can disagree with the target it names, which is the failure
+mode this item is about reproduced one level up"*, and proposed deciding between a free-text note
+and a typed role on those grounds. The premise was wrong: `worker::kernel_target` already derives
+`nt` against `hv` from the engine's primary module on every open, so the role is the one claim here
+that **is** checkable. `server::role_disagreement` holds the two together and reports a mismatch in
+the session's `limitation`, in both halves of the result. So the choice was not note-or-role but
+both, with the line between them stated: `role` is checked, `guest` and `note` are the operator's
+word and nothing can check them -- no debugger question asks two endpoints whether they are the
+same machine.
+
+Two things about that check are deliberate and were not obvious. **Absent is not disagreement**: a
+freshly attached kernel can have nothing but `nt` in the inventory yet, and reporting one then
+would turn *"this server could not tell"* into *"your configuration is wrong"* -- this item's own
+failure mode, aimed at the operator instead of the target. And it is **said, never refused**: by
+the time there is anything to compare the session is open and the target is whatever it is, so
+closing it would cost the attach without fixing the file. The comparison lives in the supervisor
+because that is the only side holding both halves -- the worker derives `kernel_target` and has
+never heard of a profile, and the profile is resolved before a worker exists.
+
+**What building it changed underneath.** A value of the wrong type used to fail the **whole** file,
+so one typo cost every other profile -- and the entry most likely to be malformed is the one being
+edited, which landed hardest exactly mid-change. Refusal is now per entry, and per *field* below
+that: a `role` that is not one of the four spellings, a `guest` that is not a name, a `note` with a
+control character in it, or a member this server does not know each cost that field alone and are
+reported in the configuration notes, while the target still opens. The opposite would mean a typo
+in a description costs the machine it describes.
+
+**`note` is scrubbed at render rather than at parse**, which is the one ordering that works: it is
+the field a pasted connection string would land in, and `KNOWN_SECRETS` is complete only once every
+profile on the host has been admitted, so masking by value -- the half of `scrub` that is a
+guarantee rather than a net -- needs the later moment. `Entry`, the pre-`Connection` shape holding
+the raw string, is deliberately **not** `Debug`; tests destructure it.
+
+**What it cost.** `modelVisible` did not move at all -- 94,879 B before and after -- because the
+claims travel in `outputSchema`, which
+[`docs/token-budget.md`](./docs/token-budget.md) measured as never reaching the model. Seven tools'
+output schemas grew: +299 B on each of the six openers and +364 B on `session_status`, +2,158 B of
+wire in total, which is why `tests/golden/tool_budget.json` moved and
+`every_documented_surface_figure_matches_the_served_surface` did not. Measured on the ARM64 bench
+2026-09-21 against a worktree at `1c749a9`: 1,011 unit tests and 123 `mcp_smoke` with
+`WINDBG_MCP_SMOKE_DUMP=1`, 0 failed.
+
+**What it did not do.** `guest` is unverified and will stay so. Nothing was added to the
+`attach_kernel` *description* -- the surface is where bytes are expensive, and the refusal text
+already routes a caller there -- though the "how do I configure one" advice in that refusal now
+names the object form, which is the moment an agent decides what to ask the user for.
+
+**Where it landed:** `src/kdconn.rs` (`Details`, `Entry`, `entry_of`/`configured`, the per-field
+refusals and the listing), `src/structured.rs` (`ProfileFacts`, `KernelTarget::label`, the field on
+`OpenedSession` and `SessionInfo`), `src/engine.rs` (the facts held on the session),
+`src/server.rs` (`opened_as` and `role_disagreement`), and
+[`docs/kernel-profiles.md`](./docs/kernel-profiles.md), with the agent-facing half in
+`skills/windbg-debugging/`.
