@@ -268,7 +268,16 @@ fn walk_budget(patience: Duration, queued: Duration) -> Option<Duration> {
 /// Short, because this is a process on its way out and the engine may be parked in a wait that
 /// will never end. Long enough for an idle engine to resume and detach a live kernel, which is
 /// the case that matters: exiting without it leaves the target machine halted.
-const ABRUPT_EXIT_RELEASE: Duration = Duration::from_secs(5);
+///
+/// **Eight rather than five, because a live-kernel teardown now resumes before it quits.**
+/// dbgscope's `quit_and_detach_target` spends the break-ins an `INITIAL_BREAK` KD attach left
+/// owing — up to five bounded resumes — between clearing the breakpoints and sending `qd`, since
+/// a leftover would otherwise take the target's only continue and leave the guest frozen. A wait
+/// that expired mid-drain would produce exactly that, on the one path where nobody is left to ask
+/// again. Unconditional rather than sized per attach: this is a **timeout**, so a teardown with
+/// nothing to drain still returns the moment it is done, and a number conditioned on which attach
+/// the *other crate* performed is one that goes stale silently when its cap moves.
+const ABRUPT_EXIT_RELEASE: Duration = Duration::from_secs(8);
 
 /// Only metadata crosses threads. No DbgEng call is made by these guards.
 struct KernelSafety {
@@ -335,294 +344,6 @@ impl KernelSafety {
 }
 
 static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
-
-/// Whether this worker's kernel target was attached **over a KD connection** with
-/// `INITIAL_BREAK`, and so may still owe a break-in that the teardown has to consume.
-///
-/// **Measured on a Microsoft hypervisor, 2026-09-20.** `DEBUG_ENGOPT_INITIAL_BREAK` leaves a
-/// pending host break-in behind it; dbgscope's `absorb_initial_break_artifact` consumes *one* with
-/// a single `g`, which is right for NT and one short on that target. What is left over is not
-/// visible in the attach's result — the session looks ordinary — and it is spent at the worst
-/// possible moment: the teardown's `qd` sends one `DbgKdContinue`, the pending break-in takes it,
-/// and the target stops again with no debugger attached. The guest is then frozen while this
-/// server reports `released: true, target_left_running: true`, which is
-/// [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md)'s whole shape.
-///
-/// How it was pinned down, because the obvious reading is wrong: a plain attach leaves the
-/// hypervisor halted *on its own* `int 3` at `hv+0x404a60`, and stepping past that before
-/// detaching still froze it — so it is not where the instruction pointer sits. What does show the
-/// leftover is a resume: the first `go` after a completed attach returns **immediately** with
-/// DbgEng's CTRL+BREAK banner, while every later one runs to its bound and has to be broken in.
-/// One pending break-in, exactly.
-///
-/// The announcement attach removes `INITIAL_BREAK` and leaves none, which is why it detaches
-/// cleanly, and why this is `false` for it rather than unconditional.
-///
-/// **`attach_kernel_local` arms the same flag and is deliberately not tracked here.** What is
-/// being protected is the target's one `DbgKdContinue`: `qd` sends it over the KD link and a
-/// pending break-in spends it, leaving a *halted* machine. Local kernel debugging halts nothing —
-/// it cannot set a breakpoint, single-step, or control execution at all
-/// (`docs/secure-kernel-debugging-plan.md`) — so there is no continue to lose, and the drain's own
-/// `g` is one of the commands it refuses: [`DebugEngine::execute_and_wait`] propagates a failed
-/// `Execute` as `Err` while the target is still there, so tracking it would buy one refused resume
-/// per teardown and nothing else. Raised as a review finding on
-/// [#361](https://github.com/glslang/windbg-mcp/pull/361); the premise is right — both paths call
-/// `request_initial_break` — which is why the first line above names the KD connection rather than
-/// repeating the flag's name.
-static INITIAL_BREAK_ATTACH: AtomicBool = AtomicBool::new(false);
-
-/// How long each drain resume gives a leftover break-in to show itself.
-///
-/// It fires on the *first instruction* of the resume, so this is a bound on a thing that either
-/// happens at once or not at all rather than a budget for work. When nothing is pending the target
-/// simply runs for this long and is broken back in, which is measurably harmless — a forced break
-/// leaves no artifact of its own.
-const KERNEL_DRAIN_MS: u32 = 500;
-
-/// How many resumes the drain will spend, and how many consecutive *free* ones end it.
-///
-/// **Two in a row, because one is not evidence.** A resume that reaches its deadline says the
-/// target ran for that window without stopping — but a break-in that is merely slow to arrive
-/// produces the same reading, and stopping there leaves it pending for `qd` to spend. Draining
-/// until two consecutive resumes run free is the state that was measured safe by hand: one
-/// delivered break, then two that had to be broken in, then a detach the guest survived.
-///
-/// The attempt cap is what keeps a target that breaks on every resume — its own `int 3` in a
-/// loop, say — from turning a teardown into an unbounded one. Reaching it is not an error: the
-/// release runs regardless, exactly as it did before any of this.
-const KERNEL_DRAIN_ATTEMPTS: usize = 5;
-const KERNEL_DRAIN_FREE_RUNS: usize = 2;
-
-/// The whole drain's worst case, which is what a teardown's budget has to cover *on top of* the
-/// release it precedes.
-///
-/// Derived rather than written down, so raising either half above cannot leave this stale — and
-/// checked against the shortest grace it has to fit inside by
-/// [`tests::the_drain_fits_inside_the_grace_a_disconnect_gives_a_release`].
-const KERNEL_DRAIN_BUDGET: Duration =
-    Duration::from_millis(KERNEL_DRAIN_ATTEMPTS as u64 * KERNEL_DRAIN_MS as u64);
-
-/// What one drain resume settled about the break-ins still owed.
-///
-/// Split from the engine call so the loop's termination rule can be driven by a test: the two
-/// facts it turns on — how a run ended, and whether the target is still there — are the whole of
-/// what the engine contributes, and [`Drain`] below decides everything else. The file's
-/// convention, alongside `settle_verdict` and `analysis_fits`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Resumed {
-    /// It came back on its own, which for a resume this short means a break-in was waiting — and
-    /// not one of this session's own breakpoints, [`disarm_before_draining`] having taken those
-    /// off the target before the first resume. That is one fewer for `qd` to lose.
-    OnABreak,
-    /// The deadline stopped it: the target ran the whole window without stopping, so nothing was
-    /// pending in this one.
-    Freely,
-    /// A host asked for the break. That says nothing about what the target was doing, so it is
-    /// **not** a free run — counting it as one is how a drain stops early and leaves the break-in
-    /// for `qd`. [`seal_against_interrupts`] makes it unreachable from the teardown; this arm is
-    /// what keeps the classification right if that ever moves.
-    OnRequest,
-    /// The target has gone. Nothing is owed and nothing more can be learned by resuming.
-    Gone,
-}
-
-impl Resumed {
-    /// Reads one run. `target_gone` first: a run that lost its target may also have been cut
-    /// short, and which of the two happened decides whether resuming again is worth anything.
-    fn of(run: &CommandRun) -> Self {
-        match (run.target_gone, run.cut_short) {
-            (true, _) => Self::Gone,
-            (false, Some(Interruption::Deadline { .. })) => Self::Freely,
-            (false, Some(Interruption::OnRequest)) => Self::OnRequest,
-            (false, None) => Self::OnABreak,
-        }
-    }
-}
-
-/// How much of the drain has been spent, and what it has learned.
-#[derive(Debug, Default, PartialEq, Eq)]
-struct Drain {
-    /// Resumes spent, against [`KERNEL_DRAIN_ATTEMPTS`].
-    spent: usize,
-    /// Resumes answered by a break-in — the figure the log carries.
-    delivered: usize,
-    /// Consecutive free runs, against [`KERNEL_DRAIN_FREE_RUNS`]. Reset by a delivered break.
-    free_runs: usize,
-    /// The target has gone; no further resume can say anything.
-    gone: bool,
-}
-
-impl Drain {
-    /// Whether another resume is worth spending.
-    fn resume_again(&self) -> bool {
-        !self.gone && self.spent < KERNEL_DRAIN_ATTEMPTS && self.free_runs < KERNEL_DRAIN_FREE_RUNS
-    }
-
-    /// Folds in what one resume settled.
-    fn saw(&mut self, resumed: Resumed) {
-        self.spent += 1;
-        match resumed {
-            Resumed::OnABreak => {
-                self.delivered += 1;
-                self.free_runs = 0;
-            }
-            Resumed::Freely => self.free_runs += 1,
-            // Neither evidence of a free run nor of a break-in: it costs an attempt and leaves the
-            // count where it was.
-            Resumed::OnRequest => {}
-            Resumed::Gone => self.gone = true,
-        }
-    }
-}
-
-/// Spends the break-ins an `INITIAL_BREAK` attach left over, before the teardown's `qd` can.
-///
-/// Returns how many resumes were answered by a delivered break, for the log — a number that is
-/// zero on NT and was one per attach on the hypervisor this was measured against.
-fn drain_pending_break_ins(e: &DebugEngine, _disarmed: Disarmed) -> usize {
-    let mut drain = Drain::default();
-    while drain.resume_again() {
-        match e.execute_and_wait("g", KERNEL_DRAIN_MS) {
-            Ok(run) => drain.saw(Resumed::of(&run)),
-            // The engine refused the resume — a target that has gone, most likely, or one that
-            // never had execution control to begin with. There is nothing left to drain and
-            // nothing to report about it.
-            Err(_) => break,
-        }
-    }
-    drain.delivered
-}
-
-/// Whether a teardown owes a drain, given what the attach recorded and what the engine says about
-/// its target.
-///
-/// **An unreadable status is not an absent target, and which way this errs is the decision rather
-/// than a default.** `has_target` propagates `GetExecutionStatus`'s failure, and dbgscope
-/// deliberately leaves each caller to say what to make of that. The two mistakes are not the same
-/// size. Draining an engine that turns out to hold nothing costs one refused command —
-/// `execute_and_wait` opens with `refuse_without_a_debuggee`, which is what stands between this
-/// and an access violation *inside* DbgEng that no `catch_unwind` traps — and the loop stops on
-/// that `Err`. Skipping a drain the engine did owe hands the break-in back to `qd` and leaves the
-/// target halted, which is the whole of what this branch exists to prevent. So only a **confirmed**
-/// `Ok(false)` skips it. Raised as a review finding on
-/// [#361](https://github.com/glslang/windbg-mcp/pull/361), where this asked for `Ok(true)` and so
-/// took the expensive direction on no evidence.
-///
-/// Generic over the error because it never reads one: what decides is that the answer was not a
-/// confirmed absence, and a test can say that without constructing a `DbgEngError`.
-fn drain_is_owed<E>(attach_owes_a_break_in: bool, target: Result<bool, E>) -> bool {
-    attach_owes_a_break_in && !matches!(target, Ok(false))
-}
-
-/// Takes this session's breakpoints off the target before the drain resumes it, and reports
-/// whether the target came back clean.
-///
-/// **A resume cannot tell a user's breakpoint from the attach's leftover break-in.** Both stop the
-/// target and both come back with no `cut_short`, so a breakpoint the target reaches can spend
-/// every attempt the drain has, leave the leftover still owing for `qd`, and be counted in the log
-/// as break-ins consumed — reproducing the freeze through the mechanism built to prevent it.
-/// Clearing first is what makes the drain's evidence readable, and it is the teardown's own first
-/// step (`quit_and_detach_target` clears and only then sends `qd`) moved in front of the resume it
-/// has to precede rather than a new one.
-///
-/// **A clearing that fails does not cancel the drain, and the first version of this had that the
-/// other way round.** It skipped, on the reasoning that `GetNumberBreakpoints` is the call the
-/// teardown's own clearing opens with, so an inventory this could not read was one the teardown
-/// could not read either — it would fail there, never send `qd`, and answer
-/// `TargetLeft::KernelHalted`, leaving nothing for a drain to protect. That assumed the failure
-/// was **persistent**, which nothing established: the teardown's clearing is a fresh attempt and
-/// may succeed where this one did not, and then `qd` goes out with the break-in still owed — a
-/// certain freeze, bought to avoid a possible misread. It is not even only a question of
-/// transients: this removes by **id** (`GetBreakpointById`) where the teardown removes by
-/// **index** (`GetBreakpointByIndex2(0)`), so the two can genuinely disagree. Raised as a review
-/// finding on [#361](https://github.com/glslang/windbg-mcp/pull/361), against the commit before
-/// it that introduced the skip.
-///
-/// **And the property that skip was protecting is not about this resume.** The rule
-/// `tests/mcp_smoke.rs` states — a kernel whose breakpoint will not come off is left halted rather
-/// than run with an `int 3` in it — is about the resume that *hands the target back*: `qd` sets it
-/// going and detaches, so a processor reaching a stale `int 3` afterwards takes an exception with
-/// no debugger to answer it. A drain resume is bounded and the debugger stays attached throughout,
-/// so a processor reaching one is an ordinary breakpoint stop. That was over-read once, and the
-/// skip was built on it.
-///
-/// The removals are best-effort and the **readback** decides what is reported, because the two are
-/// different facts: a removal that reports failure against a breakpoint that is gone anyway is
-/// nothing to a resume, and a removal that reports success is not evidence the target is clean.
-fn disarm_before_draining(e: &DebugEngine) -> Disarmed {
-    if let Ok(armed) = e.breakpoints() {
-        for breakpoint in &armed {
-            let _ = e.remove_breakpoint(breakpoint.id);
-        }
-    }
-    Disarmed {
-        confirmed: nothing_armed(e.breakpoints().ok().map(|left| left.len())),
-    }
-}
-
-/// What the clearing above settled — and the proof that it happened at all, which
-/// [`drain_pending_break_ins`] takes because it resumes the target.
-///
-/// A token rather than a check inside the drain, because what has to hold is an **ordering**, and
-/// an ordering is what no test here can reach: the drain runs only on a live KD attach, so every
-/// tier this repository can run offline stays green when the clearing is skipped entirely —
-/// measured, by skipping it. So the rule goes where the compiler keeps it instead of where a test
-/// would have had to, and a resume that has not been preceded by a clearing cannot be written by
-/// accident.
-struct Disarmed {
-    /// The inventory read back **empty**, so a stop during the drain is the attach's leftover
-    /// rather than a breakpoint this session set. Not a permission — the drain runs either way —
-    /// but it is what decides whether the count it reports means anything.
-    confirmed: bool,
-}
-
-/// Whether the target came back **confirmed clean** from [`disarm_before_draining`].
-///
-/// **An unreadable inventory is not an empty one.** It is not a reason to skip the drain — see
-/// there for why that reasoning was wrong — but it is equally not evidence the target is clean,
-/// and the drain's count is only meaningful on a target that is.
-fn nothing_armed(left: Option<usize>) -> bool {
-    left == Some(0)
-}
-
-/// The drain and the one condition it runs under, for **both** teardown paths.
-///
-/// Shared because the two are reached by different routes and only one of them has a caller: an
-/// [`EngineOp::EndSession`] answers a request, while [`Job::Release`] is what the worker does to
-/// itself when the supervisor disappears. A drain on the first alone leaves the crash and Ctrl+C
-/// paths — the ones this server's whole release machinery exists for — handing `qd` the same
-/// leftover break-in. Raised as a review finding on
-/// [#361](https://github.com/glslang/windbg-mcp/pull/361).
-///
-/// Best-effort and deliberately not a `?`: this is a teardown, and a session that will not close
-/// is worse than a resume that did not happen. The release runs either way, and still reports what
-/// it did.
-fn drain_before_release(e: &DebugEngine) {
-    if !drain_is_owed(INITIAL_BREAK_ATTACH.load(Ordering::SeqCst), e.has_target()) {
-        return;
-    }
-    let disarmed = disarm_before_draining(e);
-    // Draining on regardless, and saying so: the release still needs its continue protected, and
-    // the teardown's own clearing is a fresh attempt that may succeed where this one did not.
-    // What is lost is the reading, not the resume — a stop can no longer be attributed to the
-    // attach rather than to a breakpoint this session set.
-    let confirmed = disarmed.confirmed;
-    if !confirmed {
-        tracing::warn!(
-            "this session's breakpoints could not be confirmed off the target, so a stop during \
-             the drain cannot be told from a breakpoint this session set; draining anyway, since \
-             the release still owes the target its continue"
-        );
-    }
-    let delivered = drain_pending_break_ins(e, disarmed);
-    if delivered > 0 {
-        tracing::info!(
-            delivered,
-            confirmed,
-            "consumed break-ins left over from the attach before releasing the target"
-        );
-    }
-}
 
 fn kernel_recovery_required() -> Failed {
     Failed::categorised(
@@ -1293,16 +1014,6 @@ pub fn run(args: &[String]) -> ! {
         }
         None => ABRUPT_EXIT_RELEASE,
     };
-    // And the release itself may have to spend the attach's leftover break-ins before it can send
-    // `qd` (see [`drain_before_release`]). This is the wait that has to cover that, for the same
-    // reason it covers a batch's rollback: a drain cut off by the grace hands the break-in back to
-    // `qd` and leaves the target halted, which is the one outcome this path exists to prevent.
-    // Nobody is on the other end of it — the supervisor being gone is why we are here — so the
-    // extra seconds are not taken from a caller.
-    let grace = match INITIAL_BREAK_ATTACH.load(Ordering::SeqCst) {
-        true => grace + KERNEL_DRAIN_BUDGET,
-        false => grace,
-    };
     let (ack, released) = mpsc::channel();
     if tx.send(Job::Release(ack)).is_err() {
         // The engine thread died before this could be asked, so nothing was even attempted --
@@ -1513,14 +1224,12 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                     let _ = ack.send(false);
                     continue;
                 }
-                // The same leftover break-in, on the path with no request behind it: nothing here
-                // came from a caller, so there is no seal to take and nobody to refuse — the
-                // request reader has already met EOF. See [`drain_before_release`], and
-                // [`ABRUPT_EXIT_RELEASE`] for the budget this runs inside.
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    drain_before_release(&engine);
-                    engine.end_session()
-                }));
+                // The attach's leftover break-ins are spent inside this call, by dbgscope's
+                // `quit_and_detach_target` — so this path gets it without asking, which is why
+                // there is nothing here to go with it. Nothing on this path came from a caller,
+                // so there is no seal to take and nobody to refuse either: the request reader has
+                // already met EOF. See [`ABRUPT_EXIT_RELEASE`] for the budget it runs inside.
+                let result = catch_unwind(AssertUnwindSafe(|| engine.end_session()));
                 let confirmed = matches!(&result, Ok(Ok(_)));
                 if confirmed {
                     KERNEL_SAFETY.released();
@@ -2119,11 +1828,13 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
                 // wait still establishing the link, so a guest that never dials in parks here
                 // for good. It parks *this process*, which the supervisor can kill.
                 // Unwrap only for the typed attach call; never log the exposed connection.
-                // Recorded for the teardown, which has to undo what this path leaves behind —
-                // see [`INITIAL_BREAK_ATTACH`]. One session per worker, so one flag is the whole
-                // bookkeeping, and it is set before the attach rather than after because a wait
-                // that fails still leaves whatever the engine armed on its way in.
-                INITIAL_BREAK_ATTACH.store(!experimental_break_on_connect, Ordering::SeqCst);
+                //
+                // What this path leaves behind for the teardown to undo — the break-ins an
+                // `INITIAL_BREAK` attach still owes — is recorded and spent inside dbgscope,
+                // beside the `qd` that would otherwise lose the target's only continue to one.
+                // Nothing is bookkept here: this server cannot see which of the two calls below
+                // armed what, and a flag it kept would be a second copy of an answer the engine
+                // already holds.
                 let pending = if experimental_break_on_connect {
                     e.attach_kernel_announcement_begin(connection.expose())
                 } else {
@@ -2569,20 +2280,17 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // which has never heard of the client's surface.
             let detaching = e.attached_to_a_live_process();
             // This op reaches here already closed to breaks, sealed by [`claim`] before its first
-            // statement ran — for the reason the rollback is sealed, and with the drain below as
-            // the sharp case: a resume cut short by a host's interrupt is indistinguishable from
-            // one that found nothing pending, so a client interrupting its own `end_session` could
-            // otherwise end the drain early and hand the leftover break-in straight back to `qd`.
-            // Raised as a review finding on
+            // statement ran — for the reason a batch's rollback is sealed, and with the live
+            // kernel as the sharp case. The teardown below resumes the target: dbgscope's
+            // `quit_and_detach_target` spends the break-ins an `INITIAL_BREAK` attach left owing
+            // before it sends `qd`, and a resume cut short by a host's interrupt is
+            // indistinguishable from one that found nothing pending — so a client interrupting
+            // its own `end_session` could end that drain early and hand the leftover straight
+            // back to `qd`, which is a frozen guest. Raised as a review finding on
             // [#361](https://github.com/glslang/windbg-mcp/pull/361), where the proposed remedy
-            // was to read that interrupt out of the drain's result; sealing is the same fix two
-            // steps earlier, and leaves no window at all. The engine's own watchdog is untouched
-            // by it, so each resume is still bounded.
-            //
-            // **Spend the leftover break-in here, where it costs a bounded resume, rather than
-            // letting `qd` spend it on the target's only continue.** See [`INITIAL_BREAK_ATTACH`]
-            // for what leaves one and how it was measured.
-            drain_before_release(e);
+            // was to read the interrupt out of the drain's result; sealing leaves no window to
+            // read one in. The engine's own watchdog is untouched by it, so each resume is still
+            // bounded.
             let ended = e
                 .end_session()
                 .map(|left| {
@@ -13407,197 +13115,6 @@ mod tests {
         assert!(
             !running.release(9),
             "a job that started after the interrupt must not answer for it"
-        );
-    }
-
-    // ---- what the teardown's drain spends, and when it stops ----------------
-
-    fn ran(cut_short: Option<Interruption>, target_gone: bool) -> CommandRun {
-        CommandRun {
-            output: String::new(),
-            cut_short,
-            target_gone,
-        }
-    }
-
-    /// Runs a drain over a scripted sequence of resumes, as [`drain_pending_break_ins`] does over
-    /// real ones, and answers with the state it stopped in.
-    ///
-    /// The whole loop rather than one step, because the rule under test *is* the loop: how many
-    /// resumes it spends, and on what evidence it stops.
-    fn drain_over(resumes: &[Resumed]) -> Drain {
-        let mut drain = Drain::default();
-        let mut next = resumes.iter();
-        while drain.resume_again() {
-            match next.next() {
-                Some(resumed) => drain.saw(*resumed),
-                None => panic!(
-                    "the drain asked for resume {} and the script had none",
-                    drain.spent + 1
-                ),
-            }
-        }
-        drain
-    }
-
-    /// **One free run is not evidence, and this is the rule that was measured.**
-    ///
-    /// A break-in that is merely slow to arrive reads exactly like a target running freely, so a
-    /// drain that stopped at the first free resume left it pending for `qd`. Measured by hand on
-    /// the hypervisor: draining once went 2 of 3 cycles, with the third freezing the guest;
-    /// draining to two consecutive free runs went 5 of 5.
-    #[test]
-    fn one_free_run_does_not_end_the_drain() {
-        let mut drain = Drain::default();
-        drain.saw(Resumed::OnABreak);
-        drain.saw(Resumed::Freely);
-        assert!(
-            drain.resume_again(),
-            "stopping on a single free resume is the version that froze the guest"
-        );
-        drain.saw(Resumed::Freely);
-        assert!(!drain.resume_again(), "two in a row is what ends it");
-        assert_eq!(drain.delivered, 1, "one break-in was spent, not three");
-    }
-
-    /// A delivered break-in starts the count again: the two free runs have to be *consecutive*,
-    /// or a drain could stop having seen one free resume before a break and one after it.
-    #[test]
-    fn a_break_in_between_two_free_runs_restarts_the_count() {
-        let drain = drain_over(&[
-            Resumed::Freely,
-            Resumed::OnABreak,
-            Resumed::Freely,
-            Resumed::Freely,
-        ]);
-        assert_eq!(drain.spent, 4);
-        assert_eq!(drain.delivered, 1);
-    }
-
-    /// The attempt cap is what keeps a target that breaks on every resume — its own `int 3` in a
-    /// loop, say — from turning a teardown into an unbounded one.
-    #[test]
-    fn a_target_that_breaks_every_time_still_ends_the_drain() {
-        let drain = drain_over(&[Resumed::OnABreak; KERNEL_DRAIN_ATTEMPTS]);
-        assert_eq!(drain.spent, KERNEL_DRAIN_ATTEMPTS);
-        assert_eq!(drain.delivered, KERNEL_DRAIN_ATTEMPTS);
-    }
-
-    /// **A host's interrupt is not a free run.** It says the caller asked, and nothing whatever
-    /// about whether a break-in was pending — so counting it as one is how a drain stops early
-    /// and hands the leftover back to `qd`. The teardown is sealed against interrupts, which is
-    /// what makes this unreachable rather than merely handled; this pins the classification so
-    /// that moving the seal cannot quietly change it.
-    #[test]
-    fn a_host_interrupt_is_not_counted_as_a_free_run() {
-        let mut drain = Drain::default();
-        drain.saw(Resumed::Freely);
-        drain.saw(Resumed::OnRequest);
-        assert!(
-            drain.resume_again(),
-            "an interrupt and a deadline are not two free runs"
-        );
-        assert_eq!(drain.free_runs, 1, "and it does not reset the count either");
-        assert_eq!(drain.delivered, 0, "nor is it a break-in delivered");
-    }
-
-    /// **An unreadable breakpoint inventory is not an empty one**, and neither is one with a
-    /// breakpoint left in it.
-    ///
-    /// What turns on this is what the drain's count *means*, not whether it runs. A resume cannot
-    /// tell a user's breakpoint from the attach's leftover break-in, so on a target that is not
-    /// confirmed clean a stop is not attributable and the figure the log carries is not a count of
-    /// break-ins. The drain runs either way, since the release still owes the target its continue
-    /// and the teardown's own clearing may succeed where this one did not — see
-    /// [`disarm_before_draining`] for the version of this that skipped, and why that was a certain
-    /// freeze bought to avoid a possible misread.
-    #[test]
-    fn an_unreadable_breakpoint_inventory_is_not_a_clean_target() {
-        assert!(
-            nothing_armed(Some(0)),
-            "an inventory that read back empty is the one case a stop can be attributed in"
-        );
-        assert!(
-            !nothing_armed(None),
-            "an inventory that could not be read is no evidence the target is clean"
-        );
-        assert!(
-            !nothing_armed(Some(1)),
-            "a breakpoint still on the target is what a drain resume could stop at"
-        );
-    }
-
-    /// **An engine that cannot say whether it holds a target is not an engine that holds none.**
-    ///
-    /// The asymmetry is the point: draining an engine holding nothing costs one command that
-    /// `execute_and_wait` refuses on its own, while skipping a drain that was owed hands the
-    /// break-in to `qd` and freezes the target. A guard that errs is only as good as the direction
-    /// it errs in, and this one used to err the expensive way.
-    #[test]
-    fn an_unreadable_target_status_does_not_excuse_the_drain() {
-        assert!(
-            drain_is_owed(true, Ok::<bool, ()>(true)),
-            "the ordinary case"
-        );
-        assert!(
-            drain_is_owed(true, Err::<bool, ()>(())),
-            "an unreadable status is no evidence the target is gone, and guessing that it is costs \
-             a halted machine"
-        );
-        assert!(
-            !drain_is_owed(true, Ok::<bool, ()>(false)),
-            "a confirmed absence is the one answer that skips it"
-        );
-        // And the attach's own record still decides first: an announcement attach removes
-        // `INITIAL_BREAK` and leaves nothing owing, whatever the engine says afterwards.
-        assert!(!drain_is_owed(false, Ok::<bool, ()>(true)));
-        assert!(!drain_is_owed(false, Err::<bool, ()>(())));
-    }
-
-    /// A target that goes during the drain ends it there. Nothing is owed by a target that is
-    /// gone, and the release has nothing left to protect.
-    #[test]
-    fn a_target_that_goes_ends_the_drain() {
-        let drain = drain_over(&[Resumed::Gone]);
-        assert_eq!(drain.spent, 1);
-        assert_eq!(drain.delivered, 0);
-    }
-
-    /// The two facts the engine contributes, read the one way round that matters: a run that lost
-    /// its target may *also* have been cut short, and which of the two happened decides whether
-    /// another resume is worth anything.
-    #[test]
-    fn a_run_that_lost_its_target_is_read_as_gone_however_it_ended() {
-        assert_eq!(Resumed::of(&ran(None, true)), Resumed::Gone);
-        assert_eq!(
-            Resumed::of(&ran(Some(Interruption::Deadline { after_ms: 500 }), true)),
-            Resumed::Gone,
-            "a deadline on a run whose target went is not evidence the target ran freely"
-        );
-        assert_eq!(
-            Resumed::of(&ran(Some(Interruption::Deadline { after_ms: 500 }), false)),
-            Resumed::Freely
-        );
-        assert_eq!(
-            Resumed::of(&ran(Some(Interruption::OnRequest), false)),
-            Resumed::OnRequest
-        );
-        assert_eq!(Resumed::of(&ran(None, false)), Resumed::OnABreak);
-    }
-
-    /// The drain runs *inside* a teardown's budget, and the shortest of those is the grace a
-    /// disconnect gives a release ([`crate::engine::SHUTDOWN_RELEASE_TIMEOUT`]) — that path ends
-    /// the session through the same [`EngineOp::EndSession`] an explicit teardown uses.
-    ///
-    /// Asserted rather than noted because both numbers are free to move and neither mentions the
-    /// other: a drain that does not leave the release room is a target released by nothing.
-    #[test]
-    fn the_drain_fits_inside_the_grace_a_disconnect_gives_a_release() {
-        assert!(
-            KERNEL_DRAIN_BUDGET * 2 <= crate::engine::SHUTDOWN_RELEASE_TIMEOUT,
-            "the drain's worst case ({KERNEL_DRAIN_BUDGET:?}) leaves under half of the \
-             disconnect grace ({:?}) for the release it precedes",
-            crate::engine::SHUTDOWN_RELEASE_TIMEOUT
         );
     }
 
