@@ -279,10 +279,12 @@ sequence does not cover is a second processor.
    (`0x005D`) and bit 16 is the *fast* flag, with the input parameter in `rdx` (`0x200B`). Naming
    the call code needs the TLFS; the register is the measurement.
 
-   **That value does not cross, and it is the one this wrapper holds most of the time**, so take
-   another one *here*, before the hypervisor is armed for it. `0x8001005D` never reached the
-   hypervisor's dispatcher in 60 s of free running, while the next value out of the same wrapper
-   reached it in 714 ms. Bit 31 marks a hypercall for the parent hypervisor and this lab's guest is
+   **That value does not cross, and you will keep landing on it**, so take another one *here*,
+   before the hypervisor is armed for it. Both unconditional captures of this wrapper held
+   `0x8001005D`, and excluding it cost 9.6 s to get a second value where the first hit had come in
+   7 ms — that is what "keep landing on it" rests on, rather than a count of calls. `0x8001005D`
+   never reached the hypervisor's dispatcher in 60 s of free running, while the next value out of
+   the same wrapper reached it in 714 ms. Bit 31 marks a hypercall for the parent hypervisor and this lab's guest is
    itself nested, which is a plausible reading and not a measured one. Re-arm NT to skip it:
 
    ```text
@@ -305,11 +307,21 @@ sequence does not cover is a second processor.
    bp <hv-base>+21056d "j (@rbx == <input-value>) ''; 'gc'"
    ```
 
-   Then release NT and read the guest register array at the stop — `rcx` points at it. Every
-   register agrees with the NT-side capture, transformed as the wrapper's prologue transforms it:
-   `rbp` is NT's `rsp` less seven pushes less `0x27`, `rsi` is NT's `rsi` with exactly its low byte
-   cleared, and `rdi`, `r13`, `r10` and `r11` arrive untouched. Those two transformed values are
-   what make it one *instance* rather than one value. It landed **714 ms** after NT was released.
+   **Both targets are halted at this point, so three calls in this order, and the middle one is
+   the one it is easy to leave out:** `continue_async` **NT** — which cannot take effect yet and is
+   simply lodged — then `continue_async` the **hypervisor**, which is what puts the guest back on a
+   processor and lets NT take that lodged resume, then `wait_for_stop` on the hypervisor. Releasing
+   NT alone changes nothing: this file's own asymmetry says a halted hypervisor stops NT, and a
+   procedure that resumes the hypervisor only at teardown never reaches a stop.
+
+   Read the guest register array at that stop — `rcx` points at it. Every register agrees with the
+   NT-side capture, transformed as the wrapper's prologue transforms it: `rbp` is NT's `rsp` less
+   seven pushes less `0x27`, `rsi` is NT's `rsi` with exactly its low byte cleared, and `rdi`,
+   `r13`, `r10` and `r11` arrive untouched. It landed **714 ms** into that hypervisor run.
+
+   **Those two transformed values are not *unique*** — the same thread calling the same wrapper
+   again at the same stack depth would reproduce them. What makes this one instance is the
+   ordering: NT was parked at that call, released, and this was the first hypercall matching it.
 6. **Resume both, hypervisor first.** Take any hypervisor breakpoint off first or the next
    hypercall re-enters it immediately, then `continue_async` the hypervisor. Only now does NT
    execute: an outstanding NT call unblocks the moment the hypervisor runs.
