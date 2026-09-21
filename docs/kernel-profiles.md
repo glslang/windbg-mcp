@@ -109,6 +109,15 @@ they are the same machine, so these are the operator's word, reported as such. T
 configuring — an asserted pairing is a fact somebody wrote down, where a pairing read off two names
 is a guess — but do not read them as findings.
 
+Two spellings of one name are one profile here, and if they reach the same target while
+*describing* it differently, the field they disagree about is **dropped** rather than settled as
+whichever the file was read into first. That order is not even arbitrary — the file becomes a
+`BTreeMap`, where `-` sorts before `_` — and reporting a `guest` nothing vouches for is exactly
+the failure that field exists to prevent, so absence is the honest answer. The profile stays
+dialable, because which *target* was meant was never in doubt; two spellings naming different
+targets is the other case, and still makes the name unusable. One spelling saying less than the
+other is not a disagreement at all: the union contradicts nothing, so it is taken.
+
 A field this server cannot take costs **that field** and never the profile: a `role` that is not
 one of the four spellings, a `guest` that is not a name, a `note` with a line break in it or over
 200 characters, or a member this server does not know is dropped with a note in the configuration

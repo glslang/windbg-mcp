@@ -587,6 +587,48 @@ impl Details {
         self.role.is_none() && self.guest.is_none() && self.note.is_none()
     }
 
+    /// Reconciles a second spelling of this name that reaches the **same** target, answering
+    /// which fields had to be dropped.
+    ///
+    /// Not a conflict in [`Profile::conflicts`]' sense, and deliberately not treated as one: the
+    /// connection agrees, so which *target* was meant is not in doubt, and refusing the attach
+    /// would cost a machine over a description. Which *description* was meant is in doubt, and
+    /// keeping whichever spelling was read first is the one outcome to avoid — `lab-hv` and
+    /// `lab_hv` are one name here, so an operator who gave them different guests would be shown a
+    /// pairing this server cannot vouch for, which is precisely the failure the `guest` field
+    /// exists to prevent. The field goes instead: absence claims nothing.
+    ///
+    /// **Absent is not a disagreement.** One spelling saying less than the other contradicts
+    /// nothing, so the union is taken; only two *declared* values that differ are the doubt.
+    fn reconcile(&mut self, other: &Details) -> Vec<&'static str> {
+        let mut dropped = Vec::new();
+        match (self.role, other.role) {
+            (Some(mine), Some(theirs)) if mine != theirs => {
+                self.role = None;
+                dropped.push("role");
+            }
+            (None, Some(theirs)) => self.role = Some(theirs),
+            _ => {}
+        }
+        match (&self.guest, &other.guest) {
+            (Some(mine), Some(theirs)) if mine != theirs => {
+                self.guest = None;
+                dropped.push("guest");
+            }
+            (None, Some(theirs)) => self.guest = Some(theirs.clone()),
+            _ => {}
+        }
+        match (&self.note, &other.note) {
+            (Some(mine), Some(theirs)) if mine != theirs => {
+                self.note = None;
+                dropped.push("note");
+            }
+            (None, Some(theirs)) => self.note = Some(theirs.clone()),
+            _ => {}
+        }
+        dropped
+    }
+
     /// How a profile's claims read beside its name: `hypervisor, guest "lab", "root partition"`.
     /// `None` when it makes none, which is every profile configured as a bare string.
     fn described(&self) -> Option<String> {
@@ -892,11 +934,17 @@ impl Profiles {
         match self.entries.entry(normalize(&name)) {
             std::collections::btree_map::Entry::Occupied(mut taken) => {
                 let kept = taken.get_mut();
-                // Environment over file is the documented precedence, not a mistake, and neither
-                // is a duplicate that agrees with itself. Two spellings within *one* source that
-                // name **different** targets are: they are one name once `-`, `_` and `.` are
-                // treated alike, and nothing here can know which was meant.
-                if kept.source == source && kept.connection.expose() != connection {
+                // Environment over file is the documented precedence, not a mistake — and an
+                // override *replaces*, so the file's description is not merged into the
+                // environment's connection either: the result would be an effective profile
+                // neither source states.
+                if kept.source != source {
+                    return;
+                }
+                // Two spellings within one source that name **different** targets: they are one
+                // name once `-`, `_` and `.` are treated alike, and nothing here can know which
+                // was meant.
+                if kept.connection.expose() != connection {
                     self.notes.push(format!(
                         "`{name}` and `{}` in {} are one name once `-`, `_` and `.` are treated \
                          alike, but name different targets, so neither can be used until one is \
@@ -905,6 +953,18 @@ impl Profiles {
                         source.label(),
                     ));
                     kept.conflicts.push(name);
+                    return;
+                }
+                // Same name, same target, and a description they disagree about. See
+                // [`Details::reconcile`] for why that costs the field rather than the profile.
+                for field in kept.details.reconcile(&details) {
+                    self.notes.push(format!(
+                        "`{name}` and `{}` in {} are one name and reach the same target, but \
+                         disagree about `{field}`, so that field was dropped rather than settled \
+                         as whichever was read first. Rename or remove one of them.",
+                        kept.name,
+                        source.label(),
+                    ));
                 }
             }
             std::collections::btree_map::Entry::Vacant(slot) => {
@@ -2340,6 +2400,83 @@ mod tests {
             !notes.contains("not json"),
             "the value is not echoed: {notes}"
         );
+    }
+
+    /// Two spellings of one name reaching the **same** target may still describe it differently,
+    /// and the field they disagree about is dropped rather than settled as whichever was read
+    /// first (Codex, PR #367).
+    ///
+    /// Keeping one would be this feature's own failure mode produced by the server: `lab-hv` and
+    /// `lab_hv` are one name here, so an operator who gave them different guests would be shown a
+    /// pairing nothing vouches for — and the order is not even arbitrary, the file being read
+    /// into a `BTreeMap` where `-` sorts before `_`. The profile stays dialable, because which
+    /// *target* was meant was never in doubt.
+    #[test]
+    fn two_spellings_of_one_name_do_not_settle_a_description_between_them() {
+        let lab = format!("{{ \"connection\": \"{FAKE}\", \"role\": \"hv\", \"guest\": \"lab\" }}");
+        let other = format!(
+            "{{ \"connection\": \"{FAKE}\", \"role\": \"hv\", \"guest\": \"other\", \
+             \"note\": \"only here\" }}"
+        );
+        let profiles =
+            Profiles::from_pairs(&[("lab-hv", lab.as_str()), ("lab_hv", other.as_str())]);
+
+        // One name, and still usable: the connection agrees, so nothing about the target is in
+        // doubt and refusing the attach would cost a machine over a description.
+        assert_eq!(profiles.names(), ["lab-hv"]);
+        let selected = resolve("lab-hv", &profiles).expect("the target is not in doubt");
+        assert_eq!(selected.connection.expose(), FAKE);
+        let facts = selected.facts.expect("a profile named it");
+
+        // The field they disagree about is gone — neither value, not the first one.
+        assert_eq!(
+            facts.guest, None,
+            "a guest nothing vouches for must not be reported"
+        );
+        // The one they agree about survives, and so does one only the second spelling declared:
+        // saying less than the other contradicts nothing, so the union is the honest reading.
+        assert_eq!(facts.role, Some(KernelTarget::Hypervisor));
+        assert_eq!(facts.note.as_deref(), Some("only here"));
+
+        let notes = profiles.notes.join("\n");
+        assert!(notes.contains("`guest`"), "{notes}");
+        assert!(
+            notes.contains("lab_hv") && notes.contains("lab-hv"),
+            "{notes}"
+        );
+        assert!(
+            !notes.contains("`role`") && !notes.contains("`note`"),
+            "{notes}"
+        );
+        // And it is not reported as the *other* kind of duplicate, which makes a name unusable.
+        assert!(!notes.contains("name different targets"), "{notes}");
+    }
+
+    /// An override **replaces**, so a bare environment variable beside a described file entry does
+    /// not borrow the file's description: the result would be an effective profile neither source
+    /// states, and the documented precedence is that the environment is the deliberate one.
+    #[test]
+    fn an_environment_override_does_not_take_the_files_description() {
+        let described =
+            format!("{{ \"connection\": \"{FAKE}\", \"role\": \"hv\", \"guest\": \"lab\" }}");
+        let mut profiles = Profiles {
+            entries: BTreeMap::new(),
+            notes: Vec::new(),
+            file: None,
+        };
+        profiles.admit("lab-hv".into(), Entry::of(FAKE), Source::Env);
+        profiles.admit(
+            "lab-hv".into(),
+            configured(&described).expect("a valid object"),
+            Source::File,
+        );
+
+        let facts = resolve("lab-hv", &profiles)
+            .expect("resolves")
+            .facts
+            .expect("a profile named it");
+        assert!(facts.role.is_none() && facts.guest.is_none());
+        assert!(profiles.notes.is_empty(), "{:?}", profiles.notes);
     }
 
     /// An object is still a *profile*, so it has to say how to dial one. That refusal is the

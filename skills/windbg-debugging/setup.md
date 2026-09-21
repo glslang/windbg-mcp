@@ -582,6 +582,10 @@ consequences of that matching worth knowing:
   *neither* resolves until you rename or remove one — guessing would open a session on the wrong
   machine while reporting it as the right one. (Two spellings of the *same* connection are fine,
   and the environment overriding the file is the documented precedence, not a conflict.)
+- Two spellings that reach the **same** target but *describe* it differently keep working, and the
+  field they disagree about is **dropped** rather than settled as whichever was read first — a
+  `guest` nothing vouches for is the failure the field exists to prevent. One spelling saying less
+  than the other is not a disagreement: the union is taken.
 - An entry whose name is not a name (letters, digits, `-`, `_`, `.`) is skipped, and not quoted
   back in the error — the usual cause is an entry written the wrong way round, which would make
   the name the connection string.
