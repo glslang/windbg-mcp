@@ -3923,13 +3923,40 @@ const LEASE_REVISION: &str = "2025-06-18";
 /// [SEP-2567]: https://modelcontextprotocol.io/seps/2567-sessionless-mcp
 const STATELESS_REVISION: &str = "2026-07-28";
 
-/// A free loopback port, taken by binding and letting go.
+/// A free loopback **TCP** port, taken by binding and letting go — for this server's own listener.
 ///
-/// Racy in principle and not in practice: the window is microseconds, tests each take their own,
-/// and a collision fails loudly at bind rather than silently sharing a server.
+/// Racy in principle and not in practice *for that use*: the window is microseconds, tests each
+/// take their own, and a collision fails loudly at bind rather than silently sharing a server.
+/// That reasoning does not carry across protocols, which is what [`free_kdnet_port`] is for.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
         .expect("a loopback port")
+        .local_addr()
+        .expect("a bound address")
+        .port()
+}
+
+/// A free **UDP** port for a synthetic KDNET endpoint.
+///
+/// **Not [`free_port`], and the difference is a measured CI failure rather than tidiness.** TCP and
+/// UDP are separate port namespaces, so a TCP probe will happily hand back a number that another
+/// test's engine is already listening on for KDNET — the OS has no reason to exclude it. The
+/// attach that follows then fails outright instead of parking, as
+/// `Failed to attach to kernel: Unspecified error (0x80004005)`, and the test reports that its
+/// "synthetic attach did not reach unresolved state", which names the symptom and hides this.
+/// Measured both halves: that error is what binding the port and attaching to it produces
+/// (`a_kdnet_endpoint_another_process_holds_is_refused_rather_than_parked`), and it is what CI
+/// printed on 2026-09-21 when the two synthetic-endpoint tests overlapped by 124 ms.
+///
+/// Probing the protocol that will be used is the fix: the OS will not hand out an ephemeral UDP
+/// port another process already holds, which is exactly the collision above. `0.0.0.0` rather than
+/// loopback because that is the scope the engine's listener takes, and a probe bound more narrowly
+/// would not be excluded by it. The socket is released before the attach — nothing can hand a live
+/// one to DbgEng — so a window does remain in which a second probe draws the same number; it is
+/// now a window the allocator works against rather than one it cannot see.
+fn free_kdnet_port() -> u16 {
+    std::net::UdpSocket::bind("0.0.0.0:0")
+        .expect("a udp port")
         .local_addr()
         .expect("a bound address")
         .port()
@@ -11887,7 +11914,7 @@ fn a_stateless_client_can_work_while_one_of_its_own_calls_is_parked() {
 
     // Nothing is listening on it, so the attach parks rather than failing. Its own port, so a
     // stray listener on this host cannot turn the park into an error and the test into a pass.
-    let connection = format!("net:port={},key=1.1.1.1", free_port());
+    let connection = format!("net:port={},key=1.1.1.1", free_kdnet_port());
     // Held for the rest of the test: this connection *is* the parked request.
     let _parked = server.stateless_unanswered(
         9001,
@@ -12292,7 +12319,7 @@ fn an_unresolved_kernel_worker_survives_supervisor_loss() {
         let reply = server.call_tool(
             "attach_kernel",
             json!({
-                "connection": format!("net:port={},key=1.1.1.1", free_port())
+                "connection": format!("net:port={},key=1.1.1.1", free_kdnet_port())
             }),
             TARGET_STEP,
         );
@@ -17941,4 +17968,49 @@ fn bridge_location_and_memory_share_the_module_coordinate() {
     );
     assert_eq!(failure["error"]["category"], "debugger");
     server.tool_data("end_session", json!({"session_id": session}), TARGET_STEP);
+}
+
+/// A KDNET endpoint somebody else is already listening on is **refused**, not parked.
+///
+/// The two are opposite states and the tests around here turn on the difference: a synthetic
+/// endpoint nothing answers leaves the attach waiting, which is what becomes an unresolved
+/// controller, while one already bound fails at `AttachKernel` and leaves no session at all. This
+/// pins the second, because it is what a port collision looks like from the outside and it reads
+/// as anything but: `Unspecified error (0x80004005)` names no port, and the test that meets it
+/// reports only that its attach "did not reach unresolved state".
+///
+/// That is not hypothetical. CI hit it on 2026-09-21 when [`free_port`] — a **TCP** probe — handed
+/// a synthetic attach a number another test's engine held for KDNET; [`free_kdnet_port`] exists
+/// because of it and carries the reasoning.
+#[test]
+fn a_kdnet_endpoint_another_process_holds_is_refused_rather_than_parked() {
+    if target_tier().is_none() {
+        return;
+    }
+    // Held for the whole call, which is the point: this stands in for another engine's listener.
+    let held = std::net::UdpSocket::bind("0.0.0.0:0").expect("a udp port to hold");
+    let port = held.local_addr().expect("a bound address").port();
+    let mut server = Server::started_with(&[("WINDBG_MCP_CALL_TIMEOUT_SECS", "1")]);
+    let reply = server.call_tool(
+        "attach_kernel",
+        json!({ "connection": format!("net:port={port},key=1.1.1.1") }),
+        TARGET_STEP,
+    );
+    let failure = &reply["result"]["structuredContent"];
+    assert_eq!(
+        failure["status"], "error",
+        "a port another process holds must not read as an attach that is still going: {reply}"
+    );
+    // `no` rather than `unknown`: nothing was claimed, so there is no target whose state is in
+    // doubt and nothing for an operator to recover — which is exactly what separates this from
+    // the parked attach the tests above are about.
+    assert_eq!(failure["target"], "no");
+    assert_eq!(failure["error"]["category"], "debugger");
+    assert!(
+        server.tool_data("session_status", json!({}), STEP)["sessions"]
+            .as_array()
+            .unwrap()
+            .is_empty(),
+        "a refused attach left a session behind"
+    );
 }
