@@ -312,3 +312,58 @@ has the three environment variables, for a run made without the wrapper — whic
 independent postcondition, and the 2026-09-20 measurements are what says why that matters.
 Do not run the NT live-kernel tier against this profile: that tier deliberately expects NT and
 Windows driver/pool structures.
+
+## 2026-09-21: the drain placement validated live, and an NT-side hazard
+
+Two results from one session on the one-vCPU lab, against the server identifying itself as
+**`0.19.0+g023a294a`** -- read from the built binary rather than assumed from the checkout, since
+the two routinely differ. That is the commit which moved the break-in drain out of this server and
+into dbgscope's `quit_and_detach_target`, and whose own message recorded "Live hypervisor
+re-validation against this placement is still outstanding". The hypervisor target was 29671,
+`hvix64.exe`, image size `6393856`, timestamp `3152137373`, checksum `2578329`, no symbols -- the
+same image identity the 2026-09-20 pages record.
+
+**The teardown is validated for that placement, on one vCPU.** An NT session and a hypervisor
+session were held open simultaneously, both targets halted, and released in the documented order
+-- hypervisor resumed first, NT ended, then the hypervisor. Each `end_session` answered
+`released: true`, `target_left_running: true`, `recovery_required: false`. Independent WinRM then
+answered twice with the boot identity unchanged and uptime advancing, 572.21 s to 575.59 s, and
+both KD endpoints were free with no worker process left. That is one run, one vCPU, one engine
+build; the four-processor case remains `FOLLOWUPS.md` item 93's.
+
+**Two sessions coexist, and the freeze asymmetry is now measured in both directions.** With NT
+halted at a breakpoint, a hypervisor attach connected and broke in -- so an NT stop does not stop
+the hypervisor, and the hypervisor session stays usable across one. With the hypervisor halted, a
+`read_memory` on the NT session for a page DbgEng had not already fetched blocked, and returned
+the moment the hypervisor was resumed. The causal direction is therefore observed rather than
+inferred from silence.
+
+**The trap in that second half:** a halted hypervisor does not make the NT session look dead.
+Anything the engine already holds still answers at once -- `registers` returned the full context
+captured when NT stopped, and a read near the stopped instruction pointer came from an
+already-fetched page. The session looks healthy until it is asked for something it does not have,
+and then the call blocks for its whole budget. A fast, correct-looking answer from the NT session
+is not evidence that the guest is executing.
+
+**A software breakpoint in NT's hypercall code page freezes this guest, and a reset was the only
+recovery.** The page whose address is in `nt!HvcallCodeVa` holds a short table of stubs, each
+ending in `vmcall; ret` -- a generic entry taking the call code in a register, plus dedicated
+stubs for individual codes. Breaking on the generic entry froze the guest; breaking on the
+dedicated stubs froze it again. Both times the console went black, the break-in was never
+serviced, and the guest's own hypervisor endpoint -- with hypervisor debugging confirmed enabled
+for that boot -- would not connect either, so no debugger could reach the machine and the native-KD
+recovery this document describes elsewhere had nothing to answer it. The `int 3` costs nothing
+across the reset, since that page is dynamically mapped rather than file-backed.
+
+Three placements separate the cause. A control run with **nothing** armed took its bounded
+break-in cleanly at 15021 ms, which rules out the KD link itself; breakpoints on the NT wrappers
+in `ntoskrnl` (`HvcallInitiateHypercall`, `HvcallFastExtended`, `HvcallpExtendedFastHypercall`,
+`HvcallpExtendedFastHypercallWithOutput`) ran and were hit without incident. The surviving
+explanation is that the debugger's own path for reporting a trap re-enters the page it trapped in,
+so the stop can never be delivered; that mechanism has not been instrumented. **Break on the
+wrappers, not on the page** -- they carry the hypercall input value in a register and answer the
+same question. On the measured build that value was `0x8001005D` at `HvcallInitiateHypercall`,
+whose low 16 bits are the call code and whose bit 16 is the fast flag.
+
+Measured with one logical processor throughout. Whether a second processor changes the freeze --
+by leaving something able to service the transport -- is untested in either direction.

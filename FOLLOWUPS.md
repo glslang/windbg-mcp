@@ -77,7 +77,10 @@ and files the rest in `untracked`. Item 93 records the multiprocessor hypervisor
 investigation (2026-09-20): debugger-reported release could leave further processor stops, while
 inspection without a temporary breakpoint or step detached with independently healthy execution.
 And item 94 from giving that investigation's harness the tools it was written against (2026-09-20):
-a typed breakpoint listing and removal landed, and `bd`/`be` deliberately did not.
+a typed breakpoint listing and removal landed, and `bd`/`be` deliberately did not. And item 95 from
+debugging a hypervisor alongside the NT kernel it runs (2026-09-21), which needs to know that two
+endpoints are two halves of one guest -- a fact a connection profile has nowhere to put, and which
+cannot safely be read off the names.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1923,6 +1926,28 @@ same boot and advancing uptime each time. NT is unaffected (two pool-walk cycles
 four-processor guest, unchanged). Stepping past the hypervisor's own `int 3` before detaching does
 **not** help, which is what rules out the instruction pointer as the cause.
 
+**The dbgscope placement is now validated live, on one vCPU** (2026-09-21, server
+`0.19.0+g023a294a` read off the binary that answered, recorded in
+[`docs/hypervisor-debugging.md`](./docs/hypervisor-debugging.md)). That commit moved
+the drain out of this server into `quit_and_detach_target` and noted its own re-validation as
+outstanding; a session holding an NT and a hypervisor target open at once released both in the
+documented order -- hypervisor resumed first -- each answering `released: true`,
+`target_left_running: true`, `recovery_required: false`, with independent WinRM confirming the
+same boot and uptime advancing afterwards and both endpoints free. The earlier 2 of 2 / 5 of 5
+figures above were taken against the drain while it still lived in this server (`5919469`), so
+this is the first live check of where it lives now. One run, one vCPU, one engine build.
+
+**Same session, a second finding that constrains how the remaining half can be done.** A software
+breakpoint anywhere in NT's hypercall code page -- the stub table `nt!HvcallCodeVa` points at,
+generic entry or a dedicated per-code stub -- froze that guest twice, console black, with the
+guest's own hypervisor endpoint refusing to connect afterwards although hypervisor debugging was
+enabled for the boot, so no debugger could reach it and a reset was the only recovery. Three
+placements separate the cause: nothing armed takes its bounded break-in cleanly, breakpoints on
+the `ntoskrnl` wrappers run and hit without incident, and only the page freezes it. The surviving
+explanation is that the debugger's own trap-reporting path re-enters the page it trapped in; it
+has not been instrumented. Break on the wrappers, which carry the hypercall input value in a
+register and answer the same question.
+
 **What remains open:** the four-processor lab specifically. That guest is now configured with one
 processor, so the case this item was filed for -- an actual temporary breakpoint hit followed by
 further *per-processor* stops after removal and reported detach -- has not been re-run against the
@@ -1981,3 +2006,36 @@ gap rather than a missing primitive -- the same shape item 2 records for `ba`, w
   today.
 - **Picks up at:** `worker::clear_breakpoints` and `ClearBreakpointsArgs`, and
   `breakpoints_are_listed_and_cleared_through_their_own_tools` for the round trip.
+
+## 95. [windbg-mcp] A connection profile carries a name and a string, and nothing about the target
+
+`profiles.json` maps a name to a connection string, and `WINDBG_MCP_PROFILE_<NAME>` does the same
+through the environment (`kdconn::Profiles::from_host`). Neither form can say **what** an endpoint
+reaches: that this one is a hypervisor rather than an NT kernel, or that two of them are two
+endpoints of the *same* guest.
+
+That second fact is the one debugging a hypervisor alongside its root partition is built on -- the
+two sessions only interact through the guest underneath them, so a pair pointing at different
+guests is two sessions that never interact, which reads as a bug for a long time. Today the fact
+lives only in the operator's head. `attach_kernel {}` answers with the names this host has, which
+is how an agent discovers profiles without asking for a string, and a name is all it learns; a
+listing of three names says nothing about which two belong together.
+
+**Inferring it from the tree is worse than not knowing it**, which is what makes this a gap rather
+than a documentation task: the wiring is machine-specific and deliberately untracked (`CLAUDE.md`
+says so, and this is a public repository), so any convention read off the *names* is a guess that
+looks like knowledge. A pair that looks matched need not be.
+
+- **Why deferred:** the bare string is the documented form, is what `docs/kernel-profiles.md`
+  describes, and is in use -- so a richer form is a compatibility surface rather than an edit, and
+  it buys discovery rather than function. Nothing currently fails for want of it; an operator who
+  knows their own bench is unblocked.
+- **What closes it:** an optional object value accepted wherever the string is
+  (`{ "connection": "net:port=…,key=…", … }`), parsed back-compatibly so every existing file keeps
+  working, with whatever it carries surfaced in the listing `attach_kernel {}` returns and in
+  `session_status`. Decide what the extra fields *are* before writing it -- a free-text note and a
+  typed role are different features, and a role the server does not verify is a label that can
+  disagree with the target it names, which is the failure mode this item is about reproduced one
+  level up. The value would have to stay out of logs on the same terms the connection does.
+- **Picks up at:** `kdconn::Profiles::from_host` and the refusal listing in `server::attach_kernel`,
+  with `docs/kernel-profiles.md` as the documented shape to extend.

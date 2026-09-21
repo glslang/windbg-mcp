@@ -111,6 +111,7 @@ them — read it to pick the one you want.
 | `/tiers` | before claiming a change is covered by a green run, or to turn on the dump, bounded, live-kernel, TTD or 32-bit tier |
 | `/review-round` | working bot findings on a PR, or before calling a review done |
 | `/live-kernel` | attaching to a kernel target, walking a driver's IOCTL dispatch, or diagnosing a parked attach or unresolved symbols |
+| `/live-hypervisor` | attaching to the Microsoft hypervisor, holding it and an NT session at once, correlating a hypercall across the two, or diagnosing a guest left frozen after a detach |
 | `/eval-bench` | running `tools/local_model_eval.py`, adding or re-grading a task, or writing up a benchmark result |
 | `/handoff` | updating the handoff docs, closing a `FOLLOWUPS.md` item, or writing prose that states a rule about how this code behaves |
 
