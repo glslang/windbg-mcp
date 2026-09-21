@@ -1970,14 +1970,41 @@ vCPUs with controlled breakpoint placement and stepping; establish the cause; an
 validate an engine-thread implementation with repeated four-vCPU breakpoint-hit/detach runs
 and independent same-boot guest health. A passing one-vCPU run alone does not close the item.
 
-**The hypercall correlation belongs here too, and not as a separate strand.** Seeing one hypercall
-from both ends means breaking on the hypervisor's own dispatch, which needs its RVA out of the
-static work in [`docs/hypervisor-demonstration-20260920.md`](./docs/hypervisor-demonstration-20260920.md)
--- and a dispatch breakpoint is hypervisor-side code **every processor runs**, which is precisely
-the shape this item was filed for. The NT half is already measured (2026-09-21): a wrapper
-breakpoint hit with the input value in a register, and the hypervisor attached and broken in while
-NT sat at it. What has never been observed is a single hypercall crossing. Do it on one vCPU
-first, since the four-processor topology is the open hazard above rather than a control.
+**The hypercall correlation is done on one vCPU, and what it leaves behind is this item's own
+half.** Measured 2026-09-21 and recorded in
+[`docs/hypervisor-debugging.md`](./docs/hypervisor-debugging.md). The dispatch chain came out of
+the saved image -- `hv+0x25F460` the exit handler, `hv+0x25F9D4` its VMCALL case, `hv+0x21AFF0`,
+`hv+0x210520` the dispatcher, and `hv+0x21056D` where the input value sits in `rbx` -- and three
+landmarks were read byte-for-byte off the live target before anything was armed. One hypercall was
+then seen from both ends: NT parked at `nt!HvcallInitiateHypercall` holding input value `0x10068`,
+released, and the hypervisor stopping **714 ms** later with all fifteen guest registers agreeing --
+`rbp` NT's own stack pointer less seven pushes less `0x27`, `rsi` NT's `rsi` with exactly its low
+byte cleared, `rdi`/`r13`/`r10`/`r11` untouched. Those two transformed values identify the
+*instance*, not merely the value.
+
+**That breakpoint is hypervisor-side code every processor runs, and on one processor it was
+uneventful** -- no freeze, no stray stops, both sessions answering `released: true`,
+`target_left_running: true`, `recovery_required: false`, and independent WinRM confirming the same
+boot with uptime advancing afterwards, on a guest that had been frozen for minutes at a stretch.
+One run, one vCPU. It says nothing about four, which is what this item still is.
+
+**Two things that run fell out of, both worth having before a four-processor attempt.** A
+conditional breakpoint whose expression dereferences memory **can fault, and a faulting condition
+stops the hypervisor** -- which freezes the guest and ends the run having learned nothing; it cost
+two runs, and taking the VP pointer from `@rcx` rather than a fixed address did not save it. Break
+where the value is already in a register. And an **unconditional** hypervisor breakpoint on a
+hypercall site **deadlocks the NT session**: every hypercall stops the world, so NT never
+accumulates the execution it needs to take its KD resume packet off the NIC and stays parked
+however many times the hypervisor is continued -- twelve stop/resume cycles delivered not one
+resume. The conditional form, auto-continuing with `j (cond) ''; 'gc'`, had NT running within a
+second.
+
+**One thing that run did not settle.** `0x8001005D` -- the input value `HvcallInitiateHypercall`
+holds most of the time on this guest, bit 31 set -- never reached the dispatcher in 60 s of free
+running, while the other value from the same wrapper reached it in 714 ms. That does not separate
+"never delivered to this hypervisor" from "answered by `hv+0x247850` before the dispatcher", and
+nothing was instrumented to tell them apart. This lab's guest is itself nested, which makes a
+hypercall aimed at the parent a plausible reading and not a measured one.
 
 **Picks up at:** the investigation's live/static follow-up sections and #355's checklist. **The
 reproducer half is no longer the temporary local runner**: since 2026-09-20 the hypervisor tier's

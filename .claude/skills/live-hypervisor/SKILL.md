@@ -145,11 +145,11 @@ a successful disassembly of what you asked for. On a target stopped at the KD br
 `nt!DbgBreakPointWithStatus`, whose `int 3; ret` reads plausibly enough to be believed. Two
 consecutive calls returning byte-identical output for two different arguments is the tell.
 
-4. **What the hypervisor implements** is the other side of the same list, and it is reversing work
-   rather than a lookup: find the VM-exit dispatch in `hvix64.exe` and take the `VMCALL` entry,
-   which fans out to a table indexed by call code. `docs/hypervisor-demonstration-20260920.md`
-   walks the image this way — PE exception directory to bound functions, RVAs throughout — and the
-   saved artefacts it hashes are where to start rather than re-deriving from a fresh copy.
+4. **What the hypervisor implements** was reversing work and is now done for this build: the VM
+   exit reaches a `VMCALL` case that fans out through a switch over call codes, and the chain is
+   in the second table below. `docs/hypervisor-demonstration-20260920.md` walks the image the long
+   way — PE exception directory to bound functions, RVAs throughout — and the saved artefacts it
+   hashes are where to start rather than re-deriving from a fresh copy.
 
 **Every RVA in those documents belongs to one build**: hypervisor 29671, `hvix64.exe`, image size
 `6393856`, timestamp `3152137373`, checksum `2578329`. `modules` reports `timestamp` and `size` for
@@ -167,6 +167,30 @@ the session in front of you; if they differ, the landmarks are a different funct
 of a debug-break poll inside a *recurring* callback, reachable on branches where no break was
 requested — which is why other processors met a breakpoint there without issuing anything. The
 demonstration used it because it was a return address it could read off the stopped stack.
+
+**The hypercall path itself, measured 2026-09-21 on that same build** — the chain one `vmcall`
+takes, and the crossing that used it, are in
+[`docs/hypervisor-debugging.md`](../../../docs/hypervisor-debugging.md):
+
+| RVA | What it is |
+|---|---|
+| `hv+0x25F460` | the VP loop's exit handler, entered with the exit reason in `edx` |
+| `hv+0x25F9D4` | its `cmp r12d,12h` — the VMCALL case, calling `hv+0x21AFF0` |
+| `hv+0x21AFF0` | the hypercall entry; `hv+0x247850` gets first refusal, then `hv+0x210520` |
+| `hv+0x210520` | the dispatcher: guest register array at `[[r9]+0x10C0]`, input value from guest `RCX` |
+| `hv+0x21056D` | **the site to break on** — input value in `rbx`, register array in `rcx` |
+| `hv+0x210669` | where codes `0x5C`/`0x5D` go, and only with bit 31 of the input value set |
+
+**Break at `hv+0x21056D` rather than at either function's entry.** A conditional breakpoint whose
+expression dereferences memory can fault, and a faulting condition *stops* the hypervisor — which
+freezes the guest and ends the run with nothing learned. It cost two runs, 90 s and 120 s, and
+taking the VP from `@rcx` instead of a fixed address did not save it. At `hv+0x21056D` the value is
+already in a register, so the condition reads no memory at all.
+
+**A second VP entry/exit pair in the image is not this one.** `hv+0x405860` with handler
+`hv+0x375F3C`, whose VMCALL case calls `hv+0x402D9C`, reads exactly like the hypercall path and is
+not it — it refuses fast hypercalls and ones with bit 31 set, and its caller routes that refusal
+into what reads as a bugcheck path.
 
 ## Stopping this guest after the attach froze it, twice
 
@@ -229,7 +253,8 @@ the stop rather than taking it — so asking twice gives the same answer, a run 
 nobody waited still has its stop there, and on a kernel target the report names the **processor**.
 
 **This sequence ran end to end on 2026-09-21**, one vCPU, with the guest independently healthy
-afterwards. Steps 1–4 are measured; step 5 onward is where it stops being so, and says so.
+afterwards — every step of it, including the crossing at step 5. What it does not cover is a
+second processor.
 
 1. **NT, machine running. Arm the wrappers, not the page.**
    ```jsonc
@@ -256,13 +281,48 @@ afterwards. Steps 1–4 are measured; step 5 onward is where it stops being so, 
    `symbols: none`. Both sessions are then open, independently routed, and both targets halted.
    Work the hypervisor stop by address and `hv+RVA`: `registers` landed on `hv+0x404a60`, the
    documented `int 3; ret` initial-break site, reproduced on a fresh boot.
-5. **Correlating the two ends is the part that has not been done.** Reaching the hypervisor's own
-   hypercall dispatch needs its RVA, which needs the static work in
-   `docs/hypervisor-demonstration-20260920.md`, and a breakpoint there is hypervisor-side code
-   every processor runs — see the item 93 note below.
-6. **Resume both, hypervisor first.** Take any hypervisor breakpoint off first or the next
+5. **Correlate, with a conditional breakpoint on each side.** Measured 2026-09-21. Arm the
+   hypervisor at `hv+0x21056D` with a register-only condition, which auto-continues on every
+   other hypercall so the guest keeps running:
+
+   ```text
+   bp <hv-base>+21056d "j (@rbx == <input-value>) ''; 'gc'"
+   ```
+
+   Then release NT and read the guest register array at the stop — `rcx` points at it. Every
+   register agrees with the NT-side capture, transformed as the wrapper's prologue transforms it:
+   `rbp` is NT's `rsp` less seven pushes less `0x27`, `rsi` is NT's `rsi` with exactly its low byte
+   cleared, and `rdi`, `r13`, `r10` and `r11` arrive untouched. Those two transformed values are
+   what make it one *instance* rather than one value. It landed **714 ms** after NT was released.
+6. **Pick a value this hypervisor actually handles.** `0x8001005D` — what
+   `HvcallInitiateHypercall` holds most of the time on this guest — never reached the dispatcher in
+   60 s of free running, while the other value from the same wrapper reached it in 714 ms. Bit 31
+   marks a hypercall for the parent hypervisor and this lab's guest is itself nested, so that is a
+   plausible reading and not a measured one. `j (@rcx != 0x8001005d) ''; 'gc'` on the NT wrapper is
+   how to find a value that does cross.
+7. **Resume both, hypervisor first.** Take any hypervisor breakpoint off first or the next
    hypercall re-enters it immediately, then `continue_async` the hypervisor. Only now does NT
    execute: an outstanding NT call unblocks the moment the hypervisor runs.
+
+**Two ordering traps, both measured 2026-09-21, and each costs a run.**
+
+**An *unconditional* hypervisor breakpoint on a hypercall site deadlocks the NT session.** Every
+hypercall stops the world, so the guest executes for microseconds per resume and NT never
+accumulates enough time to take its KD resume packet off the NIC — it stays parked at its own
+breakpoint however many times the hypervisor is continued. Twelve stop/resume cycles did not
+deliver one resume; the conditional form above had NT running again within a second.
+`... Retry sending the same data packet for 4160 times.` in the NT session's output is what that
+deadlock looks like from the other end.
+
+**NT's breakpoints can only be edited while the hypervisor runs.** `bp` and `bc` write to NT
+memory over a transport NT services only when it is executing, so with the hypervisor halted they
+block like any other uncached read. Resume the hypervisor, edit NT's breakpoints, then park NT
+again.
+
+**A bounded hypervisor run that expires leaves a break-in owing**, and the next resume spends it:
+an immediate stop at `hv+0x404a60` with the CTRL+BREAK banner and nothing armed. Seen twice. It is
+the same leftover the teardown drain exists for, it is harmless, and it reads like a breakpoint
+hit if you are not expecting it.
 
 **A breakpoint on hypervisor-side dispatch is shared code every processor runs.** That is the exact
 shape `FOLLOWUPS.md` item 93 is open on: on the four-processor lab, a temporary breakpoint hit, its
@@ -343,13 +403,17 @@ stale controller on its debug link.
 ## What has not been measured
 
 Measured on 2026-09-21, one vCPU, one engine build, one guest: the enumeration, the NT-side
-hypercall breakpoint and its call code, both sessions open at once, the asymmetry in both
-directions, and a clean two-session teardown with independent health. What remains:
+hypercall breakpoint and its call code, the hypervisor-side dispatch chain and one hypercall
+crossing it, both sessions open at once, the asymmetry in both directions, and a clean two-session
+teardown with independent health. What remains:
 
-- **Neither end of one hypercall has been seen from both sides.** The NT half is measured; the
-  hypervisor-side dispatch has never been broken on, so no single hypercall has been observed
-  entering the hypervisor. That needs dispatch's RVA out of the static work, and it is the
-  breakpoint item 93 is about.
+- **One hypercall has been seen from both ends, once, on one vCPU** — so what is open is the
+  multiprocessor case rather than the crossing. A dispatcher breakpoint is hypervisor-side code
+  every processor runs, which is the shape `FOLLOWUPS.md` item 93 is filed on; on one processor it
+  was uneventful, and that is all it says.
+- **Why `0x8001005D` never arrives is unresolved.** The absence is measured at `hv+0x21056D`; it
+  does not separate "this hypervisor never receives it" from "`hv+0x247850` answers it before the
+  dispatcher is reached", and nothing was instrumented to tell those apart.
 - **The hypercall-page freeze has a surviving explanation, not an instrumented one.** Three
   placements separate it cleanly — page freezes, `ntoskrnl` and nothing-armed do not — but nothing
   has shown *where* the reporting path re-enters the page.
