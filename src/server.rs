@@ -6556,6 +6556,7 @@ mod tests {
             role: Some(role),
             guest: Some("lab".to_string()),
             note: None,
+            ignored: Vec::new(),
         };
         let found = |kernel_target| structured::TargetSummary {
             kernel_target,

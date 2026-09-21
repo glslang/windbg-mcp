@@ -4231,13 +4231,36 @@ and refusing the attach would cost a machine over a description. One spelling sa
 other is not a disagreement -- the union contradicts nothing, so it is taken. The test was
 mutation-verified: backing the reconciliation out fails it at the `guest` assertion.
 
-**What it cost.** `modelVisible` did not move at all -- 94,879 B before and after -- because the
+**Then the same fold produced a second finding, and that is the part worth keeping.** The first fix
+merged the spellings incrementally over `Option` fields, and Codex came back with `lab`, `other`,
+`lab`: the second spelling emptied `guest` and the third **refilled** it, so the asserted pairing
+turned on the order the file was read in while the configuration still disagreed. The cause was
+structural rather than a missed case -- `Option` cannot tell *never declared* from *dropped because
+contradicted*, so every fold over it has to remember the difference somewhere else, which is the
+second place to remember that this module's own rules exist to avoid (`is_secret_name`,
+`Connection::new`). Patching the fold would have been the third round. What went in instead was a
+type: `Claim<T>` of `Unset`/`Agreed`/`Conflicted`, where `Conflicted` is **absorbing**, so
+`Claim::absorb` is commutative and associative and there is no transition that brings a
+contradicted field back. The test asserts all three orderings settle alike, and that the note is
+said once rather than once per later spelling.
+
+**And the rule this item rests on was half-built until the third finding.** "A malformed field
+costs that field and not the profile" only holds if the loss is *said* -- and the configuration
+notes are rendered by `how_to_configure`, which runs on the refusal paths. A profile that
+**resolved** reported nothing at all: an operator's `"role": "windwos"` was simply absent, the
+attach looked entirely ordinary, and the role check silently did not run. So a profile keeps its
+own refused fields and they travel as `ProfileFacts::ignored`, on the open and on every
+`session_status` row. The documentation had already claimed this behaviour before it existed, which
+is the more useful half of the finding: the prose described the design rather than the code.
+
+**What it cost.** Re-derived after review added `ignored` below, rather than left at the figure
+first measured. `modelVisible` did not move at all -- 94,879 B before and after -- because the
 claims travel in `outputSchema`, which
 [`docs/token-budget.md`](./docs/token-budget.md) measured as never reaching the model. Seven tools'
-output schemas grew: +299 B on each of the six openers and +364 B on `session_status`, +2,158 B of
+output schemas grew: +352 B on each of the six openers and +417 B on `session_status`, +2,529 B of
 wire in total, which is why `tests/golden/tool_budget.json` moved and
 `every_documented_surface_figure_matches_the_served_surface` did not. Measured on the ARM64 bench
-2026-09-21 against a worktree at `1c749a9`: 1,011 unit tests and 123 `mcp_smoke` with
+2026-09-21 against a worktree at `1c749a9`: 1,015 unit tests and 123 `mcp_smoke` with
 `WINDBG_MCP_SMOKE_DUMP=1`, 0 failed.
 
 **What it did not do.** `guest` is unverified and will stay so. Nothing was added to the

@@ -559,32 +559,101 @@ fn is_ambiguous(c: char) -> bool {
 /// The alternative to carrying them is reading them off the *names*, which is worse than not
 /// knowing. The wiring here is machine-specific and deliberately untracked, so any convention read
 /// off a name is a guess that looks like knowledge, and a pair that looks matched need not be.
+/// One of a profile's claims, folded over **every** spelling of its name.
+///
+/// `Option` cannot hold this: it has no way to tell *never declared* from *dropped because two
+/// spellings contradicted each other*, so a fold over it has to remember the difference somewhere
+/// else — and this module's own rule is that a second place to remember is a place to forget (see
+/// [`is_secret_name`] and [`Connection::new`], both of which exist to have one). Keeping it
+/// out of band is what let `lab`, `other`, `lab` settle as `lab`: the second spelling emptied the
+/// field and the third refilled it, so the reported pairing turned on the order the file happened
+/// to be read in (Codex, PR #367, second round on this same fold).
+///
+/// So the contradiction lives *in* the value. [`Claim::Conflicted`] is **absorbing**, which makes
+/// [`Claim::absorb`] commutative and associative — the fold settles the same way whatever order
+/// the spellings arrive in, and there is no transition that can bring a contradicted field back.
+#[derive(Clone, Default, Debug, PartialEq)]
+enum Claim<T> {
+    /// No spelling of this name declared it.
+    #[default]
+    Unset,
+    /// Every spelling that declared it declared this.
+    Agreed(T),
+    /// Two spellings declared different values, so which was meant is not known and neither is
+    /// reported. There is no way back out of this state, deliberately.
+    Conflicted,
+}
+
+impl<T: PartialEq> Claim<T> {
+    /// Folds one more spelling's claim in, answering whether *this* is the fold that lost it.
+    ///
+    /// `true` at most once per field, because the note belongs to the disagreement rather than to
+    /// each later spelling: a third spelling arriving at an already-contradicted field has nothing
+    /// new to say about it.
+    fn absorb(&mut self, other: Self) -> bool {
+        let value = match other {
+            Claim::Unset => return false,
+            // Unreachable while every `Entry` is one JSON object, whose fields are `Unset` or
+            // `Agreed`. Handled rather than asserted so the fold stays total if that changes.
+            Claim::Conflicted => {
+                let lost = !matches!(self, Claim::Conflicted);
+                *self = Claim::Conflicted;
+                return lost;
+            }
+            Claim::Agreed(value) => value,
+        };
+        match self {
+            Claim::Conflicted => false,
+            Claim::Unset => {
+                *self = Claim::Agreed(value);
+                false
+            }
+            Claim::Agreed(kept) if *kept == value => false,
+            Claim::Agreed(_) => {
+                *self = Claim::Conflicted;
+                true
+            }
+        }
+    }
+}
+
+impl<T> Claim<T> {
+    /// The value, if this server knows it. `Unset` and `Conflicted` are both "no" to a caller —
+    /// they differ in what to tell the *operator*, which is what the configuration notes carry.
+    fn known(&self) -> Option<&T> {
+        match self {
+            Claim::Agreed(value) => Some(value),
+            Claim::Unset | Claim::Conflicted => None,
+        }
+    }
+}
+
 #[derive(Clone, Default, Debug)]
 struct Details {
     /// Which kind of kernel this endpoint reaches — the *pre-attach* half of the fact
     /// [`KernelTarget`] carries afterwards. Worth knowing in advance precisely because attaching
     /// to the wrong one of a pair costs a session and stops a guest's world.
-    role: Option<KernelTarget>,
+    role: Claim<KernelTarget>,
     /// A name shared by every profile that reaches one machine, which is what makes two endpoints
     /// a *pair* rather than two unrelated targets — the fact debugging a hypervisor alongside its
     /// root partition is built on, and the one that otherwise lives only in the operator's head.
     /// Name-shaped ([`is_profile_name`]), so it is safe to render wherever a profile name is.
-    guest: Option<String>,
+    guest: Claim<String>,
     /// Free text, exactly as configured. Read through [`Details::note`] and never directly: it is
     /// the one field here that could carry a pasted key, and scrubbing it at every render — by
     /// which time every profile on this host has been admitted, so [`KNOWN_SECRETS`] is complete —
     /// is what keeps a mistake in a config file out of the transcript.
-    note: Option<String>,
+    note: Claim<String>,
 }
 
 impl Details {
     /// The note as it is safe to report. See the field for why this is the only way to read it.
     fn note(&self) -> Option<String> {
-        self.note.as_deref().map(scrub)
+        self.note.known().map(|note| scrub(note))
     }
 
     fn is_empty(&self) -> bool {
-        self.role.is_none() && self.guest.is_none() && self.note.is_none()
+        self.role.known().is_none() && self.guest.known().is_none() && self.note.known().is_none()
     }
 
     /// Reconciles a second spelling of this name that reaches the **same** target, answering
@@ -600,43 +669,25 @@ impl Details {
     ///
     /// **Absent is not a disagreement.** One spelling saying less than the other contradicts
     /// nothing, so the union is taken; only two *declared* values that differ are the doubt.
-    fn reconcile(&mut self, other: &Details) -> Vec<&'static str> {
-        let mut dropped = Vec::new();
-        match (self.role, other.role) {
-            (Some(mine), Some(theirs)) if mine != theirs => {
-                self.role = None;
-                dropped.push("role");
-            }
-            (None, Some(theirs)) => self.role = Some(theirs),
-            _ => {}
-        }
-        match (&self.guest, &other.guest) {
-            (Some(mine), Some(theirs)) if mine != theirs => {
-                self.guest = None;
-                dropped.push("guest");
-            }
-            (None, Some(theirs)) => self.guest = Some(theirs.clone()),
-            _ => {}
-        }
-        match (&self.note, &other.note) {
-            (Some(mine), Some(theirs)) if mine != theirs => {
-                self.note = None;
-                dropped.push("note");
-            }
-            (None, Some(theirs)) => self.note = Some(theirs.clone()),
-            _ => {}
-        }
-        dropped
+    fn reconcile(&mut self, other: Details) -> Vec<&'static str> {
+        [
+            ("role", self.role.absorb(other.role)),
+            ("guest", self.guest.absorb(other.guest)),
+            ("note", self.note.absorb(other.note)),
+        ]
+        .into_iter()
+        .filter_map(|(field, lost)| lost.then_some(field))
+        .collect()
     }
 
     /// How a profile's claims read beside its name: `hypervisor, guest "lab", "root partition"`.
     /// `None` when it makes none, which is every profile configured as a bare string.
     fn described(&self) -> Option<String> {
         let mut parts = Vec::new();
-        if let Some(role) = self.role {
+        if let Some(role) = self.role.known() {
             parts.push(role.label().to_string());
         }
-        if let Some(guest) = &self.guest {
+        if let Some(guest) = self.guest.known() {
             parts.push(format!("guest \"{guest}\""));
         }
         if let Some(note) = self.note() {
@@ -726,7 +777,7 @@ fn entry_of(value: &serde_json::Value) -> Result<Entry, String> {
         match member.as_str() {
             "connection" => {}
             "role" => match value.as_str().and_then(role_of) {
-                Some(role) => entry.details.role = Some(role),
+                Some(role) => entry.details.role = Claim::Agreed(role),
                 None => entry.complaints.push(
                     "its `role` was ignored: it must be `windows` (or `nt`) or `hypervisor` (or \
                      `hv`), which are the two an attach can be checked against"
@@ -734,7 +785,7 @@ fn entry_of(value: &serde_json::Value) -> Result<Entry, String> {
                 ),
             },
             "guest" => match value.as_str().map(str::trim).filter(|g| is_profile_name(g)) {
-                Some(guest) => entry.details.guest = Some(guest.to_string()),
+                Some(guest) => entry.details.guest = Claim::Agreed(guest.to_string()),
                 None => entry.complaints.push(format!(
                     "its `guest` was ignored: it must be a name (letters, digits, `-`, `_` or \
                      `.`, up to {NAME_LIMIT} characters), because it is rendered wherever this \
@@ -742,7 +793,7 @@ fn entry_of(value: &serde_json::Value) -> Result<Entry, String> {
                 )),
             },
             "note" => match value.as_str().map(str::trim).filter(|n| is_note(n)) {
-                Some(note) => entry.details.note = Some(note.to_string()),
+                Some(note) => entry.details.note = Claim::Agreed(note.to_string()),
                 None => entry.complaints.push(format!(
                     "its `note` was ignored: it must be text of at most {NOTE_LIMIT} characters \
                      with no line breaks or other control characters, which would let a profile \
@@ -816,6 +867,11 @@ struct Profile {
     /// [`Details::default`].
     details: Details,
     source: Source,
+    /// What this profile tried to say and could not keep — the same sentences the configuration
+    /// notes carry, held here as well so a profile that *resolves* can report them. The notes are
+    /// rendered only where a lookup fails, so a successful attach would otherwise say nothing
+    /// about a field it silently dropped.
+    ignored: Vec<String>,
     /// Other spellings from the same source that normalize to this name and point somewhere
     /// **else**. Non-empty makes this profile unusable, deliberately: the server cannot tell which
     /// target was meant, and the failure mode of guessing is attaching to the wrong kernel while
@@ -831,9 +887,10 @@ impl Profile {
     fn facts(&self) -> ProfileFacts {
         ProfileFacts {
             name: self.name.clone(),
-            role: self.details.role,
-            guest: self.details.guest.clone(),
+            role: self.details.role.known().copied(),
+            guest: self.details.guest.known().cloned(),
             note: self.details.note(),
+            ignored: self.ignored.clone(),
         }
     }
 }
@@ -925,7 +982,7 @@ impl Profiles {
         // Reported, and never fatal. A field this server could not take costs that field alone —
         // see [`Entry::complaints`] — so the profile is admitted either way and these say what it
         // is missing.
-        for complaint in complaints {
+        for complaint in &complaints {
             self.notes.push(format!(
                 "profile `{name}` in {}: {complaint}",
                 source.label()
@@ -945,6 +1002,7 @@ impl Profiles {
                 // name once `-`, `_` and `.` are treated alike, and nothing here can know which
                 // was meant.
                 if kept.connection.expose() != connection {
+                    // Unusable from here on, so there is nothing to attach these to.
                     self.notes.push(format!(
                         "`{name}` and `{}` in {} are one name once `-`, `_` and `.` are treated \
                          alike, but name different targets, so neither can be used until one is \
@@ -957,21 +1015,26 @@ impl Profiles {
                 }
                 // Same name, same target, and a description they disagree about. See
                 // [`Details::reconcile`] for why that costs the field rather than the profile.
-                for field in kept.details.reconcile(&details) {
-                    self.notes.push(format!(
+                for field in kept.details.reconcile(details) {
+                    let why = format!(
                         "`{name}` and `{}` in {} are one name and reach the same target, but \
                          disagree about `{field}`, so that field was dropped rather than settled \
                          as whichever was read first. Rename or remove one of them.",
                         kept.name,
                         source.label(),
-                    ));
+                    );
+                    kept.ignored.push(why.clone());
+                    self.notes.push(why);
                 }
+                // This spelling's own refused fields belong to the same profile.
+                kept.ignored.extend(complaints);
             }
             std::collections::btree_map::Entry::Vacant(slot) => {
                 slot.insert(Profile {
                     name,
                     connection: Connection::new(connection),
                     details,
+                    ignored: complaints,
                     source,
                     conflicts: Vec::new(),
                 });
@@ -2450,6 +2513,91 @@ mod tests {
         );
         // And it is not reported as the *other* kind of duplicate, which makes a name unusable.
         assert!(!notes.contains("name different targets"), "{notes}");
+    }
+
+    /// **A third spelling cannot bring a contradicted field back** (Codex, PR #367, second round
+    /// on this fold).
+    ///
+    /// `lab`, `other`, `lab` is the case: with the field held as an `Option`, the second spelling
+    /// emptied it and the third refilled it, so the pairing this server asserted turned on the
+    /// order the file happened to be read in while the configuration still disagreed.
+    /// [`Claim::Conflicted`] is absorbing, so there is no such transition to make.
+    #[test]
+    fn a_third_spelling_cannot_restore_a_contradicted_field() {
+        let with_guest =
+            |guest: &str| format!("{{ \"connection\": \"{FAKE}\", \"guest\": \"{guest}\" }}");
+        let (first, second, third) = (with_guest("lab"), with_guest("other"), with_guest("lab"));
+
+        // Every order settles the same way, which is what makes the fold a fold.
+        for spellings in [
+            [
+                ("lab-hv", first.as_str()),
+                ("lab_hv", second.as_str()),
+                ("lab.hv", third.as_str()),
+            ],
+            [
+                ("lab-hv", second.as_str()),
+                ("lab_hv", first.as_str()),
+                ("lab.hv", third.as_str()),
+            ],
+            [
+                ("lab-hv", third.as_str()),
+                ("lab_hv", first.as_str()),
+                ("lab.hv", second.as_str()),
+            ],
+        ] {
+            let profiles = Profiles::from_pairs(&spellings);
+            let facts = resolve("lab-hv", &profiles)
+                .expect("the target is not in doubt")
+                .facts
+                .expect("a profile named it");
+            assert_eq!(
+                facts.guest, None,
+                "two of these disagree, so no guest is knowable however they are ordered: {:?}",
+                profiles.notes
+            );
+            // Said once, not once per later spelling: the note belongs to the disagreement.
+            assert_eq!(
+                profiles
+                    .notes
+                    .iter()
+                    .filter(|note| note.contains("`guest`"))
+                    .count(),
+                1,
+                "{:?}",
+                profiles.notes
+            );
+        }
+    }
+
+    /// A field this server refused reaches a **successful** attach, not only a failing one
+    /// (Codex, PR #367).
+    ///
+    /// The rule that a malformed field costs that field and never the profile only holds if the
+    /// loss is said out loud. The configuration notes are rendered on the refusal paths, so a
+    /// profile that resolves used to report nothing at all about a field it had dropped: the
+    /// operator's `"role": "windwos"` simply went missing and the attach looked ordinary.
+    #[test]
+    fn a_refused_field_is_reported_by_the_profile_that_resolves() {
+        let typo =
+            format!("{{ \"connection\": \"{FAKE}\", \"role\": \"windwos\", \"guest\": \"lab\" }}");
+        let profiles = Profiles::from_pairs(&[("lab-nt", typo.as_str())]);
+
+        let facts = resolve("lab-nt", &profiles)
+            .expect("a typo'd role costs the role, not the target")
+            .facts
+            .expect("a profile named it");
+        assert!(facts.role.is_none());
+        assert_eq!(facts.guest.as_deref(), Some("lab"), "the rest is untouched");
+        assert_eq!(facts.ignored.len(), 1, "{:?}", facts.ignored);
+        assert!(facts.ignored[0].contains("`role`"), "{:?}", facts.ignored);
+
+        // A profile with nothing refused carries an empty list, which the schema omits.
+        let clean = resolve("lab-nt", &Profiles::from_pairs(&[("lab-nt", FAKE)]))
+            .expect("resolves")
+            .facts
+            .expect("a profile named it");
+        assert!(clean.ignored.is_empty());
     }
 
     /// An override **replaces**, so a bare environment variable beside a described file entry does
