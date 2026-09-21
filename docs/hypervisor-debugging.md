@@ -7,6 +7,13 @@ but its second cycle lost WinRM reachability despite passing MCP assertions.
 The new opt-in announcement attach passed three independently checked MCP cycles on the measured
 build. The default attach path remains unchanged. See [Validation](#validation) before use.
 
+**Do not set a breakpoint inside NT's hypercall code page.** On the measured one-vCPU lab it froze
+the guest so completely that the guest's own hypervisor endpoint stopped answering and a reset was
+the only recovery — twice, on two different stubs. Break on the `ntoskrnl` wrappers instead; they
+carry the hypercall input value in a register. The measurements, the control that isolates the
+cause, and the pairing of an NT session with a hypervisor one are in
+[2026-09-21](#2026-09-21-the-drain-placement-validated-live-and-an-nt-side-hazard).
+
 Use `attach_kernel` with a profile for the **hypervisor's** KDNET endpoint. The existing
 DbgEng kernel transport handles this; no EXDI backend, separate attach tool, or Secure Kernel
 debug setting is required. This debugs the Microsoft hypervisor, not the NT kernel and not VTL1.
