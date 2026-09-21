@@ -313,8 +313,8 @@ availability, or guest responsiveness; verify the latter out of band.
 
 Adding `-BreakpointHit` also runs to a return address read off the stopped processor's stack and
 asserts execution reached it. That is the sequence whose four-processor run left the guest frozen
-(`FOLLOWUPS.md` item 93), so the wrapper refuses it unless the guest reports exactly one logical
-processor, and the refusal is checked before every cycle rather than once. `docs/smoke-test.md`
+(item 93), so the wrapper refuses it on a multiprocessor guest unless `-AllowMultiprocessor` is
+passed, and the check is made before every cycle rather than once. `docs/smoke-test.md`
 has the three environment variables, for a run made without the wrapper — which is a run with no
 independent postcondition, and the 2026-09-20 measurements are what says why that matters.
 Do not run the NT live-kernel tier against this profile: that tier deliberately expects NT and
@@ -633,13 +633,18 @@ attempt count no longer does.
 Measured through `examples/hypervisor_detach_regression.ps1` on the four-processor guest, each
 cycle carrying its own WinRM boot-identity and advancing-uptime check:
 
-| Drain | Cycles | Guest healthy afterwards |
-|---|---|---|
-| Backed out | 4 | 2 |
-| Present, sized per processor | 10 | 10 |
+| Drain | Build | Cycles | Guest healthy afterwards |
+|---|---|---|---|
+| Backed out | local | 4 | 2 |
+| Present, sized per processor | local | 10 | 10 |
+| Present, sized per processor | pinned `192e3486` | 5 | 5 |
 
 The ten were two batches of five, with the backed-out runs interleaved between them on the same
-guest and the same boot, so the difference is the drain rather than the guest settling.
+guest and the same boot, so the difference is the drain rather than the guest settling. The last
+row is the same sequence after dbgscope#175 merged and `Cargo.toml`'s `rev` moved to it, which is
+what the ten do not cover: they were taken against a local `[patch]`, and a measurement is a
+reading of the binary that answered rather than of the checkout beside it. All nineteen cycles ran
+against the one boot the guest came up on that afternoon.
 
 ### What this does not say
 
