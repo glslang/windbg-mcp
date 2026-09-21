@@ -373,6 +373,23 @@ fn open_failure(
     ))
 }
 
+/// What a profile could not keep, as lines under a report.
+///
+/// **Both halves, or it is half a warning**, which `.claude/rules/tool-surface.md` states and this
+/// broke: `ProfileFacts::ignored` reached `structuredContent` only, so a text-only client saw an
+/// entirely ordinary attach and never learned that a field had been dropped — and the whole reason
+/// a malformed field costs only itself is that the loss gets *said* (Codex, PR #367).
+fn ignored_fields(profile: Option<&structured::ProfileFacts>) -> Option<String> {
+    let ignored = &profile?.ignored;
+    (!ignored.is_empty()).then(|| {
+        ignored
+            .iter()
+            .map(|why| format!("  profile: {why}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    })
+}
+
 /// What to say when a profile's declared `role` is not what the attach found.
 ///
 /// **Only when both are known**, which is narrower than it looks: a freshly attached kernel can
@@ -1802,6 +1819,10 @@ fn describe_session(s: &SessionSnapshot) -> String {
         s.pid,
         fmt_duration(s.age)
     );
+    if let Some(ignored) = ignored_fields(s.profile.as_ref()) {
+        out.push_str(&ignored);
+        out.push('\n');
+    }
     let waited = fmt_duration(s.in_state_for);
     match &s.state {
         SessionState::KernelUnresolved(why) => out.push_str(&format!(
@@ -2241,6 +2262,11 @@ impl WindbgServer {
                 // Both halves again, for the reason below: the worker already appended its own
                 // limitation to the text it built, so a line added to the field alone would be a
                 // warning the text readers never get.
+                // Said in the text as well as in `profile.ignored`, for the reason
+                // [`ignored_fields`] gives.
+                if let Some(ignored) = ignored_fields(profile.as_ref()) {
+                    report = format!("{report}\n{ignored}");
+                }
                 if let Some(disagreement) = role_disagreement(profile.as_ref(), &summary) {
                     summary.limitation = Some(match summary.limitation.take() {
                         Some(existing) => format!("{existing}\n{disagreement}"),
@@ -6599,6 +6625,46 @@ mod tests {
         );
         // A raw `connection` claims nothing, so it can be wrong about nothing.
         assert!(role_disagreement(None, &found(Some(structured::KernelTarget::Windows))).is_none());
+    }
+
+    /// A field a profile could not keep is said in the **text** too, not only in
+    /// `structuredContent` (Codex, PR #367).
+    ///
+    /// `.claude/rules/tool-surface.md`: a fact added to one half of a result is one half the
+    /// clients never see. A text-only client was shown an entirely ordinary attach while the role
+    /// check had silently not run — and the reason a malformed field costs only itself is that the
+    /// loss gets said.
+    #[test]
+    fn a_field_a_profile_could_not_keep_is_said_in_the_text() {
+        let carrying = |ignored: Vec<String>| structured::ProfileFacts {
+            name: "lab-nt".to_string(),
+            role: None,
+            guest: Some("lab".to_string()),
+            note: None,
+            ignored,
+        };
+
+        let said = ignored_fields(Some(&carrying(vec![
+            "its `role` was ignored: it must be `windows` (or `nt`) or `hypervisor` (or `hv`)"
+                .to_string(),
+        ])))
+        .expect("a dropped field is worth a line");
+        assert!(said.contains("`role`"), "{said}");
+        assert!(said.contains("profile:"), "{said}");
+
+        // Nothing to say is nothing said, which is the ordinary case on every open.
+        assert!(ignored_fields(Some(&carrying(Vec::new()))).is_none());
+        assert!(ignored_fields(None).is_none());
+
+        // And `session_status`'s text carries it, which is the other half a client may be reading.
+        let mut snap = snapshot(
+            SessionKind::Kernel,
+            SessionState::Open,
+            Duration::from_secs(1),
+        );
+        snap.profile = Some(carrying(vec!["its `guest` was ignored".to_string()]));
+        let out = describe_session(&snap);
+        assert!(out.contains("its `guest` was ignored"), "{out}");
     }
 
     // ---- What `session_status` says ------------------------------------

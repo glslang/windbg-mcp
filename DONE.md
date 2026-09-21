@@ -4253,6 +4253,25 @@ own refused fields and they travel as `ProfileFacts::ignored`, on the open and o
 `session_status` row. The documentation had already claimed this behaviour before it existed, which
 is the more useful half of the finding: the prose described the design rather than the code.
 
+**A third round, and the P1 in it came in through the field added to carry a label.** `guest` is
+validated by `is_profile_name`, and that was taken as making it safe to render. It stops the two
+things the charset was written for -- a connection string cannot pass, and nothing can forge a line
+in a report -- and it does not stop a bare KDNET key, because a key is dotted decimal and
+`1.2.3.4` is digits and dots. So a key pasted into `guest` was rendered verbatim into the listing
+`attach_kernel {}` answers with, into every session label and into structured output: the exact
+disclosure this module exists to prevent, arriving through the least likely field. It is scrubbed
+at every render now, like the note beside it, and masking by **value** means a legitimate guest
+costs nothing -- a profile named after the target's IP address stays readable.
+
+The same round also caught `ignored` reaching `structuredContent` **only**, so a text-only client
+still saw an ordinary attach: `.claude/rules/tool-surface.md`'s rule about annotating both halves,
+broken in the commit whose own comments cite it. One renderer now feeds the open's report and
+`session_status`'s text.
+
+**Four rounds, three of them on mechanisms the previous round had just added.** The pattern is the
+one `prefer-simplification-over-gap-fixing` describes, and the round that broke it was the one that
+changed a *type* rather than the fold: `Option` to an absorbing `Claim`.
+
 **What it cost.** Re-derived after review added `ignored` below, rather than left at the figure
 first measured. `modelVisible` did not move at all -- 94,879 B before and after -- because the
 claims travel in `outputSchema`, which
@@ -4260,7 +4279,7 @@ claims travel in `outputSchema`, which
 output schemas grew: +352 B on each of the six openers and +417 B on `session_status`, +2,529 B of
 wire in total, which is why `tests/golden/tool_budget.json` moved and
 `every_documented_surface_figure_matches_the_served_surface` did not. Measured on the ARM64 bench
-2026-09-21 against a worktree at `1c749a9`: 1,015 unit tests and 123 `mcp_smoke` with
+2026-09-21 against a worktree at `1c749a9`: 1,017 unit tests and 123 `mcp_smoke` with
 `WINDBG_MCP_SMOKE_DUMP=1`, 0 failed.
 
 **What it did not do.** `guest` is unverified and will stay so. Nothing was added to the

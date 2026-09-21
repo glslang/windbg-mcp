@@ -129,9 +129,16 @@ it describes.
 A field this server cannot take costs **that field** and never the profile: a `role` that is not
 one of the four spellings, a `guest` that is not a name, a `note` with a line break in it or over
 200 characters, or a member this server does not know is dropped with a note in the configuration
-report, and the target still opens. The opposite would mean a typo in a description costs the
-machine it describes. A `note` is scrubbed like everything else here, so a connection string pasted
-into one does not leave this process either.
+report **and by the profile itself** — an `ignored` list beside its claims, in both halves of the
+result, because a field silently absent from an otherwise ordinary attach is the same as not
+reporting it — and the target still opens. The opposite would mean a typo in a description costs
+the machine it describes.
+
+`note` **and `guest`** are both scrubbed at every render, so a connection string or a key pasted
+into either does not leave this process. Being name-shaped is not what makes `guest` safe: the
+charset stops a connection string and a forged report line, and it admits a bare KDNET key, which
+is dotted decimal. Masking is by value, so a guest that is not one of this host's own keys is
+untouched.
 
 Configured profiles stay in the supervisor: an engine worker is spawned **without** the
 `WINDBG_MCP_PROFILE_*` variables, and is told only the one connection it is opening, over its
