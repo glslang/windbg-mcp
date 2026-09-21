@@ -343,12 +343,17 @@ visible in the prose:
 | 3 capture, re-arm, **resume again**, capture the crossing value | halted at the chosen value | not attached |
 | 4 attach | halted | halted at `hv+0x404a60` |
 | 5 arm `hv+0x21056D`, lodge NT, **resume the hypervisor** | resumes, then frozen mid-`vmcall` | halted at `hv+0x21056D` |
-| 6 clear the hypervisor breakpoint, resume it | running — clear NT's conditional too, or it stops again at the next match | running |
+| 6 clear the hypervisor breakpoint, resume it | resumes, and stops again at once if its conditional is still armed | running |
 
-Two rules fall out of that column pair, and they are the ones the findings kept landing on:
-**arming is not resuming** — `bp`, `bc` and `set_breakpoint` change what is armed and leave the
-target exactly where it was — and **NT's state is only meaningful while the hypervisor runs**, so
-any row where the hypervisor is halted is a row where NT does nothing at all.
+Three rules fall out of that column pair, and they are the ones the findings kept landing on.
+**Arming is not resuming** — `bp`, `bc` and `set_breakpoint` change what is armed and leave the
+target exactly where it was. **NT's state is only meaningful while the hypervisor runs**, so any
+row where the hypervisor is halted is a row where NT does nothing at all. And **a row that says
+*running* is a row that accepts three calls and no others** — `interrupt`, `end_session` and a
+further resume (`Sessions::refuse_while_running`), which step 2 says of NT and is just as true
+here: NT's own conditional cannot be cleared until NT has stopped, by its next match or by an
+`interrupt`. Clearing it by hand is optional anyway, since `end_session`'s teardown clears
+breakpoints itself before it detaches.
 
 **Two ordering traps, both measured 2026-09-21, and each costs a run.**
 
