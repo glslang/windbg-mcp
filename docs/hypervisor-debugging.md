@@ -491,9 +491,20 @@ carried `0x6A`, `0x100010050`, `0x30015` and `0x12`. The crossing's `0x10068` ap
 is what NT's generic wrapper held on both occasions it was caught there with an unconditional
 breakpoint. A register-only conditional at `hv+0x21056D` hunting it ran 60 s with the guest
 running free and never fired, while the *other* value from the same wrapper reached that same
-instruction 714 ms after NT was released. Two earlier hunts, at `hv+0x210520` for 120 s and at
-`hv+0x21AFF0`, also never fired, but both used a memory-dereferencing condition and one of them
-faulted (below), so only the 60 s run is evidence.
+instruction 714 ms after NT was released.
+
+**Three earlier runs hunted the same value and none of them is evidence**, for two different
+reasons -- worth separating, because "no hit" means nothing until the condition is known to have
+been evaluated on every hypercall in the window:
+
+| Run | Site | Condition | Why it does not count |
+|---|---|---|---|
+| 120 s | `hv+0x210520` | fixed VP address, dereferences memory | reached its bound with no hit, but only the session's running/stopped state was read and its stop record never was, so whether the condition faulted part-way through is unverified |
+| 90 s | `hv+0x21AFF0` | fixed VP address, dereferences memory | printed `Memory access error` and stopped -- coverage from that point on is nil |
+| 120 s | `hv+0x21AFF0` | exiting VP from `@rcx`, still dereferences | same, which is what showed the fault was not the fixed address |
+
+The 60 s run is the one that counts because its condition reads a register and nothing else, so it
+cannot fault, and the guest was running free throughout.
 
 That measures an absence at the dispatcher, and no more. It does **not** separate "this hypervisor
 never receives it" from "`hv+0x247850` answers it before `hv+0x210520` is reached", and nothing here
@@ -507,7 +518,8 @@ is that this build's own `0x5C`/`0x5D` branch requires that bit set, so it does 
 
 - **A conditional breakpoint whose expression faults stops the target.** `j (poi(poi(<vp>+0x10c0)+8)
   == <value>) ''; 'gc'` printed `Memory access error at ...` and stopped -- and a stopped hypervisor
-  freezes the guest, so the run ends there having learned nothing. Two runs, 90 s and 120 s, died
+  freezes the guest, so the run ends there having learned nothing. Two runs, 90 s and 120 s -- the
+  last two rows of the table above -- died
   this way; using the exiting VP from `@rcx` rather than a fixed address did not save it. A
   condition reading **only registers** cannot fault, which is the whole reason to prefer
   `hv+0x21056D`, where the input value is already in `rbx`.
