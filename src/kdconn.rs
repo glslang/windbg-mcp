@@ -546,6 +546,23 @@ fn is_ambiguous(c: char) -> bool {
     c.is_whitespace() || c.is_control()
 }
 
+/// What a profile claimed and the target contradicted, as the profile should now report itself.
+///
+/// The check is worth nothing if only the *open* remembers it. `session_status` reads the session,
+/// possibly on a later turn or from another client, and would otherwise go on advertising the
+/// declared role with no warning and nothing to check it against (Codex, PR #367) — which is this
+/// item's own failure mode surviving the very check added to catch it.
+///
+/// So the contradicted claim is **withdrawn** rather than annotated: the role goes, and the reason
+/// joins `ignored`, which is already what "this profile said something this server will not
+/// report" means. No new field, and nothing downstream has to learn a third state.
+pub fn contradicted(facts: &ProfileFacts, why: String) -> ProfileFacts {
+    let mut facts = facts.clone();
+    facts.role = None;
+    facts.ignored.push(why);
+    facts
+}
+
 /// What a profile says about the target it reaches, beyond how to dial it.
 ///
 /// All three are the **operator's claims**, not this server's findings, and that difference is why
@@ -911,7 +928,12 @@ impl Profile {
             role: self.details.role.known().copied(),
             guest: self.details.guest(),
             note: self.details.note(),
-            ignored: self.ignored.clone(),
+            // Scrubbed, because a complaint **quotes the operator's own text** — a member name,
+            // by way of [`a_member`] — and `is_profile_name` admits a dotted-decimal key just as
+            // it did for `guest`. So `{ "1.2.3.4": … }` inside a profile object would otherwise
+            // put the key in the listing, the attach result and `session_status` (Codex,
+            // PR #367). Masking by value, so an ordinary member name is untouched.
+            ignored: self.ignored.iter().map(|why| scrub(why)).collect(),
         }
     }
 }
@@ -1109,7 +1131,13 @@ impl Profiles {
             notes => format!(
                 "\n\nThe configuration was read with problems, which may be why the profile you \
                  want is missing:\n- {}",
-                notes.join("\n- ")
+                // Scrubbed for the same reason [`Profile::facts`] scrubs its half: these quote
+                // names the operator wrote, and a name can be a key.
+                notes
+                    .iter()
+                    .map(|note| scrub(note))
+                    .collect::<Vec<_>>()
+                    .join("\n- ")
             ),
         };
         format!(
@@ -2485,6 +2513,60 @@ mod tests {
                 .as_deref(),
             Some("10.0.26100")
         );
+    }
+
+    /// A key used as an unknown **member name** does not get out either (Codex, PR #367).
+    ///
+    /// The same hole as the one in `guest`, one level over and reached by a different route: a
+    /// complaint *quotes* the member it is about, [`a_member`] quotes it when it is name-shaped,
+    /// and a key is name-shaped. So the text written to help an operator find their typo was
+    /// itself the disclosure — in the configuration notes, in `ignored`, and so in the listing,
+    /// the attach result and `session_status`.
+    #[test]
+    fn a_key_used_as_a_member_name_cannot_get_out() {
+        let leaky = format!("{{ \"connection\": \"{FAKE}\", \"{FAKE_KEY}\": \"whatever\" }}");
+        let profiles = Profiles::from_pairs(&[("lab", leaky.as_str())]);
+
+        // Both render paths: the profile's own report of what it could not keep...
+        let ignored = resolve("lab", &profiles)
+            .expect("an unknown member costs the member, not the target")
+            .facts
+            .expect("a profile named it")
+            .ignored;
+        assert_eq!(ignored.len(), 1, "{ignored:?}");
+        assert!(!ignored[0].contains(FAKE_KEY), "{ignored:?}");
+        assert!(ignored[0].contains(MASK), "{ignored:?}");
+
+        // ...and the configuration advice, which is where the notes are rendered.
+        let advice = profiles.how_to_configure();
+        assert!(!advice.contains(FAKE_KEY), "{advice}");
+        assert!(advice.contains(MASK), "{advice}");
+    }
+
+    /// A claim the target contradicted is **withdrawn**, not annotated — so nothing reading the
+    /// session later repeats it (Codex, PR #367).
+    #[test]
+    fn a_contradicted_role_is_withdrawn_from_what_a_profile_reports() {
+        let claimed = ProfileFacts {
+            name: "lab-hv".to_string(),
+            role: Some(KernelTarget::Hypervisor),
+            guest: Some("lab".to_string()),
+            note: None,
+            ignored: Vec::new(),
+        };
+        let settled = contradicted(&claimed, "the attach found the Windows kernel".to_string());
+
+        assert_eq!(
+            settled.role, None,
+            "a contradicted role is not reported at all"
+        );
+        assert_eq!(
+            settled.guest.as_deref(),
+            Some("lab"),
+            "the rest is untouched"
+        );
+        assert_eq!(settled.ignored.len(), 1);
+        assert!(settled.ignored[0].contains("Windows kernel"));
     }
 
     /// The object form is accepted **wherever the string is**, and the environment is the route a
