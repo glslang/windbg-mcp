@@ -4219,6 +4219,18 @@ profile on the host has been admitted, so masking by value -- the half of `scrub
 guarantee rather than a net -- needs the later moment. `Entry`, the pre-`Connection` shape holding
 the raw string, is deliberately **not** `Debug`; tests destructure it.
 
+**What review found, and it was this feature's own failure mode produced by the server.** Codex,
+on [#367](https://github.com/glslang/windbg-mcp/pull/367): two spellings of one name that reach the
+**same** target were treated as agreeing however differently they *described* it, so `lab-hv` and
+`lab_hv` declaring different guests kept whichever was read first and discarded the other in
+silence -- and the order is not arbitrary, the file becoming a `BTreeMap` where `-` sorts before
+`_`. A caller would then have been shown a pairing nothing vouches for, which is the one outcome
+`guest` exists to prevent. The field they disagree about is now dropped rather than settled, with a
+note naming it; the profile stays dialable, because which *target* was meant was never in doubt,
+and refusing the attach would cost a machine over a description. One spelling saying less than the
+other is not a disagreement -- the union contradicts nothing, so it is taken. The test was
+mutation-verified: backing the reconciliation out fails it at the `guest` assertion.
+
 **What it cost.** `modelVisible` did not move at all -- 94,879 B before and after -- because the
 claims travel in `outputSchema`, which
 [`docs/token-budget.md`](./docs/token-budget.md) measured as never reaching the model. Seven tools'
