@@ -43,7 +43,8 @@ object and pool inspection does not apply. An inventory it does not recognise le
 
 **A declared `role` is checked against exactly that**, in the supervisor, which is the only side
 holding both halves: `server::role_disagreement` puts the profile's claim beside
-`summary.kernel_target` and reports a mismatch in the session's `limitation`. So a disagreement is
+`summary.kernel_target`, and a mismatch **withdraws** the declared role: it disappears from the
+profile and the reason joins its `ignored`, in both halves of the result. So a disagreement is
 the *configuration's* fault — trust the identity, and tell the user which profile to fix. It is
 silent where `kernel_target` is absent, and that silence is not agreement: an unrecognised
 inventory still means ask again.

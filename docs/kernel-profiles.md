@@ -100,8 +100,11 @@ what it always did. What they change is what a caller can see before and after a
 ### What is checked, and what is only claimed
 
 `role` is **checked**. An attach derives the same fact from the engine's primary module (`nt` or
-`hv`), and a profile that says one and reaches the other is reported in the session's `limitation`,
-in both halves of the result. Absent is not disagreement: a freshly attached kernel can have
+`hv`), and a profile that says one and reaches the other has its `role` **withdrawn** — the field
+goes, and the reason joins that profile's `ignored`, which both halves of the result render. It is
+deliberately *not* in `summary.limitation`: that field is what a session cannot do, and a
+mislabelled profile limits nothing — the session can do whatever its real target allows, and what
+is wrong is the file. Absent is not disagreement: a freshly attached kernel can have
 nothing but `nt` in the engine's inventory yet, and "this server could not tell" must not be
 reported as "your configuration is wrong". Nothing is refused either way — by the time there is
 anything to compare, the session is open and the target is whatever it is; what is wrong is the

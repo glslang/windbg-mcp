@@ -52,8 +52,9 @@ Pick one entry point:
   (`net:port=50000,key=<redacted>`), so `session_status` still tells two kernel targets apart.
   A profile's own description travels with the session, in the label and as a `profile` object on
   the open and on each `session_status` row. Its `role` is **checked** against what the attach
-  actually found, so a mismatch is the configuration's fault and not the target's — say so and
-  trust the attach; `guest` and any note are the user's word and are checked by nothing.
+  actually found, and a mismatch withdraws the claim rather than keeping it — so a mismatch is the
+  configuration's fault and not the target's; say so and trust the attach. `guest` and any note are
+  the user's word and are checked by nothing.
   Full configuration details: [setup.md](setup.md).
 
 Each of these opens a session of its own and returns a `session_id` — opening one does not close

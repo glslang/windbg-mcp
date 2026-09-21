@@ -623,8 +623,9 @@ machine; `note` is free text. All are optional, a bare string still works, and t
 also come back as a `profile` object on the open and on each `session_status` row.
 
 **Read `role` as checked and the rest as claims.** An attach derives the same fact from the
-engine's primary module, and a profile that disagrees with what it reached says so in the session's
-`limitation` — tell the user their file is wrong, and trust the attach. `guest` and `note` cannot
+engine's primary module, and a profile that disagrees with what it reached has its `role`
+withdrawn, with the reason reported beside the profile — tell the user their file is wrong, and
+trust the attach. `guest` and `note` cannot
 be checked by anything: they are the operator's word. If a description is missing after an edit,
 the field was dropped for being malformed and the configuration report says which; the profile
 itself still works.
