@@ -76,10 +76,7 @@ A64 writes `a || b || c` as three compares feeding one branch, and this walk rea
 and files the rest in `untracked`. And item 94 from giving the multiprocessor hypervisor
 investigation's harness the tools it was written against (2026-09-20) -- that investigation is
 item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
-`bd`/`be` deliberately did not. And item 95 from
-debugging a hypervisor alongside the NT kernel it runs (2026-09-21), which needs to know that two
-endpoints are two halves of one guest -- a fact a connection profile has nowhere to put, and which
-cannot safely be read off the names.
+`bd`/`be` deliberately did not.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1920,36 +1917,3 @@ gap rather than a missing primitive -- the same shape item 2 records for `ba`, w
   today.
 - **Picks up at:** `worker::clear_breakpoints` and `ClearBreakpointsArgs`, and
   `breakpoints_are_listed_and_cleared_through_their_own_tools` for the round trip.
-
-## 95. [windbg-mcp] A connection profile carries a name and a string, and nothing about the target
-
-`profiles.json` maps a name to a connection string, and `WINDBG_MCP_PROFILE_<NAME>` does the same
-through the environment (`kdconn::Profiles::from_host`). Neither form can say **what** an endpoint
-reaches: that this one is a hypervisor rather than an NT kernel, or that two of them are two
-endpoints of the *same* guest.
-
-That second fact is the one debugging a hypervisor alongside its root partition is built on -- the
-two sessions only interact through the guest underneath them, so a pair pointing at different
-guests is two sessions that never interact, which reads as a bug for a long time. Today the fact
-lives only in the operator's head. `attach_kernel {}` answers with the names this host has, which
-is how an agent discovers profiles without asking for a string, and a name is all it learns; a
-listing of three names says nothing about which two belong together.
-
-**Inferring it from the tree is worse than not knowing it**, which is what makes this a gap rather
-than a documentation task: the wiring is machine-specific and deliberately untracked (`CLAUDE.md`
-says so, and this is a public repository), so any convention read off the *names* is a guess that
-looks like knowledge. A pair that looks matched need not be.
-
-- **Why deferred:** the bare string is the documented form, is what `docs/kernel-profiles.md`
-  describes, and is in use -- so a richer form is a compatibility surface rather than an edit, and
-  it buys discovery rather than function. Nothing currently fails for want of it; an operator who
-  knows their own bench is unblocked.
-- **What closes it:** an optional object value accepted wherever the string is
-  (`{ "connection": "net:port=…,key=…", … }`), parsed back-compatibly so every existing file keeps
-  working, with whatever it carries surfaced in the listing `attach_kernel {}` returns and in
-  `session_status`. Decide what the extra fields *are* before writing it -- a free-text note and a
-  typed role are different features, and a role the server does not verify is a label that can
-  disagree with the target it names, which is the failure mode this item is about reproduced one
-  level up. The value would have to stay out of logs on the same terms the connection does.
-- **Picks up at:** `kdconn::Profiles::from_host` and the refusal listing in `server::attach_kernel`,
-  with `docs/kernel-profiles.md` as the documented shape to extend.

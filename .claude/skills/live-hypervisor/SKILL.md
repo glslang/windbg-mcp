@@ -19,16 +19,34 @@ keyed by the endpoint — `Endpoint::Net(port)`, compared with `conflicts`. Two 
 not collide, so an NT session and a hypervisor session coexist with no interaction inside this
 server at all. **Every interaction between them is in the guest.**
 
-`attach_kernel {}` lists the profiles the host has; which of them is the hypervisor endpoint, which
-is NT, and whether they reach the same guest are facts about the machine rather than about this
-repository, so ask rather than infer. A pair pointing at *different* guests gives two sessions that
-never interact, which reads as a bug for a long time.
+`attach_kernel {}` lists the profiles the host has, **and the listing may say which is which.** A
+profile configured as an object carries a `role` and a `guest` (`docs/kernel-profiles.md`), so the
+list can read `lab-hv (hypervisor, guest "lab"); lab-nt (windows, guest "lab")` — the pair, named.
+Read that before asking anybody anything.
+
+Where it says nothing, which of them is the hypervisor endpoint, which is NT, and whether they
+reach the same guest are facts about the machine rather than about this repository, so ask rather
+than infer. A pair pointing at *different* guests gives two sessions that never interact, which
+reads as a bug for a long time. Then ask the user to **record** the answer as a `guest` on both
+profiles, because nothing in this server can recover it later.
+
+**A matching `guest` is an assertion, not a check.** No debugger question asks two endpoints
+whether they are the same machine, so what it beats is a guess off the two names — which is worth
+a great deal and is still somebody's word. A pair that looks matched can be wrong; it is just wrong
+in writing, where you can go and ask about it.
 
 **Check the identity rather than the profile name.** `kernel_mode: true` is true of both. What
 separates them is `summary.kernel_target`: `"hypervisor"` when the engine reports kernel mode *and*
 the primary module is `hv` (`worker::kernel_target`), with a limitation saying NT process, driver,
 object and pool inspection does not apply. An inventory it does not recognise leaves
 `kernel_target` **absent** rather than guessing, so absence means ask again, not "this is NT".
+
+**A declared `role` is checked against exactly that**, in the supervisor, which is the only side
+holding both halves: `server::role_disagreement` puts the profile's claim beside
+`summary.kernel_target` and reports a mismatch in the session's `limitation`. So a disagreement is
+the *configuration's* fault — trust the identity, and tell the user which profile to fix. It is
+silent where `kernel_target` is absent, and that silence is not agreement: an unrecognised
+inventory still means ask again.
 
 **The NT-shaped tools are not merely uninformative here, they fail.** `threads` on a hypervisor
 session comes back `An unexpected exception was raised (0x80040205)`: there is no `_ETHREAD` list

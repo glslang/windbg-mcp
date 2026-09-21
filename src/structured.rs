@@ -361,6 +361,17 @@ pub struct OpenedSession {
     pub report: String,
     /// The same few facts as values.
     pub summary: TargetSummary,
+    /// What the profile named in the request claims about this target, when one was named. Absent
+    /// for every other opener, and for an `attach_kernel` given a raw `connection`.
+    ///
+    /// Beside [`Self::summary`] on purpose: the claim and the finding are only useful together,
+    /// and a client holding both can see whether they agree without parsing a label.
+    ///
+    /// Boxed — which JSON never sees — for the same reason [`TargetSummary::primary_module`] is:
+    /// this struct travels as one variant of [`OpenOutcome`], whose other variant is a fraction
+    /// of its size.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<Box<ProfileFacts>>,
 }
 
 /// What a caller reads off an open every single time: which build, where the kernel is, and —
@@ -425,6 +436,56 @@ pub struct TargetSummary {
 pub enum KernelTarget {
     Windows,
     Hypervisor,
+}
+
+impl KernelTarget {
+    /// How this reads in a label, and the spelling a connection profile's `role` is written in
+    /// (`crate::kdconn`). One definition, so a profile cannot declare a word a report never uses.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Windows => "windows",
+            Self::Hypervisor => "hypervisor",
+        }
+    }
+
+    /// How this target is named in a **sentence**, with the module the fact was read from.
+    ///
+    /// Separate from [`Self::label`], which is the configuration's spelling. A hypervisor is not a
+    /// kernel, so a message that composes `label` into "a hypervisor kernel" is wrong about the
+    /// very thing it is correcting.
+    pub fn described(self) -> &'static str {
+        match self {
+            Self::Windows => "the Windows kernel (`nt`)",
+            Self::Hypervisor => "a hypervisor (`hv`)",
+        }
+    }
+}
+
+/// What a kernel connection profile claims about the target it reaches, beyond how to dial it.
+///
+/// **Configuration, not findings**, and the distinction is the point. `role` is checkable — an
+/// attach derives the same fact from the engine's primary module, and this server says so in the
+/// session's `limitation` when the two disagree — while `guest` and `note` are the operator's word
+/// and nothing else: no debugger question asks two endpoints whether they are the same machine.
+///
+/// Carried as values rather than only inside the session's `target` label because `guest` exists
+/// to be *acted* on — pairing two sessions as two endpoints of one machine is something a client
+/// does, not something it reads.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct ProfileFacts {
+    /// The profile's name as configured, which is what `attach_kernel`'s `profile` takes.
+    pub name: String,
+    /// Which kind of kernel this profile says its endpoint reaches. Compare it against
+    /// [`TargetSummary::kernel_target`]: that one is what the attach found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub role: Option<KernelTarget>,
+    /// A name shared by every profile reaching one machine, so two endpoints of one guest can be
+    /// told from two unrelated targets. Unverified — this server has no way to check it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest: Option<String>,
+    /// Whatever else the operator wrote about this endpoint. Unverified, and scrubbed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 /// A failed open, and the one thing a caller must know about it.
@@ -542,6 +603,12 @@ pub struct SessionInfo {
     /// What this session holds, as it can safely be described: a kernel connection appears with
     /// its key redacted, exactly as in the text.
     pub target: String,
+    /// The claims of the profile this session was opened with, if it was opened with one.
+    ///
+    /// Held from the open rather than re-read, because the configuration can change under a
+    /// running session and what this one was opened with is the fact worth reporting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<ProfileFacts>,
     /// The pid of the engine process that owns it — one process per session.
     pub engine_pid: u32,
     pub state: SessionStateInfo,

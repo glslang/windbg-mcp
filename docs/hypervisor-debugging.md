@@ -38,6 +38,25 @@ Save that endpoint as a machine-local [connection profile](kernel-profiles.md), 
 attaching, verify the configured debugger address still matches this host and that no other
 debugger owns the same port. Do not operate two controllers on one endpoint.
 
+**Give both endpoints of the guest the same `guest` name, and give each a `role`.** The two
+sessions here interact only through the guest underneath them, so a hypervisor profile paired with
+some *other* machine's NT profile is two sessions that never interact — which reads as a bug for a
+long time before it reads as a configuration mistake. A profile's value may be an object that says
+so, and that assertion is the only reliable form of it: read off the names, the pairing is a guess.
+
+```jsonc
+{
+  "lab-nt": { "connection": "net:port=50000,key=<w.x.y.z>", "role": "nt", "guest": "lab" },
+  "lab-hypervisor": { "connection": "net:port=50005,key=<w.x.y.z>", "role": "hv", "guest": "lab" }
+}
+```
+
+`role` is the half this server checks: the attach derives the same fact from its primary module
+(`nt` or `hv`), and a profile that claims one and reaches the other is reported in the session's
+`limitation`. `guest` is checked by nothing — no debugger question asks two endpoints whether they
+are the same machine — so it is worth writing down precisely because it cannot be recovered later.
+See [kernel profiles](kernel-profiles.md#saying-what-an-endpoint-reaches).
+
 ## Through MCP
 
 For a known-running lab hypervisor, explicitly select the experimental attach path:

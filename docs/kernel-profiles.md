@@ -46,6 +46,76 @@ it belongs in the MCP client's server definition and takes a server restart to c
 `attach_kernel` with **neither** selector answers with the names this host has, which is how an
 agent discovers them without ever asking the user for a string.
 
+## Saying what an endpoint reaches
+
+A name and a string cannot say **what** a profile reaches: that this one is the hypervisor rather
+than the NT kernel, or that two of them are two endpoints of the *same* guest. That second fact is
+what [debugging a hypervisor alongside its root partition](hypervisor-debugging.md) is built on —
+the two sessions interact only through the guest underneath them, so a pair pointing at different
+guests is two sessions that never interact, which reads as a bug for a long time.
+
+Inferring it from the *names* is worse than not knowing. The wiring is machine-specific and
+deliberately untracked, so any convention read off a name is a guess that looks like knowledge, and
+a pair that looks matched need not be. So a profile's value may be an **object** instead of a
+string, everywhere a string is accepted:
+
+```jsonc
+// %USERPROFILE%\.windbg-mcp\profiles.json
+{
+  "lab-nt": {
+    "connection": "net:port=50000,key=1.2.3.4",
+    "role": "windows",          // or "nt"; "hypervisor" or "hv" for the other kind
+    "guest": "lab",             // shared by every endpoint of one machine
+    "note": "root partition"    // free text, up to 200 characters
+  },
+  "lab-hv": { "connection": "net:port=50001,key=5.6.7.8", "role": "hv", "guest": "lab" },
+  "ctf-vm": "net:port=50002,key=9.9.9.9"
+}
+```
+
+```pwsh
+# The same through the environment. A connection string never starts with `{`, so the two forms
+# cannot be confused and every variable set before this existed keeps its meaning.
+$env:WINDBG_MCP_PROFILE_LAB_HV =
+  '{"connection":"net:port=50001,key=5.6.7.8","role":"hypervisor","guest":"lab"}'
+```
+
+Every field but `connection` is optional, and a profile that carries none of them renders exactly
+what it always did. What they change is what a caller can see before and after an attach:
+
+- `attach_kernel` with **neither** selector now describes what it lists —
+  `Configured profiles: ctf-vm; lab-hv (hypervisor, guest "lab"); lab-nt (windows, guest "lab",
+  "root partition").` — so an agent discovers the *pair* and not only the names.
+- the session describes itself with them: `kernel target: profile "lab-hv" [hypervisor, guest
+  "lab"] (net:port=50001,key=<redacted>)`.
+- and they arrive as **values** too, in a `profile` object on the open's result and on every
+  `session_status` row, beside the `kernel_target` the attach derived for itself. `guest` exists to
+  be acted on — pairing two sessions as two endpoints of one machine is something a client does,
+  not something it reads — and a structured-aware client forwards `structuredContent` and drops the
+  text.
+
+### What is checked, and what is only claimed
+
+`role` is **checked**. An attach derives the same fact from the engine's primary module (`nt` or
+`hv`), and a profile that says one and reaches the other is reported in the session's `limitation`,
+in both halves of the result. Absent is not disagreement: a freshly attached kernel can have
+nothing but `nt` in the engine's inventory yet, and "this server could not tell" must not be
+reported as "your configuration is wrong". Nothing is refused either way — by the time there is
+anything to compare, the session is open and the target is whatever it is; what is wrong is the
+file.
+
+`guest` and `note` are **claims and nothing more**. No debugger question asks two endpoints whether
+they are the same machine, so these are the operator's word, reported as such. They are still worth
+configuring — an asserted pairing is a fact somebody wrote down, where a pairing read off two names
+is a guess — but do not read them as findings.
+
+A field this server cannot take costs **that field** and never the profile: a `role` that is not
+one of the four spellings, a `guest` that is not a name, a `note` with a line break in it or over
+200 characters, or a member this server does not know is dropped with a note in the configuration
+report, and the target still opens. The opposite would mean a typo in a description costs the
+machine it describes. A `note` is scrubbed like everything else here, so a connection string pasted
+into one does not leave this process either.
+
 Configured profiles stay in the supervisor: an engine worker is spawned **without** the
 `WINDBG_MCP_PROFILE_*` variables, and is told only the one connection it is opening, over its
 private pipe. A `launch`ed debuggee inherits its worker's environment, and a debuggee is exactly the

@@ -18,7 +18,11 @@ Pick one entry point:
   and summaries. So the order below is not a style preference; step 3 is the one to get right.
   1. **Know the profile name?** `attach_kernel { "profile": "<name>" }`. Done.
   2. **Don't?** Call `attach_kernel {}` with no arguments. The refusal lists the profiles this
-     host has, so you never have to guess a name or ask the user for anything.
+     host has, so you never have to guess a name or ask the user for anything. A listed profile
+     may also describe itself — `lab-hv (hypervisor, guest "lab")` — which is the **only**
+     trustworthy way to learn that two of these names are two endpoints of one machine. Never
+     infer that from the names themselves: the wiring is machine-specific, and a pair that looks
+     matched need not be.
   3. **No profile covers the target?** **Ask the user to create one** — do not ask for a
      connection string. Ask for the **file**, which is the only route that works mid-session:
 
@@ -43,6 +47,10 @@ Pick one entry point:
   Passing both, or neither, is refused. So is a connection string put in `profile` by mistake —
   and it is not echoed back. Sessions report their connection with the key masked
   (`net:port=50000,key=<redacted>`), so `session_status` still tells two kernel targets apart.
+  A profile's own description travels with the session, in the label and as a `profile` object on
+  the open and on each `session_status` row. Its `role` is **checked** against what the attach
+  actually found, so a mismatch is the configuration's fault and not the target's — say so and
+  trust the attach; `guest` and any note are the user's word and are checked by nothing.
   Full configuration details: [setup.md](setup.md).
 
 Each of these opens a session of its own and returns a `session_id` — opening one does not close
