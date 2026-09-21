@@ -374,3 +374,163 @@ whose low 16 bits are the call code and whose bit 16 is the fast flag.
 
 Measured with one logical processor throughout. Whether a second processor changes the freeze --
 by leaving something able to service the transport -- is untested in either direction.
+
+## 2026-09-21: one hypercall, seen from both ends
+
+The NT half was measured above: a wrapper breakpoint with the input value in a register. This is
+the other half and the join between them -- the **same hypercall instance** observed at the NT
+wrapper before its `vmcall` and inside the hypervisor after the VM exit. One vCPU, against the
+server identifying itself as **`0.19.0+g023a294a`**, read from the built binary's version resource,
+which on this bench was built from `023a294a` while the checkout stood at `1c749a9`. Hypervisor
+target 29671, `hvix64.exe`, image size `6393856`, timestamp `3152137373`, checksum `2578329`,
+`symbols: none` -- the same identity the 2026-09-20 pages record.
+
+### Finding the dispatch in the image
+
+From the saved image alone, with no debugger attached: `sk-29671-static/hvix64.exe`, SHA-256
+re-checked as `AD601A86...886DBAB1`, and its disassembly `DD72301A...BE0657D45`, both matching the
+2026-09-20 record. Addresses are image-relative, preferred base `0x140000000`.
+
+| RVA | What it is |
+|---|---|
+| `hv+0x406307` / `hv+0x40630F` | the VP loop's `vmresume` / `vmlaunch` |
+| `hv+0x406536` | `mov eax,4402h; vmread` -- the exit reason |
+| `hv+0x406577` | `call hv+0x25F460`, reason in `edx` |
+| `hv+0x25F460` | the exit handler; that call is its only caller in the image |
+| `hv+0x25F9D4` | `cmp r12d,12h` -- the **VMCALL** case, calling `hv+0x21AFF0` |
+| `hv+0x21AFF0` | the hypercall entry: calls `hv+0x247850` first and returns early if that answers, otherwise `hv+0x210520` |
+| `hv+0x210520` | the dispatcher: guest register array from `[[r9]+0x10C0]`, input value from guest `RCX`, or `RDX:RAX` for the 32-bit form |
+| `hv+0x21056D` | the instruction after `mov rbx,[rcx+8]`: **`rbx` is the input value, `rcx` the guest register array** |
+| `hv+0x210663` | `jmp rcx` into a switch over call codes `0x02`--`0x5D`, through a byte table at `hv+0x14452` and target RVAs at `hv+0x14446` |
+
+That switch has three targets rather than one per code: `hv+0x2107E5` for codes `0x02`, `0x03`,
+`0x13` and `0x14`; `hv+0x210669` for `0x5C` and `0x5D`, which additionally requires **bit 31** of
+the input value (`test ebx,ebx; jns`) and otherwise falls through; and `hv+0x210A26` for the rest.
+
+**There is a second VP entry/exit pair in this image, and it is not the one in play.** `hv+0x405860`
+with its handler `hv+0x375F3C`, whose VMCALL case calls `hv+0x402D9C` -- a dispatcher that rejects
+fast hypercalls and ones with bit 31 set, and whose caller routes that refusal into what reads as a
+bugcheck path -- read off the code shape, not observed. It is named here because it reads exactly
+like the hypercall path and is not it; nothing measured below went through it.
+
+### The landmarks, checked against the live target
+
+At base `0xfffff877c8a00000`, three reads matched the saved image byte for byte before anything was
+armed:
+
+| Site | Bytes read from the target |
+|---|---|
+| `hv+0x210520` | `48895c241055565741544155415641574883ec60` |
+| `hv+0x21AFF0` | `40534883ec40488b8140010000` |
+| `hv+0x25F9D4` | `4183fc12750d498bcee80eb6fbff` |
+
+The attach itself broke in at `hv+0x404a60`, the documented `int 3`, reproducing 2026-09-20 on a
+fresh boot. At the first dispatcher stop `r12` held `0x12`, the exit reason still in the register
+the exit handler put it in -- which is how the live path was confirmed to be the one read above.
+
+### The guest register array
+
+The array the entry stub fills on a VM exit, confirmed by what it contained rather than by its
+shape:
+
+| Offset | Register | Offset | Register |
+|---|---|---|---|
+| `+0x00` | `rax` | `+0x40` | `r8` |
+| `+0x08` | `rcx` | `+0x48` | `r9` |
+| `+0x10` | `rdx` | `+0x50` | `r10` |
+| `+0x18` | `rbx` | `+0x58` | `r11` |
+| `+0x28` | `rbp` | `+0x60` | `r12` |
+| `+0x30` | `rsi` | `+0x68` | `r13` |
+| `+0x38` | `rdi` | `+0x70` | `r14` |
+| | | `+0x78` | `r15` |
+
+`+0x20` read as zero throughout and is not the guest stack pointer, which lives in the VMCS rather
+than in this array.
+
+### The crossing
+
+NT was stopped at `nt!HvcallInitiateHypercall` by a conditional breakpoint, released, and the
+hypervisor stopped **714 ms** into the run that followed, at `hv+0x21056D`, on a matching input
+value. Every one of the
+fifteen registers the array carries then agrees with the NT-side capture -- either carried
+through untouched, or transformed exactly as that wrapper's prologue transforms it:
+
+| Register | NT, at the wrapper | Hypervisor, at the exit | Why |
+|---|---|---|---|
+| `rax` | `0` | `fffff80404460000` | `mov rax,[nt!HvcallCodeVa]` -- the page NT called through |
+| `rcx` | `0000000000010068` | `0000000000010068` | the input value, passed through |
+| `rdx` | `0` | `0` | the parameter |
+| `rbx` | `0` | `0000000000010068` | `mov rbx,rcx` |
+| `rbp` | `fffffed1d7aa3910` | `fffff93150df76d9` | `lea rbp,[rsp-27h]` after 7 pushes: `rsp` was `fffff93150df7738` |
+| `rsi` | `fffff804ee6092d0` | `fffff804ee609200` | `xor sil,sil` |
+| `rdi` | `fffffed1d3477d30` | `fffffed1d3477d30` | never touched before the call |
+| `r8` | `0` | `0` | passed through |
+| `r9` | `0` | `0` | never touched |
+| `r10` | `fffff80477af3490` | `fffff80477af3490` | never touched -- and it is the wrapper's own address |
+| `r11` | `0000000040000010` | `0000000040000010` | never touched |
+| `r12` | `0` | `0` | `xor r12d,r12d` |
+| `r13` | `fffffed1d15912c0` | `fffffed1d15912c0` | never touched |
+| `r14` | `0` | `0` | `mov r14,rdx` |
+| `r15` | `fffff804ee614420` | `0` | `mov r15,r8` |
+
+`rbp` and `rsi` are the two that make this an instance rather than a value match: `rbp` is NT's own
+stack pointer minus seven pushes minus `0x27`, to the byte, and `rsi` is NT's `rsi` with exactly
+its low byte cleared. Neither is a value the hypervisor could have had from anywhere else.
+
+For context on how distinctive that is: sampled with NT parked, four consecutive dispatcher hits
+carried input values `0x12`, `0x6A`, `0x6A`, `0x6A`, and four more while NT's resume was pending
+carried `0x6A`, `0x100010050`, `0x30015` and `0x12`. The crossing's `0x10068` appeared in none of them.
+
+### What did not cross, and what that does not prove
+
+**`0x8001005D` was never seen hypervisor-side.** That value -- call code `0x5D`, fast bit, bit 31 --
+is what NT's generic wrapper held on both occasions it was caught there with an unconditional
+breakpoint. A register-only conditional at `hv+0x21056D` hunting it ran 60 s with the guest
+running free and never fired, while the *other* value from the same wrapper reached that same
+instruction 714 ms after NT was released. Two earlier hunts, at `hv+0x210520` for 120 s and at
+`hv+0x21AFF0`, also never fired, but both used a memory-dereferencing condition and one of them
+faulted (below), so only the 60 s run is evidence.
+
+That measures an absence at the dispatcher, and no more. It does **not** separate "this hypervisor
+never receives it" from "`hv+0x247850` answers it before `hv+0x210520` is reached", and nothing here
+was instrumented to tell those apart. Bit 31 is documented in the TLFS as the flag directing a
+hypercall at the parent hypervisor, and this guest runs its own `hvix64` nested under the bench's
+host hypervisor, so a call aimed past it is a plausible reading -- and taking it as the explanation
+needs the specification and a measurement on the host, neither of which is here. What *is* measured
+is that this build's own `0x5C`/`0x5D` branch requires that bit set, so it does expect such values.
+
+### Four things that cost a run each
+
+- **A conditional breakpoint whose expression faults stops the target.** `j (poi(poi(<vp>+0x10c0)+8)
+  == <value>) ''; 'gc'` printed `Memory access error at ...` and stopped -- and a stopped hypervisor
+  freezes the guest, so the run ends there having learned nothing. Two runs, 90 s and 120 s, died
+  this way; using the exiting VP from `@rcx` rather than a fixed address did not save it. A
+  condition reading **only registers** cannot fault, which is the whole reason to prefer
+  `hv+0x21056D`, where the input value is already in `rbx`.
+- **An unconditional hypervisor breakpoint on a hypercall site deadlocks the NT session.** Every
+  hypercall stops the world, so the guest executes for microseconds per resume and NT never
+  accumulates enough time to take its KD resume packet off the NIC: NT stays parked however many
+  times the hypervisor is continued. Twelve stop/resume cycles did not deliver one resume. The
+  conditional form, which auto-continues on everything else, had NT running again within a second.
+  `... Retry sending the same data packet for 4160 times.` in the NT session's output is what the
+  deadlock looks like from the other end.
+- **NT's breakpoints can only be edited while the hypervisor runs.** `bp` and `bc` write to NT
+  memory over a transport NT services only when it is executing, so with the hypervisor halted they
+  block like any other uncached read. The order is: resume the hypervisor, edit NT's breakpoints,
+  then park NT again.
+- **A bounded hypervisor run that expires leaves a break-in owing.** Twice, the next resume stopped
+  immediately at `hv+0x404a60` with the CTRL+BREAK banner and nothing armed -- the pending break-in
+  being spent. Harmless, and the same leftover the teardown drain exists for, but it costs a cycle
+  and reads like a breakpoint hit.
+
+### Teardown and guest health
+
+Breakpoints cleared on both sides, then the documented order: hypervisor resumed, NT `end_session`,
+hypervisor `end_session`. Each answered `released: true`, `target_left_running: true`,
+`recovery_required: false`. Independent WinRM twice afterwards: boot identity unchanged across the
+whole session -- during which the guest was frozen for minutes at a stretch -- and uptime advancing
+5479.30 s to 5483.69 s. Both KD ports free, no worker process left.
+
+**A dispatcher breakpoint is hypervisor-side code every processor runs, and on one processor it was
+uneventful**: no freeze, no stray stops, guest healthy afterwards. That is one vCPU. It says nothing
+about four, which is `FOLLOWUPS.md` item 93.
