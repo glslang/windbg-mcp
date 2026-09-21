@@ -94,8 +94,9 @@ of band, then `end_session { session_id, kernel_handoff_pid }`, which verifies p
 **not** a resume or a detach.
 
 Either attach shape lands on the hypervisor's own break routine — `hv+0x404a60`, `int 3` followed
-by `ret` on the build below — and every later forced break-in lands there too, banner and all. It
-is this target's `nt!DbgBreakPointWithStatus`, not a breakpoint of yours.
+by `ret` on the build below — and every forced break-in measured here landed there too, banner and
+all, on whichever processor answered. Read it as this target's `nt!DbgBreakPointWithStatus` rather
+than as a breakpoint of yours.
 
 ## Survey: enumerating hypercalls
 
