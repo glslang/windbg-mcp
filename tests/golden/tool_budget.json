@@ -6,8 +6,8 @@
       "inputSchema": 1233,
       "modelVisible": 2602,
       "name": "attach_kernel",
-      "outputSchema": 4460,
-      "wire": 7216
+      "outputSchema": 4513,
+      "wire": 7269
     },
     {
       "annotations": 122,
@@ -15,8 +15,8 @@
       "inputSchema": 33,
       "modelVisible": 330,
       "name": "attach_kernel_local",
-      "outputSchema": 4460,
-      "wire": 4943
+      "outputSchema": 4513,
+      "wire": 4996
     },
     {
       "annotations": 117,
@@ -24,8 +24,8 @@
       "inputSchema": 204,
       "modelVisible": 547,
       "name": "attach_process",
-      "outputSchema": 4460,
-      "wire": 5155
+      "outputSchema": 4513,
+      "wire": 5208
     },
     {
       "annotations": 68,
@@ -321,8 +321,8 @@
       "inputSchema": 229,
       "modelVisible": 586,
       "name": "launch",
-      "outputSchema": 4460,
-      "wire": 5206
+      "outputSchema": 4513,
+      "wire": 5259
     },
     {
       "annotations": 65,
@@ -339,8 +339,8 @@
       "inputSchema": 211,
       "modelVisible": 718,
       "name": "open_dump",
-      "outputSchema": 4460,
-      "wire": 5337
+      "outputSchema": 4513,
+      "wire": 5390
     },
     {
       "annotations": 114,
@@ -348,8 +348,8 @@
       "inputSchema": 211,
       "modelVisible": 534,
       "name": "open_trace",
-      "outputSchema": 4460,
-      "wire": 5139
+      "outputSchema": 4513,
+      "wire": 5192
     },
     {
       "annotations": 123,
@@ -456,8 +456,8 @@
       "inputSchema": 314,
       "modelVisible": 1387,
       "name": "session_status",
-      "outputSchema": 3744,
-      "wire": 5235
+      "outputSchema": 3797,
+      "wire": 5288
     },
     {
       "annotations": 114,
@@ -574,10 +574,10 @@
     "inputSchema": 55021,
     "instructions": 2003,
     "modelVisible": 94879,
-    "outputSchema": 161737,
-    "payload": 265075,
+    "outputSchema": 162108,
+    "payload": 265446,
     "tools": 63,
-    "wire": 265001,
+    "wire": 265372,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

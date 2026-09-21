@@ -19,10 +19,13 @@ Pick one entry point:
   1. **Know the profile name?** `attach_kernel { "profile": "<name>" }`. Done.
   2. **Don't?** Call `attach_kernel {}` with no arguments. The refusal lists the profiles this
      host has, so you never have to guess a name or ask the user for anything. A listed profile
-     may also describe itself — `lab-hv (hypervisor, guest "lab")` — which is the **only**
-     trustworthy way to learn that two of these names are two endpoints of one machine. Never
-     infer that from the names themselves: the wiring is machine-specific, and a pair that looks
-     matched need not be.
+     may also describe itself — `lab-hv (hypervisor, guest "lab")` — which is the only **explicit
+     record** that two of these names are two endpoints of one machine. It is not a verification:
+     `guest` is unchecked operator input, and nothing this server can ask confirms it, so treat a
+     shared `guest` as the configuration's claim and confirm it with the user before anything that
+     depends on the two sessions being one machine. What it beats is inferring the pairing from the
+     names, which the wiring being machine-specific makes a guess: a pair that looks matched need
+     not be.
   3. **No profile covers the target?** **Ask the user to create one** — do not ask for a
      connection string. Ask for the **file**, which is the only route that works mid-session:
 

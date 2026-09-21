@@ -486,6 +486,17 @@ pub struct ProfileFacts {
     /// Whatever else the operator wrote about this endpoint. Unverified, and scrubbed.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    /// What this profile tried to say and this server would not report, one sentence each: a field
+    /// whose value is not one of its kind, a member it does not know, or a field two spellings of
+    /// this name disagreed about.
+    ///
+    /// Here because the rule that a malformed field costs **that field** and not the profile only
+    /// works if the loss is *said*: a profile that resolves puts nothing on the configuration
+    /// report, which is rendered on the refusal paths, so without this an operator's typo'd `role`
+    /// is silently absent and the attach looks entirely ordinary (Codex, PR #367). Empty in the
+    /// ordinary case.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub ignored: Vec<String>,
 }
 
 /// A failed open, and the one thing a caller must know about it.

@@ -42,7 +42,10 @@ debugger owns the same port. Do not operate two controllers on one endpoint.
 sessions here interact only through the guest underneath them, so a hypervisor profile paired with
 some *other* machine's NT profile is two sessions that never interact — which reads as a bug for a
 long time before it reads as a configuration mistake. A profile's value may be an object that says
-so, and that assertion is the only reliable form of it: read off the names, the pairing is a guess.
+so, and that is the only **explicit record** of it — not a verification. Nothing this server can
+ask confirms that two endpoints are one machine, so check the pairing out of band before relying on
+it: the endpoints' own boot identity over WinRM, as the detach regressions here already read, is
+what settles it. What the record beats is reading the pairing off the names, which is a guess.
 
 ```jsonc
 {
