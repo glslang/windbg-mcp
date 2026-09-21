@@ -444,8 +444,9 @@ shape:
 | `+0x38` | `rdi` | `+0x70` | `r14` |
 | | | `+0x78` | `r15` |
 
-`+0x20` read as zero throughout and is not the guest stack pointer, which lives in the VMCS rather
-than in this array.
+The stub writes that array at `hv+0x406451` and **never writes `+0x20`** -- which is why that slot,
+which read as zero throughout, is not the guest stack pointer. That lives in the VMCS rather than in
+this array, and `+0x08` is written separately from the `rcx` the stub stashed before the exit.
 
 ### The crossing
 

@@ -253,8 +253,10 @@ the stop rather than taking it — so asking twice gives the same answer, a run 
 nobody waited still has its stop there, and on a kernel target the report names the **processor**.
 
 **This sequence ran end to end on 2026-09-21**, one vCPU, with the guest independently healthy
-afterwards — every step of it, including the crossing at step 5. What it does not cover is a
-second processor.
+afterwards — every step of it, including the crossing at step 5. One thing is written in a better
+order than it was run: choosing a value that crosses happened *after* the hypervisor was attached
+that day, which cost three runs hunting a value that never arrives, so it is step 3 here. What the
+sequence does not cover is a second processor.
 
 1. **NT, machine running. Arm the wrappers, not the page.**
    ```jsonc
@@ -276,14 +278,28 @@ second processor.
    **`rcx = 0x8001005D`** — by the TLFS input-value layout the low 16 bits are the call code
    (`0x005D`) and bit 16 is the *fast* flag, with the input parameter in `rdx` (`0x200B`). Naming
    the call code needs the TLFS; the register is the measurement.
+
+   **That value does not cross, and it is the one this wrapper holds most of the time**, so take
+   another one *here*, before the hypervisor is armed for it. `0x8001005D` never reached the
+   hypervisor's dispatcher in 60 s of free running, while the next value out of the same wrapper
+   reached it in 714 ms. Bit 31 marks a hypercall for the parent hypervisor and this lab's guest is
+   itself nested, which is a plausible reading and not a measured one. Re-arm NT to skip it:
+
+   ```text
+   bc *; bp nt!HvcallInitiateHypercall "j (@rcx != 0x8001005d) ''; 'gc'"
+   ```
+
+   That stopped on `rcx = 0x00010068` — call code `0x68`, fast bit, `rdx = 0`. **That** is the value
+   step 5 arms for, and record `rsp`, `rsi`, `rdi` and `r13` with it: they are what identify the
+   instance at the other end.
 4. **Attach the hypervisor while NT sits there.** This works — it is how the asymmetry above was
    measured — and the summary comes back `kernel_target: "hypervisor"` with `hv`/`hvix64.exe` and
    `symbols: none`. Both sessions are then open, independently routed, and both targets halted.
    Work the hypervisor stop by address and `hv+RVA`: `registers` landed on `hv+0x404a60`, the
    documented `int 3; ret` initial-break site, reproduced on a fresh boot.
 5. **Correlate, with a conditional breakpoint on each side.** Measured 2026-09-21. Arm the
-   hypervisor at `hv+0x21056D` with a register-only condition, which auto-continues on every
-   other hypercall so the guest keeps running:
+   hypervisor at `hv+0x21056D` for the value step 3 settled on, with a register-only condition,
+   which auto-continues on every other hypercall so the guest keeps running:
 
    ```text
    bp <hv-base>+21056d "j (@rbx == <input-value>) ''; 'gc'"
@@ -294,13 +310,7 @@ second processor.
    `rbp` is NT's `rsp` less seven pushes less `0x27`, `rsi` is NT's `rsi` with exactly its low byte
    cleared, and `rdi`, `r13`, `r10` and `r11` arrive untouched. Those two transformed values are
    what make it one *instance* rather than one value. It landed **714 ms** after NT was released.
-6. **Pick a value this hypervisor actually handles.** `0x8001005D` — what
-   `HvcallInitiateHypercall` holds most of the time on this guest — never reached the dispatcher in
-   60 s of free running, while the other value from the same wrapper reached it in 714 ms. Bit 31
-   marks a hypercall for the parent hypervisor and this lab's guest is itself nested, so that is a
-   plausible reading and not a measured one. `j (@rcx != 0x8001005d) ''; 'gc'` on the NT wrapper is
-   how to find a value that does cross.
-7. **Resume both, hypervisor first.** Take any hypervisor breakpoint off first or the next
+6. **Resume both, hypervisor first.** Take any hypervisor breakpoint off first or the next
    hypercall re-enters it immediately, then `continue_async` the hypervisor. Only now does NT
    execute: an outstanding NT call unblocks the moment the hypervisor runs.
 
