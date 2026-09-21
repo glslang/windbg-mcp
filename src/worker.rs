@@ -336,8 +336,8 @@ impl KernelSafety {
 
 static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
 
-/// Whether this worker's kernel target was attached through the **`INITIAL_BREAK`** path, and so
-/// may still owe a break-in that the teardown has to consume.
+/// Whether this worker's kernel target was attached **over a KD connection** with
+/// `INITIAL_BREAK`, and so may still owe a break-in that the teardown has to consume.
 ///
 /// **Measured on a Microsoft hypervisor, 2026-09-20.** `DEBUG_ENGOPT_INITIAL_BREAK` leaves a
 /// pending host break-in behind it; dbgscope's `absorb_initial_break_artifact` consumes *one* with
@@ -357,6 +357,18 @@ static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
 ///
 /// The announcement attach removes `INITIAL_BREAK` and leaves none, which is why it detaches
 /// cleanly, and why this is `false` for it rather than unconditional.
+///
+/// **`attach_kernel_local` arms the same flag and is deliberately not tracked here.** What is
+/// being protected is the target's one `DbgKdContinue`: `qd` sends it over the KD link and a
+/// pending break-in spends it, leaving a *halted* machine. Local kernel debugging halts nothing —
+/// it cannot set a breakpoint, single-step, or control execution at all
+/// (`docs/secure-kernel-debugging-plan.md`) — so there is no continue to lose, and the drain's own
+/// `g` is one of the commands it refuses: [`DebugEngine::execute_and_wait`] propagates a failed
+/// `Execute` as `Err` while the target is still there, so tracking it would buy one refused resume
+/// per teardown and nothing else. Raised as a review finding on
+/// [#361](https://github.com/glslang/windbg-mcp/pull/361); the premise is right — both paths call
+/// `request_initial_break` — which is why the first line above names the KD connection rather than
+/// repeating the flag's name.
 static INITIAL_BREAK_ATTACH: AtomicBool = AtomicBool::new(false);
 
 /// How long each drain resume gives a leftover break-in to show itself.
@@ -381,40 +393,128 @@ const KERNEL_DRAIN_MS: u32 = 500;
 const KERNEL_DRAIN_ATTEMPTS: usize = 5;
 const KERNEL_DRAIN_FREE_RUNS: usize = 2;
 
+/// The whole drain's worst case, which is what a teardown's budget has to cover *on top of* the
+/// release it precedes.
+///
+/// Derived rather than written down, so raising either half above cannot leave this stale — and
+/// checked against the shortest grace it has to fit inside by
+/// [`tests::the_drain_fits_inside_the_grace_a_disconnect_gives_a_release`].
+const KERNEL_DRAIN_BUDGET: Duration =
+    Duration::from_millis(KERNEL_DRAIN_ATTEMPTS as u64 * KERNEL_DRAIN_MS as u64);
+
+/// What one drain resume settled about the break-ins still owed.
+///
+/// Split from the engine call so the loop's termination rule can be driven by a test: the two
+/// facts it turns on — how a run ended, and whether the target is still there — are the whole of
+/// what the engine contributes, and [`Drain`] below decides everything else. The file's
+/// convention, alongside `settle_verdict` and `analysis_fits`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resumed {
+    /// It came back on its own, which for a resume this short means a break-in was waiting. That
+    /// is one fewer for `qd` to lose.
+    OnABreak,
+    /// The deadline stopped it: the target ran the whole window without stopping, so nothing was
+    /// pending in this one.
+    Freely,
+    /// A host asked for the break. That says nothing about what the target was doing, so it is
+    /// **not** a free run — counting it as one is how a drain stops early and leaves the break-in
+    /// for `qd`. [`seal_against_interrupts`] makes it unreachable from the teardown; this arm is
+    /// what keeps the classification right if that ever moves.
+    OnRequest,
+    /// The target has gone. Nothing is owed and nothing more can be learned by resuming.
+    Gone,
+}
+
+impl Resumed {
+    /// Reads one run. `target_gone` first: a run that lost its target may also have been cut
+    /// short, and which of the two happened decides whether resuming again is worth anything.
+    fn of(run: &CommandRun) -> Self {
+        match (run.target_gone, run.cut_short) {
+            (true, _) => Self::Gone,
+            (false, Some(Interruption::Deadline { .. })) => Self::Freely,
+            (false, Some(Interruption::OnRequest)) => Self::OnRequest,
+            (false, None) => Self::OnABreak,
+        }
+    }
+}
+
+/// How much of the drain has been spent, and what it has learned.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct Drain {
+    /// Resumes spent, against [`KERNEL_DRAIN_ATTEMPTS`].
+    spent: usize,
+    /// Resumes answered by a break-in — the figure the log carries.
+    delivered: usize,
+    /// Consecutive free runs, against [`KERNEL_DRAIN_FREE_RUNS`]. Reset by a delivered break.
+    free_runs: usize,
+    /// The target has gone; no further resume can say anything.
+    gone: bool,
+}
+
+impl Drain {
+    /// Whether another resume is worth spending.
+    fn resume_again(&self) -> bool {
+        !self.gone && self.spent < KERNEL_DRAIN_ATTEMPTS && self.free_runs < KERNEL_DRAIN_FREE_RUNS
+    }
+
+    /// Folds in what one resume settled.
+    fn saw(&mut self, resumed: Resumed) {
+        self.spent += 1;
+        match resumed {
+            Resumed::OnABreak => {
+                self.delivered += 1;
+                self.free_runs = 0;
+            }
+            Resumed::Freely => self.free_runs += 1,
+            // Neither evidence of a free run nor of a break-in: it costs an attempt and leaves the
+            // count where it was.
+            Resumed::OnRequest => {}
+            Resumed::Gone => self.gone = true,
+        }
+    }
+}
+
 /// Spends the break-ins an `INITIAL_BREAK` attach left over, before the teardown's `qd` can.
 ///
 /// Returns how many resumes were answered by a delivered break, for the log — a number that is
 /// zero on NT and was one per attach on the hypervisor this was measured against.
 fn drain_pending_break_ins(e: &DebugEngine) -> usize {
-    let mut delivered = 0;
-    let mut free_runs = 0;
-    for _ in 0..KERNEL_DRAIN_ATTEMPTS {
-        let Ok(run) = e.execute_and_wait("g", KERNEL_DRAIN_MS) else {
-            // The engine refused the resume — a target that has gone, most likely. There is
-            // nothing left to drain and nothing to report about it.
-            break;
-        };
-        if run.target_gone {
-            break;
-        }
-        match run.cut_short {
-            // The deadline stopped it, so the target was running freely: nothing was pending in
-            // this window.
-            Some(_) => {
-                free_runs += 1;
-                if free_runs >= KERNEL_DRAIN_FREE_RUNS {
-                    break;
-                }
-            }
-            // It came back on its own, which for a resume this short means a break was waiting.
-            // That is one fewer for `qd` to lose, and the count starts again.
-            None => {
-                delivered += 1;
-                free_runs = 0;
-            }
+    let mut drain = Drain::default();
+    while drain.resume_again() {
+        match e.execute_and_wait("g", KERNEL_DRAIN_MS) {
+            Ok(run) => drain.saw(Resumed::of(&run)),
+            // The engine refused the resume — a target that has gone, most likely, or one that
+            // never had execution control to begin with. There is nothing left to drain and
+            // nothing to report about it.
+            Err(_) => break,
         }
     }
-    delivered
+    drain.delivered
+}
+
+/// The drain and the one condition it runs under, for **both** teardown paths.
+///
+/// Shared because the two are reached by different routes and only one of them has a caller: an
+/// [`EngineOp::EndSession`] answers a request, while [`Job::Release`] is what the worker does to
+/// itself when the supervisor disappears. A drain on the first alone leaves the crash and Ctrl+C
+/// paths — the ones this server's whole release machinery exists for — handing `qd` the same
+/// leftover break-in. Raised as a review finding on
+/// [#361](https://github.com/glslang/windbg-mcp/pull/361).
+///
+/// Best-effort and deliberately not a `?`: this is a teardown, and a session that will not close
+/// is worse than a resume that did not happen. The release runs either way, and still reports what
+/// it did.
+fn drain_before_release(e: &DebugEngine) {
+    if !INITIAL_BREAK_ATTACH.load(Ordering::SeqCst) || !matches!(e.has_target(), Ok(true)) {
+        return;
+    }
+    let delivered = drain_pending_break_ins(e);
+    if delivered > 0 {
+        tracing::info!(
+            delivered,
+            "consumed break-ins left over from the attach before releasing the target"
+        );
+    }
 }
 
 fn kernel_recovery_required() -> Failed {
@@ -645,15 +745,37 @@ struct Running {
     /// gets there first, the other sees it — so a run is either broken in or never started, and
     /// there is no third outcome where the teardown waits.
     tearing_down: bool,
-    /// The job that has entered a phase no break may reach — a [`crate::batch`] running its
-    /// `always` block.
+    /// The job that has entered a phase no break may reach, and **which** cleanup it is running.
     ///
     /// Cleanup is the one thing an interrupt must never touch. A restore cut short returns `Ok`
     /// with partial output like any other interrupted command, so `run_step` records it as a step
     /// that worked and the report says `rollback: COMPLETE` with the patch still applied — the
     /// exact loss the whole transaction machinery exists to prevent, arriving through the tool
     /// meant to be the gentle way out.
-    uninterruptible: Option<u64>,
+    ///
+    /// The [`Cleanup`] rides along because the refusal a caller reads has to be true of the job it
+    /// names, and the two need opposite advice: a rollback is over shortly and `end_session` is
+    /// the way out of it, while for a teardown `end_session` *is* what is running.
+    uninterruptible: Option<(u64, Cleanup)>,
+}
+
+/// Which cleanup a sealed job is running. See [`Running::uninterruptible`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cleanup {
+    /// A [`crate::batch`] running its `always` block.
+    Rollback,
+    /// An [`EngineOp::EndSession`] releasing this session's target.
+    ///
+    /// Sealed for a sharper version of the rollback's reason: the teardown of a live kernel
+    /// resumes the target and detaches it, and a resume that stops halfway is exactly how that
+    /// target is left halted — which is the whole of
+    /// [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md), measured. That the *interrupt* can reach it is
+    /// read from the code rather than measured: the request reader answers an
+    /// [`EngineOp::Interrupt`] without queueing behind the engine thread, and this job is the one
+    /// [`claim`] named. Nothing on this path is worth interrupting in exchange for that risk —
+    /// the release is bounded by the server's own grace either way, and the engine's watchdog
+    /// still bounds each resume, the seal being a boundary against *hosts* and not against time.
+    Teardown,
 }
 
 static RUNNING: Mutex<Running> = Mutex::new(Running {
@@ -688,13 +810,14 @@ impl Running {
     }
 
     /// Closes `id` to interrupts for the rest of its life. See [`Self::uninterruptible`].
-    fn seal(&mut self, id: u64) {
-        self.uninterruptible = Some(id);
+    fn seal(&mut self, id: u64, cleanup: Cleanup) {
+        self.uninterruptible = Some((id, cleanup));
     }
 
-    /// Whether a break may still be raised for `id`.
-    fn sealed(&self, id: u64) -> bool {
-        self.uninterruptible == Some(id)
+    /// Which cleanup `id` is sealed for, or `None` if a break may still be raised for it.
+    fn sealed(&self, id: u64) -> Option<Cleanup> {
+        self.uninterruptible
+            .and_then(|(sealed, cleanup)| (sealed == id).then_some(cleanup))
     }
 
     /// Records that `id` is pumping a target it set running, or that it has stopped doing so.
@@ -814,10 +937,11 @@ fn claim_pump(id: u64) -> Result<(), PumpRefused> {
 ///
 /// Both under the one lock, which is what makes it a boundary rather than a hope: a raise takes the
 /// same lock, so every break is either lodged before this — and drained here, before the first
-/// cleanup command runs — or refused after it. Called by a batch as it enters its `always` block.
-fn seal_against_interrupts(e: &DebugEngine, id: u64) {
+/// cleanup command runs — or refused after it. Called by a batch as it enters its `always` block,
+/// and by the teardown before it touches the target.
+fn seal_against_interrupts(e: &DebugEngine, id: u64, cleanup: Cleanup) {
     let mut running = running();
-    running.seal(id);
+    running.seal(id, cleanup);
     // Under the lock deliberately: a break raised between the seal and the drain would survive
     // both and land on the first restore command.
     let _ = e.interrupted();
@@ -1027,6 +1151,16 @@ pub fn run(args: &[String]) -> ! {
             ABRUPT_EXIT_RELEASE + within
         }
         None => ABRUPT_EXIT_RELEASE,
+    };
+    // And the release itself may have to spend the attach's leftover break-ins before it can send
+    // `qd` (see [`drain_before_release`]). This is the wait that has to cover that, for the same
+    // reason it covers a batch's rollback: a drain cut off by the grace hands the break-in back to
+    // `qd` and leaves the target halted, which is the one outcome this path exists to prevent.
+    // Nobody is on the other end of it — the supervisor being gone is why we are here — so the
+    // extra seconds are not taken from a caller.
+    let grace = match INITIAL_BREAK_ATTACH.load(Ordering::SeqCst) {
+        true => grace + KERNEL_DRAIN_BUDGET,
+        false => grace,
     };
     let (ack, released) = mpsc::channel();
     if tx.send(Job::Release(ack)).is_err() {
@@ -1238,7 +1372,14 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                     let _ = ack.send(false);
                     continue;
                 }
-                let result = catch_unwind(AssertUnwindSafe(|| engine.end_session()));
+                // The same leftover break-in, on the path with no request behind it: nothing here
+                // came from a caller, so there is no seal to take and nobody to refuse — the
+                // request reader has already met EOF. See [`drain_before_release`], and
+                // [`ABRUPT_EXIT_RELEASE`] for the budget this runs inside.
+                let result = catch_unwind(AssertUnwindSafe(|| {
+                    drain_before_release(&engine);
+                    engine.end_session()
+                }));
                 let confirmed = matches!(&result, Ok(Ok(_)));
                 if confirmed {
                     KERNEL_SAFETY.released();
@@ -1548,17 +1689,28 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
     // short returns `Ok` with partial output like any other interrupted command, so it would be
     // recorded as a step that worked and reported as `rollback: COMPLETE` with the patch still
     // applied.
-    if running.sealed(job) {
+    if let Some(cleanup) = running.sealed(job) {
         return Ok((
             Interrupted::Sealed,
-            format!(
-                "Not interrupted. The operation on this session (job {job}) is a `debug_batch` \
-                 that has finished its steps and is running its rollback, which is deliberately \
-                 not interruptible — a restore stopped halfway would report success while leaving \
-                 the target changed. It is bounded by the batch's own budget and will return \
-                 shortly. If it does not, `end_session` ends the session outright, at the cost of \
-                 the target."
-            ),
+            match cleanup {
+                Cleanup::Rollback => format!(
+                    "Not interrupted. The operation on this session (job {job}) is a `debug_batch` \
+                     that has finished its steps and is running its rollback, which is \
+                     deliberately not interruptible — a restore stopped halfway would report \
+                     success while leaving the target changed. It is bounded by the batch's own \
+                     budget and will return shortly. If it does not, `end_session` ends the \
+                     session outright, at the cost of the target."
+                ),
+                // Deliberately not offering `end_session` as the way out, which is the advice
+                // above and is void here: this *is* that teardown.
+                Cleanup::Teardown => format!(
+                    "Not interrupted. The operation on this session (job {job}) is its \
+                     `end_session`, which is deliberately not interruptible — releasing a live \
+                     kernel resumes the target and then detaches it, and a resume stopped halfway \
+                     leaves that machine halted with no debugger attached. It is bounded by this \
+                     server's release grace, and its own reply says what became of the target."
+                ),
+            },
         ));
     }
     // At most one break per job otherwise, for the same reason one step later: a batch told to stop
@@ -2274,20 +2426,21 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // session. Naming no tool, per `FOLLOWUPS.md` item 43: this is built in the worker,
             // which has never heard of the client's surface.
             let detaching = e.attached_to_a_live_process();
+            // Closed to breaks before anything here touches the target, and for the reason the
+            // rollback is: what follows is cleanup, and every part of it is a thing that must not
+            // stop halfway. The drain below is the sharp case — a resume cut short by a host's
+            // interrupt is indistinguishable from one that found nothing pending, so without this
+            // a client interrupting its own `end_session` could end the drain early and hand the
+            // leftover break-in straight back to `qd`. Raised as a review finding on
+            // [#361](https://github.com/glslang/windbg-mcp/pull/361), where the proposed remedy
+            // was to read that interrupt out of the drain's result; sealing is the same fix one
+            // step earlier, and leaves no window between the two. The engine's own watchdog is
+            // untouched by it, so each resume is still bounded.
+            seal_against_interrupts(e, id, Cleanup::Teardown);
             // **Spend the leftover break-in here, where it costs a bounded resume, rather than
             // letting `qd` spend it on the target's only continue.** See [`INITIAL_BREAK_ATTACH`]
-            // for what leaves one and how it was measured. Best-effort and deliberately not a
-            // `?`: this is a teardown, and a session that will not close is worse than a resume
-            // that did not happen — the release below still runs, and still reports what it did.
-            if INITIAL_BREAK_ATTACH.load(Ordering::SeqCst) && matches!(e.has_target(), Ok(true)) {
-                let delivered = drain_pending_break_ins(e);
-                if delivered > 0 {
-                    tracing::info!(
-                        delivered,
-                        "consumed break-ins left over from the attach before releasing the target"
-                    );
-                }
-            }
+            // for what leaves one and how it was measured.
+            drain_before_release(e);
             let ended = e
                 .end_session()
                 .map(|left| {
@@ -5640,7 +5793,7 @@ impl Debuggee for BatchEngine<'_> {
     }
 
     fn rolling_back(&mut self) {
-        seal_against_interrupts(self.e, self.job);
+        seal_against_interrupts(self.e, self.job, Cleanup::Rollback);
     }
 }
 
@@ -13035,15 +13188,34 @@ mod tests {
     fn a_sealed_job_takes_no_interrupt_at_all() {
         let mut running = idle();
         running.claim(7);
-        assert!(!running.sealed(7), "an ordinary job is interruptible");
+        assert_eq!(running.sealed(7), None, "an ordinary job is interruptible");
 
-        running.seal(7);
-        assert!(running.sealed(7));
+        running.seal(7, Cleanup::Rollback);
+        assert_eq!(
+            running.sealed(7),
+            Some(Cleanup::Rollback),
+            "a sealed job answers with the cleanup it is running, which is what its refusal says"
+        );
         // And the seal is the job's, not the process's: it goes when the job does, or the next
         // batch on this session could never be interrupted.
         assert!(!running.release(7), "no interrupt was ever raised for it");
         running.claim(8);
-        assert!(!running.sealed(8), "the next job starts interruptible");
+        assert_eq!(running.sealed(8), None, "the next job starts interruptible");
+    }
+
+    /// The seal carries **which** cleanup, because the refusal a caller reads has to be true of
+    /// the job it names.
+    ///
+    /// Both are uninterruptible for the same reason and the advice is opposite: a rollback ends
+    /// shortly and `end_session` is the way out of a batch that will not, while a teardown *is*
+    /// that `end_session` — telling its caller to run one is telling them to do the thing they
+    /// are already waiting on.
+    #[test]
+    fn a_sealed_teardown_is_not_described_as_a_batch() {
+        let mut running = idle();
+        running.claim(11);
+        running.seal(11, Cleanup::Teardown);
+        assert_eq!(running.sealed(11), Some(Cleanup::Teardown));
     }
 
     /// The other side of the same race: an interrupt that arrives between jobs binds to nothing, so
@@ -13062,6 +13234,144 @@ mod tests {
         assert!(
             !running.release(9),
             "a job that started after the interrupt must not answer for it"
+        );
+    }
+
+    // ---- what the teardown's drain spends, and when it stops ----------------
+
+    fn ran(cut_short: Option<Interruption>, target_gone: bool) -> CommandRun {
+        CommandRun {
+            output: String::new(),
+            cut_short,
+            target_gone,
+        }
+    }
+
+    /// Runs a drain over a scripted sequence of resumes, as [`drain_pending_break_ins`] does over
+    /// real ones, and answers with the state it stopped in.
+    ///
+    /// The whole loop rather than one step, because the rule under test *is* the loop: how many
+    /// resumes it spends, and on what evidence it stops.
+    fn drain_over(resumes: &[Resumed]) -> Drain {
+        let mut drain = Drain::default();
+        let mut next = resumes.iter();
+        while drain.resume_again() {
+            match next.next() {
+                Some(resumed) => drain.saw(*resumed),
+                None => panic!(
+                    "the drain asked for resume {} and the script had none",
+                    drain.spent + 1
+                ),
+            }
+        }
+        drain
+    }
+
+    /// **One free run is not evidence, and this is the rule that was measured.**
+    ///
+    /// A break-in that is merely slow to arrive reads exactly like a target running freely, so a
+    /// drain that stopped at the first free resume left it pending for `qd`. Measured by hand on
+    /// the hypervisor: draining once went 2 of 3 cycles, with the third freezing the guest;
+    /// draining to two consecutive free runs went 5 of 5.
+    #[test]
+    fn one_free_run_does_not_end_the_drain() {
+        let mut drain = Drain::default();
+        drain.saw(Resumed::OnABreak);
+        drain.saw(Resumed::Freely);
+        assert!(
+            drain.resume_again(),
+            "stopping on a single free resume is the version that froze the guest"
+        );
+        drain.saw(Resumed::Freely);
+        assert!(!drain.resume_again(), "two in a row is what ends it");
+        assert_eq!(drain.delivered, 1, "one break-in was spent, not three");
+    }
+
+    /// A delivered break-in starts the count again: the two free runs have to be *consecutive*,
+    /// or a drain could stop having seen one free resume before a break and one after it.
+    #[test]
+    fn a_break_in_between_two_free_runs_restarts_the_count() {
+        let drain = drain_over(&[
+            Resumed::Freely,
+            Resumed::OnABreak,
+            Resumed::Freely,
+            Resumed::Freely,
+        ]);
+        assert_eq!(drain.spent, 4);
+        assert_eq!(drain.delivered, 1);
+    }
+
+    /// The attempt cap is what keeps a target that breaks on every resume — its own `int 3` in a
+    /// loop, say — from turning a teardown into an unbounded one.
+    #[test]
+    fn a_target_that_breaks_every_time_still_ends_the_drain() {
+        let drain = drain_over(&[Resumed::OnABreak; KERNEL_DRAIN_ATTEMPTS]);
+        assert_eq!(drain.spent, KERNEL_DRAIN_ATTEMPTS);
+        assert_eq!(drain.delivered, KERNEL_DRAIN_ATTEMPTS);
+    }
+
+    /// **A host's interrupt is not a free run.** It says the caller asked, and nothing whatever
+    /// about whether a break-in was pending — so counting it as one is how a drain stops early
+    /// and hands the leftover back to `qd`. The teardown is sealed against interrupts, which is
+    /// what makes this unreachable rather than merely handled; this pins the classification so
+    /// that moving the seal cannot quietly change it.
+    #[test]
+    fn a_host_interrupt_is_not_counted_as_a_free_run() {
+        let mut drain = Drain::default();
+        drain.saw(Resumed::Freely);
+        drain.saw(Resumed::OnRequest);
+        assert!(
+            drain.resume_again(),
+            "an interrupt and a deadline are not two free runs"
+        );
+        assert_eq!(drain.free_runs, 1, "and it does not reset the count either");
+        assert_eq!(drain.delivered, 0, "nor is it a break-in delivered");
+    }
+
+    /// A target that goes during the drain ends it there. Nothing is owed by a target that is
+    /// gone, and the release has nothing left to protect.
+    #[test]
+    fn a_target_that_goes_ends_the_drain() {
+        let drain = drain_over(&[Resumed::Gone]);
+        assert_eq!(drain.spent, 1);
+        assert_eq!(drain.delivered, 0);
+    }
+
+    /// The two facts the engine contributes, read the one way round that matters: a run that lost
+    /// its target may *also* have been cut short, and which of the two happened decides whether
+    /// another resume is worth anything.
+    #[test]
+    fn a_run_that_lost_its_target_is_read_as_gone_however_it_ended() {
+        assert_eq!(Resumed::of(&ran(None, true)), Resumed::Gone);
+        assert_eq!(
+            Resumed::of(&ran(Some(Interruption::Deadline { after_ms: 500 }), true)),
+            Resumed::Gone,
+            "a deadline on a run whose target went is not evidence the target ran freely"
+        );
+        assert_eq!(
+            Resumed::of(&ran(Some(Interruption::Deadline { after_ms: 500 }), false)),
+            Resumed::Freely
+        );
+        assert_eq!(
+            Resumed::of(&ran(Some(Interruption::OnRequest), false)),
+            Resumed::OnRequest
+        );
+        assert_eq!(Resumed::of(&ran(None, false)), Resumed::OnABreak);
+    }
+
+    /// The drain runs *inside* a teardown's budget, and the shortest of those is the grace a
+    /// disconnect gives a release ([`crate::engine::SHUTDOWN_RELEASE_TIMEOUT`]) — that path ends
+    /// the session through the same [`EngineOp::EndSession`] an explicit teardown uses.
+    ///
+    /// Asserted rather than noted because both numbers are free to move and neither mentions the
+    /// other: a drain that does not leave the release room is a target released by nothing.
+    #[test]
+    fn the_drain_fits_inside_the_grace_a_disconnect_gives_a_release() {
+        assert!(
+            KERNEL_DRAIN_BUDGET * 2 <= crate::engine::SHUTDOWN_RELEASE_TIMEOUT,
+            "the drain's worst case ({KERNEL_DRAIN_BUDGET:?}) leaves under half of the \
+             disconnect grace ({:?}) for the release it precedes",
+            crate::engine::SHUTDOWN_RELEASE_TIMEOUT
         );
     }
 

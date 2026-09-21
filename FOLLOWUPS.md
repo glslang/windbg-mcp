@@ -1913,7 +1913,10 @@ callback analysis, live caller-context capture, limitations, and local evidence 
 hypervisor. The leftover is invisible in the attach's result and is spent at teardown: `qd` sends
 one `DbgKdContinue`, the pending break-in takes it, and the target stops again with no debugger
 attached. `worker::drain_pending_break_ins` now spends them before the release instead, resuming
-until two consecutive resumes run free. Measured on the one-vCPU lab: the plain attach-and-detach
+until two consecutive resumes run free. It runs on **both** teardown paths -- the `EndSession` op
+and the release a worker performs for itself when the supervisor disappears -- and the teardown is
+sealed against interrupts first, since a resume a host cut short reads exactly like one that found
+nothing pending. Measured on the one-vCPU lab: the plain attach-and-detach
 froze the guest 2 times out of 2 before, and survived 5 out of 5 after, with WinRM confirming the
 same boot and advancing uptime each time. NT is unaffected (two pool-walk cycles on a
 four-processor guest, unchanged). Stepping past the hypervisor's own `int 3` before detaching does
