@@ -1567,10 +1567,11 @@ uptime advancing and the boot identity unchanged. Three shorter detach-only cycl
 agreed on the postcondition, one of them with a 32-second window of 26 silent samples out of 30.
 The guest was still up on that same boot afterwards, with its driver running.
 
-So `qd` leaves an NT kernel executing on this build, and on four processors -- which is where the
-hypervisor's own four-processor behaviour differs (`FOLLOWUPS.md` item 93). One guest, one engine
+So `qd` leaves an NT kernel executing on this build, and on four processors. One guest, one engine
 version, one transport: it does not generalise to serial or 1394, to another DbgEng, or to a
-target that had breakpoints armed when the teardown ran.
+target that had breakpoints armed when the teardown ran -- which is the case the hypervisor's own
+four-processor runs then measured, and where a breakpoint in shared code leaves a stop owing per
+other processor (`FOLLOWUPS.md` item 93).
 
 ## The live-hypervisor tier
 
@@ -1586,11 +1587,15 @@ skips.
 - `WINDBG_MCP_SMOKE_HYPERVISOR_BREAKPOINT_HIT=1` adds the half that reads a return address off the
   stopped processor's stack, checks it is inside the `hv` image this session attached to, runs to
   it and asserts `verdict: hit` with an empty breakpoint inventory afterwards. **Opt-in on
-  purpose**: [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md) is open, and on the four-processor lab that
-  sequence was followed by further processor stops after a successful removal and a reported
-  detach, leaving the guest frozen until a separately authorised recovery connection released
-  them. One vCPU passed with independently healthy execution afterwards -- one run, not a remedy,
-  and the topology is not established as the cause.
+  purpose**, and what it is opt-in *about* was settled on 2026-09-21: that address is in code every
+  processor runs, so on four processors the hit left **three** further stops behind it, one per
+  other processor, each a first-chance `0x80000003` at the same address and delivered on a later
+  resume. `qd` has one continue to spend, so a teardown that does not drain them hands it to the
+  first and the guest stops with no debugger attached -- 2 of 4 runs froze that way, each released
+  again by one attach and one `end_session`. dbgscope's teardown now spends them, sized one resume
+  per processor, and **10 of 10** four-processor cycles came back clean with independently healthy
+  execution afterwards ([`FOLLOWUPS.md` item 93](../FOLLOWUPS.md)). It still halts somebody's
+  hypervisor, which is why it stays a deliberate act.
 
 **Run it through
 [`examples/hypervisor_detach_regression.ps1`](../examples/hypervisor_detach_regression.ps1)
@@ -1598,8 +1603,9 @@ rather than through `cargo test` directly**, because the postcondition is not th
 report: a detach that answers `released: true` is not evidence the guest is executing, which is
 exactly what the 2026-09-20 four-processor run demonstrated. The wrapper reads the guest's boot
 identity and uptime over WinRM before and twice after, fails if either moved the wrong way, and
-refuses `-BreakpointHit` on a guest reporting more than one logical processor -- checked per
-cycle, since a VM's processor count changes with a restart.
+refuses `-BreakpointHit` on a multiprocessor guest unless `-AllowMultiprocessor` is passed --
+checked per cycle, since a VM's processor count changes with a restart, and worth passing
+deliberately because a guest that does freeze needs a recovery route.
 
 ## MessageManager CTF regression
 

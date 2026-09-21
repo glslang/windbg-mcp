@@ -16056,9 +16056,10 @@ fn a_live_hypervisor_session_inspects_steps_and_detaches() {
 
         if std::env::var_os(HYPERVISOR_BREAKPOINT_HIT).is_none() {
             skip(&format!(
-                "set {HYPERVISOR_BREAKPOINT_HIT}=1 on a **one-vCPU** lab to also run the \
-                     breakpoint-hit half; FOLLOWUPS.md item 93 is open and that sequence froze \
-                     the four-processor lab on 2026-09-20"
+                "set {HYPERVISOR_BREAKPOINT_HIT}=1 to also run the breakpoint-hit half; on a \
+                     multiprocessor guest the hit leaves one stop owing per other processor, and \
+                     a teardown without the drain that spends them froze the four-processor lab \
+                     in 2 of 4 runs (FOLLOWUPS.md item 93)"
             ));
             return;
         }
@@ -16082,13 +16083,19 @@ const HYPERVISOR_BREAK_ON_CONNECT: &str = "WINDBG_MCP_SMOKE_HYPERVISOR_BREAK_ON_
 ///
 /// **This is the half of the 2026-09-20 demonstration that the tier could not carry**, and the
 /// reason it is opt-in rather than part of the run above is
-/// [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md): the same sequence on the **four-processor** lab was
-/// followed by further processor stops after a successful breakpoint removal and a reported
-/// detach, and left the guest frozen until a separately authorised recovery connection released
-/// them. One vCPU passed with independently healthy execution afterwards; that is one run, not a
-/// remedy, and nothing here establishes the topology was the cause. So the gate is a deliberate
-/// act by whoever knows what the lab is, and `examples/hypervisor_detach_regression.ps1` will not
-/// pass it to a guest reporting more than one logical processor.
+/// [`FOLLOWUPS.md` item 93](../FOLLOWUPS.md). The address below is in code **every processor
+/// runs**, so on a multiprocessor guest more than one of them reaches the patched instruction
+/// before the removal: measured on four processors 2026-09-21, this hit left three further stops
+/// behind it, one per other processor, each a first-chance `0x80000003` at this same address and
+/// delivered on a later resume — after `run_to_address` has reported `hit` and taken the
+/// breakpoint off. `qd` has one continue to spend, so a teardown that does not drain them hands
+/// it to the first and the guest stops with no debugger attached: 2 of 4 runs froze that way.
+/// dbgscope's teardown now spends them, sized per processor, and ten of ten cycles came back
+/// clean with independently healthy execution afterwards.
+///
+/// So the gate stays a deliberate act by whoever knows what the lab is — it halts somebody's
+/// hypervisor either way — and `examples/hypervisor_detach_regression.ps1` will not pass it to a
+/// multiprocessor guest without `-AllowMultiprocessor`.
 ///
 /// **The address comes off the target rather than out of this file.** The demonstration's
 /// `hv+0x312024` was a return address on the stopped processor's stack, and the image base moves
