@@ -555,3 +555,97 @@ whole session -- during which the guest was frozen for minutes at a stretch -- a
 **A dispatcher breakpoint is hypervisor-side code every processor runs, and on one processor it was
 uneventful**: no freeze, no stray stops, guest healthy afterwards. That is one vCPU. It says nothing
 about four, which is `FOLLOWUPS.md` item 93.
+
+## 2026-09-21: four processors, and the stop each of the others owes
+
+The lab guest was restarted with **four** virtual processors, which is the configuration
+`FOLLOWUPS.md` item 93 was filed on and had not been re-run against since the drain landed. Same
+guest and same images as the sections above -- NT 29671, hypervisor 29671, `hvix64.exe`, image size
+`6393856`, timestamp `3152137373`, checksum `2578329` -- and the same server, `0.19.0+g023a294a`,
+read off the binary that answered. The hypervisor's own attach report names the topology:
+`Microsoft Hypervisor Kernel Version 29671 MP (4 procs) Free x64`.
+
+### The mechanism, measured directly
+
+An `experimental_break_on_connect` attach landed at `hv+0x404a60` as always, and two bounded
+1500 ms resumes both ran to their deadline -- so **that attach shape owes no break-in**, which is
+consistent with it removing `INITIAL_BREAK` rather than arming it. The stops came back on
+processors 3 and 0, at `hv+0x404a60`, with the CTRL+BREAK banner.
+
+`[rsp]` at the stop held `hv+0x312024`, the same return site the 2026-09-20 demonstration used.
+`run_to_address` to it returned `verdict: hit`, `stopped_at` equal to the address asked for, and
+the breakpoint inventory afterwards was **empty**. The next three resumes then stopped
+**immediately**:
+
+| Resume | Ran for | Processor | Stop | Stack pointer |
+|---|---|---|---|---|
+| 1 | 2 ms | 2 | first-chance `0x80000003` at `hv+0x312024` | -- |
+| 2 | 3 ms | 3 | first-chance `0x80000003` at `hv+0x312024` | -- |
+| 3 | 1 ms | 1 | first-chance `0x80000003` at `hv+0x312024` | `0xffffe70000205be0` |
+| 4 | 1534 ms | 3 | deadline; CTRL+BREAK banner at `hv+0x404a60` | -- |
+
+Three stops, one per processor other than the one the hit was reported on, all at the breakpoint's
+own address, none carrying the CTRL+BREAK banner, and then the target ran free. The four stack
+pointers seen across the session sit 2 MiB apart -- `0xffffe70000005ad8`, `0xffffe70000205be0`,
+`0xffffe70000405830`, `0xffffe70000605828` -- so each is a different processor's stack rather than
+one processor stopping repeatedly. The reading is that the other processors reached the patched
+instruction before `run_to_address` removed it, and their break exceptions are delivered one per
+resume, **after** the tool that armed the breakpoint has reported success and taken it off. One
+processor has nobody to owe, which is why every one-vCPU run of this sequence was clean.
+
+Draining those three by hand and then ending the session left the guest healthy: same boot, uptime
+advancing 536.99 s to 539.35 s. Re-attaching afterwards found nothing owing.
+
+### What it does to a detach, and that it is a race
+
+`qd` sends one `DbgKdContinue`. A queued stop takes it and the target stops again with **no
+debugger attached**: the guest goes black while `end_session` answers `released: true`,
+`target_left_running: true`, `recovery_required: false`. Whether that happens depends on the timing
+of the delivery against the quit, so it is intermittent. **2 of 4** four-processor hit-then-detach
+runs froze the guest on this build -- one by hand, one through the tier, and two more through the
+tier with the drain deliberately backed out.
+
+Both freezes had the same signature and both were recovered **in this server**, with no reset and
+no native KD:
+
+```jsonc
+{ "profile": "<hv-profile>" }   // attach_kernel, plain -- no experimental_break_on_connect
+{ "session_id": "<hv>" }        // end_session
+```
+
+The plain attach found the target stopped at `hv+0x312024` -- the breakpoint's own address --
+with `.lastevent` reporting a first-chance `0x80000003`, on a stack region belonging to another
+processor (`0xffffe70000405830` the first time, `0xffffe70000605830` the second). `end_session`
+then released it: WinRM answered on the **same boot** each time, with uptime advancing (962.23 s
+onwards, then 1671.1 s onwards) -- the boot the guest had come up on before any of this work
+started.
+
+### The fix, and the before-and-after
+
+The drain existed and did not run. `spend_pending_break_ins` was gated on
+`ClientState::kd_initial_break_attach`, which the announcement attach clears -- so the one attach
+shape a *running* hypervisor has to be opened with was the one shape the drain skipped. And its cap
+of five attempts was three stops plus two free runs: four processors exactly, by coincidence.
+[dbgscope#175](https://github.com/glslang/dbgscope/pull/175) drops the gate, sizes the attempts
+from `GetNumberProcessors`, and bounds the wall clock with a four-second `DRAIN_BUDGET` where the
+attempt count no longer does.
+
+Measured through `examples/hypervisor_detach_regression.ps1` on the four-processor guest, each
+cycle carrying its own WinRM boot-identity and advancing-uptime check:
+
+| Drain | Cycles | Guest healthy afterwards |
+|---|---|---|
+| Backed out | 4 | 2 |
+| Present, sized per processor | 10 | 10 |
+
+The ten were two batches of five, with the backed-out runs interleaved between them on the same
+guest and the same boot, so the difference is the drain rather than the guest settling.
+
+### What this does not say
+
+One lab, one guest, one engine build, four processors. Nothing here was measured above four, so the
+one-resume-per-processor rule is what sizes the drain beyond it rather than a second measurement.
+The mechanism was read off delivery order and stack pointers; nothing instrumented the KD stub to
+show where the queued exceptions are held. And `threads` is not available on a hypervisor session
+to confirm the processor identities independently -- it fails `0x80040205` -- so the processor
+numbers here are the stop reports' own.

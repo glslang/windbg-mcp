@@ -7,10 +7,16 @@ No configuration changes, resets, or automatic recovery. Use a disposable VM.
 
 -Session runs the broader test (inspection, one step, breakpoint set and clear, detach)
 instead of the detach-only one. -BreakpointHit adds the half that runs to a return
-address off the target's own stack and hits a breakpoint there; it implies -Session and
-is REFUSED unless the guest reports exactly one logical processor, because on a
-four-processor lab that sequence left the guest frozen until a separately authorised
-recovery connection released further stops (FOLLOWUPS.md item 93).
+address off the target's own stack and hits a breakpoint there; it implies -Session.
+
+That breakpoint sits in code every processor runs, so on a guest with N processors the
+hit leaves N-1 queued break exceptions behind it - measured, one per other processor -
+and a teardown that does not spend them hands the target's one continue to the first:
+the four-processor lab froze that way in 2 of 4 runs (FOLLOWUPS.md item 93). So
+-BreakpointHit is REFUSED on a multiprocessor guest unless -AllowMultiprocessor is
+passed, which is the operator saying they know that and have a recovery route. The
+route, if it does freeze: attach_kernel with the plain shape (no break-on-connect),
+which finds the target stopped at the breakpoint's own address, then end_session.
 #>
 [CmdletBinding()]
 param(
@@ -20,7 +26,8 @@ param(
     [ValidateRange(1,10)][int]$Cycles=3,
     [switch]$ExperimentalBreakOnConnect,
     [switch]$Session,
-    [switch]$BreakpointHit
+    [switch]$BreakpointHit,
+    [switch]$AllowMultiprocessor
 )
 $ErrorActionPreference='Stop'
 Set-StrictMode -Version Latest
@@ -58,8 +65,8 @@ try {
         # Checked before every cycle and not once at the start: the guest is somebody else's
         # disposable VM and its processor count is changed by restarting it, which is exactly
         # what happened between the two 2026-09-20 demonstrations.
-        if($BreakpointHit -and $before.LogicalProcessors -ne 1) {
-            throw "-BreakpointHit refused: $ExpectedComputerName reports $($before.LogicalProcessors) logical processors. The breakpoint-hit sequence has only been seen to detach cleanly on one vCPU; on four it left the guest frozen (FOLLOWUPS.md item 93). Run without -BreakpointHit, or give the VM one processor."
+        if($BreakpointHit -and $before.LogicalProcessors -ne 1 -and -not $AllowMultiprocessor) {
+            throw "-BreakpointHit refused: $ExpectedComputerName reports $($before.LogicalProcessors) logical processors, so the hit leaves $($before.LogicalProcessors - 1) queued break exceptions behind it, one per other processor. On 2026-09-20 that left a four-processor lab frozen after a reported detach (FOLLOWUPS.md item 93). Pass -AllowMultiprocessor to run it anyway on a guest you can recover, run without -BreakpointHit, or give the VM one processor."
         }
         Write-Host "Cycle $cycle of $Cycles; profile=$Profile; guest=$ExpectedComputerName; processors=$($before.LogicalProcessors)"
         $testExit=1

@@ -1906,127 +1906,66 @@ no capability negotiation, no extension, and it works for the client item 8 meas
 ## 93. [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach
 
 Tracked in [windbg-mcp #355](https://github.com/glslang/windbg-mcp/issues/355). The
-[investigation record](./docs/hypervisor-demonstration-20260920.md) preserves the exact measured
-server and DbgEng identities, packet-event order, successful and failed recoveries, static
-callback analysis, live caller-context capture, limitations, and local evidence hashes.
+[investigation record](./docs/hypervisor-demonstration-20260920.md) preserves the 2026-09-20
+measured server and DbgEng identities, packet-event order, successful and failed recoveries,
+static callback analysis, live caller-context capture and local evidence hashes;
+[`docs/hypervisor-debugging.md`](./docs/hypervisor-debugging.md) carries the 2026-09-21 four-
+processor section this entry summarises.
 
-**The mechanism was found and fixed on 2026-09-20, for the case that could be measured.** A
-`DEBUG_ENGOPT_INITIAL_BREAK` attach leaves a pending host break-in behind it, and dbgscope's
-`absorb_initial_break_artifact` consumes exactly one -- right for NT, one short on this
-hypervisor. The leftover is invisible in the attach's result and is spent at teardown: `qd` sends
-one `DbgKdContinue`, the pending break-in takes it, and the target stops again with no debugger
-attached. dbgscope's `quit_and_detach_target` now spends them between `clear_all_breakpoints` and
-`qd`, resuming until two consecutive resumes run free
-([dbgscope#174](https://github.com/glslang/dbgscope/pull/174)). Both of this server's teardown paths
-get it by construction, since both reach it through `end_session`, and the teardown is sealed
-against interrupts as it is claimed -- a resume a host cut short reads exactly like one that found
-nothing pending. Measured on the one-vCPU lab: the plain attach-and-detach
-froze the guest 2 times out of 2 before, and survived 5 out of 5 after, with WinRM confirming the
-same boot and advancing uptime each time. NT is unaffected (two pool-walk cycles on a
-four-processor guest, unchanged). Stepping past the hypervisor's own `int 3` before detaching does
-**not** help, which is what rules out the instruction pointer as the cause.
+**The mechanism is established, and it is not about the attach.** Measured on the four-processor
+lab, 2026-09-21, server `0.19.0+g023a294a` read off the binary that answered. The demonstration's
+breakpoint site is in code **every processor runs**, so more than one of them reaches the patched
+instruction before the debugger removes it: a `run_to_address` that returned `verdict: hit` with an
+**empty** breakpoint inventory left exactly **three** further stops behind it -- processors 2, 3
+and 1 where the hit was reported on 0, each a first-chance `0x80000003` at the breakpoint's own
+address, each on that processor's own stack (the four are 2 MiB apart), delivered one per resume in
+1-3 ms, after which the target ran free. `qd` sends one `DbgKdContinue`; the first queued stop
+takes it and the target stops again with no debugger attached, which is the frozen guest reported
+as a clean release. It races the quit, so it is intermittent -- **2 of 4** hit-then-detach runs
+froze -- and one processor owes nothing, which is why every one-vCPU run was clean.
 
-**The dbgscope placement is now validated live, on one vCPU** (2026-09-21, server
-`0.19.0+g023a294a` read off the binary that answered, recorded in
-[`docs/hypervisor-debugging.md`](./docs/hypervisor-debugging.md)). That commit moved
-the drain out of this server into `quit_and_detach_target` and noted its own re-validation as
-outstanding; a session holding an NT and a hypervisor target open at once released both in the
-documented order -- hypervisor resumed first -- each answering `released: true`,
-`target_left_running: true`, `recovery_required: false`, with independent WinRM confirming the
-same boot and uptime advancing afterwards and both endpoints free. The earlier 2 of 2 / 5 of 5
-figures above were taken against the drain while it still lived in this server (`5919469`), so
-this is the first live check of where it lives now. One run, one vCPU, one engine build.
+**Recovery is one attach and one detach, in this server.** A plain `attach_kernel` (no
+`experimental_break_on_connect`) finds the target stopped at the breakpoint's own address, and
+`end_session`'s drain spends what is owed. Done twice on 2026-09-21, each time on the same boot
+with uptime advancing and no reset. That supersedes "a separately authorised native-KD connection"
+as the documented remedy for *this* freeze; the hypercall-page freeze recorded in
+`.claude/skills/live-hypervisor/SKILL.md` still has none, because nothing is left executing there
+to answer a debugger.
 
-**Same session, a second finding that constrains how the remaining half can be done.** A software
-breakpoint anywhere in NT's hypercall code page -- the stub table `nt!HvcallCodeVa` points at,
-generic entry or a dedicated per-code stub -- froze that guest twice, console black, with the
-guest's own hypervisor endpoint refusing to connect afterwards although hypervisor debugging was
-enabled for the boot, so no debugger could reach it and a reset was the only recovery. Three
-placements separate the cause: nothing armed takes its bounded break-in cleanly, breakpoints on
-the `ntoskrnl` wrappers run and hit without incident, and only the page freezes it. The surviving
-explanation is that the debugger's own trap-reporting path re-enters the page it trapped in; it
-has not been instrumented. Break on the wrappers, which carry the hypercall input value in a
-register and answer the same question -- but for a *crossing*, which value they carry matters, and
-the one they hold most often here is not one that reaches the hypervisor at all (below).
+**The fix is in dbgscope and is what this item is now waiting on.**
+[dbgscope#175](https://github.com/glslang/dbgscope/pull/175): `spend_pending_break_ins` no longer
+asks how the session was opened -- the gate on `kd_initial_break_attach` left the drain unrun on
+exactly the announcement attach every hypervisor run here uses -- and its attempt count comes from
+`GetNumberProcessors` plus the two free runs rather than a fixed five, which was three stops plus
+two free runs and so fitted four processors by coincidence. `DRAIN_BUDGET` bounds the wall clock at
+four seconds where the count no longer does. Validated on the four-processor lab through
+`examples/hypervisor_detach_regression.ps1`, whose `-BreakpointHit` gate is now
+`-AllowMultiprocessor` rather than a refusal: **10 of 10** cycles clean, each with an independent
+WinRM boot-identity and advancing-uptime check, against 2 of 4 freezing with the drain backed out
+on the same guest and the same boot.
 
-**What remains open:** the four-processor lab specifically. That guest is now configured with one
-processor, so the case this item was filed for -- an actual temporary breakpoint hit followed by
-further *per-processor* stops after removal and reported detach -- has not been re-run against the
-fix. The drain consumes up to five break-ins, which is more than one processor can owe, but
-whether four processors owe one each is unmeasured. Re-running it needs the owner's topology
-change, not more investigation here. The original observation stands as recorded: Delivery order does not determine whether those exceptions were raised before or after
-resume. The breakpoint site is in a recurring callback and is reachable even when its native
-debug-break check is false; a hypercall-resume origin has not been established. Neither a fixed
-number of continues nor explicit per-processor resumes is a validated remedy.
+**What closes it:** dbgscope#175 merged, the `rev` pin moved here with `cargo update -p dbgscope`,
+and one four-processor run against *that* build -- the ten above were taken against a local
+`[patch]`, which is not what this repository will ship. Nothing else is outstanding: the earlier
+closing conditions (a portable bounded reproducer, each post-breakpoint stop's processor-specific
+context, the one-versus-four comparison, the cause, and repeated four-vCPU validation with
+independent health) are met above and in the doc section.
 
-**Why deferred:** the guest has recovered without rebooting, but the mechanism and dependable
-post-breakpoint teardown remain unproven. After the owner changed the disposable VM to one vCPU,
-the [one-vCPU demonstration](./docs/hypervisor-demonstration-single-vcpu-20260920.md) passed one
-breakpoint-hit/detach run with independently healthy same-boot execution. This does not close
-the multiprocessor investigation. No host-wide security/scheduler change is part of this follow-up.
+**Why it is still open rather than moved:** the fix is in review in the other repository, so this
+repository's shipped behaviour is unchanged until the pin moves.
 
-**What closes it:** preserve a portable bounded reproducer; obtain each post-breakpoint stop's
-caller/exception context with correct processor-specific memory context; compare one and four
-vCPUs with controlled breakpoint placement and stepping; establish the cause; and, if warranted,
-validate an engine-thread implementation with repeated four-vCPU breakpoint-hit/detach runs
-and independent same-boot guest health. A passing one-vCPU run alone does not close the item.
+**Picks up at:** `Cargo.toml`'s `dbgscope` `rev`, then
+`examples/hypervisor_detach_regression.ps1 -Cycles 5 -Session -BreakpointHit
+-ExperimentalBreakOnConnect -AllowMultiprocessor` against the four-processor lab.
 
-**The hypercall correlation is done on one vCPU, and what it leaves behind is this item's own
-half.** Measured 2026-09-21 and recorded in
-[`docs/hypervisor-debugging.md`](./docs/hypervisor-debugging.md). The dispatch chain came out of
-the saved image -- `hv+0x25F460` the exit handler, `hv+0x25F9D4` its VMCALL case, `hv+0x21AFF0`,
-`hv+0x210520` the dispatcher, and `hv+0x21056D` where the input value sits in `rbx` -- and three
-landmarks were read byte-for-byte off the live target before anything was armed. One hypercall was
-then seen from both ends: NT parked at `nt!HvcallInitiateHypercall` holding input value `0x10068`,
-released, and the hypervisor stopping **714 ms** later with all fifteen general-purpose registers
-that array carries agreeing -- it does not carry `rsp` --
-`rbp` NT's own stack pointer less seven pushes less `0x27`, `rsi` NT's `rsi` with exactly its low
-byte cleared, `rdi`/`r13`/`r10`/`r11` untouched. Those transformed values are not *unique* -- the
-same thread calling again at the same stack depth would reproduce them -- so what makes it one
-instance is the ordering: NT parked at that call, released, and this the first hypercall matching
-it.
-
-**That breakpoint is hypervisor-side code every processor runs, and on one processor it was
-uneventful** -- no freeze, no stray stops, both sessions answering `released: true`,
-`target_left_running: true`, `recovery_required: false`, and independent WinRM confirming the same
-boot with uptime advancing afterwards, on a guest that had been frozen for minutes at a stretch.
-One run, one vCPU. It says nothing about four, which is what this item still is.
-
-**Two things that run fell out of, both worth having before a four-processor attempt.** A
-conditional breakpoint whose expression dereferences memory **can fault, and a faulting condition
-stops the hypervisor** -- which freezes the guest and ends the run having learned nothing; it cost
-two runs, and taking the VP pointer from `@rcx` rather than a fixed address did not save it. Break
-where the value is already in a register. And an **unconditional** hypervisor breakpoint on a
-hypercall site **deadlocks the NT session**: every hypercall stops the world, so NT never
-accumulates the execution it needs to take its KD resume packet off the NIC and stays parked
-however many times the hypervisor is continued -- twelve stop/resume cycles delivered not one
-resume. The conditional form, auto-continuing with `j (cond) ''; 'gc'`, had NT running within a
-second.
-
-**One thing that run did not settle.** `0x8001005D` -- bit 31 set, and the value both of this
-guest's unconditional `HvcallInitiateHypercall` captures held, with excluding it costing 9.6 s to
-reach a second value where the first had come in 7 ms -- never reached the dispatcher in 60 s of
-free running, while that other value from the same wrapper reached it in 714 ms. That does not separate
-"never delivered to this hypervisor" from "answered by `hv+0x247850` before the dispatcher", and
-nothing was instrumented to tell them apart. This lab's guest is itself nested, which makes a
-hypercall aimed at the parent a plausible reading and not a measured one.
-
-**Picks up at:** the investigation's live/static follow-up sections and #355's checklist. **The
-reproducer half is no longer the temporary local runner**: since 2026-09-20 the hypervisor tier's
-`a_live_hypervisor_session_inspects_steps_and_detaches` carries the breakpoint-hit sequence behind
-`WINDBG_MCP_SMOKE_HYPERVISOR_BREAKPOINT_HIT`, and `examples/hypervisor_detach_regression.ps1`
-drives it with the independent WinRM health checks and refuses that gate on a guest reporting more
-than one logical processor. That is a shipped way to *repeat* the one-vCPU run, not evidence about
-four, and it re-measures nothing recorded here. What is still open is everything above it: the
-cause, the controlled one-vs-four comparison, and the four-vCPU validation. Keep this distinct from
+**Two things measured alongside it, neither of which this item is about.** A conditional breakpoint
+whose expression dereferences memory can fault, and a faulting condition stops the hypervisor; and
+an *unconditional* hypervisor breakpoint on a hypercall site deadlocks the NT session, because
+every hypercall stops the world and NT never accumulates enough execution to take its KD resume
+packet off the NIC. Both are in the skill. Keep this item distinct from
 [dbgscope #173](https://github.com/glslang/dbgscope/issues/173)'s shared live-kernel `qd`
-validation -- which now has its NT half: on 2026-09-20 five attach/detach cycles against a
-disposable four-processor NT guest left it executing on the same boot every time, two of them
-holding it unreachable for close to two minutes, with the frozen window measured from outside the
-debugger rather than inferred
-([`docs/smoke-test.md`](./docs/smoke-test.md), `examples/kernel_detach_regression.ps1`). That says
-nothing about the hypervisor case below it --
-and [WinDbg-Feedback #396](https://github.com/microsoft/WinDbg-Feedback/issues/396)'s unconnected
+validation -- whose NT half is in [`docs/smoke-test.md`](./docs/smoke-test.md) -- and from
+[WinDbg-Feedback #396](https://github.com/microsoft/WinDbg-Feedback/issues/396)'s unconnected
 KDNET EXIT-interrupt cancellation report.
 
 ## 94. [windbg-mcp] Disabling a breakpoint has no typed tool
