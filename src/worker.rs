@@ -905,9 +905,38 @@ fn running() -> std::sync::MutexGuard<'static, Running> {
 /// told this worker is usable is never then told there is no handle.
 static INTERRUPT: OnceLock<InterruptHandle> = OnceLock::new();
 
-/// [`Running::claim`] on this process's one tracker.
-fn claim(id: u64) {
-    running().claim(id);
+/// [`Running::claim`] on this process's one tracker, **sealing in the same breath** when the op is
+/// one no break may reach.
+///
+/// The two are one operation rather than two calls because the gap between them is reachable: an
+/// interrupt arriving after the claim and before a seal taken inside the op finds an interruptible
+/// job, raises a break, and binds itself to a job that is about to become uninterruptible. The
+/// seal then consumes the break — so the target is protected — while the caller has been told the
+/// teardown is stopping and `Running::interrupted` still names it, which `release` turns into a
+/// *completed* teardown reported as a result cut short. Raised as a review finding on
+/// [#361](https://github.com/glslang/windbg-mcp/pull/361). Under the one lock there is no gap:
+/// [`interrupt_running`] takes it too, so a break is either raised before the claim — binding to
+/// nothing, since no job was claimed — or refused with the [`Interrupted::Sealed`] answer that was
+/// promised.
+fn claim(e: &DebugEngine, id: u64, cleanup: Option<Cleanup>) {
+    let mut running = running();
+    running.claim(id);
+    if let Some(cleanup) = cleanup {
+        seal_locked(&mut running, e, id, cleanup);
+    }
+}
+
+/// Which cleanup an op has to be sealed for **before it starts**, if any.
+///
+/// A [`crate::batch`] is not here and must not be: its rollback is a *phase* it enters partway
+/// through, and sealing a batch at the claim would make its steps uninterruptible, which is the
+/// whole of what `interrupt` on a batch is for. A teardown has no such phase — every part of it is
+/// cleanup — so it is the one op that can be sealed at the door.
+fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
+    match op {
+        EngineOp::EndSession => Some(Cleanup::Teardown),
+        _ => None,
+    }
 }
 
 /// [`Running::interrupt_pending`] on this process's one tracker.
@@ -937,10 +966,15 @@ fn claim_pump(id: u64) -> Result<(), PumpRefused> {
 ///
 /// Both under the one lock, which is what makes it a boundary rather than a hope: a raise takes the
 /// same lock, so every break is either lodged before this — and drained here, before the first
-/// cleanup command runs — or refused after it. Called by a batch as it enters its `always` block,
-/// and by the teardown before it touches the target.
+/// cleanup command runs — or refused after it. Called by a batch as it enters its `always` block;
+/// a teardown is sealed by [`claim`] instead, having no phase to enter.
 fn seal_against_interrupts(e: &DebugEngine, id: u64, cleanup: Cleanup) {
-    let mut running = running();
+    seal_locked(&mut running(), e, id, cleanup);
+}
+
+/// [`seal_against_interrupts`] for a caller that already holds the lock — which [`claim`] does,
+/// that being the point of it.
+fn seal_locked(running: &mut Running, e: &DebugEngine, id: u64, cleanup: Cleanup) {
     running.seal(id, cleanup);
     // Under the lock deliberately: a break raised between the seal and the drain would survive
     // both and land on the first restore command.
@@ -1424,8 +1458,9 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         let kernel_attach = matches!(request.op, EngineOp::AttachKernel { .. });
         let ending_kernel = matches!(request.op, EngineOp::EndSession);
         // Claimed around the whole op, so an interrupt arriving while it runs names *this* job.
-        // Outside the `catch_unwind` below, so a panicking op gives the claim back too.
-        claim(id);
+        // Outside the `catch_unwind` below, so a panicking op gives the claim back too. A teardown
+        // is also sealed here rather than inside itself — see [`claim`] for the window that closes.
+        claim(&engine, id, sealed_as(&request.op));
         // A panic inside a dbgscope method (several use `.expect`) must not kill the session —
         // surface it as an error for this one op. The engine survives, so this stays a
         // debugger-level failure the model can work around by trying something else.
@@ -2426,17 +2461,17 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
             // session. Naming no tool, per `FOLLOWUPS.md` item 43: this is built in the worker,
             // which has never heard of the client's surface.
             let detaching = e.attached_to_a_live_process();
-            // Closed to breaks before anything here touches the target, and for the reason the
-            // rollback is: what follows is cleanup, and every part of it is a thing that must not
-            // stop halfway. The drain below is the sharp case — a resume cut short by a host's
-            // interrupt is indistinguishable from one that found nothing pending, so without this
-            // a client interrupting its own `end_session` could end the drain early and hand the
-            // leftover break-in straight back to `qd`. Raised as a review finding on
+            // This op reaches here already closed to breaks, sealed by [`claim`] before its first
+            // statement ran — for the reason the rollback is sealed, and with the drain below as
+            // the sharp case: a resume cut short by a host's interrupt is indistinguishable from
+            // one that found nothing pending, so a client interrupting its own `end_session` could
+            // otherwise end the drain early and hand the leftover break-in straight back to `qd`.
+            // Raised as a review finding on
             // [#361](https://github.com/glslang/windbg-mcp/pull/361), where the proposed remedy
-            // was to read that interrupt out of the drain's result; sealing is the same fix one
-            // step earlier, and leaves no window between the two. The engine's own watchdog is
-            // untouched by it, so each resume is still bounded.
-            seal_against_interrupts(e, id, Cleanup::Teardown);
+            // was to read that interrupt out of the drain's result; sealing is the same fix two
+            // steps earlier, and leaves no window at all. The engine's own watchdog is untouched
+            // by it, so each resume is still bounded.
+            //
             // **Spend the leftover break-in here, where it costs a bounded resume, rather than
             // letting `qd` spend it on the target's only continue.** See [`INITIAL_BREAK_ATTACH`]
             // for what leaves one and how it was measured.
@@ -13201,6 +13236,37 @@ mod tests {
         assert!(!running.release(7), "no interrupt was ever raised for it");
         running.claim(8);
         assert_eq!(running.sealed(8), None, "the next job starts interruptible");
+    }
+
+    /// **A teardown is sealed at the door and nothing else is.**
+    ///
+    /// Sealing it inside its own arm left a window — the claim, then a statement or two, then the
+    /// seal — in which an interrupt still found an interruptible job: the break it raised was
+    /// consumed by the seal that followed, so the target was protected, while its caller had been
+    /// told the teardown was stopping and `Running::interrupted` still named a teardown that went
+    /// on to succeed, which `release` turns into a completed result reported as cut short.
+    ///
+    /// A batch is deliberately not here. Its rollback is a phase it enters partway through, so
+    /// sealing it at the claim would make its steps uninterruptible — which is the whole of what
+    /// `interrupt` on a batch is for.
+    #[test]
+    fn a_teardown_is_the_only_op_sealed_before_it_starts() {
+        assert_eq!(
+            sealed_as(&EngineOp::EndSession),
+            Some(Cleanup::Teardown),
+            "a teardown that is not sealed by its claim has a window where it is not sealed at all"
+        );
+        assert_eq!(
+            sealed_as(&EngineOp::Batch(BatchOp {
+                steps: Vec::new(),
+                always: Vec::new(),
+                budget_ms: 0,
+                patience_ms: 0,
+            })),
+            None,
+            "a batch seals itself when it reaches its rollback, and must run its steps interruptible"
+        );
+        assert_eq!(sealed_as(&EngineOp::PreserveKernel), None);
     }
 
     /// The seal carries **which** cleanup, because the refusal a caller reads has to be true of
