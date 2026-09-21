@@ -541,8 +541,13 @@ is that this build's own `0x5C`/`0x5D` branch requires that bit set, so it does 
 
 ### Teardown and guest health
 
-Breakpoints cleared on both sides, then the documented order: hypervisor resumed, NT `end_session`,
-hypervisor `end_session`. Each answered `released: true`, `target_left_running: true`,
+**The two clears interleave with the resume and cannot be done in one pass.** The hypervisor's
+breakpoint comes off while it is halted at the crossing; the hypervisor is resumed; and only then
+can NT's come off -- NT is stopped at that point, but a breakpoint write to it still travels over a
+transport NT services only while the guest executes, which is the trap above. Saying "both sides
+cleared, then the hypervisor resumed" describes a sequence that blocks. Then the documented order:
+NT `end_session`, hypervisor `end_session`. Each answered `released: true`,
+`target_left_running: true`,
 `recovery_required: false`. Independent WinRM twice afterwards: boot identity unchanged across the
 whole session -- during which the guest was frozen for minutes at a stretch -- and uptime advancing
 5479.30 s to 5483.69 s. Both KD ports free, no worker process left.
