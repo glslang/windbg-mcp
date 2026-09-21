@@ -1946,7 +1946,8 @@ placements separate the cause: nothing armed takes its bounded break-in cleanly,
 the `ntoskrnl` wrappers run and hit without incident, and only the page freezes it. The surviving
 explanation is that the debugger's own trap-reporting path re-enters the page it trapped in; it
 has not been instrumented. Break on the wrappers, which carry the hypercall input value in a
-register and answer the same question.
+register and answer the same question -- but for a *crossing*, which value they carry matters, and
+the one they hold most often here is not one that reaches the hypervisor at all (below).
 
 **What remains open:** the four-processor lab specifically. That guest is now configured with one
 processor, so the case this item was filed for -- an actual temporary breakpoint hit followed by
@@ -1977,7 +1978,8 @@ the saved image -- `hv+0x25F460` the exit handler, `hv+0x25F9D4` its VMCALL case
 `hv+0x210520` the dispatcher, and `hv+0x21056D` where the input value sits in `rbx` -- and three
 landmarks were read byte-for-byte off the live target before anything was armed. One hypercall was
 then seen from both ends: NT parked at `nt!HvcallInitiateHypercall` holding input value `0x10068`,
-released, and the hypervisor stopping **714 ms** later with all fifteen guest registers agreeing --
+released, and the hypervisor stopping **714 ms** later with all fifteen general-purpose registers
+that array carries agreeing -- it does not carry `rsp` --
 `rbp` NT's own stack pointer less seven pushes less `0x27`, `rsi` NT's `rsi` with exactly its low
 byte cleared, `rdi`/`r13`/`r10`/`r11` untouched. Those two transformed values identify the
 *instance*, not merely the value.
