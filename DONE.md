@@ -4191,7 +4191,7 @@ mode this item is about reproduced one level up"*, and proposed deciding between
 and a typed role on those grounds. The premise was wrong: `worker::kernel_target` already derives
 `nt` against `hv` from the engine's primary module on every open, so the role is the one claim here
 that **is** checkable. `server::role_disagreement` holds the two together and reports a mismatch in
-the session's `limitation`, in both halves of the result. So the choice was not note-or-role but
+that profile's own record, in both halves of the result. So the choice was not note-or-role but
 both, with the line between them stated: `role` is checked, `guest` and `note` are the operator's
 word and nothing can check them -- no debugger question asks two endpoints whether they are the
 same machine.
@@ -4292,7 +4292,17 @@ operator's own text, had already been retained. A connection is remembered when 
 in `Entry::of`, whatever later becomes of the entry; that is the correct rule on its own terms,
 since being handed a secret in an entry that was then discarded is still being handed one.
 
-**Six rounds, five of them on mechanisms the previous round had just added.** Every round that
+**A sixth round found the warning said twice, which is what three homes for one fact buys.** The
+disagreement was appended to the report, put in `summary.limitation`, *and* — once the withdrawal
+landed — carried in `ignored`, which the text renders: so a mismatched attach returned the same
+multi-sentence paragraph twice. Both of the older two went. `limitation` is the wrong field for it
+anyway, and that was easier to see with one home than three: it is what a session **cannot do** —
+a 32-bit target with no SOS, a hypervisor where NT inspection does not apply — and a mislabelled
+profile limits nothing, since the session can do whatever its real target allows. Mixing the two
+was worst in exactly the case this check exists for, where the worker's own hypervisor limitation
+already occupies that field.
+
+**Seven rounds, six of them on mechanisms the previous round had just added.** Every round that
 ended a strand changed a *representation* rather than a behaviour: `Option` to an absorbing
 `Claim`, per-field scrubbing to scrubbing at the render boundary, secret registration moved from
 admission to the read, and two renderings of a claim collapsed to one. Every round that patched a

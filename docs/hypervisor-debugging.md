@@ -55,8 +55,8 @@ what settles it. What the record beats is reading the pairing off the names, whi
 ```
 
 `role` is the half this server checks: the attach derives the same fact from its primary module
-(`nt` or `hv`), and a profile that claims one and reaches the other is reported in the session's
-`limitation`. `guest` is checked by nothing — no debugger question asks two endpoints whether they
+(`nt` or `hv`), and a profile that claims one and reaches the other has that claim withdrawn, with
+the reason reported beside it. `guest` is checked by nothing — no debugger question asks two endpoints whether they
 are the same machine — so it is worth writing down precisely because it cannot be recovered later.
 See [kernel profiles](kernel-profiles.md#saying-what-an-endpoint-reaches).
 

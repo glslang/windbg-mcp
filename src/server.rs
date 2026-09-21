@@ -2278,23 +2278,25 @@ impl WindbgServer {
             Ok(OpenReport {
                 id,
                 mut report,
-                mut summary,
+                summary,
             }) => {
                 let mut profile = profile;
-                // Both halves again, for the reason below: the worker already appended its own
-                // limitation to the text it built, so a line added to the field alone would be a
-                // warning the text readers never get.
+                // **Withdrawn from the session, and reported from there** — one home rather than
+                // three. It was appended to the report here as well, and put in
+                // `summary.limitation`, both of which predate `ignored` carrying it: the direct
+                // append then became a second copy of the same paragraph in one result, since
+                // `profile_lines` renders the withdrawal's reason below (Codex, PR #367).
+                //
+                // `limitation` is not the right home for it either, which is clearer now there is
+                // one: that field is what this session *cannot do* — a 32-bit target with no SOS,
+                // a hypervisor where NT inspection does not apply — and a mislabelled profile
+                // limits nothing. The session can do whatever its real target allows; what is
+                // wrong is the configuration, which is what `ignored` is for. Mixing them was
+                // worst in exactly the case this check exists for, where the worker's own
+                // hypervisor limitation is already in that field.
                 if let Some(disagreement) = role_disagreement(profile.as_ref(), &summary) {
-                    summary.limitation = Some(match summary.limitation.take() {
-                        Some(existing) => format!("{existing}\n{disagreement}"),
-                        None => disagreement.clone(),
-                    });
-                    report = format!("{report}\n{disagreement}");
-                    // **And withdrawn from the session**, not only reported here. `session_status`
-                    // reads the session, possibly on a later turn or from another client, and
-                    // would otherwise keep advertising the role the target just contradicted.
                     if let Some(session) = self.sessions.held(&id) {
-                        session.withdraw_profile_claim(disagreement.clone());
+                        session.withdraw_profile_claim(disagreement);
                     }
                     profile = self.sessions.held(&id).and_then(|s| s.profile());
                 }
@@ -6699,6 +6701,14 @@ mod tests {
 
         // Nothing to say is nothing said, which is every opener but `attach_kernel`.
         assert!(profile_lines(None).is_none());
+
+        // **Once, not twice.** The disagreement used to be appended to the report here *and*
+        // carried in `ignored`, which `profile_lines` renders — so a mismatched attach returned
+        // the same multi-sentence paragraph twice (Codex, PR #367). One home, one rendering.
+        let reason = "The profile \"lab-nt\" says this endpoint reaches a hypervisor (`hv`)";
+        let once = profile_lines(Some(&carrying(None, vec![reason.to_string()])))
+            .expect("the withdrawal is worth saying");
+        assert_eq!(once.matches(reason).count(), 1, "{once}");
 
         // And `session_status`'s text carries it, which is the other half a client may be reading.
         let mut snap = snapshot(
