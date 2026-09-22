@@ -97,6 +97,29 @@ what it always did. What they change is what a caller can see before and after a
   not something it reads — and a structured-aware client forwards `structuredContent` and drops the
   text.
 
+### An older server reading a described file
+
+**The compatibility runs one way.** A file written before this feature works unchanged here; a file
+written *for* it is refused **whole** by a server built before it. That parser required every value
+to be a string, so one object-valued entry fails the read of the file and takes the entries that
+are still plain strings with it. Measured on 2026-09-22 against `0.19.0+gb22a2583`: given a file of
+three profiles, one of them a bare string, it answered `No profiles are configured on this host.`
+and named only the first entry it had choked on.
+
+**The window is narrow and worth stating exactly**, because it is easy to make this sound worse
+than it is. A server reads this file at all only from **v0.6.0**, where profiles arrived, and
+understands the described form from the release *after* **v0.19.0**, where it landed — so the
+servers that refuse a described file are the ones in between. Anything older ignores the file
+entirely and cannot be affected by what is in it: the plugin snapshot installed on this bench is
+one of those, and answers `attach_kernel {}` with *missing field `connection`* because profiles did
+not exist in it.
+
+So this bites one arrangement: **two servers in that version range on one machine, sharing the
+file** — a current checkout beside a v0.6.0–v0.19.0 install, both reading
+`%USERPROFILE%\.windbg-mcp\profiles.json`. Describe the profiles once every server reading that
+file has this, or keep the described file away from the older one: `WINDBG_MCP_PROFILES` names the
+file per process. The window closes on its own at the next release.
+
 ### What is checked, and what is only claimed
 
 `role` is **checked**. An attach derives the same fact from the engine's primary module (`nt` or
