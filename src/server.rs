@@ -2296,9 +2296,15 @@ impl WindbgServer {
                 // hypervisor limitation is already in that field.
                 if let Some(disagreement) = role_disagreement(profile.as_ref(), &summary) {
                     if let Some(session) = self.sessions.held(&id) {
-                        session.withdraw_profile_claim(disagreement);
+                        session.withdraw_profile_claim(disagreement.clone());
                     }
-                    profile = self.sessions.held(&id).and_then(|s| s.profile());
+                    // Corrected **here as well, rather than read back** from the session. A
+                    // successful open runs `reconcile_capacity` before it returns, so a
+                    // concurrent one can reclaim this now-idle session and a later trim can drop
+                    // it — and a second lookup that then answered `None` would take `guest`,
+                    // `note` and `ignored` out of this result along with the role it meant to
+                    // withdraw (CodeRabbit, PR #367). One correction, applied to both copies.
+                    profile = profile.map(|facts| kdconn::contradicted(&facts, disagreement));
                 }
                 // Rendered **after** the withdrawal above, for the reason [`profile_lines`]
                 // gives: the text and the typed facts have to say the same thing, so the text is
