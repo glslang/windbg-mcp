@@ -363,6 +363,15 @@ in [dbgscope #173](https://github.com/glslang/dbgscope/issues/173).
 - Saved `sk-29671-static/hv-disasm.txt`:
   `DD72301A9F16394604F8D72FCB2D6CAD65027EC90EE5F7A01B41238BE0657D45`.
 
-These are SHA-256 hashes of the saved local evidence at this checkpoint. The temporary runner is
-`target/hypervisor-demo-run.ps1` in the debugger workspace; it contains lab-specific wiring and
-is not a portable or committed example.
+These are SHA-256 hashes of the saved local evidence at this checkpoint. That evidence is held on
+the bench, **outside this repository and outside its build output** — the hashes are how a copy is
+checked, not a way to find one, and no path here resolves to them.
+
+**The runner that drove this day is uncommitted on purpose, and the reason is worth stating rather
+than implying.** It validates the profile's *connection string* literally and hard-codes the
+guest's address, so it embeds this lab's debug key: it cannot be committed to a public repository
+without being rewritten, and rewriting it would not reproduce the runs recorded above. What
+supersedes it **is** committed — `examples/hypervisor_detach_regression.ps1`, driving the
+hypervisor smoke tier, which repeats the attach/inspect/step/detach sequence and the breakpoint
+hit with independent WinRM health checks either side. Use that to repeat any of this; the runner
+is a record of how the day was driven rather than a thing to re-run.
