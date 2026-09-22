@@ -1938,7 +1938,10 @@ does not reach.
   read registers/modules, set a breakpoint.
 - **Typed user Segment Heap** — from a sibling `dbgscope` checkout, run
   `cargo run --example user_heap_smoke`. The helper launches an x64 child that retains known
-  LFH/VS/backend/large allocations, reloads the exact `ntdll` PDB, verifies each pointer and
+  LFH/VS/backend/large allocations, reloads the exact `ntdll` PDB, and checks that the heap the
+  child created is among the listed roots. It is listed only because roots come from `ntdll`'s
+  heap list: on current Windows the PEB names the process heap alone (`FOLLOWUPS.md` item 79).
+  It then verifies each pointer and
   backend, writes a temporary `/ma` full-memory dump, reopens it, and repeats the checks. Set
   `WIN_KEXP_USER_HEAP_SYMBOLS` (or `_NT_SYMBOL_PATH`) when the default Microsoft symbol-store path
   is not appropriate. Missing private types are a failed prerequisite; export symbols must not be

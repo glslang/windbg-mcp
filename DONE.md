@@ -115,6 +115,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 85](#85-windbg-mcp-the-arm64-second-opinion-exists-and-has-never-been-diffed--done-2026-09-20) — [windbg-mcp] The ARM64 second opinion exists and has never been diffed — done (2026-09-20)
 - [Item 93](#93-windbg-mcp--dbgscope-multiprocessor-hypervisor-stops-after-a-temporary-breakpoint-and-detach--done-2026-09-21) — [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach — done (2026-09-21)
 - [Item 95](#95-windbg-mcp-a-connection-profile-carries-a-name-and-a-string-and-nothing-about-the-target--done-2026-09-21) — [windbg-mcp] A connection profile carries a name and a string, and nothing about the target — done (2026-09-21)
+- [Item 79](#79-dbgscope-a-heap-outside-the-pebs-processheaps-is-invisible-to-the-heap-tools--done-2026-09-22-dbgscope176) — [dbgscope] A heap outside the PEB's `ProcessHeaps` is invisible to the heap tools — done (2026-09-22, dbgscope#176)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4351,3 +4352,125 @@ one way, and a server between **v0.6.0** (where profiles arrived) and **v0.19.0*
 described file **whole**, plain-string entries included. Older than that it does not read the file
 at all -- the plugin snapshot on this bench answers `attach_kernel {}` with *missing field
 `connection`* -- so that range is the whole exposure, and it closes at the next release.
+
+## 79. [dbgscope] A heap outside the PEB's `ProcessHeaps` is invisible to the heap tools — **done** (2026-09-22, dbgscope#176)
+
+**Repo:** `dbgscope` ([#176](https://github.com/glslang/dbgscope/pull/176)) and, through it,
+`windbg-mcp`. Surfaced by `windbg-mcp`'s heap tools.
+
+As filed:
+
+
+`walk_user_segment_heaps` enumerates roots from `_PEB.NumberOfHeaps` / `ProcessHeaps`, and on
+Windows 26200 that array does not list every heap the debugger can see. Measured on `RuntimeBroker`
+(2026-09-15): `NumberOfHeaps` is **1**, `ProcessHeaps[0]` is the segment heap at `0x19a88000000`,
+and `!heap -s` reports **four** segment heaps at `0x19a88000000`, `…400000`, `…600000` and
+`…800000`. The walk of the listed root is healthy — 8,878 chunks, 3,698 allocated — so this is a
+*root discovery* gap rather than a decode one.
+
+**It is not a bad read of the PEB**, which was the first thing checked: `cmd.exe` stopped at its
+initial breakpoint reports `NumberOfHeaps` 1 and genuinely has one heap at that point, so the
+field and its offset are right.
+
+**How it was found.** Running `dbgscope`'s own `examples/user_heap_smoke` after item 78 (2026-09-15).
+It now gets past the layout refusal and fails one step later: its child calls
+`HeapCreate(HEAP_CREATE_SEGMENT_HEAP)`, prints the handle, and the walker lists **one** root — the
+process default heap, `kind: Nt` — with the created heap absent from `ProcessHeaps` entirely. So the
+example cannot reach the Segment Heap it exists to verify, live or over its dump, and the crate's
+one end-to-end user-mode heap check is standing down on every current build.
+`_NO_DEBUG_HEAP=1` changes nothing, so the debugger's debug heap is not the cause.
+
+- **Why deferred:** the severity is not yet known and the measurement that settles it is the work.
+  If the three unlisted heaps are **heap-manager-internal**, `ProcessHeaps` is the correct answer
+  for application heaps and what needs fixing is the example's premise plus a sentence in the tool
+  descriptions. If any of them is **app-visible** — and a `HeapCreate` return value missing from
+  `ProcessHeaps` suggests at least one is — then `heap_list` under-reports on current Windows while
+  saying it listed every root, which is the failure mode this repo has already been bitten by once
+  (a walk that rejected every segment reporting an empty pool rather than an error).
+- **It does not block a release, and the reasoning is worth keeping.** PEB-based enumeration is
+  what every release has shipped, and the tools report `coverage` and name the heaps they walked
+  rather than claiming completeness. What changed in item 78 is only that the layout now resolves,
+  so the tools return a partial answer where they previously returned an error — which is why this
+  became visible then rather than being introduced then.
+- **What would close it:** establish where `!heap -s` gets its segment-heap table — `ntdll`'s own
+  heap-manager globals rather than the PEB — and whether an entry there is app-visible. Then either
+  enumerate from that source beside the PEB, or state the boundary in `heap_list`'s description and
+  fix `user_heap_smoke` to verify a heap it can actually reach. Either way the answer has to say
+  *how many roots it could not see*, not merely how many it walked.
+
+**Where it picks up.** `walk_user_segment_heaps` in `dbgscope`'s `src/pool/snapshot.rs` and the PEB
+read feeding it, `examples/user_heap_smoke.rs`, and `heap_list`'s description in
+`windbg-mcp`'s `src/server.rs`.
+
+
+**What it measured (2026-09-22).** The deferral hung on one question: are the unlisted heaps
+heap-manager-internal, or app-visible? They are app-visible, and that follows from the code rather
+than from a sample. `ntdll!RtlpProcessHeapsInsert` was disassembled on ARM64 26100.1 (live) and on
+x64 26200 (from `docs/samples/stale-throw-abort.dmp`). On both builds it does the same things:
+
+- allocates a 0x30-byte entry from the process heap and stores the heap at +0x10;
+- links the entry onto a `LIST_ENTRY` in `ntdll`'s data;
+- stores the entry's address in the heap's `UserContext` (`_SEGMENT_HEAP` +0x38, `_HEAP` +0x188
+  on ARM64);
+- writes `NumberOfHeaps = 1; ProcessHeaps[0] = heap`, but **only while the process has no heap
+  yet**.
+
+`RtlGetProcessHeaps` calls `RtlpEnumProcessHeaps`, and that walks the list. So on these builds the
+PEB array holds one entry and never grows, while `GetProcessHeaps` returns heaps it never names.
+
+The live check used `user_heap_smoke`'s own child on the debugger guest. `NumberOfHeaps` was 1, and
+the list held three heaps: the process heap, an NT heap, and the child's `HeapCreate` return value.
+The repo's two x64 26200 user dumps carry `ntdll`'s data but no heap pages. In both, the list head
+links two different entries while `NumberOfHeaps` is 1.
+
+**What the entry got wrong.**
+
+- It sent the search to "`ntdll`'s own heap-manager globals". The table is not there, and it is not
+  a Segment Heap table. It is a process heap list that holds heaps of **both** kinds (the child's
+  NT heap is on it). Its head is `ntdll!RtlpProcessHeaps` on 26200, a symbol the public PDB for ARM64
+  26100.1 does not carry. What made the list reachable on both builds is the heap's end of the link,
+  `UserContext`, which both PDBs type.
+- It framed the close as finding where `!heap -s` gets its table. `!heap` was never measured. The
+  service's engine bundle ships no `exts.dll`, and the SDK's would not load into it (`0n126`). What
+  settled app-visibility is `GetProcessHeaps`'s own code. That is the stronger answer anyway: it
+  defines what an application's heaps are, and `!heap` is one more reader of them.
+- It named `walk_user_segment_heaps` as the enumerator. Roots were enumerated by `enumerate_roots`
+  in `src/heap.rs`. `walk_user_segment_heaps` only walks the roots it is handed.
+- It said the answer has to say *how many* roots it could not see. That number does not exist: a
+  list has no count until it has been walked, so where the walk breaks, how many entries lie beyond
+  the break is unknowable. What the answer carries instead is whether enumeration saw every root. A
+  broken list makes the walk `partial`, with a diagnostic naming the entry. `scope_for` also stops
+  refusing a heap selector as unsupported when it may simply have been unseen.
+
+**What landed** ([dbgscope#176](https://github.com/glslang/dbgscope/pull/176)). Roots come from that
+list, in its order. It is reached through the process heap's typed `UserContext` rather than the
+head's symbol, since only one build has the symbol. The entry has no public type, so +0x10 is a
+measured offset. What makes reading it safe is the check made on every entry:
+
+- the entry's heap names the entry back;
+- the entry's `Blink` is the entry before it, and the ring closes on the first entry;
+- exactly one entry, the head, lies inside `ntdll`.
+
+Anything that fails a check ends the walk as unseen. A build whose process heap names no entry
+keeps no list, and gets the PEB answer exactly as before. `UserContext` is resolved for the
+**user** schema only. The kernel's `_SEGMENT_HEAP` carries it too, and reading it there would move
+every pool fingerprint, including the two item 78 pinned. Here, `heap_list`'s description and text
+header stop saying "PEB", and the shipped skill tells an agent why `NumberOfHeaps` 1 beside three
+listed roots is not a disagreement.
+
+**What it did not do.** The x64 gate stays. The live ARM64 check ran with the gate relaxed in an
+uncommitted copy. The root listing was right, and the walk that followed was not: a 0x4000
+allocation decoded as VS where x64 decodes it as Segment, and VS free-tree pointers came back as
+unreadable addresses. That is ARM64 backend decoding, which is what the gate is for. The entry's
+word at +0x18 has a bit 0 that `RtlpEnumProcessHeaps` uses to hide a heap from `GetProcessHeaps`;
+such heaps are listed like any other, and none was seen. No build that predates the list is
+reachable from this bench, so the fallback is covered by a unit test on the pre-change path and
+not by a measurement.
+
+**Verified.** In dbgscope, 46 heap and layout tests passed, 9 of them new. The enumeration tests
+run against a byte-level double laid out with the measured process's own addresses. The full lib
+suite on the guest passed 414 of 414. Seven mutations were run: skipping the list, dropping the
+back-reference, `Blink` or single-head check, dropping the unseen diagnostic from the walk, letting
+`saw_every_root` ignore it, and letting the kernel schema read the user field. Each failed the test
+written for it. Live on ARM64 with the gate relaxed, `heap::list` returned the process heap, the NT
+heap and the created heap `0x149d8400000`, against `NumberOfHeaps` 1.

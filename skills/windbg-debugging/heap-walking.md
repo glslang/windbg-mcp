@@ -46,12 +46,18 @@ validated VS family. An unfamiliar or ambiguous family is intentionally refused.
 
 ## User heap workflow
 
-Start with `heap_list`. It lists every PEB heap root and separates:
+Start with `heap_list`. It lists every heap root in the process and separates:
 
 - supported Segment Heaps that were walked;
 - classic NT heaps, which v1 lists but skips;
 - unknown roots; and
 - roots whose signatures could not be read.
+
+The roots come from `ntdll`'s process heap list, which is what `GetProcessHeaps` returns. They do
+not come from the PEB. On current Windows the PEB's `ProcessHeaps` names the process heap alone, so
+`dt ntdll!_PEB @$peb NumberOfHeaps` answering 1 beside several listed roots is expected and is not
+a disagreement. If that list cannot be followed, the walk is `partial` and a diagnostic names where
+it stopped. Any heap past that point is unknown, not absent.
 
 Then use:
 
@@ -65,7 +71,7 @@ Then use:
 User results report allocation `capacity`. `requested_size` is present only when the selected PDB
 schema validates exact unused-byte metadata; absence means unknown, not equal to capacity. Reuse
 the cached snapshot while stopped, refresh after execution, and inspect all three result guards:
-`layout` (what decoded it), `scope` (which PEB heaps were included or skipped), and `walk` (whether
+`layout` (what decoded it), `scope` (which heaps were included or skipped), and `walk` (whether
 coverage was complete).
 
 ## V1 boundary

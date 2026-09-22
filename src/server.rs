@@ -2895,7 +2895,7 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
-    /// List every heap root in the current process PEB. Segment Heaps are marked supported;
+    /// List every heap root in the current process. Segment Heaps are marked supported;
     /// classic NT heaps are listed but deliberately excluded from v1 coverage and should be
     /// inspected with `!heap`. Requires a stopped x64 live target or sufficiently complete dump
     /// and matching `ntdll` PDB type information.
