@@ -5580,8 +5580,8 @@ impl rmcp::ServerHandler for WindbgServer {
     /// is the whole of `FOLLOWUPS.md` item 40. Everything else here is what the macro would have
     /// built, including the `name`, which left to the default reads `rmcp` at the SDK's version
     /// because `Implementation::from_build_env()` resolves its `env!`s inside rmcp.
-    fn get_info(&self) -> rmcp::model::ServerInfo {
-        rmcp::model::ServerInfo::new(
+    fn get_info(&self) -> rmcp::model::ServerConfig {
+        rmcp::model::ServerConfig::new(
             rmcp::model::ServerCapabilities::builder()
                 .enable_tools()
                 .build(),

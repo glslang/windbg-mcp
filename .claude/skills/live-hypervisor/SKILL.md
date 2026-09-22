@@ -323,22 +323,27 @@ nobody waited still has its stop there, and on a kernel target the report names 
    (`0x005D`) and bit 16 is the *fast* flag, with the input parameter in `rdx`. Naming the call
    code needs the TLFS; the register is the measurement.
 
-   **That value does not cross, and you will keep landing on it.** Both unconditional captures of
-   this wrapper held `0x8001005D`, and it never reached the hypervisor's dispatcher in 60 s of free
-   running, while the next value out of the same wrapper reached it in 714 ms. Bit 31 marks a
-   hypercall for the parent hypervisor and this lab's guest is itself nested, which is a plausible
-   reading and not a measured one — nothing separates "never delivered here" from "answered by
-   `hv+0x247850` before the dispatcher". Re-arm NT to skip it, and then **resume NT again**,
-   because `bc`/`bp` only change what is armed and leave NT halted where it was:
+   **A value with bit 31 set does not cross, and that is the class to exclude rather than the
+   value.** `0x8001005D` was what both unconditional captures held on 2026-09-21, and it never
+   reached the hypervisor's dispatcher in 60 s of free running while the next value out of the same
+   wrapper reached it in 714 ms. The first capture on 2026-09-22 was **`0x8000005C`** — a different
+   call code, the same bit 31 — so an exclusion written as `@rcx != 0x8001005d` parks on the next
+   one of these instead. Mask it:
 
    ```text
-   bc *; bp nt!HvcallInitiateHypercall "j (@rcx != 0x8001005d) ''; 'gc'"
+   bc *; bp nt!HvcallInitiateHypercall "j ((@rcx & 0x80000000) == 0) ''; 'gc'"
    ```
 
-   Excluding it cost 9.6 s to reach a second value where the first hit had come in 7 ms. That
-   stopped on `rcx = 0x00010068` — call code `0x68`, fast bit, `rdx = 0`. **That** is the value
-   step 5 arms for, and record `rsp`, `rsi`, `rdi` and `r13` with it: they are what identify the
-   instance at the other end.
+   Then **resume NT again**, because `bc`/`bp` only change what is armed and leave NT halted where
+   it was. That reached `rcx = 0x00010068` — call code `0x68`, fast bit, `rdx = 0` — in 8.5 s
+   (excluding one value by equality took 9.6 s the day before, where the first hit had come in
+   7 ms). **That** is the value step 5 arms for, and record `rsp`, `rsi`, `rdi` and `r13` with it:
+   they are what identify the instance at the other end.
+
+   Bit 31 marks a hypercall for the parent hypervisor and this lab's guest is itself nested, which
+   is a plausible reading of *why* and not a measured one — nothing separates "never delivered
+   here" from "answered by `hv+0x247850` before the dispatcher". What is measured is that these do
+   not arrive at the dispatcher and that the guest keeps making them.
 4. **Attach the hypervisor while NT sits there.** This works — it is how the asymmetry above was
    measured — and the summary comes back `kernel_target: "hypervisor"` with `hv`/`hvix64.exe` and
    `symbols: none`. Both sessions are then open, independently routed, and both targets halted.
@@ -409,6 +414,15 @@ memory over a transport NT services only when it is executing, so with the hyper
 block like any other uncached read. Resume the hypervisor, edit NT's breakpoints, then park NT
 again.
 
+**NT's transport reports itself lost across a long hypervisor hold, and recovers on its own.**
+Measured on four processors: with the hypervisor halted through the crossing, the NT session's
+output carried `... Retry sending the same data packet for 64 times.` and then *"The transport
+connection between host kernel debugger and target Windows seems lost. please try resync with
+target, recycle the host debugger, or reboot the target Windows."* **Do none of those.** The
+machine is frozen rather than gone: resume the hypervisor and NT resynchronises by itself — it
+answered `vertarget` with a fresh debug session time immediately afterwards and detached cleanly.
+The session's own run reported `running_for_ms: 38974` for a run that spent most of that frozen.
+
 **A bounded run that expires can leave a break-in owing**, and the next resume spends it: an
 immediate stop at `hv+0x404a60` with the CTRL+BREAK banner and nothing armed. It is harmless, and
 it reads like a breakpoint hit if you are not expecting it. Tell it from a queued per-processor
@@ -425,15 +439,20 @@ safe — an extra one is another bounded run to interpret, not a stop consumed.
 
 ## Teardown
 
-1. **Resume the hypervisor** and leave it attached.
+1. **Resume the hypervisor** and leave it attached — with a bound that outlasts the rest of this
+   list. A `continue_async` whose `max_run_ms` expires puts the guest back on the floor, and the
+   next step is then asking a frozen kernel to detach itself. Twenty seconds was not enough on
+   2026-09-22 and the hypervisor had to be resumed a second time; check `session_status` rather
+   than assuming the run is still going.
 2. **`end_session` the NT session** — it resumes and actively detaches a live kernel, and needs a
    machine that can execute to do it.
 3. **`end_session` the hypervisor session.**
 4. **Read guest health from outside the debugger**, twice, for boot identity and advancing uptime.
 
-That order was measured with both sessions open and both targets halted: each answered
-`released: true`, `target_left_running: true`, `recovery_required: false`, independent WinRM then
-gave the same boot with uptime advancing, and both KD ports were free with no worker left.
+That order was measured with both sessions open and both targets halted, on one vCPU and again on
+four: each answered `released: true`, `target_left_running: true`, `recovery_required: false`,
+independent WinRM then gave the same boot with uptime advancing, and both KD ports were free with
+no worker left.
 
 **What the teardown does.** dbgscope's `quit_and_detach_target` clears the breakpoints, **spends
 the stops the target still owes, and only then sends `qd`**. Two things leave one owing: a
@@ -485,7 +504,8 @@ measurements quoted here.
 hypervisor and NT both 29671. **The topology differs by section, and it matters.** The hypercall
 work — the enumeration, the wrappers, the crossing, the dispatch landmarks, the hypercall-page
 freeze — was measured on that guest with **one** vCPU; the stop-per-processor rule, its detach
-and its recovery on the **four** it was rebuilt with, 2026-09-21. The asymmetry between the two
-sessions, and the two-session teardown order, are one-vCPU measurements that have not been re-run
-on four — nothing suggests they move, and nothing has checked. Nothing here generalises to another
-DbgEng, another transport, a processor count above four, or a guest with child partitions running.
+and its recovery on the **four** it was rebuilt with, 2026-09-21. The asymmetry, the crossing and
+the two-session teardown were then **re-run on four** on 2026-09-22 and came out the same, with two
+additions: the crossing kept its processor (NT parked on 1, the hypervisor stopping on 1), and it
+took 1131 ms where one vCPU took 714 ms. Nothing here generalises to another DbgEng, another
+transport, a processor count above four, or a guest with child partitions running.

@@ -7,7 +7,7 @@
 ## Build, Test, and Development Commands
 
 - `cargo fmt --all --check`: verify Rust formatting as CI does.
-- `cargo clippy --all-targets`: run lint checks for library, binary, and tests.
+- `cargo clippy --all-targets -- -D warnings`: run lint checks for library, binary, and tests, as CI does — a warning fails the build there.
 - `cargo test`: run the unit tests, including parser and tool-schema coverage in `src/server.rs` and `src/ttd.rs`.
 - `cargo build --release`: build the Windows release binary at `target/release/windbg-mcp.exe`.
 

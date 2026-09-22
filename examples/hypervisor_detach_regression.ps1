@@ -46,6 +46,18 @@ function Read-GuestHealth {
     if($health.Name -ne $ExpectedComputerName){throw 'Guest identity mismatch; do not attach'}
     return $health
 }
+# How far the guest's reported boot time may move between two readings and still be the same boot.
+#
+# It is not a constant of the guest: `LastBootUpTime` is derived, and a clock synchronisation moves
+# it. Measured on this lab, 333 microseconds of drift across ten hours with no reboot -- which an
+# equality test reads as "the guest rebooted" and reports against a detach that worked. Two seconds
+# is chosen because no reboot can fit inside it: a guest that has restarted cannot answer WinRM for
+# tens of seconds afterwards, and its new boot time is a whole uptime away from the old one. So the
+# tolerance separates the two cases completely rather than trading one error for the other.
+$script:BootDriftTicks=20000000
+function Test-SameBoot([long]$first,[long]$second){
+    return ([math]::Abs($first-$second) -le $script:BootDriftTicks)
+}
 # -BreakpointHit is the wider test plus its own opt-in, so asking for it asks for -Session too.
 if($BreakpointHit){$Session=$true}
 $previousProfile=$env:WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE
@@ -82,7 +94,8 @@ try {
                 $after=Read-GuestHealth
                 Start-Sleep -Seconds 2
                 $later=Read-GuestHealth
-                if($before.BootTicks -ne $after.BootTicks -or $after.BootTicks -ne $later.BootTicks) {
+                if(-not (Test-SameBoot $before.BootTicks $after.BootTicks) -or
+                   -not (Test-SameBoot $after.BootTicks $later.BootTicks)) {
                     throw 'The guest rebooted; this is not a successful detach'
                 }
                 if($later.UptimeSeconds -le $after.UptimeSeconds) {

@@ -79,7 +79,8 @@ and check a worker's console; and `tokio` appears twice, the second a dev-depend
 `test-util` for `src/progress.rs`'s heartbeat assertions. Delete either dev entry and `cargo build`
 stays green while the test targets stop compiling.
 
-So the check is this repo's own gate — `cargo test` and `cargo clippy --all-targets` — and a
+So the check is this repo's own gate — `cargo test` and `cargo clippy --all-targets -- -D warnings`
+(the flag is CI's, so run it here or a local pass will miss what the job fails on) — and a
 dependency behind an optional feature needs that feature turned on as well, since no target in the
 default set reaches it. `--all-targets` is what compiles the examples and `tests/`; it is the
 minimum, and it is what the `windows-core` experiment above was run with.
