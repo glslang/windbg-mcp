@@ -4356,7 +4356,7 @@ at all -- the plugin snapshot on this bench answers `attach_kernel {}` with *mis
 ## 79. [dbgscope] A heap outside the PEB's `ProcessHeaps` is invisible to the heap tools — **done** (2026-09-22, dbgscope#176)
 
 **Repo:** `dbgscope` ([#176](https://github.com/glslang/dbgscope/pull/176)) and, through it,
-`windbg-mcp`. Surfaced by `windbg-mcp`'s heap tools.
+`windbg-mcp` ([#373](https://github.com/glslang/windbg-mcp/pull/373)). Surfaced by `windbg-mcp`'s heap tools.
 
 As filed:
 
