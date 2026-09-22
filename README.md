@@ -122,7 +122,7 @@ Sixty-three tools in eight `--tools` groups; the rows below split some of those 
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 
-All of them are served unless you say otherwise, and the definitions cost the model **94,879 bytes —
+All of them are served unless you say otherwise, and the definitions cost the model **94,875 bytes —
 about 24k tokens — before it has asked anything** (measured 2026-09-20). `--tools
 session,inspect,crash` cuts that to 33,187 B for twenty-three tools, and a `--listen` client can be
 given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`

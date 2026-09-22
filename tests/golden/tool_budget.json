@@ -263,12 +263,12 @@
     },
     {
       "annotations": 119,
-      "description": 306,
+      "description": 302,
       "inputSchema": 465,
-      "modelVisible": 821,
+      "modelVisible": 817,
       "name": "heap_list",
       "outputSchema": 5159,
-      "wire": 6130
+      "wire": 6126
     },
     {
       "annotations": 120,
@@ -570,14 +570,14 @@
   ],
   "totals": {
     "annotations": 6672,
-    "description": 36540,
+    "description": 36536,
     "inputSchema": 55021,
     "instructions": 2003,
-    "modelVisible": 94879,
+    "modelVisible": 94875,
     "outputSchema": 162108,
-    "payload": 265446,
+    "payload": 265442,
     "tools": 63,
-    "wire": 265372,
+    "wire": 265368,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

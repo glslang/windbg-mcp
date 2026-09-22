@@ -288,7 +288,7 @@ spec. Re-read them rather than trusting this table, which has been stale before.
 
 | | bytes | ≈tokens |
 |---|---|---|
-| The tool surface, paid once per conversation | 94,879 (63 tools) | ~24k |
+| The tool surface, paid once per conversation | 94,875 (63 tools) | ~24k |
 | — the same surface as `--tools session,inspect,crash` | 33,187 (23 tools) | ~8k |
 | — as `--tools crash` | 19,943 (13 tools) | ~5k |
 | Its worst single tool (`debug_batch`) | 10,021 | ~2.5k |
@@ -465,7 +465,7 @@ client-side.**
 
 - **The tool-surface profile is `--tools`** (2026-08-22). Start the listener with
   `--tools session,inspect,crash` and the surface is 23 tools and 33,187 B instead of 63 and
-  94,879 — `--tools crash` is 13 and 19,943 B, which is the difference between "roughly twice an 8k
+  94,875 — `--tools crash` is 13 and 19,943 B, which is the difference between "roughly twice an 8k
   window" and "half of one" (re-measured 2026-09-20; it was 20 tools and 25,465 B against 51 and
   68,893 when the flag landed, and every one of those figures moves with the surface). The tools
   that remain are the tools they were, less the sentences pointing at ones that went (item 41).
