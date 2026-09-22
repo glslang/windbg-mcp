@@ -348,7 +348,8 @@ and new coexist.
 
 For a compile/behavior check without touching the locked release exe, use the **dev profile**
 (writes `target/debug`, which the registered release server never holds): `cargo test` and
-`cargo clippy --all-targets`. The release
+`cargo clippy --all-targets -- -D warnings`, which is what CI runs — without the flag a local run
+passes over the warning the job will fail on. The release
 build differs only in optimization and is exercised by CI on a fresh runner.
 
 The dev exe can be locked too — by a worker left running from a driver script or a killed tier —

@@ -682,3 +682,78 @@ The mechanism was read off delivery order and stack pointers; nothing instrument
 show where the queued exceptions are held. And `threads` is not available on a hypervisor session
 to confirm the processor identities independently -- it fails `0x80040205` -- so the processor
 numbers here are the stop reports' own.
+
+## 2026-09-22: both sessions at once, on four processors
+
+The two-session work -- the asymmetry, the hypercall crossing and the ordered teardown -- had only
+ever been done on the one-vCPU configuration. Re-run here on the **four**-processor guest, against
+the registered stdio server `0.19.0+gb22a2583` (dbgscope `192e3486`, the sized drain), on the same
+boot the guest had been up on for ten hours.
+
+### Two sessions, independently routed
+
+`attach_kernel { "profile": "<nt>" }` answered `kernel_target: "windows"`,
+`Windows 10 Kernel Version 29671 MP (4 procs)`, `nt` with `symbols: "pdb"`.
+`attach_kernel { "profile": "<hv>", "experimental_break_on_connect": true }` answered
+`kernel_target: "hypervisor"`, `MP (4 procs)`, `symbols: "none"`. One `session_status` then listed
+both as `state: open`, `live: true`, on **separate engine pids** (10340 and 6316) -- one worker
+process each, as the design says, with no interaction inside the server.
+
+Both profiles on this host are bare connection strings, so those two identities are the *engine's*
+answer about each target rather than a `role` read back from configuration -- worth saying now that
+a profile can declare one (item 95, `docs/kernel-profiles.md`), because a reader meeting both
+features at once cannot otherwise tell which of them produced the words above.
+
+**The hypervisor attach was made while NT was halted at a breakpoint**, and it connected and broke
+in. So an NT break does not stop the hypervisor on four processors either.
+
+### The crossing, and it keeps its processor
+
+NT was parked at `nt!HvcallInitiateHypercall` holding input value `0x00010068` -- call code `0x68`,
+fast bit -- on **processor 1**. Lodging NT's resume, then resuming the hypervisor, then waiting on
+the hypervisor stopped it at `hv+0x21056D` after **1131 ms** (the one-vCPU run: 714 ms) with
+`rbx = 0x10068`, on **processor 1 as well**. That correspondence is new: with one processor there
+was nothing to correspond.
+
+The guest register array at `rcx = 0xffffe70000207080` carries every relationship the one-vCPU run
+measured, unchanged:
+
+| Offset | Value | Against NT's capture |
+|---|---|---|
+| `+0x08`, `+0x18` | `0x0000000000010068` | the input value, twice |
+| `+0x28` | `0xffff93d2cc53f6d9` | NT's `rsp` `0xffff93d2cc53f738` less seven pushes (`0x38`) less `0x27` |
+| `+0x30` | `0xfffff805b3759200` | NT's `rsi` `0xfffff805b37592d0` with exactly its low byte cleared |
+| `+0x38` | `0xffffdc39399ead30` | NT's `rdi`, untouched |
+| `+0x50` | `0xfffff805c44f3490` | NT's `r10`, untouched -- the wrapper's own address |
+| `+0x58` | `0x0000000040000010` | NT's `r11`, untouched |
+| `+0x68` | `0xffffdc3936613a60` | NT's `r13`, untouched |
+
+It does not carry `rsp`, as before.
+
+### Two things this run adds
+
+**Excluding the non-crossing value needs a mask, not a literal.** The 2026-09-21 run met
+`0x8001005D` twice and skipped it by equality. The first capture today was `0x8000005C` -- a
+different code, the same bit 31 -- so a `@rcx != 0x8001005d` condition would have parked on it.
+`j ((@rcx & 0x80000000) == 0) ''; 'gc'` reached a crossing value in 8.5 s.
+
+**NT's KD transport reports itself lost while the hypervisor holds the world, and recovers.** With
+the hypervisor halted across the crossing, the NT session's output carried
+`... Retry sending the same data packet for 64 times.` followed by *"The transport connection
+between host kernel debugger and target Windows seems lost. please try resync with target, recycle
+the host debugger, or reboot the target Windows."* None of those remedies is right here: the
+session resynchronised by itself once the hypervisor ran, answered `vertarget` with a fresh debug
+session time and advancing uptime, and detached cleanly. The lodged resume reported
+`running_for_ms: 38974` for a run that was frozen for most of it.
+
+### Teardown
+
+The documented order, both targets held: resume the hypervisor, `end_session` NT, `end_session` the
+hypervisor. Each answered `released: true`, `target_left_running: true`, `recovery_required: false`.
+Independent WinRM twice afterwards: boot identity unchanged and uptime advancing, 38858.8 s to
+38861.1 s. Both KD endpoints free, no worker process left, and the server's session list empty.
+
+**A bounded hypervisor run that expires freezes the guest until the next resume**, which is the one
+thing to watch in this sequence: the 20-second bound used between the crossing and the teardown ran
+out, and NT then had no machine to execute on until the hypervisor was resumed again. `end_session`
+on NT before that would have been asking a frozen kernel to detach.

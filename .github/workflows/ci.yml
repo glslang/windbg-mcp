@@ -46,8 +46,14 @@ jobs:
       - name: Format check
         run: cargo fmt --all --check
 
+      # `-D warnings` makes a warning a red build, which is the point and is also the cost: the
+      # toolchain above is `stable`, so a lint added by a future release can fail this job with no
+      # change on this side. That is the trade taken deliberately -- a warning nobody is forced to
+      # read is a warning that accumulates, and this repo had two (a deprecated `rmcp` alias) sitting
+      # in every run until the gate went in. When a new release does fail it, fix the lint or
+      # `#[allow]` it with a reason at the site; do not weaken the flag.
       - name: Clippy
-        run: cargo clippy --all-targets
+        run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
         run: cargo build --release
