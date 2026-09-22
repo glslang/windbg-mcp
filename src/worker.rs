@@ -6236,7 +6236,7 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
         HeapOp::List { refresh } => {
             let answer = heap_query::list(e, walk(refresh)).map_err(heap_failure)?;
             let mut text = format!(
-                "{} PEB heap(s); {}\n\nindex  address             kind        supported\n",
+                "{} heap root(s); {}\n\nindex  address             kind        supported\n",
                 answer.found.len(),
                 heap_walk_text(&answer.walk)
             );

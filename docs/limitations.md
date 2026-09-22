@@ -165,8 +165,12 @@
   `Unreadable` is the walk's own limit (a Verifier guard page reads that way) and says nothing
   about whether the allocator freed anything. `pool_chunk` also
   reports the **neighbouring** chunks, which is what tells you what a reclaim would land next to. `pool_diagnostics` returns the walk's own diagnostics filtered by substring: a real walk emits tens of thousands across a hundred-plus categories, so any per-call summary truncates and the one line explaining a specific heap is never in the truncated head — filter by a heap address or a phrase to reach it.
-- The **user Segment Heap** tools share that typed decoder but discover roots through the current
-  process's PDB-resolved `_PEB.NumberOfHeaps` and `ProcessHeaps`. They require a stopped x64 user
+- The **user Segment Heap** tools share that typed decoder. They discover roots by following
+  `ntdll`'s process heap list, which is what `GetProcessHeaps` walks. They reach it through the
+  process heap's PDB-typed `UserContext`, and check every entry against the heap it names. They do
+  not trust the PEB for this. On current Windows `_PEB.ProcessHeaps` names the process heap alone,
+  and it is the answer only on a build that keeps no list. A list that cannot be followed makes the
+  walk `partial`, with a diagnostic naming where it stopped. They require a stopped x64 user
   target (or a dump with sufficient memory) and the exact loaded `ntdll` PDB. `heap_list` reports
   every root and explicitly separates Segment Heaps walked from classic NT, unknown, and unreadable
   heaps skipped. V1 does not decode classic NT heaps, WOW64, or ARM64; use `!heap` for classic heaps.
