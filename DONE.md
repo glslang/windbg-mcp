@@ -4332,3 +4332,22 @@ refusals and the listing), `src/structured.rs` (`ProfileFacts`, `KernelTarget::l
 `src/server.rs` (`opened_as` and `role_disagreement`), and
 [`docs/kernel-profiles.md`](./docs/kernel-profiles.md), with the agent-facing half in
 `skills/windbg-debugging/`.
+
+**Exercised end to end on the hypervisor lab, 2026-09-22**, against `0.19.0+g1a7f504e` with the
+bench's own `lab-nt`/`lab-hypervisor` pair described for the first time. Six of the claims above
+were measured rather than read: the listing names the pair
+(`ctf-vm; lab-hypervisor (hypervisor, guest "lab"); lab-nt (windows, guest "lab", "root
+partition")`, the undescribed profile rendering bare); an open carries the `profile` object and the
+`profile says:` line while the label keeps only the name and the redacted connection; a
+`session_status` row carries both; a **wrong** `role` is withdrawn -- gone from the facts, its
+reason in `ignored`, in the report, the structured half *and* the later status row, with
+`kernel_target` untouched and the session still open; two spellings disagreeing about `guest` drop
+that field and keep the agreed `role` and the one-sided `note`; and a malformed entry costs itself
+alone -- a numeric value skipped the profile, `role: "banana"` and a 201-character note each cost
+their field with the profile still listed and dialable. The object form through
+`WINDBG_MCP_PROFILE_<NAME>` parses and renders the same. **The one thing that run added** is in
+`docs/kernel-profiles.md` under *An older server reading a described file*: the compatibility runs
+one way, and a server between **v0.6.0** (where profiles arrived) and **v0.19.0** refuses a
+described file **whole**, plain-string entries included. Older than that it does not read the file
+at all -- the plugin snapshot on this bench answers `attach_kernel {}` with *missing field
+`connection`* -- so that range is the whole exposure, and it closes at the next release.
