@@ -53,10 +53,10 @@ Start with `heap_list`. It lists every heap root in the process and separates:
 - unknown roots; and
 - roots whose signatures could not be read.
 
-The roots come from `ntdll`'s process heap list, which is what `GetProcessHeaps` returns. They do
-not come from the PEB. On current Windows the PEB's `ProcessHeaps` names the process heap alone, so
-`dt ntdll!_PEB @$peb NumberOfHeaps` answering 1 beside several listed roots is expected and is not
-a disagreement. If that list cannot be followed, the walk is `partial` and a diagnostic names where
+The roots come from `ntdll`'s process heap list, which is what `GetProcessHeaps` returns. The PEB
+is only the fallback, for a build that keeps no such list. On current Windows the PEB's
+`ProcessHeaps` names the process heap alone, so `dt ntdll!_PEB @$peb NumberOfHeaps` answering 1
+beside several listed roots is expected and is not a disagreement. If that list cannot be followed, the walk is `partial` and a diagnostic names where
 it stopped. Any heap past that point is unknown, not absent.
 
 Then use:
