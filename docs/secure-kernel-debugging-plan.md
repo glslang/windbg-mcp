@@ -2,6 +2,63 @@
 
 ## Handoff status
 
+- **First EXDI attempts; one reset this workspace, 2026-09-23:** the `Kd=` option set is now read
+  out of `dbgeng.dll` 10.0.29617.1000: **six** kernel-discovery modes, of which
+  **`Kd=VerAddr:<addr>`** takes an arbitrary `KdVersionBlock` address (parsed, range-checked,
+  `E_INVALIDARG` on a bad one). That is the mechanism a Secure Kernel bind would use, and it is the
+  finding worth keeping. **The `sk!KdVersionBlock` record reported in the entry below is weaker
+  than that entry claimed**: mapping `.pdata` and classifying every function that touches its table
+  found the readers reached only from EXDI-referencing functions, no KD-transport caller among 91
+  such strings, and the `hv`-vs-`sk` selector at RVA `0x42EDE0` with **no callers and its address
+  never taken**. So a hypervisor KD session cannot be steered to `sk`, and the record may be
+  vestigial; the strong reading is corrected in place. **Registration of the EXDI COM server is a
+  real prerequisite** — a plain elevated `kd -kx` with the CLSID absent returns
+  `0x80040154 Class not registered` and registers nothing, so the earlier claim that the engine
+  self-registers was wrong. **And `Inproc=`, which looks like the way to avoid registering, hung
+  this host hard enough to need a reset**; DbgEng warns about exactly that before it happens, the
+  60-second kill on the child did not save the machine, and a job object is the bound a retry
+  needs. Nothing was left registered, no target was touched, and no BCD or host setting changed.
+  For the rig: `ExdiGdbSrv.dll` ships in the WinDbg package, `EXDI_GDBSRV_XML_CONFIG_FILE` points
+  the engine at a private config, and the preconfigured **`VMWare`** target is a better x64
+  starting point than `QEMU` (already `X64`, 40 registers rather than 66). This workspace cannot
+  host the target — it is a Hyper-V guest with Hyper-V disabled and 10.3 GB free, and **Hyper-V
+  exposes no gdbstub** in any case, so a Hyper-V guest cannot substitute for QEMU or VMware. The
+  user elected to set up a VMware VM separately. Working detail is in
+  [`docs/exdi-stub-plan.md`](exdi-stub-plan.md); measurements in the
+  [transport experiments](secure-kernel-debugging-validation.md#exdi-transport-experiments-and-the-host-reset-2026-09-23).
+- **Dispatch identified and the EXDI prerequisite corrected, 2026-09-22:** an offline pass
+  re-derived the stub finding from the retained samples and reproduced the recorded break-request
+  RVAs in five of the six matrix images; the 29671 image is no longer on this workspace, so its
+  row is carried over rather than re-measured. **No `IumpDebugBreakRequestedByVtl1` exists in any
+  of the eight images inspected in this pass**, and the absence is structural rather than a gap to
+  find in another build: the routine is the handler for **secure call `0x124`**, reached from
+  `IumInvokeSecureService` and `IumpInvokeLimitedModeSecureService`, which are the only direct
+  branches to it a cross-reference scan of the executable sections finds. A `…ByVtl1` counterpart
+  would have no caller, because VTL1 asking itself to break is not a secure call. That scan reads
+  direct branches and data references, so it does not exclude an indirect path, and 29671 was not
+  re-checked. The body is identical-COMDAT-folded with three unrelated routines, so **a breakpoint
+  on that address is ambiguous across four callers** — relevant before anyone arms one live. Of
+  the eleven `Kd`-prefixed symbols in each of the six post-26100 images, none is a function; the
+  two pre-26100 samples have no `Kd`-prefixed symbol at all. Against that,
+  `SkdInitDebuggerDataBlock` populates the debugger data block in full, so SK ships the metadata a
+  debugger keys off and no transport to deliver it. For Phase 4 this corrects step 2 below:
+  `ExdiGdbSrv.dll` and `exdiConfigData.xml` ship **inside the installed WinDbg package**, so the
+  EXDI adaptation layer needs no separate distribution and a backend implements a **GDB stub
+  rather than a COM server**, which is what removes the LiveCloudKd dependency. Registration
+  remains host setup exactly as that step says — the CLSID in the shipped DLL
+  (`{29f9906e-9dbe-4d4b-b0fb-6acf7fb6d014}`) is absent from this workspace's `HKLM` and `HKCU`
+  class registrations. `DEBUG_ATTACH_EXDI_DRIVER` is reachable with the features dbgscope already
+  enables. *If EXDI is required* below stands, with one correction applied to it: its claim that
+  `EngineOp::AttachKernel` carries only `connection` had gone stale, and the second field it now
+  carries is precedent for that section’s own advice. One gap it still does not name is that
+  `Connection::endpoint` returns `Endpoint::Unknown` for every non-`net:` prefix, which
+  `Endpoint::conflicts` treats as conflicting with **every** other kernel endpoint, so
+  `Sessions::admit` would refuse an EXDI attach alongside any live kernel session and refuse
+  every later one alongside it. That is over-conservative rather than permissive, and it
+  breaks the two-session NT-plus-hypervisor workflow already in use here. **Whether DbgEng's EXDI path can be pointed
+  at `securekernel` rather than `nt` is still unproven and decides the design.** No live attach,
+  reboot, BCD change, host change, EXDI installation or registration followed. See the
+  [dispatch and EXDI reassessment](secure-kernel-debugging-validation.md#secure-call-dispatch-of-the-debug-break-request-and-exdi-reassessment-2026-09-22).
 - **Publication and host boundary, 2026-09-19:** the user rules out configuration changes
   on the hardened outer host. The next lab direction is a separate nested lab, not a
   scheduler change on that host. Provisioning and capacity remain pending; do not start
@@ -333,12 +390,16 @@ verbatim error text.
 
 ## Phase 4: EXDI fallback
 
-Entered only by a gate decision from Phase 1 or Phase 3.
+Entered only by a gate decision from Phase 1 or Phase 3. **The working detail for this phase is
+[`docs/exdi-stub-plan.md`](exdi-stub-plan.md)**, which carries the staged gates, the stub’s wire
+contract and the integration edits; the steps below remain the summary.
 
 1. Restore the guest to the Phase 2 checkpoint.
-2. Install the separate **EXDI live debugger** distribution and register its EXDI COM server. This
-   registration is host setup: the MCP server cannot perform it, and no code change removes the
-   requirement.
+2. Register an EXDI COM server. **A separate distribution is not required for the GDB-server
+   route**: `ExdiGdbSrv.dll` and `exdiConfigData.xml` ship inside the installed WinDbg package
+   (measured 2026-09-22), and a backend then implements a GDB stub rather than a COM server.
+   Registration is still host setup: the MCP server cannot perform it, and no code change
+   removes the requirement. The shipped CLSID is not registered on this workspace.
 3. Follow the published configuration: fixed guest memory, one vCPU for the first experiment, Secure
    Kernel scanning enabled, and matching symbols. Keep nested virtualization disabled on the target
    guest where the published Hyper-V recipe calls for that, and note the conflict with Phase 2 step
@@ -382,8 +443,10 @@ Add an optional **`transport: "kdnet" | "exdi"`** argument to `attach_kernel`, d
   heap or pool allocator backend such as LFH, VS, Segment or Large. "kernel" would also be a poor
   label for one arm, since EXDI is kernel debugging too.
 - **Prefer a field on the existing op over a new variant.** `EngineOp::AttachKernel`
-  (`src/proto.rs`) currently carries only `connection`, so the selection does not exist on the
-  wire yet. A new `EngineOp` variant would require reviewing three classification methods in that
+  (`src/proto.rs`) carries `connection` and `experimental_break_on_connect` (re-read
+  2026-09-22), so the transport selection does not exist on the wire yet — and that second
+  field is precedent for this advice rather than an argument against it. A new `EngineOp`
+  variant would require reviewing three classification methods in that
   file: `is_opener`, `opening` and `target_origin`. `opening` deliberately returns `None` for
   kernel attaches; `is_opener` and `target_origin` explicitly match `AttachKernel`.
   **`target_origin` ends in a wildcard that returns `None`**, so a forgotten arm silently suppresses

@@ -1,12 +1,31 @@
 # Secure Kernel debugging validation
 
-## Current status, 2026-09-19
+## Current status, 2026-09-23
 
 NT and hypervisor debugging passed; native Secure Kernel attachment did not. Loader
 configuration and hypervisor VTL1 debug-buffer initialization were measured successfully
 after resolving earlier failures. Offline comparison found the same three stub-like
 debugger routines in six exact SK images; it does not establish universal build support.
 See [the build comparison](#offline-build-comparison-and-native-route-gate-2026-09-19).
+
+The stub finding was re-derived from the retained image samples on 2026-09-22, and the
+routine was traced to its caller: it is the handler for **secure call `0x124`**, so there is
+no `IumpDebugBreakRequestedByVtl1` to find and its absence is structural. The same pass found
+that SK populates a complete debugger data block while shipping no KD transport, and that
+Microsoft's own `ExdiGdbSrv.dll` ships with WinDbg — which makes the EXDI backend contract a
+GDB stub rather than a COM server or a LiveCloudKd dependency. No live attach, host change or
+EXDI installation followed. See
+[the dispatch and EXDI reassessment](#secure-call-dispatch-of-the-debug-break-request-and-exdi-reassessment-2026-09-22).
+
+The first EXDI attempts then ran on 2026-09-22/23 and **one of them reset this workspace**.
+Offline reading established the `Kd=` option set — six discovery modes, of which
+`Kd=VerAddr:<addr>` takes an arbitrary `KdVersionBlock` address and is the mechanism a Secure
+Kernel bind would use. The `sk!KdVersionBlock` record found earlier turns out to be
+**EXDI-gated and possibly vestigial**, so a hypervisor KD session cannot be steered to it;
+that earlier reading was too strong and is corrected there. Registration of the EXDI COM
+server is a real prerequisite, and the `Inproc` option that appears to avoid it is what took
+the machine down. Nothing was left registered and no target was touched. See
+[the transport experiments](#exdi-transport-experiments-and-the-host-reset-2026-09-23).
 
 The user has ruled out configuration changes on the hardened outer host and selected a
 separate nested lab as the future direction. Provisioning is deferred while the investigation
@@ -1392,6 +1411,317 @@ support limitation, host-wide scheduling impact, a coordinated reboot affecting 
 workspace, and separately reviewed host debugger installation. Neither route is approved
 by the supplied read-only output. No VM was stopped, checkpoint restored, host setting
 changed, or debugger component installed in response to it.
+
+### Secure-call dispatch of the debug-break request and EXDI reassessment, 2026-09-22
+
+Re-derived the stub finding from the retained image samples rather than recalling it, then
+established what *calls* the stub. Entirely offline: no VM was queried, attached, reconfigured
+or rebooted, no MCP server was involved, no live attach or break request was issued, and no BCD
+or host setting changed. The debugger was `cdb` **10.0.29617.1000 AMD64** from WinDbg package
+**1.2606.22001.0**, opening each image with `-z` against the existing local symbol cache. Images
+came from `target/sk-build-survey-20260919/`; every SHA-256 was recomputed before use.
+
+**The 29671 target image is no longer on this workspace** — `target/sk-29671-static/` is gone, and
+only its archived excerpt survives. So five of the six matrix rows below were re-measured, and the
+29671 row is carried over from
+[the earlier comparison](#offline-build-comparison-and-native-route-gate-2026-09-19)
+rather than reproduced.
+
+#### Replication
+
+| SK file version | Image SHA-256 status | Break-request RVA | Body | `…ByVtl1` |
+|---|---|---|---|---|
+| 10.0.26100.9457 | matches accepted matrix | `0x27CDC` | `xor eax,eax; ret` | absent |
+| 10.0.28000.2952 | matches accepted matrix | `0x2BA6C` | `xor eax,eax; ret` | absent |
+| 10.0.29617.1000 | matches accepted matrix | `0x439EC` | `xor eax,eax; ret` | absent |
+| 10.0.29639.1000 | matches accepted matrix | `0x42840` | `xor eax,eax; ret` | absent |
+| 10.0.29648.1000 | matches accepted matrix | `0x2FA90` | `xor eax,eax; ret` | absent |
+| 10.0.29671.1000 | not re-measured; archived excerpt | `0x2ED60` | `xor eax,eax; ret` | absent |
+| 10.0.29667.1000 | **index mismatch, identity unverified** | `0x2ED60` | `xor eax,eax; ret` | absent |
+| 10.0.19041.207 | hash-verified, unclassified | symbol absent | — | absent |
+| 10.0.22621.7581 | **index mismatch, identity unverified** | symbol absent | — | absent |
+
+The five re-measured RVAs reproduce the recorded values exactly. The 29667 sample remains one of
+the rejected downloads and is listed separately; **its matching the 29671 RVA is a coincidence of
+layout and not evidence that the two files are the same** — their hashes differ
+(`7CB59806…` against `F6112AEE…`).
+
+`x securekernel!*DebugBreakRequested*` returns exactly one symbol in every image, so
+`IumpDebugBreakRequestedByVtl1` is not a spelling to keep hunting for. It does not exist in any
+sample inspected here, including the two pre-26100 ones.
+
+#### There is no VTL1 counterpart because the routine is a secure-call handler
+
+The name records a *direction of request*, not a debugger role. In 29648,
+`IumpInvokeLimitedModeSecureService` (`0x2FA9C`) switches on the secure call number read from
+`[rcx+2]`, and **call number `0x124`** dispatches straight into the stub:
+
+```text
+4002fad1 b824010000      mov     eax,124h
+4002fad6 663bc8          cmp     cx,ax
+4002fad9 0f87f6000000    ja      IumpInvokeLimitedModeSecureService+0x139
+4002fadf 0f84e6000000    je      IumpInvokeLimitedModeSecureService+0x12f
+...
+4002fbcb e8c0feffff      call    securekernel!IumpDebugBreakRequestedByVtl0 (00000001`4002fa90)
+```
+
+A rel32 scan of every executable section finds **exactly two** call sites in each of the six
+images that have the symbol, and both are dispatch sites — there is no internal use:
+
+| SK file version | `IumInvokeSecureService` site | `IumpInvokeLimitedModeSecureService` site |
+|---|---|---|
+| 10.0.26100.9457 | `0x199D2` | `0x27E15` |
+| 10.0.28000.2952 | `0x1C02E` | `0x2BBA9` |
+| 10.0.29617.1000 | `0x1AA80` | `0x43B27` |
+| 10.0.29639.1000 | `0x1B48D` | `0x4297B` |
+| 10.0.29648.1000 | `0x14BA9` | `0x2FBCB` |
+| 10.0.29667.1000 | `0x14BA9` | `0x2EE9B` |
+
+VTL0 asking VTL1 to break is a secure call; VTL1 asking itself is not a secure call at all, so a
+symmetric `…ByVtl1` entry point would have nothing to dispatch it. **The absence is structural,
+not a missing feature to look for in another build.** That is an argument about this dispatch
+shape in these images, and it does not exclude some other VTL1 debug entry reached by a mechanism
+not inspected here.
+
+#### Four details the first pass did not record
+
+- **The body is identical-COMDAT-folded.** In 29648, four symbols share `0x14002FA90`:
+  `IumpDebugBreakRequestedByVtl0`, `SkIsSecureKernel`, `SkhalpPciAccessAtsCapability` and
+  `SkpnppSwdValidateTrustlet`. This cuts both ways. The linker folds only byte-identical bodies,
+  so `return 0` is genuinely what the routine compiles to; but **a breakpoint at that address is
+  ambiguous across four unrelated callers**, which matters to anyone planning to arm one live.
+- **`.pdata` confirms the extent without the symbol.** The `RUNTIME_FUNCTION` at `0x14DD28` reads
+  `Begin=0x2FA90, End=0x2FA94, UnwindData=0x112FA0` — a four-byte function, independent of whether
+  the PDB named it correctly.
+- **`SkiSecureServiceTable` does not contain it.** The table sits at `0x156000` with
+  `SkiSecureServiceLimit` immediately after it at `0x1560D0` holding `0x1A`, so it has 26 entries,
+  all `Ium*` device/enclave services. The debug break is switch-dispatched, not table-dispatched,
+  which is why a table walk alone would miss it.
+- **`SkdpStub` disappears after 26100.** Present in 19041.207, 22621.7581 and 26100.9457; absent
+  from 28000.2952, 29617, 29639, 29648 and 29667. The earlier note that 19041's `SkdpStub`
+  contains exception-handling logic still stands, and this says only when the symbol stopped being
+  emitted, not what replaced it.
+
+#### No transport, but a complete self-description
+
+`x securekernel!*Kd*` returns `KdDebuggerDataBlock`, `KdVersionBlock`, `KdpDebuggerDataListHead`
+and the `KdpSearch*` globals — **all data**. There is no `KdSendPacket`, `KdReceivePacket`,
+`KdpTrap` or `KdInitSystem` in any inspected image. `SkdIsThisAKdTrap` exists in all of them and
+is a classifier, not a servicer: it tests the exception code for `0x80000003` or `0x4000001F`,
+requires a non-zero parameter count and a non-null `ExceptionInformation[0]`, and returns a
+boolean. Nothing consumes that verdict over a wire.
+
+Against that, `SkdInitDebuggerDataBlock` populates the block fully: the `KDBG` signature
+(`0x4742444B`), size `0x3A8`, `SkLoadedModuleList` into the loaded-module-list slot,
+`SkeProcessorBlock`, `SkiBugCheckData`, `SkmmHighestUserAddress`, `SkmmSystemRangeStart`,
+`SkmmUserProbeAddress`, `DbgBreakPointWithStatus` and the PTE swizzle bit.
+
+**So the split is: SK ships the metadata a debugger needs to describe it, and ships no transport
+to deliver it.** That is a statement about these images' inspected routines, not a proof that no
+alternative path exists — but it is the same split across every sample, and it is what decides
+which integration route is worth pursuing.
+
+#### EXDI reassessment: the backend contract is GDB RSP, not COM
+
+Re-examined the Phase 4 prerequisites in light of the above, and of the requirement that no
+LiveCloudKd component be taken as a dependency. Read-only inspection of the installed WinDbg
+package found that **Microsoft already ships the EXDI adaptation layer**:
+
+| Item | Observed |
+|---|---|
+| `ExdiGdbSrv.dll` | present for `amd64` (1,455,416 B) and `arm64` (1,523,512 B) |
+| `exdiConfigData.xml` | present beside it and under `winext\`; `CurrentTarget = "QEMU"` |
+| Preconfigured targets | Trace32, BMC-OpenOCD, QEMU, VMWare, BMC-SMM, UEFI |
+| Memory-command flags | `SupervisorMemory`, `HypervisorMemory`, `requirePAMemoryAccess` |
+| CLSID in the DLL's strings | `{29f9906e-9dbe-4d4b-b0fb-6acf7fb6d014}` |
+| That CLSID registered on this workspace | **no** — absent from `HKLM` and `HKCU` `\SOFTWARE\Classes\CLSID` |
+
+`ExdiGdbSrv.dll` is a generic EXDI COM server that speaks the GDB remote serial protocol, so a
+backend implements a **GDB stub over TCP** rather than an EXDI COM interface. That removes both
+the LiveCloudKd dependency and the COM surface from the design. The last row matters and is easy
+to skip past: **shipping is not registration**, so a working route still requires a registration
+step that has not been taken or reviewed here.
+
+The engine-side plumbing is two changes, both in existing shapes:
+
+- **dbgscope.** `attach_kernel_begin` (`src/dbgeng.rs:4174`) passes
+  `DEBUG_ATTACH_KERNEL_CONNECTION`; an EXDI attach is the same call with
+  `DEBUG_ATTACH_EXDI_DRIVER`. That constant is reachable today — `windows` 0.62.2,
+  `Windows/Win32/System/Diagnostics/Debug/Extensions/mod.rs:323`, value `2`.
+- **windbg-mcp.** `Connection::endpoint` (`src/kdconn.rs:133`) already returns `Endpoint::Unknown`
+  for any prefix other than `net:`, so an EXDI connection string flows through the profile and
+  redaction machinery without a gate change. **It is still a blocker, and in the opposite
+  direction to the one this entry first recorded.** `Endpoint::conflicts` (`src/kdconn.rs:99`)
+  treats `Unknown` as conflicting with *everything*, and `Sessions::admit`
+  (`src/engine.rs:3200`) refuses the open on a conflict. So an EXDI attach would be refused
+  whenever any live kernel session exists, and once admitted would block every later kernel
+  attach whatever its port — which breaks the two-session NT-plus-hypervisor workflow this
+  bench already runs on non-conflicting `net:` ports. The guard is over-conservative rather
+  than permissive; a new `Endpoint` variant carrying the stub’s host and port is still the
+  fix, for coexistence rather than for safety. The first reading of this was taken from the
+  variant’s name without opening `conflicts`, which is the failure
+  [`measurement-provenance.md`](../.claude/rules/measurement-provenance.md) opens with.
+
+Neither code change has been made, and no EXDI component was installed or registered. **An
+attach was attempted on 2026-09-22 and it reset this workspace** — see
+[the transport experiments](#exdi-transport-experiments-and-the-host-reset-2026-09-23).
+
+#### What this does not settle, and the two cheapest experiments
+
+**Whether DbgEng's EXDI kernel path can be pointed at `securekernel` rather than `nt` is
+unproven, and it decides the whole design.** `Kd=Guess` scans for NT's debugger data block, and
+whatever assumptions sit below that were not inspected. Everything above establishes that SK
+*has* a block worth keying off, not that DbgEng can be made to use it.
+
+Two steps answer that without provisioning a lab or changing the outer host:
+
+1. **Use the hypervisor session that already works.** The hypervisor KD route passed on this
+   bench, so SK's `KdDebuggerDataBlock` can be located and parsed at runtime from there. That
+   confirms the block is populated *live* rather than merely written by a routine whose execution
+   was inferred, and it costs one session. **It will not reach SK through DbgEng's own `sk`
+   record**, which the follow-up below measured as EXDI-gated — this step reads memory, it does
+   not bind a target.
+2. **Then test DbgEng-over-EXDI against QEMU**, which `exdiConfigData.xml` already targets. The
+   assumption to be tested is that a nested-VBS guest's SK pages are readable through QEMU's
+   gdbstub beneath the nested hypervisor's SLAT; that assumption is **not** established here and
+   is the point of the experiment.
+
+Neither step needs a Hyper-V-side stub, and step 2 is what a custom hypervisor would have to beat
+before it could be justified. Note also that the Root-scheduler, fixed-memory and single-vCPU
+constraints recorded in
+[the host preflight](#exdi-host-preflight-and-topology-decision-2026-09-19) are the LiveCloudKd
+recipe's, not EXDI's — a stub written here is not bound by them, though whatever supplies
+VTL-qualified register state still needs privileged Hyper-V access, and that requirement does not
+go away.
+
+#### Evidence
+
+Published: `secure-call-dispatch-29648.1000.txt` in the
+[evidence bundle](samples/secure-kernel-debugger-investigation/README.md), recorded under
+`supplementary` in `images.json`. The six pre-existing `evidence_sha256` values were re-verified
+before that file was added and all still match, so the earlier excerpts are unchanged.
+
+Ignored local evidence, under the session scratchpad rather than `target/`: per-image
+`x securekernel!*` symbol dumps, `uf` output for the routines above, the rel32 cross-reference
+scan (`xrefscan.py`, a pure PE parse with no debugger involved), and the resolved
+`SkiSecureServiceTable` listing.
+
+### EXDI transport experiments and the host reset, 2026-09-23
+
+First attempts to drive DbgEng's EXDI path on this workspace, plus an offline read of the engine's
+option parser. **One attempt reset this machine**; that is the most important line here. No VM was
+queried, attached or reconfigured, no BCD or host security setting changed, and nothing was left
+registered. The engine throughout was `dbgeng.dll` **10.0.29617.1000** with `kd.exe` from WinDbg
+package **1.2606.22001.0**; no PDB is served for that engine build, so all offline readings are
+from string cross-references, `.pdata` and imports rather than symbols.
+
+#### The `Kd=` option set, read offline
+
+The connection string is a list of `Name=Value` pairs, and `Kd=` selects one of **six**
+kernel-discovery modes. The parser spans image RVA `0x2FC810`-`0x2FCB46`; each option is a string
+compare followed by a mode number stored at `ctx+0x20`:
+
+| `Kd=` value | Mode | Compared with | Carries an address |
+|---|---|---|---|
+| `Ioctl` | 1 | `_wcsicmp` | no |
+| `GsPcr` | 2 | `_wcsicmp` | no |
+| `VerAddr:<addr>` | 3 | `_wcsnicmp`, length 8 | **yes** - `%I64i` into `ctx+0x28` |
+| `Guess` | 4 | `_wcsicmp` | no |
+| `NTBaseAddr` | 5 | `_wcsicmp` | no |
+| `HwDbgBlock` | 6 | `_wcsicmp` | no; also sets `ctx+0x44` |
+
+A malformed address returns `0x80070057` and the conversion is checked for exactly one field, so
+`VerAddr:` is parsed rather than merely recognised. Remaining option names: `CLSID`, `DataBreaks`,
+`Desc`, `EBC`, `Exdi`, `ForceX86`, `Args`, `Linux`, `Inproc`, `PathToSrvCfgFiles`.
+
+**`Kd=VerAddr:<address>` is the load-bearing find.** It lets a caller name the version block
+instead of letting the engine hunt for NT's, which is the mechanism a Secure Kernel bind would
+need.
+
+#### An `sk` record exists; its reachability does not
+
+A table of 40-byte records at `.data` RVA `0xA1F718` maps an EXDI memory space to a kernel module
+and its version-block symbol: `nt`/User Mode, `nt`/Supervisor-Kernel, `hv`/Hypervisor, and
+**`sk`/Hypervisor with `sk!KdVersionBlock`**. Those space names are the ones `exdiConfigData.xml`
+gates with `SupervisorMemory` and `HypervisorMemory`.
+
+That looked like a built-in Secure Kernel bootstrap and was first recorded here as one. A follow-up
+on 2026-09-23 mapped `.pdata` (18,091 functions) and classified every function that touches the
+table, which does not support the stronger reading:
+
+| Question | Measurement |
+|---|---|
+| Who reaches the three table readers? | Only functions that also reference **EXDI** strings (`0x3042F4`, `0x305900`, `0x42EE70`) |
+| Any KD-transport caller? | **None** - 0 of 91 KD-transport strings appear in any function touching the table |
+| The `hv`-vs-`sk` selector at `0x42EDE0` | **No direct callers; its address is never taken** |
+
+So the path is EXDI-gated and the one function distinguishing the `sk` record from the `hv` record
+is unreferenced in this build. **A hypervisor KD session cannot be steered to `sk` by this
+machinery.** The record is real; whether it is reachable at all is unproven, and it may be
+vestigial. Absence of a direct caller is not proof of dead code - a computed jump table would not
+show in that scan - and this is one engine build.
+
+**One string is a red herring, recorded so it is not re-read as evidence.** The only `securekernel`
+occurrence with a code reference (RVA `0x814178`) sits in a partially-mapped-image diagnostic, not
+a bootstrap. The `securekernel.exe` and `securekernella57.exe` names at `0x813E60`/`0x813EC0` have
+no code reference; they live in a name table.
+
+#### Registration is a real prerequisite
+
+With the CLSID `{29f9906e-9dbe-4d4b-b0fb-6acf7fb6d014}` absent from `HKLM` and `HKCU`, and the
+shell elevated, `kd -kx exdi:CLSID={29f9906e-...},Kd=Guess,DataBreaks=Exdi` fails with
+`0x80040154 Class not registered` and **registers nothing**. An earlier entry read the engine's
+registration strings as proof it self-registers; it has that code and did not run it there. The
+strings were evidence of a code path, not of when it executes.
+
+Also measured: **`cdb.exe` has no `-k` switch at all** - kernel work needs `kd.exe`, whose
+`-kx <options>` is the EXDI connection.
+
+#### The `Inproc` attempt reset the workspace
+
+`Inproc=<value>` resolves `<debugger module directory>\<value>` and calls `LoadLibraryExW`, so the
+value is a **bare filename**: `Inproc=1` tried `...\amd64\1`, and an absolute path was concatenated
+onto the debugger directory and failed with error 126. With `Inproc=ExdiGdbSrv.dll` the engine
+printed its own warning and nothing further:
+
+```text
+EXDI WARNING! The /Inproc option is not compatible with connecting remote clients.
+              Consider removing it if you encounter hangs or strange behavior.
+```
+
+**That attempt hung the host hard enough to require a reset.** The box returned with a 2-minute
+uptime and no surviving debugger processes. A private GDB-RSP responder on the far end
+(`localhost:12345`) logged **no connection at all**, so nothing reached the transport: neither a
+runaway `Kd=Guess` scan nor the responder's replies were involved, and `heuristicScanSize` was
+already `0xffe`. The hang was not observed directly - the session was interrupted and the machine
+reset - so *in-process COM load* is where the evidence points rather than a proven cause. What is
+established is that the warning is the last output and the machine did not recover.
+
+The attempt carried a 60-second kill on the child and **the kill did not save the machine**, so a
+job object is the bound a retry needs, not a `WaitForExit` timeout. Nothing was left registered, so
+there was no cleanup. This is the hazard class of a `cdb -server` spinning on a broken pipe.
+
+#### Rig findings for a future attempt
+
+`ExdiGdbSrv.dll` and `exdiConfigData.xml` ship inside the WinDbg package for `amd64` and `arm64`,
+so the EXDI adaptation layer needs no separate distribution and a backend implements a **GDB stub
+rather than a COM server**. The engine can be pointed at a private copy of the config with the
+`EXDI_GDBSRV_XML_CONFIG_FILE` environment variable, which worked here. The shipped `CurrentTarget`
+is `QEMU` with `targetArchitecture` **ARM64**, wrong for this x64 workspace; retargeting it to
+`X64` selects a 66-entry register block totalling **608 bytes** (1,216 hex characters for a `g`
+reply). The preconfigured **`VMWare`** entry is a better starting point on x64: already `X64`, 40
+register entries rather than 66, `heuristicScanSize=0xffe`, `forceLegacyResumeStepCommands=yes`,
+and all seven memory-command flags `no` - meaning plain `m`/`M` with virtual addresses.
+
+This workspace cannot host the target itself: it is a Hyper-V guest, `Microsoft-Hyper-V-All` and
+`VirtualMachinePlatform` are **Disabled**, no VMware or VirtualBox is installed, and 10.3 GB is
+free. **Hyper-V exposes no gdbstub in any case**, so a Hyper-V guest cannot stand in for QEMU or
+VMware as an EXDI target - that gap is the backend work itself, not a way around it. The user
+elected to set up a VMware VM separately.
+
+Ignored local evidence, under the session scratchpad rather than `target/`: the option-parser and
+`.pdata` classification scripts, per-image string and cross-reference dumps, the private
+`exdiConfigData.xml`, the GDB-RSP responder and its log, and the `kd` attach logs.
 
 ### Selected layout and resources
 
