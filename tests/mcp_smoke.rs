@@ -14536,6 +14536,22 @@ const CACHED_QUERY_CEILING: Duration = Duration::from_secs(5);
 /// If it ever collides the test says so and stays honest rather than failing; change it then.
 const ABSENT_TAG: &str = "Zq7x";
 
+/// How many of `pool_find_tag`'s chunks to put back to the engine's own pool extension.
+///
+/// Small deliberately: each one is a round trip to a live target over KD, and the claim is that
+/// the *decoder* agrees with an independent reading, which a handful settles as well as a
+/// hundred would. Raising it buys coverage of the same one fact.
+const POOL_ORACLE_SAMPLE: usize = 4;
+
+/// The fewest of those comparisons that must actually have happened for the run to mean anything.
+///
+/// This constant is the whole guard, and it is here because of how `FOLLOWUPS.md` item 96's two
+/// defects survived: their fixtures were built by *calling the code under test*, so every
+/// assertion ran, compared real values and could not fail. `!pool`'s output is text nobody here
+/// controls, so a parse that matches nothing looks exactly the same as a target on which
+/// everything agreed — and would go green. A run that compares zero chunks fails instead.
+const POOL_ORACLE_MINIMUM: usize = 1;
+
 /// The global the pool walker needs before it can read anything: the allocator's root.
 ///
 /// It is not an export, so resolving it is the cheapest honest proof that full `nt` symbols are
@@ -15117,6 +15133,113 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                      again (the first walk, for scale, took {walked_for:?})"
                 );
                 println!("`{tag}` found again from the cached snapshot in {reuse:?}");
+
+                // ---- The decoding, against an oracle that is not the decoder. ----
+                //
+                // Every cross-check above compares two readings of *one* walk — the census
+                // against `find_tag`, as the comment there says in as many words — so they share
+                // every decoder and none of them can see one be wrong. `!pool` is the engine's
+                // own extension reading the same bytes with none of dbgscope's code in the path,
+                // which is the only reason it is worth the extra round trips over KD.
+                //
+                // This is the check that was missing while the kernel LFH block bitmap was read
+                // two bits per block and the big-page hash truncated its page number
+                // (`FOLLOWUPS.md` item 96). Both were wrong the whole time against fixtures that
+                // were built by *calling the code under test* — `big_page_memory` asked
+                // `big_page_hash` which slot to put the entry in — so the comparisons were real
+                // and their answers predetermined.
+                let offered = found["chunks"].as_array().map_or(0, Vec::len);
+                let mut compared = 0usize;
+                let mut unreadable: Vec<String> = Vec::new();
+                for chunk in found["chunks"]
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .take(POOL_ORACLE_SAMPLE)
+                {
+                    let Some(address) = chunk["address"].as_str() else {
+                        continue;
+                    };
+                    let command = format!("!pool {address}");
+                    let call = server.call_tool(
+                        "execute",
+                        json!({ "command": command, "session_id": session }),
+                        POOL_CALL_BUDGET,
+                    );
+                    let answer = text_of(&call["result"]).replace(&command, "");
+                    // Printed on every run, passing or not. This is a text format nobody in this
+                    // repository controls, and the first thing any failure here needs is what
+                    // the extension actually said — which is also how the parse below gets
+                    // tightened rather than guessed at.
+                    println!("$ {command}\n{}", answer.trim());
+                    if is_tool_error(&call) {
+                        unreadable.push(format!("{address}: `!pool` itself failed"));
+                        continue;
+                    }
+                    // `!pool` dumps the whole page and marks the block containing the address
+                    // with a leading `*`, so the page's *other* blocks carry both "(Allocated)"
+                    // and "(Free)" and searching the whole answer would match either at random.
+                    // A large allocation is printed as one line with no marker at all.
+                    let marked = answer
+                        .lines()
+                        .find(|line| line.trim_start().starts_with('*'))
+                        .unwrap_or_default()
+                        .to_ascii_lowercase();
+                    let whole = answer.to_ascii_lowercase();
+                    let large = whole.contains("large pool allocation")
+                        || whole.contains("large page allocation");
+                    let engine_state = if marked.contains("(allocated)") || large {
+                        "allocated"
+                    } else if marked.contains("(free)") {
+                        "reusable_free"
+                    } else {
+                        unreadable.push(format!("{address}: no state in `!pool`'s answer"));
+                        continue;
+                    };
+                    let ours = chunk["state"].as_str().unwrap_or_default();
+                    assert_eq!(
+                        ours,
+                        engine_state,
+                        "this walk and the engine's own `!pool` disagree about {address}: the \
+                         walk says `{ours}`, `!pool` says `{engine_state}`. One of the two \
+                         decoders is wrong and it is not the one shipped with the \
+                         debugger.\n{}",
+                        answer.trim()
+                    );
+                    // The tag is the half that exercises the big-page lookup: a large allocation
+                    // only carries one because `lookup_big_page_target` found its tracker entry,
+                    // which is exactly what a wrong start index used to stop it doing — and a
+                    // failed lookup falls back to tag 0, not to an error.
+                    let printed = chunk["tag"].as_str().unwrap_or_default();
+                    if !printed.is_empty() {
+                        assert!(
+                            whole.contains(&printed.to_ascii_lowercase()),
+                            "the walk tagged {address} `{printed}` and `!pool` does not mention \
+                             that tag anywhere in its answer. On a large allocation this is the \
+                             big-page lookup missing its entry.\n{}",
+                            answer.trim()
+                        );
+                    }
+                    if large {
+                        println!(
+                            "  ^ a large allocation, so this one exercised the big-page lookup"
+                        );
+                    }
+                    compared += 1;
+                }
+                // The guard that makes the loop above worth having. A text parse that matches
+                // nothing is indistinguishable from a target on which everything agreed, and
+                // that resemblance is the whole of how item 96's two defects survived. So
+                // comparing nothing fails here; it does not skip.
+                assert!(
+                    compared >= POOL_ORACLE_MINIMUM,
+                    "the walk offered {offered} chunk(s) for `{tag}` and none of the \
+                     {POOL_ORACLE_SAMPLE} sampled could be compared against `!pool`, so this run \
+                     proved nothing about the decoder. That is a failure rather than a skip on \
+                     purpose — a silent zero here is the shape of the bug this check exists for. \
+                     What went wrong: {unreadable:?}"
+                );
+                println!("{compared} chunk(s) agreed with `!pool`, the engine's own reading");
             }
             HeaviestTag::Queryable(tag) => eprintln!(
                 "NOTE: the walk was incomplete, so the census/find_tag cross-check on `{tag}` was \
