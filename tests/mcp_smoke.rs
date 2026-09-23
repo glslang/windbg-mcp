@@ -14536,12 +14536,21 @@ const CACHED_QUERY_CEILING: Duration = Duration::from_secs(5);
 /// If it ever collides the test says so and stays honest rather than failing; change it then.
 const ABSENT_TAG: &str = "Zq7x";
 
-/// How many of `pool_find_tag`'s chunks to put back to the engine's own pool extension.
+/// Which pages, counted from the anchor chunk's own, to put to the engine's pool extension.
 ///
-/// Small deliberately: each one is a round trip to a live target over KD, and the claim is that
-/// the *decoder* agrees with an independent reading, which a handful settles as well as a
-/// hundred would. Raising it buys coverage of the same one fact.
-const POOL_ORACLE_SAMPLE: usize = 4;
+/// Spread rather than consecutive, and reaching well past the anchor on purpose. An LFH
+/// subsegment of 171 blocks covers twenty-odd pages, and the bitmap bug of `FOLLOWUPS.md` item
+/// 96 was wrong only for the *high* slots — so a probe that stayed on the anchor's page would
+/// have read the part that was right. Measured on a live x64 kernel: slot 0 decoded correctly
+/// and slots above ~96 read free while `FreeCount` was 0.
+const POOL_ORACLE_PAGE_STEPS: &[u64] = &[0, 4, 9, 14, 19];
+
+/// How many allocated blocks to take from any one page, so a dense page cannot supply the whole
+/// sample and leave the spread above doing nothing.
+const POOL_ORACLE_PER_PAGE: usize = 4;
+
+/// How many of the census's tags to try before giving up on finding an LFH-backed anchor.
+const POOL_ORACLE_TAG_CANDIDATES: usize = 6;
 
 /// The fewest of those comparisons that must actually have happened for the run to mean anything.
 ///
@@ -14549,8 +14558,12 @@ const POOL_ORACLE_SAMPLE: usize = 4;
 /// defects survived: their fixtures were built by *calling the code under test*, so every
 /// assertion ran, compared real values and could not fail. `!pool`'s output is text nobody here
 /// controls, so a parse that matches nothing looks exactly the same as a target on which
-/// everything agreed — and would go green. A run that compares zero chunks fails instead.
-const POOL_ORACLE_MINIMUM: usize = 1;
+/// everything agreed — and would go green. A run that compares too few fails instead.
+///
+/// Eight rather than one: a single comparison from the anchor's own page is exactly the reading
+/// that was already correct, so a minimum of one would be satisfied by the half of the decoder
+/// that never broke.
+const POOL_ORACLE_MINIMUM: usize = 8;
 
 /// The global the pool walker needs before it can read anything: the allocator's root.
 ///
@@ -14771,6 +14784,145 @@ struct KernelSymbols {
 /// The census now carries `raw_tag` beside it, so every tag it lists can be queried and the
 /// stand-down has nothing left to describe. A missing `raw_tag` is a defect in the server, not a
 /// fact about the pool, so it fails here rather than skipping.
+/// Put the walk's own decoding back to `!pool`, the engine's extension, and require agreement.
+///
+/// The oracle matters more than the assertions. Every other cross-check in this tier compares
+/// two readings of one walk, which share every decoder — so they can agree while both are wrong,
+/// which is what `FOLLOWUPS.md` item 96's two defects did for months.
+///
+/// Measured against a live x64 kernel 2026-09-23, on the dbgscope revision pinned at the time:
+/// subsegment `0xffffac09de402000` had `BlockCount` 171, `WitheldBlockCount` 14 and `FreeCount`
+/// **0** — every block allocated — and the walk reported its high slots `reusable_free`, because
+/// the kernel bitmap was read two bits per block and so sized at `ceil(171 / 4)` = 43 bytes
+/// against a real bitmap of `ceil(185 / 64) * 8` = 24. The extra 19 bytes are the zeroes after
+/// the bitmap, so every slot above ~96 read free. An allocated kernel object reported as freed
+/// is the worst direction for this to be wrong in, and nothing here could see it.
+fn compare_pool_decoding_against_the_engine(server: &mut Server, session: &str, tags: &[String]) {
+    // `pool_find_tag` is the **anchor**, never the sample. It returns the chunks the walk calls
+    // allocated, and the defect this exists for produces false *frees* — which by construction
+    // can never appear in its output. The first version of this sampled it and agreed four times
+    // out of four against a decoder that was wrong about tens of thousands of blocks.
+    //
+    // The anchor has to be **LFH-backed**, which is why this takes the census's tags rather than
+    // its heaviest one. On this bench the heaviest is `0x00000000` — the large allocations whose
+    // tag the big-page lookup failed to recover — and those sit in segment regions where `!pool`
+    // prints "large page allocation" and no per-block state, so stepping pages from one of them
+    // found nothing to compare and the control run failed on the *minimum* rather than on a
+    // disagreement. Failing for the wrong reason is still a wrong test.
+    let mut anchor = None;
+    let mut anchor_tag = String::new();
+    for candidate in tags.iter().take(POOL_ORACLE_TAG_CANDIDATES) {
+        let found = server.tool_data(
+            "pool_find_tag",
+            json!({ "tag": candidate, "session_id": session, "limit": 8 }),
+            POOL_CALL_BUDGET,
+        );
+        let lfh = found["chunks"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|chunk| chunk["backend"] == "lfh")
+            .and_then(|chunk| chunk["header_address"].as_str())
+            .and_then(|address| u64::from_str_radix(address.trim_start_matches("0x"), 16).ok());
+        if let Some(address) = lfh {
+            anchor = Some(address);
+            anchor_tag = candidate.clone();
+            break;
+        }
+    }
+    let anchor = anchor.unwrap_or_else(|| {
+        panic!(
+            "none of the census's first {POOL_ORACLE_TAG_CANDIDATES} tags ({tags:?}) has an \
+             LFH-backed chunk to anchor on, so the LFH half of the decoder cannot be put to the \
+             engine at all. That is a failure rather than a skip: a live kernel with no LFH \
+             allocation is not a thing, so this is a walk that decoded none of them."
+        )
+    });
+    let tag = anchor_tag.as_str();
+
+    // Walk *forward* through the region rather than staying on the anchor's page. An LFH
+    // subsegment of 171 blocks spans twenty-odd pages, and the slots whose bitmap bits were read
+    // wrongly are the high ones — pages an allocated anchor is nowhere near, since a block the
+    // walk got wrong is one it called free and so never handed back.
+    let mut compared = 0usize;
+    let mut disagreed = 0usize;
+    let mut unreadable: Vec<String> = Vec::new();
+    for step in POOL_ORACLE_PAGE_STEPS {
+        let page = (anchor & !0xfff) + step * 0x1000;
+        let command = format!("!pool {page:#x}");
+        let call = server.call_tool(
+            "execute",
+            json!({ "command": command, "session_id": session }),
+            POOL_CALL_BUDGET,
+        );
+        if is_tool_error(&call) {
+            unreadable.push(format!("{page:#x}: `!pool` failed"));
+            continue;
+        }
+        let answer = text_of(&call["result"]).replace(&command, "");
+        let mut on_this_page = 0usize;
+        for line in answer.lines() {
+            if on_this_page >= POOL_ORACLE_PER_PAGE {
+                break;
+            }
+            let line = line.trim_start();
+            // Only blocks the engine calls allocated. A false *free* is the failure being hunted,
+            // so the engine's "allocated" is the claim worth putting back to the walk.
+            if !line.contains("(Allocated)") {
+                continue;
+            }
+            let Some(header) = line
+                .trim_start_matches('*')
+                .split_whitespace()
+                .next()
+                .and_then(|address| u64::from_str_radix(&address.replace('`', ""), 16).ok())
+            else {
+                continue;
+            };
+            // `!pool` names the header; the tools are asked about the payload, as a caller holds
+            // it. A `_POOL_HEADER` is 0x10 and every block listed this way carries one.
+            let payload = header + 0x10;
+            let chunk = server.tool_data(
+                "pool_chunk",
+                json!({ "address": format!("{payload:#x}"), "session_id": session }),
+                POOL_CALL_BUDGET,
+            );
+            if chunk["covered"] != true {
+                // A live walk's coverage is legitimately partial, so an address it never reached
+                // is not a disagreement about state.
+                unreadable.push(format!("{payload:#x}: not covered by the walk"));
+                continue;
+            }
+            let ours = chunk["chunk"]["state"].as_str().unwrap_or_default();
+            if ours != "allocated" {
+                disagreed += 1;
+                eprintln!(
+                    "DISAGREE {payload:#x}: `!pool` says allocated, this walk says `{ours}`\n  {line}"
+                );
+            }
+            compared += 1;
+            on_this_page += 1;
+        }
+    }
+    // A text parse that matches nothing is indistinguishable from a target on which everything
+    // agreed, so comparing nothing fails rather than skips. And this assertion lives at the
+    // helper's own level: the first live run had it nested inside a "walk completed" arm, which a
+    // `partial` walk skipped whole, and the test passed having compared nothing.
+    assert!(
+        compared >= POOL_ORACLE_MINIMUM,
+        "anchored on `{tag}` at {anchor:#x}, only {compared} block(s) could be compared against \
+         `!pool` — fewer than the {POOL_ORACLE_MINIMUM} this needs to mean anything. What went \
+         wrong: {unreadable:?}"
+    );
+    assert_eq!(
+        disagreed, 0,
+        "{disagreed} of {compared} blocks that `!pool` calls allocated are not allocated to this \
+         walk (lines above). A live allocated object reported as freed is the worst direction for \
+         these tools to be wrong in, and it is what `FOLLOWUPS.md` item 96 was about."
+    );
+    println!("{compared} block(s) the engine calls allocated agreed with this walk");
+}
+
 enum HeaviestTag {
     /// A tag that can be handed straight back to `pool_find_tag`.
     Queryable(String),
@@ -15080,6 +15232,28 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
             assert_diagnostic_total_covers_its_categories(&diagnostics);
         }
 
+        // ---- The decoding, against an oracle that is not the decoder. ----
+        //
+        // Deliberately *outside* the completeness gate below and before it. This needs chunks,
+        // not a complete walk, and the first live run of it proved why that distinction matters:
+        // sitting inside the `if complete` arm it was skipped on a `partial` walk — taking its
+        // own `POOL_ORACLE_MINIMUM` guard with it — and the test passed having compared nothing.
+        // A guard inside the branch it is guarding against is not a guard.
+        //
+        // Every other cross-check here compares two readings of one walk, which is a consistency
+        // check: they share every decoder and cannot see one be wrong. That is how both defects
+        // in `FOLLOWUPS.md` item 96 lasted — including against fixtures built by calling the code
+        // under test. `!pool` is the engine's own extension reading the same bytes.
+        let census_tags: Vec<String> = totals["tags"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry["raw_tag"].as_str().map(str::to_owned))
+            .collect();
+        if !census_tags.is_empty() {
+            compare_pool_decoding_against_the_engine(&mut server, &session, &census_tags);
+        }
+
         match heaviest_census_tag(&totals) {
             // What one tool saw, the other has to find. Only meaningful when the walk completed:
             // an incomplete snapshot is deliberately not cached, so these would be two separate
@@ -15133,113 +15307,6 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
                      again (the first walk, for scale, took {walked_for:?})"
                 );
                 println!("`{tag}` found again from the cached snapshot in {reuse:?}");
-
-                // ---- The decoding, against an oracle that is not the decoder. ----
-                //
-                // Every cross-check above compares two readings of *one* walk — the census
-                // against `find_tag`, as the comment there says in as many words — so they share
-                // every decoder and none of them can see one be wrong. `!pool` is the engine's
-                // own extension reading the same bytes with none of dbgscope's code in the path,
-                // which is the only reason it is worth the extra round trips over KD.
-                //
-                // This is the check that was missing while the kernel LFH block bitmap was read
-                // two bits per block and the big-page hash truncated its page number
-                // (`FOLLOWUPS.md` item 96). Both were wrong the whole time against fixtures that
-                // were built by *calling the code under test* — `big_page_memory` asked
-                // `big_page_hash` which slot to put the entry in — so the comparisons were real
-                // and their answers predetermined.
-                let offered = found["chunks"].as_array().map_or(0, Vec::len);
-                let mut compared = 0usize;
-                let mut unreadable: Vec<String> = Vec::new();
-                for chunk in found["chunks"]
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .take(POOL_ORACLE_SAMPLE)
-                {
-                    let Some(address) = chunk["address"].as_str() else {
-                        continue;
-                    };
-                    let command = format!("!pool {address}");
-                    let call = server.call_tool(
-                        "execute",
-                        json!({ "command": command, "session_id": session }),
-                        POOL_CALL_BUDGET,
-                    );
-                    let answer = text_of(&call["result"]).replace(&command, "");
-                    // Printed on every run, passing or not. This is a text format nobody in this
-                    // repository controls, and the first thing any failure here needs is what
-                    // the extension actually said — which is also how the parse below gets
-                    // tightened rather than guessed at.
-                    println!("$ {command}\n{}", answer.trim());
-                    if is_tool_error(&call) {
-                        unreadable.push(format!("{address}: `!pool` itself failed"));
-                        continue;
-                    }
-                    // `!pool` dumps the whole page and marks the block containing the address
-                    // with a leading `*`, so the page's *other* blocks carry both "(Allocated)"
-                    // and "(Free)" and searching the whole answer would match either at random.
-                    // A large allocation is printed as one line with no marker at all.
-                    let marked = answer
-                        .lines()
-                        .find(|line| line.trim_start().starts_with('*'))
-                        .unwrap_or_default()
-                        .to_ascii_lowercase();
-                    let whole = answer.to_ascii_lowercase();
-                    let large = whole.contains("large pool allocation")
-                        || whole.contains("large page allocation");
-                    let engine_state = if marked.contains("(allocated)") || large {
-                        "allocated"
-                    } else if marked.contains("(free)") {
-                        "reusable_free"
-                    } else {
-                        unreadable.push(format!("{address}: no state in `!pool`'s answer"));
-                        continue;
-                    };
-                    let ours = chunk["state"].as_str().unwrap_or_default();
-                    assert_eq!(
-                        ours,
-                        engine_state,
-                        "this walk and the engine's own `!pool` disagree about {address}: the \
-                         walk says `{ours}`, `!pool` says `{engine_state}`. One of the two \
-                         decoders is wrong and it is not the one shipped with the \
-                         debugger.\n{}",
-                        answer.trim()
-                    );
-                    // The tag is the half that exercises the big-page lookup: a large allocation
-                    // only carries one because `lookup_big_page_target` found its tracker entry,
-                    // which is exactly what a wrong start index used to stop it doing — and a
-                    // failed lookup falls back to tag 0, not to an error.
-                    let printed = chunk["tag"].as_str().unwrap_or_default();
-                    if !printed.is_empty() {
-                        assert!(
-                            whole.contains(&printed.to_ascii_lowercase()),
-                            "the walk tagged {address} `{printed}` and `!pool` does not mention \
-                             that tag anywhere in its answer. On a large allocation this is the \
-                             big-page lookup missing its entry.\n{}",
-                            answer.trim()
-                        );
-                    }
-                    if large {
-                        println!(
-                            "  ^ a large allocation, so this one exercised the big-page lookup"
-                        );
-                    }
-                    compared += 1;
-                }
-                // The guard that makes the loop above worth having. A text parse that matches
-                // nothing is indistinguishable from a target on which everything agreed, and
-                // that resemblance is the whole of how item 96's two defects survived. So
-                // comparing nothing fails here; it does not skip.
-                assert!(
-                    compared >= POOL_ORACLE_MINIMUM,
-                    "the walk offered {offered} chunk(s) for `{tag}` and none of the \
-                     {POOL_ORACLE_SAMPLE} sampled could be compared against `!pool`, so this run \
-                     proved nothing about the decoder. That is a failure rather than a skip on \
-                     purpose — a silent zero here is the shape of the bug this check exists for. \
-                     What went wrong: {unreadable:?}"
-                );
-                println!("{compared} chunk(s) agreed with `!pool`, the engine's own reading");
             }
             HeaviestTag::Queryable(tag) => eprintln!(
                 "NOTE: the walk was incomplete, so the census/find_tag cross-check on `{tag}` was \

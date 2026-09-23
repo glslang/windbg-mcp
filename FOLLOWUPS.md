@@ -1888,10 +1888,11 @@ gap rather than a missing primitive -- the same shape item 2 records for `ba`, w
 nothing else), and they will need to work there — the maintainer's call, 2026-09-23, when the heap
 tools were lifted and this was split off.
 
-**The two readings this was filed against have been corrected. The live check it asked for has
-not been run.** Both corrections are on dbgscope's `fix/nt-lfh-bitmap-and-big-page-hash`,
-measured 2026-09-23 from `nt`'s own code on the repository's sample dumps (x64 26100.32995,
-`081226-2187-01.dmp`; ARM64 26100, `082126-7015-01.dmp`).
+**Both readings this was filed against are corrected and confirmed against a live pool; the gate
+is what is left.** The corrections are on dbgscope's `fix/nt-lfh-bitmap-and-big-page-hash`, read
+2026-09-23 from `nt`'s own code on the repository's sample dumps (x64 26100.32995,
+`081226-2187-01.dmp`; ARM64 26100, `082126-7015-01.dmp`) and then measured against the live
+`ctf-vm` guest, below.
 
 - **`nt`'s LFH block bitmap is one bit per block, 64 to a word**, now
   `LfhBitmap::ContiguousBits`. The bit-level authority is
@@ -1923,22 +1924,39 @@ exactly rather than masked, a free-page-tree node exempted from the `TreeSignatu
 links no longer masked to 16 bytes — each measured in user mode only. Those are still unmeasured
 against a kernel.
 
-**What remains unmeasured is a pool.** No live kernel was reachable from this bench on 2026-09-23:
-the `ctf-vm` KDNET attach parked without the target dialling in (recovered through the PID
-handoff), this host's `{current}` boot entry carries no `debug` flag so `attach_kernel_local` is
-not available, and both sample dumps are minidumps — `nt!ExPoolState`, `nt!PoolBigPageTable` and
-`nt!PoolBigPageTableSize` all read `????????` on the ARM64 one, and `pool_census` on the x64 one
-fails at a sparse range inside `nt`'s data. So the slot-for-slot claim rests on four of `nt`'s own
-routines across two architectures, which is stronger than the reading it replaces and is still not
-a reading of a pool.
+**Both halves are now measured against a live x64 kernel** — the `ctf-vm` guest, Server 26100.33438,
+2026-09-23, once it was rebooted:
 
-- **Why deferred:** what is left wants a live pool, and this bench had none on the day. The x64
-  CTF guest that item 78 used is the x64 check when it is up.
-- **What would close it:** the `nt` arrangement confirmed slot for slot on a live x64 kernel —
-  against `!pool`, or against `RtlpHpLfhSubsegmentCountAllocatedBlocks`'s count, which
-  `_HEAP_LFH_SUBSEGMENT.FreeCount` gives independently as `BlockCount - FreeCount` — with the
-  three shared changes re-run through the live-kernel tier there. Then the gate: with the
-  structural half already answered above, lift the machine check and walk an ARM64 kernel pool.
+- **The LFH bitmap, slot for slot.** Subsegment `0xffffac09de402000` carried `BlockCount` 171,
+  `WitheldBlockCount` 14 and `FreeCount` **0** — every block allocated — with
+  `CommitStateOffset - 8` = 3 bitmap words, all three `0xffffffffffffffff`. `nt`'s own arithmetic
+  checks out exactly on it: popcount 192, minus `(-(171 + 14)) & 63` = 7 padding bits, minus 14
+  withheld, is 171. The walk reported its *high* slots `reusable_free` against that, because two
+  bits per block sizes the read at `ceil(171 / 4)` = 43 bytes where the bitmap is 24 — the extra
+  19 bytes being the zeroes after it, so everything above slot ~96 read free. `!pool` calls those
+  blocks `(Allocated)`; slot 0 decoded correctly, which is the boundary the arithmetic predicts.
+- **The big-page hash.** `nt!PoolBigPageTable` at `0xffff8b836f5c0000`, `PoolBigPageTableSize`
+  `0x4000`. The entry for VA `0xffff8b8371402000` sits at index **`0x1640`**, which is what `nt`'s
+  hash computes; the truncating one computes `0x1948`, an empty slot.
+- **The scale, and the direction.** A forced walk before the fix reported 173,649 allocated chunks
+  of 276,511; after it, 252,079 of 292,736. Tens of thousands of live allocated kernel objects
+  were being reported as freed — which is the worst direction for these tools to be wrong in, and
+  is exactly backwards for the use they were built for.
+
+`a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` now carries that comparison
+(`compare_pool_decoding_against_the_engine`). **The control is run and the confirming arm is
+not.** Against the pinned revision it fails naming four disagreeing blocks, which is the property
+it was written for; the run against the fix has not completed — the first attempt exited non-zero
+with its output filtered away, and the re-run was killed by the host for memory pressure before
+it finished. So what is established is that the check *catches* the defect, not yet that the fix
+*satisfies* it. Re-run it before treating this entry as settled.
+
+- **Why still open:** only the ARM64 gate is left, and lifting it wants an ARM64 kernel to walk.
+  This bench is x64 and the ARM64 sample dump is a minidump whose `nt!ExPoolState` reads
+  `????????`, so nothing here can walk an ARM64 pool.
+- **What would close it:** lift the machine check in `pool::query` and walk a live ARM64 kernel
+  pool — the structural half is already answered above, so what is missing is the run, not the
+  reading. The `pool_*` descriptions in `src/server.rs` move with it.
 - **Where it picks up:** `LfhBitmap` in dbgscope's `src/pool/decode.rs` and
   `AllocatorSchema::lfh_bitmap` in `src/pool/layout.rs`; the machine check in `src/pool/query.rs`;
   and the `pool_*` descriptions in `windbg-mcp`'s `src/server.rs`, which say *"Needs a broken-in
