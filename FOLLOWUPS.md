@@ -77,7 +77,12 @@ A64 writes `a || b || c` as three compares feeding one branch, and this walk rea
 and files the rest in `untracked`. And item 94 from giving the multiprocessor hypervisor
 investigation's harness the tools it was written against (2026-09-20) -- that investigation is
 item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
-`bd`/`be` deliberately did not.
+`bd`/`be` deliberately did not. And items 96–98 from running the heap tools on ARM64 for the
+first time ([dbgscope#177](https://github.com/glslang/dbgscope/pull/177), 2026-09-23), with the
+target's own `HeapWalk` as the oracle: the pool walker's LFH reading, which that run showed is not
+`nt`'s, and the ARM64 pool gate it now waits on; an LFH block awaiting a delayed free, which
+`HeapWalk` calls free and the heap tools call allocated; and the uncommitted memory that keeps
+every live walk measured at `Partial` once the diagnostics were gone.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1873,3 +1878,90 @@ gap rather than a missing primitive -- the same shape item 2 records for `ba`, w
   today.
 - **Picks up at:** `worker::clear_breakpoints` and `ClearBreakpointsArgs`, and
   `breakpoints_are_listed_and_cleared_through_their_own_tools` for the round trip.
+
+## 96. [dbgscope + windbg-mcp] The pool walker on ARM64, and an LFH reading that is not `nt`'s
+
+**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s heap tools
+([dbgscope#177](https://github.com/glslang/dbgscope/pull/177)).
+
+`pool_*` still refuses every ARM64 kernel (`pool::query` accepts `IMAGE_FILE_MACHINE_AMD64` and
+nothing else), and they will need to work there — the maintainer's call, 2026-09-23, when the heap tools were
+lifted and this was split off. The gate is not the only thing in the way, and the part that is not
+is an x64 problem too.
+
+**`nt` packs an LFH block bitmap one bit per block, and the walker reads two.** Measured
+2026-09-23 from `nt`'s own code on the repository's sample dumps:
+`nt!RtlpHpLfhBlockBitmapInitialize` (x64 26100.32995, `081226-2187-01.dmp`) zeroes
+`ceil(n / 64)` words and sets the top `(-n) & 63` bits of the last; ARM64 26100's
+`nt!RtlpHpLfhBlockBitmapAllocateNonAtomic` (`082126-7015-01.dmp`) sets `1 << bit` in a word and
+returns `word * 64 + bit`; and `RtlpHpLfhSubsegmentCountAllocatedBlocks` popcounts whole words and
+subtracts `(-(BlockCount + WitheldBlockCount)) & 63` on both. The walker reads bit `2 * slot`
+(`LfhBitmap::AdjacentPairs`) and sizes the read at `blocks / 4` bytes, twice the bitmap. dbgscope#177
+moved `ntdll` to its own arrangement — 32 blocks to a word, busy bits in the low half — and left
+the kernel's reading exactly as it was, because nothing on this bench could check a change to it.
+So **the pool tools' LFH slot states are expected to be wrong on x64 today**, and that is an
+inference from disassembly, not a measurement of a pool.
+
+dbgscope#177 also changed three things the kernel walker shares — a segment list's head compared
+exactly rather than masked, a free-page-tree node exempted from the `TreeSignature` check, and tree
+links no longer masked to 16 bytes — each measured in user mode only.
+
+- **Why deferred:** every half of it wants a live pool to check against, and the one this bench
+  has is the ARM64 serial target, which the gate refuses. The x64 CTF guest that item 78 used is
+  the x64 check.
+- **What would close it:** an `LfhBitmap` arm for `nt`'s arrangement, confirmed slot for slot on a
+  live x64 kernel — against `!pool`, or a kernel-side count such as
+  `RtlpHpLfhSubsegmentCountAllocatedBlocks`'s — with the three shared changes re-run through the
+  live-kernel tier there. Then the gate: check what the pool walker took from x64 `nt` alone
+  (`decode_pool_header`'s checks and the big-page hash were read from x64 code) against an ARM64
+  `nt`, and lift it.
+- **Where it picks up:** `LfhBitmap` in dbgscope's `src/pool/decode.rs` and
+  `AllocatorSchema::lfh_bitmap` in `src/pool/layout.rs`; the machine check in `src/pool/query.rs`;
+  and the `pool_*` descriptions in `windbg-mcp`'s `src/server.rs`, which say *"Needs a broken-in
+  x64 kernel target"*.
+
+## 97. [dbgscope] An LFH block awaiting a delayed free is reported allocated
+
+**Repo:** `dbgscope`.
+
+`ntdll!RtlpHpLfhSubsegmentWalk`, which `HeapWalk` reaches, copies the subsegment's block bitmap
+and then walks `State.DelayFreeList` — the list head holds a slot index plus one, and each block on
+the list holds the next in its first two bytes — clearing both of that block's bits in the copy
+before it tests any. So a block freed but not yet returned to the bitmap is free to `HeapWalk` and
+busy in the bitmap as stored, which is what the heap tools read. Read from the disassembly on x64
+26100.8972 and ARM64 26100.1, 2026-09-23; `nt` has the same list
+(`RtlpHpLfhSubsegmentDelayFreeListProcess`).
+
+- **Why deferred:** not seen. `user_heap_smoke` frees nothing, and every subsegment measured had
+  `DelayFreeCount` zero, so the walker and `HeapWalk` agreed exactly without it — which also means
+  nothing here would catch it.
+- **What would close it:** read the chain at discovery, bounded by `BlockCount` and
+  `DelayFreeCount`, and report those slots `CachedFree` — the state the heap tools already give a
+  VS chunk on a delay-free list. And give `user_heap_smoke` a free that lands on the list, which
+  first means finding what sends one there (`RtlpHpLfhSubsegmentDelayFreeListBatch` is where to
+  start).
+- **Where it picks up:** the LFH arm of `discover_segment_context` in dbgscope's
+  `src/pool/snapshot.rs`, and `_HEAP_LFH_SUBSEGMENT_STATE` in `src/pool/layout.rs`.
+
+## 98. [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete`
+
+**Repo:** `dbgscope`.
+
+After dbgscope#177 a walk of `user_heap_smoke`'s process on ARM64 26100.1 has **no** diagnostics
+and still reports `coverage: Partial`, on every run taken that day. What holds it there is eight
+`Unreadable` spans, and all eight lie where the allocator reserves more than it commits: the
+tails of two VS subsegments (0x5000 and 0xb000 bytes), and the parts of page ranges and free
+ranges past what their allocations needed (0x85000, 0x8a000, 0xf000, 0x1000, 0xf000 and 0x9e0000).
+That they are uncommitted is read from where they lie, not yet checked page by page against the
+allocator's commit records. If it holds, they are not unknown, and counting them as gaps makes
+`Partial` the answer
+on a healthy live target — which blunts the one signal the tools have for *we could not see
+something*. Not measured on x64, where nothing about the mechanism differs.
+
+- **Why deferred:** it changes what `Complete` means for both walkers, and a dump is the case that
+  must not be swept up with it: a dump can lack committed pages, and those stay unreadable.
+- **What would close it:** tell decommitted from unreadable using what the allocator records —
+  a page range descriptor's `CommittedPageCount`, a VS subsegment's `CommitBitmap` — and report
+  the first as a state of its own that does not clear `complete`.
+- **Where it picks up:** `walk_region` and the page-range and VS walks in dbgscope's
+  `src/pool/snapshot.rs`, and `unreadable_gaps` in `src/heap.rs`.

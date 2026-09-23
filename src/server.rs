@@ -2897,8 +2897,8 @@ impl WindbgServer {
 
     /// List every heap root in the current process. Segment Heaps are marked supported;
     /// classic NT heaps are listed but deliberately excluded from v1 coverage and should be
-    /// inspected with `!heap`. Requires a stopped x64 live target or sufficiently complete dump
-    /// and matching `ntdll` PDB type information.
+    /// inspected with `!heap`. Requires a stopped x64 or ARM64 live target or sufficiently
+    /// complete dump and matching `ntdll` PDB type information.
     #[rmcp::tool(
         annotations(
             title = "List user-mode heaps",
@@ -2923,8 +2923,8 @@ impl WindbgServer {
     }
 
     /// List user Segment Heap chunks, filtered by heap, backend, state, and capacity. Defaults
-    /// to allocated chunks. Requires a stopped x64 live target or sufficiently complete dump and
-    /// matching `ntdll` PDB type information.
+    /// to allocated chunks. Requires a stopped x64 or ARM64 live target or sufficiently complete
+    /// dump and matching `ntdll` PDB type information.
     #[rmcp::tool(
         annotations(
             title = "List Segment Heap allocations",
@@ -2982,7 +2982,8 @@ impl WindbgServer {
     /// Locate the user allocation containing an address and return its contiguous neighbours
     /// from the same heap, backend, and subsegment. An uncovered address is not reported as free;
     /// inspect the returned coverage before treating absence as evidence. Requires a stopped x64
-    /// live target or sufficiently complete dump and matching `ntdll` PDB type information.
+    /// or ARM64 live target or sufficiently complete dump and matching `ntdll` PDB type
+    /// information.
     #[rmcp::tool(
         annotations(
             title = "Locate a Segment Heap chunk",
@@ -3007,8 +3008,8 @@ impl WindbgServer {
     }
 
     /// Group Segment Heap chunks by heap, backend, state, and size class, heaviest first. Requires
-    /// a stopped x64 live target or sufficiently complete dump and matching `ntdll` PDB type
-    /// information.
+    /// a stopped x64 or ARM64 live target or sufficiently complete dump and matching `ntdll` PDB
+    /// type information.
     #[rmcp::tool(
         annotations(
             title = "Census Segment Heap usage",
@@ -3033,8 +3034,8 @@ impl WindbgServer {
     }
 
     /// Inspect Segment Heap walk diagnostic categories and kept examples, optionally scoped to
-    /// one heap root and narrowed by a case-insensitive substring. Requires a stopped x64 live
-    /// target or sufficiently complete dump and matching `ntdll` PDB type information.
+    /// one heap root and narrowed by a case-insensitive substring. Requires a stopped x64 or
+    /// ARM64 live target or sufficiently complete dump and matching `ntdll` PDB type information.
     #[rmcp::tool(
         annotations(
             title = "Filter Segment Heap diagnostics",

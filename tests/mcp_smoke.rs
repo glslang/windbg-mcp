@@ -13153,8 +13153,9 @@ fn a_pool_query_with_no_time_to_walk_is_refused_rather_than_run() {
 /// heaps: `cmd.exe` has no Segment Heap at all and still exercises the whole of what broke.
 ///
 /// **It asserts that a family is named, never which one.** Three shapes ship and all three are
-/// live — this bench reports `affinity_slot_vs_offset`, a 2026 x64 build reports
-/// `affinity_slot_vs`, an older one `inline_vs` — and a test that pinned this host's answer would
+/// live — an x64 26200 host reports `affinity_slot_vs_offset`, a 2026 x64 build
+/// `affinity_slot_vs`, and the ARM64 bench's 26100.1 `inline_vs` — and a test that pinned this
+/// host's answer would
 /// fail on a colleague's machine for being right. Selection is by the fields the target's own PDB
 /// carries and never by a build number, so "some shape resolved" is the property; which one is the
 /// target's business.
@@ -13190,10 +13191,9 @@ fn a_user_mode_heap_query_names_the_vs_shape_it_decoded_with() {
             skip("this host has no private `ntdll` PDB, so no layout can be resolved at all");
             return;
         }
-        if report.contains("x64") {
-            skip("the heap walker decodes x64 targets only");
-            return;
-        }
+        // There used to be a third, for a walker that took x64 targets only: every ARM64 host
+        // stood down here, which is how the ARM64 runners' live tier never walked a heap. It
+        // takes both now, so `cmd.exe` on either is a target it must answer for.
         panic!(
             "the heap query failed. If this names an unsupported allocator layout, this host's \
              `ntdll` carries a VS shape the walker does not recognise — which is the whole of \
@@ -13214,6 +13214,57 @@ fn a_user_mode_heap_query_names_the_vs_shape_it_decoded_with() {
          its `AllocatorSemanticFamily` variant here too:\n{report}"
     );
     ran(&format!("a live user-mode target decoded as {family}"));
+}
+
+/// A **WoW64** process is refused by the heap tools, never walked.
+///
+/// The trap is that a walk would *work*. Under a 64-bit engine the PEB and `ntdll` a heap query
+/// reads are the 64-bit emulation layer's, whose heaps are real, so the answer would list them and
+/// call itself complete while every heap the program allocates from is 32-bit and absent. No
+/// processor type says so at the first break — measured on ARM64 26100.1, 2026-09-23, the
+/// effective machine is still ARM64 there — so `dbgscope` reads `_TEB.WowTebOffset`, which is
+/// `+0x2000` at that break.
+///
+/// Which refusal arrives depends on the worker, and either is the property: a 64-bit worker says
+/// `WoW64`, a 32-bit one has an x86 processor and says `machine 0x14c`. What would fail is a
+/// listing.
+#[test]
+fn a_wow64_process_is_refused_by_the_heap_tools_rather_than_walked() {
+    if !launch_tier() {
+        return;
+    }
+    let windows = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let mut server = Server::started();
+    let session = server.open_session(
+        "launch",
+        json!({ "command_line": format!(r"{windows}\SysWOW64\cmd.exe /c ping -n 30 127.0.0.1") }),
+        TARGET_STEP,
+    );
+
+    let answer = server.call_tool("heap_list", json!({ "session_id": &session }), TARGET_STEP);
+    let report = text_of(&answer["result"]);
+    server.tool_text(
+        "end_session",
+        json!({ "session_id": &session }),
+        TARGET_STEP,
+    );
+
+    assert_no_error(&answer, "heap_list on a WoW64 process");
+    if report.contains("private PDB type information") || report.contains("missing allocator") {
+        skip("this host has no private `ntdll` PDB, so no layout can be resolved at all");
+        return;
+    }
+    assert!(
+        is_tool_error(&answer),
+        "a WoW64 process was walked, which lists the emulation layer's heaps as the program's:\n\
+         {report}"
+    );
+    assert!(
+        report.contains("WoW64") || report.contains("machine 0x14c"),
+        "the refusal should say why — WoW64 from a 64-bit worker, an x86 machine from a 32-bit \
+         one:\n{report}"
+    );
+    ran("a WoW64 process refused by heap_list");
 }
 
 /// An **older** build's allocator schema still resolves, read from that build's own PDB.

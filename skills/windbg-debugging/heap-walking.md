@@ -11,7 +11,7 @@ v1 decoder does not support.
    consistent snapshot while it changes.
 2. For a broken-in x64 kernel target or suitable kernel dump, load private `nt` types with
    `set_symbol_path`, then `execute { "command": ".reload /f nt" }`. Use `pool_*`.
-3. For a stopped x64 user process or sufficiently complete user dump, load private `ntdll` types
+3. For a stopped x64 or ARM64 user process or sufficiently complete user dump, load private `ntdll` types
    with `set_symbol_path`, then `execute { "command": ".reload /f ntdll.dll" }`. Use `heap_*`.
 4. Check `execute { "command": "lm m nt" }` or `lm m ntdll`. The module must report PDB symbols,
    not exports or deferred symbols. If loading fails, follow [setup.md](setup.md)'s engine and
@@ -76,7 +76,10 @@ coverage was complete).
 
 ## V1 boundary
 
-V1 supports x64 Segment Heaps in stopped live targets and dumps with sufficient memory. It does
-not decode classic NT heaps, WOW64, or ARM64. Microsoft `!heap` supports both Segment and NT heaps,
+V1 supports x64 and ARM64 Segment Heaps in stopped live targets and dumps with sufficient memory,
+including an x64 process emulated on ARM64 — though one launched under the debugger on ARM64
+26100.1 had only classic NT heaps, even for a `HeapCreate` asking for a Segment Heap, so expect
+`heap_list` to list its heaps as unsupported there. It does not decode classic NT heaps, and it
+refuses a WOW64 process rather than list the emulation layer's heaps as the program's. Microsoft `!heap` supports both Segment and NT heaps,
 so direct a classic-heap case to `execute { "command": "!heap ..." }` and state that its output is
 outside typed Segment Heap coverage. See Microsoft's [`!heap` documentation](https://learn.microsoft.com/en-us/windows-hardware/drivers/debuggercmds/-heap).

@@ -33,7 +33,7 @@ This file is the map. Each topic is one document, and each document is the whole
 | [Transactional batches](docs/debug-batch.md) | `debug_batch`: a mutating sequence whose cleanup runs on every path, including a timeout or a disconnect |
 | [Walking a structure](docs/walk-memory.md) | `walk_memory`: lists, arrays and chains where an unreadable node is a row rather than the end of the walk |
 | [Session transcripts](docs/transcripts.md) | `WINDBG_MCP_TRANSCRIPT`: a JSONL record of every call, what is redacted, and rendering one as an asciicast |
-| [Limitations & notes](docs/limitations.md) | The honest edges — TTD is user-mode only, static reachability is best-effort, pool and heap walks need a stopped x64 target |
+| [Limitations & notes](docs/limitations.md) | The honest edges — TTD is user-mode only, static reachability is best-effort, pool walks need a stopped x64 kernel and heap walks a stopped x64 or ARM64 process |
 | [Walkthroughs](docs/walkthroughs.md) | Worked sessions end to end: crash-dump triage, TTD, a Flare-On solve, driver IOCTL surfaces |
 | [The local-model eval](docs/local-model-eval.md) | A grid of model × tool surface × context window against a verified answer key: what a laptop-sized model can drive, and the two defects it found in this server |
 
@@ -122,7 +122,7 @@ Sixty-three tools in eight `--tools` groups; the rows below split some of those 
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 
-All of them are served unless you say otherwise, and the definitions cost the model **94,875 bytes —
+All of them are served unless you say otherwise, and the definitions cost the model **94,921 bytes —
 about 24k tokens — before it has asked anything** (measured 2026-09-20). `--tools
 session,inspect,crash` cuts that to 33,187 B for twenty-three tools, and a `--listen` client can be
 given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
@@ -261,7 +261,8 @@ The full list, with what each one means for a workflow, is in
   operations serially: await each result before sending the next call against that session.
 - **Symbol *names* need setup on the debugger host** — `msdia140.dll` beside the binary, a symbol
   path, and (for TTD) a reload at a stopped position. Without them, address-based queries still work.
-- **The pool and heap walkers need a stopped x64 target.** They decode x64 allocator structures, so
-  a 32-bit target has no `heap_*` tools whichever worker holds it — SOS's own `!dumpheap`/`!eeheap`
-  are the managed equivalent, and reaching those is what the 32-bit worker and its `x86\` engine
-  payload ([`docs/install.md`](docs/install.md)) are for.
+- **The pool walker needs a stopped x64 kernel, and the heap walker a stopped x64 or ARM64
+  process.** A 32-bit or WoW64 process has no `heap_*` tools whichever worker holds it, because its
+  heaps are 32-bit structures — SOS's own `!dumpheap`/`!eeheap` are the managed equivalent, and
+  reaching those is what the 32-bit worker and its `x86\` engine payload
+  ([`docs/install.md`](docs/install.md)) are for.

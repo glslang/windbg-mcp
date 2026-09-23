@@ -227,48 +227,48 @@
     },
     {
       "annotations": 128,
-      "description": 220,
+      "description": 229,
       "inputSchema": 1153,
-      "modelVisible": 1430,
+      "modelVisible": 1439,
       "name": "heap_allocations",
       "outputSchema": 5629,
-      "wire": 7218
+      "wire": 7227
     },
     {
       "annotations": 124,
-      "description": 194,
+      "description": 203,
       "inputSchema": 618,
-      "modelVisible": 864,
+      "modelVisible": 873,
       "name": "heap_census",
       "outputSchema": 5463,
-      "wire": 6482
+      "wire": 6491
     },
     {
       "annotations": 126,
-      "description": 356,
+      "description": 366,
       "inputSchema": 493,
-      "modelVisible": 900,
+      "modelVisible": 910,
       "name": "heap_chunk",
       "outputSchema": 5819,
-      "wire": 6876
+      "wire": 6886
     },
     {
       "annotations": 130,
-      "description": 259,
+      "description": 268,
       "inputSchema": 762,
-      "modelVisible": 1078,
+      "modelVisible": 1087,
       "name": "heap_diagnostics",
       "outputSchema": 5295,
-      "wire": 6534
+      "wire": 6543
     },
     {
       "annotations": 119,
-      "description": 302,
+      "description": 311,
       "inputSchema": 465,
-      "modelVisible": 817,
+      "modelVisible": 826,
       "name": "heap_list",
       "outputSchema": 5159,
-      "wire": 6126
+      "wire": 6135
     },
     {
       "annotations": 120,
@@ -570,14 +570,14 @@
   ],
   "totals": {
     "annotations": 6672,
-    "description": 36536,
+    "description": 36582,
     "inputSchema": 55021,
     "instructions": 2003,
-    "modelVisible": 94875,
+    "modelVisible": 94921,
     "outputSchema": 162108,
-    "payload": 265442,
+    "payload": 265488,
     "tools": 63,
-    "wire": 265368,
+    "wire": 265414,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }
