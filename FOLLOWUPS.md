@@ -82,7 +82,12 @@ first time ([dbgscope#177](https://github.com/glslang/dbgscope/pull/177), 2026-0
 target's own `HeapWalk` as the oracle: the pool walker's LFH reading, which that run showed is not
 `nt`'s, and the ARM64 pool gate it now waits on; an LFH block awaiting a delayed free, which
 `HeapWalk` calls free and the heap tools call allocated; and the uncommitted memory that keeps
-every live walk measured at `Partial` once the diagnostics were gone.
+every live walk measured at `Partial` once the diagnostics were gone. And items 99–100 from
+checking item 96's fixes end to end through the tool surface once they had merged (2026-09-23) —
+a big-page tag `!pool` resolves and the walker still does not, which is the half of item 96's
+heaviest tag that its hash correction turned out not to explain; and the VS chunk chain coming
+apart on **29671**, found while confirming those fixes were not fitted to 26100, which they are
+not.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -2017,3 +2022,78 @@ something*. Not measured on x64, where nothing about the mechanism differs.
   the first as a state of its own that does not clear `complete`.
 - **Where it picks up:** `walk_region` and the page-range and VS walks in dbgscope's
   `src/pool/snapshot.rs`, and `unreadable_gaps` in `src/heap.rs`.
+
+## 99. [dbgscope] A big-page tag the engine resolves and the walker does not
+
+**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s `pool_*` tools.
+
+Item 96's hash fix was **necessary and not sufficient**. With it in place, on the live `ctf-vm`
+guest (Server 26100.33438, 2026-09-23) `0x00000000` is still the heaviest tag the census reports —
+10,432 allocations, 51.7 MB — against 11,492 and 52.7 MB before it, so the correction barely moved
+the count it was expected to account for. The prediction that it would collapse was wrong, and it
+was written down before it was checked.
+
+Three of those chunks put to `!pool`:
+
+| address | the walk | `!pool` |
+|---|---|---|
+| `0xffff8b836d455000` | tag 0, 41584 bytes | large page allocation, tag `MiPm`, size `0xa270` |
+| `0xffff8b836d464010` | tag 0, 4080 bytes | large page allocation, tag `Mm`, size `0x1000` |
+| `0xffff8b836d454000` | tag 0, VS, 592 bytes, header `…453ff0` | `(Allocated) *Mm`, header `…454000`, size `0x250` |
+
+The first two are large allocations whose tracker entry the engine finds and the walker does not —
+the sizes agree exactly (`0xa270` = 41,584; `0x1000` − 0x10 = 4,080), so the block is being located
+correctly and only the tag is lost. `lookup_big_page_target` emits *no* diagnostic for them
+(`pool_diagnostics` lists four shapes, none of them the "no validated big-page entry" message it
+pushes when a probe runs out), so whatever happens is upstream of the probe rather than a lookup
+that ran and failed.
+
+The third is not a large allocation at all, and is a **different disagreement**: the two place the
+block's header 0x10 apart — the walker at `…453ff0`, the page before, which is where
+`adjust_page_end_header` puts a header that would straddle a page boundary. Whether the walker or
+the extension is right there is unmeasured, and it should not be assumed to be the same fault as
+the other two.
+
+- **Why deferred:** filed from the end-to-end check that followed item 96's merge rather than from
+  the work itself, and the first thing it needs is to be told apart from the third row above.
+- **What would close it:** read `nt!PoolBigPageTable` directly for one of those VAs — the index
+  arithmetic is settled by item 96 and can be computed by hand — and say whether the entry is
+  absent, present-and-unreached, or present-and-rejected. `docs/smoke-test.md`'s oracle
+  comparison exempts a `....` tag from its tag check, which is why the tier passes over this;
+  that exemption is the other thing to revisit.
+- **Where it picks up:** `lookup_big_page_target` in dbgscope's `src/pool/snapshot.rs`, and
+  `adjust_page_end_header` in `src/pool/decode.rs` for the third row.
+
+## 100. [dbgscope] The VS chunk chain comes apart on 29671 in a way it does not on 26100
+
+**Repo:** `dbgscope`.
+
+The pool walker was run against `lab-nt` — Windows **29671** (`rs_prerelease`, 260911-1426), some
+3,500 builds past the 26100 everything else here is measured on — 2026-09-23, to check the item 96
+fixes were not fitted to one build. They are not: `_HEAP_LFH_SUBSEGMENT` and `_POOL_HEADER` have
+identical offsets, `RtlpHpLfhSubsegmentCountAllocatedBlocks` is the same popcount less padding less
+withheld, `ExpAddTagForBigPages` still shifts the whole pointer and multiplies 64 bits wide, and
+the walk reports **457,457 allocated of 552,676** (82.8%, against 83.0% on the fixed `ctf-vm`).
+Every block checked against `!pool` agreed, including ones `pool_find_tag` had not returned.
+
+What is new there is the diagnostics: **2,160** against 172, in two shapes that `ctf-vm` produces
+none of —
+
+- `VS extent at # does not begin on a chunk boundary: the chunk chain names # # bytes back inside
+  unreadable memory; # bytes not decoded` — 254
+- `VS extent at # cannot be placed: the chain was already lost earlier in this region; # bytes not
+  decoded` — 204
+
+— beside 272 unreadable VS free tree nodes and `unplaced_bytes: 7,700,480`.
+
+- **Why deferred:** it is one reading of one machine, and the confound is not ruled out. That
+  guest is a hypervisor lab's root partition with 3h34m uptime; `ctf-vm` had minutes. A busier,
+  more fragmented pool is a complete explanation for a longer chain being lost, and nothing here
+  separates that from a 29671 change.
+- **What would close it:** the same walk on a 26100 guest with comparable uptime and pool
+  pressure, or on 29671 shortly after boot. If the shapes track the build rather than the load,
+  read `_HEAP_VS_CHUNK_HEADER` and the extent placement on 29671 against 26100.
+- **Where it picks up:** `walk_vs` and the extent placement in dbgscope's `src/pool/snapshot.rs`.
+  Note while working there that **`!pool` is a weaker oracle on that guest**: it printed
+  `No page table info` and `MI_SYSTEM_INFORMATION.Vs.SystemVaType not initialized`, and called a
+  region `Unknown`, so the engine's own reading is partly degraded on 29671 too.
