@@ -1450,6 +1450,29 @@ about. This is the other half — an attach that lands:
   containing one cannot be turned back into the bytes it came from. That is a fact about rendering
   and says nothing about the walk, so it skips the comparison with a note rather than failing.
 
+  **And the decoding is put to an oracle that is not the decoder.** Every comparison above reads
+  one walk twice — the census against `pool_find_tag`, as that paragraph says — so they share
+  every decoder and cannot see one be wrong, which is how both of `FOLLOWUPS.md` item 96's
+  defects lasted. `compare_pool_decoding_against_the_engine` dumps a pool page with `!pool`,
+  `kdexts`' own reading, and asks `pool_chunk` about every block **the engine** calls allocated.
+  That direction is the point: the failure it was written for reports allocated blocks as freed,
+  and `pool_find_tag` lists only what the walk already calls allocated — so sampling *it* cannot
+  show a false free, and the first version of this did exactly that and agreed four times out of
+  four against a decoder that was wrong about tens of thousands of blocks. The anchor has to be
+  LFH-backed and the pages are stepped `[0, 4, 9, 14, 19]` from it, because the bitmap was read
+  correctly for low slots and wrongly for high ones, and a subsegment of 171 blocks spans twenty
+  pages. `POOL_ORACLE_MINIMUM` fails a run that compared too few rather than passing it: a text
+  parse that matches nothing looks exactly like a target on which everything agreed. Verified
+  both ways against one guest (Server 26100.33438, 2026-09-23) — four of twenty blocks
+  disagreeing before the fix, twelve compared and none disagreeing after.
+
+  **It costs about ten minutes, and the reason is worth knowing before adding queries here.**
+  Measured 626s. A walk that ends `partial` is not cached, and on a live kernel it always does —
+  uncommitted space alone emitted 148 diagnostics on that run — so each `pool_find_tag` and
+  `pool_chunk` the helper makes pays a fresh ~20s walk. Any multi-query test of this shape is
+  therefore quadratic in the questions it asks. The four disagreements were all on **one** page,
+  so the page spread is the part that must not shrink; the per-page count is the part that can.
+
 - **`device_security` is checked against the debugger's own view of the same device.** Three
   oracles, none of them this server's code. `!devobj` -- somebody else's extension -- names the
   device object, its driver and **its security descriptor**, and every one of those has to be the
