@@ -1330,18 +1330,29 @@ presents VirtIO, and `1AF4` is not in the Debugging Tools' `VerifiedNICList.xml`
 are **transport-specific and skip themselves** rather than failing: the KD endpoint being owned by
 the worker process is a UDP claim, and the key-redaction claim needs a key to look for.
 
-**Nor does the target have to be x64** — but two of the ten tests need one. The pool tools
-document it (*"Needs a broken-in x64 kernel target"*) because the walker decodes x64 pool
-descriptors, so `a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` and
-`a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer` stand down against anything
-else. The architecture is read from the target's own `vertarget`, not from `cfg!(target_arch)`: what
-decides it is the target, and the debugger host is routinely a different machine of a different
-shape. Everything skipped here says so in the output rather than passing quietly.
+**Nor does the target have to be x64.** It did until dbgscope#179 — the walker refused anything
+else, so `a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` and
+`a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer` stood down against an ARM64
+kernel, reading the architecture from the target's own `vertarget`. Both take ARM64 now.
 
-One caveat that is not a gate, because it is a property of a particular wire rather than of the
-tests: **a pool walk over a 115200-baud serial link will not finish inside any sane budget** — it
-reads every committed pool page. If you point the tier at a serial target, expect those two to time
-out rather than to skip, unless the target is also non-x64 and stands down first.
+**What gates those two instead is the wire, and it is the caveat this section used to carry as a
+non-gate.** A pool walk reads every committed pool page, and over a 115200-baud serial link it
+does not finish: measured 2026-09-23 against a live ARM64 kernel, a single `pool_find_tag` took
+285.0, 285.1, 285.2 and 285.4s across four runs and every one returned
+`coverage: deadline_truncated`. A spread that tight is a bound being hit rather than work
+finishing, and it sits within 15s of the 300s default `WINDBG_MCP_CALL_TIMEOUT_SECS`. Since
+`compare_pool_decoding_against_the_engine` asks ~18 such queries (see below for why it cannot
+share one walk), the same comparison over serial is about **85 minutes**.
+
+So `pool_walk_is_affordable` reads the transport out of the connection string — `com:` is the
+slow case, measured; KDNET is the ~20s-a-walk case the 626s figure below came from — and the two
+tests skip a serial link by cost rather than fail by timeout. That skip is not a deletion:
+**`WINDBG_MCP_SMOKE_POOL_SLOW_LINK=1` runs them anyway**, which is how the ARM64 half of
+`FOLLOWUPS.md` item 96 was measured in the first place. Budget the wall clock before setting it.
+A transport nobody has measured counts as affordable, deliberately: the safe default is running
+a test that may be slow, not skipping one silently.
+
+Everything skipped here says so in the output rather than passing quietly.
 
 `--test-threads=1` is required, not tidiness: the filter matches **ten** tests, and the KD
 transport is single-owner. Run them in parallel and the later attaches fail, which can leave the

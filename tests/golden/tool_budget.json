@@ -353,39 +353,39 @@
     },
     {
       "annotations": 123,
-      "description": 375,
+      "description": 384,
       "inputSchema": 602,
-      "modelVisible": 1029,
+      "modelVisible": 1038,
       "name": "pool_census",
       "outputSchema": 4936,
-      "wire": 6119
+      "wire": 6128
     },
     {
       "annotations": 129,
-      "description": 941,
+      "description": 950,
       "inputSchema": 760,
-      "modelVisible": 1752,
+      "modelVisible": 1761,
       "name": "pool_chunk",
       "outputSchema": 5704,
-      "wire": 7616
+      "wire": 7625
     },
     {
       "annotations": 127,
-      "description": 1095,
+      "description": 1104,
       "inputSchema": 831,
-      "modelVisible": 1983,
+      "modelVisible": 1992,
       "name": "pool_diagnostics",
       "outputSchema": 4873,
-      "wire": 7014
+      "wire": 7023
     },
     {
       "annotations": 122,
-      "description": 671,
+      "description": 680,
       "inputSchema": 1795,
-      "modelVisible": 2520,
+      "modelVisible": 2529,
       "name": "pool_find_tag",
       "outputSchema": 5756,
-      "wire": 8429
+      "wire": 8438
     },
     {
       "annotations": 90,
@@ -570,14 +570,14 @@
   ],
   "totals": {
     "annotations": 6672,
-    "description": 36582,
+    "description": 36618,
     "inputSchema": 55021,
     "instructions": 2003,
-    "modelVisible": 94921,
+    "modelVisible": 94957,
     "outputSchema": 162108,
-    "payload": 265488,
+    "payload": 265524,
     "tools": 63,
-    "wire": 265414,
+    "wire": 265450,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

@@ -140,7 +140,9 @@
   `.reload /f` for a driver it does not have.
 - The **kernel pool** tools (`pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics`) walk the allocator's own
   descriptors through dbgscope rather than shelling out to `!pool`/`!poolused`, so all four read
-  one snapshot and cannot disagree with each other. They need a **broken-in x64 kernel** target.
+  one snapshot and cannot disagree with each other. They need a **broken-in x64 or ARM64 kernel**
+  target — ARM64 since dbgscope#179, which lifted the gate after the walk was checked against
+  `!pool` block for block on a live ARM64 kernel (`FOLLOWUPS.md` item 96).
   Walking every pool page is expensive, so the snapshot is **cached per session** and reused; pass
   `refresh: true` after letting the target run, or you are reading a photograph of a target that has
   since moved. A walk that does happen is bounded by **what is left of the caller's own timeout**

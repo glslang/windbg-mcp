@@ -13947,38 +13947,85 @@ fn has_thread_context(registers: &str) -> bool {
     registers.contains("rip=") || registers.contains("pc=")
 }
 
-/// Whether the attached target is the **x64** kernel the pool tools require.
+/// Whether a live-kernel link is fast enough to put the pool walker to an oracle.
 ///
-/// Read from the opener's own `vertarget` report rather than from `cfg!(target_arch)`, because the
-/// architecture that decides this is the *target's* and not the debugger host's — those are
-/// routinely different, and on this project's own bench they are. `vertarget` names it:
-/// `Free x64` against `Free ARM 64-bit (AArch64)`.
+/// **Not architecture.** It was, until dbgscope#179: the walker refused anything but x64, so an
+/// ARM64 target left these tests with no premise. It takes both now, and what is left is the
+/// *wire* — which the connection string names, so this reads that rather than the target.
 ///
-/// The pool tools say "Needs a broken-in x64 kernel target" in their own descriptions
-/// (`src/server.rs`), and the walker decodes x64 pool descriptors. Against anything else the two
-/// tests below have no premise, so they say so instead of failing.
-fn target_is_x64(report: &str) -> bool {
-    !report.contains("AArch64") && !report.contains("ARM 64") && report.contains("x64")
+/// Both sides of the comparison are measured rather than assumed. Over KDNET on `ctf-vm`, a
+/// fresh walk costs ~20s and `compare_pool_decoding_against_the_engine` 626s end to end
+/// (`docs/smoke-test.md`). Over `com:port=COM1,baud=115200`, one `pool_find_tag` measured
+/// 285.0, 285.1, 285.2 and 285.4s across four runs on 2026-09-23 — a spread that tight is a
+/// bound being hit rather than work finishing, and every one returned
+/// `coverage: deadline_truncated`. That puts the same ~18-query comparison near **85 minutes**,
+/// with each call within 15s of the 300s default `WINDBG_MCP_CALL_TIMEOUT_SECS`.
+///
+/// So the serial bench stands down on **cost**, not on having nothing to prove — which is why
+/// [`POOL_SLOW_LINK_ENV`] exists rather than the tests simply being x64-only again. A walk that
+/// runs out of budget is a truncated answer, not a wrong one, and these tests want a complete
+/// enough one to compare.
+fn pool_walk_is_affordable(connection: &str) -> bool {
+    !connection
+        .trim_start()
+        .to_ascii_lowercase()
+        .starts_with("com:")
+}
+
+/// Run the pool tests against a link [`pool_walk_is_affordable`] calls too slow.
+///
+/// On demand and nothing else — budget the wall clock before setting it, because the measurement
+/// above is per *query* and these tests ask ~18 of them.
+const POOL_SLOW_LINK_ENV: &str = "WINDBG_MCP_SMOKE_POOL_SLOW_LINK";
+
+/// Whether the two pool tests should run against this connection at all.
+fn pool_tier_runs(connection: &str) -> bool {
+    pool_tier_runs_with(connection, std::env::var_os(POOL_SLOW_LINK_ENV).is_some())
+}
+
+/// The decision itself, with the override passed in rather than read.
+///
+/// Split out so it can be asserted: reading the environment inside it would make the one
+/// interesting case — an override that turns a refusal into a run — testable only by mutating
+/// process-wide state that every other test in this binary shares.
+fn pool_tier_runs_with(connection: &str, forced: bool) -> bool {
+    pool_walk_is_affordable(connection) || forced
 }
 
 /// Why the two pool tests stand down. Shared, so the pair cannot drift into disagreeing about
-/// what they need.
-const NOT_X64_SKIP: &str = "the pool tools need a broken-in x64 kernel target; this one is not, so \
-                            there is nothing here for them to be right or wrong about";
+/// what they need — and it names the override, because a skip whose reason is "too slow" is
+/// useless to whoever has the time.
+const SLOW_LINK_SKIP: &str = "this kernel link is serial, where a single pool query measured \
+                              ~285s and returned a truncated walk; set \
+                              WINDBG_MCP_SMOKE_POOL_SLOW_LINK=1 to run the pool tests against it \
+                              anyway, and budget around 85 minutes";
 
 /// Pinned in the default tier, like the two predicates above, because the tier that would catch a
 /// regression needs a kernel on the other end of a wire.
 #[test]
-fn a_targets_architecture_is_read_from_its_own_report() {
-    assert!(target_is_x64(
-        "Windows 10 Kernel Version 26100 MP (4 procs) Free x64"
-    ));
-    assert!(!target_is_x64(
-        "Windows 10 Kernel Version 26100 MP (4 procs) Free ARM 64-bit (AArch64)"
-    ));
-    // Nothing to go on is not x64: this gates work that would otherwise fail confusingly, so the
-    // safe answer to "cannot tell" is to skip it.
-    assert!(!target_is_x64("Windows 10 Kernel Version 26100 MP"));
+fn a_serial_kernel_link_is_read_as_too_slow_for_the_pool_oracle() {
+    // KDNET, which is what the 626s figure was measured over.
+    assert!(pool_walk_is_affordable("net:port=50000,key=1.2.3.4"));
+    // Serial, which is what the ~285s-per-query figure was measured over.
+    assert!(!pool_walk_is_affordable("com:port=COM1,baud=115200"));
+    // The engine accepts the transport prefix case-insensitively and a profile may carry
+    // leading space, so neither may smuggle a serial link past this.
+    assert!(!pool_walk_is_affordable("  COM:pipe,port=\\\\.\\pipe\\kd"));
+    // Unlike the architecture predicate this replaces, "cannot tell" is *affordable* here: the
+    // safe default is to run a test that may be slow rather than to skip one silently. A wire
+    // nobody has measured is a wire nobody has shown to be slow.
+    assert!(pool_walk_is_affordable("1394:channel=1"));
+}
+
+/// The override is the whole reason the skip above is a deferral rather than a deletion, so the
+/// case that matters is the one where it changes the answer.
+#[test]
+fn the_slow_link_override_turns_the_pool_skip_into_a_run() {
+    let serial = "com:port=COM1,baud=115200";
+    assert!(!pool_tier_runs_with(serial, false));
+    assert!(pool_tier_runs_with(serial, true));
+    // And it is an override, not a gate: a fast link needs nothing set.
+    assert!(pool_tier_runs_with("net:port=50000,key=1.2.3.4", false));
 }
 
 /// Pinned in the default tier for the same reason as the port parser above: the assertion it feeds
@@ -15043,12 +15090,12 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         assert_no_error(&attached, "attach_kernel");
 
-        // The pool walker decodes x64 pool descriptors, which the tools' own descriptions say. On
-        // any other target this test has no premise, so it says so — before paying for symbols,
-        // and while still falling through to the detach below, since the target is broken in from
-        // the attach onward whatever we decide here.
-        if !target_is_x64(&report) {
-            skip(NOT_X64_SKIP);
+        // Said before paying for symbols, and while still falling through to the detach below,
+        // since the target is broken in from the attach onward whatever we decide here. The
+        // question is the wire rather than the target: the walker takes ARM64 kernels since
+        // dbgscope#179, and what a serial link cannot afford is the walking.
+        if !pool_tier_runs(&connection) {
+            skip(SLOW_LINK_SKIP);
             return;
         }
 
@@ -16426,29 +16473,22 @@ fn hypervisor_breakpoint_hit(server: &mut Server, session: &str) {
     println!("hypervisor: ran to {address} and hit it, with an empty breakpoint inventory after");
 }
 
-/// [`with_live_kernel_session`], for a body that only means anything against an **x64** target.
+/// [`with_live_kernel_session`], for a body whose cost only a fast link can carry.
 ///
-/// The architecture is read from the target's own `vertarget` rather than from `cfg!`, for the
-/// reason [`target_is_x64`] gives: what decides this is the target, not the debugger host. That
-/// costs one engine-local call, and it is asked *after* attaching because there is nowhere earlier
-/// to ask — which is fine, since the detach the wrapped helper performs runs either way.
-fn with_live_x64_kernel_session(
+/// This used to attach, ask the target `vertarget`, and stand down unless it was x64. Both halves
+/// of that are gone: the walker takes ARM64 kernels since dbgscope#179, and the question that is
+/// left — how fast the wire is — is answered by the connection string *before* attaching, so the
+/// engine-local call it cost is gone with it. See [`pool_walk_is_affordable`].
+fn with_live_pool_kernel_session(
     server: &mut Server,
     connection: &str,
     body: impl FnOnce(&mut Server, &str),
 ) {
-    with_live_kernel_session(server, connection, |server, session| {
-        let report = server.tool_text(
-            "execute",
-            json!({ "command": "vertarget", "session_id": session }),
-            TARGET_STEP,
-        );
-        if !target_is_x64(&report) {
-            skip(NOT_X64_SKIP);
-            return;
-        }
-        body(server, session);
-    });
+    if !pool_tier_runs(connection) {
+        skip(SLOW_LINK_SKIP);
+        return;
+    }
+    with_live_kernel_session(server, connection, body);
 }
 
 /// The steps that save a byte, patch it, and prove the patch landed — the opening of every
@@ -16985,7 +17025,7 @@ fn a_live_kernel_batch_step_can_ask_the_pool_about_a_captured_pointer() {
         &SERVER_CALL_TIMEOUT.as_secs().to_string(),
     )]);
 
-    with_live_x64_kernel_session(&mut server, &connection, |server, session| {
+    with_live_pool_kernel_session(&mut server, &connection, |server, session| {
         let symbols = load_kernel_symbols(server, session);
         assert!(
             symbols.loaded.contains("pdb symbols") && !symbols.probe.is_empty(),
