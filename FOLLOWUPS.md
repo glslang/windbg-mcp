@@ -77,17 +77,17 @@ A64 writes `a || b || c` as three compares feeding one branch, and this walk rea
 and files the rest in `untracked`. And item 94 from giving the multiprocessor hypervisor
 investigation's harness the tools it was written against (2026-09-20) -- that investigation is
 item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
-`bd`/`be` deliberately did not. And items 96–98 from running the heap tools on ARM64 for the
+`bd`/`be` deliberately did not. And items 97–98 from running the heap tools on ARM64 for the
 first time ([dbgscope#177](https://github.com/glslang/dbgscope/pull/177), 2026-09-23), with the
-target's own `HeapWalk` as the oracle: the pool walker's LFH reading, which that run showed is not
-`nt`'s, and the ARM64 pool gate it now waits on; an LFH block awaiting a delayed free, which
-`HeapWalk` calls free and the heap tools call allocated; and the uncommitted memory that keeps
-every live walk measured at `Partial` once the diagnostics were gone. And items 99–100 from
-checking item 96's fixes end to end through the tool surface once they had merged (2026-09-23) —
-a big-page tag `!pool` resolves and the walker still does not, which is the half of item 96's
-heaviest tag that its hash correction turned out not to explain; and the VS chunk chain coming
-apart on **29671**, found while confirming those fixes were not fitted to 26100, which they are
-not.
+target's own `HeapWalk` as the oracle: an LFH block awaiting a delayed free, which `HeapWalk`
+calls free and the heap tools call allocated; and the uncommitted memory that keeps every live
+walk measured at `Partial` once the diagnostics were gone. That run filed item 96 as well — the
+pool walker's LFH reading, which it showed is not `nt`'s, and the ARM64 pool gate behind it — and
+that one is now in [`DONE.md`](./DONE.md). And items 99–100 from checking its fixes end to end
+through the tool surface once they had merged (2026-09-23) — a big-page tag `!pool` resolves and
+the walker still does not, which is the half of item 96's heaviest tag that its hash correction
+turned out not to explain; and the VS chunk chain coming apart on **29671**, found while
+confirming those fixes were not fitted to 26100, which they are not.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1883,99 +1883,6 @@ gap rather than a missing primitive -- the same shape item 2 records for `ba`, w
   today.
 - **Picks up at:** `worker::clear_breakpoints` and `ClearBreakpointsArgs`, and
   `breakpoints_are_listed_and_cleared_through_their_own_tools` for the round trip.
-
-## 96. [dbgscope + windbg-mcp] The pool walker on ARM64, and an LFH reading that is not `nt`'s
-
-**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s heap tools
-([dbgscope#177](https://github.com/glslang/dbgscope/pull/177)).
-
-`pool_*` still refuses every ARM64 kernel (`pool::query` accepts `IMAGE_FILE_MACHINE_AMD64` and
-nothing else), and they will need to work there — the maintainer's call, 2026-09-23, when the heap
-tools were lifted and this was split off.
-
-**Both readings this was filed against are corrected and confirmed against a live pool; the gate
-is what is left.** The corrections are on dbgscope's `fix/nt-lfh-bitmap-and-big-page-hash`, read
-2026-09-23 from `nt`'s own code on the repository's sample dumps (x64 26100.32995,
-`081226-2187-01.dmp`; ARM64 26100, `082126-7015-01.dmp`) and then measured against the live
-`ctf-vm` guest, below.
-
-- **`nt`'s LFH block bitmap is one bit per block, 64 to a word**, now
-  `LfhBitmap::ContiguousBits`. The bit-level authority is
-  `nt!RtlpHpLfhSubsegmentSetWitheldBlocks`, which withholds block `rdx` with `shr rdx,6` /
-  `and r8d,3Fh` / `bts rcx,r8` against `BlockBitmap` itself — so the walker's bit `2 * slot` over
-  `blocks / 4` bytes was neither the right bit nor the right length.
-  `RtlpHpLfhBlockBitmapInitialize`, `RtlpHpLfhSubsegmentCountAllocatedBlocks` and ARM64's
-  `RtlpHpLfhBlockBitmapAllocateNonAtomic` agree with it. Note what that routine withholds:
-  the block straddling each page boundary, **wherever in the subsegment it falls**, marked busy
-  like any allocation — withheld blocks are not a band of high slots a walk can stop before.
-- **The big-page hash truncated the page number to ULONG, and `nt` does not.**
-  `nt!ExpRemoveTagForBigPages` shifts the whole pointer and multiplies 64 bits wide
-  (`shr rax,0Ch` / `imul rcx,rax,9E5Fh` / `shr rdx,20h` / `xor edx,ecx`); ARM64's
-  `ExpAddTagForBigPages` is the same (`lsr x9,x21,#0xC` / `mul` / `eor x25,x8,x8,lsr #0x20`).
-  Truncating agrees on the low 32 bits of the product and therefore on nothing that survives the
-  fold: the two indices differed for every kernel address tried, a kernel page number not fitting
-  in 32 bits. `lookup_big_page_target` stops at the first empty entry, so a wrong start index
-  loses the tag and size rather than costing probes. Its test had recomputed the same truncating
-  formula, so it agreed with the bug instead of catching it; it now pins `nt`'s indices as
-  literals. **This half was never ARM64-specific** — it was wrong on x64 too, which is why it is
-  worth reading before the gate.
-- **Nothing the walker decodes has turned out to be x64-specific.** `_POOL_HEADER` and
-  `_HEAP_LFH_SUBSEGMENT` have identical offsets on both, and both routine families above are the
-  same algorithm on both. That answers the *investigation* the gate was waiting on; it is not a
-  substitute for walking an ARM64 pool.
-
-dbgscope#177 also changed three things the kernel walker shares — a segment list's head compared
-exactly rather than masked, a free-page-tree node exempted from the `TreeSignature` check, and tree
-links no longer masked to 16 bytes — each measured in user mode only. Those are still unmeasured
-against a kernel.
-
-**Both halves are now measured against a live x64 kernel** — the `ctf-vm` guest, Server 26100.33438,
-2026-09-23, once it was rebooted:
-
-- **The LFH bitmap, slot for slot.** Subsegment `0xffffac09de402000` carried `BlockCount` 171,
-  `WitheldBlockCount` 14 and `FreeCount` **0** — every block allocated — with
-  `CommitStateOffset - 8` = 3 bitmap words, all three `0xffffffffffffffff`. `nt`'s own arithmetic
-  checks out exactly on it: popcount 192, minus `(-(171 + 14)) & 63` = 7 padding bits, minus 14
-  withheld, is 171. The walk reported its *high* slots `reusable_free` against that, because two
-  bits per block sizes the read at `ceil(171 / 4)` = 43 bytes where the bitmap is 24 — the extra
-  19 bytes being the zeroes after it, so everything above slot ~96 read free. `!pool` calls those
-  blocks `(Allocated)`; slot 0 decoded correctly, which is the boundary the arithmetic predicts.
-- **The big-page hash.** `nt!PoolBigPageTable` at `0xffff8b836f5c0000`, `PoolBigPageTableSize`
-  `0x4000`. The entry for VA `0xffff8b8371402000` sits at index **`0x1640`**, which is what `nt`'s
-  hash computes; the truncating one computes `0x1948`, an empty slot.
-- **The scale, and the direction.** A forced walk before the fix reported 173,649 allocated chunks
-  of 276,511; after it, 252,079 of 292,736. Tens of thousands of live allocated kernel objects
-  were being reported as freed — which is the worst direction for these tools to be wrong in, and
-  is exactly backwards for the use they were built for.
-
-`a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` now carries that comparison
-(`compare_pool_decoding_against_the_engine`), **run both ways against the same guest**: on
-`3c1fc7b`, the revision pinned before this landed, it fails naming four of twenty blocks that
-`!pool` calls allocated and the walk calls `reusable_free`; on the fix — now
-[dbgscope#178](https://github.com/glslang/dbgscope/pull/178), pinned here as `5f33d47` — it
-passes, twelve blocks compared and none disagreeing. Twelve is past `POOL_ORACLE_MINIMUM`, which
-is what says it compared rather than skipped. The fix was verified through a path dependency and
-the merged revision is byte-identical to it (`git diff` over `src/pool/` is empty), so the
-reading carries to the pinned build without a second ten-minute run.
-
-**It costs 626s, and that is a finding rather than a footnote.** A `partial` walk's snapshot is
-not reused, so each of the helper's `pool_find_tag` and `pool_chunk` calls pays a fresh ~20s walk
-— roughly 18 of them here. On a live kernel the walk is *always* partial (uncommitted space
-alone emitted 148 diagnostics), so every multi-query test of this shape is quadratic in the
-number of questions it asks. Trimming the sample is the cheap half; the four disagreements the
-control found were all on **one** page, so the page spread is what must not shrink and the
-per-page count is what can.
-
-- **Why still open:** only the ARM64 gate is left, and lifting it wants an ARM64 kernel to walk.
-  This bench is x64 and the ARM64 sample dump is a minidump whose `nt!ExPoolState` reads
-  `????????`, so nothing here can walk an ARM64 pool.
-- **What would close it:** lift the machine check in `pool::query` and walk a live ARM64 kernel
-  pool — the structural half is already answered above, so what is missing is the run, not the
-  reading. The `pool_*` descriptions in `src/server.rs` move with it.
-- **Where it picks up:** `LfhBitmap` in dbgscope's `src/pool/decode.rs` and
-  `AllocatorSchema::lfh_bitmap` in `src/pool/layout.rs`; the machine check in `src/pool/query.rs`;
-  and the `pool_*` descriptions in `windbg-mcp`'s `src/server.rs`, which say *"Needs a broken-in
-  x64 kernel target"* and stay accurate while the gate stands.
 
 ## 97. [dbgscope] An LFH block awaiting a delayed free is reported allocated
 

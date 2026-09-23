@@ -20,7 +20,7 @@
 //!
 //! ```text
 //!   group      tools   bytes   what it is for
-//!   allocator     10   16,499  pool and heap walks, and `walk_memory`
+//!   allocator     10   16,535  pool and heap walks, and `walk_memory`
 //!   inspect       10   13,152  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session       10   13,682  opening a target, ending it, and watching this server
 //!   exec          10   14,876  breakpoints and execution control

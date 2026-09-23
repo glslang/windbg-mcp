@@ -9,8 +9,8 @@ v1 decoder does not support.
 
 1. Stop the target. The walkers refuse a running target because allocator metadata is not a
    consistent snapshot while it changes.
-2. For a broken-in x64 kernel target or suitable kernel dump, load private `nt` types with
-   `set_symbol_path`, then `execute { "command": ".reload /f nt" }`. Use `pool_*`.
+2. For a broken-in x64 or ARM64 kernel target or suitable kernel dump, load private `nt` types
+   with `set_symbol_path`, then `execute { "command": ".reload /f nt" }`. Use `pool_*`.
 3. For a stopped x64 or ARM64 user process or sufficiently complete user dump, load private `ntdll` types
    with `set_symbol_path`, then `execute { "command": ".reload /f ntdll.dll" }`. Use `heap_*`.
 4. Check `execute { "command": "lm m nt" }` or `lm m ntdll`. The module must report PDB symbols,

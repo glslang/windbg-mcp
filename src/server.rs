@@ -2762,8 +2762,8 @@ impl WindbgServer {
     }
 
     /// Find **allocated** kernel pool chunks carrying a tag, with their size, allocator and
-    /// backend. Needs a broken-in x64 kernel target. `stop_after_matches` can make a new walk
-    /// return deliberately early; a complete cached snapshot remains exhaustive.
+    /// backend. Needs a broken-in x64 or ARM64 kernel target. `stop_after_matches` can make a
+    /// new walk return deliberately early; a complete cached snapshot remains exhaustive.
     /// This walks the pool's own descriptors rather than shelling out to `!poolused`, so the
     /// result is structured.
     /// Only allocated chunks are indexed by tag — a freed chunk's tag is not reliably
@@ -2798,7 +2798,7 @@ impl WindbgServer {
     }
 
     /// Identify the pool chunk containing an address, **with its immediate neighbours**.
-    /// Needs a broken-in x64 kernel target.
+    /// Needs a broken-in x64 or ARM64 kernel target.
     /// This is the use-after-free question: it reports whether the chunk is still Allocated
     /// or has been freed, and what now borders it — which is what decides whether a pointer
     /// the target still holds is dangling, and what a reclaim would land next to.
@@ -2833,7 +2833,7 @@ impl WindbgServer {
     }
 
     /// The pool walk's own diagnostics, verbatim, optionally narrowed by substring.
-    /// Needs a broken-in x64 kernel target.
+    /// Needs a broken-in x64 or ARM64 kernel target.
     /// A real walk emits tens of thousands of diagnostics across a hundred-plus categories, so
     /// the summaries the other tools print are necessarily truncated — and the one line
     /// explaining a specific heap is reliably not in the truncated head. Filter by a heap
@@ -2869,7 +2869,7 @@ impl WindbgServer {
     }
 
     /// Per-tag census of the kernel pool: allocation counts and bytes, heaviest first.
-    /// Needs a broken-in x64 kernel target.
+    /// Needs a broken-in x64 or ARM64 kernel target.
     /// The structured answer to what `!poolused` renders as text. Useful for spotting
     /// which tag a driver's allocations are landing under before querying it by name.
     #[rmcp::tool(
