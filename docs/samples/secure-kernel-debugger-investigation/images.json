@@ -114,5 +114,18 @@
                                                  }
                                              ]
                    }
-               ]
+               ],
+    "supplementary":  [
+                          {
+                              "captured_date":  "2026-09-22",
+                              "scope":  "Secure-call dispatch of the VTL0 debug-break request; one image, offline",
+                              "file_version":  "10.0.29648.1000",
+                              "architecture":  "x64",
+                              "image_sha256":  "77DA0F3187B736554070DCB812A6AEB94BEFDDA48818BFE471CAFF3BD5DE390D",
+                              "pdb_signature":  "0B3BAA417248F6A9CB0CE8BAF184A7751",
+                              "debugger":  "cdb 10.0.29617.1000 AMD64, from WinDbg package 1.2606.22001.0",
+                              "evidence_file":  "secure-call-dispatch-29648.1000.txt",
+                              "evidence_sha256":  "04D64DEC85E8F058DF3E03332BAA24D77A66018FA005A6B7BFD58B02787B25C8"
+                          }
+                      ]
 }

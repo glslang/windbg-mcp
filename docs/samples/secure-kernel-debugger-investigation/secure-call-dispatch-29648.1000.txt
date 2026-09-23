@@ -1,0 +1,392 @@
+Offline securekernel.exe function excerpts, file version 10.0.29648.1000
+Second pass, 2026-09-22: secure-call dispatch of the VTL0 debug-break request.
+Addresses are offline image addresses, not captured live target addresses.
+Headers, local paths, prompts and unrelated disassembly have been omitted.
+
+--- Symbols sharing image address 00000001`4002fa90 (identical COMDAT folding) ---
+
+00000001`4002fa90 securekernel!IumpDebugBreakRequestedByVtl0 (IumpDebugBreakRequestedByVtl0)
+00000001`4002fa90 securekernel!SkhalpPciAccessAtsCapability (SkhalpPciAccessAtsCapability)
+00000001`4002fa90 securekernel!SkIsSecureKernel (SkIsSecureKernel)
+00000001`4002fa90 securekernel!SkpnppSwdValidateTrustlet (SkpnppSwdValidateTrustlet)
+
+--- uf securekernel!IumpDebugBreakRequestedByVtl0 ---
+
+securekernel!IumpDebugBreakRequestedByVtl0:
+00000001`4002fa90 33c0            xor     eax,eax
+00000001`4002fa92 c3              ret
+
+--- uf securekernel!IumpInvokeLimitedModeSecureService ---
+
+securekernel!IumpInvokeLimitedModeSecureService:
+00000001`4002fa9c 48895c2418      mov     qword ptr [rsp+18h],rbx
+00000001`4002faa1 4889742420      mov     qword ptr [rsp+20h],rsi
+00000001`4002faa6 57              push    rdi
+00000001`4002faa7 4883ec50        sub     rsp,50h
+00000001`4002faab 488bd9          mov     rbx,rcx
+00000001`4002faae 0fb74902        movzx   ecx,word ptr [rcx+2]
+00000001`4002fab2 8bf2            mov     esi,edx
+00000001`4002fab4 85d2            test    edx,edx
+00000001`4002fab6 7419            je      securekernel!IumpInvokeLimitedModeSecureService+0x35 (00000001`4002fad1)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x1c:
+00000001`4002fab8 b801000000      mov     eax,1
+00000001`4002fabd 8705dd561000    xchg    eax,dword ptr [securekernel!IumpSingleThreadedServiceRequestEntered (00000001`401351a0)]
+00000001`4002fac3 85c0            test    eax,eax
+00000001`4002fac5 740a            je      securekernel!IumpInvokeLimitedModeSecureService+0x35 (00000001`4002fad1)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x2b:
+00000001`4002fac7 bf220000c0      mov     edi,0C0000022h
+00000001`4002facc e9fb010000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x230 (00000001`4002fccc)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x35:
+00000001`4002fad1 b824010000      mov     eax,124h
+00000001`4002fad6 663bc8          cmp     cx,ax
+00000001`4002fad9 0f87f6000000    ja      securekernel!IumpInvokeLimitedModeSecureService+0x139 (00000001`4002fbd5)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x43:
+00000001`4002fadf 0f84e6000000    je      securekernel!IumpInvokeLimitedModeSecureService+0x12f (00000001`4002fbcb)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x49:
+00000001`4002fae5 8bc1            mov     eax,ecx
+00000001`4002fae7 2d05010000      sub     eax,105h
+00000001`4002faec 0f84cb000000    je      securekernel!IumpInvokeLimitedModeSecureService+0x121 (00000001`4002fbbd)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x56:
+00000001`4002faf2 83e812          sub     eax,12h
+00000001`4002faf5 0f84b4000000    je      securekernel!IumpInvokeLimitedModeSecureService+0x113 (00000001`4002fbaf)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x5f:
+00000001`4002fafb 83e801          sub     eax,1
+00000001`4002fafe 0f848b000000    je      securekernel!IumpInvokeLimitedModeSecureService+0xf3 (00000001`4002fb8f)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x68:
+00000001`4002fb04 83e803          sub     eax,3
+00000001`4002fb07 0f84a9000000    je      securekernel!IumpInvokeLimitedModeSecureService+0x11a (00000001`4002fbb6)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x71:
+00000001`4002fb0d 83e802          sub     eax,2
+00000001`4002fb10 7432            je      securekernel!IumpInvokeLimitedModeSecureService+0xa8 (00000001`4002fb44)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x76:
+00000001`4002fb12 83f806          cmp     eax,6
+00000001`4002fb15 0f85d3010000    jne     securekernel!IumpInvokeLimitedModeSecureService+0x252 (00000001`4002fcee)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x7f:
+00000001`4002fb1b 8b4330          mov     eax,dword ptr [rbx+30h]
+00000001`4002fb1e 4c8b4b20        mov     r9,qword ptr [rbx+20h]
+00000001`4002fb22 4c8b4318        mov     r8,qword ptr [rbx+18h]
+00000001`4002fb26 488b5310        mov     rdx,qword ptr [rbx+10h]
+00000001`4002fb2a 8b4b08          mov     ecx,dword ptr [rbx+8]
+00000001`4002fb2d 89442428        mov     dword ptr [rsp+28h],eax
+00000001`4002fb31 488b4328        mov     rax,qword ptr [rbx+28h]
+00000001`4002fb35 4889442420      mov     qword ptr [rsp+20h],rax
+00000001`4002fb3a e879de0200      call    securekernel!SkmmNtKernelShadowStackAssist (00000001`4005d9b8)
+00000001`4002fb3f e97a010000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x222 (00000001`4002fcbe)
+
+securekernel!IumpInvokeLimitedModeSecureService+0xa8:
+00000001`4002fb44 8b4b20          mov     ecx,dword ptr [rbx+20h]
+00000001`4002fb47 83f940          cmp     ecx,40h
+00000001`4002fb4a 760a            jbe     securekernel!IumpInvokeLimitedModeSecureService+0xba (00000001`4002fb56)
+
+securekernel!IumpInvokeLimitedModeSecureService+0xb0:
+00000001`4002fb4c bf05000080      mov     edi,80000005h
+00000001`4002fb51 e96a010000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x224 (00000001`4002fcc0)
+
+securekernel!IumpInvokeLimitedModeSecureService+0xba:
+00000001`4002fb56 448b4b10        mov     r9d,dword ptr [rbx+10h]
+00000001`4002fb5a 488d4328        lea     rax,[rbx+28h]
+00000001`4002fb5e 448b430c        mov     r8d,dword ptr [rbx+0Ch]
+00000001`4002fb62 8a5308          mov     dl,byte ptr [rbx+8]
+00000001`4002fb65 4889442440      mov     qword ptr [rsp+40h],rax
+00000001`4002fb6a 8b431c          mov     eax,dword ptr [rbx+1Ch]
+00000001`4002fb6d 894c2438        mov     dword ptr [rsp+38h],ecx
+00000001`4002fb71 33c9            xor     ecx,ecx
+00000001`4002fb73 89442430        mov     dword ptr [rsp+30h],eax
+00000001`4002fb77 8b4318          mov     eax,dword ptr [rbx+18h]
+00000001`4002fb7a 89442428        mov     dword ptr [rsp+28h],eax
+00000001`4002fb7e 8b4314          mov     eax,dword ptr [rbx+14h]
+00000001`4002fb81 89442420        mov     dword ptr [rsp+20h],eax
+00000001`4002fb85 e8b25c0400      call    securekernel!SkhalAccessPciDevice (00000001`4007583c)
+00000001`4002fb8a e92f010000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x222 (00000001`4002fcbe)
+
+securekernel!IumpInvokeLimitedModeSecureService+0xf3:
+00000001`4002fb8f 8b4330          mov     eax,dword ptr [rbx+30h]
+00000001`4002fb92 488d5310        lea     rdx,[rbx+10h]
+00000001`4002fb96 448b4b28        mov     r9d,dword ptr [rbx+28h]
+00000001`4002fb9a 4c8b4320        mov     r8,qword ptr [rbx+20h]
+00000001`4002fb9e 8b4b08          mov     ecx,dword ptr [rbx+8]
+00000001`4002fba1 89442420        mov     dword ptr [rsp+20h],eax
+00000001`4002fba5 e8ae520400      call    securekernel!SkhalReportBugCheckProgress (00000001`40074e58)
+00000001`4002fbaa e90f010000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x222 (00000001`4002fcbe)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x113:
+00000001`4002fbaf 33c9            xor     ecx,ecx
+00000001`4002fbb1 e87a840700      call    securekernel!SkPrepareForCrashDump (00000001`400a8030)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x11a:
+00000001`4002fbb6 33ff            xor     edi,edi
+00000001`4002fbb8 e903010000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x224 (00000001`4002fcc0)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x121:
+00000001`4002fbbd 488d4b08        lea     rcx,[rbx+8]
+00000001`4002fbc1 e8121b0300      call    securekernel!SkmmWriteProtectedPage (00000001`400616d8)
+00000001`4002fbc6 e9f3000000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x222 (00000001`4002fcbe)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x12f:
+00000001`4002fbcb e8c0feffff      call    securekernel!IumpDebugBreakRequestedByVtl0 (00000001`4002fa90)
+00000001`4002fbd0 e9e9000000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x222 (00000001`4002fcbe)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x139:
+00000001`4002fbd5 8bc1            mov     eax,ecx
+00000001`4002fbd7 2d27010000      sub     eax,127h
+00000001`4002fbdc 0f84d7000000    je      securekernel!IumpInvokeLimitedModeSecureService+0x21d (00000001`4002fcb9)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x146:
+00000001`4002fbe2 2dd9060000      sub     eax,6D9h
+00000001`4002fbe7 0f84af000000    je      securekernel!IumpInvokeLimitedModeSecureService+0x200 (00000001`4002fc9c)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x151:
+00000001`4002fbed 83e801          sub     eax,1
+00000001`4002fbf0 0f8481000000    je      securekernel!IumpInvokeLimitedModeSecureService+0x1db (00000001`4002fc77)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x15a:
+00000001`4002fbf6 83e801          sub     eax,1
+00000001`4002fbf9 7440            je      securekernel!IumpInvokeLimitedModeSecureService+0x19f (00000001`4002fc3b)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x15f:
+00000001`4002fbfb 83f801          cmp     eax,1
+00000001`4002fbfe 0f85ea000000    jne     securekernel!IumpInvokeLimitedModeSecureService+0x252 (00000001`4002fcee)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x168:
+00000001`4002fc04 bf0d0000c0      mov     edi,0C000000Dh
+00000001`4002fc09 48c705e4b9120000000000 mov qword ptr [securekernel!IumHiberCrashContext+0x11d8 (00000001`4015b5f8)],0
+00000001`4002fc14 e83ba80500      call    securekernel!ShvlExitMinimalDispatchLoop (00000001`4008a454)
+00000001`4002fc19 33c9            xor     ecx,ecx
+00000001`4002fc1b e8707f0500      call    securekernel!SkeResumeTimers (00000001`40087b90)
+00000001`4002fc20 488d542468      lea     rdx,[rsp+68h]
+00000001`4002fc25 b901000000      mov     ecx,1
+00000001`4002fc2a e831f0feff      call    securekernel!SkpSetHiberCrashState (00000001`4001ec60)
+00000001`4002fc2f c605a277110000  mov     byte ptr [securekernel!IumpLimitedDispatchFromNormalDispatch (00000001`401473d8)],0
+00000001`4002fc36 e985000000      jmp     securekernel!IumpInvokeLimitedModeSecureService+0x224 (00000001`4002fcc0)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x19f:
+00000001`4002fc3b 488b5310        mov     rdx,qword ptr [rbx+10h]
+00000001`4002fc3f 4c8d4c2460      lea     r9,[rsp+60h]
+00000001`4002fc44 8a4b08          mov     cl,byte ptr [rbx+8]
+00000001`4002fc47 4c8d442468      lea     r8,[rsp+68h]
+00000001`4002fc4c c644246800      mov     byte ptr [rsp+68h],0
+00000001`4002fc51 c744246000000000 mov     dword ptr [rsp+60h],0
+00000001`4002fc59 e89a790700      call    securekernel!SkGetSecurePageList (00000001`400a75f8)
+00000001`4002fc5e 8bf8            mov     edi,eax
+00000001`4002fc60 85c0            test    eax,eax
+00000001`4002fc62 785c            js      securekernel!IumpInvokeLimitedModeSecureService+0x224 (00000001`4002fcc0)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x1c8:
+00000001`4002fc64 0fb6442468      movzx   eax,byte ptr [rsp+68h]
+00000001`4002fc69 48894310        mov     qword ptr [rbx+10h],rax
+00000001`4002fc6d 8b442460        mov     eax,dword ptr [rsp+60h]
+00000001`4002fc71 48894318        mov     qword ptr [rbx+18h],rax
+00000001`4002fc75 eb49            jmp     securekernel!IumpInvokeLimitedModeSecureService+0x224 (00000001`4002fcc0)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x1db:
+00000001`4002fc77 8a4b08          mov     cl,byte ptr [rbx+8]
+00000001`4002fc7a 488d542468      lea     rdx,[rsp+68h]
+00000001`4002fc7f c744246800000000 mov     dword ptr [rsp+68h],0
+00000001`4002fc87 e83c750700      call    securekernel!SkEndSecurePageIteration (00000001`400a71c8)
+00000001`4002fc8c 8bf8            mov     edi,eax
+00000001`4002fc8e 85c0            test    eax,eax
+00000001`4002fc90 782e            js      securekernel!IumpInvokeLimitedModeSecureService+0x224 (00000001`4002fcc0)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x1f6:
+00000001`4002fc92 8b442468        mov     eax,dword ptr [rsp+68h]
+00000001`4002fc96 48894310        mov     qword ptr [rbx+10h],rax
+00000001`4002fc9a eb24            jmp     securekernel!IumpInvokeLimitedModeSecureService+0x224 (00000001`4002fcc0)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x200:
+00000001`4002fc9c 8b4328          mov     eax,dword ptr [rbx+28h]
+00000001`4002fc9f 448b4b20        mov     r9d,dword ptr [rbx+20h]
+00000001`4002fca3 4c8b4318        mov     r8,qword ptr [rbx+18h]
+00000001`4002fca7 488b5310        mov     rdx,qword ptr [rbx+10h]
+00000001`4002fcab 8a4b08          mov     cl,byte ptr [rbx+8]
+00000001`4002fcae 89442420        mov     dword ptr [rsp+20h],eax
+00000001`4002fcb2 e8c9870700      call    securekernel!SkStartSecurePageIteration (00000001`400a8480)
+00000001`4002fcb7 eb05            jmp     securekernel!IumpInvokeLimitedModeSecureService+0x222 (00000001`4002fcbe)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x21d:
+00000001`4002fcb9 e856a90700      call    securekernel!SkTerminate (00000001`400aa614)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x222:
+00000001`4002fcbe 8bf8            mov     edi,eax
+
+securekernel!IumpInvokeLimitedModeSecureService+0x224:
+00000001`4002fcc0 85f6            test    esi,esi
+00000001`4002fcc2 7408            je      securekernel!IumpInvokeLimitedModeSecureService+0x230 (00000001`4002fccc)
+
+securekernel!IumpInvokeLimitedModeSecureService+0x228:
+00000001`4002fcc4 33c0            xor     eax,eax
+00000001`4002fcc6 8705d4541000    xchg    eax,dword ptr [securekernel!IumpSingleThreadedServiceRequestEntered (00000001`401351a0)]
+
+securekernel!IumpInvokeLimitedModeSecureService+0x230:
+00000001`4002fccc 488b742478      mov     rsi,qword ptr [rsp+78h]
+00000001`4002fcd1 33c0            xor     eax,eax
+00000001`4002fcd3 66894302        mov     word ptr [rbx+2],ax
+00000001`4002fcd7 4863c7          movsxd  rax,edi
+00000001`4002fcda 48894308        mov     qword ptr [rbx+8],rax
+00000001`4002fcde c6430101        mov     byte ptr [rbx+1],1
+00000001`4002fce2 488b5c2470      mov     rbx,qword ptr [rsp+70h]
+00000001`4002fce7 4883c450        add     rsp,50h
+00000001`4002fceb 5f              pop     rdi
+00000001`4002fcec c3              ret
+
+securekernel!IumpInvokeLimitedModeSecureService+0x252:
+00000001`4002fcee 4c8bc1          mov     r8,rcx
+00000001`4002fcf1 48c744242000000000 mov   qword ptr [rsp+20h],0
+00000001`4002fcfa b921010000      mov     ecx,121h
+00000001`4002fcff 48c7c21c0000c0  mov     rdx,0FFFFFFFFC000001Ch
+00000001`4002fd06 41b901000000    mov     r9d,1
+00000001`4002fd0c e81770feff      call    securekernel!SkeBugCheckEx (00000001`40016d28)
+00000001`4002fd11 cc              int     3
+00000001`4002fd12 cc              int     3
+00000001`4002fd13 cc              int     3
+00000001`4002fd14 cc              int     3
+00000001`4002fd15 cc              int     3
+00000001`4002fd16 cc              int     3
+00000001`4002fd17 cc              int     3
+00000001`4002fd18 48895c2408      mov     qword ptr [rsp+8],rbx
+00000001`4002fd1d 57              push    rdi
+00000001`4002fd1e 4883ec20        sub     rsp,20h
+00000001`4002fd22 41c70100000000  mov     dword ptr [r9],0
+00000001`4002fd29 498bf9          mov     rdi,r9
+00000001`4002fd2c 418bc0          mov     eax,r8d
+00000001`4002fd2f 488bda          mov     rbx,rdx
+00000001`4002fd32 4885c9          test    rcx,rcx
+00000001`4002fd35 744f            je      securekernel!IumpQueryProfileInformation+0x6e (00000001`4002fd86)
+
+securekernel!IumpQueryProfileInformation+0x1f:
+00000001`4002fd37 baefefefef      mov     edx,0EFEFEFEFh
+00000001`4002fd3c 483bca          cmp     rcx,rdx
+00000001`4002fd3f 7407            je      securekernel!IumpQueryProfileInformation+0x30 (00000001`4002fd48)
+
+securekernel!IumpQueryProfileInformation+0x29:
+00000001`4002fd41 b80e0000c0      mov     eax,0C000000Eh
+00000001`4002fd46 eb4b            jmp     securekernel!IumpQueryProfileInformation+0x7b (00000001`4002fd93)
+
+securekernel!IumpQueryProfileInformation+0x30:
+00000001`4002fd48 83f804          cmp     eax,4
+00000001`4002fd4b 7307            jae     securekernel!IumpQueryProfileInformation+0x3c (00000001`4002fd54)
+
+securekernel!IumpQueryProfileInformation+0x35:
+00000001`4002fd4d b8230000c0      mov     eax,0C0000023h
+00000001`4002fd52 eb3f            jmp     securekernel!IumpQueryProfileInformation+0x7b (00000001`4002fd93)
+
+securekernel!IumpQueryProfileInformation+0x3c:
+00000001`4002fd54 c70300000000    mov     dword ptr [rbx],0
+00000001`4002fd5a e88567ffff      call    securekernel!GetHotpatchTestBootFunctionState (00000001`400264e4)
+00000001`4002fd5f 85c0            test    eax,eax
+00000001`4002fd61 7406            je      securekernel!IumpQueryProfileInformation+0x51 (00000001`4002fd69)
+
+securekernel!IumpQueryProfileInformation+0x4b:
+00000001`4002fd63 c70303000000    mov     dword ptr [rbx],3
+
+securekernel!IumpQueryProfileInformation+0x51:
+00000001`4002fd69 e88667ffff      call    securekernel!GetHotpatchTestRuntimeFunctionState (00000001`400264f4)
+00000001`4002fd6e 85c0            test    eax,eax
+00000001`4002fd70 7407            je      securekernel!IumpQueryProfileInformation+0x61 (00000001`4002fd79)
+
+securekernel!IumpQueryProfileInformation+0x5a:
+00000001`4002fd72 e87d67ffff      call    securekernel!GetHotpatchTestRuntimeFunctionState (00000001`400264f4)
+00000001`4002fd77 8903            mov     dword ptr [rbx],eax
+
+securekernel!IumpQueryProfileInformation+0x61:
+00000001`4002fd79 c70704000000    mov     dword ptr [rdi],4
+00000001`4002fd7f b837000040      mov     eax,40000037h
+00000001`4002fd84 eb0d            jmp     securekernel!IumpQueryProfileInformation+0x7b (00000001`4002fd93)
+
+securekernel!IumpQueryProfileInformation+0x6e:
+00000001`4002fd86 4c8bc7          mov     r8,rdi
+00000001`4002fd89 8bd0            mov     edx,eax
+00000001`4002fd8b 488bcb          mov     rcx,rbx
+00000001`4002fd8e e8ad3f0600      call    securekernel!SkpgQueryProfileInformation (00000001`40093d40)
+
+securekernel!IumpQueryProfileInformation+0x7b:
+00000001`4002fd93 488b5c2430      mov     rbx,qword ptr [rsp+30h]
+00000001`4002fd98 4883c420        add     rsp,20h
+00000001`4002fd9c 5f              pop     rdi
+00000001`4002fd9d c3              ret
+
+--- uf securekernel!SkdIsThisAKdTrap ---
+
+securekernel!SkdIsThisAKdTrap:
+00000001`400f4954 8b01            mov     eax,dword ptr [rcx]
+00000001`400f4956 3d03000080      cmp     eax,80000003h
+00000001`400f495b 7407            je      securekernel!SkdIsThisAKdTrap+0x10 (00000001`400f4964)
+
+securekernel!SkdIsThisAKdTrap+0x9:
+00000001`400f495d 3d1f000040      cmp     eax,4000001Fh
+00000001`400f4962 7510            jne     securekernel!SkdIsThisAKdTrap+0x20 (00000001`400f4974)
+
+securekernel!SkdIsThisAKdTrap+0x10:
+00000001`400f4964 83791800        cmp     dword ptr [rcx+18h],0
+00000001`400f4968 760a            jbe     securekernel!SkdIsThisAKdTrap+0x20 (00000001`400f4974)
+
+securekernel!SkdIsThisAKdTrap+0x16:
+00000001`400f496a 4883792000      cmp     qword ptr [rcx+20h],0
+00000001`400f496f 0f95c0          setne   al
+00000001`400f4972 c3              ret
+
+securekernel!SkdIsThisAKdTrap+0x20:
+00000001`400f4974 32c0            xor     al,al
+00000001`400f4976 c3              ret
+
+--- dd securekernel!SkiSecureServiceLimit L4 / dq securekernel!SkiSecureServiceTable ---
+
+SkiSecureServiceTable = 00000001`40156000, SkiSecureServiceLimit = 00000001`401560d0
+Limit value 0000001a = 26 entries, so the table ends where the limit variable begins.
+Truncated to the table extent; the debug-break routine is not among these entries.
+
+00000001`401560d0  0000001a 18080820 0820041c 0c080c0c
+#TABLE
+00000001`40156000  00000001`40075684 00000001`40075684
+00000001`40156010  00000001`400a28b0 00000001`40047f88
+00000001`40156020  00000001`400483a0 00000001`400b16bc
+00000001`40156030  00000001`40075df0 00000001`40075684
+00000001`40156040  00000001`40048880 00000001`400762fc
+00000001`40156050  00000001`40048930 00000001`400b17ac
+00000001`40156060  00000001`40072b80 00000001`40075684
+00000001`40156070  00000001`40048a48 00000001`4009f858
+00000001`40156080  00000001`40072d30 00000001`400a2c7c
+00000001`40156090  00000001`400aa720 00000001`400aa848
+00000001`401560a0  00000001`400a1c40 00000001`4009f9d0
+00000001`401560b0  00000001`40073148 00000001`400a27dc
+00000001`401560c0  00000001`400a3a70 00000001`40055ff4
+00000001`401560d0  18080820`0000001a 0c080c0c`0820041c
+
+Entries resolved against the symbol table (four indices share one folded body):
+
+  [ 0] 000140075684  securekernel!IumAssignMemoryToSocDomain / securekernel!IumOpenCurrentExtension / securekernel!IumAwaitSmc / securekernel!IumEmitSmc
+  [ 1] 000140075684  securekernel!IumAssignMemoryToSocDomain / securekernel!IumOpenCurrentExtension / securekernel!IumAwaitSmc / securekernel!IumEmitSmc
+  [ 2] 0001400a28b0  securekernel!IumCreateSecureDevice
+  [ 3] 000140047f88  securekernel!IumCreateSecureSection
+  [ 4] 0001400483a0  securekernel!IumCreateSecureSectionSpecifyPages
+  [ 5] 0001400b16bc  securekernel!IumCrypto
+  [ 6] 000140075df0  securekernel!IumDmaMapMemory
+  [ 7] 000140075684  securekernel!IumAssignMemoryToSocDomain / securekernel!IumOpenCurrentExtension / securekernel!IumAwaitSmc / securekernel!IumEmitSmc
+  [ 8] 000140048880  securekernel!IumFlushSecureSectionBuffers
+  [ 9] 0001400762fc  securekernel!IumGetDmaEnabler
+  [10] 000140048930  securekernel!IumGetExposedSecureSection
+  [11] 0001400b17ac  securekernel!IumGetIdk
+  [12] 000140072b80  securekernel!IumMapSecureIo
+  [13] 000140075684  securekernel!IumAssignMemoryToSocDomain / securekernel!IumOpenCurrentExtension / securekernel!IumAwaitSmc / securekernel!IumEmitSmc
+  [14] 000140048a48  securekernel!IumOpenSecureSection
+  [15] 00014009f858  securekernel!IumPostMailbox
+  [16] 000140072d30  securekernel!IumProtectSecureIo
+  [17] 0001400a2c7c  securekernel!IumQuerySecureDeviceInformation
+  [18] 0001400aa720  securekernel!IumSecureStorageGet
+  [19] 0001400aa848  securekernel!IumSecureStoragePut
+  [20] 0001400a1c40  securekernel!IumSetDmaTargetProperties
+  [21] 00014009f9d0  securekernel!IumSetPolicyExtension
+  [22] 000140073148  securekernel!IumUnmapSecureIo
+  [23] 0001400a27dc  securekernel!IumUpdateSecureDeviceState
+  [24] 0001400a3a70  securekernel!IumEnclaveUsesAttestedKeys
+  [25] 000140055ff4  securekernel!IumCopyEnclaveMemory

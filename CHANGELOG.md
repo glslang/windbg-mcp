@@ -17,6 +17,45 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **A run's identity block claimed more than its log said, in three places, because the grader worked out what a record contributes by testing the backend once per field.** `local_model_eval.identity()` had two such tests and they did not agree in shape -- a three-way `if/elif/else` covering `harness` and `reasoning`, and an unrelated inline ternary choosing `os_build` over `model_digest` for `weights` -- each added reactively, one per review round on the PR that introduced the third backend, each after a run had already reported something false: an fm run comparing across a macOS update as though the model had not moved (`09aa279`), and `think: false` on a backend with no reasoning arm printing `on, off` for a run in which every backend *with* the knob ran with it on (`faa147a`). Both were fixed; the shape that produced them was not, and it produced three more. Each driver now emits the resolved value under one agreed key: `IDENTITY_FIELDS` is the closed list (`weights`, `reasoning`, `harness`), each of `local_model_drive.py`, `claude_code_drive.py` and `fm_drive.py` has an `identity_block()` answering **all three** on every record -- `None` where the row has no answer -- and `identity()` reads that one key and tests no backend at all. Re-grading the six logs in `eval-out/` moved **only** the identity block, every cell score and `--matrix` distribution being byte-identical, and every line that moved was an overclaim: a mixed run's `harness 2.1.270 (Claude Code)` belonged to the Claude rows alone and now carries `, unavailable`; `reasoning unrecorded` on the pre-axis logs is `unavailable, unrecorded`, the Claude rows never having had an arm to record; and arm A of the reasoning A/B read `off` where it is `off, unavailable`, while arm B gains a `harness unavailable` line it had printed **not at all** -- so the one composition difference between the two arms, that arm A had Claude rows and arm B did not, was invisible in the field the A/B is about. `docs/eval-runs.json` is regenerated from the same logs. The old rendering had two spellings of "no answer" and chose between them per backend -- fm stated `reasoning unavailable` where claude-code, in the same position, contributed nothing -- which was itself the bug: two backend tests, a round apart, not agreeing. The dispatch survives in exactly one place, `legacy_identity()`, for records written before the drivers stated a block, and that function is closed by construction rather than by discipline: a record without the key predates it, so a new backend's records always carry the block and a new field is absent from every legacy record and correctly reads `unrecorded`. `tools/test_local_model_eval.py` is new -- twelve tests, run with `python3 -m unittest discover -s tools -p 'test_*.py'` -- and two of them are the ratchet: one fails when a name is added to `IDENTITY_FIELDS` that a driver has no opinion about, one when the grader defaults a field instead of saying so. Each is mutation-verified against the mutation it is for, and the two hold the seam from opposite sides: adding a field to `IDENTITY_FIELDS` fails the first on all three backends and leaves the second green, while making `stated()` read an absent key as `unavailable` fails the second and leaves the first green. Re-introducing the `faa147a` inference fails three of the twelve. `FOLLOWUPS.md` item 80, now in `DONE.md`.
 
+### Documentation
+
+- **Secure Kernel: why the native route is dead, and what an EXDI route would actually cost.** The
+  stub finding was re-derived from the retained `securekernel.exe` samples rather than recalled, and
+  the routine was traced to its caller: `IumpDebugBreakRequestedByVtl0` is the handler for **secure
+  call `0x124`**, reached from `IumInvokeSecureService` and `IumpInvokeLimitedModeSecureService` and
+  from no other direct branch in the image. So **there is no `IumpDebugBreakRequestedByVtl1` to
+  look for** -- VTL1 asking itself to break is not a secure call, and the absence is structural
+  rather than a gap another build might fill. Its body is identical-COMDAT-folded with three
+  unrelated routines, so a breakpoint on that address is ambiguous across four callers, which
+  matters before anyone arms one live. Of the eleven `Kd`-prefixed symbols in each post-26100
+  image **none is a function**, while `SkdInitDebuggerDataBlock` fills the block completely: SK
+  ships the metadata a debugger keys off and no transport to deliver it. That split is what makes
+  EXDI the interesting route and is written up as [`docs/exdi-stub-plan.md`](docs/exdi-stub-plan.md),
+  which Phase 4 of the Secure Kernel plan now defers to.
+
+  **The EXDI reading is measured, including where it was first wrong.** `ExdiGdbSrv.dll` ships
+  inside the WinDbg package, so a backend implements a **GDB stub rather than a COM server** and
+  needs no LiveCloudKd dependency. `Kd=` turns out to select one of **six** kernel-discovery modes,
+  of which `Kd=VerAddr:<addr>` takes an arbitrary `KdVersionBlock` address -- the mechanism a
+  Secure Kernel bind would use. Three claims made from static reading did not survive being run,
+  and each is corrected in place rather than quietly replaced: DbgEng does **not** self-register the
+  EXDI COM server (a plain elevated `kd -kx` returns `0x80040154` and registers nothing); an `sk`
+  record in DbgEng's memory-space table is **EXDI-gated and possibly vestigial**, its `hv`-vs-`sk`
+  selector having no callers at all, so a hypervisor KD session cannot be steered to it; and
+  `Endpoint::conflicts` treats `Endpoint::Unknown` as conflicting with **everything**, so an EXDI
+  attach would be *refused* alongside any live kernel session rather than escaping the check -- the
+  guard is over-conservative, not permissive, and it would break the two-session
+  NT-plus-hypervisor workflow already in use.
+
+  **And one attempt reset the bench, which the record says plainly.** `Inproc=`, which looks like a
+  way to avoid registering, hung this workspace hard enough to need a reset; DbgEng warns about
+  exactly that first, the far-end responder logged no connection so nothing reached the transport,
+  and a 60-second kill on the child did not save the machine. A job object is the bound a retry
+  needs. Nothing was left registered, no target was attached, and no BCD or host setting changed.
+  The evidence bundle gains `secure-call-dispatch-29648.1000.txt` under `supplementary` in
+  `images.json`; the six pre-existing `evidence_sha256` values were re-verified before it was added
+  and all still match.
+
 ## [0.20.0] - 2026-09-24
 
 ### Added
