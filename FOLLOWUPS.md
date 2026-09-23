@@ -1885,40 +1885,64 @@ gap rather than a missing primitive -- the same shape item 2 records for `ba`, w
 ([dbgscope#177](https://github.com/glslang/dbgscope/pull/177)).
 
 `pool_*` still refuses every ARM64 kernel (`pool::query` accepts `IMAGE_FILE_MACHINE_AMD64` and
-nothing else), and they will need to work there — the maintainer's call, 2026-09-23, when the heap tools were
-lifted and this was split off. The gate is not the only thing in the way, and the part that is not
-is an x64 problem too.
+nothing else), and they will need to work there — the maintainer's call, 2026-09-23, when the heap
+tools were lifted and this was split off.
 
-**`nt` packs an LFH block bitmap one bit per block, and the walker reads two.** Measured
-2026-09-23 from `nt`'s own code on the repository's sample dumps:
-`nt!RtlpHpLfhBlockBitmapInitialize` (x64 26100.32995, `081226-2187-01.dmp`) zeroes
-`ceil(n / 64)` words and sets the top `(-n) & 63` bits of the last; ARM64 26100's
-`nt!RtlpHpLfhBlockBitmapAllocateNonAtomic` (`082126-7015-01.dmp`) sets `1 << bit` in a word and
-returns `word * 64 + bit`; and `RtlpHpLfhSubsegmentCountAllocatedBlocks` popcounts whole words and
-subtracts `(-(BlockCount + WitheldBlockCount)) & 63` on both. The walker reads bit `2 * slot`
-(`LfhBitmap::AdjacentPairs`) and sizes the read at `blocks / 4` bytes, twice the bitmap. dbgscope#177
-moved `ntdll` to its own arrangement — 32 blocks to a word, busy bits in the low half — and left
-the kernel's reading exactly as it was, because nothing on this bench could check a change to it.
-So **the pool tools' LFH slot states are expected to be wrong on x64 today**, and that is an
-inference from disassembly, not a measurement of a pool.
+**The two readings this was filed against have been corrected. The live check it asked for has
+not been run.** Both corrections are on dbgscope's `fix/nt-lfh-bitmap-and-big-page-hash`,
+measured 2026-09-23 from `nt`'s own code on the repository's sample dumps (x64 26100.32995,
+`081226-2187-01.dmp`; ARM64 26100, `082126-7015-01.dmp`).
+
+- **`nt`'s LFH block bitmap is one bit per block, 64 to a word**, now
+  `LfhBitmap::ContiguousBits`. The bit-level authority is
+  `nt!RtlpHpLfhSubsegmentSetWitheldBlocks`, which withholds block `rdx` with `shr rdx,6` /
+  `and r8d,3Fh` / `bts rcx,r8` against `BlockBitmap` itself — so the walker's bit `2 * slot` over
+  `blocks / 4` bytes was neither the right bit nor the right length.
+  `RtlpHpLfhBlockBitmapInitialize`, `RtlpHpLfhSubsegmentCountAllocatedBlocks` and ARM64's
+  `RtlpHpLfhBlockBitmapAllocateNonAtomic` agree with it. Note what that routine withholds:
+  the block straddling each page boundary, **wherever in the subsegment it falls**, marked busy
+  like any allocation — withheld blocks are not a band of high slots a walk can stop before.
+- **The big-page hash truncated the page number to ULONG, and `nt` does not.**
+  `nt!ExpRemoveTagForBigPages` shifts the whole pointer and multiplies 64 bits wide
+  (`shr rax,0Ch` / `imul rcx,rax,9E5Fh` / `shr rdx,20h` / `xor edx,ecx`); ARM64's
+  `ExpAddTagForBigPages` is the same (`lsr x9,x21,#0xC` / `mul` / `eor x25,x8,x8,lsr #0x20`).
+  Truncating agrees on the low 32 bits of the product and therefore on nothing that survives the
+  fold: the two indices differed for every kernel address tried, a kernel page number not fitting
+  in 32 bits. `lookup_big_page_target` stops at the first empty entry, so a wrong start index
+  loses the tag and size rather than costing probes. Its test had recomputed the same truncating
+  formula, so it agreed with the bug instead of catching it; it now pins `nt`'s indices as
+  literals. **This half was never ARM64-specific** — it was wrong on x64 too, which is why it is
+  worth reading before the gate.
+- **Nothing the walker decodes has turned out to be x64-specific.** `_POOL_HEADER` and
+  `_HEAP_LFH_SUBSEGMENT` have identical offsets on both, and both routine families above are the
+  same algorithm on both. That answers the *investigation* the gate was waiting on; it is not a
+  substitute for walking an ARM64 pool.
 
 dbgscope#177 also changed three things the kernel walker shares — a segment list's head compared
 exactly rather than masked, a free-page-tree node exempted from the `TreeSignature` check, and tree
-links no longer masked to 16 bytes — each measured in user mode only.
+links no longer masked to 16 bytes — each measured in user mode only. Those are still unmeasured
+against a kernel.
 
-- **Why deferred:** every half of it wants a live pool to check against, and the one this bench
-  has is the ARM64 serial target, which the gate refuses. The x64 CTF guest that item 78 used is
-  the x64 check.
-- **What would close it:** an `LfhBitmap` arm for `nt`'s arrangement, confirmed slot for slot on a
-  live x64 kernel — against `!pool`, or a kernel-side count such as
-  `RtlpHpLfhSubsegmentCountAllocatedBlocks`'s — with the three shared changes re-run through the
-  live-kernel tier there. Then the gate: check what the pool walker took from x64 `nt` alone
-  (`decode_pool_header`'s checks and the big-page hash were read from x64 code) against an ARM64
-  `nt`, and lift it.
+**What remains unmeasured is a pool.** No live kernel was reachable from this bench on 2026-09-23:
+the `ctf-vm` KDNET attach parked without the target dialling in (recovered through the PID
+handoff), this host's `{current}` boot entry carries no `debug` flag so `attach_kernel_local` is
+not available, and both sample dumps are minidumps — `nt!ExPoolState`, `nt!PoolBigPageTable` and
+`nt!PoolBigPageTableSize` all read `????????` on the ARM64 one, and `pool_census` on the x64 one
+fails at a sparse range inside `nt`'s data. So the slot-for-slot claim rests on four of `nt`'s own
+routines across two architectures, which is stronger than the reading it replaces and is still not
+a reading of a pool.
+
+- **Why deferred:** what is left wants a live pool, and this bench had none on the day. The x64
+  CTF guest that item 78 used is the x64 check when it is up.
+- **What would close it:** the `nt` arrangement confirmed slot for slot on a live x64 kernel —
+  against `!pool`, or against `RtlpHpLfhSubsegmentCountAllocatedBlocks`'s count, which
+  `_HEAP_LFH_SUBSEGMENT.FreeCount` gives independently as `BlockCount - FreeCount` — with the
+  three shared changes re-run through the live-kernel tier there. Then the gate: with the
+  structural half already answered above, lift the machine check and walk an ARM64 kernel pool.
 - **Where it picks up:** `LfhBitmap` in dbgscope's `src/pool/decode.rs` and
   `AllocatorSchema::lfh_bitmap` in `src/pool/layout.rs`; the machine check in `src/pool/query.rs`;
   and the `pool_*` descriptions in `windbg-mcp`'s `src/server.rs`, which say *"Needs a broken-in
-  x64 kernel target"*.
+  x64 kernel target"* and stay accurate while the gate stands.
 
 ## 97. [dbgscope] An LFH block awaiting a delayed free is reported allocated
 
