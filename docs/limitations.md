@@ -192,9 +192,10 @@
   its 32-bit engine is absent the target **still opens**, on the x64 build, with an opener
   `limitation` saying SOS is unreachable rather than a failure: native analysis of such a target
   works and always has. Two things such a session does not have, and only one of them is about the
-  worker. The `heap_*` tools refuse any non-x64 *target* (*"heap walking supports x64 targets
-  only"*), so they are gone whichever worker holds it — SOS's own `!dumpheap`/`!eeheap` are the
-  managed equivalent. The other **is** the 32-bit worker's own trade: a live WoW64 `attach_process`
+  worker. The `heap_*` tools refuse a 32-bit process whichever worker holds it — a 32-bit worker
+  sees an x86 machine (*"heap walking supports x64 and ARM64 targets only (machine 0x14c)"*), and
+  a 64-bit one sees WoW64, whose 64-bit heaps are the emulation layer's rather than the
+  program's — so SOS's own `!dumpheap`/`!eeheap` are the managed equivalent. The other **is** the 32-bit worker's own trade: a live WoW64 `attach_process`
   there sees only the 32-bit half of the process. The emulation layer above 4 GiB (`wow64.dll`,
   `wow64cpu.dll`, `wow64win.dll` and the 64-bit `ntdll`) is what the x64 engine reaches with
   `!wow64exts.sw` and this one cannot — measured on one process, 36 modules against 30. That is the

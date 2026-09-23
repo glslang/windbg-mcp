@@ -1224,7 +1224,9 @@ Two tests, because one bench is one Windows:
   `cmd.exe` it already launches. `heap::list` resolves the schema *before* it enumerates heaps, so
   a target with no Segment Heap at all still exercises the whole of what the rename broke. It
   asserts that *a* shape was named, never which one — pinning this host's answer would fail on a
-  machine that is merely older. It stands down, loudly, when `ntdll` has no private PDB.
+  machine that is merely older. It stands down, loudly, when `ntdll` has no private PDB. It used to
+  stand down on ARM64 as well, when the walker took x64 only, so the ARM64 runners never walked a
+  heap; it runs there now, and the ARM64 bench's 26100.1 answers `inline_vs`.
 - **`an_older_builds_allocator_schema_still_resolves`** is `#[ignore]`d, because it needs `nt`
   PDBs from a symbol server that CI is not asked for. It opens the two checked-in **x64** dumps,
   whose `nt` carries the address-bearing shape that predates the rename, and asserts the walk gets
@@ -1236,6 +1238,17 @@ The other two dumps are ARM64, and the pool walker decodes x64 only — but they
 about, because between them the four span every shape: `121524-4703-01` has no
 `_HEAP_VS_AFFINITY_SLOT` at all (inline), and `082126-7015-01` already carries `VsContextOffset`.
 Read them with `dt nt!_HEAP_VS_AFFINITY_SLOT` rather than through the pool tools.
+
+## A WoW64 process and the heap tools
+
+**`a_wow64_process_is_refused_by_the_heap_tools_rather_than_walked`** rides the debugger tier on
+`SysWOW64\cmd.exe`, and asserts a refusal. The trap it guards is that a walk would *work*: under a
+64-bit engine the PEB and `ntdll` it reads are the emulation layer's, whose heaps are real, so it
+would list them and call itself complete while the program's own heaps are 32-bit and absent.
+Either refusal passes, because which one arrives is the routing's business — a 32-bit worker sees
+an x86 machine (`machine 0x14c`), a 64-bit one reads `_TEB.WowTebOffset` (`+0x2000` at the first
+break on ARM64 26100.1, where the effective machine still reads ARM64). It stands down on a host
+with no private `ntdll` PDB, like the test above, since the TEB field comes from that PDB.
 
 ## The bounded-command tier
 
@@ -1937,12 +1950,14 @@ does not reach.
 - **Live user-mode** — `examples/test_usermode.ps1`: launch `cmd.exe` under the debugger, break in,
   read registers/modules, set a breakpoint.
 - **Typed user Segment Heap** — from a sibling `dbgscope` checkout, run
-  `cargo run --example user_heap_smoke`. The helper launches an x64 child that retains known
-  LFH/VS/backend/large allocations, reloads the exact `ntdll` PDB, and checks that the heap the
+  `cargo run --example user_heap_smoke`. The helper launches a child of the host's architecture
+  (x64 or ARM64) that retains known LFH/VS/backend/large allocations and records its own
+  `HeapWalk` of the heap it created, reloads the exact `ntdll` PDB, and checks that the heap the
   child created is among the listed roots. It is listed only because roots come from `ntdll`'s
   heap list: on current Windows the PEB names the process heap alone (`FOLLOWUPS.md` item 79).
   It then verifies each pointer and
-  backend, writes a temporary `/ma` full-memory dump, reopens it, and repeats the checks. Set
+  backend, and that the created heap's allocated chunks are exactly the blocks `HeapWalk` called
+  busy, writes a temporary `/ma` full-memory dump, reopens it, and repeats the checks. Set
   `WIN_KEXP_USER_HEAP_SYMBOLS` (or `_NT_SYMBOL_PATH`) when the default Microsoft symbol-store path
   is not appropriate. Missing private types are a failed prerequisite; export symbols must not be
   accepted as a layout. The dump is written to the operating system temporary directory as

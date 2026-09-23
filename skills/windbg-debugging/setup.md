@@ -362,9 +362,10 @@ architecture in its own header, and a live process answers `IsWow64Process2`. Bo
 server before the worker starts, because afterwards is too late.
 
 **One thing a 32-bit worker still cannot give you, and it is not about the worker.** The five
-`heap_*` tools refuse any target that is not x64 — *"heap walking supports x64 targets only
-(machine 0x14c)"* — because the walker decodes x64 segment-heap structures, so a 32-bit target has
-no heap tools whichever engine holds it. SOS's own `!dumpheap` and `!eeheap` are the managed
+`heap_*` tools refuse a 32-bit process — *"heap walking supports x64 and ARM64 targets only
+(machine 0x14c)"* from this worker, and a WoW64 refusal from a 64-bit one — because its heaps are
+32-bit segment-heap structures the walker does not decode, so a 32-bit target has no heap tools
+whichever engine holds it. SOS's own `!dumpheap` and `!eeheap` are the managed
 equivalent and do work here, which is the reason to be on this page at all.
 
 **And one thing it is a trade rather than a win: `attach_process` on a running WoW64 process no

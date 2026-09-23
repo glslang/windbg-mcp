@@ -339,7 +339,7 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,453 | 17.3% |
+   | `allocator` | 10 | 16,499 | 17.4% |
    | `inspect` | 10 | 13,152 | 13.9% |
    | `session` | 10 | 13,682 | 14.4% |
    | `ioctl` | 10 | 12,435 | 13.1% |
@@ -350,7 +350,7 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 63 | 94,875 |
+   | *(absent)* | 63 | 94,921 |
    | `session,inspect,exec,crash` | 33 | 48,216 |
    | `session,inspect,crash` | 23 | 33,187 |
    | `crash` | 13 | 19,943 |
