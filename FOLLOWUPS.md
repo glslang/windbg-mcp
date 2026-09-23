@@ -1944,10 +1944,14 @@ against a kernel.
   is exactly backwards for the use they were built for.
 
 `a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable` now carries that comparison
-(`compare_pool_decoding_against_the_engine`), **run both ways against the same guest**: on the
-revision `Cargo.toml` pins it fails, naming four of twenty blocks that `!pool` calls allocated and
-the walk calls `reusable_free`; on the fix it passes, twelve blocks compared and none disagreeing.
-Twelve is past `POOL_ORACLE_MINIMUM`, which is what says it compared rather than skipped.
+(`compare_pool_decoding_against_the_engine`), **run both ways against the same guest**: on
+`3c1fc7b`, the revision pinned before this landed, it fails naming four of twenty blocks that
+`!pool` calls allocated and the walk calls `reusable_free`; on the fix — now
+[dbgscope#178](https://github.com/glslang/dbgscope/pull/178), pinned here as `5f33d47` — it
+passes, twelve blocks compared and none disagreeing. Twelve is past `POOL_ORACLE_MINIMUM`, which
+is what says it compared rather than skipped. The fix was verified through a path dependency and
+the merged revision is byte-identical to it (`git diff` over `src/pool/` is empty), so the
+reading carries to the pinned build without a second ten-minute run.
 
 **It costs 626s, and that is a finding rather than a footnote.** A `partial` walk's snapshot is
 not reused, so each of the helper's `pool_find_tag` and `pool_chunk` calls pays a fresh ~20s walk
