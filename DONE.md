@@ -4714,8 +4714,9 @@ whose middles the allocator had decommitted, each running past the committed ext
 for which `walk_vs` emitted no span and cleared `complete` **silently**. A span is geometry and
 state, both known there (header read, size out of that header and past the subsegment bound, state
 from the free tree); the only thing missing is the chunk's contents, which no span carries. So
-where the tail holds nothing the chunk is now reported, where it is memory the process has it is
-still refused, and either way the walk now names the chunk it dropped. That silent site was the
+where the tail is **confirmed** to hold nothing the chunk is now reported, and where it is not —
+memory the process has, or memory nothing could be asked about — it is still refused, with the
+walk now naming the chunk it dropped. That silent site was the
 standing example in `docs/unknown-not-absent.md` of a walk ending incomplete having said nothing.
 
 **The trap that cost the most time is in the primitive, not the walk.** `QueryVirtual`'s output
