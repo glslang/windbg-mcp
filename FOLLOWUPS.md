@@ -87,7 +87,10 @@ that one is now in [`DONE.md`](./DONE.md). And items 100–101 from checking its
 end through the tool surface once they had merged (2026-09-23) — the VS chunk chain coming apart
 on **29671**, found while confirming those fixes were not fitted to 26100, which they are not; and
 the same chain drifting 0x10 on 26100, which is all that is left of item 99 now that it too is in
-[`DONE.md`](./DONE.md). Those two may be one question.
+[`DONE.md`](./DONE.md). They were filed as possibly one question and are **not** (2026-09-24):
+item 100 is the target's paged pool being trimmed out from under a KD link, with nothing in the
+walker to fix, and is measured and declined; item 101 is a real placement defect in readable
+memory.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -107,10 +110,12 @@ what answers *which file*, for whoever followed a citation here.
 deleted, renumbered, or moved without reaching `DONE.md`'s index fails the build rather than a
 reader.
 
-Two kinds of item stay here rather than moving. One that is **measured and declined** (27, 35): each
-records the measurement that settled it and the condition that would reopen it, and item 35 leaves a
-judgement call open. And one that has **half** landed (2, 50) — the entry is narrowed to the half
-that is left rather than split across two files.
+Two kinds of item stay here rather than moving. One that is **measured and declined** (27, 35, 100):
+each records the measurement that settled it and the condition that would reopen it, item 35 leaves
+a judgement call open, and item 100 answers its own question against itself — the walk it was filed
+about turns out to be right, and what the run found instead is recorded in item 98. And one that has
+**half** landed (2, 50) — the entry is narrowed to the half that is left rather than split across
+two files.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster.
 
@@ -1927,12 +1932,106 @@ something*. Not measured on x64, where nothing about the mechanism differs.
 - **What would close it:** tell decommitted from unreadable using what the allocator records —
   a page range descriptor's `CommittedPageCount`, a VS subsegment's `CommitBitmap` — and report
   the first as a state of its own that does not clear `complete`.
+- **There are three states, not two** (measured 2026-09-24, closing item 100). A page this walk
+  cannot read is decommitted, **or committed and paged out**, and the allocator's commit records
+  cannot tell those apart — `CommitBitmap` says a page is committed either way. The PTE can:
+  `0x0000000000000080` is DemandZero (reserved, never written — the tails this item is about),
+  while a low word of `0x00002088` — `Valid=0, Prototype=0, Transition=0, Protection=4` — over a
+  nonzero `PageFileHigh` is a pagefile PTE, a page that was written and trimmed. The two were seen on different guests on the same day, so a fix
+  built on the commit records alone would call a paged-out page complete and be wrong on any target
+  under memory pressure. Note the PTE base must come from `nt!MmPteBase` rather than `!pte`, which
+  is broken on 29671 — see item 100.
 - **Where it picks up:** `walk_region` and the page-range and VS walks in dbgscope's
   `src/pool/snapshot.rs`, and `unreadable_gaps` in `src/heap.rs`.
 
-## 100. [dbgscope] The VS chunk chain comes apart on 29671 in a way it does not on 26100
+## 100. [dbgscope] The VS chunk chain comes apart on 29671 — the target's paging, not the build
 
-**Repo:** `dbgscope`.
+**Repo:** `dbgscope`. **Measured and declined 2026-09-24.**
+
+**The chain is not coming apart: the headers it names are paged out.** On `lab-nt` the memory each
+lost extent points back into holds a committed, written, *trimmed* page, and a KD link cannot fault
+one in. The walk declines to invent chunks there and says so, which is what it is built to do —
+so there is nothing in `walk_vs` to fix, and the 29671 hypothesis below is unnecessary rather than
+merely unproven. What the run did leave is a third memory state item 98 does not have, recorded
+there.
+
+### What settled it
+
+Server `windbg-mcp 0.19.0+g46737cc4` (the stdio release exe), both guests walked through the tool
+surface within two minutes of each other:
+
+| | `ctf-vm` | `lab-nt` |
+|---|---|---|
+| Build | 26100.33438 `lt_release_svc_prod1.260904-1524` | 29671.1000 `rs_prerelease.260911-1426` |
+| Uptime at attach | 17:07:24 | 19:40:42 |
+| Walked / allocated | 783,042 / 690,128 (88.1%) | 756,638 / 617,425 (81.6%) |
+| Diagnostics | 207, in 4 shapes | 3,616, in 9 shapes |
+| `does not begin on a chunk boundary` | **0** | 459 |
+| `cannot be placed` | **0** | 332 |
+| `unplaced_bytes` | **0** (no `gaps` block) | 15,626,240 |
+| Modified pages (`!vm 1`) | **170** (680 Kb) | **41,614** (166,456 Kb) |
+
+**Uptime is eliminated.** `ctf-vm` was walked at *longer* uptime than the 3h34m this item was filed
+against and produced none of either shape, so "a busier, more fragmented pool" in the sense of age
+is not the explanation.
+
+**What the two guests' holes actually are, which is the whole answer.** `!pte` on the pages the
+chain names:
+
+- `ctf-vm` — PTE contains `0000000000000080`: **DemandZero**, `Protect: 4 - ReadWrite`. Reserved
+  and never written, so no chunk header was ever in it and the chain is never orphaned. These are
+  item 98's uncommitted tails.
+- `lab-nt` — PTE contains `0x0003330700002088`, and four more with the same low word and a
+  different `PageFileHigh` (`0x1695`, `0x16d8`, `0x33321`, `0x33338`, over the pages
+  `0xffffabecca216000`, `…26e000`, `…2cb000`, `…30f000` and `…34f000`):
+  `Valid=0, Prototype=0, Transition=0, Protection=4 ReadWrite, PageFileLow=2`. **Pagefile PTEs**,
+  5 of 5 sampled. Only *paged* pool can carry one, so these are paged-pool headers written and then
+  trimmed — and `lab-nt` is trimming hard, at 245× `ctf-vm`'s modified-page count.
+
+The readable side confirms the reading rather than resting on it: at `0xffffabecca217000`, the first
+byte of an extent whose predecessor is unreadable, the bytes are
+`00 00 2b 03 4d 69 52 72` — a genuine `_POOL_HEADER` tagged `MiRr` — its PTE is a valid hardware one
+(`0x86000000f5fc8943`, `Valid=1`), and `pool_chunk` on it answers `covered: false`. The cost is real
+and it is exactly the 15.6 MB reported.
+
+### The build comparison this item asked for, which came out negative
+
+Done anyway, because a difference found later would read as the cause. `_HEAP_VS_CHUNK_HEADER`
+does differ: at `+0x008`, 26100 has **`SkipDuringWalk`** at `Pos 9, 1 Bit` with `Spare` at
+`Pos 10, 22 Bits`, while 29671 has no such field and `Spare` starts at `Pos 9, 23 Bits`.
+**It cannot be the cause: dbgscope reads it on neither build** — the pinned checkout
+(`9bd539d`) contains no reference to it. `_HEAP_VS_CHUNK_HEADER_SIZE` has identical offsets on both
+(`MemoryCost +0`, `UnsafeSize +2`, `UnsafePrevSize +4`, `Allocated +6`; 29671 merely names `+0x007`
+`Spare0` where 26100 leaves it unnamed), so the chain arithmetic reads the same words either way.
+
+- **Why it stays here rather than moving to `DONE.md`:** nothing was built. The reopening condition
+  is the content above.
+- **What would reopen it:** a target that loses the chain where the named page is **not** a pagefile
+  PTE. That would be a placement defect and belongs with item 101.
+- **The confound that remains, and it does not matter here:** one guest per build, and `lab-nt` is
+  also a hypervisor root partition (`Partition Pages: 4096`), so "29671" and "this guest under this
+  load" are not separated. The mechanism found is build-independent — any target trimming paged pool
+  does this — so no build change is needed to explain the split. VBS was checked and is *not* the
+  discriminator: both guests run the Secure Kernel (`SkPagesInUnchargedSlabs` 5,931 on `ctf-vm`
+  against 5,437 on `lab-nt`).
+
+### The engine is degraded on 29671, which weakens every cross-check taken there
+
+Worth knowing before trusting any oracle on that build, and it is worse than this item first
+recorded. `!pte` computes from a **zero** PTE base: for `0xffffabecca2167e0` it printed
+`PTE at 00000055F66510B0`, while `nt!MmPteBase` reads `0xffffa90000000000` and the hand-computed
+entry is `0xffffa955f66510b0` — same low bits, base lost. Every PTE above was read at the
+hand-computed address for that reason. `dt nt!_MI_VISIBLE_STATE SystemPteInfo` answers
+`Cannot find specified field members`, which is why `!vm 1` reports `Free System PTEs: 0` and prints
+`Running out of system PTEs` on a healthy guest, and reports `PagedPool Commit: 0` on a machine
+whose paged pool is demonstrably in the pagefile. `!pool` was already noted here as printing
+`No page table info` and calling a region `Unknown`; it is the same root cause.
+
+- **Where it picks up if reopened:** `walk_vs` and the extent placement in dbgscope's
+  `src/pool/snapshot.rs`.
+
+<details>
+<summary>The original 2026-09-23 reading, kept for the numbers it established</summary>
 
 The pool walker was run against `lab-nt` — Windows **29671** (`rs_prerelease`, 260911-1426), some
 3,500 builds past the 26100 everything else here is measured on — 2026-09-23, to check the item 96
@@ -1952,17 +2051,13 @@ none of —
 
 — beside 272 unreadable VS free tree nodes and `unplaced_bytes: 7,700,480`.
 
-- **Why deferred:** it is one reading of one machine, and the confound is not ruled out. That
-  guest is a hypervisor lab's root partition with 3h34m uptime; `ctf-vm` had minutes. A busier,
-  more fragmented pool is a complete explanation for a longer chain being lost, and nothing here
-  separates that from a 29671 change.
-- **What would close it:** the same walk on a 26100 guest with comparable uptime and pool
-  pressure, or on 29671 shortly after boot. If the shapes track the build rather than the load,
-  read `_HEAP_VS_CHUNK_HEADER` and the extent placement on 29671 against 26100.
-- **Where it picks up:** `walk_vs` and the extent placement in dbgscope's `src/pool/snapshot.rs`.
-  Note while working there that **`!pool` is a weaker oracle on that guest**: it printed
-  `No page table info` and `MI_SYSTEM_INFORMATION.Vs.SystemVaType not initialized`, and called a
-  region `Unknown`, so the engine's own reading is partly degraded on 29671 too.
+The deferral then read: *one reading of one machine, and the confound is not ruled out — that guest
+is a hypervisor lab's root partition with 3h34m uptime, `ctf-vm` had minutes, and a busier, more
+fragmented pool is a complete explanation.* Both counts roughly doubled by the next day's walk as
+uptime went 3h34m → 19h40m (254 → 459, 204 → 332, 7.7 MB → 15.6 MB), so load does scale them; what
+it does not do is produce them, which is what the 26100 control settled.
+
+</details>
 
 ## 101. [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts
 
@@ -1996,6 +2091,9 @@ measured this.
   `nt!RtlpHpVsChunkSplit`/`RtlpHpVsSubsegmentInitialize` for what a header-less chunk's
   `UnsafeSize` counts.
 - **Where it picks up:** `walk_vs`'s chain arithmetic in dbgscope's `src/pool/snapshot.rs`, and
-  `decode_vs_chunk` in `src/pool/decode.rs`. Note item 100 may be the same defect seen on another
-  build — its two new diagnostic shapes are both about a VS extent that does not begin on a chunk
-  boundary.
+  `decode_vs_chunk` in `src/pool/decode.rs`. **This is not item 100**, which that entry's
+  measurement settled on 2026-09-24: item 100's extents begin on a boundary the walk cannot *read*
+  — the page holding the previous header is paged out — whereas this one mislocates a header in
+  memory that reads fine. The drift here is a uniform 0x10; there, the gap between the chain's
+  expectation and the next readable boundary runs to 0x820 and more, and varies per site. A target
+  that loses the chain where the named page is **not** a pagefile PTE would belong here.
