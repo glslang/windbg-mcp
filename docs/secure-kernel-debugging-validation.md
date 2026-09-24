@@ -1530,8 +1530,8 @@ package found that **Microsoft already ships the EXDI adaptation layer**:
 | Item | Observed |
 |---|---|
 | `ExdiGdbSrv.dll` | present for `amd64` (1,455,416 B) and `arm64` (1,523,512 B) |
-| `exdiConfigData.xml` | present beside it and under `winext\`; `CurrentTarget = "QEMU"` |
-| Preconfigured targets | Trace32, BMC-OpenOCD, QEMU, VMWare, BMC-SMM, UEFI |
+| `exdiConfigData.xml` | present beside it and under `winext\`; `CurrentTarget = "QEMU"` in both. The two copies are **not the same file** - see the 2026-09-24 re-measurement below |
+| Preconfigured targets | Trace32, BMC-OpenOCD, QEMU, VMWare, BMC-SMM, UEFI - this is the **top-level** copy's set; the `winext\` copy ends VMWare, gdbserver |
 | Memory-command flags | `SupervisorMemory`, `HypervisorMemory`, `requirePAMemoryAccess` |
 | CLSID in the DLL's strings | `{29f9906e-9dbe-4d4b-b0fb-6acf7fb6d014}` |
 | That CLSID registered on this workspace | **no** — absent from `HKLM` and `HKCU` `\SOFTWARE\Classes\CLSID` |
@@ -1709,15 +1709,41 @@ rather than a COM server**. The engine can be pointed at a private copy of the c
 `EXDI_GDBSRV_XML_CONFIG_FILE` environment variable, which worked here. The shipped `CurrentTarget`
 is `QEMU` with `targetArchitecture` **ARM64**, wrong for this x64 workspace; retargeting it to
 `X64` selects a 66-entry register block totalling **608 bytes** (1,216 hex characters for a `g`
-reply). The preconfigured **`VMWare`** entry is a better starting point on x64: already `X64`, 40
-register entries rather than 66, `heuristicScanSize=0xffe`, `forceLegacyResumeStepCommands=yes`,
-and all seven memory-command flags `no` - meaning plain `m`/`M` with virtual addresses.
+reply). The preconfigured **`VMWare`** entry looked like a better starting point on x64, and
+**which of the two `exdiConfigData.xml` copies you read decides whether it is** - the row above
+records the file as present in two places and the rest of this section then treated it as one.
+Re-measured 2026-09-24 against the same package (`Microsoft.WinDbg_1.2606.22001.0_x64`), the two
+are different files:
+
+| | `<arch>\exdiConfigData.xml` | `<arch>\winext\exdiConfigData.xml` |
+|---|---|---|
+| sha256, first 16 | `ee64b9e18e6f6343` | `983f9e9d014b7beb` |
+| Targets | Trace32, BMC-OpenOCD, QEMU, VMWare, BMC-SMM, UEFI | Trace32, BMC-OpenOCD, QEMU, VMWare, gdbserver |
+| `VMWare` `targetArchitecture` | `X64` | **`X86`** |
+| `VMWare` register blocks | X64 (40 entries, `rax`..`fop`) and x86 (40, `Eax`..`xmm7`) | x86 only (40, `Eax`..`xmm7`) |
+| `VMWare` `forceLegacyResumeStepCommands` | `yes` | **absent** |
+| `VMWare` `HostNameAndPort` | `localhost:1234` | `localhost:15360` |
+
+So *"already `X64`, 40 register entries ... `forceLegacyResumeStepCommands=yes`"* describes the
+**top-level** copy, and the *Preconfigured targets* row above lists that copy's six. In the
+`winext\` copy the same entry is `X86` with no X64 block at all. `heuristicScanSize=0xffe` and all
+seven memory-command flags `no` - plain `m`/`M` with virtual addresses - hold in both.
+
+**This repo bundles the `winext\` copy**: `target\release\winext\exdiConfigData.xml` is
+byte-identical to it, sha256 `983f9e9d014b7beb`. Taken as it ships, that entry offers DbgEng a
+32-bit register contract, so it is a starting point for a 64-bit guest only after the X64 block is
+put back. Which copy the engine loads when neither `EXDI_GDBSRV_XML_CONFIG_FILE` nor
+`PathToSrvCfgFiles` is set was **not** established here. The `QEMU` entry is identical in both
+copies, and its 66-entry X64 block is 66 live `<Entry>` elements of 69, three being commented out.
 
 This workspace cannot host the target itself: it is a Hyper-V guest, `Microsoft-Hyper-V-All` and
 `VirtualMachinePlatform` are **Disabled**, no VMware or VirtualBox is installed, and 10.3 GB is
 free. **Hyper-V exposes no gdbstub in any case**, so a Hyper-V guest cannot stand in for QEMU or
 VMware as an EXDI target - that gap is the backend work itself, not a way around it. The user
-elected to set up a VMware VM separately.
+elected to set up a VMware VM separately. As of 2026-09-24 that guest exists, on the same box that
+hosts this workspace; what it still needs before E0 can run, and the VBS question that VMware and
+Hyper-V sharing a box raises for E2, are in
+[`docs/exdi-stub-plan.md`](exdi-stub-plan.md#where-each-component-runs).
 
 Ignored local evidence, under the session scratchpad rather than `target/`: the option-parser and
 `.pdata` classification scripts, per-image string and cross-reference dumps, the private

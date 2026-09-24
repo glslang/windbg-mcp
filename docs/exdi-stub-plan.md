@@ -41,6 +41,48 @@ with `exdiConfigData.xml` beside it (measured 2026-09-22). So there is no LiveCl
 no EXDI COM interface to implement, and no third-party distribution to install — only a
 registration, which is host setup the MCP server cannot do.
 
+### Where each component runs
+
+**The guest's own IP address is not the debug endpoint, and that is the first thing to get wrong.**
+The GDB stub is opened by the per-VM `vmware-vmx` process on the **VMware host**, on that host's
+TCP stack; the guest's NAT address is for KDNET or WinRM and the driver never dials it.
+`ExdiGdbSrv.dll` is a *client* of that stub and loads inside the debugger process, so it belongs
+wherever `dbgeng.dll` runs — which can be a different machine from the VMware host:
+
+```text
+VMware host
+  ├─ vmware-vmx ──► GDB stub, TCP 8864        ◄── the endpoint the debugger dials
+  │    └─ Windows guest ── NAT ── <guest-ip>  ◄── KDNET/WinRM only
+  └─ (the stub binds 127.0.0.1 unless debugStub.listen.guest64.remote is set)
+
+debugger host  ── windbg-mcp worker ─ dbgeng.dll ─ ExdiGdbSrv.dll ──TCP──► <vmware-host>:8864
+```
+
+Checked 2026-09-24 on this bench, which is a Hyper-V guest of the box running VMware: the VMware
+host answers on the Hyper-V NAT network, so guest-to-host is the direction the transport needs and
+the one NAT allows. The stub's port was closed, the debugger host had no route to the VMware NAT
+segment at all, and of the parent's management ports only SMB answered — so the `.vmx` edit and the
+firewall rule are console work on the VMware host rather than something the debugger host can
+arrange for itself. The `.vmx` keys and the 8864/8832 defaults are **recalled and not measured
+here**, no VMware being installed on the debugger host to check them against.
+
+**When Hyper-V owns the box, VMware runs on the Windows Hypervisor Platform, and that may cost the
+guest its VBS.** Nested virtualisation (`vhv.enable`) is what lets the guest run VBS/HVCI, and
+without VBS there is no Secure Kernel in it to debug — which is E2's whole subject, while E0 and E1
+need only a plain NT guest. Whether WHP supports `vhv.enable`, and whether the debugStub works
+under WHP at all, were **not** established here. Settle it from inside the guest before building
+anything on top of it:
+
+```pwsh
+(Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard `
+  -ClassName Win32_DeviceGuard).VirtualizationBasedSecurityStatus   # 2 = VBS running
+```
+
+If that answers `2`, E2 has a target. If it does not, the way back — disabling Hyper-V so VMware
+regains its own hypervisor — removes any debugger host that is itself a Hyper-V guest of the same
+box, so on a single machine "this bench drives" and "that guest has VBS" can be mutually exclusive.
+A second machine for either role dissolves it.
+
 ## Gates
 
 Each gate has a pass condition and a control. **A gate without its control passing first is not
@@ -84,6 +126,13 @@ Nothing to do with Secure Kernel. Establishes the rig.
    `CurrentTarget` to it. Start from the `QEMU` entry: it already carries a 66-entry **X64**
    register block, and all seven of its memory-command flags are `no`, meaning plain `m`/`M` with
    virtual addresses and no special-memory path. That is the smallest contract to serve.
+
+   **Copy the `QEMU` entry's X64 block rather than the `VMWare` entry's, unless you check which
+   `exdiConfigData.xml` you are reading.** The package ships two that differ, and the `winext\` one
+   — which this repo bundles — has `VMWare` as `X86` with no X64 register block at all, where the
+   copy beside the debugger binaries has it as `X64`. `QEMU` is identical in both. Measured
+   2026-09-24 and tabulated in
+   [the validation record](secure-kernel-debugging-validation.md#exdi-transport-experiments-and-the-host-reset-2026-09-23).
 3. Boot an ordinary Windows guest under QEMU with its gdbstub on `1234`, and attach with the
    documented form: `-kx exdi:CLSID={29f9906e-…},Kd=Guess,DataBreaks=Exdi` — no `Inproc`.
 4. **Bound the debugger so a spin cannot take the host.** Run `kd` in a job object that can be

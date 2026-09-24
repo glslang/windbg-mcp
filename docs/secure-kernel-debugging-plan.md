@@ -20,10 +20,18 @@
   needs. Nothing was left registered, no target was touched, and no BCD or host setting changed.
   For the rig: `ExdiGdbSrv.dll` ships in the WinDbg package, `EXDI_GDBSRV_XML_CONFIG_FILE` points
   the engine at a private config, and the preconfigured **`VMWare`** target is a better x64
-  starting point than `QEMU` (already `X64`, 40 registers rather than 66). This workspace cannot
+  starting point than `QEMU` — but only in the copy of `exdiConfigData.xml` beside the debugger
+  binaries (`X64`, 40 registers rather than 66). The `winext\` copy, which is the one this repo
+  bundles, has that same entry as **`X86`** with no X64 register block; re-measured 2026-09-24 and
+  tabulated in the [transport experiments](secure-kernel-debugging-validation.md#exdi-transport-experiments-and-the-host-reset-2026-09-23).
+  This workspace cannot
   host the target — it is a Hyper-V guest with Hyper-V disabled and 10.3 GB free, and **Hyper-V
   exposes no gdbstub** in any case, so a Hyper-V guest cannot substitute for QEMU or VMware. The
-  user elected to set up a VMware VM separately. Working detail is in
+  user elected to set up a VMware VM separately, and as of 2026-09-24 that guest exists on the box
+  hosting this workspace. What it still needs before E0 can run is in
+  [`docs/exdi-stub-plan.md`](exdi-stub-plan.md#where-each-component-runs) — the stub is not a guest
+  service and does not listen off-host by default, and VMware sharing a box with Hyper-V raises a
+  VBS question that decides whether E2 has a target at all. Working detail is in
   [`docs/exdi-stub-plan.md`](exdi-stub-plan.md); measurements in the
   [transport experiments](secure-kernel-debugging-validation.md#exdi-transport-experiments-and-the-host-reset-2026-09-23).
 - **Dispatch identified and the EXDI prerequisite corrected, 2026-09-22:** an offline pass
