@@ -1487,6 +1487,22 @@ about. This is the other half — an attach that lands:
   both ways against one guest (Server 26100.33438, 2026-09-23) — four of twenty blocks
   disagreeing before the fix, twelve compared and none disagreeing after.
 
+  **The same pages answer a second question, about the one allocation with no tag to read.**
+  `ExAllocatePoolWithTag` sends anything that will not fit inside a page to `ExpAllocateBigPool`,
+  which records the tag in `nt!PoolBigPageTable` rather than in a `_POOL_HEADER`, so `!pool`
+  prints `large page allocation, tag is …` and reads that tag from the table. `BigPageOracle`
+  takes every such line out of the answers already fetched — no extra `!pool` calls, and the line
+  names the *allocation* rather than the page, so the steps inside one of them compare it once —
+  and asks `pool_chunk` about the allocation's **start**, since this is the one shape carrying no
+  header. Sampled from the engine for the same reason as the rest: a walk that loses a tag loses
+  the allocation from every query made under that tag, so its own output cannot show the loss, and
+  before `FOLLOWUPS.md` item 99 this walk reported whatever the caller's first sixteen bytes
+  spelled — `..N.`, from a registry hive bin's `hbin`. A tag `!pool` did not render as four
+  printable bytes is skipped, because comparing it would compare two renderings rather than two
+  readings. Item 99's remaining half — the same tag lost on an allocation served out of a VS
+  subsegment — is asserted to *still* fail, and to fail in its known shape (right address, right
+  length, no name), so closing it fails this tier and the exemption has to go with it.
+
   **It costs about ten minutes, and the reason is worth knowing before adding queries here.**
   Measured 626s. A walk that ends `partial` is not cached, and on a live kernel it always does —
   uncommitted space alone emitted 148 diagnostics on that run — so each `pool_find_tag` and
