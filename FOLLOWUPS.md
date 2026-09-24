@@ -1994,15 +1994,22 @@ byte of an extent whose predecessor is unreadable, the bytes are
 (`0x86000000f5fc8943`, `Valid=1`), and `pool_chunk` on it answers `covered: false`. The cost is real
 and it is exactly the 15.6 MB reported.
 
-### The build comparison this item asked for, which came out negative
+### The build comparison this item asked for, and why it was never going to answer
 
-Done anyway, because a difference found later would read as the cause. `_HEAP_VS_CHUNK_HEADER`
-does differ: at `+0x008`, 26100 has **`SkipDuringWalk`** at `Pos 9, 1 Bit` with `Spare` at
-`Pos 10, 22 Bits`, while 29671 has no such field and `Spare` starts at `Pos 9, 23 Bits`.
-**It cannot be the cause: dbgscope reads it on neither build** — the pinned checkout
-(`9bd539d`) contains no reference to it. `_HEAP_VS_CHUNK_HEADER_SIZE` has identical offsets on both
-(`MemoryCost +0`, `UnsafeSize +2`, `UnsafePrevSize +4`, `Allocated +6`; 29671 merely names `+0x007`
-`Spare0` where 26100 leaves it unnamed), so the chain arithmetic reads the same words either way.
+`_HEAP_VS_CHUNK_HEADER` does differ: at `+0x008`, 26100 has `SkipDuringWalk` at `Pos 9, 1 Bit` with
+`Spare` at `Pos 10, 22 Bits`, while 29671 has no such field and `Spare` starts at `Pos 9, 23 Bits`.
+`_HEAP_VS_CHUNK_HEADER_SIZE` is unchanged in offsets.
+
+**That is the expected case, not a finding.** These structures change between builds, and the walker
+is built for it: every type and field is resolved by name from the PDB at run time
+(`type_id`/`type_size`/`field_offset` in `src/pool/layout.rs`), which is what keeps one walker
+correct across builds, and `layout.fingerprint` on every answer moves when an offset does. A
+layout diff therefore cannot by itself explain a behaviour split — the code compensates for exactly
+that. `SkipDuringWalk` additionally goes unread on both builds; the pinned checkout (`9bd539d`)
+contains no reference to it.
+
+Recorded so the next person diffing these builds does not stop here: the diff is real, it is
+routine, and it is not the mechanism.
 
 - **Why it stays here rather than moving to `DONE.md`:** nothing was built. The reopening condition
   is the content above.
@@ -2015,17 +2022,28 @@ does differ: at `+0x008`, 26100 has **`SkipDuringWalk`** at `Pos 9, 1 Bit` with 
   discriminator: both guests run the Secure Kernel (`SkPagesInUnchargedSlabs` 5,931 on `ctf-vm`
   against 5,437 on `lab-nt`).
 
-### The engine is degraded on 29671, which weakens every cross-check taken there
+### Three `!` extensions do not work on 29671, and they do not say so
 
-Worth knowing before trusting any oracle on that build, and it is worse than this item first
-recorded. `!pte` computes from a **zero** PTE base: for `0xffffabecca2167e0` it printed
-`PTE at 00000055F66510B0`, while `nt!MmPteBase` reads `0xffffa90000000000` and the hand-computed
-entry is `0xffffa955f66510b0` — same low bits, base lost. Every PTE above was read at the
-hand-computed address for that reason. `dt nt!_MI_VISIBLE_STATE SystemPteInfo` answers
-`Cannot find specified field members`, which is why `!vm 1` reports `Free System PTEs: 0` and prints
-`Running out of system PTEs` on a healthy guest, and reports `PagedPool Commit: 0` on a machine
-whose paged pool is demonstrably in the pagefile. `!pool` was already noted here as printing
-`No page table info` and calling a region `Unknown`; it is the same root cause.
+Named individually, because "partly degraded" — which is what this entry said before — is not a
+usable warning. Each of these ran to completion and printed a confident wrong number:
+
+- **`!pte` does not work.** It computes from a **zero** PTE base: for `0xffffabecca2167e0` it
+  printed `PTE at 00000055F66510B0`, while `nt!MmPteBase` reads `0xffffa90000000000` and the entry
+  is really at `0xffffa955f66510b0` — same low bits, base lost. Every PTE quoted above was read at
+  an address computed by hand from `nt!MmPteBase` for that reason.
+- **`!vm`'s system-PTE and paged-pool figures do not work.** It prints
+  `Unable to get offset of nt!_MI_VISIBLE_STATE.SystemPteInfo` — `dt` confirms the field is absent
+  on this build — and then reports `Free System PTEs: 0` and `Running out of system PTEs` on a
+  healthy guest, and `PagedPool Commit: 0` on a machine whose paged pool is demonstrably in the
+  pagefile. The rest of its output is fine, which is what makes it dangerous.
+- **`!pool`'s region classification does not work**, as this entry already noted:
+  `No page table info`, `MI_SYSTEM_INFORMATION.Vs.SystemVaType not initialized`, region `Unknown`.
+
+**The common failure is the substitution, not the missing field.** Each looks a field up by name,
+does not find it on this build, and carries on with zero instead of refusing. That is the opposite
+of what `src/pool/layout.rs` does with the same lookup — a type or field it cannot resolve is an
+error carrying the name, and the answer reports the layout it did resolve. So on a build this new,
+these three are not oracles; the walker's own reading and the raw bytes are.
 
 - **Where it picks up if reopened:** `walk_vs` and the extent placement in dbgscope's
   `src/pool/snapshot.rs`.
