@@ -1345,7 +1345,7 @@ finishing, and it sits within 15s of the 300s default `WINDBG_MCP_CALL_TIMEOUT_S
 share one walk), the same comparison over serial is about **85 minutes**.
 
 So `pool_walk_is_affordable` reads the transport out of the connection string — `com:` is the
-slow case, measured; KDNET is the ~20s-a-walk case the 626s figure below came from — and the two
+slow case, measured; KDNET is the 20–46s-a-walk case the figure below came from — and the two
 tests skip a serial link by cost rather than fail by timeout. That skip is not a deletion:
 **`WINDBG_MCP_SMOKE_POOL_SLOW_LINK=1` runs them anyway**, which is how the ARM64 half of
 `FOLLOWUPS.md` item 96 was measured in the first place. Budget the wall clock before setting it.
@@ -1491,10 +1491,16 @@ about. This is the other half — an attach that lands:
   `ExAllocatePoolWithTag` sends anything that will not fit inside a page to `ExpAllocateBigPool`,
   which records the tag in `nt!PoolBigPageTable` rather than in a `_POOL_HEADER`, so `!pool`
   prints `large page allocation, tag is …` and reads that tag from the table. `BigPageOracle`
-  takes every such line out of the answers already fetched — no extra `!pool` calls, and the line
-  names the *allocation* rather than the page, so the steps inside one of them compare it once —
-  and asks `pool_chunk` about the allocation's **start**, since this is the one shape carrying no
-  header. Sampled from the engine for the same reason as the rest: a walk that loses a tag loses
+  reads `nt!PoolBigPageTable` with `dq` and puts the first few live entries back to `!pool`, then
+  asks `pool_chunk` about each allocation's **start**, since this is the one shape carrying no
+  header. It also scans the answers already fetched for the same line shape, which costs nothing.
+  **The table is the source because the page steps are not enough**: the anchor is chosen for the
+  LFH half, and the first live run of this found not one `large page allocation` line among its
+  five pages — the guard fired and the tier went red having compared nothing, which is the guard
+  working and the sampling being a property of the run. `dq` is the engine's own memory read and
+  shares no decoder with the walk, so only the addresses moved. Two guards rather than one, since
+  a count of zero cannot tell "no such table on this target" from "the walk reached none of them".
+  Sampled from the engine for the same reason as the rest: a walk that loses a tag loses
   the allocation from every query made under that tag, so its own output cannot show the loss, and
   before `FOLLOWUPS.md` item 99 this walk reported whatever the caller's first sixteen bytes
   spelled — `..N.`, from a registry hive bin's `hbin`. A tag `!pool` did not render as four
@@ -1504,12 +1510,17 @@ about. This is the other half — an attach that lands:
   same fault, and the exemption would have been how this tier went on passing over the thing it
   was written for.
 
-  **It costs about ten minutes, and the reason is worth knowing before adding queries here.**
-  Measured 626s. A walk that ends `partial` is not cached, and on a live kernel it always does —
-  uncommitted space alone emitted 148 diagnostics on that run — so each `pool_find_tag` and
-  `pool_chunk` the helper makes pays a fresh ~20s walk. Any multi-query test of this shape is
-  therefore quadratic in the questions it asks. The four disagreements were all on **one** page,
-  so the page spread is the part that must not shrink; the per-page count is the part that can.
+  **It costs about half an hour, and the reason is worth knowing before adding queries here.**
+  Measured **1,667s** on 2026-09-24 — 1,532s of it before the big-page samples were added, against
+  the **626s** this said until then. A walk that ends `partial` is not cached, and on a live kernel
+  it always does — uncommitted space alone emitted 183 diagnostics on that run — so each
+  `pool_find_tag` and `pool_chunk` the helper makes pays a fresh walk of the whole pool, measured
+  at 45–46s where it was ~20s. Any multi-query test of this shape is therefore quadratic in the
+  questions it asks, **and the constant moves with the target**: that figure more than doubled
+  without a query being added, because the guest had been up fourteen hours and its pool had grown
+  to 781,331 chunks. Re-measure it rather than trusting this sentence. The four disagreements the
+  original run found were all on **one** page, so the page spread is the part that must not shrink;
+  the per-page count is the part that can, and `POOL_ORACLE_BIG_PAGE_SAMPLES` is the other dial.
 
 - **`device_security` is checked against the debugger's own view of the same device.** Three
   oracles, none of them this server's code. `!devobj` -- somebody else's extension -- names the

@@ -14638,6 +14638,13 @@ const POOL_ORACLE_PAGE_STEPS: &[u64] = &[0, 4, 9, 14, 19];
 /// sample and leave the spread above doing nothing.
 const POOL_ORACLE_PER_PAGE: usize = 4;
 
+/// How many big-pool allocations to take out of `nt!PoolBigPageTable` and put to the walk.
+///
+/// Each costs a `pool_chunk`, and a `partial` walk is not cached, so each is a fresh walk of the
+/// whole pool — 46s measured. Four is what a class of allocation that had **every** tag wrong
+/// until `FOLLOWUPS.md` item 99 is worth, against a tier already running twenty-five minutes.
+const POOL_ORACLE_BIG_PAGE_SAMPLES: usize = 4;
+
 /// How many of the census's tags to try before giving up on finding an LFH-backed anchor.
 const POOL_ORACLE_TAG_CANDIDATES: usize = 6;
 
@@ -15016,6 +15023,7 @@ fn compare_pool_decoding_against_the_engine(server: &mut Server, session: &str, 
          these tools to be wrong in, and it is what `FOLLOWUPS.md` item 96 was about."
     );
     println!("{compared} block(s) the engine calls allocated agreed with this walk");
+    big_pages.sample_the_table(server, session);
     big_pages.assert_agreement();
 }
 
@@ -15038,6 +15046,10 @@ struct BigPageOracle {
     seen: std::collections::BTreeSet<u64>,
     agreed: usize,
     wrong: Vec<String>,
+    /// The table itself could not be read, so no allocation could be sourced from it. Kept apart
+    /// from "the walk reached none of them", which is a defect rather than a host that has no
+    /// such table — the two are indistinguishable from a count of zero alone.
+    table_unreadable: bool,
     /// Allocations the walk did not reach — `pool_chunk` answered `covered: false`, meaning no
     /// span it recorded contains the address.
     ///
@@ -15054,6 +15066,110 @@ struct BigPageOracle {
 }
 
 impl BigPageOracle {
+    /// Take big-pool allocations out of `nt!PoolBigPageTable` itself, rather than hoping the
+    /// pages stepped through above happened to cross one.
+    ///
+    /// **They did not**, on the first live run of this: the anchor is chosen for the *LFH* half
+    /// of the comparison, five pages were stepped from it, and `!pool` printed not one
+    /// `large page allocation` line among them — so the guard fired and the tier went red having
+    /// compared nothing. That is the guard working, and it is still the wrong way to find these:
+    /// whether an LFH subsegment has a big-pool allocation within twenty pages of it is a
+    /// property of the run.
+    ///
+    /// The table is read with `dq` — the **engine's** own memory read, which shares no decoder
+    /// with the walk under test — and `!pool` supplies each allocation's tag, so this is as
+    /// oracle-sided as the line scan it backs up. Only the *addresses* come from a new place.
+    fn sample_the_table(&mut self, server: &mut Server, session: &str) {
+        let Some(base) = Self::engine_value(server, session, "dq nt!PoolBigPageTable L1") else {
+            self.table_unreadable = true;
+            return;
+        };
+        // From the PDB, not a literal: the entry grew a `ProcessBilled` field within this
+        // build's own lifetime, and a stride that is wrong reads every other field as garbage.
+        let Some(stride) =
+            Self::engine_value(server, session, "?? sizeof(nt!_POOL_TRACKER_BIG_PAGES)")
+                .filter(|stride| (8..=0x100).contains(stride) && stride.is_multiple_of(8))
+        else {
+            self.table_unreadable = true;
+            return;
+        };
+        let call = server.call_tool(
+            "execute",
+            json!({ "command": format!("dq {base:#x} L100"), "session_id": session }),
+            POOL_CALL_BUDGET,
+        );
+        if is_tool_error(&call) {
+            self.table_unreadable = true;
+            return;
+        }
+        let words = Self::qwords_of(&text_of(&call["result"]));
+        let live: Vec<u64> = words
+            .chunks(stride as usize / 8)
+            .filter_map(|entry| entry.first().copied())
+            // `Va` of `1` is a slot never used and `Va | 1` is one freed — bit 0 is
+            // `POOL_BIG_TABLE_ENTRY_FREE`, so neither names a live allocation.
+            .filter(|va| *va > 1 && va % 2 == 0)
+            .take(POOL_ORACLE_BIG_PAGE_SAMPLES)
+            .collect();
+        for va in live {
+            let command = format!("!pool {va:#x} 2");
+            let call = server.call_tool(
+                "execute",
+                json!({ "command": command.clone(), "session_id": session }),
+                POOL_CALL_BUDGET,
+            );
+            if is_tool_error(&call) {
+                continue;
+            }
+            let answer = text_of(&call["result"]).replace(&command, "");
+            for line in answer.lines() {
+                self.compare(server, session, line);
+            }
+        }
+    }
+
+    /// The one number a `dq … L1` or `??` answered with.
+    fn engine_value(server: &mut Server, session: &str, command: &str) -> Option<u64> {
+        let call = server.call_tool(
+            "execute",
+            json!({ "command": command, "session_id": session }),
+            POOL_CALL_BUDGET,
+        );
+        if is_tool_error(&call) {
+            return None;
+        }
+        let answer = text_of(&call["result"]).replace(command, "");
+        // `??` prints `unsigned int64 0x20`; `dq` prints an address then the value.
+        Self::qwords_of(&answer)
+            .first()
+            .copied()
+            .or_else(|| {
+                answer
+                    .split_whitespace()
+                    .filter_map(|token| token.strip_prefix("0x"))
+                    .find_map(|value| u64::from_str_radix(value, 16).ok())
+            })
+            .filter(|value| *value != 0)
+    }
+
+    /// Every value on a `dq` line, skipping the address it opens with.
+    fn qwords_of(answer: &str) -> Vec<u64> {
+        let mut words = Vec::new();
+        for line in answer.lines() {
+            let mut tokens = line.split_whitespace();
+            // A `dq` line opens with the address of its first value. Anything that does not is
+            // the command's own echo or a diagnostic, and has no values on it.
+            let Some(first) = tokens.next() else { continue };
+            if u64::from_str_radix(&first.replace('`', ""), 16).is_err() {
+                continue;
+            }
+            words.extend(
+                tokens.filter_map(|token| u64::from_str_radix(&token.replace('`', ""), 16).ok()),
+            );
+        }
+        words
+    }
+
     fn compare(&mut self, server: &mut Server, session: &str, line: &str) {
         let line = line.trim_start();
         let Some((head, rest)) = line.split_once(" : large page allocation, tag is ") else {
@@ -15120,11 +15236,18 @@ impl BigPageOracle {
         let compared = self.agreed + self.wrong.len();
         let sampled = compared + self.uncovered.len();
         assert!(
+            !self.table_unreadable,
+            "`nt!PoolBigPageTable` could not be read, so the one class of allocation whose tag \
+             the walk cannot take from the page in front of it was never put to the engine at \
+             all. A Windows kernel has that table; a target that does not is not one these tools \
+             claim to walk."
+        );
+        assert!(
             compared > 0,
             "no `large page allocation` line could be compared, so the tag of an allocation with \
-             no pool header was never put to the walk at all. A live kernel holds thousands of \
-             them — this bench's had 7,639 — so finding none is a walk that reached none of them, \
-             not a target without any. `!pool` named {} of them here and the walk covered none: \
+             no pool header was never put to the walk at all. The table was read and named live \
+             allocations, so this is a walk that reached none of them rather than a target \
+             without any. {} were sampled and the walk covered none: \
              {:#x?}",
             self.uncovered.len(),
             self.uncovered
