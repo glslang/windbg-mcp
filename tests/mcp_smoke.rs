@@ -15038,6 +15038,11 @@ struct BigPageOracle {
     seen: std::collections::BTreeSet<u64>,
     agreed: usize,
     wrong: Vec<String>,
+    /// Allocations the walk could not look up — `pool_chunk` returned `covered: false`, which
+    /// happens when the walk was deadline-truncated before reaching this address. A live-kernel
+    /// walk always ends `partial`, so some of these are expected; the assertion below fails when
+    /// the coverage is pathologically low rather than when it is incomplete.
+    uncovered: Vec<u64>,
 }
 
 impl BigPageOracle {
@@ -15081,6 +15086,7 @@ impl BigPageOracle {
             POOL_CALL_BUDGET,
         );
         if chunk["covered"] != true {
+            self.uncovered.push(address);
             return;
         }
         let chunk = &chunk["chunk"];
@@ -15103,12 +15109,17 @@ impl BigPageOracle {
     }
 
     fn assert_agreement(&self) {
+        let compared = self.agreed + self.wrong.len();
+        let sampled = compared + self.uncovered.len();
         assert!(
-            self.agreed + self.wrong.len() > 0,
+            compared > 0,
             "no `large page allocation` line came back from any of the pages stepped through, so \
              the tag of an allocation with no pool header was never put to the walk at all. A live \
              kernel holds thousands of them — this bench's had 7,639 — so finding none is a walk \
-             that reached none of them, not a target without any."
+             that reached none of them, not a target without any. Sampled {} allocation(s) total, \
+             {} uncovered by the walk.",
+            sampled,
+            self.uncovered.len()
         );
         assert!(
             self.wrong.is_empty(),
@@ -15118,9 +15129,16 @@ impl BigPageOracle {
             self.wrong.len(),
             self.wrong
         );
+        if !self.uncovered.is_empty() {
+            println!(
+                "{} big-pool allocation(s) could not be looked up (walk truncated before reaching \
+                 them)",
+                self.uncovered.len()
+            );
+        }
         println!(
-            "{} big-pool allocation(s) carried the engine's own tag",
-            self.agreed
+            "{} big-pool allocation(s) carried the engine's own tag ({} sampled, {} covered)",
+            self.agreed, sampled, compared
         );
     }
 }
