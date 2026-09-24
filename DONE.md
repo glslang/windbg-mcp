@@ -4704,9 +4704,11 @@ between builds, against one call — and the one call is also the only one of th
   what the entry itself did — "read from where they lie, not yet checked" — and item 100 is the
   case it would have got wrong: on a guest trimming paged pool the pages that will not read are
   committed and written.
-- **A kernel session is not asked at all**, so the kernel pool walk is unchanged. `QueryVirtual` is
-  a user-mode question, and a kernel walk files thousands of unreadable spans, which would be
-  thousands of failed calls to learn the same thing each time.
+- **A kernel session is not asked at all**, so the kernel pool walk **classifies** exactly as
+  before. `QueryVirtual` is a user-mode question, and a kernel walk files thousands of unreadable
+  spans, which would be thousands of failed calls to learn the same thing each time. It is not
+  *unchanged* — that word was in this entry until the kernel run below, and it was wrong: the
+  silent `walk_vs` site is silent on a kernel too, and now names what it drops.
 
 **The entry named one mechanism and there were two.** With every gap classified, `sihost` was
 *still* `Partial`, with no diagnostics, no refusals and no stalls to say why — five free chunks
@@ -4744,9 +4746,28 @@ swept it up would be the same lie in the other direction. A thin dump (`.dump /m
 `sihost`: address `0x1ec81102040` answers `Committed`, reading it fails `0x8007001E`, and the walk
 keeps counting it. A committed page a dump does not carry is not forgiven.
 
-**What was not measured.** No live-kernel run — no lab guest was up on 2026-09-24 — so the claim
-that the kernel pool walk is unchanged rests on `committed_run` returning `None` for a kernel
-target and on 435 fixture tests whose sources cannot answer it. And `examples/user_heap_smoke.rs`
+**The live-kernel control, taken the same day once a guest was up**, and it corrected this entry.
+The tier ran against `ctf-vm` (live 26100, KDNET) on the new pin: 633,665 chunks walked, 444,836
+allocated, `coverage: partial` and the walk returning in 42.3s, inside its budget — so the
+conservative path really is the one a kernel takes, and it costs nothing, `committed_run` being
+gated on `is_kernel_target` before any engine query. What the run also showed is that "the kernel
+pool walk is unchanged" was too strong. The new `walk_vs` diagnostic is the **largest shape on that
+target**: `VS chunk at # is # bytes and runs # past the committed extent at #; no span is emitted
+for it`, **2,768** occurrences, beside 2,617 of the unchanged `region # is only committed through #`.
+Those 2,768 chunks were being dropped before this change as well — the site already cleared
+`complete` — with nothing in the answer saying which, or how many. So classification and coverage
+are unchanged on a kernel and `diagnostics_emitted` rises, which is the improvement rather than a
+regression, and anything thresholding on that count will see it.
+
+**Do not read the other shapes' counts against item 100's table.** That run was a different build
+on a differently-loaded guest — 783,042 chunks at 88.1% allocated against 633,665 at 70.2% here —
+so the 2,617 here and the 207 there are two readings of two machine states, not a before and an
+after. What says the unchanged shape is unchanged is the third arm of
+`test_a_gap_with_nothing_behind_it_is_not_worth_a_diagnostic`, which is the kernel case exactly: a
+source that cannot be asked still emits it. The conditional added here can only make that
+diagnostic fire *less*, never more.
+
+**What was not measured.** `examples/user_heap_smoke.rs`
 does not run on this x64 26200 bench at all, for a reason that is not a defect:
 `HeapCreate(HEAP_CREATE_SEGMENT_HEAP)` returns an **NT** heap here (signature `0xeeffeeff` at
 `+0x10`, checked in-process), so the heap that example exists to walk is never created. An already
