@@ -181,10 +181,11 @@
   allocator-backed, while `requested_size` is optional and appears only when the selected schema
   validates exact unused-byte metadata. `heap_allocations` defaults to `state: allocated`; when
   investigating freed memory, pass `state: reusable_free` or `state: cached_free` explicitly. Two
-  further states are gaps rather than chunks: `unreadable` is memory the process has that the walk
-  could not see, and `uncommitted` is address space with no pages behind it, confirmed against the
-  memory manager (`QueryVirtual`) rather than inferred from where the span lies. Only the first
-  makes the walk `partial`; `walk.uncommitted_gaps` counts the second. A kernel pool walk cannot be
+  further states are gaps rather than chunks: `uncommitted` is address space with no pages behind
+  it, confirmed against the memory manager (`QueryVirtual`) rather than inferred from where the
+  span lies, and `unreadable` is everything else the walk could not read — memory the process
+  does have, *and* memory nothing could be asked about. It is the conservative bucket rather than
+  a claim, so only it makes the walk `partial`; `walk.uncommitted_gaps` counts the second. A kernel pool walk cannot be
   asked that question and counts every span it could not read. Read
   `layout`, `scope`, and `walk` before treating an absent allocation as evidence. The agent workflow is in
   [`skills/windbg-debugging/heap-walking.md`](../skills/windbg-debugging/heap-walking.md).

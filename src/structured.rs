@@ -2035,8 +2035,10 @@ pub enum HeapChunkState {
     Allocated,
     ReusableFree,
     CachedFree,
-    /// Memory the walk could not read that the process **has** -- paged out, or absent from a
-    /// dump. Something may have been there, so it costs the walk its coverage.
+    /// A span the walk could not read and **nothing established was empty** -- a page that is
+    /// paged out, one absent from a dump, one the debugger refused, or one no commitment query
+    /// could be made about at all. Something may have been there, so it costs the walk its
+    /// coverage. It is the conservative bucket, not a claim that the process has the memory.
     Unreadable,
     /// Address space in a heap region with no pages behind it, as the target's memory manager
     /// says. A reserved subsegment tail is the allocator working, not something the walk
@@ -2155,7 +2157,8 @@ pub struct HeapWalkInfo {
     pub chunks_walked: usize,
     pub allocated_chunks: usize,
     pub diagnostics_emitted: usize,
-    /// Spans the walk could not read that the process has. Each one makes `coverage` partial.
+    /// Spans the walk could not read and nothing established were empty. Each one makes
+    /// `coverage` partial.
     pub unreadable_gaps: usize,
     /// Spans with no pages behind them -- reserved subsegment and page-range tails, confirmed
     /// against the memory manager rather than assumed from where they lie. Reported beside
