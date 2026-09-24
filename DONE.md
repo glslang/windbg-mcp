@@ -4767,8 +4767,23 @@ after. What says the unchanged shape is unchanged is the third arm of
 source that cannot be asked still emits it. The conditional added here can only make that
 diagnostic fire *less*, never more.
 
-**What was not measured.** `examples/user_heap_smoke.rs`
-does not run on this x64 26200 bench at all, for a reason that is not a defect:
-`HeapCreate(HEAP_CREATE_SEGMENT_HEAP)` returns an **NT** heap here (signature `0xeeffeeff` at
-`+0x10`, checked in-process), so the heap that example exists to walk is never created. An already
-running process that the system gave Segment Heaps is the target to use on this host.
+**`examples/user_heap_smoke.rs` could not run, and the reason is not this bench.** This entry
+first said `HeapCreate(HEAP_CREATE_SEGMENT_HEAP)` "returns an NT heap **here**", which attributed
+to the machine what belongs to the Win32 wrapper: `KERNELBASE!HeapCreate` opens with
+`and ecx,40005h` — `HEAP_CREATE_ENABLE_EXECUTE | HEAP_GENERATE_EXCEPTIONS | HEAP_NO_SERIALIZE` —
+so 0x100 never reaches `RtlCreateHeap`, and that example built a classic NT heap on **any** host
+with this wrapper. It then failed two hundred lines later saying the heap was not among the roots,
+which reads as a defect in root enumeration and is not one.
+
+Measured in one process on x64 26200 (2026-09-24), `ntdll!RtlpHpHeapFeatures` 0 throughout: all
+three `HeapCreate` shapes that could plausibly matter — growable, with an initial size, with a
+fixed maximum — came back NT, and `RtlCreateHeap` with the same flags plus 0x100 came back a
+Segment Heap moments later. Fixed in dbgscope#186, which calls `RtlCreateHeap` and reads the
+signature back at creation.
+
+The **per-process** switch is a separate thing and is the one to know when picking a target:
+`ntdll!RtlpHpHeapFeatures` bit 0 governs the heaps an image gets *without* asking — 1 in `sihost`,
+whose four heaps are Segment, 0 in `cmd.exe`. So a process the system enabled it for is what to
+point the tools at. And two signatures are easy to swap: `_SEGMENT_HEAP.Signature` and
+`_HEAP.SegmentSignature` are both at `+0x10`, while `_HEAP.Signature` (`0xeeffeeff`) is at `+0x98`
+— this entry quoted the latter at the former's offset.

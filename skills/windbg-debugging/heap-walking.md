@@ -83,11 +83,13 @@ coverage was complete).
 ## V1 boundary
 
 V1 supports x64 and ARM64 Segment Heaps in stopped live targets and dumps with sufficient memory,
-including an x64 process emulated on ARM64 — though `HeapCreate(HEAP_CREATE_SEGMENT_HEAP)` does not
-always give one: measured on ARM64 26100.1 under the debugger, and on x64 26200 both under a
-debugger and without one, where the returned heap carries the classic `0xeeffeeff` signature. So
-expect `heap_list` to report a process's heaps as unsupported where it opted in and the system
-declined, and pick a target the *system* gave Segment Heaps rather than one that asked for them. It does not decode classic NT heaps, and it
+including an x64 process emulated on ARM64. **`HeapCreate(HEAP_CREATE_SEGMENT_HEAP)` does not give
+one**, and not because a host declined it: `KERNELBASE!HeapCreate` masks its caller's flags with
+`0x40005`, so 0x100 never reaches `RtlCreateHeap` (measured on x64 26200, 2026-09-24, where the
+direct call with the same flags did give one). Whether an image gets Segment Heaps *without* asking
+is `ntdll!RtlpHpHeapFeatures` bit 0, a per-process opt-in. So pick a target the system enabled it
+for rather than one that asked, and expect `heap_list` to report a process's heaps as unsupported
+where a program asked through `HeapCreate` and got the classic allocator. It does not decode classic NT heaps, and it
 refuses a WOW64 process rather than list the emulation layer's heaps as the program's. Microsoft `!heap` supports both Segment and NT heaps,
 so direct a classic-heap case to `execute { "command": "!heap ..." }` and state that its output is
 outside typed Segment Heap coverage. See Microsoft's [`!heap` documentation](https://learn.microsoft.com/en-us/windows-hardware/drivers/debuggercmds/-heap).
