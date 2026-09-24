@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.20.0] - 2026-09-24
+
 ### Added
 
 - **The `heap_*` tools walk ARM64 processes.** They refused any processor but AMD64 (*"heap walking supports x64 targets only (machine 0xaa64)"*), which on an ARM64 debugger host is every target there is — native processes and x64 processes emulated there alike. They take both now, through [dbgscope#177](https://github.com/glslang/dbgscope/pull/177), and the pin moves to it. What they refuse on either machine is a **WoW64** process: under a 64-bit engine the PEB and `ntdll` a walk reads are the emulation layer's, so it would list those heaps as the program's and call the answer complete. No processor type says so at a WoW64 launch's first break, so it is read from `_TEB.WowTebOffset`; `a_wow64_process_is_refused_by_the_heap_tools_rather_than_walked` holds it, whichever worker the process lands on. `a_user_mode_heap_query_names_the_vs_shape_it_decoded_with` no longer stands down on ARM64, so the ARM64 runners' live tier walks a heap for the first time.
@@ -3862,7 +3864,8 @@ Initial release, packaged as a single-plugin Claude Code marketplace.
 - Crash-dump `!analyze` support via automatic WinDbg extension DLL loading.
 - Windows CI (format, clippy, build, test) and walkthrough docs with sample dumps.
 
-[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.19.0...HEAD
+[Unreleased]: https://github.com/glslang/windbg-mcp/compare/v0.20.0...HEAD
+[0.20.0]: https://github.com/glslang/windbg-mcp/compare/v0.19.0...v0.20.0
 [0.19.0]: https://github.com/glslang/windbg-mcp/compare/v0.18.0...v0.19.0
 [0.18.0]: https://github.com/glslang/windbg-mcp/compare/v0.17.0...v0.18.0
 [0.17.0]: https://github.com/glslang/windbg-mcp/compare/v0.16.0...v0.17.0
