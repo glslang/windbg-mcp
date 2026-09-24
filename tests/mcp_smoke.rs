@@ -15038,10 +15038,18 @@ struct BigPageOracle {
     seen: std::collections::BTreeSet<u64>,
     agreed: usize,
     wrong: Vec<String>,
-    /// Allocations the walk could not look up — `pool_chunk` returned `covered: false`, which
-    /// happens when the walk was deadline-truncated before reaching this address. A live-kernel
-    /// walk always ends `partial`, so some of these are expected; the assertion below fails when
-    /// the coverage is pathologically low rather than when it is incomplete.
+    /// Allocations the walk did not reach — `pool_chunk` answered `covered: false`, meaning no
+    /// span it recorded contains the address.
+    ///
+    /// **Not the same thing as a truncated walk, and worth keeping apart from one.** The
+    /// deadline is one way to get here; so is a region whose pages would not read, a descriptor
+    /// the walk refused, and a region it never enumerated at all. And the address came from
+    /// `!pool`, so the allocation is *there* — every one of these is a live allocation this
+    /// walk has no span for, which is a coverage gap rather than bookkeeping. A live-kernel walk
+    /// is legitimately `partial`, so the count is reported rather than asserted on; what would
+    /// make it an assertion is knowing which of those causes produced it, and nothing here does.
+    /// Dropping them silently, as this did until Cursor caught it, let a walk that reached
+    /// almost nothing look like one that agreed about everything it saw.
     uncovered: Vec<u64>,
 }
 
@@ -15113,13 +15121,13 @@ impl BigPageOracle {
         let sampled = compared + self.uncovered.len();
         assert!(
             compared > 0,
-            "no `large page allocation` line came back from any of the pages stepped through, so \
-             the tag of an allocation with no pool header was never put to the walk at all. A live \
-             kernel holds thousands of them — this bench's had 7,639 — so finding none is a walk \
-             that reached none of them, not a target without any. Sampled {} allocation(s) total, \
-             {} uncovered by the walk.",
-            sampled,
-            self.uncovered.len()
+            "no `large page allocation` line could be compared, so the tag of an allocation with \
+             no pool header was never put to the walk at all. A live kernel holds thousands of \
+             them — this bench's had 7,639 — so finding none is a walk that reached none of them, \
+             not a target without any. `!pool` named {} of them here and the walk covered none: \
+             {:#x?}",
+            self.uncovered.len(),
+            self.uncovered
         );
         assert!(
             self.wrong.is_empty(),
@@ -15130,10 +15138,13 @@ impl BigPageOracle {
             self.wrong
         );
         if !self.uncovered.is_empty() {
+            // The addresses, not just how many: each is an allocation `!pool` can see and this
+            // walk cannot, so they are where to start if the ratio ever looks wrong. Bounded,
+            // because a badly truncated walk would otherwise print thousands.
             println!(
-                "{} big-pool allocation(s) could not be looked up (walk truncated before reaching \
-                 them)",
-                self.uncovered.len()
+                "{} big-pool allocation(s) the walk has no span for, first few: {:#x?}",
+                self.uncovered.len(),
+                &self.uncovered[..self.uncovered.len().min(8)]
             );
         }
         println!(
