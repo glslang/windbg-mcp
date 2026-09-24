@@ -14028,6 +14028,24 @@ fn the_slow_link_override_turns_the_pool_skip_into_a_run() {
     assert!(pool_tier_runs_with("net:port=50000,key=1.2.3.4", false));
 }
 
+/// What the override was worth before this: nothing, on the one bench it was written for.
+///
+/// A forced serial run reaches the walk and then fails the ceiling — 285s measured against 170s
+/// allowed — so `WINDBG_MCP_SMOKE_POOL_SLOW_LINK=1` bought a *red* run rather than a slow one,
+/// and the skip it lifts is the only reason nobody had seen it. See [`pool_ceiling`] for why the
+/// answer is no ceiling rather than a bigger one.
+#[test]
+fn a_forced_serial_run_is_not_held_to_the_kdnet_ceiling() {
+    assert_eq!(
+        pool_ceiling("net:port=50000,key=1.2.3.4"),
+        Some(POOL_CEILING)
+    );
+    assert_eq!(pool_ceiling("com:port=COM1,baud=115200"), None);
+    // The measurement this is all about, stated as the assertion it replaces: a run of the
+    // recorded length is exactly what the fast-link ceiling would have rejected.
+    assert!(Duration::from_millis(285_400) > POOL_CEILING);
+}
+
 /// Pinned in the default tier for the same reason as the port parser above: the assertion it feeds
 /// lives in a tier that needs a kernel on the other end of a wire, so a spelling quietly dropped
 /// here would not be noticed until someone had one.
@@ -14543,6 +14561,30 @@ fn disconnecting_releases_a_live_kernel_session_rather_than_killing_it() {
 /// fails *here* with a diagnosis rather than as an opaque harness timeout.
 const POOL_CEILING: Duration = Duration::from_secs(170);
 
+/// Which wall-clock ceiling a link is held to, and `None` for one that can carry none.
+///
+/// [`POOL_CEILING`] is the 120s walk budget plus slack for the reads already in flight when the
+/// deadline passes, the render and the round trip. Over KDNET that slack is small and the number
+/// therefore means something. Over serial it is the whole quantity: the walk *does* stop at its
+/// budget there — all four runs on 2026-09-23 returned `coverage: deadline_truncated` — and the
+/// call still took 285.0–285.4s, so 170s would fail a forced run for the baud rather than for the
+/// bug it watches for. No tighter number replaces it, either: 285.4s sits 14.6s under
+/// [`SERVER_CALL_TIMEOUT`], and a ceiling inside that margin is measuring a wire nobody has
+/// characterised.
+///
+/// So a forced slow link asserts nothing here, deliberately, and **the property is still
+/// covered** — by the timeout this test pins rather than by a number invented for it. A walk that
+/// failed to poll its deadline runs until [`SERVER_CALL_TIMEOUT`] cuts it off, which arrives as a
+/// tool error that `assert_no_error` and `is_tool_error` above both fail on, with a diagnosis. The
+/// ceiling buys the *fast* link an earlier and sharper failure; it never was the only thing
+/// standing between an unpolled loop and a green run.
+///
+/// Reached only after [`pool_tier_runs`] said yes, so a link that is not
+/// [`pool_walk_is_affordable`] is one that was forced.
+fn pool_ceiling(connection: &str) -> Option<Duration> {
+    pool_walk_is_affordable(connection).then_some(POOL_CEILING)
+}
+
 /// How long a call made *after* a walk returned may wait.
 ///
 /// Generous by an order of magnitude — `registers` on a broken-in kernel is one `r` over the
@@ -15057,6 +15099,17 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
     let Some(connection) = kernel_tier() else {
         return;
     };
+    // Before anything is started, because the question is the *wire* and the connection string
+    // answers it — nothing below is consulted. It used to be asked after the attach, on the
+    // reasoning that the target is broken in from there onward whatever we decide; that is true,
+    // and it is true *because* the check was there. A serial bench would break a live kernel in
+    // and detach it again to learn something already in hand, and this tier's own comments are
+    // about how a kernel gets left halted. `with_live_pool_kernel_session` gates the other pool
+    // test in the same place, so the pair now agree.
+    if !pool_tier_runs(&connection) {
+        skip(SLOW_LINK_SKIP);
+        return;
+    }
     // Before the server starts, because the engine is loaded when the worker does. This is the
     // only tier that needs symbols, and so the only one that ever noticed they were impossible.
     let engine = ensure_engine_beside_test_binary();
@@ -15089,15 +15142,6 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
 
     let outcome = catch_unwind(AssertUnwindSafe(|| {
         assert_no_error(&attached, "attach_kernel");
-
-        // Said before paying for symbols, and while still falling through to the detach below,
-        // since the target is broken in from the attach onward whatever we decide here. The
-        // question is the wire rather than the target: the walker takes ARM64 kernels since
-        // dbgscope#179, and what a serial link cannot afford is the walking.
-        if !pool_tier_runs(&connection) {
-            skip(SLOW_LINK_SKIP);
-            return;
-        }
 
         // The documented precondition, satisfied rather than assumed — and then *checked*.
         // Asking for symbols and carrying on regardless is what made the previous run report a
@@ -15155,11 +15199,21 @@ fn a_live_kernel_pool_walk_is_bounded_and_leaves_its_session_usable() {
              problem from an unset symbol path.\n{absent}\n\nsymbol setup said:{transcript}"
         );
         println!("a forced pool walk over a live kernel returned in {walked_for:?}");
-        assert!(
-            walked_for < POOL_CEILING,
-            "the walk took {walked_for:?}, past the {POOL_CEILING:?} its budget should hold it \
-             to — either the deadline is not enforced, or some loop in the walk is not polling it"
-        );
+        match pool_ceiling(&connection) {
+            Some(ceiling) => assert!(
+                walked_for < ceiling,
+                "the walk took {walked_for:?}, past the {ceiling:?} its budget should hold it \
+                 to — either the deadline is not enforced, or some loop in the walk is not \
+                 polling it"
+            ),
+            // A forced serial run. See [`pool_ceiling`]: the wall clock there is mostly baud, so
+            // there is no honest number, and the unpolled-loop case arrives as a tool error from
+            // the pinned `SERVER_CALL_TIMEOUT` instead — which the two assertions above fail on.
+            None => println!(
+                "no wall-clock ceiling was applied: this link was forced through by \
+                 {POOL_SLOW_LINK_ENV}, and {POOL_CEILING:?} is a KDNET figure"
+            ),
+        }
 
         // The engine is free the moment the walk returns. Before the budget it was not: the
         // caller's timeout fired, the walk carried on, and this call waited out the remainder.

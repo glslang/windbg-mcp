@@ -1349,6 +1349,16 @@ slow case, measured; KDNET is the ~20s-a-walk case the 626s figure below came fr
 tests skip a serial link by cost rather than fail by timeout. That skip is not a deletion:
 **`WINDBG_MCP_SMOKE_POOL_SLOW_LINK=1` runs them anyway**, which is how the ARM64 half of
 `FOLLOWUPS.md` item 96 was measured in the first place. Budget the wall clock before setting it.
+
+Two things about that forced run, because the override shipped once without them and was worth
+nothing on the bench it was written for. **The 170s wall-clock ceiling on the walk does not apply
+over serial**, and is not replaced by a larger one: 285s of a 285s call is the wire, not the
+budget, and the walk demonstrably stopped at its 120s budget all four times. What still catches a
+walk that ignores its deadline there is the `WINDBG_MCP_CALL_TIMEOUT_SECS` the test pins at 300s,
+which turns it into a tool error the run already fails on. And **the batch test's pool step is
+unmeasured over serial**: it arms the walk with the batch's own budget, clamped to about 255s, and
+whether a walk armed that long drains inside the 330s the harness waits has not been run. The 285s
+figure above is for a 120s-budget walk, so it does not answer it either way.
 A transport nobody has measured counts as affordable, deliberately: the safe default is running
 a test that may be slow, not skipping one silently.
 
