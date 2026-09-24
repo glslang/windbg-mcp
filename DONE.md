@@ -118,6 +118,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 79](#79-dbgscope-a-heap-outside-the-pebs-processheaps-is-invisible-to-the-heap-tools--done-2026-09-22-dbgscope176) — [dbgscope] A heap outside the PEB's `ProcessHeaps` is invisible to the heap tools — done (2026-09-22, dbgscope#176)
 - [Item 96](#96-dbgscope--windbg-mcp-the-pool-walker-on-arm64-and-an-lfh-reading-that-is-not-nts--done-2026-09-23-dbgscope179) — [dbgscope + windbg-mcp] The pool walker on ARM64, and an LFH reading that is not `nt`'s — done (2026-09-23, dbgscope#179)
 - [Item 99](#99-dbgscope-a-big-page-tag-the-engine-resolves-and-the-walker-does-not--done-2026-09-24-dbgscope180-dbgscope181) — [dbgscope] A big-page tag the engine resolves and the walker does not — done (2026-09-24, dbgscope#180, dbgscope#181)
+- [Item 98](#98-dbgscope-uncommitted-memory-is-an-unreadable-gap-so-a-live-heap-walk-is-not-complete--done-2026-09-24-dbgscope183) — [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete` — done (2026-09-24, dbgscope#183)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4664,3 +4665,88 @@ header at all, so only they can have it mislocated.
 from the engine's side — a walk that loses a tag loses the allocation from every query made under
 that tag, so its own output could never have shown this.
 
+
+## 98. [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete` — **done** (2026-09-24, dbgscope#183)
+
+**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s `heap_*` and `pool_*` tools.
+
+**The entry's own proposed remedy is not the one that landed, and the reason is the half of it the
+entry was least sure about.** It said to tell decommitted from unreadable *using what the
+allocator records* — `CommittedPageCount`, `CommitBitmap` — and then, in a bullet added the day
+before this was built, warned that those records cannot separate a page that was never committed
+from one that was committed and trimmed. Both halves are right, and together they say the
+allocator is the wrong witness. The **memory manager** is the right one:
+`IDebugDataSpaces2::QueryVirtual` answers `MEM_RESERVE`, `MEM_COMMIT` or `MEM_FREE` about the
+target in one call, and about the target rather than about what one allocator believes. It is now
+`DebugEngine::virtual_region`, a typed `VirtualRegion`/`VirtualState`.
+
+**Checked rather than assumed, because the allocator route was the specified one.** On 26200 the
+records are all there and they do answer: a VS subsegment at `0x245ce144000` covering 0x40000
+bytes carried `CommitBitmap = 0x00c01fffffffffff`, and the nine clear bits 45–53 are exactly the
+`[0x245ce171000, 0x245ce17a000)` hole the walk reported — bit for bit, no rounding. What the route
+also needs is *three* structures rather than two: an LFH page range's descriptor reads
+`CommittedPageCount = 1` while two of its 33 pages read, because LFH commits its own pages lazily
+and records them at `_HEAP_LFH_SUBSEGMENT.CommitStateOffset` (in eight-byte units, just past the
+block bitmap; `CommitUnitShift`/`CommitUnitCount` beside it). Three structures that each move
+between builds, against one call — and the one call is also the only one of the four that is
+*about the pages* rather than about an allocator's bookkeeping.
+
+**`PoolState::Uncommitted` joins `Unreadable`**, `HeapState` with it, and
+`PoolState::is_coverage_gap` is now the single definition of which gap costs a walk its
+`complete`. Three properties keep it from being an excuse:
+
+- **Only a positive answer excuses a gap.** A failed query, a run that cannot advance, a state the
+  crate does not name (`VirtualState::Unknown`), and a source that cannot be asked are each `None`,
+  and `None` keeps the conservative reading. `PoolMemory::committed_run` **defaults** to `None`, so
+  every fixture written before this keeps its old meaning and the ones exercising the new state
+  have to say so — which is what makes their assertions mean anything.
+- **It is asked of the memory manager, never inferred from where the span lies.** That inference is
+  what the entry itself did — "read from where they lie, not yet checked" — and item 100 is the
+  case it would have got wrong: on a guest trimming paged pool the pages that will not read are
+  committed and written.
+- **A kernel session is not asked at all**, so the kernel pool walk is unchanged. `QueryVirtual` is
+  a user-mode question, and a kernel walk files thousands of unreadable spans, which would be
+  thousands of failed calls to learn the same thing each time.
+
+**The entry named one mechanism and there were two.** With every gap classified, `sihost` was
+*still* `Partial`, with no diagnostics, no refusals and no stalls to say why — five free chunks
+whose middles the allocator had decommitted, each running past the committed extent it starts in,
+for which `walk_vs` emitted no span and cleared `complete` **silently**. A span is geometry and
+state, both known there (header read, size out of that header and past the subsegment bound, state
+from the free tree); the only thing missing is the chunk's contents, which no span carries. So
+where the tail holds nothing the chunk is now reported, where it is memory the process has it is
+still refused, and either way the walk now names the chunk it dropped. That silent site was the
+standing example in `docs/unknown-not-absent.md` of a walk ending incomplete having said nothing.
+
+**The trap that cost the most time is in the primitive, not the walk.** `QueryVirtual`'s output
+buffer must be **16-byte aligned**, and `MEMORY_BASIC_INFORMATION64` is 48 bytes of 8-byte fields,
+so Rust aligns it to 8. The engine's *live-target* path copies the answer out with three `movaps`
+stores and takes an access violation **inside dbgeng**; the dump path copies field by field and
+never complains. The identical call had already answered 22 queries against a full dump before it
+was first pointed at a live process, so the dump measurement was evidence of nothing. Found by
+running the probe under this server (`dbgeng!Ordinal367+0x14f96`,
+`movaps xmmword ptr [rbx],xmm0`, 26200, 2026-09-24) — there is no Rust frame in the fault.
+
+**Measured**, through the new `examples/heap_coverage.rs`, which walks a target and then puts every
+gap the walk filed back to the memory manager with an allocated chunk and a free one as controls:
+
+| | before | after |
+|---|---|---|
+| `sihost` (live, 26200, 4 Segment Heaps) | `Partial`, 45–47 unreadable gaps | `Complete`, 0 unreadable, 33 uncommitted (0x3fd0a0 B) |
+| a `.dump /ma` of `RuntimeBroker` | `Partial`, 22 unreadable gaps | `Complete`, 0 unreadable, 22 uncommitted (0x335000 B) |
+
+Every gap `MEM_RESERVE` on both, from a query independent of the one the walk made; both controls
+`MEM_COMMIT` on both.
+
+**And the dump case the entry was deferred over was checked from the other end**, since a walk that
+swept it up would be the same lie in the other direction. A thin dump (`.dump /mdi`) of that same
+`sihost`: address `0x1ec81102040` answers `Committed`, reading it fails `0x8007001E`, and the walk
+keeps counting it. A committed page a dump does not carry is not forgiven.
+
+**What was not measured.** No live-kernel run — no lab guest was up on 2026-09-24 — so the claim
+that the kernel pool walk is unchanged rests on `committed_run` returning `None` for a kernel
+target and on 435 fixture tests whose sources cannot answer it. And `examples/user_heap_smoke.rs`
+does not run on this x64 26200 bench at all, for a reason that is not a defect:
+`HeapCreate(HEAP_CREATE_SEGMENT_HEAP)` returns an **NT** heap here (signature `0xeeffeeff` at
+`+0x10`, checked in-process), so the heap that example exists to walk is never created. An already
+running process that the system gave Segment Heaps is the target to use on this host.

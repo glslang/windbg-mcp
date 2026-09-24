@@ -335,12 +335,12 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-09-20** and move with any edit to a description.
+   Both tables are measurements of **2026-09-24** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,535 | 17.4% |
-   | `inspect` | 10 | 13,152 | 13.9% |
+   | `allocator` | 10 | 16,549 | 17.4% |
+   | `inspect` | 10 | 13,152 | 13.8% |
    | `session` | 10 | 13,682 | 14.4% |
    | `ioctl` | 10 | 12,435 | 13.1% |
    | `exec` | 10 | 14,876 | 15.7% |
@@ -350,7 +350,7 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 63 | 94,957 |
+   | *(absent)* | 63 | 94,971 |
    | `session,inspect,exec,crash` | 33 | 48,216 |
    | `session,inspect,crash` | 23 | 33,187 |
    | `crash` | 13 | 19,943 |

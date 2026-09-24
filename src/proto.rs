@@ -874,6 +874,7 @@ pub enum HeapStateFilter {
     ReusableFree,
     CachedFree,
     Unreadable,
+    Uncommitted,
 }
 
 /// The five user Segment Heap tools after defaults and output caps are applied.
