@@ -15037,11 +15037,6 @@ struct BigPageOracle {
     /// inside one of them repeat it verbatim.
     seen: std::collections::BTreeSet<u64>,
     agreed: usize,
-    /// Disagreements the walk is *known* to still have, kept apart from the ones it must not:
-    /// a big-pool allocation served out of a VS subsegment is `FOLLOWUPS.md` item 99's remaining
-    /// half. Asserted to be exactly that shape rather than waved through, and asserted to still
-    /// exist, so that fixing it fails here and this exemption has to go.
-    open: Vec<String>,
     wrong: Vec<String>,
 }
 
@@ -15100,22 +15095,16 @@ impl BigPageOracle {
              ({} bytes, {backend})",
             chunk["size"]
         );
-        // The open half has a signature, and anything outside it is a new defect rather than the
-        // known one: the walk finds the block, at the right address and the right length, and has
-        // only lost its name.
-        let known = backend == "vs"
-            && chunk["state"] == "allocated"
-            && size.is_some_and(|size| chunk["size"].as_u64() == Some(size));
-        if known {
-            self.open.push(record);
-        } else {
-            self.wrong.push(record);
-        }
+        // Every one of these is a defect, and there is deliberately no exempt class. There was
+        // one for a day: a big-pool allocation served out of a VS subsegment, which
+        // `FOLLOWUPS.md` item 99 had filed as probably a different fault. It was the same one,
+        // and an exemption is how a test goes on passing over the thing it was written for.
+        self.wrong.push(record);
     }
 
     fn assert_agreement(&self) {
         assert!(
-            self.agreed + self.open.len() + self.wrong.len() > 0,
+            self.agreed + self.wrong.len() > 0,
             "no `large page allocation` line came back from any of the pages stepped through, so \
              the tag of an allocation with no pool header was never put to the walk at all. A live \
              kernel holds thousands of them — this bench's had 7,639 — so finding none is a walk \
@@ -15123,27 +15112,15 @@ impl BigPageOracle {
         );
         assert!(
             self.wrong.is_empty(),
-            "{} big-pool allocation(s) disagree with `!pool` in a way `FOLLOWUPS.md` item 99 does \
-             not account for: {:#?}",
+            "{} big-pool allocation(s) carry a tag `!pool` does not give them: {:#?}. That is \
+             `FOLLOWUPS.md` item 99 exactly, in both of the places it happened — a plain page \
+             range and a VS subsegment — so a fresh one is a fresh defect and not a known gap.",
             self.wrong.len(),
             self.wrong
         );
-        // Deliberately *not* an assertion that the open half is still open. Which pages get
-        // stepped through depends on an anchor chosen from the census's own ordering, so whether
-        // any of the allocations compared came out of a VS subsegment is a property of the run
-        // rather than of the code — a test that required one would fail for the wrong reason on
-        // the first target whose anchor sat away from them. It is printed instead, and
-        // `FOLLOWUPS.md` item 99 names this exemption as the thing to delete when it closes.
-        if self.open.is_empty() {
-            println!(
-                "note: every big-pool allocation compared carried the engine's own tag. If item \
-                 99's VS half has landed, fold `open` into `wrong` here."
-            );
-        }
         println!(
-            "{} big-pool allocation(s) carried the engine's own tag, {} still untagged (item 99)",
-            self.agreed,
-            self.open.len()
+            "{} big-pool allocation(s) carried the engine's own tag",
+            self.agreed
         );
     }
 }

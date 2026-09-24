@@ -1499,9 +1499,10 @@ about. This is the other half — an attach that lands:
   before `FOLLOWUPS.md` item 99 this walk reported whatever the caller's first sixteen bytes
   spelled — `..N.`, from a registry hive bin's `hbin`. A tag `!pool` did not render as four
   printable bytes is skipped, because comparing it would compare two renderings rather than two
-  readings. Item 99's remaining half — the same tag lost on an allocation served out of a VS
-  subsegment — is asserted to *still* fail, and to fail in its known shape (right address, right
-  length, no name), so closing it fails this tier and the exemption has to go with it.
+  readings. **There is no exempt class.** There was one for a day, for a big-pool allocation
+  served out of a VS subsegment, which item 99 had filed as probably a different fault; it was the
+  same fault, and the exemption would have been how this tier went on passing over the thing it
+  was written for.
 
   **It costs about ten minutes, and the reason is worth knowing before adding queries here.**
   Measured 626s. A walk that ends `partial` is not cached, and on a live kernel it always does —

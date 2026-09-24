@@ -117,6 +117,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 95](#95-windbg-mcp-a-connection-profile-carries-a-name-and-a-string-and-nothing-about-the-target--done-2026-09-21) — [windbg-mcp] A connection profile carries a name and a string, and nothing about the target — done (2026-09-21)
 - [Item 79](#79-dbgscope-a-heap-outside-the-pebs-processheaps-is-invisible-to-the-heap-tools--done-2026-09-22-dbgscope176) — [dbgscope] A heap outside the PEB's `ProcessHeaps` is invisible to the heap tools — done (2026-09-22, dbgscope#176)
 - [Item 96](#96-dbgscope--windbg-mcp-the-pool-walker-on-arm64-and-an-lfh-reading-that-is-not-nts--done-2026-09-23-dbgscope179) — [dbgscope + windbg-mcp] The pool walker on ARM64, and an LFH reading that is not `nt`'s — done (2026-09-23, dbgscope#179)
+- [Item 99](#99-dbgscope-a-big-page-tag-the-engine-resolves-and-the-walker-does-not--done-2026-09-24-dbgscope180-dbgscope181) — [dbgscope] A big-page tag the engine resolves and the walker does not — done (2026-09-24, dbgscope#180, dbgscope#181)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4607,3 +4608,59 @@ list against the same `IMAGE_FILE_MACHINE_*` constants `heap::validate_target` u
 `test_unsupported_architecture_names_the_machine`, whose fixture moved to i386 because `0xaa64`
 became a machine the gate *accepts*; the four `pool_*` descriptions in `windbg-mcp`'s
 `src/server.rs`; and `pool_walk_is_affordable` in `tests/mcp_smoke.rs`.
+
+## 99. [dbgscope] A big-page tag the engine resolves and the walker does not — **done** (2026-09-24, dbgscope#180, dbgscope#181)
+
+**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s `pool_*` tools.
+
+**Filed as a question with three candidate answers** — the big-page entry is absent,
+present-and-unreached, or present-and-rejected — and the answer was a fourth one the entry did not
+list: **present, at exactly the index `big_page_hash` computes, and never consulted at all.**
+
+`ExAllocatePoolWithTag` sends anything that will not fit inside a page to `ExpAllocateBigPool`,
+which records the caller's tag and length in `nt!PoolBigPageTable` rather than in a `_POOL_HEADER`.
+The walker decoded the page as though a header were there, so it read the caller's own first
+sixteen bytes as `PreviousSize`/`BlockSize`/`PoolType`/`PoolTag` and reported the block as starting
+0x10 in and 0x10 short. `!pool` calls `ffffac09dd0f5000` a 0x1000-byte `CM25` allocation; the walk
+called it a 4080-byte block at `+0x10` tagged `..N.`, out of a registry hive bin's own `hbin`
+header. Where those bytes happened to be zero the tag came out `0x00000000`, which is how the item
+presented in the first place: as tens of thousands of untagged allocations.
+
+**What the entry got wrong is which question decides it.** It assumed the *allocator* did — that a
+big-pool allocation is a plain page range, told apart from the others by its descriptor — and its
+third row, a VS chunk disagreeing by 0x10, was filed as probably-unrelated. It is the same defect:
+`nt` puts big-pool allocations inside VS subsegments too, where the descriptor says `0x0f`, and a
+descriptor cannot tell them apart in either place. What decides it is the **size**, and
+structurally rather than by measurement: `_POOL_HEADER.BlockSize` is eight bits of sixteen-byte
+units (`dt nt!_POOL_HEADER`, x64 26100.33438), so `0xff * 16` — 4080 bytes of chunk, its own header
+included — is the most it can describe. 4080 of payload plus the header is exactly a page, and one
+byte more has nowhere to record its own length. That is *why* such an allocation is in the
+big-page table, and the table says it back: all 7,639 live entries on that guest recorded
+`NumberOfBytes` of `0x1000` or more, and none fewer.
+
+**Two further defects fell out of reading `nt` rather than the structure.** Bit 0 of `Va` is
+`POOL_BIG_TABLE_ENTRY_FREE` and the address stays behind it — `ExpRemoveTagForBigPages` frees an
+entry with `lock inc qword ptr [rax]` — so matching on `Va & !1` answered for *freed* pool with the
+tag it used to have; 2,300 of that kernel's 32,768 slots were in that state, and `nt`'s own
+comparison is `cmp rcx,rdi`. And the probe's stop test for `Va == 0` never fired, a never-used slot
+reading `1`, so every miss scanned all 32,768 entries.
+
+**Measured** on `ctf-vm` (26100.33438), the same census before and after the first half, minutes
+apart: distinct tags **5,665 → 1,501**, the `....` bulk 79,166,848 → 51,216,352 bytes, and `CM25`
+(19.0 MB), `CM16`, `EtwB`, `Gpbm`, `Obtb`, `ClfI`, `CM29`, `DxgK` and `Pool` — the big-page table's
+own 1 MB allocation — correctly tagged where they had been scattered across bogus tags, one of
+which was `0x838bffff`, the top half of a kernel pointer. After the second half, two hours later
+against a pool that had itself grown 5%, the `....` bulk fell again to 42,785,104 bytes and
+`0xffffac09da29f000` matched `!pool` exactly: `MiRr`, 57,792 bytes, header at the allocation.
+
+**The remedy was built so that it did not have to wait for what is still unexplained.** A chunk
+past the limit is matched against the table's entries **by containment and length** rather than by
+arithmetic on the chunk header, because the 0x10 between the two is measured and not understood.
+That is now item 101, and it is a smaller thing than it was: only chunks *under* the limit carry a
+header at all, so only they can have it mislocated.
+
+**A test that agreed four times out of four is the reason this one has an oracle.** `mcp_smoke`'s
+`BigPageOracle` puts every `large page allocation` line `!pool` prints back to the walk, sampled
+from the engine's side — a walk that loses a tag loses the allocation from every query made under
+that tag, so its own output could never have shown this.
+

@@ -83,13 +83,11 @@ target's own `HeapWalk` as the oracle: an LFH block awaiting a delayed free, whi
 calls free and the heap tools call allocated; and the uncommitted memory that keeps every live
 walk measured at `Partial` once the diagnostics were gone. That run filed item 96 as well — the
 pool walker's LFH reading, which it showed is not `nt`'s, and the ARM64 pool gate behind it — and
-that one is now in [`DONE.md`](./DONE.md). And items 99–100 from checking its fixes end to end
-through the tool surface once they had merged (2026-09-23) — a big-page tag `!pool` resolves and
-the walker still does not, whose page-range half landed as
-[dbgscope#180](https://github.com/glslang/dbgscope/pull/180) and whose remainder is the same tag
-lost on an allocation served out of a VS subsegment; and the VS chunk chain coming apart on
-**29671**, found while confirming those fixes were not fitted to 26100, which they are not. Those
-two may be one question.
+that one is now in [`DONE.md`](./DONE.md). And items 100–101 from checking its fixes end to
+end through the tool surface once they had merged (2026-09-23) — the VS chunk chain coming apart
+on **29671**, found while confirming those fixes were not fitted to 26100, which they are not; and
+the same chain drifting 0x10 on 26100, which is all that is left of item 99 now that it too is in
+[`DONE.md`](./DONE.md). Those two may be one question.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1932,65 +1930,6 @@ something*. Not measured on x64, where nothing about the mechanism differs.
 - **Where it picks up:** `walk_region` and the page-range and VS walks in dbgscope's
   `src/pool/snapshot.rs`, and `unreadable_gaps` in `src/heap.rs`.
 
-## 99. [dbgscope] A big-pool allocation served out of a VS subsegment keeps no tag
-
-**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s `pool_*` tools.
-
-**Half of this landed** ([dbgscope#180](https://github.com/glslang/dbgscope/pull/180), 2026-09-24).
-The item was filed as "a big-page tag the engine resolves and the walker does not", and reading
-`nt!PoolBigPageTable` directly answered its question: the entry is **present, at exactly the index
-`big_page_hash` computes, and was never consulted.** `ExAllocatePoolWithTag` sends anything that
-will not fit inside a page to `ExpAllocateBigPool`, which records the tag there rather than in a
-`_POOL_HEADER`; nothing in the page range descriptor separates one from a plain page-range
-allocation, both being `RangeFlags` `0x03`, so the walker decoded the page as though a header were
-there and read the caller's own first sixteen bytes as one. An allocated kernel page range is now
-looked up in that table. Two further defects in the same lookup went with it: matching on
-`Va & !1` answered for freed pool, bit 0 being `POOL_BIG_TABLE_ENTRY_FREE` and 2,300 of this
-kernel's 32,768 slots being in that state; and the probe's stop test for `Va == 0` never fired,
-because a never-used slot reads `1`. Measured on `ctf-vm` (26100.33438, 12h uptime), the same
-census minutes apart: distinct tags **5,665 → 1,501**, the `....` bulk 79,166,848 → 51,216,352
-bytes, and `CM25` (19.0 MB), `CM16`, `EtwB`, `Gpbm`, `Obtb`, `ClfI`, `CM29`, `DxgK` and `Pool` —
-the big-page table's own 1 MB allocation — correctly tagged where they had been scattered across
-bogus tags, one of which was `0x838bffff`, the top half of a kernel pointer.
-
-**What is left is the item's third row**, and it is no longer a guess about what that row was. The
-big-page table also names allocations served out of a **VS subsegment**, and those carry no pool
-header either. Measured on the same guest:
-
-| address | `!pool` | the walk |
-|---|---|---|
-| `0xffffac09da29f000` | large page allocation, `MiRr`, `0xe1c0` | VS, `....`, 57,792 bytes, header `…29eff0` |
-| `0xffff8b836d455000` | large page allocation, `MiPm`, `0xa270` | VS, `....`, 41,584 bytes, header `…454ff0` |
-| `0xffff8b836d460000` | large page allocation, `MmIn`, `0x1c00` | VS, `0x838bffff`, 7,168 bytes |
-
-`0xe1c0` is 57,792 and `0xa270` is 41,584: **the walk finds the block, at the right address and the
-right length, and has lost only its name.** The entries are live and hash-correct —
-`0xffff8b836d460000` sits at index `0x715e`, which is its own hash — and the page they are in is a
-continuation unit of the 17-page `RangeFlags` `0x0f` VS subsegment whose first descriptor is page
-`0x53` of segment `0xffff8b836d400000`. So this is not a stale descriptor and not a stale entry:
-`nt` puts big-pool allocations inside VS subsegments, and every one of the 7,639 live entries on
-that guest has a page-aligned `Va` and a size of at least `0x1000`.
-
-**And the chain is 0x10 early wherever that happens.** For a chunk that *does* carry a pool header
-the two disagree by exactly 0x10 — `!pool` puts `0xffff8b836d462000`'s header at `…462000`
-(`MiSe`, `0xb0`) and the walk puts it at `…461ff0` — while for a header-less one the walk's
-invented header compensates and its *data* address comes out right. One offset explains both:
-the walk's `header_address` is where the `_HEAP_VS_CHUNK_HEADER` really is. Where the 0x10 enters
-the chain is not established; `_HEAP_VS_SUBSEGMENT` is 0x28 bytes and `0x30 + 0xffd * 16` is
-exactly the range's 16 committed pages, so the chunk area's start is not obviously the culprit.
-
-- **Why deferred:** the tag is recoverable the moment a VS chunk is looked up in the table, but the
-  chain offset is measured and **not explained**, and fitting the tag onto a placement that may
-  itself be wrong would be a guess dressed as a fix. Item 100 is the other half of that question.
-- **What would close it:** find where the VS chain gains its 0x10 — read
-  `nt!RtlpHpVsSubsegmentInitialize` for the chunk area's first chunk and `RtlpHpVsChunkCoalesce`
-  for what a header-less chunk's `UnsafeSize` covers — then look a VS chunk up in the big-page
-  table the way an allocated page range now is. `mcp_smoke`'s oracle comparison already puts every
-  `large page allocation` line `!pool` prints back to the walk and **asserts this half still
-  fails**, so closing it fails that assertion and forces the exemption out.
-- **Where it picks up:** `walk_vs` and the VS extent placement in dbgscope's `src/pool/snapshot.rs`,
-  and `BigPageTable::lookup` beside the page-range call site added by #180.
-
 ## 100. [dbgscope] The VS chunk chain comes apart on 29671 in a way it does not on 26100
 
 **Repo:** `dbgscope`.
@@ -2024,3 +1963,39 @@ none of —
   Note while working there that **`!pool` is a weaker oracle on that guest**: it printed
   `No page table info` and `MI_SYSTEM_INFORMATION.Vs.SystemVaType not initialized`, and called a
   region `Unknown`, so the engine's own reading is partly degraded on 29671 too.
+
+## 101. [dbgscope] The VS chunk chain drifts 0x10, and not from where it starts
+
+**Repo:** `dbgscope`, surfaced by `windbg-mcp`'s `pool_*` tools.
+
+Left over from item 99, and now the only thing left in it. On a live 26100.33438 kernel
+(2026-09-24) the walk places a VS chunk's `_POOL_HEADER` **0x10 before** where one really is, for
+every chunk in certain subsegments. Read from the bytes rather than from `!pool`'s heuristic: at
+`0xffff8b836d46f000` sits a genuine `_POOL_HEADER` — `BlockSize` `0x21`, `PoolType` `0x02`, tag
+`MmLd`, matching `!pool`'s `size: 210` exactly — while the walk read the eight bytes 0x10 earlier,
+which are a pointer, and reported the tag `0x838bffff`: the top half of a kernel address.
+
+It is **not a lost chain**: the walk's chunk starts 0x10 early *and* is 0x10 long, so each chunk
+ends where the real one does and the next is found. The size it reports is over by the same 0x10 —
+528 against `!pool`'s 0x210 less its header.
+
+Item 99's fix removed the part of this that was about tags: a chunk too large for
+`_POOL_HEADER.BlockSize` is now named from `nt!PoolBigPageTable` by containment, so its placement
+does not matter. What is left is the chunks *under* that limit, which do carry a header and whose
+header the walk mislocates — 1,047 of them under `0x838bffff` alone, 2.0 MB, on the run that
+measured this.
+
+- **Why deferred:** the obvious cause is ruled out and no other is established. It would be a
+  guess, and item 99's remedy was built specifically so that it did not have to wait for this.
+- **What would close it:** find which chunk introduces the 0x10. **The chunk area's start is not
+  it** — `sizeof(_HEAP_VS_SUBSEGMENT)` is `0x28`, the first chunk header is at `+0x30` where
+  `discover_segment_context` computes it, and a real `MiSe` `_POOL_HEADER` sits at `+0x40`. So the
+  chain begins correctly and drifts later, which points at a chunk whose `UnsafeSize` covers
+  something the walk does not expect — a big-pool chunk is the obvious candidate, since those are
+  the ones with no header and the drift shows up after them. Read
+  `nt!RtlpHpVsChunkSplit`/`RtlpHpVsSubsegmentInitialize` for what a header-less chunk's
+  `UnsafeSize` counts.
+- **Where it picks up:** `walk_vs`'s chain arithmetic in dbgscope's `src/pool/snapshot.rs`, and
+  `decode_vs_chunk` in `src/pool/decode.rs`. Note item 100 may be the same defect seen on another
+  build — its two new diagnostic shapes are both about a VS extent that does not begin on a chunk
+  boundary.
