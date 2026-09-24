@@ -826,7 +826,7 @@
         "min_capacity: integer|null/uint64",
         "refresh: boolean|null",
         "session_id: string|null",
-        "state: enum[\"allocated\"|\"reusable_free\"|\"cached_free\"|\"unreadable\"]|null"
+        "state: enum[\"allocated\"|\"reusable_free\"|\"cached_free\"|\"unreadable\"|\"uncommitted\"]|null"
       ],
       "required": [],
       "title": "List Segment Heap allocations"

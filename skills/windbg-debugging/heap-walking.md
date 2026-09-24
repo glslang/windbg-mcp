@@ -63,7 +63,11 @@ Then use:
 
 - `heap_allocations` for capped filters by heap, backend (`lfh`, `vs`, `segment`, `large`), state,
   and capacity. It defaults to `state: allocated`; when investigating freed memory, pass
-  `state: reusable_free` or `state: cached_free` explicitly;
+  `state: reusable_free` or `state: cached_free` explicitly. Two states are not chunks at all:
+  `unreadable` is memory the process has that the walk could not see, and `uncommitted` is address
+  space with no pages behind it — a reserved subsegment tail, which the allocator produces in
+  normal operation. Only the first makes `walk.coverage` partial, and `walk.uncommitted_gaps`
+  counts the second so what a complete answer forgave is still visible;
 - `heap_chunk` for the allocation containing an address, its offset, and same-heap neighbours;
 - `heap_census` for heaviest heap/backend/state/size-class groups; and
 - `heap_diagnostics` for categories and examples, optionally scoped to one heap.
@@ -77,9 +81,11 @@ coverage was complete).
 ## V1 boundary
 
 V1 supports x64 and ARM64 Segment Heaps in stopped live targets and dumps with sufficient memory,
-including an x64 process emulated on ARM64 — though one launched under the debugger on ARM64
-26100.1 had only classic NT heaps, even for a `HeapCreate` asking for a Segment Heap, so expect
-`heap_list` to list its heaps as unsupported there. It does not decode classic NT heaps, and it
+including an x64 process emulated on ARM64 — though `HeapCreate(HEAP_CREATE_SEGMENT_HEAP)` does not
+always give one: measured on ARM64 26100.1 under the debugger, and on x64 26200 both under a
+debugger and without one, where the returned heap carries the classic `0xeeffeeff` signature. So
+expect `heap_list` to report a process's heaps as unsupported where it opted in and the system
+declined, and pick a target the *system* gave Segment Heaps rather than one that asked for them. It does not decode classic NT heaps, and it
 refuses a WOW64 process rather than list the emulation layer's heaps as the program's. Microsoft `!heap` supports both Segment and NT heaps,
 so direct a classic-heap case to `execute { "command": "!heap ..." }` and state that its output is
 outside typed Segment Heap coverage. See Microsoft's [`!heap` documentation](https://learn.microsoft.com/en-us/windows-hardware/drivers/debuggercmds/-heap).

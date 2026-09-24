@@ -77,13 +77,14 @@ A64 writes `a || b || c` as three compares feeding one branch, and this walk rea
 and files the rest in `untracked`. And item 94 from giving the multiprocessor hypervisor
 investigation's harness the tools it was written against (2026-09-20) -- that investigation is
 item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
-`bd`/`be` deliberately did not. And items 97–98 from running the heap tools on ARM64 for the
+`bd`/`be` deliberately did not. And item 97 from running the heap tools on ARM64 for the
 first time ([dbgscope#177](https://github.com/glslang/dbgscope/pull/177), 2026-09-23), with the
 target's own `HeapWalk` as the oracle: an LFH block awaiting a delayed free, which `HeapWalk`
-calls free and the heap tools call allocated; and the uncommitted memory that keeps every live
-walk measured at `Partial` once the diagnostics were gone. That run filed item 96 as well — the
-pool walker's LFH reading, which it showed is not `nt`'s, and the ARM64 pool gate behind it — and
-that one is now in [`DONE.md`](./DONE.md). And items 100–101 from checking its fixes end to
+calls free and the heap tools call allocated. That run filed two more, both now in
+[`DONE.md`](./DONE.md) — item 96, the pool walker's LFH reading, which it showed is not `nt`'s,
+and the ARM64 pool gate behind it; and item 98, the uncommitted memory that kept every live walk
+measured at `Partial` once the diagnostics were gone, which turned out to want the memory
+manager's answer rather than the allocator's. And items 100–101 from checking its fixes end to
 end through the tool surface once they had merged (2026-09-23) — the VS chunk chain coming apart
 on **29671**, found while confirming those fixes were not fitted to 26100, which they are not; and
 the same chain drifting 0x10 on 26100, which is all that is left of item 99 now that it too is in
@@ -113,7 +114,8 @@ reader.
 Two kinds of item stay here rather than moving. One that is **measured and declined** (27, 35, 100):
 each records the measurement that settled it and the condition that would reopen it, item 35 leaves
 a judgement call open, and item 100 answers its own question against itself — the walk it was filed
-about turns out to be right, and what the run found instead is recorded in item 98. And one that has
+about turns out to be right, and what the run found instead went into item 98, now in
+[`DONE.md`](./DONE.md). And one that has
 **half** landed (2, 50) — the entry is narrowed to the half that is left rather than split across
 two files.
 
@@ -1912,38 +1914,6 @@ busy in the bitmap as stored, which is what the heap tools read. Read from the d
 - **Where it picks up:** the LFH arm of `discover_segment_context` in dbgscope's
   `src/pool/snapshot.rs`, and `_HEAP_LFH_SUBSEGMENT_STATE` in `src/pool/layout.rs`.
 
-## 98. [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete`
-
-**Repo:** `dbgscope`.
-
-After dbgscope#177 a walk of `user_heap_smoke`'s process on ARM64 26100.1 has **no** diagnostics
-and still reports `coverage: Partial`, on every run taken that day. What holds it there is eight
-`Unreadable` spans, and all eight lie where the allocator reserves more than it commits: the
-tails of two VS subsegments (0x5000 and 0xb000 bytes), and the parts of page ranges and free
-ranges past what their allocations needed (0x85000, 0x8a000, 0xf000, 0x1000, 0xf000 and 0x9e0000).
-That they are uncommitted is read from where they lie, not yet checked page by page against the
-allocator's commit records. If it holds, they are not unknown, and counting them as gaps makes
-`Partial` the answer
-on a healthy live target — which blunts the one signal the tools have for *we could not see
-something*. Not measured on x64, where nothing about the mechanism differs.
-
-- **Why deferred:** it changes what `Complete` means for both walkers, and a dump is the case that
-  must not be swept up with it: a dump can lack committed pages, and those stay unreadable.
-- **What would close it:** tell decommitted from unreadable using what the allocator records —
-  a page range descriptor's `CommittedPageCount`, a VS subsegment's `CommitBitmap` — and report
-  the first as a state of its own that does not clear `complete`.
-- **There are three states, not two** (measured 2026-09-24, closing item 100). A page this walk
-  cannot read is decommitted, **or committed and paged out**, and the allocator's commit records
-  cannot tell those apart — `CommitBitmap` says a page is committed either way. The PTE can:
-  `0x0000000000000080` is DemandZero (reserved, never written — the tails this item is about),
-  while a low word of `0x00002088` — `Valid=0, Prototype=0, Transition=0, Protection=4` — over a
-  nonzero `PageFileHigh` is a pagefile PTE, a page that was written and trimmed. The two were seen on different guests on the same day, so a fix
-  built on the commit records alone would call a paged-out page complete and be wrong on any target
-  under memory pressure. Note the PTE base must come from `nt!MmPteBase` rather than `!pte`, which
-  is broken on 29671 — see item 100.
-- **Where it picks up:** `walk_region` and the page-range and VS walks in dbgscope's
-  `src/pool/snapshot.rs`, and `unreadable_gaps` in `src/heap.rs`.
-
 ## 100. [dbgscope] The VS chunk chain comes apart on 29671 — the target's paging, not the build
 
 **Repo:** `dbgscope`. **Measured and declined 2026-09-24.**
@@ -1952,8 +1922,10 @@ something*. Not measured on x64, where nothing about the mechanism differs.
 lost extent points back into holds a committed, written, *trimmed* page, and a KD link cannot fault
 one in. The walk declines to invent chunks there and says so, which is what it is built to do —
 so there is nothing in `walk_vs` to fix, and the 29671 hypothesis below is unnecessary rather than
-merely unproven. What the run did leave is a third memory state item 98 does not have, recorded
-there.
+merely unproven. What the run did leave is a **third** memory state — a page that will not read is
+reserved, *or* committed and trimmed, *or* committed and present — and that is what settled item 98
+against the remedy it had specified: no allocator commit record separates the last two, and the
+memory manager answers all three (now in [`DONE.md`](./DONE.md), dbgscope#183).
 
 ### What settled it
 
@@ -1978,9 +1950,10 @@ is not the explanation.
 **What the two guests' holes actually are, which is the whole answer.** `!pte` on the pages the
 chain names:
 
-- `ctf-vm` — PTE contains `0000000000000080`: **DemandZero**, `Protect: 4 - ReadWrite`. Reserved
-  and never written, so no chunk header was ever in it and the chain is never orphaned. These are
-  item 98's uncommitted tails.
+- `ctf-vm` — PTE contains `0000000000000080`: **DemandZero**, `Protect: 4 - ReadWrite`. Never
+  written, so no chunk header was ever in it and the chain is never orphaned. These are the kernel
+  equivalent of item 98's uncommitted tails — and only the *equivalent*: item 98's fix is
+  `QueryVirtual`, which a kernel session cannot be asked, so the kernel walk still counts these.
 - `lab-nt` — PTE contains `0x0003330700002088`, and four more with the same low word and a
   different `PageFileHigh` (`0x1695`, `0x16d8`, `0x33321`, `0x33338`, over the pages
   `0xffffabecca216000`, `…26e000`, `…2cb000`, `…30f000` and `…34f000`):

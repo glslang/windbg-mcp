@@ -1350,6 +1350,7 @@ pub enum HeapStateArg {
     ReusableFree,
     CachedFree,
     Unreadable,
+    Uncommitted,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2961,6 +2962,7 @@ impl WindbgServer {
             HeapStateArg::ReusableFree => HeapStateFilter::ReusableFree,
             HeapStateArg::CachedFree => HeapStateFilter::CachedFree,
             HeapStateArg::Unreadable => HeapStateFilter::Unreadable,
+            HeapStateArg::Uncommitted => HeapStateFilter::Uncommitted,
         });
         let out = self
             .run(

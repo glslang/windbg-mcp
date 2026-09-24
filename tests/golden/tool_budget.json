@@ -228,11 +228,11 @@
     {
       "annotations": 128,
       "description": 229,
-      "inputSchema": 1153,
-      "modelVisible": 1439,
+      "inputSchema": 1167,
+      "modelVisible": 1453,
       "name": "heap_allocations",
-      "outputSchema": 5629,
-      "wire": 7227
+      "outputSchema": 5792,
+      "wire": 7404
     },
     {
       "annotations": 124,
@@ -240,8 +240,8 @@
       "inputSchema": 618,
       "modelVisible": 873,
       "name": "heap_census",
-      "outputSchema": 5463,
-      "wire": 6491
+      "outputSchema": 5626,
+      "wire": 6654
     },
     {
       "annotations": 126,
@@ -249,8 +249,8 @@
       "inputSchema": 493,
       "modelVisible": 910,
       "name": "heap_chunk",
-      "outputSchema": 5819,
-      "wire": 6886
+      "outputSchema": 5982,
+      "wire": 7049
     },
     {
       "annotations": 130,
@@ -258,8 +258,8 @@
       "inputSchema": 762,
       "modelVisible": 1087,
       "name": "heap_diagnostics",
-      "outputSchema": 5295,
-      "wire": 6543
+      "outputSchema": 5380,
+      "wire": 6628
     },
     {
       "annotations": 119,
@@ -267,8 +267,8 @@
       "inputSchema": 465,
       "modelVisible": 826,
       "name": "heap_list",
-      "outputSchema": 5159,
-      "wire": 6135
+      "outputSchema": 5244,
+      "wire": 6220
     },
     {
       "annotations": 120,
@@ -366,8 +366,8 @@
       "inputSchema": 760,
       "modelVisible": 1761,
       "name": "pool_chunk",
-      "outputSchema": 5704,
-      "wire": 7625
+      "outputSchema": 5744,
+      "wire": 7665
     },
     {
       "annotations": 127,
@@ -384,8 +384,8 @@
       "inputSchema": 1795,
       "modelVisible": 2529,
       "name": "pool_find_tag",
-      "outputSchema": 5756,
-      "wire": 8438
+      "outputSchema": 5796,
+      "wire": 8478
     },
     {
       "annotations": 90,
@@ -571,13 +571,13 @@
   "totals": {
     "annotations": 6672,
     "description": 36618,
-    "inputSchema": 55021,
+    "inputSchema": 55035,
     "instructions": 2003,
-    "modelVisible": 94957,
-    "outputSchema": 162108,
-    "payload": 265524,
+    "modelVisible": 94971,
+    "outputSchema": 162847,
+    "payload": 266277,
     "tools": 63,
-    "wire": 265450,
+    "wire": 266203,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10021
   }

@@ -6134,6 +6134,7 @@ fn heap_state_name(state: HeapState) -> structured::HeapChunkState {
         HeapState::ReusableFree => structured::HeapChunkState::ReusableFree,
         HeapState::CachedFree => structured::HeapChunkState::CachedFree,
         HeapState::Unreadable => structured::HeapChunkState::Unreadable,
+        HeapState::Uncommitted => structured::HeapChunkState::Uncommitted,
     }
 }
 
@@ -6153,12 +6154,13 @@ fn heap_walk_text(walk: &heap_query::HeapWalkReport) -> String {
     let coverage = structured::AllocatorCoverage::from(walk.coverage);
     format!(
         "coverage={}; {} chunks ({} allocated); {} diagnostics; {} unreadable gaps; {} \
-         refused headers",
+         uncommitted gaps; {} refused headers",
         coverage.as_str(),
         walk.total_chunks,
         walk.allocated_chunks,
         walk.diagnostic_count,
         walk.unreadable_gaps,
+        walk.uncommitted_gaps,
         walk.refused_headers
     )
 }
@@ -6303,6 +6305,7 @@ fn heap(e: &DebugEngine, args: HeapOp, within: Duration) -> Result<Output, Faile
                 HeapStateFilter::ReusableFree => HeapState::ReusableFree,
                 HeapStateFilter::CachedFree => HeapState::CachedFree,
                 HeapStateFilter::Unreadable => HeapState::Unreadable,
+                HeapStateFilter::Uncommitted => HeapState::Uncommitted,
             };
             let answer = heap_query::allocations(e, walk(refresh)).map_err(heap_failure)?;
             let matches: Vec<_> = answer
@@ -6629,6 +6632,15 @@ fn render_chunk(address: u64, found: &query::PoolNeighbourhood) -> String {
         PoolState::Unreadable => out.push_str(
             "\nThis span could not be read, so its state is unknown. That is a limit of the \
              walk, not evidence that the allocator freed it.\n",
+        ),
+        // Not the sentence above with a softer verb: `Unreadable` says the walk could not see
+        // what is here, and this says there is nothing here to see. A pointer into it is as
+        // dead as one into a freed chunk, and for a stronger reason — no page is mapped, so a
+        // dereference faults rather than reading whatever moved in.
+        PoolState::Uncommitted => out.push_str(
+            "\nNo memory is committed at this address: the allocator reserved the space and \
+             never backed it with pages. Nothing the target holds can read or write here \
+             without faulting.\n",
         ),
     }
     if chunk.heap.special {

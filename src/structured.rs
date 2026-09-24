@@ -1833,6 +1833,11 @@ pub enum PoolChunkState {
     /// The walk could not read the span. A limit of the walk, not a fact about lifetime — a
     /// Verifier guard page reads exactly this way.
     Unreadable,
+    /// Address space with no pages behind it, as the target's memory manager says. Nothing can
+    /// be in memory that does not exist, so this is neither a chunk nor a limit of the walk.
+    /// User-mode targets only: a kernel session cannot be asked, and there every span that
+    /// would not read stays `unreadable`.
+    Uncommitted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
@@ -1869,6 +1874,7 @@ impl From<&dbgscope::pool::PoolSpan> for PoolChunkInfo {
                 PoolState::ReusableFree => PoolChunkState::ReusableFree,
                 PoolState::CachedFree => PoolChunkState::CachedFree,
                 PoolState::Unreadable => PoolChunkState::Unreadable,
+                PoolState::Uncommitted => PoolChunkState::Uncommitted,
             },
             tag: span.display_tag.clone(),
             raw_tag: dbgscope::pool::raw_tag_hex(span.raw_tag),
@@ -2029,7 +2035,13 @@ pub enum HeapChunkState {
     Allocated,
     ReusableFree,
     CachedFree,
+    /// Memory the walk could not read that the process **has** -- paged out, or absent from a
+    /// dump. Something may have been there, so it costs the walk its coverage.
     Unreadable,
+    /// Address space in a heap region with no pages behind it, as the target's memory manager
+    /// says. A reserved subsegment tail is the allocator working, not something the walk
+    /// missed, so this does *not* make the walk partial.
+    Uncommitted,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
@@ -2091,6 +2103,7 @@ impl From<&dbgscope::heap::HeapAllocation> for HeapAllocationInfo {
                 HeapState::ReusableFree => HeapChunkState::ReusableFree,
                 HeapState::CachedFree => HeapChunkState::CachedFree,
                 HeapState::Unreadable => HeapChunkState::Unreadable,
+                HeapState::Uncommitted => HeapChunkState::Uncommitted,
             },
             header_address: addr(allocation.header_address),
             user_address: addr(allocation.user_address),
@@ -2142,7 +2155,14 @@ pub struct HeapWalkInfo {
     pub chunks_walked: usize,
     pub allocated_chunks: usize,
     pub diagnostics_emitted: usize,
+    /// Spans the walk could not read that the process has. Each one makes `coverage` partial.
     pub unreadable_gaps: usize,
+    /// Spans with no pages behind them -- reserved subsegment and page-range tails, confirmed
+    /// against the memory manager rather than assumed from where they lie. Reported beside
+    /// `unreadable_gaps` rather than folded into it, so a reader can see what a `complete`
+    /// answer forgave. Always 0 where nothing could be asked, such as a dump that records no
+    /// memory information.
+    pub uncommitted_gaps: usize,
     /// What the walk could not read or decode, when there was anything. Healthy results omit it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub gaps: Option<WalkGaps>,
@@ -2156,6 +2176,7 @@ impl From<&dbgscope::heap::HeapWalkReport> for HeapWalkInfo {
             allocated_chunks: walk.allocated_chunks,
             diagnostics_emitted: walk.diagnostic_count,
             unreadable_gaps: walk.unreadable_gaps,
+            uncommitted_gaps: walk.uncommitted_gaps,
             gaps: WalkGaps::of_heap(walk),
         }
     }
@@ -4686,6 +4707,7 @@ mod tests {
             allocated_chunks: 0,
             diagnostic_count: 0,
             unreadable_gaps: 0,
+            uncommitted_gaps: 0,
             refused_headers,
             stalls,
             unplaced_bytes: 0,
