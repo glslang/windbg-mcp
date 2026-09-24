@@ -184,9 +184,10 @@
   further states are gaps rather than chunks: `uncommitted` is address space with no pages behind
   it, confirmed against the memory manager (`QueryVirtual`) rather than inferred from where the
   span lies, and `unreadable` is everything else the walk could not read — memory the process
-  does have, *and* memory nothing could be asked about. It is the conservative bucket rather than
-  a claim, so only it makes the walk `partial`; `walk.uncommitted_gaps` counts the second. A kernel pool walk cannot be
-  asked that question and counts every span it could not read. Read
+  does have, *and* memory nothing could be asked about. `unreadable` is the conservative bucket
+  rather than a claim, so it alone makes the walk `partial`, and `walk.unreadable_gaps` counts it;
+  `walk.uncommitted_gaps` counts `uncommitted`, so what a complete answer forgave stays visible. A
+  kernel pool walk cannot be asked that question and counts every span it could not read. Read
   `layout`, `scope`, and `walk` before treating an absent allocation as evidence. The agent workflow is in
   [`skills/windbg-debugging/heap-walking.md`](../skills/windbg-debugging/heap-walking.md).
 - **A 32-bit user-mode target is opened by a worker of its own architecture, and what that buys and

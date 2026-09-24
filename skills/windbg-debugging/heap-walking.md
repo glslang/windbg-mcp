@@ -67,8 +67,9 @@ Then use:
   `uncommitted` is address space with no pages behind it — a reserved subsegment tail, which the
   allocator produces in normal operation — and `unreadable` is everything else the walk could not
   read, which is memory the process does have *or* memory nothing could be asked about. Treat
-  `unreadable` as unknown rather than as confirmed memory. Only it makes `walk.coverage` partial;
-  `walk.uncommitted_gaps` counts the other so what a complete answer forgave is still visible;
+  `unreadable` as unknown rather than as confirmed memory: it alone makes `walk.coverage` partial,
+  and `walk.unreadable_gaps` counts it, while `walk.uncommitted_gaps` counts `uncommitted` so what
+  a complete answer forgave stays visible;
 - `heap_chunk` for the allocation containing an address, its offset, and same-heap neighbours;
 - `heap_census` for heaviest heap/backend/state/size-class groups; and
 - `heap_diagnostics` for categories and examples, optionally scoped to one heap.
