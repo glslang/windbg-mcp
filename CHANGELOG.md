@@ -56,6 +56,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `images.json`; the six pre-existing `evidence_sha256` values were re-verified before it was added
   and all still match.
 
+- **The WinDbg package ships two different `exdiConfigData.xml`, and the EXDI rig notes described
+  one while citing the other.** Re-measured 2026-09-24 against
+  `Microsoft.WinDbg_1.2606.22001.0_x64`: the copy beside the debugger binaries (sha256
+  `ee64b9e18e6f6343`) carries targets Trace32, BMC-OpenOCD, QEMU, VMWare, BMC-SMM and UEFI, with
+  `VMWare` as `targetArchitecture` **`X64`** — a 40-entry X64 register block plus a 40-entry x86
+  one, `forceLegacyResumeStepCommands=yes`, `localhost:1234`. The `winext\` copy (sha256
+  `983f9e9d014b7beb`) ends Trace32, BMC-OpenOCD, QEMU, VMWare, gdbserver, and its `VMWare` entry is
+  **`X86`** with the x86 block only, no `forceLegacyResumeStepCommands`, `localhost:15360`. The
+  claim that the preconfigured `VMWare` target is "already `X64`, 40 registers" therefore held for
+  the top-level copy alone, while **this repo bundles the `winext\` one** —
+  `target\release\winext\exdiConfigData.xml` is byte-identical to it — so taken as it ships that
+  entry offers DbgEng a 32-bit register contract for a 64-bit guest. `heuristicScanSize=0xffe` and
+  all seven memory-command flags `no` hold in both, and the `QEMU` entry is identical in both, its
+  66-entry X64 block being 66 live `<Entry>` elements of 69 with three commented out. Which copy
+  the engine loads when neither `EXDI_GDBSRV_XML_CONFIG_FILE` nor `PathToSrvCfgFiles` is set was
+  not established. `docs/exdi-stub-plan.md` also gains **where each component runs**: the GDB stub
+  belongs to the VMware host's `vmware-vmx` process rather than to the guest, so the guest's NAT
+  address is a KDNET/WinRM address and never the debugger's endpoint, and `ExdiGdbSrv.dll` is a
+  client that loads in the debugger process and may sit on a different machine. Recorded with it is
+  the VBS question that VMware and Hyper-V sharing one box raises for gate E2, which is open rather
+  than answered.
+
 ## [0.20.0] - 2026-09-24
 
 ### Added
