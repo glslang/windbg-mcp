@@ -343,6 +343,82 @@ it.
 - **E2b, the stub path below**, unchanged, and now what it is for is a backend rather than an
   answer.
 
+#### What the oracle actually is, read from its own release
+
+Inspected statically 2026-09-25 from release `v3.3.2.20260720` (zip sha256 `c8dff9409ad896ec…`);
+nothing was registered or run. The article's naming is stale: the server is **`ExdiHvSrv.dll`**, not
+`ExdiKdSample.dll`.
+
+**It registers exactly as `ExdiGdbSrv.dll` does, so E0's activation stall is a shared risk rather
+than a separate problem.** Identical export set — `DllRegisterServer`, `DllUnregisterServer`,
+`DllGetClassObject`, `DllInstall`, `DllCanUnloadNow` — and the binary carries `DllSurrogate`,
+`AppID`, `InprocServer32` and `ThreadingModel`/`Apartment`, so its self-registration writes a
+surrogate AppID too. Its own `Start-ExdiDebugger.ps1` installs with `regsvr32 /s` and carries a
+`Stop-ExdiContainingDllHosts` that enumerates `dllhost` processes holding the DLL and kills them.
+**That script says it derives from Microsoft's `WinDbg-Samples/Exdi/exdigdbsrv/Start-ExdiDebugger.ps1`,**
+so the surrogate-outlives-the-debugger behaviour E0 hit is known upstream and the job object was
+never going to be sufficient on its own.
+
+**It ships a kernel driver signed with a revoked certificate.** `hvmm.sys` is signed
+`CN=Atheros Communications Inc.`, issued by VeriSign, valid 2010-03-30 to 2013-04-01, **no
+timestamp counter-signature**, and Windows reports *"A certificate was explicitly revoked by its
+issuer"*. It will not load under ordinary code integrity, so it implies test signing or weakened CI
+on whichever machine hosts the target's hypervisor — a decision to take deliberately rather than
+discover. The other three shipped binaries are merely unsigned, which is ordinary for a research
+build. **The driver may not be needed**: `READ_MEMORY_METHOD` and `WRITE_MEMORY_METHOD` name
+`HvmmDrvInternal`, **`WinHv`** and `HvmmLocal`, so the memory backend is pluggable and the shipped
+`RegParam_old.reg` merely defaults to method `1`. Whether `WinHv` reaches VTL1 is unestablished and
+is the cheapest thing to try before loading anything.
+
+#### Why a VTL0 driver can read VTL1 at all, and how small the needed part is
+
+**The trust boundary is partition-to-partition, not VTL-to-VTL, which is what makes this work
+without an IUM app.** The tool runs in VTL0 of the **root** partition and reads the **guest**
+partition's memory. VBS protects a guest's VTL1 from that guest's own VTL0; it does not protect a
+guest from its host, which is why Hyper-V can live-migrate and save a VM at all. So the guest's
+VTL1 pages are ordinary guest-physical pages to the root, no VTL1 code runs, and nothing needs to
+be an IUM trustlet. The same fact bounds the technique: **it reaches a guest's Secure Kernel and
+never the host's own**, which is the independent-machine requirement the validation record already
+states for that case.
+
+**The driver is a privileged memory accessor, not a secure-kernel component.** That is visible in
+the types: `MEMORY_ACCESS_TYPE` is `MmPhysicalMemory`, `MmVirtualMemory`, `MmAccessRtCore64`, and
+the read/write method enums make the driver one of three interchangeable backends beside `WinHv`.
+Nothing in its role is SK-specific.
+
+**And the whole public SDK is eleven functions**, which is the answer to whether this can be
+reduced to what VTL1 debugging needs:
+
+```text
+SdkGetDefaultConfig  SdkEnumPartitions  SdkSelectPartition  SdkCloseAllPartitions
+SdkGetData           SdkControlVmState
+SdkReadPhysicalMemory  SdkWritePhysicalMemory  SdkReadVirtualMemory  SdkWriteVirtualMemory
+```
+
+Enumerate partitions, select one, read and write memory, pause and resume. Everything else arrives
+through `SdkGetData` with an information class, and the **secure-kernel-specific part is four
+values**: `InfoSecureKernelBase`, `InfoSecureKernelSize`, `InfoHvddGetCr3Securekernel`, and
+`Cr3SecureKernel` in `GET_CR3_TYPE`. A `VTL_LEVEL` enum spans `Vtl0`–`Vtl15`, and `GUEST_TYPE`
+carries `MmNonKdbgPartition`, commented *"for hvix64\\hvax64 memory area or securekernel"*. So a
+minimal VTL1 **read** capability is: select the guest partition, take SK's base, size and CR3, read
+guest-physical memory, and translate VTL1 virtual addresses with that CR3.
+
+**This reopens the choice that produced the hardware problem.** The stub route was picked to avoid
+implementing an EXDI COM interface, and that is precisely what forces a hypervisor exposing a
+gdbstub — which Hyper-V does not, hence VMware, QEMU and a second machine. Implementing against
+Hyper-V's own partition interfaces needs no gdbstub and runs on the Hyper-V already present. The
+`vid.sys` route is the candidate the table below already lists as "a large reverse-engineering
+effort", and this release ships `vid.h`, `viddefs.h` and a 157 KB `hvgdk.h` against it, which
+lowers that cost without measuring how far.
+
+**Two cautions against reading this as a decided re-plan.** Execution control looks weak in the
+technique generally: `SdkControlVmState` pauses and resumes a VM, which is not VTL1 stepping, and
+the active CLSID's breakpoint support is undemonstrated. And **EXDI's whole value here was DbgEng's
+kernel awareness for SK**, which E1 found EXDI-gated with its selector unreferenced — so if that
+awareness does not materialise, direct reads exposed as tools lose little against an EXDI server
+that would have to be written anyway. Licensing has not been checked, and reuse of any of this in a
+shipped artifact depends on it.
+
 **Check EXDI activation before either.** Both routes are the same dbgeng plumbing, and E0 found
 activation stalling on this bench — registration writes an `AppID` with an empty `DllSurrogate`,
 hosting the server in `dllhost.exe`, and a bare `CreateInstance` blocked past 17 s having launched
