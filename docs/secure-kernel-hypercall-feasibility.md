@@ -132,6 +132,49 @@ host, and H2 falls back to writing the driver rather than probing with someone e
 Topology is decided by the constraint that the debugging component runs on the **Hyper-V host of
 the target**: the host of these two guests is the machine the rest of this plan runs on.
 
+### H1 result, 2026-09-25: the two knobs are independent, and the oracle survives
+
+**VBS and nested virtualisation are separate settings on this host, which is the answer the tension
+above needed.** A Generation 2 guest, configuration version 12.0, 2 vCPU, 4 GB static memory, vTPM
+enabled and `VirtualizationBasedSecurityOptOut` false, was built with
+**`ExposeVirtualizationExtensions = False`** — confirmed from the host, which is the authoritative
+side — and reports from inside:
+
+```text
+VBS=2 Running=2
+```
+
+So VTL1 is active *and* HVCI is running in a guest whose nesting is off. LiveCloudKd's requirement
+that the guest have nested virtualisation disabled therefore does not conflict with the target
+having a Secure Kernel, and the oracle remains available to H2 and H4 on this host. Guest build
+**10.0.26200**, x64, recorded because H4's comparison against the on-disk `securekernel.exe`
+depends on knowing which image.
+
+**Read the two fields as separate facts.** `VirtualizationBasedSecurityStatus = 2` says VTL1 is up
+and `securekernel.exe` is loaded; `SecurityServicesRunning` says what is using it, and it read
+**`0`** on the first pass — VBS running with no service behind it. That state passes every gate
+here, since VTL1 exists and has a CR3 either way, but it is a thinner target than the subject of
+study: HyperGuard and SKPG are what make VTL1 interesting and they arrive with HVCI. Turning on
+Memory Integrity and rebooting moved it to `2`.
+
+**Two traps this gate produced, both worth carrying forward.** The `Secure System` process is
+present whenever VBS runs and says nothing about which services are active, so it cannot stand in
+for the `SecurityServicesRunning` reading — it was sampled twice, identical but for a working set,
+and neither sample distinguished the two states. And **both the guest and the host now report
+`VBS=2`**, so a bare status reading cannot be attributed to a machine: every VBS reading in this
+plan is taken with `$env:COMPUTERNAME` beside it, which is what caught the first one.
+
+**An asymmetry that matters for H2.** The debugger host — the Hyper-V host of this guest — is
+itself running VBS with **HVCI**, while the guest was not until it was turned on. HVCI blocks
+drivers signed with revoked certificates, which is what LiveCloudKd's `hvmm.sys` is. So on this
+host the oracle's default driver path is blocked by the very feature under study, and
+`ReadInterfaceWinHv` moves from *preferred first probe* to *the only one that does not require
+weakening the debugger host*. Disabling HVCI here remains possible and would become a condition of
+every measurement taken afterwards, so it is recorded rather than assumed away.
+
+**Still outstanding for H1:** the VBS-off twin, which is the control for H3 and H4 and without
+which a plausible-looking VTL1 read cannot be distinguished from a real one.
+
 ## H2 — can the root read the guest's physical memory at all
 
 Foundational, and independent of every VTL question. If GPA reads do not work, nothing after this
