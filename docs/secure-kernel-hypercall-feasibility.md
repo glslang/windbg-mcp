@@ -116,8 +116,21 @@ every gate after H2, and without it a plausible-looking read cannot be told from
 - **Control:** the second guest reports `0` and runs no secure services.
 - **Record the build of both**, because every later comparison against an on-disk image depends on
   knowing which image.
-- Topology is decided by the constraint that the debugging component runs on the **Hyper-V host of
-  the target**: the host of these two guests is the machine the rest of this plan runs on.
+
+**Resolve one tension before building, not after.** The target needs VBS so that a Secure Kernel
+exists, and LiveCloudKd — the H2 probe and the H4 second oracle — reports that it wants nested
+virtualisation **disabled** on the guest. Whether those conflict depends on something the
+validation record already flags and this plan should not assume either way: exposing
+virtualisation extensions to a VM "enables the nested-hypervisor route, **not** a universal
+prerequisite for Hyper-V guest VBS". So the two may be independent knobs, or enabling VBS may drag
+nesting in with it. Settle it on the first guest, cheaply, before building the pair: turn VBS on
+**without** `ExposeVirtualizationExtensions` and see whether
+`VirtualizationBasedSecurityStatus` reaches `2` from inside. If it does, the knobs are independent
+and the oracle stays usable. If it does not, the oracle and the target are in conflict on this
+host, and H2 falls back to writing the driver rather than probing with someone else's.
+
+Topology is decided by the constraint that the debugging component runs on the **Hyper-V host of
+the target**: the host of these two guests is the machine the rest of this plan runs on.
 
 ## H2 — can the root read the guest's physical memory at all
 
