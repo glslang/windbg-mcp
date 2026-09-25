@@ -448,6 +448,11 @@ it. That LiveCloudKd exposes `Cr3SecureKernel` is suggestive and not evidence of
 A driver is still required, `VMCALL` being privileged — but a minimal one, signable by whoever runs
 it, rather than one carrying a revoked certificate.
 
+**The gates for that route are in
+[`docs/secure-kernel-hypercall-feasibility.md`](secure-kernel-hypercall-feasibility.md)**, written
+as a sibling of this document rather than a replacement: it shares E4's integration work and E0's
+activation problem, and differs in reaching SK through hypercalls rather than a GDB stub.
+
 **Two cautions against reading this as a decided re-plan.** Execution control looks weak in the
 technique generally: `SdkControlVmState` pauses and resumes a VM, which is not VTL1 stepping, and
 the active CLSID's breakpoint support is undemonstrated. And **EXDI's whole value here was DbgEng's

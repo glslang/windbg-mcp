@@ -1,0 +1,183 @@
+# Feasibility test plan: reading a guest's VTL1 from the root partition
+
+The question this answers is narrow and falsifiable: **can a root-partition component read a
+guest's Secure Kernel state well enough to drive a debugger?** It is not a plan to build one.
+Every gate below can fail, each says how, and the stop conditions are written before the work
+starts so that a sunk cost does not decide.
+
+This is a sibling of [`docs/exdi-stub-plan.md`](exdi-stub-plan.md) rather than a replacement. That
+document's route reaches SK through a GDB stub and needs a hypervisor that exposes one; this route
+reaches it through hypercalls and needs the Hyper-V already present. The two share E4's integration
+work and share the EXDI activation problem E0 found.
+
+## What is already established, and what is assumed
+
+Carried in from work recorded elsewhere, so that no gate re-derives it and no gate rests on it
+silently:
+
+| Fact | Where from | Standing |
+|---|---|---|
+| SK ships no KD transport; every `Kd`-prefixed symbol in post-26100 `securekernel.exe` is data | exdi-stub-plan, 2026-09-22 | measured |
+| `SkdInitDebuggerDataBlock` fills `KdDebuggerDataBlock` completely — `KDBG`, size `0x3A8`, `SkLoadedModuleList`, PTE swizzle bit | exdi-stub-plan, 2026-09-22 | measured |
+| `Kd=VerAddr:<addr>` is parsed and range-checked, mode 3 of six | exdi-stub-plan E1, 2026-09-22 | measured |
+| DbgEng's `sk` record is EXDI-gated and its selector unreferenced | exdi-stub-plan E1, 2026-09-23 | measured |
+| The hypercall surface is VTL-parameterised — `HV_INPUT_VTL`, `HV_TRANSLATE_GVA_INPUT_VTL_MASK` | header survey, 2026-09-25 | measured |
+| EXDI activation stalls on this bench; registration is surrogate-hosted | exdi-stub-plan E0, 2026-09-25 | measured |
+| VBS defends a guest's VTL1 from that guest's VTL0, not from its host | architecture | **assumed** — H3 tests it |
+| The hypervisor permits a *root* partition to read a guest's VTL1 registers | — | **assumed, and the likeliest thing to be wrong** |
+
+## Two disciplines that apply throughout
+
+**Clean-room.** LiveCloudKd is GPL-3.0. *Running* it is unrestricted and it is used below as an
+oracle; **linking to or deriving from it is not**, and no gate's implementation may be written from
+its headers or source. Implementation facts come from Microsoft's published TLFS and VSM
+documentation. Keep that tree closed while writing code, and note in the commit which document a
+structure came from.
+
+**A gate without its control is not evidence.** An SK failure and a rig failure are
+indistinguishable from the calling side — this is the lesson the EXDI plan already carries, and it
+applies harder here because a wrong answer often looks like a plausible number rather than an
+error. Every gate below names a control, and a control that has not passed invalidates the gate
+above it rather than merely weakening it.
+
+## H0 — does the specification permit it at all
+
+Desk work. No hardware, no guest, no code. Hours rather than days, and it can kill the route.
+
+Read the TLFS on `HvCallGetVpRegisters`, `HvCallTranslateVirtualAddress`, `HvCallReadGpa`, the
+`HV_INPUT_VTL` input field, and the partition privileges gating them (`AccessVpRegisters`,
+`AccessGpa` and neighbours). The question is whether a *parent* partition may name a **child's**
+VTL1 in those calls, or whether VTL1 register access is reserved to the VP itself and to higher
+VTLs.
+
+- **Pass:** the specification describes a permitted path, and the privileges it requires are ones a
+  root partition holds or can be granted.
+- **Fail:** the specification reserves VTL1 state. The route is then not dead but is much more
+  expensive — it falls back to physical-memory scanning plus reimplementing SK's swizzled
+  page-table walk, and should be re-costed rather than continued into.
+- **This gate cannot pass on its own.** A documented interface is evidence of a code path, not of
+  what a given build permits at runtime — the same distinction that made an earlier revision of the
+  EXDI plan claim DbgEng self-registers. H0 decides whether H3 is worth building for; only H3
+  answers it.
+
+## H1 — a target that actually has a Secure Kernel, and a control that does not
+
+Build **two** guests, identical but for VBS. The second is not optional: it is the control for
+every gate after H2, and without it a plausible-looking read cannot be told from a real one.
+
+- **Pass:** in the VBS guest, `Win32_DeviceGuard.VirtualizationBasedSecurityStatus` is `2` from
+  inside that guest, `SecurityServicesRunning` is non-empty, and `securekernel.exe` is present on
+  disk with a build recorded.
+- **Control:** the second guest reports `0` and runs no secure services.
+- **Record the build of both**, because every later comparison against an on-disk image depends on
+  knowing which image.
+- Topology is decided by the constraint that the debugging component runs on the **Hyper-V host of
+  the target**: the host of these two guests is the machine the rest of this plan runs on.
+
+## H2 — can the root read the guest's physical memory at all
+
+Foundational, and independent of every VTL question. If GPA reads do not work, nothing after this
+matters.
+
+Two mechanisms, cheapest first:
+
+1. **`winhvr.sys` as it stands**, which LiveCloudKd's `ReadInterfaceWinHv` suggests is sufficient
+   for some operations. Probe with LiveCloudKd configured to that method — running it is licence-
+   safe and answers whether the route exists on this Hyper-V build before any driver is written.
+2. **A minimal root-partition driver** issuing `HvCallReadGpa`, written only if the above is
+   insufficient. Signable by whoever runs it; the revoked-certificate driver that ships with
+   LiveCloudKd is not a dependency of this plan and should not be loaded to satisfy it.
+
+- **Pass:** a page whose contents are known is read from the root at the right GPA. *Make* it
+  known — allocate a large non-paged buffer inside the guest, fill it with a random signature
+  generated for the run, and find that signature from the root. A signature chosen at run time
+  rather than a constant, so a stale match cannot be mistaken for a live one.
+- **Control 1:** the same search against the *other* guest does not find it. Without this, a read
+  that is actually hitting host memory passes.
+- **Control 2:** a GPA the guest does not have backed must **fail** rather than return zeroes.
+  A reader that returns zeroes for unmapped memory will later report SK as "all zeroes" and be
+  believed.
+
+## H3 — can the root read the guest's VTL1 registers (the pivotal gate)
+
+Everything rests here. `HvCallGetVpRegisters` with `HV_INPUT_VTL` set to `Vtl1`, asking for `CR3`.
+
+- **Pass:** the call succeeds and returns a CR3 that is **not** the guest's VTL0 CR3.
+- **Control 1 — the positive control that makes a negative meaningful.** The same call with
+  `HV_INPUT_VTL = Vtl0` must return a CR3 that matches what the guest's own kernel reports, checked
+  by attaching an ordinary kernel debugger to that guest and reading it. If VTL0 succeeds and VTL1
+  is refused, that is a clean answer about VTL1. If **both** are refused, the finding is about
+  privileges or plumbing and says nothing about VTL1 — and the two failures must not be reported as
+  one.
+- **Control 2:** against the VBS-off guest, the VTL1 request must fail or report VTL1 not enabled.
+  A VTL1 CR3 from a guest with no VTL1 means the value is being fabricated somewhere.
+- **Control 3:** `HvRegisterVsmVpStatus` and `HvRegisterVsmPartitionStatus` should independently
+  agree that VTL1 is enabled on that VP in the first guest and not in the second.
+- **Stop condition:** refused for the VBS guest while the VTL0 control passes — the route as
+  designed is closed, and what remains is the scanning fallback, which is a different plan with a
+  different cost and should be re-decided rather than drifted into.
+
+## H4 — does what comes back look like Secure Kernel
+
+Only meaningful once H3 passes. `HvCallTranslateVirtualAddress` with
+`HV_TRANSLATE_GVA_INPUT_VTL_MASK`, then read.
+
+- **Pass, weak:** at the claimed SK base there is a valid PE header, and its section names and
+  sizes match the `securekernel.exe` image on disk for that guest's build.
+- **Pass, strong:** SK's `KdDebuggerDataBlock` is located — `KDBG` signature, size `0x3A8` — and
+  `SkLoadedModuleList` points at a list whose first entries are plausible module records. Those
+  three facts come from H0's table and were measured from the image, so this is a real test rather
+  than a restatement.
+- **Control 1:** the same procedure against the VBS-off guest finds **no** SK data block. This
+  control is inherited from the EXDI plan's E2 and matters as much here.
+- **Control 2 — an oracle that is not this mechanism.** Compare read-only sections against the
+  on-disk image. Two readings produced by the same hypercall path can agree and both be wrong; the
+  image on disk was produced by neither. LiveCloudKd may be used as a *second* oracle, with the
+  caveat that if it turns out to use the same hypercall it is not independent — establish which
+  route it takes before treating agreement as confirmation.
+- **Note the expected mismatch:** a live image's IAT is populated and will not match the file. A
+  comparison that demands whole-image equality will fail for the wrong reason.
+
+## H5 — can DbgEng be driven off it
+
+Two sub-paths, and the first is **blocked until E0's activation stall is resolved**, since it needs
+a working EXDI server on the debugger host.
+
+- **H5a, through DbgEng.** An EXDI server of our own, handed SK's `KdVersionBlock` address through
+  `Kd=VerAddr:<addr>`. **Pass:** `lm` lists `securekernel`, symbols resolve against live memory, SK
+  structures walk. **Partial pass is the likely outcome and is not a failure** — E1 found DbgEng's
+  `sk` record EXDI-gated with its selector unreferenced, so SK-aware semantics may simply not
+  materialise and what remains is a generic target with correct memory.
+- **H5b, without DbgEng.** Expose the reads as windbg-mcp tools: SK base and size, structure walks,
+  symbol resolution against the image. **This is the fallback that loses least**, precisely because
+  of E1 — if DbgEng contributes no SK awareness, it is contributing only its memory plumbing, which
+  is the part we would already have.
+
+Deciding between them is a result of H4 and E1, not a preference to settle now.
+
+## Explicitly out of scope
+
+**Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility
+question. Nothing seen so far demonstrates them: `SdkControlVmState` pauses and resumes a whole VM,
+which is not VTL1 stepping, and LiveCloudKd's active CLSID is undemonstrated by its own write-up.
+Read-only inspection is the deliverable being tested, and a plan that quietly grows execution
+control will not finish.
+
+**The host's own Secure Kernel.** This technique crosses a partition boundary, so it reaches a
+*guest's* SK and never the host's. Debugging the physical host's SK needs an independent machine,
+which the validation record already states.
+
+## Stop conditions
+
+Written here so they are not renegotiated later:
+
+- **H0 says the specification reserves VTL1 state**, and H3 then refuses with its VTL0 control
+  passing. The hypercall route is closed; re-cost the scanning fallback as a separate decision.
+- **H2 cannot read guest physical memory** by either mechanism. Then the problem is below every
+  VTL question and this plan has learned nothing about SK.
+- **H3 passes but H4 finds nothing recognisable** at any candidate address. Either the translation
+  is wrong or VTL1 memory is protected from the root in a way register access is not — and those
+  are distinguishable, so say which before continuing.
+- **H4 passes and H5a finds DbgEng contributes no SK awareness.** Not a failure: it selects H5b and
+  retires the EXDI work for this route, which is a saving rather than a loss.
+- **Any gate passes without its control having passed.** The result is withdrawn, not caveated.
