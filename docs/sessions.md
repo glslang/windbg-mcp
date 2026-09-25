@@ -220,6 +220,13 @@ here and is worth stating because the refusal above could be read as cancelling 
 session goes on taking calls that name no session, and they run against whatever the worker now
 holds. Only the guarantee a handle buys is withdrawn, because only a handle ever bought one.
 
+**And a stop this server already filed is still collectible with the retired handle.** A
+`continue_async` run whose breakpoint command replaced the target retires the session at that very
+stop, and `wait_for_stop` hands the result over anyway: it reads a record rather than touching a
+target, and the run's own result is the thing a caller most needs at the moment they are told their
+handle no longer names what they opened. `break_in` and `interrupt` are on the other side of that
+line — they reach the debugger, and would reach whatever it is holding now — so they stay refused.
+
 Two more things follow that are worth knowing at the tool surface. The retirement can arrive on a
 call that did nothing wrong — the one that happened to be running when the swap was noticed answers
 normally, and the *next* call naming that handle is refused. And a target that has simply **gone** —

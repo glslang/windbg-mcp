@@ -504,6 +504,28 @@ impl SessionState {
         self.accepts_handle() || matches!(self, Self::Retired(_) | Self::KernelUnresolved(_))
     }
 
+    /// May this handle **collect a result this server already recorded** for it?
+    ///
+    /// Widened by the same one state as the two above, and for a third distinct reason: a stop
+    /// that has been filed is a fact about a run that already happened, and handing it back
+    /// touches nothing. `continue_async` promises that a run which stops while nobody is waiting
+    /// stays collectible — so retiring the session between the stop and the `wait_for_stop` that
+    /// collects it would take away a result the tool had already undertaken to keep, and the
+    /// replacement that retired it is exactly when a caller most needs to see where their run
+    /// ended up.
+    ///
+    /// It is deliberately *not* widened for `break_in` or `interrupt`, which reach the engine and
+    /// would land on whatever target it now holds — the distinction is reading a record against
+    /// operating on a target, not "is an execution handle involved".
+    ///
+    /// **And unlike [`Self::accepts_teardown`] this needs no matching widening at the front of the
+    /// queue**, because the call it admits never gets there: `Sessions::wait_for_stop` reads the
+    /// session's execution slot and waits on a watch, and submits no job. `FOLLOWUPS.md` item 55's
+    /// rule — widen both halves or only move the refusal — applies where there are two halves.
+    fn accepts_execution_read(&self) -> bool {
+        self.accepts_handle() || matches!(self, Self::Retired(_))
+    }
+
     /// Whether the session still owns a worker process.
     pub fn is_live(&self) -> bool {
         !matches!(self, Self::Failed(_) | Self::Closed(_))
@@ -1711,6 +1733,16 @@ impl Sessions {
         supplied: Option<&str>,
     ) -> Result<Arc<Session>, EngineError> {
         self.resolve_admitting(supplied, SessionState::accepts_teardown)
+    }
+
+    /// [`Self::resolve`] for a call that **collects a result already recorded** for this handle
+    /// rather than working on its target, so a retired handle still resolves. See
+    /// [`SessionState::accepts_execution_read`] — including why this one has no queue-side twin.
+    pub fn resolve_for_execution_read(
+        &self,
+        supplied: Option<&str>,
+    ) -> Result<Arc<Session>, EngineError> {
+        self.resolve_admitting(supplied, SessionState::accepts_execution_read)
     }
 
     fn resolve_admitting(
@@ -5408,7 +5440,39 @@ mod tests {
         assert!(!retired.accepts_handle());
         assert!(retired.accepts_default());
         assert!(retired.accepts_teardown());
+        // **And it can still collect a stop this server already filed.** `continue_async`
+        // promises that a run which stops while nobody is waiting stays collectible; a breakpoint
+        // command that replaces the target retires the session at that very stop, so refusing
+        // here would withhold the result in the one case a caller most needs it. It reads a
+        // record rather than reaching the engine, which is the line — `break_in` and `interrupt`
+        // are on the other side of it and stay refused.
+        assert!(retired.accepts_execution_read());
         assert!(retired.is_live());
+    }
+
+    /// The three widened predicates agree on `Retired` and must not be collapsed into one.
+    ///
+    /// They part company on `KernelUnresolved`, which only a teardown may touch: it is a
+    /// preservation boundary, and admitting a stop read or an unaddressed call there would hand
+    /// out a result — or route work — for a target whose ownership is still unresolved.
+    #[test]
+    fn the_widened_predicates_are_not_one_predicate() {
+        let unresolved = SessionState::KernelUnresolved("attach unconfirmed".to_string());
+        assert!(unresolved.accepts_teardown());
+        assert!(!unresolved.accepts_execution_read());
+        assert!(!unresolved.accepts_default());
+        assert!(!unresolved.accepts_handle());
+
+        // A session that has finished is past all four, whichever way it finished.
+        for over in [
+            SessionState::Closed("ended".to_string()),
+            SessionState::Failed("never opened".to_string()),
+        ] {
+            assert!(!over.accepts_handle());
+            assert!(!over.accepts_default());
+            assert!(!over.accepts_teardown());
+            assert!(!over.accepts_execution_read());
+        }
     }
 
     #[test]

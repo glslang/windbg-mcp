@@ -5014,6 +5014,19 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   promise was made to this caller*, not *what is true of the target*, and the first draft asked only
   the second.
 
+- **Retiring at the stop took away the stop**, which was the fourth finding and the only one that
+  was a regression this change *introduced* rather than a gap it failed to close. A
+  `continue_async` run whose breakpoint command replaces the target is retired by the very op that
+  filed its stop, and `wait_for_stop` resolved through `Sessions::resolve` — so the result the tool
+  undertakes to keep collectible became uncollectible at the moment it was most worth reading.
+  `SessionState::accepts_execution_read` is the third widened predicate beside `accepts_default`
+  and `accepts_teardown`, and the line it draws is **reading a record against operating on a
+  target**, not "is an execution handle involved": `break_in` and `interrupt` reach the engine and
+  stay refused. Unlike item 55 it needs no matching widening at the front of the queue, because the
+  call it admits never gets there — `Sessions::wait_for_stop` reads the execution slot and submits
+  no job. Worth checking before adding a fourth: the three agree on `Retired` and part company on
+  `KernelUnresolved`, which only a teardown may touch.
+
 - **The baseline was conditioned on the opener having *succeeded*, and an opener can fail with the
   target already open.** `Sessions::open` answers `OpenError::PostCommit { report_only: true }`
   when only the follow-up diagnostic failed, and hands back a usable handle on purpose — so those
