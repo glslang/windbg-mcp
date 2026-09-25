@@ -1273,9 +1273,8 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         }
         let kernel_attach = matches!(request.op, EngineOp::AttachKernel { .. });
         let ending_session = matches!(request.op, EngineOp::EndSession);
-        // Read here because the op moves into `execute` below, and both are needed after it:
-        // an opener is where [`watch_the_target`]'s baseline is *taken* rather than checked.
-        let opener = request.op.is_opener();
+        // Read here because the op moves into `execute` below and the answer is needed after it.
+        let watch = watch_for(&request.op);
         // Claimed around the whole op, so an interrupt arriving while it runs names *this* job.
         // Outside the `catch_unwind` below, so a panicking op gives the claim back too. A teardown
         // is also sealed here rather than inside itself — see [`claim`] for the window that closes.
@@ -1321,7 +1320,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         // this op's answer reaches its caller — and before anything queued behind it is
         // dispatched. Sending it as a field on the reply would arrive at the same instant as the
         // answer and leave the ordering to whichever the supervisor happened to do first.
-        watch_the_target(&engine, id, opener, ending_session, result.is_ok());
+        watch_the_target(&engine, id, watch);
         // A `Done` is what removes the supervisor's waiter, so one that never arrives costs the
         // caller its session rather than its result: the call times out, the waiter stays, and
         // the session counts as busy — and so stays unreclaimable — for the life of the server.
@@ -1757,12 +1756,116 @@ fn fingerprints_the_process(kind: Option<DebuggeeType>) -> bool {
 /// The reading taken when this worker's target was opened, which every later op is measured
 /// against.
 ///
-/// Set at most once, by [`watch_the_target`], and only for an opener that succeeded **and left a
-/// target behind**. A worker with no baseline is never watched: there is nothing to compare, and
-/// the one open that can finish *after* it reported failure is a kernel attach, where a later
-/// reading would differ from a baseline taken over an empty engine and retire a session that had
-/// just become usable.
+/// Set at most once, by [`watch_the_target`], for an opener that **left a target behind** — which
+/// is asked of the engine rather than read off the opener's result, because the two disagree. An
+/// opener can fail *after* the target exists: `Sessions::open` answers `OpenError::PostCommit`
+/// with `report_only` when only the follow-up diagnostic failed, and hands the caller a usable
+/// handle, precisely so they do not open a second time. Conditioning the baseline on the opener
+/// having *succeeded* therefore left exactly those sessions unwatched for good — live,
+/// caller-visible, and with nothing to compare against. Raised by Codex on
+/// [#389](https://github.com/glslang/windbg-mcp/pull/389).
+///
+/// A worker with no baseline is still never watched, and the case that leaves one is a kernel
+/// attach that timed out before its link came up: the engine holds nothing to fingerprint, and a
+/// baseline taken over an empty engine would differ from every later reading and retire a session
+/// that had just become usable.
 static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
+
+/// Refuses an op that would run against a target this session was **not** opened for.
+///
+/// **The post-op check cannot cover this, which is why there are two of them.** `engine::pump`
+/// writes a job into the worker's pipe as soon as it clears the session gate, without waiting for
+/// the job ahead of it to answer — so by the time an op replaces the target, the next call may
+/// already be queued in this process, having passed a gate that was looking at a session still
+/// `Open`. Retiring the handle afterwards is then too late for *that* job however fast the
+/// supervisor is: it is past every check the supervisor has. So the worker refuses it here, which
+/// is the only side that can. Raised by Codex on
+/// [#389](https://github.com/glslang/windbg-mcp/pull/389).
+///
+/// The by-name list does not need this, and the difference is where the retirement happens:
+/// `Gate::retires` is applied by the pump *as it forwards the offending job*, so anything behind
+/// it meets a session that is already `Retired`. An observation can only be made after the fact,
+/// so the gap it opens has to be closed after the fact too.
+///
+/// Exempts exactly what [`refuse_when_the_target_is_gone`] exempts, for its reasons: an opener is
+/// where the baseline is taken, a teardown is the answer every refusal gives, and an interrupt
+/// never reaches this queue.
+fn refuse_when_the_target_was_replaced(e: &DebugEngine, id: u64, op: &EngineOp) -> Option<Failed> {
+    if watch_for(op) != Watch::Compare {
+        return None;
+    }
+    let why = replacement_now(e)?;
+    // Emitted here as well as from [`watch_the_target`], because this can be the first to notice:
+    // the op that did the replacing may have left the engine unreadable for an instant, and a
+    // refusal that did not also tell the supervisor would refuse every later call while
+    // `session_status` went on reporting the session open.
+    emit(&WorkerMessage::TargetReplaced {
+        id,
+        why: why.clone(),
+    });
+    Some(Failed::categorised(
+        structured::ErrorCategory::StaleSession,
+        format!(
+            "this call was already queued when the target it names was replaced, so it was not \
+             run: {why}. The session's handle has been retired; open again for one that means \
+             something, or `end_session` to release this worker."
+        ),
+    ))
+}
+
+/// What the fingerprint does about one op.
+///
+/// A value rather than two predicates, and computed **before** the op moves into [`execute`], so
+/// the pre-op refusal and the post-op notice read one list and cannot come to disagree about
+/// which ops are in scope — the shape of mistake that leaves an op refused on the way in and
+/// never reported, or reported and never refused.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Watch {
+    /// An opener: this is where the baseline is *taken*, not checked.
+    Baseline,
+    /// An ordinary op: the engine is asked before it runs and again after.
+    Compare,
+    /// Neither. The same two exemptions [`refuse_when_the_target_is_gone`] makes, for its
+    /// reasons: a teardown is the answer every refusal gives and must not be refused by one, and
+    /// an interrupt is answered ahead of this queue and never arrives here — named so that giving
+    /// it a route later does not silently acquire a gate.
+    Ignore,
+}
+
+fn watch_for(op: &EngineOp) -> Watch {
+    match op {
+        _ if op.is_opener() => Watch::Baseline,
+        EngineOp::EndSession | EngineOp::Interrupt { .. } => Watch::Ignore,
+        _ => Watch::Compare,
+    }
+}
+
+/// The fingerprint comparison itself: the sentence to report, or `None` if there is nothing to.
+///
+/// Shared by the two callers so *"is this still the target this session was opened for"* is asked
+/// one way. It answers `None` for a worker with no baseline, for a target that has gone, and for
+/// an engine that will not say — see [`replacement`] for why the last two are not replacements.
+fn replacement_now(e: &DebugEngine) -> Option<String> {
+    let opened_as = OPENED_AS.get()?;
+    // **Asked before a fingerprint is read, and that ordering is the whole of it.** Driving
+    // DbgEng with no debuggee faults *inside* DbgEng — a structured exception `catch_unwind`
+    // cannot trap, so it takes the worker process down instead of failing the call, which is why
+    // [`refuse_when_the_target_is_gone`] exists and why dbgscope guards its own raw path.
+    // Reading engine queries off an engine whose debuggee has just exited is that, and it was
+    // measured here rather than reasoned about: with the reads ahead of this check, the debugger
+    // tier's two "target ends during a run" tests came back as *the engine worker process holding
+    // session `sess-…` is gone* (ARM64 26100, 2026-09-25) — a launched program running to
+    // completion, killing the session that was watching it.
+    //
+    // So this is a guard and not an optimisation, and [`replacement`] is given the answer anyway
+    // so the *rule* — that a target which has gone is not one that has been replaced — is stated
+    // in one place and testable there.
+    let holds_a_target = e.has_target().ok();
+    if holds_a_target != Some(true) {
+        return None;
+    }
+    replacement(opened_as, &TargetFingerprint::read(e), holds_a_target)
+}
 
 /// Takes the baseline after an opener, and after every other op checks that the engine is still
 /// holding what the baseline describes — answering the sentence the supervisor retires on.
@@ -1784,45 +1887,28 @@ static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
 /// `continue_async` whose debuggee simply exits would have its session retired between the stop
 /// and the `wait_for_stop` that collects it, so the run's own result would be refused to the
 /// caller who asked for it.
-fn watch_the_target(e: &DebugEngine, id: u64, opener: bool, teardown: bool, succeeded: bool) {
-    // A teardown's whole job is to let the target go, and it is the one op allowed to run after
-    // the answer below would have been taken.
-    if teardown || (opener && !succeeded) {
+fn watch_the_target(e: &DebugEngine, id: u64, watch: Watch) {
+    if watch == Watch::Baseline {
+        // **The baseline is taken from the engine, not from the opener's result**, because an
+        // opener that failed can still have left a target — see [`OPENED_AS`]. A guard either
+        // way, since reading a fingerprint off an engine holding nothing is an access violation
+        // inside DbgEng rather than an error.
+        if matches!(e.has_target(), Ok(true)) {
+            // `set` rather than an assignment because a worker is sent exactly one opener; if
+            // that ever stops being true, the *first* target is the one the handles name.
+            let _ = OPENED_AS.set(TargetFingerprint::read(e));
+        }
         return;
     }
-    // **Asked before a fingerprint is read, on both paths, and that ordering is the whole of it.**
-    // Driving DbgEng with no debuggee faults *inside* DbgEng — a structured exception
-    // `catch_unwind` cannot trap, so it takes the worker process down instead of failing the call,
-    // which is why [`refuse_when_the_target_is_gone`] exists and why dbgscope guards its own raw
-    // path. Reading engine queries off an engine whose debuggee has just exited is that, and it
-    // was measured here rather than reasoned about: with the reads ahead of this check, the
-    // debugger tier's two "target ends during a run" tests came back as *the engine worker
-    // process holding session `sess-…` is gone* (ARM64 26100, 2026-09-25) — a launched program
-    // running to completion, killing the session that was watching it.
-    //
-    // So this is a guard and not an optimisation, and [`replacement`] is given the answer anyway
-    // so the *rule* — that a target which has gone is not one that has been replaced — is stated
-    // in one place and testable there.
-    let holds_a_target = e.has_target().ok();
-    if holds_a_target != Some(true) {
+    if watch != Watch::Compare {
         return;
     }
-    if opener {
-        // `set` rather than an assignment because a worker is sent exactly one opener; if
-        // that ever stops being true, the *first* target is the one the handles name.
-        let _ = OPENED_AS.set(TargetFingerprint::read(e));
-        return;
-    }
-    let Some(opened_as) = OPENED_AS.get() else {
-        return;
-    };
-    let now = TargetFingerprint::read(e);
-    let Some(why) = replacement(opened_as, &now, holds_a_target) else {
+    let Some(why) = replacement_now(e) else {
         return;
     };
     tracing::warn!(
-        "worker: the engine is no longer holding the target this session was opened for \
-         (was {opened_as:?}, now {now:?}); the session's handles are being retired"
+        "worker: the engine is no longer holding the target this session was opened for; the \
+         session's handles are being retired ({why})"
     );
     emit(&WorkerMessage::TargetReplaced { id, why });
 }
@@ -1904,6 +1990,11 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
     let dequeued = Instant::now();
     let spent = || queued + dequeued.elapsed();
     if let Some(refusal) = refuse_when_the_target_is_gone(e, &op) {
+        return Err(refusal);
+    }
+    // Asked second, and only where the first said there *is* a target: the reads it makes are the
+    // ones that fault on an engine holding none.
+    if let Some(refusal) = refuse_when_the_target_was_replaced(e, id, &op) {
         return Err(refusal);
     }
     // Before the open rather than after it, so a failed one still records what was attempted: this
@@ -9984,6 +10075,43 @@ mod tests {
             DEBUG_CLASS_USER_WINDOWS,
             DEBUG_USER_WINDOWS_SMALL_DUMP
         )));
+    }
+
+    /// **One list decides both ends**, so an op cannot be refused on the way in and never
+    /// reported, or reported and never refused.
+    ///
+    /// The two exemptions are the load-bearing rows. `EndSession` is the answer every refusal
+    /// here gives, so refusing it would leave a session nothing can release — the same trap
+    /// `refuse_when_the_target_is_gone` documents. An opener *takes* the baseline rather than
+    /// being measured against one, and is not exempt from the mechanism so much as the other half
+    /// of it. Mutation-verified: making either of them `Compare` fails this, and dropping the
+    /// opener arm makes every opener refuse itself against a baseline it has not set yet.
+    #[test]
+    fn a_teardown_and_an_opener_are_not_measured_against_the_baseline() {
+        use super::{Watch, watch_for};
+        use crate::proto::EngineOp;
+
+        for op in [
+            EngineOp::OpenDump {
+                path: "x.dmp".into(),
+            },
+            EngineOp::OpenTrace {
+                path: "x.run".into(),
+            },
+            EngineOp::AttachKernelLocal,
+        ] {
+            assert_eq!(watch_for(&op), Watch::Baseline, "{op:?} opens the target");
+        }
+
+        assert_eq!(watch_for(&EngineOp::EndSession), Watch::Ignore);
+        assert_eq!(watch_for(&EngineOp::Interrupt { job: None }), Watch::Ignore);
+
+        // Everything else is measured, which is the default rather than a list — so an op added
+        // later is watched without anyone remembering to add it.
+        assert_eq!(
+            watch_for(&EngineOp::Registers { all: false }),
+            Watch::Compare
+        );
     }
 
     /// The three replacements the fingerprint is for, and the two readings that are not one.
