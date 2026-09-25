@@ -5003,6 +5003,17 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   is the race itself, which needs two genuinely concurrent submissions, so what is pinned is the
   shared list and the comparison rule rather than the window.
 
+- **And that refusal must not swallow the handle-less flow**, which was the third finding and the
+  one that would have been worst to ship. A retired session goes on serving calls that name *no*
+  session, deliberately: the worker is the server's current target, and a caller who asked for no
+  guarantee gets whatever it now holds (`On::Default`, `SessionState::accepts_default`, and
+  `docs/sessions.md` says so). A refusal keyed on the replacement alone made the new target
+  unreachable through the one route documented to reach it, for the life of the worker. The worker
+  cannot tell the two kinds of call apart — the supervisor knows, from the gate — so it is now told,
+  by `WorkerRequest::handle_bound`. Worth carrying: the useful shape of this mechanism is *which
+  promise was made to this caller*, not *what is true of the target*, and the first draft asked only
+  the second.
+
 - **The baseline was conditioned on the opener having *succeeded*, and an opener can fail with the
   target already open.** `Sessions::open` answers `OpenError::PostCommit { report_only: true }`
   when only the follow-up diagnostic failed, and hands back a usable handle on purpose — so those

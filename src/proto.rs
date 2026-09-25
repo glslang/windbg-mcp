@@ -1177,6 +1177,23 @@ pub struct WorkerRequest {
     /// Supervisor-held starting state for an opener. Absent on every ordinary request.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub startup_symbol_path: Option<SymbolPathSetting>,
+    /// Whether the caller supplied a `session_id`, and so is owed the guarantee a handle buys.
+    ///
+    /// **The one thing the worker cannot work out for itself and has to be told.** A session whose
+    /// target was replaced is retired, and a retired session still serves calls that name *no*
+    /// handle — deliberately, because the worker is the server's current target and a caller who
+    /// asked for no guarantee gets whatever it now holds (`engine::On::Default`,
+    /// `SessionState::accepts_default`). The worker refuses a queued call whose target was swapped
+    /// out from under it, which is a guarantee only a handle-bound caller was ever given; without
+    /// this field that refusal would swallow the handle-less flow too and leave the replacement
+    /// unreachable through the one route documented to reach it. Raised by Codex on
+    /// [#389](https://github.com/glslang/windbg-mcp/pull/389).
+    ///
+    /// Defaulted so a request written by an older build still parses, though the build identity on
+    /// `WorkerMessage::Ready` means that cannot happen — and `false` is the conservative default
+    /// either way: it refuses nothing.
+    #[serde(default)]
+    pub handle_bound: bool,
 }
 
 /// A message up the worker's stdout.

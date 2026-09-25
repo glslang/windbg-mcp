@@ -1291,7 +1291,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                 }
                 apply_symbol_path(&engine, &setting).map_err(Failed::from)?;
             }
-            execute(&engine, id, request.op, queued)
+            execute(&engine, id, request.op, queued, request.handle_bound)
         }));
         let panicked = result.is_err();
         let result = result.unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
@@ -1771,7 +1771,16 @@ fn fingerprints_the_process(kind: Option<DebuggeeType>) -> bool {
 /// that had just become usable.
 static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
 
-/// Refuses an op that would run against a target this session was **not** opened for.
+/// What this worker saw when it first noticed its target replaced, once it has.
+///
+/// A latch rather than a question asked again per op, because it answers a question about the
+/// *session* and a session does not come back: once the engine is holding something other than
+/// what the handles name, no later reading makes those handles good again. It is also what keeps
+/// the notice to one — the supervisor's retirement is idempotent, but a `warn!` per op afterwards
+/// would bury the one line that says what happened.
+static REPLACED: OnceLock<String> = OnceLock::new();
+
+/// Refuses a **handle-bound** call that would run against a target its session was not opened for.
 ///
 /// **The post-op check cannot cover this, which is why there are two of them.** `engine::pump`
 /// writes a job into the worker's pipe as soon as it clears the session gate, without waiting for
@@ -1779,36 +1788,46 @@ static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
 /// already be queued in this process, having passed a gate that was looking at a session still
 /// `Open`. Retiring the handle afterwards is then too late for *that* job however fast the
 /// supervisor is: it is past every check the supervisor has. So the worker refuses it here, which
-/// is the only side that can. Raised by Codex on
-/// [#389](https://github.com/glslang/windbg-mcp/pull/389).
+/// is the only side that can.
 ///
 /// The by-name list does not need this, and the difference is where the retirement happens:
 /// `Gate::retires` is applied by the pump *as it forwards the offending job*, so anything behind
 /// it meets a session that is already `Retired`. An observation can only be made after the fact,
 /// so the gap it opens has to be closed after the fact too.
 ///
+/// **Handle-bound only, and that qualifier is the whole of the second finding this drew.** A
+/// retired session goes on serving calls that name *no* session, deliberately — the worker is the
+/// server's current target, and a caller who asked for no guarantee gets whatever it now holds
+/// (`engine::On::Default`, `SessionState::accepts_default`, and `docs/sessions.md` says so in as
+/// many words). Refusing on the replacement alone made the new target unreachable through the one
+/// documented route to it, permanently. The worker cannot work out which kind of call this is, so
+/// it is told: `WorkerRequest::handle_bound`.
+///
 /// Exempts exactly what [`refuse_when_the_target_is_gone`] exempts, for its reasons: an opener is
 /// where the baseline is taken, a teardown is the answer every refusal gives, and an interrupt
 /// never reaches this queue.
-fn refuse_when_the_target_was_replaced(e: &DebugEngine, id: u64, op: &EngineOp) -> Option<Failed> {
-    if watch_for(op) != Watch::Compare {
+///
+/// **Reads the latch rather than the engine**, which is sound because the notice that sets it runs
+/// on this thread at the end of the op before this one — so a replacement made by the job ahead is
+/// recorded before this job is dequeued. What that leaves is the one op after a reading the engine
+/// would not answer, which is the same residual window [`replacement_now`] documents: this narrows
+/// the race rather than closing it.
+fn refuse_when_the_target_was_replaced(
+    op: &EngineOp,
+    handle_bound: bool,
+    replaced: Option<&str>,
+) -> Option<Failed> {
+    if !handle_bound || watch_for(op) != Watch::Compare {
         return None;
     }
-    let why = replacement_now(e)?;
-    // Emitted here as well as from [`watch_the_target`], because this can be the first to notice:
-    // the op that did the replacing may have left the engine unreadable for an instant, and a
-    // refusal that did not also tell the supervisor would refuse every later call while
-    // `session_status` went on reporting the session open.
-    emit(&WorkerMessage::TargetReplaced {
-        id,
-        why: why.clone(),
-    });
+    let why = replaced?;
     Some(Failed::categorised(
         structured::ErrorCategory::StaleSession,
         format!(
             "this call was already queued when the target it names was replaced, so it was not \
              run: {why}. The session's handle has been retired; open again for one that means \
-             something, or `end_session` to release this worker."
+             something, or `end_session` to release this worker. A call that names no \
+             `session_id` still reaches this worker and the target it now holds."
         ),
     ))
 }
@@ -1900,7 +1919,7 @@ fn watch_the_target(e: &DebugEngine, id: u64, watch: Watch) {
         }
         return;
     }
-    if watch != Watch::Compare {
+    if watch != Watch::Compare || REPLACED.get().is_some() {
         return;
     }
     let Some(why) = replacement_now(e) else {
@@ -1910,6 +1929,7 @@ fn watch_the_target(e: &DebugEngine, id: u64, watch: Watch) {
         "worker: the engine is no longer holding the target this session was opened for; the \
          session's handles are being retired ({why})"
     );
+    let _ = REPLACED.set(why.clone());
     emit(&WorkerMessage::TargetReplaced { id, why });
 }
 
@@ -1969,7 +1989,13 @@ fn apply_symbol_path(e: &DebugEngine, setting: &SymbolPathSetting) -> Result<(),
 
 /// Runs one op against this worker's engine. `queued` is how long it waited its turn here, which
 /// only the bounded paths care about.
-fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<Output, Failed> {
+fn execute(
+    e: &DebugEngine,
+    id: u64,
+    op: EngineOp,
+    queued: Duration,
+    handle_bound: bool,
+) -> Result<Output, Failed> {
     // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
     // *plus* whatever this op has already spent getting to the point of arming one. Every budget
     // armed in an arm below is sized from this rather than from `queued`; the messages that report
@@ -1992,9 +2018,11 @@ fn execute(e: &DebugEngine, id: u64, op: EngineOp, queued: Duration) -> Result<O
     if let Some(refusal) = refuse_when_the_target_is_gone(e, &op) {
         return Err(refusal);
     }
-    // Asked second, and only where the first said there *is* a target: the reads it makes are the
-    // ones that fault on an engine holding none.
-    if let Some(refusal) = refuse_when_the_target_was_replaced(e, id, &op) {
+    // The latch is read here rather than inside, so the rule itself is a pure function of the
+    // three things it turns on and can be stated in a test.
+    if let Some(refusal) =
+        refuse_when_the_target_was_replaced(&op, handle_bound, REPLACED.get().map(String::as_str))
+    {
         return Err(refusal);
     }
     // Before the open rather than after it, so a failed one still records what was attempted: this
@@ -10112,6 +10140,52 @@ mod tests {
             watch_for(&EngineOp::Registers { all: false }),
             Watch::Compare
         );
+    }
+
+    /// **A retired session still serves a caller who named no session, and this refusal must not
+    /// take that away.**
+    ///
+    /// That is not an edge case to be tolerated — it is the documented behaviour of omitting
+    /// `session_id` (`engine::On::Default`, `SessionState::accepts_default`, `docs/sessions.md`):
+    /// the worker is the server's current target, and a caller who asked for no guarantee gets
+    /// whatever it now holds. A refusal keyed on the replacement alone made the new target
+    /// unreachable through the one route documented to reach it, for the life of the worker.
+    /// Raised by Codex on the PR; the worker cannot tell the two kinds of call apart, so it is
+    /// told (`WorkerRequest::handle_bound`).
+    ///
+    /// Mutation-verified: dropping the `!handle_bound` term fails the handle-less assertions, and
+    /// dropping the `watch_for` term fails the teardown one — which is the row that matters most,
+    /// since a teardown refused leaves a session nothing can release.
+    #[test]
+    fn a_replaced_target_refuses_a_handle_but_still_answers_a_caller_who_named_none() {
+        use super::refuse_when_the_target_was_replaced as refused;
+        use crate::proto::EngineOp;
+
+        let work = EngineOp::Registers { all: false };
+        let why = Some("a command replaced the debug target");
+
+        // Nothing has been observed yet: neither kind of call is refused.
+        assert!(refused(&work, true, None).is_none());
+        assert!(refused(&work, false, None).is_none());
+
+        // Observed. A handle-bound call is refused, and the refusal says the handle-less route is
+        // still there rather than leaving the caller to guess.
+        let refusal = refused(&work, true, why).expect("a handle-bound call is refused");
+        assert_eq!(
+            refusal.category,
+            Some(crate::structured::ErrorCategory::StaleSession)
+        );
+        assert!(refusal.message.contains("names no `session_id`"));
+
+        // The one this test exists for.
+        assert!(
+            refused(&work, false, why).is_none(),
+            "a caller who named no session is owed no guarantee and must still be served"
+        );
+
+        // A teardown is never refused, whatever it named: it is the answer every other refusal
+        // here gives, and refusing it leaves a session nothing can release.
+        assert!(refused(&EngineOp::EndSession, true, why).is_none());
     }
 
     /// The three replacements the fingerprint is for, and the two readings that are not one.

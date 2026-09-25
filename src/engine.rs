@@ -4353,6 +4353,12 @@ fn pump(
             id: job.id,
             op,
             startup_symbol_path: job.startup_symbol_path,
+            // Read from the gate rather than recomputed, so "did this caller name a session" has
+            // one answer on both sides of the pipe. `Teardown` is a handle too — it is `Handle`
+            // plus the one state a release is still allowed in — but it is exempt in the worker
+            // for the reason every refusal there exempts it, so which of the two it is does not
+            // matter here.
+            handle_bound: matches!(job.gate.on, On::Handle | On::Teardown),
         };
         let Ok(mut line) = serde_json::to_string(&request) else {
             answer(Err(EngineError::Debugger(
