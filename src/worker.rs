@@ -1702,17 +1702,31 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// matches [`crate::server::changes_debug_target`]'s: over-matching costs a caller one re-open,
 /// under-matching lets a handle go on certifying a target it does not name.
 ///
-/// What the three actually answer, measured on dbgeng 10.0.26100.1 (ARM64, 2026-09-25) through
-/// dbgscope's `examples/held_target_probe.rs`, which is where each of these fields' limits came
-/// from rather than from reading the API:
+/// **Which field identifies which kind of target**, one row per opener this server has, because a
+/// fingerprint is only worth what it can tell apart — and three rounds of review found that out by
+/// naming one gap at a time. Measured on dbgeng 10.0.26100.1 (ARM64, 2026-09-25) through
+/// dbgscope's `examples/held_target_probe.rs` rather than read off the API:
 ///
-/// | target | kind | dumps | processes |
-/// |---|---|---|---|
-/// | a launched process at its first break | class 2, qualifier 0 | `[]` | `[its pid]` |
-/// | a loaded kernel dump | class 1, qualifier 1024 | `[<the path>]` | not asked — user-mode only |
-/// | an engine holding nothing | class 0, qualifier 0 | *refused* | not reached |
+/// | opened by | kind (class/qualifier) | dumps | processes | connection | identified by |
+/// |---|---|---|---|---|---|
+/// | `open_dump`, user | 2 / 1024 | the file | the dumped pid | — | **dumps** |
+/// | `open_dump`, kernel | 1 / 1024+ | the file | — | — | **dumps** |
+/// | `open_trace` | 2 / dump | the `.run` | the pid | — | **dumps** |
+/// | `attach_process`, `launch` | 2 / 0 | `[]` | `[the pid]` | — | **processes** |
+/// | `attach_kernel_local` | 1 / 1 | `[]` | — | — | **qualifier** |
+/// | `attach_kernel`, live | 1 / 0 | `[]` | — | `KdSrv:…` | **connection** |
 ///
-/// The last row is why [`watch_the_target`] asks `has_target` first and this is never read there:
+/// Read it as *what is covered* rather than as *what the gaps are*: a row is a claim about one
+/// opener and is checkable on its own, where "these are the only gaps" is a claim about every pair
+/// of targets and was wrong three rounds running. An opener added to `EngineOp` with no row here
+/// is covered by nothing.
+///
+/// The bottom row is the one that had to be added: **every live kernel looks alike** — same class,
+/// same qualifier, no files, no process set — so until the connection field a live kernel swapped
+/// for another was invisible, which is precisely what this mechanism exists to see.
+///
+/// An engine holding **nothing** reads class 0 / qualifier 0 and *refuses* the rest, which is why
+/// [`watch_the_target`] asks `has_target` first and none of this is read there:
 /// `GetNumberDumpFiles` on an engine with no debuggee is an access violation **inside** DbgEng.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TargetFingerprint {
@@ -1762,6 +1776,24 @@ struct TargetFingerprint {
     /// at the last break, so it moves across every `g`. A fingerprint carrying either would
     /// retire a live handle each time a kernel stopped somewhere else.
     processes: Option<Vec<u32>>,
+    /// A **hash** of the connection string a live kernel session is dialled on.
+    ///
+    /// The only thing that tells two live kernel targets apart: every field above is identical
+    /// between any two of them. Until this, a wrapped command that swapped one live kernel for
+    /// another was invisible here — raised by Codex on
+    /// [#389](https://github.com/glslang/windbg-mcp/pull/389) and confirmed by measuring one.
+    ///
+    /// **A hash rather than the string, because the string is a credential.** A KDNET connection
+    /// carries the target machine's debug `key=`, and this struct derives `Debug` and is held for
+    /// the life of the worker — one `{:?}` in a log line, now or later, would put that key on the
+    /// server's stderr and into `server_log`. Identity is all that is wanted, and a hash is all of
+    /// identity that is needed, so the string is hashed where it is read and never stored. Same
+    /// rule `crate::kdconn`'s redacting `Connection` follows for the other half of this.
+    ///
+    /// It is DbgEng's own canonical form rather than what the opener dialled — a 30-character
+    /// `com:port=COM1,baud=115200` reads back as 75 characters of `KdSrv:…` — so it is stable to
+    /// compare and cannot be matched against a profile's string.
+    connection: Option<u64>,
 }
 
 impl TargetFingerprint {
@@ -1779,8 +1811,28 @@ impl TargetFingerprint {
                 true => e.session_processes().ok().map(process_set),
                 false => None,
             },
+            // Hashed as it is read, so the string is never stored, logged or `Debug`ged — see the
+            // field. Asked of every target rather than only a live kernel: the others answer
+            // `E_UNEXPECTED`, which is a `None` like any other, and it is one engine-local call.
+            connection: e.kernel_connection_options().ok().map(|c| hashed(&c)),
         }
     }
+}
+
+/// A 64-bit digest of a string this process must not keep.
+///
+/// FNV-1a, and **not** a cryptographic choice: nothing here defends against someone crafting a
+/// second connection string that collides with the first. What it defends against is the string
+/// existing — in memory, in a log, in a `Debug` rendering — after it has been read, which for a
+/// KDNET connection is the target machine's debug key. Two targets colliding would cost a missed
+/// retirement; the string leaking costs the machine.
+fn hashed(value: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in value.as_bytes() {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h
 }
 
 /// The pids a fingerprint carries, out of what the engine listed.
@@ -2063,6 +2115,10 @@ fn replacement_sentence(opened_as: &TargetFingerprint, now: &TargetFingerprint) 
         "a target of a different kind"
     } else if opened_as.dumps != now.dumps {
         "a different dump or trace file"
+    } else if opened_as.connection != now.connection {
+        // Named without being shown, like every field here — and this one could not be shown even
+        // if the others were, being a live kernel's connection string.
+        "a different live kernel connection"
     } else {
         "a different process"
     };
@@ -10170,6 +10226,7 @@ mod tests {
             kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_PROCESS),
             dumps: Some(vec![]),
             processes: Some(vec![pid]),
+            connection: None,
         }
     }
 
@@ -10362,6 +10419,7 @@ mod tests {
             kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP),
             dumps: Some(vec!["C:\\other.dmp".to_string()]),
             processes: Some(vec![4242]),
+            connection: None,
         };
         assert!(
             says(&a_dump).unwrap().contains("a different kind"),
@@ -10375,6 +10433,7 @@ mod tests {
             kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP),
             dumps: Some(vec!["C:\\at-1000.dmp".to_string()]),
             processes: Some(vec![4242]),
+            connection: None,
         };
         let second = TargetFingerprint {
             dumps: Some(vec!["C:\\at-1005.dmp".to_string()]),
@@ -10386,6 +10445,33 @@ mod tests {
                 .contains("a different dump or trace file")
         );
 
+        // **Two live kernels differ in nothing else**, which is the row the enumeration was
+        // missing: same class, same qualifier, no dump files, no process set. Without the
+        // connection field these two fingerprints are equal and a swapped kernel is invisible —
+        // and it is the one target kind where the swap costs somebody else's machine.
+        let a_live_kernel = |connection| TargetFingerprint {
+            kind: kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_CONNECTION),
+            dumps: Some(vec![]),
+            processes: None,
+            connection: Some(connection),
+        };
+        assert!(super::replacement(&a_live_kernel(1), &a_live_kernel(1), Some(true)).is_none());
+        assert!(
+            super::replacement(&a_live_kernel(1), &a_live_kernel(2), Some(true))
+                .unwrap()
+                .contains("a different live kernel connection"),
+            "nothing else distinguishes two live kernels"
+        );
+
+        // And the hash is of the string, so the string itself never has to be kept. Pinned
+        // because the alternative — storing it — is the thing that would put a KDNET key in a
+        // `Debug` line.
+        assert_ne!(
+            super::hashed("KdSrv:server=..."),
+            super::hashed("com:port=COM1")
+        );
+        assert_eq!(super::hashed("KdSrv:a"), super::hashed("KdSrv:a"));
+
         // **A target that has *gone* is not a target that has been *replaced***, and neither is
         // an engine that will not say. Both readings differ from the baseline and neither is
         // reported: the first is already carried by the stop and refused by
@@ -10395,6 +10481,7 @@ mod tests {
             kind: None,
             dumps: None,
             processes: None,
+            connection: None,
         };
         assert!(super::replacement(&opened_as, &empty, Some(false)).is_none());
         assert!(super::replacement(&opened_as, &empty, None).is_none());

@@ -205,8 +205,11 @@ afterwards.** A command can reach `.opendump` without naming it — inside `.if`
 `.block`, `j` or `z`, or through an alias, which resolves only when it runs — and a breakpoint's
 command runs at a **hit**, which is not a moment this server can retire a handle at in advance. So
 the engine process takes a reading of what it is holding when the target is opened — what kind of
-target DbgEng says it is, which dump or trace files the session is open on, and (user-mode only)
-which processes it holds — and compares it after every operation. Note *holds*, not *is pointing
+target DbgEng says it is, which dump or trace files the session is open on, which processes it
+holds (user-mode only), and, for a live kernel, the connection it is dialled on — and compares it
+after every operation. That last one is there because every live kernel looks alike otherwise: same
+kind, no files, no processes. It is kept as a hash, never as the string, because a KDNET connection
+carries the target machine's debug key. Note *holds*, not *is pointing
 at*: the debugger's current process moves on its own when a child process starts and moves by hand
 on `|Ns`, and neither of those is a change of target. A difference retires the session's
 handles at that point, before the operation's own answer reaches its caller.
