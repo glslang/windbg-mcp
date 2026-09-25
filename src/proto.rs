@@ -1242,6 +1242,25 @@ pub enum WorkerMessage {
     /// the rollback alone would expire mid-step, which is the whole failure being fixed, arriving a
     /// little later.
     RollingBack { id: u64, within_ms: u32 },
+    /// The debuggee this worker holds is **no longer the one its session was opened for**, and
+    /// every handle naming that session has to be retired.
+    ///
+    /// Sent by the op that *found* it rather than by the one that caused it, because the two are
+    /// often not the same op and sometimes not an op at all: a `.opendump` inside a `.if`, a
+    /// `.foreach` or an alias names nothing a text scan can match
+    /// (`crate::server::changes_debug_target`), and a breakpoint's command runs at a hit this
+    /// server never sees. So the worker compares what the engine holds against what it held at
+    /// the open, after every op, and this is what it says when the two differ.
+    ///
+    /// A milestone rather than part of the reply, for the reason [`Self::Committed`] is one: the
+    /// supervisor has to act on it, and — the whole point here — it has to act on it **before**
+    /// this op's own answer reaches its caller, which one pipe read in order is what guarantees.
+    /// It belongs to no particular caller either: the retirement is the *session's*, and the
+    /// caller of the op that happened to notice is not necessarily the one that did it.
+    ///
+    /// `why` is a sentence for the caller whose next call is refused, so it says what changed
+    /// rather than naming an engine field.
+    TargetReplaced { id: u64, why: String },
     /// The op finished. `Err` is a failure with the engine's own text, and — where the worker
     /// knows better than "the debugger said no" — what kind of failure it was.
     Done {

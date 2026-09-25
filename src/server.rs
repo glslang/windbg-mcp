@@ -2054,9 +2054,10 @@ fn describe_stop(stop: &structured::StopReport) -> String {
 /// execution at all*, and the handle is retired without knowing what ran.
 ///
 /// Best-effort for a stronger reason than [`changes_debug_target`]: the data model is
-/// extensible, so no fixed list can enumerate every route to execution. `dx` and `execute`
-/// are therefore both documented as surfaces where a handle is a strong hint, not a
-/// guarantee — everywhere else in this server it is a guarantee.
+/// extensible, so no fixed list can enumerate every route to execution. What an expression
+/// this misses does *not* get away with is leaving a handle behind it: the worker compares what
+/// its engine holds against what it held at the open after every op (`worker`'s
+/// `watch_the_target`), and `dx` is an op like any other.
 fn dx_executes_commands(expression: &str) -> bool {
     expression.to_ascii_lowercase().contains("executecommand")
 }
@@ -2111,8 +2112,18 @@ fn ttd_memory_command(start: u64, end: u64, mode: Option<&str>) -> String {
 /// This is deliberately **best-effort, biased toward retiring the handle**. Over-matching
 /// costs a caller one re-open; under-matching would let a stale handle pass, which is the
 /// failure this mechanism exists to prevent. It cannot be exhaustive — DbgEng has more ways
-/// to reach the target than a name list can enumerate — so `execute` remains the one place
-/// where a handle is a strong hint rather than a guarantee.
+/// to reach the target than a name list can enumerate.
+///
+/// **It is the early defence rather than the only one, and it is early for a reason that the
+/// backstop cannot supply.** `execute` retires *before* the command runs, because a `.detach`
+/// that reports an error may still have detached — so something has to decide from the text, and
+/// a name list is what can. What it cannot see is a wrapper (`.if`, `.foreach`, `.block`, `j`,
+/// `z`) or an alias, which resolves at execution time, so no reading of the text before it runs
+/// is complete. Those are caught **afterwards** instead, by the worker comparing what its engine
+/// holds against what it held at the open (`worker`'s `watch_the_target`, `FOLLOWUPS.md` item
+/// 81). So this staying incomplete is no longer the same thing as a handle outliving its target:
+/// the two together are what make a handle mean something everywhere, and neither replaces the
+/// other.
 /// A command with its **quoted** spans blanked out, so a listed name inside a string is not read
 /// as one.
 ///
@@ -2128,7 +2139,8 @@ fn ttd_memory_command(start: u64, end: u64, mode: Option<&str>) -> String {
 /// and must never say yes to a `.detach` it could not see.
 ///
 /// It is a lexer over `"` and `\`, not a parser — it makes no claim about `.if`, `.foreach` or an
-/// alias, which reach execution without naming what they run (`FOLLOWUPS.md` item 81).
+/// alias, which reach execution without naming what they run. Those are the worker's to catch,
+/// after the fact, by reading the target rather than the command (`worker`'s `watch_the_target`).
 pub(crate) fn outside_quotes(command: &str) -> String {
     /// What a character contributes once quoting is known. A quote is only ever *inside* a line.
     fn kept(c: char, in_quote: bool) -> char {
@@ -4140,6 +4152,13 @@ impl WindbgServer {
         // This closes the path this parameter opens. It does **not** close the same hole through
         // raw text — `execute` with `bp nt!Foo ".detach"` reaches it, and has all along, because
         // finding it there means parsing `bp`'s own quoted argument rather than reading a field.
+        //
+        // **Kept now that the worker watches the target**, which is the shape two reviewers
+        // arrived at independently on [#341](https://github.com/glslang/windbg-mcp/pull/341):
+        // keep the text scan as an early defence and reconcile the target's identity afterwards.
+        // The backstop is what makes the hole above survivable rather than what makes this
+        // redundant — it retires the handle at the *next* stop, which is right for something
+        // nobody could have predicted and worse than refusing for something a reader can see.
         if let Some(command) = &args.command
             && changes_debug_target(&outside_quotes(command))
         {
@@ -7462,9 +7481,13 @@ mod tests {
     ///
     /// `execute` runs such a command and retires the handle first, because it knows the command is
     /// about to run. A breakpoint's runs at **hit** time — maybe never, maybe minutes later, and
-    /// not at any moment this server observes — so there is nowhere to put the retirement and the
-    /// only sound answer is to refuse. `changes_debug_target` is the same list `execute` uses, so
+    /// not at any moment this server observes — so there is nowhere to put the retirement and
+    /// refusing is the better answer. `changes_debug_target` is the same list `execute` uses, so
     /// the two agree about what counts.
+    ///
+    /// Since item 81 it is no longer the *only* answer: a hit that does replace the target is
+    /// caught by the worker at the run's next stop. This refusal is kept because the two are not
+    /// the same offer — a command a reader can see is better refused than armed and undone.
     #[test]
     fn a_breakpoint_command_that_changes_the_target_is_refused() {
         for command in [
@@ -7535,13 +7558,20 @@ mod tests {
             r#".printf "oops; .detach"#
         )));
 
-        // **A wrapper gets through, and this pins that rather than claiming otherwise.**
-        // `changes_debug_target` reads the first token of each `;`-separated segment, so `.if`,
-        // `.foreach` and an alias all reach execution without naming what they run. The gap is
-        // `execute`'s too and predates this parameter -- the same string through `execute` is
-        // equally unretired -- and closing it means parsing the command language, where an alias
-        // resolves at execution time and no static reading is complete. `FOLLOWUPS.md` item 81.
-        // A parser landing here should flip these to `assert!`.
+        // **A wrapper gets through *this*, and that is now a statement about where the work is
+        // done rather than about a gap.** `changes_debug_target` reads the first token of each
+        // `;`-separated segment, so `.if`, `.foreach` and an alias all reach execution without
+        // naming what they run, and no static reading can be complete while an alias resolves at
+        // execution time. Item 81 closed it from the other end instead: the worker compares what
+        // its engine holds against what it held at the open, after every op and therefore after
+        // every breakpoint hit, and retires the session's handles when the two differ
+        // (`worker`'s `watch_the_target`, covered by
+        // `only_a_user_mode_target_is_fingerprinted_by_its_process_id` and
+        // `a_replaced_target_is_reported_and_a_departed_one_is_not`).
+        //
+        // So these stay `!`, and a change that made them true would be a *second* mechanism
+        // rather than the fix — read the observer first and decide whether predicting the text
+        // is worth having as well.
         assert!(!changes_debug_target(".if (1) { .opendump C:\\other.dmp }"));
         assert!(!changes_debug_target(
             ".foreach (x { .echo 1 }) { .detach }"

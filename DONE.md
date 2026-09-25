@@ -66,7 +66,12 @@ result: it asked for a per-field backend test to be *deleted*, and a grader that
 logs written before the change can only freeze one — the deletion is real on the path that grows and
 impossible on the path that cannot. Building it also moved three published identity lines nobody had
 filed, each an overclaim the old rendering made by choosing between two spellings of "no answer" per
-backend.
+backend. **Item 81** (2026-09-25) is here because the instruction it left for whoever closed it was
+written for a different one of the three shapes it weighed: flip two assertions to `assert!`,
+which is right if you parse the command language and wrong if you read the target instead — and
+reading the target is the shape it called the only sound one. It also records the primitive that
+reads as though it already answered the question and does not (`dbgscope`'s `target_identity`),
+and the one case that looks identical to a replacement and must not be treated as one.
 
 ## What is in here
 
@@ -127,6 +132,7 @@ backend.
 - [Item 98](#98-dbgscope-uncommitted-memory-is-an-unreadable-gap-so-a-live-heap-walk-is-not-complete--done-2026-09-24-dbgscope183) — [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete` — done (2026-09-24, dbgscope#183)
 - [Item 80](#80-windbg-mcp-identity-re-derives-the-backend-distinction-once-per-field--done-2026-09-25) — [windbg-mcp] `identity()` re-derives the backend distinction once per field — done (2026-09-25)
 - [Item 32](#32-windbg-mcp-two-arm64-ci-entries-one-of-which-expires--done-2026-09-25) — [windbg-mcp] Two ARM64 CI entries, one of which expires — done (2026-09-25)
+- [Item 81](#81-windbg-mcp--dbgscope-changes_debug_target-reads-a-name-and-a-wrapper-does-not-say-one--done-2026-09-25) — [windbg-mcp + dbgscope] `changes_debug_target` reads a name, and a wrapper does not say one — done (2026-09-25)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4906,3 +4912,80 @@ which label.
 copy step, the CI section of `docs/smoke-test.md`, and the `symsrv.dll` paragraph in
 `.claude/skills/live-kernel/SKILL.md`.
 
+
+## 81. [windbg-mcp + dbgscope] `changes_debug_target` reads a name, and a wrapper does not say one — **done** (2026-09-25)
+
+**Filed as** `[windbg-mcp]`, and that was the first thing building it disproved. Three shapes were
+weighed in the entry and the third — *observe the target instead of predicting it* — was called the
+only sound one. It is, and it needed two engine queries neither crate exposed, so this is a pair of
+PRs rather than one.
+
+`changes_debug_target` matched the first token of each `;`-separated segment against a list —
+`.opendump`, `.attach`, `.detach`, `q` and the rest — and `execute` retired the session's handles
+before running a command it matched. `set_breakpoint` refused one. What neither could see was a
+wrapper: `.if (1) { .opendump C:\other.dmp }` presents `.if`, and so do `.foreach`, `.block`, `j`,
+`z` and an alias defined with `as` — which resolves at *execution* time, so no reading of the text
+before it runs can ever be complete. Raised by Codex on
+[#341](https://github.com/glslang/windbg-mcp/pull/341) and reached independently by CodeRabbit on
+the same PR, both proposing the same remedy: keep the text scan as an early defence and reconcile
+the target's identity afterwards.
+
+**What landed.** The worker takes a *fingerprint* of what its engine holds when the target is
+opened, and compares it after every op — which is after every command, and therefore after every
+breakpoint hit, since a hit happens inside the run whose op has not answered yet. When the two
+differ it sends `WorkerMessage::TargetReplaced`, **before** that op's `Done`, and the supervisor
+retires the session's handles. One pipe read in order is what makes "before" mean something: the
+retirement is applied ahead of the answer reaching the caller and ahead of anything queued behind
+it. It is the same move `worker::pump_a_resume` already made for the running state, whose comment
+had said for months that "an alias, a `;` list and `.if` all reach execution without saying so, and
+a name list that decided this would be wrong in both directions".
+
+The fingerprint is three engine reads, and what each is for is worth keeping:
+
+- **`GetDebuggeeType`'s `(class, qualifier)` pair.** Separates a live kernel from a kernel dump and
+  a live process from a user dump. dbgscope read it in two private places and threw the qualifier
+  away in both, so nothing outside the crate could ask.
+- **`GetNumberDumpFiles` + `GetDumpFileWide`.** Not read anywhere before. It is the only field that
+  sees **two dumps of the same process** — same class, same qualifier, same pid, taken five minutes
+  apart — which is the ordinary way a `.opendump` swap looks.
+- **The current process's OS id, user-mode only.** It catches the replacements that keep the kind
+  and have no file to compare: `.attach`, `.create`, `.restart`.
+
+**Five things it turned out not to be.**
+
+- **`dbgscope::DebugEngine::target_identity` reads as though it answers this and does not.** It is a
+  generation *that crate* hands out at its own openers and teardowns, used to stop a `Scope` or a
+  `ThreadContext` being restored onto a later target. A `.opendump` typed straight at the engine
+  never goes through either, so the identity sits exactly where it was — which its own `set_scope`
+  doc says, about a borrowed WinDbg client, and which reads as a caveat rather than as the answer
+  to this question. Anything that has to notice a swap has to *read the engine*, every time.
+- **The pid cannot be in a kernel fingerprint.** On a kernel target "the current process" is
+  whatever the machine was running at the last break, so it moves across every `g`; carrying it
+  would retire a live handle each time a kernel stopped somewhere else. The rule is its own
+  function (`fingerprints_the_process`) so it can be stated against the qualifiers and
+  mutation-verified rather than inferred from a call site.
+- **A target that has *gone* is not a target that has been *replaced*, and this deliberately says
+  nothing about one.** It looks like the same case and is not: there is no second target for a
+  handle to wrongly certify, the ending is already carried by `StopReport::target_gone` and refused
+  by `worker::refuse_when_the_target_is_gone` with the same recovery a retirement would name — and
+  retiring there would break the ordinary ending of a launched program, whose `continue_async`
+  would have its session retired between the stop and the `wait_for_stop` that collects it, so the
+  run's own result would be refused to the caller who asked for it.
+- **The entry's own closing instruction was wrong.** It said the two assertions in
+  `server::tests::a_breakpoint_command_that_changes_the_target_is_refused` "should flip to
+  `assert!` when it closes". That presumed the *parser* — shape two. Under shape three
+  `changes_debug_target` is exactly as incomplete as it was: it still cannot see inside an `.if`,
+  and is not supposed to. The assertions stay `!` and now say why, with a pointer to the observer
+  that makes the gap survivable. A prescription written beside three options can only be right for
+  one of them.
+- **`SessionState::Retired`'s message claimed something that was already untrue.** It told a caller
+  "the worker still holds a target, but it is not the one this handle names" — false for `.detach`,
+  `q` and `qd`, which are on the by-name list and leave none. It now says only what is true either
+  way: the handle does not name the target it was issued for.
+
+**Where it picked up.** `worker::watch_the_target`, `TargetFingerprint` and `replacement` in
+`src/worker.rs`; `WorkerMessage::TargetReplaced` in `src/proto.rs`; the `reader` arm and
+`stale_handle` in `src/engine.rs`; `changes_debug_target`, `outside_quotes`, `dx_executes_commands`
+and `set_breakpoint` in `src/server.rs` — all four of which described the gap and now describe the
+division of labour. Upstream: `DebugEngine::debuggee_type`, `DebuggeeType` and
+`DebugEngine::dump_files` in dbgscope.

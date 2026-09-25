@@ -195,8 +195,24 @@ string this server never sees.
 
 Both matches are deliberately biased toward retiring: over-matching costs one re-open,
 under-matching would let a stale handle through. Neither can be exhaustive — DbgEng has more ways to
-reach the target than a name list can enumerate, and the data model is extensible — so inside
-`execute` and `dx` a handle is a strong hint rather than a guarantee. Everywhere else it is a
-guarantee, and it is enforced at the front of that session's queue, after everything queued ahead of
-it: checking on the caller's side would leave a window in which an `execute { ".opendump …" }`
-already queued ahead retires the handle between a caller's check and its call.
+reach the target than a name list can enumerate, and the data model is extensible. They are enforced
+at the front of that session's queue, after everything queued ahead of it: checking on the caller's
+side would leave a window in which an `execute { ".opendump …" }` already queued ahead retires the
+handle between a caller's check and its call.
+
+**What makes a handle mean something even where those matches miss is that the engine is asked
+afterwards.** A command can reach `.opendump` without naming it — inside `.if`, `.foreach`,
+`.block`, `j` or `z`, or through an alias, which resolves only when it runs — and a breakpoint's
+command runs at a **hit**, which is not a moment this server can retire a handle at in advance. So
+the engine process takes a reading of what it is holding when the target is opened — what kind of
+target DbgEng says it is, which dump or trace files the session is open on, and (user-mode only)
+which process it is on — and compares it after every operation. A difference retires the session's
+handles at that point, before the operation's own answer reaches its caller.
+
+Two things follow that are worth knowing at the tool surface. The retirement can arrive on a call
+that did nothing wrong — the one that happened to be running when the swap was noticed answers
+normally, and the *next* call naming that handle is refused. And a target that has simply **gone** —
+a launched program that ran to completion, a `.detach` — is not reported this way: that is an
+ending, carried by the stop itself, and the session refuses further work with a stale-session error
+rather than a retired handle. Either way `end_session` still accepts the handle, and opening again
+is how you get a target.
