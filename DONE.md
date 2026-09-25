@@ -5081,6 +5081,25 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   outright would mean reading the engine from the request reader, which is the design change above
   rather than a fix.
 
+- **Every live kernel looks alike, so the fingerprint could not see one swapped for another** —
+  same class, same qualifier, no dump files, no process set. Raised by Codex and confirmed by
+  attaching to one: the only thing that differs is the connection, which `dbgscope`'s new
+  `kernel_connection_options` reads. It is kept as a **hash**, because a KDNET connection string
+  carries the target machine's debug `key=` and the fingerprint derives `Debug` and lives for the
+  worker's lifetime — one `{:?}` in a log line, now or later, would put a key on the server's
+  stderr and into `server_log`. Two other things that run came out of measuring it: the string is
+  DbgEng's own canonical form rather than what was dialled (30 characters of `com:port=COM1,…`
+  read back as 75 of `KdSrv:…`), so it cannot be matched against a profile; and it answers
+  `E_UNEXPECTED` on every non-kernel target, which is a `None` like any other.
+
+  **This was the third round in a row to find a gap by naming one**, which is the signal rather
+  than any of the three. The answer was to stop and enumerate: `TargetFingerprint`'s doc now
+  carries a row per opener saying which field identifies that kind of target, stated as *what is
+  covered* rather than as *what the gaps are* — a row is a claim about one opener and checkable on
+  its own, where "these are the only gaps" is a claim about every pair and had been wrong three
+  times. An opener added with no row is covered by nothing, and that is readable against
+  `EngineOp`.
+
 - **`SessionState::Retired`'s message claimed something that was already untrue.** It told a caller
   "the worker still holds a target, but it is not the one this handle names" — false for `.detach`,
   `q` and `qd`, which are on the by-name list and leave none. It now says only what is true either
