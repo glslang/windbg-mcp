@@ -209,12 +209,16 @@ target DbgEng says it is, which dump or trace files the session is open on, and 
 which process it is on — and compares it after every operation. A difference retires the session's
 handles at that point, before the operation's own answer reaches its caller.
 
-A call that was **already queued** when the swap happened is refused by the engine process itself
-rather than by the handle check, and that is not the same mechanism wearing a different hat: a job
-is handed to the engine process as soon as it clears the handle check, without waiting for the one
-ahead of it to answer, so retiring the handle afterwards is too late for a call that is already
-past every check the server has. The engine process asks the same question again before it runs
-each one.
+A call that **named the session** and was already queued when the swap happened is refused by the
+engine process itself rather than by the handle check, and that is not the same mechanism wearing a
+different hat: a job is handed to the engine process as soon as it clears the handle check, without
+waiting for the one ahead of it to answer, so retiring the handle afterwards is too late for a call
+that is already past every check the server has. The engine process asks again before it runs one.
+
+**Omitting `session_id` still reaches the new target**, which is the same rule as everywhere else
+here and is worth stating because the refusal above could be read as cancelling it: a retired
+session goes on taking calls that name no session, and they run against whatever the worker now
+holds. Only the guarantee a handle buys is withdrawn, because only a handle ever bought one.
 
 Two more things follow that are worth knowing at the tool surface. The retirement can arrive on a
 call that did nothing wrong — the one that happened to be running when the swap was noticed answers
