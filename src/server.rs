@@ -4405,7 +4405,14 @@ impl WindbgServer {
         &self,
         Parameters(args): Parameters<WaitForStopArgs>,
     ) -> Result<CallToolResult, ErrorData> {
-        let session = match self.sessions.resolve(args.session_id.as_deref()) {
+        // `resolve_for_execution_read`, not `resolve`: this collects a stop this server already
+        // filed, which touches nothing — and a run whose breakpoint command replaced the target
+        // retires the session at that very stop, so the plain resolver would withhold the one
+        // result the caller most needs in exactly the case it is most surprising.
+        let session = match self
+            .sessions
+            .resolve_for_execution_read(args.session_id.as_deref())
+        {
             Ok(session) => session,
             Err(e) => return typed_error(ErrorCategory::of(&e), e.to_string(), args.session_id),
         };
