@@ -196,7 +196,7 @@ Further recovery on the same day narrowed the connection failure:
   completed a reset handshake, but subsequent state packets retained the rejected ID. There
   was no usable command prompt. A transport reset is not a reboot of the guest.
 - KD exited cleanly through Ctrl+B while waiting; its listener was released. The guest's WinRM
-  TCP port still timed out. No guest reset, reboot, or VELKO configuration change was performed.
+  TCP port still timed out. No guest reset, reboot, or host configuration change was performed.
 
 Receiving and decoding target packets rules out a completely blocked inbound path for that
 retry. It does not establish why the transport sequence became inconsistent, nor prove the
@@ -247,7 +247,7 @@ connected without requesting an initial break, verified synchronization and gues
 requested one break before detaching. Independent WinRM checks confirmed stable boot time and
 advancing uptime after every run. These comparisons bypassed the server's automatic attach helper
 and its unconditional artifact-absorption `g`; that production path is unchanged and still requires
-a fix and validation. No reset, reboot, or VELKO configuration change was needed for the comparisons.
+a fix and validation. No reset, reboot, or host configuration change was needed for the comparisons.
 An [automatic diagnostic](hypervisor-detach-trace.md#callback-readiness-and-automatic-diagnostic)
 subsequently passed four runs using the normal-output connection announcement to request one
 break. Its reproducible source and matcher tests are retained in dbgscope's `kernel_attach_probe`
@@ -257,7 +257,7 @@ The first integration pinned dbgscope `2d49a887bb0fb9376dd8865b4524d59046992b6c`
 probe and then three sequential MCP detach-only cycles passed on DbgEng 10.0.29617.1000 and
 the four-processor Hyper-V 29671 target. The wrapper verified guest identity, unchanged boot
 time, and advancing uptime twice after each MCP cycle. No recovery attach, reboot, reset,
-installed-server replacement, or VELKO configuration change was needed. Local tests cover
+installed-server replacement, or host configuration change was needed. Local tests cover
 missing and repeated announcements, callback restoration, argument validation, and worker
 option forwarding. This does not establish live deadline-failure or already-halted reconnect
 behavior, owning-engine drop, live NT behavior, or cross-version safety.

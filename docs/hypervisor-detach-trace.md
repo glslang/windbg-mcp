@@ -103,7 +103,7 @@ the pinned dbgscope `16403fa` artifact and loaded the same DbgEng 10.0.29617.100
 
 The first probe initially received no packets because its new executable path had inbound block
 rules on the workspace's Public profile. The owner approved its network-access prompt; the same
-waiting probe then synchronized. No agent-created firewall rule or VELKO change was needed. This
+waiting probe then synchronized. No agent-created firewall rule or host change was needed. This
 pre-connection wait is not a detach failure.
 
 | Controller | Stop CPU | Break-in sends | Post-detach uptime samples (seconds) |
@@ -197,7 +197,7 @@ The direct integration probe recorded one send and stopped on CPU 2. Typed detac
 `KernelRunning` and `NO_DEBUGGEE`; independent uptime advanced from 8886.065 to 8889.403 seconds
 on the same boot. Three subsequent MCP detach-only cycles using the new option each passed,
 with identity, unchanged boot time, and advancing uptime checked over WinRM after every cycle.
-No reset, reboot, recovery controller, installed-server replacement, or VELKO configuration
+No reset, reboot, recovery controller, installed-server replacement, or host configuration
 change was required. Broader stepping, breakpoint-hit, live NT, drop, and cross-build coverage
 remain separate work.
 
@@ -238,7 +238,7 @@ observed single `qd` into a fixed-count recovery loop.
 
 The 60-second exit-only watchdog cannot be treated as a cancellation guarantee even when the
 transport has printed synchronization success. These diagnostic runs did not change the server
-binary, target boot settings, or VELKO configuration.
+binary, target boot settings, or host configuration.
 
 ## Local-only watchdog follow-up, 2026-09-20
 
@@ -270,7 +270,7 @@ prove a universal limitation, the exact failing branch, or the complete post-ACT
 A fresh independent guest-health check passed before only the verified local probe was reclaimed.
 Both debugger processes exited and the endpoint became free. Two further checks on the same boot
 showed uptime advancing from 65070.157 to 65072.473 seconds. No target break, recovery attach,
-reboot/reset, installed-server replacement, or VELKO change was made. This was process reclamation
+reboot/reset, installed-server replacement, or host change was made. This was process reclamation
 with a verified-running guest, not successful cancellation or detach. Automatic recovery remains
 unimplemented and unvalidated.
 
