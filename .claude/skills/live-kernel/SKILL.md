@@ -242,8 +242,10 @@ that one *parses* it, so without it every module reports `Symbol Type: EXPORT - 
 when the identity was known and the file was downloaded. **`symsrv.dll` is the other half, and
 System32 usually does not ship it**: on a machine with neither, a `srv*` path downloads nothing.
 *Usually*, because it is not a constant and this repo believed it was — probing both CI runners
-(issue #153) found one in `windows-latest`'s System32 and none in `windows-11-arm`'s, so check the host in
-front of you (`where.exe symsrv.dll`) rather than assuming either way. Worth
+(issue #153) found one in `windows-latest`'s System32 and none in the ARM64 image `windows-11-arm`
+named at the time, so check the host in front of you (`where.exe symsrv.dll`) rather than assuming
+either way. That qualifier is load-bearing: GitHub migrated that label onto a different image on
+2026-09-23 and nobody has probed the new one, so the reading is about a machine, never a label. Worth
 knowing because of how that presents on a *dump* — not as missing symbols but as a **memory read
 failing** (`0x8007001E`), since a kernel dump's virtual addresses are translated through structures
 the engine locates with `nt`'s symbols. That symptom was read as an ARM64 engine limitation for a

@@ -126,6 +126,7 @@ backend.
 - [Item 99](#99-dbgscope-a-big-page-tag-the-engine-resolves-and-the-walker-does-not--done-2026-09-24-dbgscope180-dbgscope181) — [dbgscope] A big-page tag the engine resolves and the walker does not — done (2026-09-24, dbgscope#180, dbgscope#181)
 - [Item 98](#98-dbgscope-uncommitted-memory-is-an-unreadable-gap-so-a-live-heap-walk-is-not-complete--done-2026-09-24-dbgscope183) — [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete` — done (2026-09-24, dbgscope#183)
 - [Item 80](#80-windbg-mcp-identity-re-derives-the-backend-distinction-once-per-field--done-2026-09-25) — [windbg-mcp] `identity()` re-derives the backend distinction once per field — done (2026-09-25)
+- [Item 32](#32-windbg-mcp-two-arm64-ci-entries-one-of-which-expires--done-2026-09-25) — [windbg-mcp] Two ARM64 CI entries, one of which expires — done (2026-09-25)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4856,4 +4857,52 @@ the two words the block actually printed rather than keying on `unrecorded` alon
 **Where it picked up.** `identity()` in `tools/local_model_eval.py`, the `stated()` helper beside it
 and its `unrecorded`/`unavailable` distinction, and the three drivers' cell dicts
 (`local_model_drive.py`, `claude_code_drive.py`, `fm_drive.py`).
+
+## 32. [windbg-mcp] Two ARM64 CI entries, one of which expires — **done** (2026-09-25)
+
+The debugger tier's ARM64 half was a **pair**: `windows-11-arm` and `windows-11-vs2026-arm`. That
+was deliberate and temporary. GitHub's Visual Studio 2026 ARM64 image went generally available on
+2026-08-20 under the new label, and the `windows-11-arm` label was to be migrated onto it between
+21 and 30 September 2026 — so for the duration the two labels were two *OS builds* and therefore
+two inbox `dbgeng.dll`s, which is the one thing that job exists to load. Running both is what made
+a break during that window attributable to the image rather than to the change under review.
+
+**It converged on 2026-09-23, and the entry was measured rather than taken on announcement.** The
+workflow's own runs report `Image: windows-11-arm64` at 2026-09-23T06:22Z and
+`windows-11-vs2026-arm64` at 12:57Z the same day — so the flip is pinned to a six-hour window
+inside the announced one — and the new image on every run since: eleven sampled across the
+following 47 hours, up to and including the merge run of item 80 (`36132889458`, 2026-09-25T12:04Z),
+where **both** ARM64 entries reported `windows-11-vs2026-arm64`, `Version: 20260920.164.1`. Same
+image, same version, same engine. That is the entry's own convergence condition, and the pair had
+stopped buying attribution and started buying a duplicate twenty-minute run on every PR.
+
+**What landed is not quite what the entry said.** It said to drop the `windows-11-arm` entry and
+keep the new one, which is right about the *label* and silent about the job *name* — and the name
+is the half with the lesson in it. The surviving entry is `windows-11-vs2026-arm` with the suffix
+`, arm64`: the label pins the image, the name says which tier it is. Carrying `vs2026` in the job
+name would rot exactly as `windows-11-arm` did, one image later. So the convention the pair
+established is now written down where the next migration will be read: **the stable entry is
+always `, arm64`; a transitional second entry always names the image in its suffix**, both are kept
+while they report different images, and the older goes when they do not.
+
+**The required-status-check trap did not bite, and was checked rather than assumed.** `ci.yml`'s
+own comment warns that renaming a matrix entry does not rename a required context — it removes the
+only job that could satisfy it, and every PR in the repo then blocks on a check that will never
+report again. The repository ruleset requires `Build & test`, `Documentation lint` and
+`Smoke test (debugger tier)` and **neither ARM64 name**, so both were free to change. Reading the
+ruleset took one API call and is the step to repeat rather than the conclusion to reuse.
+
+**And it invalidated a measurement, which is the durable half.** Issue #153's finding — that
+`windows-latest`'s System32 carries `symsrv.dll` and `windows-11-arm`'s carries none — is now a
+statement about an image that label no longer names, and nobody has probed the new one. It cost
+nothing only because the copy step was already written to be independent of the answer, which was
+the deliberate choice recorded at the time: *"copying makes the entry not depend on the answer,
+which is the property worth having across an image migration"*. That prediction was the one thing
+here that was tested by events, and it held. `docs/smoke-test.md` and
+`.claude/skills/live-kernel/SKILL.md` both now say which image the probe was taken on rather than
+which label.
+
+**Where it picked up.** The `smoke-debugger` matrix in `.github/workflows/ci.yml`, its symbol-half
+copy step, the CI section of `docs/smoke-test.md`, and the `symsrv.dll` paragraph in
+`.claude/skills/live-kernel/SKILL.md`.
 

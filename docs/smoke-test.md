@@ -51,20 +51,30 @@ clock says *some* tier had work to do; which one is a `RAN:`/`SKIPPED` line, not
 The protocol tier rides `cargo test`, so CI already runs it. The debugger tier is opt-in
 *locally* but runs on every push and PR in CI, as the **Smoke test (debugger tier)** job — it is
 the only automated check of the properties process-per-session exists for, and it needs no symbols
-and no network. It runs **three times: on x64 and on both ARM64 images**, because the thing it
+and no network. It runs **twice, on x64 and on ARM64**, because the thing it
 exercises that nothing else does is a real `dbgeng.dll`, and there is a different one on each
 ([#134](https://github.com/glslang/windbg-mcp/issues/134)). No two entries share a cargo
 cache — the key is the runner label, not the architecture — and no entry's failure cancels
 another's.
 
-The two ARM64 entries are `windows-11-arm` and `windows-11-vs2026-arm`, and the pair is temporary.
-The Visual Studio 2026 ARM64 image went generally available on 2026-08-20, and GitHub migrates the
-`windows-11-arm` label onto it between 21 and 30 September 2026 — so for now the two labels are two
-*OS builds*, which for this job means two inbox `dbgeng.dll`s, and running both is what makes a
-break attributable to the image rather than to the change under review. Once the migration
-completes they are one image and the older entry should go (`FOLLOWUPS.md` item 32). The x64 entry
-needs no such pairing: `windows-latest` has been the Visual Studio 2026 Windows Server 2025 image
-since its own migration.
+**The ARM64 entry names an image, not the moving label**, and that is what `FOLLOWUPS.md` item 32
+was about. `windows-11-arm` names whatever ARM64 image GitHub currently ships, and between
+2026-08-20 and 2026-09-23 that meaning moved: the Visual Studio 2026 ARM64 image went generally
+available under `windows-11-vs2026-arm`, and the older label was migrated onto it inside the
+21–30 September window announced for it. A third entry ran the new label beside the old one
+through that window, so that a break arriving with the new image would be attributable to the
+image rather than to the change under review; nothing broke, the two converged, and the
+transitional entry is gone. What the job runs on now is `windows-11-vs2026-arm` by name.
+
+Measured here rather than taken on announcement, because the whole point is that an OS build
+decides which inbox `dbgeng.dll` loads: this workflow's own runs report `Image: windows-11-arm64`
+at 2026-09-23T06:22Z and `windows-11-vs2026-arm64` at 12:57Z the same day, then the new image on
+every run since — eleven sampled across the following 47 hours, so it is a migration rather than a
+sample. **When the next image lands, add it as a second entry with the image in its suffix**, as
+`, arm64 vs2026` was, keep both while they report different images, and drop the older one when
+they do not. The stable entry is always `, arm64`; a transitional one always says which image it
+is. The x64 entry needs no such pairing: `windows-latest` has been the Visual Studio 2026 Windows
+Server 2025 image since its own migration.
 
 **Four of its assertions read the target's memory rather than the dump's structure, and they stand
 down on a host whose engine cannot.** A kernel dump's virtual addresses are translated through
@@ -94,14 +104,16 @@ Same engine, same dumps: symbols are the variable, and the engine's architecture
 [#153](https://github.com/glslang/windbg-mcp/issues/153) turned on.** Probing both CI runners
 directly: `windows-latest` has one at `C:\Windows\System32\symsrv.dll`, servicing-versioned like
 an inbox component, which is why its stock engine resolves symbols with `_NT_SYMBOL_PATH` unset.
-`windows-11-arm` has none anywhere in System32, matching this project's own ARM64 bench. Both
-images do carry the Debugging Tools, `symsrv.dll` included, so on the ARM64 entry the missing half
-was already on disk — the job copies the kit's `dbghelp.dll` and `symsrv.dll` beside the binary
-under test and leaves `dbgeng.dll` stock, so what that entry exercises is still the image's own
-engine. The copy runs on the `windows-11-vs2026-arm` entry too, without that image's System32
-having been probed: copying is what makes the entry independent of the answer, which is worth more
-across an image migration than a measurement a migration can invalidate. Read any blanket statement
-about what "Windows ships" in this repo with that measurement in mind.
+the ARM64 image that `windows-11-arm` named at the time had none anywhere in System32, matching
+this project's own ARM64 bench. Both images do carry the Debugging Tools, `symsrv.dll` included,
+so on the ARM64 entry the missing half was already on disk — the job copies the kit's
+`dbghelp.dll` and `symsrv.dll` beside the binary under test and leaves `dbgeng.dll` stock, so what
+that entry exercises is still the image's own engine. **The image it runs on today was never
+probed**, the 2026-09-23 migration having moved that label onto a different one: copying
+unconditionally is what makes the entry independent of the answer, which is worth more across an
+image migration than a measurement a migration can invalidate — and this one did invalidate it.
+Read any blanket statement about what "Windows ships" in this repo with that measurement in mind,
+and note which image a measurement was taken on before carrying it forward.
 
 So they **ask the host** instead of guessing from `cfg!(target_arch)`, and each asks for the
 premise it actually has. `walk_memory` and the batch work on numeric addresses, so they need only

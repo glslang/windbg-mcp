@@ -10,8 +10,9 @@ instead: a call that outlives its budget finishes its work in the worker and has
 thrown away — item 15 from the private worker channel (#65 / #72,
 2026-08-04), item 19 from
 `walk_memory` (#103, 2026-08-13), item 27 from completing the coordinate work (#156–#158,
-2026-08-18), item 32 from running the debugger tier on the ARM64 runner image that replaces
-`windows-11-arm` in September 2026, items 33 and 39 from driving the server with a **local model** —
+2026-08-18), item 32 from running the debugger tier on the ARM64 runner image that replaced
+`windows-11-arm` in September 2026 — now in [`DONE.md`](./DONE.md), the migration having landed on
+2026-09-23 — items 33 and 39 from driving the server with a **local model** —
 the lease grace measured against the wrong slow party (2026-08-22), and then running the surface,
 the window and the model as a **grid** rather than as a sighting (2026-08-23) — item 35 from
 measuring what a `registers` answer is actually made of (2026-08-22), item 47 from fixing
@@ -503,30 +504,6 @@ PDB the engine **has**.
 `SYMOPT_NO_IMAGE_SEARCH` would do it, but it is a global symbol option and setting it for one field
 would change how every symbol on the target resolves. Worth revisiting only with a per-read way to
 say "from the dump only".
-
-## 32. [windbg-mcp] Two ARM64 CI entries, one of which expires
-
-The debugger tier's ARM64 half is a **pair**: `windows-11-arm` and `windows-11-vs2026-arm`. That is
-deliberate and temporary. GitHub's Visual Studio 2026 ARM64 image went generally available on
-2026-08-20 under the new label, and the `windows-11-arm` label is migrated onto it between 21 and
-30 September 2026 — so today the two labels are two *OS builds* (10.0.26200.9168 against .8875 when
-this was written) and therefore two inbox `dbgeng.dll`s, which is the one thing this job exists to
-load. Running both is what makes a break during that window attributable to the image rather than
-to the change under review, and what gives the repo notice before every PR meets it at once.
-
-- **What to do, and when:** after the migration completes, the two labels name the same image and
-  the pair buys a second run of the same tier. Drop the `windows-11-arm` entry — not the new one:
-  the new label is the stable name for that image, and `windows-11-arm` is the one whose meaning
-  moved. The x64 entry is untouched either way; `windows-latest` migrated to the Visual Studio 2026
-  Windows Server 2025 image before this.
-- **How you will know it converged:** the two entries stop differing in the OS build they report,
-  and `actions/runner-images`' `Windows11-Arm64-Readme.md` stops naming a separate VS2022 image.
-  Until then, an entry that fails alone is the interesting one — read which label it is before
-  reading the diff.
-- **What it could still turn up in the meantime:** the copy step assumes the kit at
-  `C:\Program Files (x86)\Windows Kits\10\Debuggers\arm64`, which both images carry today (the
-  same WDK build, 10.1.26100.6584). It throws by name if that stops being true, which is the
-  failure this pair is here to catch early rather than on the migration date.
 
 ## 33. [windbg-mcp] The lease grace assumes the server is the slow party
 
