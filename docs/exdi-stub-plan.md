@@ -66,22 +66,30 @@ firewall rule are console work on the VMware host rather than something the debu
 arrange for itself. The `.vmx` keys and the 8864/8832 defaults are **recalled and not measured
 here**, no VMware being installed on the debugger host to check them against.
 
-**When Hyper-V owns the box, VMware runs on the Windows Hypervisor Platform, and that may cost the
-guest its VBS.** Nested virtualisation (`vhv.enable`) is what lets the guest run VBS/HVCI, and
+**When Hyper-V owns the box, VMware runs on the Windows Hypervisor Platform, and that costs the
+guest its VBS.** Nested virtualisation (`vhv.enable`) is what lets a guest run VBS/HVCI, and
 without VBS there is no Secure Kernel in it to debug — which is E2's whole subject, while E0 and E1
-need only a plain NT guest. Whether WHP supports `vhv.enable`, and whether the debugStub works
-under WHP at all, were **not** established here. Settle it from inside the guest before building
-anything on top of it:
+need only a plain NT guest. Reported from the host 2026-09-25: the guest's `msinfo32` gives VBS as
+not enabled, VMware is running on WHP, and virtualisation is not available to hand to the guest.
+Hyper-V stays enabled there, the Hyper-V guests on that box being the rest of this lab, so the
+guest cannot acquire VBS later either.
 
-```pwsh
-(Get-CimInstance -Namespace root\Microsoft\Windows\DeviceGuard `
-  -ClassName Win32_DeviceGuard).VirtualizationBasedSecurityStatus   # 2 = VBS running
-```
+**That closes the E0-to-E2 path on a Hyper-V-locked host one step earlier than the stop conditions
+below anticipate.** Those are written for E2 *running* and finding SK pages unreadable; here E2
+cannot run at all, because no hypervisor on the box both exposes a gdbstub and can host a VBS
+guest. Hyper-V can host one and exposes no gdbstub; VMware exposes a gdbstub and, under WHP, has no
+nested virtualisation to give. QEMU on that host meets the same wall through WHPX, and its TCG mode
+does not implement VMX/SVM for a guest hypervisor to run on — so the emulation fallback is not one.
 
-If that answers `2`, E2 has a target. If it does not, the way back — disabling Hyper-V so VMware
-regains its own hypervisor — removes any debugger host that is itself a Hyper-V guest of the same
-box, so on a single machine "this bench drives" and "that guest has VBS" can be mutually exclusive.
-A second machine for either role dissolves it.
+**A second, bare-metal Linux host restores E2 without moving the driver.** VMware Workstation on
+Linux uses its own kernel modules rather than the platform's hypervisor, so `vhv.enable` is
+available and a Windows guest there can run VBS; a guest built under Workstation on Windows moves
+across as its `.vmx` and disks. QEMU/KVM on that same host is the alternative, and is what E0's
+register block is lifted from. `ExdiGdbSrv.dll` dials out, so the debugger host stays where it is
+and reaches the new box over TCP — measured on this bench 2026-09-25, outbound TCP and DNS leave
+the Hyper-V NAT segment, which is the direction this needs and the opposite of the inbound path E0
+requires. Neither host has been built; what is established is why the single-box arrangement
+cannot work.
 
 ## Gates
 
@@ -315,6 +323,12 @@ Write these down before starting, so a sunk cost does not decide:
 - **E2 finds SK pages unreadable** through the gdbstub. Then the nested-SLAT assumption is wrong,
   and the QEMU shortcut is gone; E3's cost rises to "the whole thing" and should be re-decided
   rather than continued into.
+- **E2 cannot be reached on the host available**, which is a different stop from the one above and
+  was the one that actually fired — see [where each component runs](#where-each-component-runs).
+  A host whose hypervisor slot is already taken can leave no backend that both exposes a gdbstub
+  and can host a VBS guest, so the nested-SLAT assumption never gets tested and nothing has been
+  learned about SK. The answer is a second host rather than a redesign, and E0 and E1 do not wait
+  for it: they need only a plain NT guest behind a gdbstub, which such a host can still provide.
 - **E1 finds no forcing option and the E2 fallback also fails.** Then DbgEng cannot be driven
   against a non-NT kernel by configuration, and the remaining route is a debugger that is not
   DbgEng — which is outside this milestone and outside this server.
