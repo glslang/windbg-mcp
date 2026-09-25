@@ -1759,6 +1759,64 @@ UNRECORDED = "unrecorded"
 # read as a legacy log.
 UNAVAILABLE = "unavailable"
 
+# The identity fields a **backend answers**, rather than ones `identity()` works out per record.
+# Every driver states a value for all of them on every record it writes - `None` where the row has
+# no such answer - so the dispatch that used to live here is gone rather than relocated, and a
+# field added to this tuple with no driver opinion fails `tools/test_local_model_eval.py` instead
+# of taking whatever the author of the next field happened to write (`FOLLOWUPS.md` item 80).
+#
+# **The nulls the drivers already wrote could not have carried this**, which is why it is a new
+# key rather than a reading of the old ones: `model_digest: null` is a deliberate "no address" on
+# two backends, but `think` is `false` on an fm row and *absent* on a Claude one - one value, one
+# omission, neither null - and those two are exactly the cases the removed dispatch existed for.
+IDENTITY_FIELDS = ("weights", "reasoning", "harness")
+
+
+def legacy_identity(record):
+    """The identity block implied by a record written before a driver stated one.
+
+    **This is the only place the per-backend dispatch survives, and it cannot grow.** A record
+    with no `identity` key predates that key, so the backends and fields it can have been written
+    by are fixed at what existed when this was written (2026-09-25): a new backend's records carry
+    the block, and a new field is absent from every record here - which renders `unrecorded`,
+    which is what it is. Needing to edit this function is a sign of having misread it.
+
+    The three fields it reads are still written beside the block by the drivers, because they are
+    the *raw readings* the block resolves rather than duplicates of it: `model_digest` is what
+    `/api/ps` answered, `os_build` what `sw_vers` answered, `harness_version` what
+    `claude --version` answered. Absent stays absent here - `unrecorded` is the honest reading of
+    a log from before the field, and only a field the driver would have written as null becomes
+    `unavailable`.
+    """
+    backend = record.get("backend")
+    # **For the fm rows the OS build *is* the model version.** Apple ships the weights with the OS
+    # and gives them no address, so reading `model_digest` there would reduce every macOS revision
+    # to one indistinguishable `unavailable` - two runs whose model changed underneath them
+    # comparing as though nothing had.
+    source = "os_build" if backend == "fm" else "model_digest"
+    block = {"weights": record[source]} if source in record else {}
+    if backend in ("claude-code", "fm"):
+        # Neither has an arm this bench sets. The on-device model reports `reasoning: false`, and a
+        # Claude row's reasoning belongs to a client this bench does not drive - so `think: false`
+        # on the first and no `think` at all on the second are both an absence, and folding either
+        # in as `off` beside a `think: true` ollama group printed `on, off` for a run in which
+        # every backend *with* the knob ran with it on.
+        block["reasoning"] = None
+    elif "think" in record:
+        # A log written before the reasoning axis carries no `think`, and leaving the key out here
+        # is what makes it read as `unrecorded` rather than as an `off` nobody measured.
+        block["reasoning"] = "on" if record["think"] else "off"
+    if backend == "claude-code":
+        if "harness_version" in record:
+            block["harness"] = record["harness_version"]
+    else:
+        # An ollama or fm row's harness is a script in this repo with no version to name. That is a
+        # row with no answer, not a field nobody recorded - and saying so is why a mixed run now
+        # prints `harness <version>, unavailable` where it used to print the Claude rows' version
+        # alone, as though it were the whole run's.
+        block["harness"] = None
+    return block
+
 
 def identity(log_records):
     """The uncontrolled variables of a run: what is neither the question nor the surface.
@@ -1767,15 +1825,20 @@ def identity(log_records):
     the grid varies on purpose. These are the ones nothing controls — the build that answered, the
     weights behind a mutable tag, the harness resolving an alias, and the task list the questions
     came from.
+
+    **Nothing here tests which backend wrote the record.** `run`, `suite` and `server` are answered
+    the same way by all of them; the three that are not are read out of the block the driver
+    resolved (`IDENTITY_FIELDS`), because every instance of this going wrong has been this function
+    inferring something the writer already knew.
     """
     def stated(record, name, render=str):
         """One identity field, with **absent and null kept apart**.
 
-        A driver writes `model_digest: null` *deliberately* on a Claude row - an alias resolved
-        inside a client this bench does not own has no content address to offer - so folding that
-        into `unrecorded` labelled every current run containing a Claude cell as a log predating
-        the field. Absent means nobody recorded it and never can; null means this row cannot have
-        one. The series has to tell those apart or it cannot compare anything against history.
+        A driver writes `weights: null` *deliberately* on a Claude row - an alias resolved inside a
+        client this bench does not own has no content address to offer - so folding that into
+        `unrecorded` labelled every current run containing a Claude cell as a log predating the
+        field. Absent means nobody recorded it and never can; null means this row cannot have one.
+        The series has to tell those apart or it cannot compare anything against history.
         """
         if name not in record:
             return UNRECORDED
@@ -1798,34 +1861,12 @@ def identity(log_records):
         fields["suite"].add(stated(record, "suite", lambda s: f"{s.get('name')} ({s.get('file')})"))
         fields["server"].add(stated(record, "server",
                                     lambda s: f"{s.get('name')} {s.get('version')}"))
-        if record.get("backend") == "claude-code":
-            fields["harness"].add(stated(record, "harness_version"))
-        elif record.get("backend") == "fm":
-            # **`think: false` on an fm row is an absence, not a setting.** The driver writes it
-            # because the field is part of a cell, but this model reports `reasoning: false` - it
-            # has no arm to be in. Folding it in as `off` beside a `think: true` ollama group would
-            # print `on, off` for a run in which every backend that *has* the knob ran with it on:
-            # the same false "something moved" the Claude rows are kept out for. `unavailable` is
-            # the vocabulary this block already uses for a row with no such answer to give, and the
-            # footnote already explains it.
-            fields["reasoning"].add(UNAVAILABLE)
-        else:
-            # **Only the rows that have the knob.** Folding the Claude rows in here would report
-            # every mixed run as reasoning both ways, which is exactly the false "something moved"
-            # this block exists to prevent - their reasoning is the client's and unrecordable.
-            fields["reasoning"].add(
-                UNRECORDED if "think" not in record
-                else ("on" if record["think"] else "off"))
+        block = record["identity"] if "identity" in record else legacy_identity(record)
+        fields["harness"].add(stated(block, "harness"))
+        fields["reasoning"].add(stated(block, "reasoning"))
         model = record.get("model")
         if model:
-            # **For the fm rows the OS build *is* the model version.** Apple ships the weights with
-            # the OS and gives them no address, so `model_digest` is null by construction - and
-            # reading it here would reduce every macOS revision to one indistinguishable
-            # "unavailable", which is the opposite of what this block is for: two runs whose model
-            # changed underneath them would compare as though nothing had. `os_build` is the only
-            # identity that moves when the shipped model does.
-            digest = ("os_build" if record.get("backend") == "fm" else "model_digest")
-            weights.setdefault(model, set()).add(stated(record, digest))
+            weights.setdefault(model, set()).add(stated(block, "weights"))
     return {name: sorted(values) for name, values in fields.items()} | {
         "weights": {model: sorted(digests) for model, digests in sorted(weights.items())}}
 
@@ -1852,10 +1893,18 @@ def print_identity(ident, indent="  ", header=True):
         # here can be matched against the machine's own listing by eye, and the full value is in
         # the record for anything that needs to be exact.
         print(f"{indent}{'weights':<9} {model} {' '.join(d[:12] for d in digests)}")
-    if any(UNRECORDED in ident[name] for name in ("suite", "server", "harness", "reasoning")) or \
-            any(UNRECORDED in d for d in ident["weights"].values()):
-        print(f"{indent}({UNRECORDED} is a log written before a field existed — it cannot be "
-              f"filled in afterwards; {UNAVAILABLE} is a row that has no such answer to give)")
+    # **Whichever of the two words the block actually used**, rather than both whenever one
+    # appears. `unavailable` now reaches a run no Claude cell was in - an ollama row has no harness
+    # version to give - so a footnote keyed on `unrecorded` alone would leave the word this run
+    # printed unexplained, which is how the two get read as one thing.
+    legend = ((UNRECORDED, "a log written before a field existed — it cannot be filled in "
+                           "afterwards"),
+              (UNAVAILABLE, "a row that has no such answer to give"))
+    said = set().union(*(ident[name] for name in ("suite", "server", "harness", "reasoning")),
+                       *ident["weights"].values())
+    shown = [f"{word} is {gloss}" for word, gloss in legend if word in said]
+    if shown:
+        print(f"{indent}({'; '.join(shown)})")
 
 
 def cell_label(cell):

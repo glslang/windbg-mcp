@@ -77,9 +77,10 @@ turn can outlive the listener's lease grace, which is a real cost with its own f
 removed that cost, so the axis became affordable and was run as an A/B — the sixth run below. It is
 an axis now, set per cell group with `think` and recorded per record. Everything above ran with
 `think: false` — provably, since the driver sent it unconditionally until the axis landed — but
-their logs **do not say so**: written before the field existed, they carry no `think` at all and
-their identity blocks read `reasoning unrecorded`. That is deliberate, and the distinction matters
-twice over, since resume reads the same absence as `off` while the identity block refuses to.
+their logs **do not say so**: written before the field existed, they carry no `think` at all, so
+their ollama rows read `reasoning unrecorded` — beside the `unavailable` their Claude rows read,
+those having no arm to be in either way. That is deliberate, and the distinction matters twice
+over, since resume reads the same absence as `off` while the identity block refuses to.
 
 **The tools themselves.** The harness executes read-only tools and reports anything else back to
 the model as refused, so a wrong pick is *measured* rather than performed. `launch`, `execute` and
@@ -600,23 +601,48 @@ lines that appear when something did move were checked against a log doctored to
 section per run, which reads well and cannot be diffed — the tables in it measure different
 servers, which the page says in words and no reader can check.
 [`eval-runs.json`](./eval-runs.json) is the machine-readable half, one row per run keyed by the
-identity above:
+identity above.
+
+The checked-in file is **two** invocations rather than one, because the suite a run is graded
+against is an argument and the older logs were asked a different set of questions:
 
 ```console
-python3 tools/local_model_eval.py --series eval-out/*.jsonl tools/eval_tasks_v1.json \
-  -o docs/eval-runs.json
+python3 tools/local_model_eval.py --series \
+  eval-out/after-206.jsonl eval-out/after-210.jsonl eval-out/after-217.jsonl \
+  tools/eval_tasks_v1.json -o /tmp/a.json
+python3 tools/local_model_eval.py --series \
+  eval-out/2026-09-13.jsonl eval-out/2026-09-14-nothink.jsonl eval-out/2026-09-14-think.jsonl \
+  tools/eval_tasks.json -o /tmp/b.json
 ```
+
+concatenated in that order. Running one `--series` over `eval-out/*.jsonl` grades every log against
+whichever suite is named, which is not what those six runs measured.
 
 `unrecorded` and `unavailable` are kept apart, which matters more than it looks: the first means
 nobody recorded the field and now nobody can, while the second is a row that has no such answer to
-give — a Claude cell's `model_digest`, since `opus` is an alias resolved inside a client this bench
-does not own. Folding them together would label every current run containing a Claude cell as a
-legacy log.
+give — a Claude cell's `weights`, since `opus` is an alias resolved inside a client this bench does
+not own. Folding them together would label every current run containing a Claude cell as a legacy
+log.
 
-The three runs already in the series read `unrecorded` for every identity field, and that is the
-point rather than an omission: **a run recorded without identity cannot have it added later.** Each of
-those write-ups names its own server build in prose, which is why nothing published is wrong; what
-was missing was any way to *check* it, and to do it for a run nobody has written up yet.
+**Which of the two a row gets is the backend's own statement, not the grader's inference**
+(`FOLLOWUPS.md` item 80). Each driver writes an `identity` block answering every name in
+`local_model_eval.IDENTITY_FIELDS` — `weights`, `reasoning`, `harness` — with `None` where the row
+has no answer, and `identity()` reads that and tests no backend at all. It used to work each field
+out per record, and both times that was wrong it was wrong the same way: a field was added, one
+backend got an answer somebody had thought about, and the others got whatever fell out. The cost of
+inferring shows in what re-grading the six logs moved — no score, but three identity lines that had
+each claimed more than their log said: a mixed run's `harness 2.1.270 (Claude Code)` was the Claude
+rows' alone and now says `, unavailable` beside it; `reasoning unrecorded` on a pre-axis log was
+`unavailable, unrecorded`, the Claude rows never having had an arm to record; and arm A of the
+reasoning A/B read `off` where it is `off, unavailable`, while arm B gained a `harness unavailable`
+line it had not printed at all — so the one composition difference between the two arms was
+invisible in the field the A/B is about.
+
+The three runs already in the series read `unrecorded` for every field any row could have recorded,
+and that is the point rather than an omission: **a run recorded without identity cannot have it
+added later.** Each of those write-ups names its own server build in prose, which is why nothing
+published is wrong; what was missing was any way to *check* it, and to do it for a run nobody has
+written up yet.
 
 ## What one grid showed
 

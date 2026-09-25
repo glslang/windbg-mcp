@@ -48,11 +48,11 @@ against (2026-09-13), and items 73–74 from checking the four driver tools agai
 Driver Buddy Revolutions over `mountmgr` and HEVD — an import directory the loader may have
 freed, and the one section of the ported program with no counterpart here (2026-09-14) — and item
 79 from item 78's own fix, which got the user-mode heap walker past the layout refusal and one step
-into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16), now in
-[`DONE.md`](./DONE.md) — and item 80
+into the next wall: the PEB lists one heap where the debugger sees four (2026-09-16), and item 80
 from adding Apple's on-device model as the eval's third backend (#335 / #336, 2026-09-17), where
-two review rounds found `identity()` reporting something false about a run because it works out
-what a record contributes by testing the backend again in each field that needs it. And item 81 from
+two review rounds found `identity()` reporting something false about a run because it worked out
+what a record contributes by testing the backend again in each field that needs it — both now in
+[`DONE.md`](./DONE.md). And item 81 from
 [#341](https://github.com/glslang/windbg-mcp/pull/341)'s breakpoint-command guard, where both
 review bots independently reached the same finding — a command scanner that reads the first token
 of a segment cannot see `.opendump` inside an `.if`, a `.foreach` or an alias that resolves only
@@ -1443,71 +1443,6 @@ its own code, which is what makes the walk worth starting.
 
 **Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
 these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
-
-## 80. [windbg-mcp] `identity()` re-derives the backend distinction once per field
-
-`local_model_eval.identity()` decides what a record contributes to each identity field by testing
-the backend **again, separately, in every place that needs it**. As it stands there are two such
-tests and they do not agree in shape: a three-way `if/elif/else` covering `harness` and `reasoning`,
-and an unrelated inline ternary choosing `os_build` over `model_digest` for `weights`. Neither knows
-about the other, and a field added tomorrow gets whatever its author happens to write. The likeliest
-shape is worse than picking a wrong arm: a single `fields["x"].add(stated(record, "x"))` with **no
-backend test at all**, which treats three backends as one and is only correct for whichever of them
-the author had in mind. There is no `else` waiting to catch it — the one that exists belongs to
-`reasoning` alone.
-
-Both existing tests were added *reactively*, one per review round on the PR that introduced the
-third backend, each after a run had already reported something false:
-
-- `model_digest` is null by construction on an fm row (Apple ships the weights with the OS and gives
-  them no address), so every fm run read `weights apple-foundation-models unavailable` and two runs
-  across a macOS update — which *is* a model update — compared as though nothing had moved
-  (`09aa279`).
-- `think: false` is an absence rather than an arm, so folding it into the reasoning field printed
-  `on, off` for a run in which every backend *with* the knob ran with it on (`faa147a`).
-
-**The bugs are fixed; the shape that produced them is not.** Two fields needed a backend test and
-two got one, independently, after the fact. There is no reason the third will be noticed sooner.
-
-- **Why deferred:** the fix touches the ollama and `claude-code` paths, so it had no business in the
-  PR that added a third backend. It is also not urgent — both known instances are fixed, and the
-  cost of the next one is a review round rather than a wrong number shipped.
-- **What would close it:** make each backend *declare* what it can and cannot answer rather than
-  have `identity()` infer it per field — as **new, explicit capability metadata**, which is the
-  part worth stating precisely, because the obvious shortcut does not work.
-
-  The tempting shortcut is to read the nulls the drivers already write. That works for
-  `model_digest`, which both `claude_code_drive.py` and `fm_drive.py` set to `None` deliberately,
-  and it fails on the field that caused the trouble: `fm_drive.py` writes `think: False` — a
-  value, not a null, because the field is part of a cell — and `claude_code_drive.py` **omits**
-  `think` altogether. One absent, one false, neither null, and those two are exactly the cases the
-  backend-specific reasoning branch exists for. An implementation keyed on nulls would fix
-  `weights` and leave `reasoning` precisely where it is.
-
-  And *which fields* is not enough either, because one of the two existing dispatches is not a
-  can/cannot question at all: `weights` reads `os_build` for `fm` and `model_digest` for the other
-  two, so a backend that merely declares "I can answer `weights`" leaves `identity()` still
-  deciding where to read it from. Two shapes close it and one of them closes it completely:
-
-  - **Map each logical field to its source**, per backend — `weights -> ("os_build", render)` for
-    `fm`, `weights -> ("model_digest", render)` for the rest. This removes the inference but keeps
-    a table `identity()` has to consult.
-  - **Have each driver emit the resolved value** under one agreed key, so `fm_drive.py` writes the
-    OS build into it, `local_model_drive.py` writes the digest, `claude_code_drive.py` writes
-    `None`. `identity()` then reads one key for every backend and the dispatch is gone rather than
-    relocated — which is the point, since every instance so far has been `identity()` inferring
-    something the writer already knew.
-
-  Either way a fourth backend states its answers rather than inheriting whatever an author wrote
-  for the others.
-- **A smaller check that would have caught both:** a test that builds one record per backend and
-  asserts every identity field is what that backend claims, so a new field with no backend opinion
-  fails rather than defaults.
-
-**Where it picks up.** `identity()` in `tools/local_model_eval.py`, the `stated()` helper beside it
-and its `unrecorded`/`unavailable` distinction, and the three drivers' cell dicts
-(`local_model_drive.py`, `claude_code_drive.py`, `fm_drive.py`) which are where a backend could
-declare what it cannot answer.
 
 ## 81. [windbg-mcp] `changes_debug_target` reads a name, and a wrapper does not say one
 
