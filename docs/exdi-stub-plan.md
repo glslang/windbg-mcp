@@ -411,6 +411,43 @@ Hyper-V's own partition interfaces needs no gdbstub and runs on the Hyper-V alre
 effort", and this release ships `vid.h`, `viddefs.h` and a 157 KB `hvgdk.h` against it, which
 lowers that cost without measuring how far.
 
+**The licence is GPL-3.0, so the clean-room is mandatory rather than preferable.** Nothing from
+`hvlib` may be linked or derived from in this project. What is reusable is the *technique*, and the
+facts it rests on are Microsoft's rather than the tool's — so the implementation is written from
+the published TLFS and VSM documentation, not from the headers in that distribution, and that
+distinction should be deliberate now that those headers have been read.
+
+#### Hypercalls are the mechanism, and they are VTL-parameterised
+
+Not calls *into* Secure Kernel: `HvCallVtlCall`/`HvCallVtlReturn` are a guest transitioning between
+its own VTLs and are not the root's instrument here. What the root partition gets is all three
+pieces a read-side backend needs, each taking a VTL:
+
+- **`HvCallGetVpRegisters`** with `HV_INPUT_VTL` set to `Vtl1` — SK's `CR3` and register context,
+  which is the part that scanning memory does not readily yield.
+- **`HvCallTranslateVirtualAddress`** with `HV_TRANSLATE_GVA_INPUT_VTL_MASK` — the hypervisor
+  performs the VTL1 GVA-to-GPA translation, which removes the need to reimplement SK's swizzled
+  page-table walk and so retires the PTE swizzle bit `SkdInitDebuggerDataBlock` records as a
+  problem to solve.
+- **`HvCallReadGpa`/`HvCallWriteGpa`** — the bytes themselves.
+
+`HvRegisterVsmVpStatus`, `HvRegisterVsmPartitionStatus` and `HvRegisterVsmCapabilities` answer
+whether VTL1 is enabled on a given VP before any of that is attempted.
+
+**Locating SK may then need no scan.** Three findings meet: `HvCallGetVpRegisters` at `Vtl1` gives
+CR3; E1 established that `SkdInitDebuggerDataBlock` fills SK's `KdDebuggerDataBlock` completely,
+`SkLoadedModuleList` included; and E1's mode 3, **`Kd=VerAddr:<addr>`**, takes an arbitrary
+`KdVersionBlock` address and is parsed and range-checked rather than merely recognised. So the
+block is located through hypercalls and its address handed to DbgEng directly — no gdbstub, and no
+`Kd=Guess` heuristic scan.
+
+**What is unestablished is permission, not interface.** The TLFS documents VTL-parameterised
+register access; whether the hypervisor grants a *root* partition VTL1 register access for a VBS
+guest is a policy question its documentation answers separately, and this plan should not assume
+it. That LiveCloudKd exposes `Cr3SecureKernel` is suggestive and not evidence of the route it uses.
+A driver is still required, `VMCALL` being privileged — but a minimal one, signable by whoever runs
+it, rather than one carrying a revoked certificate.
+
 **Two cautions against reading this as a decided re-plan.** Execution control looks weak in the
 technique generally: `SdkControlVmState` pauses and resumes a VM, which is not VTL1 stepping, and
 the active CLSID's breakpoint support is undemonstrated. And **EXDI's whole value here was DbgEng's
