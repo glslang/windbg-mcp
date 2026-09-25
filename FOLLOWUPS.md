@@ -1979,10 +1979,23 @@ cannot see `.opendump` inside a `.if`, a `.foreach` or an alias — and `retires
 `debug_batch { steps: [{op: "command", command: ".if (1) { .opendump C:\\other.dmp }"}, …],
 always: [{op: "command", command: "eb <addr> <saved>"}] }` reaches it.
 
+**Reached independently by Codex** on [#389](https://github.com/glslang/windbg-mcp/pull/389) while
+that PR was in review, which is the useful part: two readings converging on the same remedy —
+recheck at step boundaries and abort the remaining steps *including the cleanup* — is worth more
+than either.
+
 **Why this was not folded into item 81.** The mechanism is cheap — the worker already computes the
-fingerprint, and `batch::Debuggee` is the trait the step loop asks about the target — but the
-*decision* is not: `always` is sold as "cleanup cannot be lost", and the right answer here is to
-**lose** it, because running it is worse than skipping it. That needs a `BatchOutcome` for it, a
+fingerprint (`worker::replacement_now`), and `batch::Debuggee` is the trait the step loop asks
+about the target — but the *decision* is not: `always` is sold as "cleanup cannot be lost", and the
+right answer here is to **lose** it, because running it is worse than skipping it.
+
+**And there is no existing skip to reuse for that**, which is the thing to know before pricing it.
+The rollback block runs on **every** path today, `BatchOutcome::TargetGone` included — that case is
+survivable only because a target that is *gone* refuses every cleanup step, so they fail and are
+reported as failures rather than succeeding somewhere else. A *replaced* target accepts them. So
+the main-loop decision is new code rather than a second trigger on an existing one; what does
+already exist is the per-step half, `StepOutcome::skipped(position, step, reason)`, which the
+`always` loop uses for the out-of-time case and which is the right shape for this one. That needs a `BatchOutcome` for it, a
 `rollback` disposition that says "not attempted, and deliberately", and both of those move the
 output schema and its goldens. It is a contract change to the one tool whose contract is about
 what survives failure, and it deserves its own review rather than a third round on somebody
