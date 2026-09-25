@@ -942,9 +942,18 @@ pub fn run(args: &[String]) -> ! {
                 if let EngineOp::Interrupt { job } = request.op {
                     emit(&WorkerMessage::Done {
                         id: request.id,
-                        result: interrupt_running(job)
-                            .map(|(did, text)| Output::interrupted(text, did))
-                            .map_err(Failed::from),
+                        result: refuse_a_break_for_a_replaced_target(
+                            request.handle_bound,
+                            REPLACED.get().map(String::as_str),
+                        )
+                        .map_or_else(
+                            || {
+                                interrupt_running(job)
+                                    .map(|(did, text)| Output::interrupted(text, did))
+                                    .map_err(Failed::from)
+                            },
+                            Err,
+                        ),
                     });
                     continue;
                 }
@@ -1830,6 +1839,42 @@ static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
 /// would bury the one line that says what happened.
 static REPLACED: OnceLock<String> = OnceLock::new();
 
+/// Refuses a **handle-bound** break for a session whose target has been replaced.
+///
+/// Its own check rather than [`refuse_when_the_target_was_replaced`], because an interrupt is
+/// answered on the *request reader* and never reaches the engine thread — which is exactly why
+/// [`watch_for`] calls it [`Watch::Ignore`], a statement about where a fingerprint can be taken
+/// rather than a licence to break in on somebody else's target. Raised by Codex on
+/// [#389](https://github.com/glslang/windbg-mcp/pull/389): `SetInterrupt` acts on whatever the
+/// engine holds, so a handle that still looked good would stop the replacement.
+///
+/// **It reads the latch and asks the engine nothing**, which is the only reason it can run on this
+/// thread at all. `SetInterrupt` is the single DbgEng entry point documented as safe from another
+/// thread and adding a second is a design change rather than a local one (`AGENTS.md`); a
+/// `OnceLock` read is not a DbgEng call.
+///
+/// **The window it cannot close is the one inside the op that does the replacing.** Until that op
+/// returns nothing has observed anything — not this worker, and not the supervisor, whose session
+/// still reads `Open` — so a break arriving in it still lands on the new target. That residual is
+/// not introduced here: before this mechanism a wrapped `.opendump` left the handle good for ever,
+/// so the window goes from unbounded to one operation. Closing it outright would mean reading the
+/// engine from this thread, which is the design change above rather than a fix.
+fn refuse_a_break_for_a_replaced_target(
+    handle_bound: bool,
+    replaced: Option<&str>,
+) -> Option<Failed> {
+    if !handle_bound {
+        return None;
+    }
+    let why = replaced?;
+    Some(Failed::categorised(
+        structured::ErrorCategory::StaleSession,
+        format!(
+            "this session's target was replaced, so no break was raised: {why}. Raising one would              have stopped whatever the debugger is holding now rather than what this handle names.              A break that names no `session_id` still reaches this worker."
+        ),
+    ))
+}
+
 /// Refuses a **handle-bound** call that would run against a target its session was not opened for.
 ///
 /// **The post-op check cannot cover this, which is why there are two of them.** `engine::pump`
@@ -1898,6 +1943,11 @@ enum Watch {
     /// reasons: a teardown is the answer every refusal gives and must not be refused by one, and
     /// an interrupt is answered ahead of this queue and never arrives here — named so that giving
     /// it a route later does not silently acquire a gate.
+    ///
+    /// **An interrupt being `Ignore` says where a fingerprint can be taken, not that a break may
+    /// land on a replaced target.** It is refused on its own path, by
+    /// [`refuse_a_break_for_a_replaced_target`], which is the request reader's half of the same
+    /// rule.
     Ignore,
 }
 
@@ -10236,6 +10286,20 @@ mod tests {
         // A teardown is never refused, whatever it named: it is the answer every other refusal
         // here gives, and refusing it leaves a session nothing can release.
         assert!(refused(&EngineOp::EndSession, true, why).is_none());
+
+        // **A break follows the same rule on its own path**, which it has to be told separately
+        // because it is answered on the request reader and never reaches the queue these ops go
+        // through — `watch_for` calling it `Watch::Ignore` says where a fingerprint can be taken,
+        // not that `SetInterrupt` may land on a replacement.
+        use super::refuse_a_break_for_a_replaced_target as break_refused;
+        assert!(break_refused(true, None).is_none(), "nothing observed yet");
+        assert!(break_refused(false, why).is_none(), "named no session");
+        let refusal = break_refused(true, why).expect("a handle-bound break is refused");
+        assert_eq!(
+            refusal.category,
+            Some(crate::structured::ErrorCategory::StaleSession)
+        );
+        assert!(refusal.message.contains("no break was raised"));
     }
 
     /// The three replacements the fingerprint is for, and the two readings that are not one.

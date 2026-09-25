@@ -5067,6 +5067,20 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   through the raw hatch, and without moving the set. The one nobody asked for is the one that
   retires the handle.
 
+- **A break has its own path and needed the rule told to it separately.** `interrupt` and
+  `break_in` are answered on the worker's *request reader*, ahead of the engine thread's queue —
+  that is the whole point of them — so neither the pre-op nor the post-op check is on their road,
+  and `SetInterrupt` acts on whatever the engine is holding. A handle that still looked good would
+  have stopped the replacement. `refuse_a_break_for_a_replaced_target` reads the same latch on that
+  thread, which it can do **because a `OnceLock` read is not a DbgEng call**: `SetInterrupt` is the
+  one entry point documented as safe from another thread, and `AGENTS.md` makes adding a second a
+  design change rather than a local one. What none of this closes is the window *inside* the op
+  that does the replacing — until it returns nothing has observed anything, here or in the
+  supervisor — and that residual is not introduced by this work: before it, a wrapped `.opendump`
+  left the handle good for ever, so the window goes from unbounded to one operation. Closing it
+  outright would mean reading the engine from the request reader, which is the design change above
+  rather than a fix.
+
 - **`SessionState::Retired`'s message claimed something that was already untrue.** It told a caller
   "the worker still holds a target, but it is not the one this handle names" — false for `.detach`,
   `q` and `qd`, which are on the by-name list and leave none. It now says only what is true either
