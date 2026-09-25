@@ -5034,6 +5034,18 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   Codex's. It is read off the engine now (`has_target`), which is the same question the guard
   above already had to ask, so the fix removed a parameter rather than adding a case.
 
+- **The current process is the *selection*, not the session**, which is the difference between a
+  fingerprint and a trap. DbgEng moves the current process by itself when a child process starts
+  and `|Ns` moves it by hand, and neither changes what the session is debugging — so a fingerprint
+  built from `current_process_system_id` retires a live handle the first time the debugger points
+  somewhere else, permanently, with nobody having asked for anything. It is the process **set**
+  now (`DebugEngine::session_processes`, made public for it), sorted, pids only. That still catches
+  what the field is for, because the replacements in question change the *composition*: `.attach`
+  and `.create` add a process, `.restart` swaps one for a new pid — the same commands the by-name
+  list already refuses, so the two agree about what counts. Raised by Codex; it was an edge I had
+  reasoned about while designing and then failed to write down, which is worse than not having
+  thought of it, since nothing in the code carried the doubt forward.
+
 - **`SessionState::Retired`'s message claimed something that was already untrue.** It told a caller
   "the worker still holds a target, but it is not the one this handle names" — false for `.detach`,
   `q` and `qd`, which are on the by-name list and leave none. It now says only what is true either

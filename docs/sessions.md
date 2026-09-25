@@ -206,7 +206,9 @@ afterwards.** A command can reach `.opendump` without naming it — inside `.if`
 command runs at a **hit**, which is not a moment this server can retire a handle at in advance. So
 the engine process takes a reading of what it is holding when the target is opened — what kind of
 target DbgEng says it is, which dump or trace files the session is open on, and (user-mode only)
-which process it is on — and compares it after every operation. A difference retires the session's
+which processes it holds — and compares it after every operation. Note *holds*, not *is pointing
+at*: the debugger's current process moves on its own when a child process starts and moves by hand
+on `|Ns`, and neither of those is a change of target. A difference retires the session's
 handles at that point, before the operation's own answer reaches its caller.
 
 A call that **named the session** and was already queued when the swap happened is refused by the

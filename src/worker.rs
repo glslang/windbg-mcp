@@ -1697,11 +1697,11 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// dbgscope's `examples/held_target_probe.rs`, which is where each of these fields' limits came
 /// from rather than from reading the API:
 ///
-/// | target | kind | dumps | process |
+/// | target | kind | dumps | processes |
 /// |---|---|---|---|
-/// | a launched process at its first break | class 2, qualifier 0 | `[]` | its pid |
-/// | a loaded kernel dump | class 1, qualifier 1024 | `[<the path>]` | not asked — `E_NOTIMPL` |
-/// | an engine holding nothing | class 0, qualifier 0 | *refused* | `E_UNEXPECTED` |
+/// | a launched process at its first break | class 2, qualifier 0 | `[]` | `[its pid]` |
+/// | a loaded kernel dump | class 1, qualifier 1024 | `[<the path>]` | not asked — user-mode only |
+/// | an engine holding nothing | class 0, qualifier 0 | *refused* | not reached |
 ///
 /// The last row is why [`watch_the_target`] asks `has_target` first and this is never read there:
 /// `GetNumberDumpFiles` on an engine with no debuggee is an access violation **inside** DbgEng.
@@ -1715,15 +1715,27 @@ struct TargetFingerprint {
     /// process** — the case neither of the other two fields can see, and the ordinary one: a
     /// dump taken at 10:00 and another at 10:05 share their class, their qualifier and their pid.
     dumps: Option<Vec<String>>,
-    /// The OS id of the process the engine is on — **user-mode targets only**.
+    /// The OS ids of the processes this session is **holding** — user-mode targets only, sorted
+    /// so the engine's own order is not part of the answer.
+    ///
+    /// **The set, not the selection**, and that distinction is the whole of this field. DbgEng's
+    /// *current* process moves on its own at a child-process event and moves by hand on `|Ns`,
+    /// and neither changes what the session is debugging — so a fingerprint built from
+    /// `current_process_system_id` retires a perfectly good handle the first time the debugger
+    /// points somewhere else, permanently and with nobody having asked for anything. Raised by
+    /// Codex on [#389](https://github.com/glslang/windbg-mcp/pull/389).
+    ///
+    /// What it still catches is a change of *composition*, which is what the replacements this
+    /// exists for actually do: `.attach` and `.create` add a process, `.restart` swaps one for a
+    /// new pid. Those are the same commands the by-name list already refuses, so the two agree
+    /// about what counts as taking a session's target away.
     ///
     /// Left out of a kernel fingerprint deliberately, and it is the one field that had to be.
-    /// On a kernel target "the current process" is whatever the machine was running at the last
-    /// break, so it moves on its own across every `g`, and a fingerprint carrying it would retire
-    /// a handle each time a live kernel stopped somewhere else. What it buys in user mode is the
-    /// replacements that keep the kind and have no dump file to compare: `.attach`, `.create` and
-    /// `.restart`.
-    process: Option<u32>,
+    /// On a kernel target there is no process set to read — `GetProcessIdsByIndex` is a user-mode
+    /// question, and the "current process" that does answer is whatever the machine was running
+    /// at the last break, so it moves across every `g`. A fingerprint carrying either would
+    /// retire a live handle each time a kernel stopped somewhere else.
+    processes: Option<Vec<u32>>,
 }
 
 impl TargetFingerprint {
@@ -1734,21 +1746,42 @@ impl TargetFingerprint {
         Self {
             kind,
             dumps: e.dump_files().ok(),
-            process: match fingerprints_the_process(kind) {
-                true => e.current_process_system_id().ok(),
+            processes: match fingerprints_the_process(kind) {
+                // Sorted, so the engine's own ordering is not part of the identity — and pids
+                // only, the engine id beside each being the handle for *selecting* a process
+                // rather than anything about which ones are held.
+                true => e.session_processes().ok().map(process_set),
                 false => None,
             },
         }
     }
 }
 
-/// Whether a fingerprint of this kind of target may carry the current process id.
+/// The pids a fingerprint carries, out of what the engine listed.
+///
+/// Its own function so the two things it decides are testable, neither being obvious from the call
+/// site. The **pid**, not the engine id beside it: that one is the handle for *selecting* a
+/// process, it is an index rather than an identity, and DbgEng is free to reuse it. And **sorted**,
+/// so the engine's own ordering is not part of the answer — a list that came back in a different
+/// order for the same processes would otherwise read as a target change.
+///
+/// What it cannot pin is the choice of engine call, which is the actual fix
+/// ([`DebugEngine::session_processes`] rather than `current_process_system_id`); that lives in the
+/// caller and needs an engine to exercise.
+fn process_set(held: Vec<(u32, u32)>) -> Vec<u32> {
+    let mut pids: Vec<u32> = held.into_iter().map(|(_id, pid)| pid).collect();
+    pids.sort_unstable();
+    pids
+}
+
+/// Whether a fingerprint of this kind of target may carry a process set.
 ///
 /// Its own function so the rule can be stated against the qualifiers rather than inferred from a
 /// call site: **user-mode only**, and a target whose kind the engine would not say is treated as
 /// if it might be a kernel one rather than guessed at as user-mode. Getting it wrong in that
-/// direction is what matters — a kernel target carrying a pid retires a live handle every time the
-/// machine stops in a different process, which is every `g`.
+/// direction is what matters — a kernel target has no process set to read, and the current process
+/// that would stand in for one moves every time the machine stops somewhere else, which is every
+/// `g`.
 fn fingerprints_the_process(kind: Option<DebuggeeType>) -> bool {
     matches!(kind, Some(kind) if !kind.is_kernel())
 }
@@ -10069,7 +10102,7 @@ mod tests {
         TargetFingerprint {
             kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_PROCESS),
             dumps: Some(vec![]),
-            process: Some(pid),
+            processes: Some(vec![pid]),
         }
     }
 
@@ -10201,19 +10234,53 @@ mod tests {
         );
 
         // `.attach`, `.create` and `.restart` keep the kind and have no dump file to compare,
-        // so the pid is the only field that moves.
+        // so the process set is the only field that moves. `.restart` swaps the pid;
+        // `.attach`/`.create` add one beside it.
         let other_process = of_a_process(4243);
         assert!(
             says(&other_process)
                 .unwrap()
                 .contains("a different process")
         );
+        let two = TargetFingerprint {
+            processes: Some(vec![4242, 4243]),
+            ..opened_as.clone()
+        };
+        assert!(
+            says(&two).unwrap().contains("a different process"),
+            "a process added beside the one this session opened is a target change"
+        );
+
+        // What the fingerprint carries out of the engine's listing: the pid rather than the
+        // engine id beside it — that one is an index for *selecting* a process and DbgEng is free
+        // to reuse it — and sorted, so an engine that listed the same processes in another order
+        // does not read as a target change. Mutation-verified both ways: taking `id` instead of
+        // `pid`, or dropping the sort, fails this.
+        assert_eq!(
+            super::process_set(vec![(7, 4243), (3, 4242)]),
+            vec![4242, 4243]
+        );
+        assert_eq!(super::process_set(vec![]), Vec::<u32>::new());
+
+        // **The selection moving is not.** DbgEng makes the child current at a child-process
+        // event and `|Ns` does it by hand, and neither changes what the session holds — so the
+        // fingerprint is built from the *set*, sorted, rather than from the current process. Built
+        // from the selection, a handle is retired permanently with nobody having asked for
+        // anything.
+        let same_set = TargetFingerprint {
+            processes: Some(vec![4242]),
+            ..opened_as.clone()
+        };
+        assert!(
+            says(&same_set).is_none(),
+            "the same set is the same target however the debugger is pointing"
+        );
 
         // `.opendump` of a user dump from a live process: the qualifier moves.
         let a_dump = TargetFingerprint {
             kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP),
             dumps: Some(vec!["C:\\other.dmp".to_string()]),
-            process: Some(4242),
+            processes: Some(vec![4242]),
         };
         assert!(
             says(&a_dump).unwrap().contains("a different kind"),
@@ -10226,7 +10293,7 @@ mod tests {
         let first = TargetFingerprint {
             kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP),
             dumps: Some(vec!["C:\\at-1000.dmp".to_string()]),
-            process: Some(4242),
+            processes: Some(vec![4242]),
         };
         let second = TargetFingerprint {
             dumps: Some(vec!["C:\\at-1005.dmp".to_string()]),
@@ -10246,7 +10313,7 @@ mod tests {
         let empty = TargetFingerprint {
             kind: None,
             dumps: None,
-            process: None,
+            processes: None,
         };
         assert!(super::replacement(&opened_as, &empty, Some(false)).is_none());
         assert!(super::replacement(&opened_as, &empty, None).is_none());
