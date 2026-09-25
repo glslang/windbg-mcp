@@ -91,6 +91,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outbound TCP and DNS leave the Hyper-V NAT segment, so a debugger host behind that NAT can reach
   such a box, which is the opposite direction from the inbound path E0 itself needs.
 
+- **A VBS target was never what this hardware lacked — a gdbstub-backed one was.** The E2 entry
+  above closed with "why the single-box arrangement cannot work", which overstates its own
+  evidence and is the failure mode `.claude/skills/handoff` names: the tidy sentence at the end of
+  an accurate paragraph. Hyper-V is the box's primary hypervisor, so
+  `Set-VMProcessor -ExposeVirtualizationExtensions` on one of its own guests is the documented
+  feature rather than the second-hypervisor-on-WHP case that defeats VMware there, and the
+  validation record's sibling layout already writes that procedure down — the flag goes on the
+  *target* VM, KDNET runs between it and the debugger, and the debugger host is asked for no
+  nesting, memory or reboot. Separately, the deferred nested layout was recorded as adding "another
+  virtualization layer whose suitability remains to be demonstrated": a published VTL1 write-up
+  runs that shape, a Hyper-V guest as debugger passing Hyper-V through to a Windows 11 25H2 target
+  inside it, so nesting depth is not the objection to either layout. **What neither supplies is a
+  transport**, which is the whole of the gap: both give `securekernel` running with its NT side
+  reachable over KDNET, neither exposes a gdbstub, and the native KD route into SK is dead. That
+  write-up does not close it either — its setup section is deferred to a later post and its
+  commands are ordinary kernel-debugger commands against `nt`.
+
 - **The EXDI server registers as an out-of-process surrogate, so the job object that gate E0 relies
   on never contained it.** Run 2026-09-25: `regsvr32` writes the CLSID with `InprocServer32` and
   `ThreadingModel = Apartment` **and** an `AppID` (`ExdiTestServer1`) whose `DllSurrogate` is the
