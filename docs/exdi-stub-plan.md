@@ -41,6 +41,21 @@ with `exdiConfigData.xml` beside it (measured 2026-09-22). So there is no LiveCl
 no EXDI COM interface to implement, and no third-party distribution to install — only a
 registration, which is host setup the MCP server cannot do.
 
+**That exclusion is about what this server would *ship*, and it does not extend to what may be used
+to answer a question.** LiveCloudKd is a third-party distribution and stays out of the product for
+the reasons above; it is also, on its author's account, an existing EXDI route into VTL1 —
+`ExdiKdSample.dll`, registering its own CLSIDs `{53838F70-0936-44A9-AB4E-ABB568401508}` (passive,
+read-only) and `{67030926-1754-4FDA-9788-7F731CBDAE42}` (active), with **no gdbstub anywhere in
+it** ([windows-internals.com](https://windows-internals.com/secure-kernel-research-with-livecloudkd/),
+read 2026-09-25). Read access to secure-kernel memory is the solid claim there; breakpoints and
+single-stepping are described but not demonstrated by that write-up, so treat the active mode as
+untested rather than available. Its constraints are that it runs **on the Hyper-V host of the
+target** — no remote debugging is described — and that the guest has VBS on and nested
+virtualisation **off**, which is consistent with the validation record's note that exposing
+virtualisation extensions "enables the nested-hypervisor route, not a universal prerequisite for
+Hyper-V guest VBS". That host requirement is a topology constraint rather than a detail: it places
+the debugger on whichever machine hosts the target's hypervisor.
+
 ### Where each component runs
 
 **The guest's own IP address is not the debug endpoint, and that is the first thing to get wrong.**
@@ -311,6 +326,29 @@ table would not show in this scan), and this is one engine build. But it is enou
 planning around the `sk` record as a shortcut.
 
 ### E2 — point it at `securekernel` (the pivotal gate)
+
+**The question is whether DbgEng can be driven against SK at all, and building a stub is one way to
+ask it rather than the only one.** E0's transport half has not passed, the gdbstub-backed rig needs
+hardware that does not exist here yet, and LiveCloudKd reports reaching VTL1 through EXDI today
+with no gdbstub involved. So E2 is ordered **oracle first, stub second**: use LiveCloudKd to find
+out whether the answer is yes, and keep the stub work for a backend that could ship, which is E3's
+subject. A no from the oracle is worth far more than a slow yes, because it would say the engine
+cannot be steered at SK by any EXDI route and would retire the stub programme rather than sequence
+it.
+
+- **E2a, the oracle.** LiveCloudKd's passive CLSID against a VBS guest, with the debugger on that
+  guest's Hyper-V host. **Pass:** SK symbols resolve against live memory and SK structures can be
+  walked. **Control:** the same reads against a VBS-off guest must *not* find an SK data block.
+  This answers the gate's question and settles nothing about a shippable backend.
+- **E2b, the stub path below**, unchanged, and now what it is for is a backend rather than an
+  answer.
+
+**Check EXDI activation before either.** Both routes are the same dbgeng plumbing, and E0 found
+activation stalling on this bench — registration writes an `AppID` with an empty `DllSurrogate`,
+hosting the server in `dllhost.exe`, and a bare `CreateInstance` blocked past 17 s having launched
+no surrogate. Whether `ExdiKdSample.dll` registers the same way is not established and is cheap to
+read off its registration; if it does, that stall is a prerequisite for both and is better found
+before a lab is built around either.
 
 Same rig, VBS/HVCI enabled in the guest.
 
