@@ -12,9 +12,11 @@
     "unrecorded"
    ],
    "harness": [
+    "unavailable",
     "unrecorded"
    ],
    "reasoning": [
+    "unavailable",
     "unrecorded"
    ],
    "weights": {
@@ -122,9 +124,11 @@
     "unrecorded"
    ],
    "harness": [
+    "unavailable",
     "unrecorded"
    ],
    "reasoning": [
+    "unavailable",
     "unrecorded"
    ],
    "weights": {
@@ -232,9 +236,11 @@
     "unrecorded"
    ],
    "harness": [
+    "unavailable",
     "unrecorded"
    ],
    "reasoning": [
+    "unavailable",
     "unrecorded"
    ],
    "weights": {
@@ -342,9 +348,11 @@
     "windbg-mcp 0.16.0+g57a47e9c"
    ],
    "harness": [
-    "2.1.270 (Claude Code)"
+    "2.1.270 (Claude Code)",
+    "unavailable"
    ],
    "reasoning": [
+    "unavailable",
     "unrecorded"
    ],
    "weights": {
@@ -673,10 +681,12 @@
     "windbg-mcp 0.16.0+g57a47e9c"
    ],
    "harness": [
-    "2.1.270 (Claude Code)"
+    "2.1.270 (Claude Code)",
+    "unavailable"
    ],
    "reasoning": [
-    "off"
+    "off",
+    "unavailable"
    ],
    "weights": {
     "gemma4:31b-mlx": [
@@ -1003,7 +1013,9 @@
    "server": [
     "windbg-mcp 0.16.0+g57a47e9c"
    ],
-   "harness": [],
+   "harness": [
+    "unavailable"
+   ],
    "reasoning": [
     "on"
    ],

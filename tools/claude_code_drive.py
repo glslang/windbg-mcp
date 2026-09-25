@@ -231,6 +231,25 @@ def harness_version():
     return out.stdout.strip() or None
 
 
+def identity_block(harness):
+    """What a Claude Code row can answer about itself, **stated rather than inferred**.
+
+    The same contract as `local_model_drive.identity_block`: every name in
+    `local_model_eval.IDENTITY_FIELDS`, answered here rather than worked out from this record's
+    nulls by the grader (`FOLLOWUPS.md` item 80). Two of the three are null, and neither is an
+    oversight:
+
+    - `weights` is null because `opus` and `sonnet` are mutable aliases resolved inside a client
+      this bench does not own, and there is no `/api/ps` to ask. `harness` is what this row has
+      instead - a floor, not an identity, since it moves when the client does and says nothing
+      about the weights behind the alias.
+    - `reasoning` is null because the arm is that client's to choose too. The ollama rows' `think`
+      is a knob this harness sets; nothing here sets one, so this row is in no arm rather than in
+      the off arm - and reading it as `off` would report a mixed run as reasoning both ways.
+    """
+    return {"weights": None, "reasoning": None, "harness": harness}
+
+
 def release_new_sessions(before):
     """End every session this credential gained while the task ran.
 
@@ -282,6 +301,8 @@ def main():
         print(f"tools offered: {len(tools)} ({surface_bytes} B, measured as the ollama rows are)")
 
         tasks = drive.load_tasks(sys.argv[1]) if len(sys.argv) > 1 else []
+        # Once: `claude --version` is a subprocess, and the cell dict names it twice.
+        harness = harness_version()
         cell = {
             "run": os.environ.get("EVAL_RUN", time.strftime("%Y%m%dT%H%M%S")),
             "backend": "claude-code",
@@ -300,7 +321,10 @@ def main():
             # `claude` has no such address to offer, and leaving the field out would make it look
             # like a field nobody thought to record. `harness_version` is what this row *can* say.
             "model_digest": None,
-            "harness_version": harness_version(),
+            "harness_version": harness,
+            # The resolved answers, which the grader reads and no longer infers. The two raw
+            # fields above stay because they are the readings this block is resolved *from*.
+            "identity": identity_block(harness),
             "server": dict(drive.SERVER_INFO) or None,
             "suite": dict(drive.SUITE) or None,
             "surface": {"client": os.environ.get("EVAL_SURFACE", ""), "tools": len(tools),

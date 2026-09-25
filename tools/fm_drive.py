@@ -200,6 +200,26 @@ def runtime_identity():
     return {"model_digest": None, "served_context": SERVED_CONTEXT, "os_build": build or None}
 
 
+def identity_block(os_build):
+    """What a Foundation Models row can answer about itself, **stated rather than inferred**.
+
+    The same contract as `local_model_drive.identity_block`: every name in
+    `local_model_eval.IDENTITY_FIELDS` (`FOLLOWUPS.md` item 80). This backend is the reason the
+    contract exists - both times the grader got a field wrong, this row is the one it got wrong:
+
+    - `weights` is the **OS build**, because Apple ships the model with the OS and gives it no
+      address. `model_digest` is null here by construction, so a grader reading that field reduced
+      every macOS revision to one indistinguishable `unavailable`, and two runs across an update -
+      which *is* a model update - compared as though nothing had moved.
+    - `reasoning` is null because this model reports `reasoning: false`. The record carries
+      `think: false` beside it only because the field is part of a cell; it is an absence, not an
+      arm, and folding it in as `off` printed `on, off` for a run in which every backend *with*
+      the knob ran with it on.
+    - `harness` is null for the reason the ollama rows' is: the harness is a script in this repo.
+    """
+    return {"weights": os_build, "reasoning": None, "harness": None}
+
+
 def main():
     refuse_axes_this_model_does_not_have()
     ensure_binary()
@@ -260,7 +280,9 @@ def main():
             # Per task, beside the turns `run()` recorded, so a reader can tell a measured count
             # from a `Response.usage` one and can see the surface the model was actually built.
             report["fm"] = {"turns": list(FM_TURNS)}
-            drive.write_record(dict(cell, **runtime_identity(), **report))
+            runtime = runtime_identity()
+            drive.write_record(dict(cell, **runtime, **report,
+                                    identity=identity_block(runtime["os_build"])))
             if not drive.SCENARIO:
                 transcript = None
                 drive.release_what_this_run_opened()

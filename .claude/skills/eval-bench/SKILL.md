@@ -150,6 +150,27 @@ rollout falls back to what both sides recorded and says `unverifiable` rather th
 recorded it) is kept apart from `unavailable`** (this row has no such answer), or every run with a
 Claude cell reads as a legacy log.
 
+**An identity field is a backend's statement, never the grader's inference** (item 80). Each
+driver writes an `identity` block answering every name in `local_model_eval.IDENTITY_FIELDS` -
+`weights`, `reasoning`, `harness` - with `None` where the row has no answer, and `identity()` reads
+that one key. Adding a field means editing **all three** drivers; a name added to the tuple with no
+driver opinion fails `tools/test_local_model_eval.py`
+(`python3 -m unittest discover -s tools -p 'test_*.py'`, which CI does not run), and so does a
+grader that defaults one instead of saying so. The temptation is to read the nulls the drivers
+already write, and it does not work: `model_digest` is null on two backends *deliberately*, but
+`think` is `false` on an fm row and **absent** on a Claude one - one value, one omission, neither
+null - and those two are precisely the cases the removed dispatch existed for. The one place it
+survives is `legacy_identity()`, for logs written before the block, and that is frozen: a record
+without the key predates it, so nothing new ever belongs there. Two things this cost that are worth
+knowing before reading an old write-up. Re-grading moved **no** score and three identity lines, all
+of them overclaims - `harness <version>` on a mixed run was the Claude rows' alone, `reasoning
+unrecorded` on a pre-axis log is `unavailable, unrecorded`, and the reasoning A/B's two arms differ
+in composition in a way only arm B's new `harness unavailable` line shows. And
+`docs/eval-runs.json` is **two** `--series` invocations concatenated, not one over
+`eval-out/*.jsonl`: the older three logs are graded against `eval_tasks_v1.json` and the newer three
+against `eval_tasks.json`, so a single run over the glob silently re-grades half of them against
+questions they were never asked.
+
 **The key is a snapshot, and `--verify-key` is what re-takes it** (item 45). The six tasks are
 graded against facts read off the checked-in dumps with this server's own tools, so a fact that
 stops being what the server reports leaves the suite grading and every model scoring against

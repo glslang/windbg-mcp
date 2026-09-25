@@ -819,6 +819,27 @@ def runtime_identity():
     return blank
 
 
+def identity_block(weights):
+    """What an ollama row can answer about itself, **stated rather than inferred**.
+
+    `local_model_eval.identity()` reads this key for every backend and tests none of them. It used
+    to work each field out per record, and both times that was wrong it was wrong the same way: a
+    field was added, one author decided what it meant for one backend, and the other two got
+    whatever fell out (`FOLLOWUPS.md` item 80). The driver already knows; it says so here.
+
+    Every name in `local_model_eval.IDENTITY_FIELDS` is answered - `None` where this row has no
+    answer to give, which renders `unavailable` - and `tools/test_local_model_eval.py` fails on a
+    missing one rather than defaulting it.
+
+    - `weights` is the digest `runtime_identity()` read: the content address behind a *mutable*
+      tag, which is the axis a comparison of two runs a month apart is entirely about.
+    - `reasoning` is the arm this process is running. Only these rows have the knob at all.
+    - `harness` is null: the harness here is this script, which has no version to name. That is an
+      answer this row does not have, not a field nobody thought to record.
+    """
+    return {"weights": weights, "reasoning": "on" if THINK else "off", "harness": None}
+
+
 def surface_digest(wire):
     """A short content address for the tool surface exactly as it was served.
 
@@ -950,7 +971,9 @@ def main():
             transcript, report = run(task, offered, transcript)
             # Read *after* the first turn: nothing is loaded before one, so asking earlier
             # reports the previous model's window or nothing at all.
-            record = dict(cell, **runtime_identity(), **report)
+            runtime = runtime_identity()
+            record = dict(cell, **runtime, **report,
+                          identity=identity_block(runtime["model_digest"]))
             if NUM_CTX and record["served_context"] and record["served_context"] != NUM_CTX:
                 # Loudly, because it is invisible otherwise and it invalidates the cell: a
                 # request's `num_ctx` does not shrink an instance the runtime already holds.

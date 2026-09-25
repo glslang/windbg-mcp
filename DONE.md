@@ -61,6 +61,12 @@ writer. **Item 51** (2026-08-28) had its account of *why* the process died wrong
 mattered: it blamed the worker's termination, a step later than the passive `EndSession` that
 actually does it — which is what let the fix be tested inside one process at all. It also records two
 probes for that fact which look correct and are not, one of which passed with the fix backed out.
+**Item 80** (2026-09-25) is here because its proposal was right about the fix and wrong about the
+result: it asked for a per-field backend test to be *deleted*, and a grader that still has to read
+logs written before the change can only freeze one — the deletion is real on the path that grows and
+impossible on the path that cannot. Building it also moved three published identity lines nobody had
+filed, each an overclaim the old rendering made by choosing between two spellings of "no answer" per
+backend.
 
 ## What is in here
 
@@ -119,6 +125,7 @@ probes for that fact which look correct and are not, one of which passed with th
 - [Item 96](#96-dbgscope--windbg-mcp-the-pool-walker-on-arm64-and-an-lfh-reading-that-is-not-nts--done-2026-09-23-dbgscope179) — [dbgscope + windbg-mcp] The pool walker on ARM64, and an LFH reading that is not `nt`'s — done (2026-09-23, dbgscope#179)
 - [Item 99](#99-dbgscope-a-big-page-tag-the-engine-resolves-and-the-walker-does-not--done-2026-09-24-dbgscope180-dbgscope181) — [dbgscope] A big-page tag the engine resolves and the walker does not — done (2026-09-24, dbgscope#180, dbgscope#181)
 - [Item 98](#98-dbgscope-uncommitted-memory-is-an-unreadable-gap-so-a-live-heap-walk-is-not-complete--done-2026-09-24-dbgscope183) — [dbgscope] Uncommitted memory is an unreadable gap, so a live heap walk is not `Complete` — done (2026-09-24, dbgscope#183)
+- [Item 80](#80-windbg-mcp-identity-re-derives-the-backend-distinction-once-per-field--done-2026-09-25) — [windbg-mcp] `identity()` re-derives the backend distinction once per field — done (2026-09-25)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4787,3 +4794,66 @@ whose four heaps are Segment, 0 in `cmd.exe`. So a process the system enabled it
 point the tools at. And two signatures are easy to swap: `_SEGMENT_HEAP.Signature` and
 `_HEAP.SegmentSignature` are both at `+0x10`, while `_HEAP.Signature` (`0xeeffeeff`) is at `+0x98`
 — this entry quoted the latter at the former's offset.
+
+## 80. [windbg-mcp] `identity()` re-derives the backend distinction once per field — **done** (2026-09-25)
+
+`local_model_eval.identity()` decided what a record contributed to each identity field by testing
+the backend **again, separately, in every place that needed it** — a three-way `if/elif/else`
+covering `harness` and `reasoning`, and an unrelated inline ternary choosing `os_build` over
+`model_digest` for `weights`. Neither knew about the other, and a field added tomorrow got whatever
+its author happened to write. Both existing tests had been added *reactively*, one per review round
+on the PR that introduced the third backend, each after a run had already reported something false:
+an fm run comparing across a macOS update — which *is* a model update — as though nothing had moved
+(`09aa279`), and `think: false` on a backend with no reasoning arm printing `on, off` for a run in
+which every backend *with* the knob ran with it on (`faa147a`).
+
+**What landed is the second of the two shapes the entry proposed**, which is the one it called the
+complete close: each driver emits the resolved value under one agreed key. `IDENTITY_FIELDS` in
+`local_model_eval.py` is the closed list — `weights`, `reasoning`, `harness` — and each of
+`local_model_drive.py`, `claude_code_drive.py` and `fm_drive.py` has an `identity_block()` that
+answers **all three** on every record it writes, `None` where the row has no answer. `identity()`
+reads that one key and tests no backend at all. `tools/test_local_model_eval.py` is the check the
+entry asked for: twelve tests, of which
+`test_every_backend_answers_every_identity_field` fails when a name is added to `IDENTITY_FIELDS`
+that a driver has no opinion about, and
+`test_a_field_no_driver_answered_is_unrecorded_rather_than_defaulted` fails when the grader
+defaults one instead of saying so. Each was mutation-verified against the mutation it is for, and
+the two hold the seam from opposite sides: adding `quantisation` to `IDENTITY_FIELDS` fails the
+first on all three backends and leaves the second green, while making `stated()` return
+`unavailable` for an absent key fails the second and leaves the first green. Two further
+mutations — `fm_drive` dropping `harness` from its block, and the grader inferring the fm arm from
+`think` again, which is the `faa147a` bug — fail
+`test_each_backend_reports_what_it_claimed` as well.
+
+**What the entry did not see is that the dispatch cannot be deleted, only frozen.** Logs written
+before the drivers stated a block still have to grade to what they graded to, or every published
+run loses its digests and its harness version. So `legacy_identity()` holds the old per-backend
+reading, for records with no `identity` key — and that function is closed by construction rather
+than by discipline: a record without the key predates it, so the backends and fields it can have
+been written by are fixed at 2026-09-25, a new backend's records always carry the block, and a new
+field is absent from every legacy record and correctly reads `unrecorded`. The dispatch is
+therefore gone from the path that grows and survives only on the path that cannot.
+
+**And three published identity lines were wrong, which nobody had filed.** Re-grading the six logs
+in `eval-out/` moved only the identity block — every cell score, `--matrix` distribution and
+`--compare` row is byte-identical — and every line that moved was an overclaim:
+
+- `harness 2.1.270 (Claude Code)` → `2.1.270 (Claude Code), unavailable` on a mixed run. The
+  version belonged to the Claude rows; printed alone it read as the whole run's.
+- `reasoning unrecorded` → `unavailable, unrecorded` on `2026-09-13` and the three pre-axis logs.
+  The Claude rows never *had* an arm; they did not fail to record one.
+- `reasoning off` → `off, unavailable` on arm A of the reasoning A/B, and arm B gains
+  `harness unavailable` where it previously printed **no harness line at all**. That pair is the
+  clearest case: the composition difference between the two arms — arm A had Claude rows and arm B
+  did not — was invisible in the field the A/B is about.
+
+The old rendering had two spellings of "no answer" and chose between them per backend: fm stated
+`reasoning unavailable` while claude-code, in exactly the same position, contributed nothing. That
+was itself an instance of the item — two backend tests, added a round apart, not agreeing in shape.
+`docs/eval-runs.json` is regenerated from the same logs, and the footnote now glosses whichever of
+the two words the block actually printed rather than keying on `unrecorded` alone.
+
+**Where it picked up.** `identity()` in `tools/local_model_eval.py`, the `stated()` helper beside it
+and its `unrecorded`/`unavailable` distinction, and the three drivers' cell dicts
+(`local_model_drive.py`, `claude_code_drive.py`, `fm_drive.py`).
+

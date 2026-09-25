@@ -518,10 +518,13 @@ All four are done, and the full graded run with them — [What it scores](#what-
 is the deliberate end state: this backend varies none of the three axes that grid is built on, so
 rows in its tables would imply a comparison the design cannot support.
 
-What is left is not a step but a consequence, recorded as `FOLLOWUPS.md` item 80: `identity()`
-works out what a record contributes by testing the backend **again in each field that needs it** —
-a three-way branch for `harness` and `reasoning`, an unrelated ternary for `weights`, neither aware
-of the other, both added one review round apart after a run had already reported something false.
-The two instances that produced — an fm run hiding a macOS update, and `think: false` reading as
-the `off` arm — are fixed. The per-field re-derivation is not, so a field added next inherits
-whichever arm its author happens to write rather than an answer this backend has stated.
+What was left was not a step but a consequence, and it closed on 2026-09-25 as `FOLLOWUPS.md`
+item 80: `identity()` worked out what a record contributes by testing the backend **again in each
+field that needs it** — a three-way branch for `harness` and `reasoning`, an unrelated ternary for
+`weights`, neither aware of the other, both added one review round apart after a run had already
+reported something false. The two instances that produced — an fm run hiding a macOS update, and
+`think: false` reading as the `off` arm — were fixed then; the per-field re-derivation under them
+is gone now. This backend states its own answers: `fm_drive.identity_block()` returns the OS build
+for `weights`, `None` for `reasoning` and `None` for `harness`, and a field added to
+`local_model_eval.IDENTITY_FIELDS` that this driver has no opinion about fails
+`tools/test_local_model_eval.py` rather than inheriting whichever arm its author happens to write.
