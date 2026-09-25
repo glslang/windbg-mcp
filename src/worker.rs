@@ -1730,6 +1730,23 @@ struct TargetFingerprint {
     /// new pid. Those are the same commands the by-name list already refuses, so the two agree
     /// about what counts as taking a session's target away.
     ///
+    /// **A child process appearing changes the set, and that is deliberately treated as a
+    /// replacement rather than tolerated as churn** — raised the other way on
+    /// [#389](https://github.com/glslang/windbg-mcp/pull/389) and settled by measuring, because
+    /// the question is not whether the set moves but whether a caller's reads still land where
+    /// they think. They do not: on dbgeng 10.0.26100.1 (ARM64, 2026-09-25, dbgscope's
+    /// `examples/child_process_identity.rs`), `.childdbg 1` and a `g` stop at the child's create
+    /// event with the set `[2368] -> [1000, 2368]` **and the current process `2368 -> 1000`**. The
+    /// engine makes the child current, and every typed tool here reads the current process — so a
+    /// handle that went on certifying the original would be certifying something the next
+    /// `registers` cannot deliver.
+    ///
+    /// That is also the line between this field and the selection, and it is not arbitrary: **the
+    /// set changing is something that happened to the session, while the selection moving on
+    /// `|Ns` is something a caller did** through the raw hatch, deliberately, and does not move
+    /// the set. So the one the caller did not ask for is the one that retires the handle. Nothing
+    /// here enables `.childdbg`; it is reachable only through `execute`.
+    ///
     /// Left out of a kernel fingerprint deliberately, and it is the one field that had to be.
     /// On a kernel target there is no process set to read — `GetProcessIdsByIndex` is a user-mode
     /// question, and the "current process" that does answer is whatever the machine was running
