@@ -88,8 +88,31 @@ across as its `.vmx` and disks. QEMU/KVM on that same host is the alternative, a
 register block is lifted from. `ExdiGdbSrv.dll` dials out, so the debugger host stays where it is
 and reaches the new box over TCP — measured on this bench 2026-09-25, outbound TCP and DNS leave
 the Hyper-V NAT segment, which is the direction this needs and the opposite of the inbound path E0
-requires. Neither host has been built; what is established is why the single-box arrangement
-cannot work.
+requires. Neither host has been built.
+
+**What that rules out is a gdbstub-backed VBS guest, which is narrower than it first reads, and the
+closing sentence here used to overstate it as "why the single-box arrangement cannot work".** A VBS
+*target* on this hardware is available and always was: Hyper-V is the box's primary hypervisor, so
+`Set-VMProcessor -ExposeVirtualizationExtensions` on one of its own guests is the supported,
+documented feature rather than the second-hypervisor-on-WHP case that defeats VMware there. The
+validation record's [sibling layout](secure-kernel-debugging-validation.md) already writes that
+procedure down, and it costs this workspace nothing: the flag goes on the *target* VM, KDNET runs
+between it and the debugger over a virtual network, and no nesting, memory or reboot is asked of
+the debugger host.
+
+**Multi-level nesting is demonstrated rather than impossible, which is the other half of the
+correction.** The deferred nested layout was recorded as adding "another virtualization layer whose
+suitability remains to be demonstrated", and a published VTL1 write-up runs exactly that shape — a
+Hyper-V guest as the debugger machine, passing Hyper-V through to a Windows 11 25H2 target inside
+it ([fluxsec.red](https://fluxsec.red/what-does-hyperguard-skpg-monitor-vtl1-windows-internals-secure-kernel-patch-guard),
+read 2026-09-25). So depth of nesting is not the objection to either layout.
+
+**Neither layout supplies a transport, and that is the whole of what is missing.** Both give a
+guest with `securekernel` running and its NT side reachable over KDNET; neither exposes a gdbstub,
+and the native KD route into SK is dead for the reasons at the top of this document. That write-up
+does not close the gap either: its setup section is explicitly deferred to a later post, and the
+commands it shows are ordinary kernel-debugger commands against `nt`. Treat it as evidence about
+topology, not about reaching VTL1.
 
 ## Gates
 
