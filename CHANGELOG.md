@@ -74,9 +74,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not established. `docs/exdi-stub-plan.md` also gains **where each component runs**: the GDB stub
   belongs to the VMware host's `vmware-vmx` process rather than to the guest, so the guest's NAT
   address is a KDNET/WinRM address and never the debugger's endpoint, and `ExdiGdbSrv.dll` is a
-  client that loads in the debugger process and may sit on a different machine. Recorded with it is
-  the VBS question that VMware and Hyper-V sharing one box raises for gate E2, which is open rather
-  than answered.
+  client that loads in the debugger process and may sit on a different machine.
+
+- **Gate E2 has no reachable target on a Hyper-V-locked host, which is a stop condition the plan
+  had not written.** Reported from the host 2026-09-25: VMware there runs on the Windows Hypervisor
+  Platform because Hyper-V owns the box, so `vhv.enable` is unavailable, the Windows guest's
+  `msinfo32` gives VBS as not enabled, and it cannot acquire VBS while Hyper-V stays on — which it
+  must, the Hyper-V guests being the rest of the lab. No backend on that box both exposes a gdbstub
+  and can host a VBS guest: Hyper-V hosts one and has no gdbstub, VMware has the gdbstub and no
+  nested virtualisation to give, and QEMU meets the same wall through WHPX while its TCG mode
+  implements no VMX/SVM for a guest hypervisor to use. The plan's existing stop conditions all
+  assume E2 *ran*; this one fires a step earlier, so it is recorded beside them. **E0 and E1 are
+  unaffected** — they need a plain NT guest, which that host still provides — and a second
+  bare-metal Linux host restores E2 without moving the debugger, VMware Workstation there using its
+  own kernel modules rather than the platform's hypervisor. Measured on this bench the same day:
+  outbound TCP and DNS leave the Hyper-V NAT segment, so a debugger host behind that NAT can reach
+  such a box, which is the opposite direction from the inbound path E0 itself needs.
 
 ## [0.20.0] - 2026-09-24
 
