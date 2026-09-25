@@ -4991,6 +4991,25 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   (`examples/held_target_probe.rs`): every claim this entry makes about what a field answers per
   target kind is a line of its output rather than a reading of the API.
 
+- **Retiring the handle afterwards is too late for a call that is already queued**, and the two
+  mechanisms differ in exactly that. `Gate::retires` is applied by the supervisor's pump *as it
+  forwards the offending job*, so anything behind it meets a session already `Retired`; an
+  observation can only be made after the fact, and `engine::pump` writes a job into the worker's
+  pipe as soon as it clears that gate without waiting for the job ahead of it to answer. So a
+  second call could be sitting in the worker's queue, past every check the supervisor has, when
+  the first one replaces the target. The worker therefore asks the same question again **before**
+  each op as well as after it — one `Watch` value decides both ends, so an op cannot be refused on
+  the way in and never reported. Raised by Codex on the PR, and correct; what no test here stages
+  is the race itself, which needs two genuinely concurrent submissions, so what is pinned is the
+  shared list and the comparison rule rather than the window.
+
+- **The baseline was conditioned on the opener having *succeeded*, and an opener can fail with the
+  target already open.** `Sessions::open` answers `OpenError::PostCommit { report_only: true }`
+  when only the follow-up diagnostic failed, and hands back a usable handle on purpose — so those
+  sessions, live and caller-visible, would have had replacement detection disabled for good. Also
+  Codex's. It is read off the engine now (`has_target`), which is the same question the guard
+  above already had to ask, so the fix removed a parameter rather than adding a case.
+
 - **`SessionState::Retired`'s message claimed something that was already untrue.** It told a caller
   "the worker still holds a target, but it is not the one this handle names" — false for `.detach`,
   `q` and `qd`, which are on the by-name list and leave none. It now says only what is true either

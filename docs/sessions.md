@@ -209,8 +209,15 @@ target DbgEng says it is, which dump or trace files the session is open on, and 
 which process it is on — and compares it after every operation. A difference retires the session's
 handles at that point, before the operation's own answer reaches its caller.
 
-Two things follow that are worth knowing at the tool surface. The retirement can arrive on a call
-that did nothing wrong — the one that happened to be running when the swap was noticed answers
+A call that was **already queued** when the swap happened is refused by the engine process itself
+rather than by the handle check, and that is not the same mechanism wearing a different hat: a job
+is handed to the engine process as soon as it clears the handle check, without waiting for the one
+ahead of it to answer, so retiring the handle afterwards is too late for a call that is already
+past every check the server has. The engine process asks the same question again before it runs
+each one.
+
+Two more things follow that are worth knowing at the tool surface. The retirement can arrive on a
+call that did nothing wrong — the one that happened to be running when the swap was noticed answers
 normally, and the *next* call naming that handle is refused. And a target that has simply **gone** —
 a launched program that ran to completion, a `.detach` — is not reported this way: that is an
 ending, carried by the stop itself, and the session refuses further work with a stale-session error
