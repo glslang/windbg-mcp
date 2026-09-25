@@ -1889,10 +1889,17 @@ fn describe_session(s: &SessionSnapshot) -> String {
             "  failed {waited} ago and never opened:\n    {why}\n  Nothing was created, so \
              opening again is the way forward.\n"
         )),
+        // **The second renderer of this state, and it said the same untrue thing.** `.detach`,
+        // `q` and `qd` are on the retiring list and leave no target at all, so "the engine
+        // process still holds a target" was never reliable — and it is `engine::stale_handle`'s
+        // sentence, which was corrected without this one moving with it. Two renderers of one
+        // state, one of them fixed, is how a claim comes to be true in the changelog and false on
+        // the wire. Caught by CodeRabbit on [#389](https://github.com/glslang/windbg-mcp/pull/389).
         SessionState::Retired(why) => out.push_str(&format!(
-            "  the handle was retired {waited} ago: {why}. The engine process still holds a \
-             target, but not the one this handle names — calls that pass `session_id` are \
-             refused, calls that omit it still reach it.\n"
+            "  the handle was retired {waited} ago: {why}. It no longer names the target it was \
+             issued for — calls that pass `session_id` are refused, calls that omit it still \
+             reach this engine process and whatever it holds now, and `end_session` still takes \
+             this handle.\n"
         )),
         SessionState::Closed(why) => out.push_str(&format!("  closed {waited} ago: {why}\n")),
     }
@@ -6836,6 +6843,12 @@ mod tests {
 
     /// A retired handle is the one state where "refused" and "unusable" part company, so the
     /// report has to say both halves or the caller writes the session off.
+    ///
+    /// **And it must not say what the engine still holds**, which is the half this renderer got
+    /// wrong for as long as it existed: `.detach`, `q` and `qd` are on the retiring list and
+    /// leave no target at all. The negative assertion is the point — the positive ones passed
+    /// happily while the sentence beside them was false, which is why a second renderer of this
+    /// state stayed wrong after the first was corrected.
     #[test]
     fn a_retired_session_is_reported_as_reachable_without_the_handle() {
         let out = describe_session(&snapshot(
@@ -6845,7 +6858,12 @@ mod tests {
         ));
         assert!(out.contains("retired"), "{out}");
         assert!(out.contains("`.opendump` replaced the target"), "{out}");
-        assert!(out.contains("calls that omit it still reach it"), "{out}");
+        assert!(out.contains("calls that omit it still reach"), "{out}");
+        assert!(out.contains("end_session"), "{out}");
+        assert!(
+            !out.contains("still holds a target"),
+            "a retired session need not hold one -- `.detach`, `q` and `qd` leave none: {out}"
+        );
     }
 
     /// A failed open must say the slate is clean — that is what makes "open again" safe advice

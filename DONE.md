@@ -5046,6 +5046,27 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   reasoned about while designing and then failed to write down, which is worse than not having
   thought of it, since nothing in the code carried the doubt forward.
 
+- **And it was worded in *three* places, of which the first draft fixed one.** `engine::stale_handle`
+  is the refusal a caller meets; `server::describe_session` is what `session_status` prints; the
+  `SessionState::Retired` variant in `src/structured.rs` is the typed half. Correcting one and
+  claiming the wording fixed is how a statement comes to be true in a changelog and false on the
+  wire — caught by CodeRabbit, and the lesson is to grep the *claim* rather than the symbol, since
+  none of the three shares a function with another.
+
+- **The one finding on this that was declined, and it was declined by measuring.** Review came
+  back on the process set arguing the other way: a child process starting or exiting under
+  `.childdbg 1` changes the set without the session being replaced, so the first child lifecycle
+  event retires the handle. The fact is right; the remedy — tolerate it — is not. The question is
+  not whether the set moves but whether a caller's reads still land where they think, and on
+  dbgeng 10.0.26100.1 (ARM64, 2026-09-25) they do not: at the child's create event the set goes
+  `[2368] -> [1000, 2368]` **and the current process goes `2368 -> 1000`**. Every typed tool here
+  reads the current process, so a handle that went on certifying the original would be certifying
+  something the next `registers` cannot deliver. dbgscope's `examples/child_process_identity.rs`
+  is the record. The line this draws is worth keeping: **a set change is something that happened
+  to the session, while the selection moving on `|Ns` is something a caller did** — deliberately,
+  through the raw hatch, and without moving the set. The one nobody asked for is the one that
+  retires the handle.
+
 - **`SessionState::Retired`'s message claimed something that was already untrue.** It told a caller
   "the worker still holds a target, but it is not the one this handle names" — false for `.detach`,
   `q` and `qd`, which are on the by-name list and leave none. It now says only what is true either

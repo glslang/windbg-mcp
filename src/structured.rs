@@ -664,7 +664,13 @@ pub enum SessionStateInfo {
     Open,
     /// The open failed and never created anything.
     Failed { why: String },
-    /// The handle was retired: the engine process still holds a target, but not this one.
+    /// The handle was retired: it no longer names the target it was issued for.
+    ///
+    /// **Says nothing about what the engine process holds now**, which is the third place this
+    /// state is worded and the third that claimed it still held one. `.detach`, `q` and `qd` are
+    /// on the retiring list and leave no target at all; the observed replacements do leave one.
+    /// The three renderers are here, `engine::stale_handle` and `server::describe_session` — a
+    /// fourth should say what is true of both, or say nothing.
     Retired { why: String },
     /// Ended.
     Closed { why: String },
