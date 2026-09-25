@@ -53,11 +53,12 @@ into the next wall: the PEB lists one heap where the debugger sees four (2026-09
 from adding Apple's on-device model as the eval's third backend (#335 / #336, 2026-09-17), where
 two review rounds found `identity()` reporting something false about a run because it worked out
 what a record contributes by testing the backend again in each field that needs it — both now in
-[`DONE.md`](./DONE.md). And item 81 from
+[`DONE.md`](./DONE.md) — as is item 81 from
 [#341](https://github.com/glslang/windbg-mcp/pull/341)'s breakpoint-command guard, where both
-review bots independently reached the same finding — a command scanner that reads the first token
+review bots independently reached the same finding: a command scanner that reads the first token
 of a segment cannot see `.opendump` inside an `.if`, a `.foreach` or an alias that resolves only
-when it runs (2026-09-18). And item **84** from running
+when it runs (filed 2026-09-18, closed 2026-09-25 by reading the target rather than the command).
+And item **84** from running
 `ioctl_map` against a live **ARM64** target for the first time
 ([#345](https://github.com/glslang/windbg-mcp/pull/345), 2026-09-19): an `adrp`+`add` table base
 lost at the `add`. That run filed five more, all now in
@@ -1420,56 +1421,6 @@ its own code, which is what makes the walk worth starting.
 
 **Where it picks up.** `src/hazards.rs`'s sink call-site recovery, which already has the call sites
 these arguments belong to, and `pool_find_tag` in `src/worker.rs` for the join.
-
-## 81. [windbg-mcp] `changes_debug_target` reads a name, and a wrapper does not say one
-
-`changes_debug_target` (`src/server.rs`) decides whether a command releases or replaces the debug
-target by taking the **first token of each `;`-separated segment** and matching it against a list —
-`.opendump`, `.detach`, `q` and the rest. `execute` uses it to retire the session handle before
-running such a command, and since #341 `set_breakpoint` uses it to *refuse* a breakpoint command
-that would do the same at hit time.
-
-**A wrapper reaches the same commands without naming them.** `.if (1) { .opendump C:\other.dmp }`
-presents `.if`; `.foreach`, `.block`, `j`, `z` and an alias defined with `as` all do the same, and
-an alias resolves at *execution* time, so no reading of the text before it runs can be complete.
-Raised by Codex on [#341](https://github.com/glslang/windbg-mcp/pull/341), and **reached
-independently by CodeRabbit on the same PR** — which is the useful part, because the two arrived at
-the same remedy without conferring: keep the text scan as an early defence, and reconcile the
-target's identity at hit time rather than trusting a deny-list, "because wrappers and
-execution-time aliases can still hide target-changing commands". Two readings converging on the
-third shape below is worth more than either raising it.
-
-**It is not new and it is not specific to breakpoints.** The identical string through `execute`
-leaves the handle unretired exactly as it did before that PR — the check is the same function — and
-`debug_batch`'s `retires_handle` calls it too. What #341 changed is that a typed parameter now
-reaches it as well as raw text, and that parameter is guarded to the same strength as the rest.
-
-**This repo already decided the general form of this question the other way, where it could.**
-`worker.rs`'s running-state check asks the *engine* rather than reading the command, and says why:
-"an alias, a `;` list and `.if` all reach execution without saying so, and a name list that decided
-this would be wrong in both directions". The fuzz corpus carries `.if (1) { g }` with the comment
-"the reason none of the guards reads the text". The reason the target-change case still reads text
-is that there is no engine question to ask: `execute` must decide *before* the command runs, and a
-breakpoint's command runs at a hit this server never observes.
-
-**Three shapes, and the cheap one does not close it:**
-
-- **Refuse control-flow and aliasing constructs on the breakpoint parameter only** — `.if`,
-  `.foreach`, `.block`, `j`, `z`, `as`/`aS`, `{`. Cheap, and defensible because a breakpoint
-  command's legitimate use is narrow (`.printf`/`.echo`/`r`/`gc`) where `execute` is the documented
-  raw hatch. But it is another name list, so it is wrong in both directions too — and an alias
-  still evades it.
-- **Parse the command language.** Complete against wrappers, still incomplete against aliases,
-  and a substantial piece of work against a syntax with no specification.
-- **Observe the target instead of predicting it.** Have the worker notice, after any command or
-  breakpoint hit, that the debuggee it holds is not the one the session was opened for, and retire
-  the handle then. This is the only one that is sound, because it reads what happened rather than
-  what was asked for — and it is the same move `worker.rs` already made for the running state.
-
-**Where it picks up.** `server::changes_debug_target` and its two callers (`execute`'s
-`Call::retiring`, `set_breakpoint`'s refusal), `batch::retires_handle`, and
-`server::tests::a_breakpoint_command_that_changes_the_target_is_refused`, whose last two assertions
-pin the gap and should flip to `assert!` when it closes.
 
 ## 84. [windbg-mcp] An `adrp`+`add` table base is lost at the `add`
 

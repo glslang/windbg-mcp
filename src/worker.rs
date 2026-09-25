@@ -45,8 +45,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use dbgscope::dbgeng::{
-    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, Instruction, InterruptHandle,
-    Interruption, RunToOutcome, WaitOutcome,
+    BreakpointAt, BreakpointSpec, CommandRun, DebugEngine, DebuggeeType, Instruction,
+    InterruptHandle, Interruption, RunToOutcome, WaitOutcome,
 };
 use dbgscope::heap::{self as heap_query, HeapAllocation, HeapBackend, HeapState, HeapWalk};
 use dbgscope::pool::query::{self, PoolPageFilter, PoolWalk};
@@ -1272,7 +1272,10 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
             continue;
         }
         let kernel_attach = matches!(request.op, EngineOp::AttachKernel { .. });
-        let ending_kernel = matches!(request.op, EngineOp::EndSession);
+        let ending_session = matches!(request.op, EngineOp::EndSession);
+        // Read here because the op moves into `execute` below, and both are needed after it:
+        // an opener is where [`watch_the_target`]'s baseline is *taken* rather than checked.
+        let opener = request.op.is_opener();
         // Claimed around the whole op, so an interrupt arriving while it runs names *this* job.
         // Outside the `catch_unwind` below, so a panicking op gives the claim back too. A teardown
         // is also sealed here rather than inside itself — see [`claim`] for the window that closes.
@@ -1296,10 +1299,10 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         if kernel_attach {
             KERNEL_SAFETY.finished_attach(result.is_err(), panicked);
         }
-        if ending_kernel && result.is_ok() {
+        if ending_session && result.is_ok() {
             KERNEL_SAFETY.released();
         }
-        if ending_kernel && result.is_err() {
+        if ending_session && result.is_err() {
             KERNEL_SAFETY.preserve();
         }
         let result = if release(id) {
@@ -1313,6 +1316,12 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
         } else {
             result
         };
+        // **Before the `Done`, which is what makes it worth a message of its own.** The channel is
+        // one pipe read in order, so a retirement sent here is applied by the supervisor before
+        // this op's answer reaches its caller — and before anything queued behind it is
+        // dispatched. Sending it as a field on the reply would arrive at the same instant as the
+        // answer and leave the ordering to whichever the supervisor happened to do first.
+        watch_the_target(&engine, id, opener, ending_session, result.is_ok());
         // A `Done` is what removes the supervisor's waiter, so one that never arrives costs the
         // caller its session rather than its result: the call times out, the waiter stays, and
         // the session counts as busy — and so stays unreclaimable — for the life of the server.
@@ -1667,6 +1676,169 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
         )),
         Ok(true) | Err(_) => None,
     }
+}
+
+/// What the engine says about the debuggee it is holding, read fresh every time.
+///
+/// **The point is that it is read rather than recorded.** Nothing in this process is told when a
+/// command replaces the target: a `.opendump` reaches DbgEng through `ExecuteWide` like any other
+/// text, and dbgscope's own `target_identity` is a generation *it* hands out at *its* openers and
+/// teardowns, so it does not move for one. These three fields are the engine's own answers, so
+/// they move whoever asked and however the asking was spelled — inside a `.if`, a `.foreach`, an
+/// alias resolved at execution time, or a breakpoint command run at a hit nobody watched.
+///
+/// Compared **whole, `None`s included**. A field that stops answering has changed what the engine
+/// says about its target, and every read here is engine-local bookkeeping rather than a trip to
+/// the target — `GetDebuggeeType`, `GetNumberDumpFiles` and `GetCurrentProcessSystemId` do not go
+/// over a KD link — so one of them failing is the engine in trouble, not a slow wire. The bias
+/// matches [`crate::server::changes_debug_target`]'s: over-matching costs a caller one re-open,
+/// under-matching lets a handle go on certifying a target it does not name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TargetFingerprint {
+    /// `GetDebuggeeType`'s class and qualifier. Separates a live kernel from a kernel dump and a
+    /// live process from a user dump, which is the coarse half of a replacement: three of the
+    /// four kinds this server opens land in different pairs.
+    kind: Option<DebuggeeType>,
+    /// The files the session is open on. This is what distinguishes **two dumps of the same
+    /// process** — the case neither of the other two fields can see, and the ordinary one: a
+    /// dump taken at 10:00 and another at 10:05 share their class, their qualifier and their pid.
+    dumps: Option<Vec<String>>,
+    /// The OS id of the process the engine is on — **user-mode targets only**.
+    ///
+    /// Left out of a kernel fingerprint deliberately, and it is the one field that had to be.
+    /// On a kernel target "the current process" is whatever the machine was running at the last
+    /// break, so it moves on its own across every `g`, and a fingerprint carrying it would retire
+    /// a handle each time a live kernel stopped somewhere else. What it buys in user mode is the
+    /// replacements that keep the kind and have no dump file to compare: `.attach`, `.create` and
+    /// `.restart`.
+    process: Option<u32>,
+}
+
+impl TargetFingerprint {
+    /// Reads all three from the engine. Never fails: a field the engine will not answer is
+    /// `None`, which is a reading like any other and compares like one.
+    fn read(e: &DebugEngine) -> Self {
+        let kind = e.debuggee_type().ok();
+        Self {
+            kind,
+            dumps: e.dump_files().ok(),
+            process: match fingerprints_the_process(kind) {
+                true => e.current_process_system_id().ok(),
+                false => None,
+            },
+        }
+    }
+}
+
+/// Whether a fingerprint of this kind of target may carry the current process id.
+///
+/// Its own function so the rule can be stated against the qualifiers rather than inferred from a
+/// call site: **user-mode only**, and a target whose kind the engine would not say is treated as
+/// if it might be a kernel one rather than guessed at as user-mode. Getting it wrong in that
+/// direction is what matters — a kernel target carrying a pid retires a live handle every time the
+/// machine stops in a different process, which is every `g`.
+fn fingerprints_the_process(kind: Option<DebuggeeType>) -> bool {
+    matches!(kind, Some(kind) if !kind.is_kernel())
+}
+
+/// The reading taken when this worker's target was opened, which every later op is measured
+/// against.
+///
+/// Set at most once, by [`watch_the_target`], and only for an opener that succeeded. A worker
+/// whose open failed has no baseline and is never watched: there is nothing to compare, and the
+/// one open that can finish *after* it reported failure is a kernel attach, where a later reading
+/// would differ from a baseline taken over an empty engine and retire a session that had just
+/// become usable.
+static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
+
+/// Takes the baseline after an opener, and after every other op checks that the engine is still
+/// holding what the baseline describes — answering the sentence the supervisor retires on.
+///
+/// **This is the backstop for every route to the target that reading a command cannot see.**
+/// [`crate::server::changes_debug_target`] matches the first token of each segment and stays the
+/// early defence, because `execute` has to retire *before* it runs a `.detach` that may detach and
+/// then report an error. What it cannot match is a wrapper — `.if`, `.foreach`, `.block`, `j`,
+/// `z` — or an alias, which resolves at execution time, so no reading of the text before it runs
+/// can be complete. This reads what happened instead of what was asked for, which is the move
+/// `pump_a_resume` already made for the running state (`FOLLOWUPS.md` item 81).
+///
+/// **A target that has *gone* is not a target that has been *replaced*, and this says nothing
+/// about one.** Two reasons, and the second is the operative one. There is no second target for a
+/// handle to wrongly certify, so nothing is stale in the sense this exists to prevent — and the
+/// case is already both reported (`StopReport::target_gone`) and refused, by
+/// [`refuse_when_the_target_is_gone`], with a category that names the same recovery a retirement
+/// would. And retiring there would break the ordinary ending of a launched program: a
+/// `continue_async` whose debuggee simply exits would have its session retired between the stop
+/// and the `wait_for_stop` that collects it, so the run's own result would be refused to the
+/// caller who asked for it.
+fn watch_the_target(e: &DebugEngine, id: u64, opener: bool, teardown: bool, succeeded: bool) {
+    // A teardown's whole job is to let the target go, and it is the one op allowed to run after
+    // the answer below would have been taken.
+    if teardown {
+        return;
+    }
+    if opener {
+        if succeeded {
+            // `set` rather than an assignment because a worker is sent exactly one opener; if
+            // that ever stops being true, the *first* target is the one the handles name.
+            let _ = OPENED_AS.set(TargetFingerprint::read(e));
+        }
+        return;
+    }
+    let Some(opened_as) = OPENED_AS.get() else {
+        return;
+    };
+    let now = TargetFingerprint::read(e);
+    let Some(why) = replacement(opened_as, &now, e.has_target().ok()) else {
+        return;
+    };
+    tracing::warn!(
+        "worker: the engine is no longer holding the target this session was opened for \
+         (was {opened_as:?}, now {now:?}); the session's handles are being retired"
+    );
+    emit(&WorkerMessage::TargetReplaced { id, why });
+}
+
+/// [`watch_the_target`]'s decision, with the engine already asked — so the rule can be stated and
+/// tested rather than only run.
+///
+/// `holds_a_target` is `Some(false)` for a target that has gone and `None` where the engine would
+/// not say. **Neither is a replacement**, and the second is the one that has to be written down:
+/// an engine that will not answer `GetExecutionStatus` will not answer the three reads in `now`
+/// either, so `now` would be an empty fingerprint differing from every baseline — a retirement on
+/// no evidence, in the one state where nothing can be checked.
+fn replacement(
+    opened_as: &TargetFingerprint,
+    now: &TargetFingerprint,
+    holds_a_target: Option<bool>,
+) -> Option<String> {
+    if holds_a_target != Some(true) || now == opened_as {
+        return None;
+    }
+    Some(replacement_sentence(opened_as, now))
+}
+
+/// The sentence a caller reads when their next call is refused.
+///
+/// Says what *kind* of change it was rather than printing both readings, because the fields are
+/// engine constants and a pid, and a caller cannot act on either — what they can act on is
+/// "something replaced your target, open again". The readings go to the log above, where a server
+/// operator is the audience.
+fn replacement_sentence(opened_as: &TargetFingerprint, now: &TargetFingerprint) -> String {
+    let what = if opened_as.kind != now.kind {
+        "a target of a different kind"
+    } else if opened_as.dumps != now.dumps {
+        "a different dump or trace file"
+    } else {
+        "a different process"
+    };
+    format!(
+        "a command replaced the debug target with {what}. It was not one of the commands this \
+         server retires a handle for by name, so it was found by comparing what the engine holds \
+         against what it held when this session was opened — a `.if`, a `.foreach`, an alias, or \
+         a breakpoint command run at a hit, any of which reaches `.opendump`, `.attach`, \
+         `.create` or `.restart` without naming it"
+    )
 }
 
 /// Applies one symbol-path mutation through DbgEng's typed API.
@@ -9733,6 +9905,127 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
 
 #[cfg(test)]
 mod tests {
+    use dbgscope::dbgeng::DebuggeeType;
+    use windows_sys::Win32::System::Diagnostics::Debug::Extensions::{
+        DEBUG_CLASS_KERNEL, DEBUG_CLASS_USER_WINDOWS, DEBUG_KERNEL_CONNECTION,
+        DEBUG_KERNEL_FULL_DUMP, DEBUG_USER_WINDOWS_PROCESS, DEBUG_USER_WINDOWS_SMALL_DUMP,
+    };
+
+    use super::TargetFingerprint;
+
+    fn kind(class: u32, qualifier: u32) -> Option<DebuggeeType> {
+        Some(DebuggeeType { class, qualifier })
+    }
+
+    /// A fingerprint that would be taken of a user-mode process.
+    fn of_a_process(pid: u32) -> TargetFingerprint {
+        TargetFingerprint {
+            kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_PROCESS),
+            dumps: Some(vec![]),
+            process: Some(pid),
+        }
+    }
+
+    /// **A kernel target's fingerprint must not carry a process id**, and that is the one field
+    /// whose inclusion would be actively harmful rather than merely imprecise: on a kernel target
+    /// "the current process" is whatever the machine was running at the last break, so it moves
+    /// across every `g` and a fingerprint carrying it would retire a live handle each time the
+    /// target stopped somewhere else.
+    ///
+    /// Mutation-verified: dropping the `!` in `fingerprints_the_process` fails the first two
+    /// assertions, and widening it to every kind fails the third.
+    #[test]
+    fn only_a_user_mode_target_is_fingerprinted_by_its_process_id() {
+        assert!(!super::fingerprints_the_process(kind(
+            DEBUG_CLASS_KERNEL,
+            DEBUG_KERNEL_CONNECTION
+        )));
+        assert!(!super::fingerprints_the_process(kind(
+            DEBUG_CLASS_KERNEL,
+            DEBUG_KERNEL_FULL_DUMP
+        )));
+        // An engine that would not say what it is holding is treated as if it might be a kernel
+        // one, rather than guessed at as user-mode.
+        assert!(!super::fingerprints_the_process(None));
+
+        assert!(super::fingerprints_the_process(kind(
+            DEBUG_CLASS_USER_WINDOWS,
+            DEBUG_USER_WINDOWS_PROCESS
+        )));
+        assert!(super::fingerprints_the_process(kind(
+            DEBUG_CLASS_USER_WINDOWS,
+            DEBUG_USER_WINDOWS_SMALL_DUMP
+        )));
+    }
+
+    /// The three replacements the fingerprint is for, and the two readings that are not one.
+    #[test]
+    fn a_replaced_target_is_reported_and_a_departed_one_is_not() {
+        let opened_as = of_a_process(4242);
+        let same = of_a_process(4242);
+        let says = |now: &TargetFingerprint| super::replacement(&opened_as, now, Some(true));
+
+        assert!(
+            says(&same).is_none(),
+            "an unchanged reading is not a replacement"
+        );
+
+        // `.attach`, `.create` and `.restart` keep the kind and have no dump file to compare,
+        // so the pid is the only field that moves.
+        let other_process = of_a_process(4243);
+        assert!(
+            says(&other_process)
+                .unwrap()
+                .contains("a different process")
+        );
+
+        // `.opendump` of a user dump from a live process: the qualifier moves.
+        let a_dump = TargetFingerprint {
+            kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP),
+            dumps: Some(vec!["C:\\other.dmp".to_string()]),
+            process: Some(4242),
+        };
+        assert!(
+            says(&a_dump).unwrap().contains("a different kind"),
+            "the kind is reported ahead of the file, being the coarser change"
+        );
+
+        // **Two dumps of one process**, which is the case neither other field can see: same
+        // class, same qualifier, same pid, and a different file. This is the reading that makes
+        // `dump_files` worth asking for.
+        let first = TargetFingerprint {
+            kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_SMALL_DUMP),
+            dumps: Some(vec!["C:\\at-1000.dmp".to_string()]),
+            process: Some(4242),
+        };
+        let second = TargetFingerprint {
+            dumps: Some(vec!["C:\\at-1005.dmp".to_string()]),
+            ..first.clone()
+        };
+        assert!(
+            super::replacement(&first, &second, Some(true))
+                .unwrap()
+                .contains("a different dump or trace file")
+        );
+
+        // **A target that has *gone* is not a target that has been *replaced***, and neither is
+        // an engine that will not say. Both readings differ from the baseline and neither is
+        // reported: the first is already carried by the stop and refused by
+        // `refuse_when_the_target_is_gone`, and retiring on it would refuse a `wait_for_stop`
+        // collecting the ordinary exit of a launched program; the second is no evidence at all.
+        let empty = TargetFingerprint {
+            kind: None,
+            dumps: None,
+            process: None,
+        };
+        assert!(super::replacement(&opened_as, &empty, Some(false)).is_none());
+        assert!(super::replacement(&opened_as, &empty, None).is_none());
+        assert!(
+            super::replacement(&opened_as, &empty, Some(true)).is_some(),
+            "an engine still holding something that answers nothing is still a change"
+        );
+    }
+
     /// A repeated id is one breakpoint, and the order the caller sent is kept.
     ///
     /// **Pinned here *and* at the call site**, deliberately: this function is a list transform and

@@ -452,9 +452,17 @@ pub enum SessionState {
     Open,
     /// The open failed without creating anything. This handle will never be usable.
     Failed(String),
-    /// The worker still holds a target, but a raw command replaced it, so this handle no longer
-    /// names what it was issued for. Calls that *supply* the handle are refused; calls that
-    /// supply none still reach the worker, exactly as they did before handles existed.
+    /// This handle no longer names the target it was issued for, because a command replaced that
+    /// target. Calls that *supply* the handle are refused; calls that supply none still reach the
+    /// worker, exactly as they did before handles existed.
+    ///
+    /// Reached two ways, and the reason it does not say which is that a caller cannot act on the
+    /// difference. Either the command was one this server retires a handle for **by name**
+    /// ([`crate::server::changes_debug_target`], which decides *before* it runs one, since a
+    /// `.detach` that reports an error may still have detached) — or the worker caught it
+    /// afterwards, by comparing what its engine holds against what it held at the open
+    /// ([`crate::worker`]'s `watch_the_target`), which is what covers a `.if`, an alias, and a
+    /// breakpoint command run at a hit nobody watched.
     Retired(String),
     /// The session is over: ended, reclaimed, or its worker died.
     Closed(String),
@@ -3343,10 +3351,15 @@ fn stale_handle(want: &str, state: &SessionState) -> String {
         // and **qualified**, which was the other half of `FOLLOWUPS.md` item 55: it routes to
         // whichever session is current, so with anything newer open it reaches a different one —
         // advice that reads as a way back to this target and is a way to act on another.
+        // **It does not say the worker still holds a target**, which it did until item 81. That
+        // was never quite true — `.detach`, `q` and `qd` are on the retiring list and leave none —
+        // and the observer retires on a *replacement* rather than on a target that has gone, so
+        // the sentence would have been a claim about the engine made from the wrong side of the
+        // pipe. What is true either way is that the handle does not name what it was issued for.
         SessionState::Retired(why) => format!(
-            "session handle `{want}` has been retired: {why}. The worker still holds a target, \
-             but it is not the one this handle names, so the guarantee the handle buys no longer \
-             applies. Open again for a handle that means something, or `end_session \
+            "session handle `{want}` has been retired: {why}. It no longer names the target it \
+             was issued for, so the guarantee the handle buys no longer applies. Open again for a \
+             handle that means something, or `end_session \
              {{ \"session_id\": \"{want}\" }}` to release this worker — that still takes this \
              handle. Omitting `session_id` reaches the worker only while this is still your \
              current session, so it is not a way back to it once you have opened another."
@@ -4473,6 +4486,33 @@ async fn reader(
                 // is a faithful record of what arrived on the wire, and progress is a narration of
                 // the call for a client — and a narration may not contradict itself.
                 tell_rollback(&waiters, id, within);
+            }
+            // The worker compared what its engine is holding against what it held when this
+            // session was opened, and they differ. Nothing read the command that did it — that is
+            // the point (`FOLLOWUPS.md` item 81) — so this is the only notice this side gets.
+            //
+            // **Applied here rather than through `set_state`**, for `promote_opened`'s reason
+            // in reverse: this is a conditional transition and the states it declines to touch
+            // are the whole of it. A `Closed` or a `Failed` session has finished and must not be
+            // relabelled; a `KernelUnresolved` one is a preservation boundary
+            // (`docs/sessions.md`) that nothing but an acknowledged handoff may move; and a
+            // session already `Retired` keeps the reason it was retired *for*, which is the one
+            // a caller was told to expect.
+            WorkerMessage::TargetReplaced { id, why } => {
+                // Logged at `warn` on both sides of the pipe: the worker says what changed, in
+                // engine terms, and this says which session lost its handles.
+                tracing::warn!(
+                    "session {}: job {id} found the worker holding a different target; retiring \
+                     the session's handles ({why})",
+                    session.id
+                );
+                session.update_state(|state| {
+                    matches!(
+                        state,
+                        SessionState::Opening | SessionState::Attaching | SessionState::Open
+                    )
+                    .then(|| SessionState::Retired(why.clone()))
+                });
             }
             // The target an `EngineOp::Resume` was given is moving. Reported to the call that
             // started it — which is waiting on exactly this and not on the result, since the
