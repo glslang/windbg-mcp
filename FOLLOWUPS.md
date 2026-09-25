@@ -94,6 +94,10 @@ the same chain drifting 0x10 on 26100, which is all that is left of item 99 now 
 item 100 is the target's paged pool being trimmed out from under a KD link, with nothing in the
 walker to fix, and is measured and declined; item 101 is a real placement defect in readable
 memory.
+And item 102 from closing item 81 (2026-09-25): the fingerprint that now retires a session's
+handles when its target is swapped does not stop a `debug_batch` mid-flight, so the batch's
+`always` block can run its rollback against the replacement — a write into a target that never had
+the mutation.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1951,3 +1955,41 @@ measured this.
   memory that reads fine. The drift here is a uniform 0x10; there, the gap between the chain's
   expectation and the next readable boundary runs to 0x820 and more, and varies per site. A target
   that loses the chain where the named page is **not** a pagefile PTE would belong here.
+
+## 102. [windbg-mcp] A `debug_batch` runs its rollback against whatever target it ends up holding
+
+**Repo:** `windbg-mcp`.
+
+Found while closing item 81, and **not introduced by it** — item 81's fingerprint retires the
+session's handles when a batch's op ends holding a different target, which is the *handle*
+guarantee. What it does not do is stop the batch, and that is the sharper half.
+
+`batch::run` watches one thing between steps: `done.target_gone`, which ends the batch with
+`BatchOutcome::TargetGone`. A target that has been **replaced** rather than released reads as an
+ordinary step, so every remaining step runs against the replacement — and so does the `always`
+block. `always` exists to put a mutation back, so on this path it writes a restore into a target
+that never had the mutation, at an address that means something else there. On a live kernel that
+is a write into somebody else's machine.
+
+Nothing upstream stops it. `batch::validate` refuses unknown fields and bad operands and says
+nothing about command text; `batch::retires_handle` and `batch::mutation` both ask
+`server::changes_debug_target`, which matches the first token of each `;`-separated segment and so
+cannot see `.opendump` inside a `.if`, a `.foreach` or an alias — and `retires_handle` retires the
+*handle* in any case, which does not stop a batch that is already running. So
+`debug_batch { steps: [{op: "command", command: ".if (1) { .opendump C:\\other.dmp }"}, …],
+always: [{op: "command", command: "eb <addr> <saved>"}] }` reaches it.
+
+**Why this was not folded into item 81.** The mechanism is cheap — the worker already computes the
+fingerprint, and `batch::Debuggee` is the trait the step loop asks about the target — but the
+*decision* is not: `always` is sold as "cleanup cannot be lost", and the right answer here is to
+**lose** it, because running it is worse than skipping it. That needs a `BatchOutcome` for it, a
+`rollback` disposition that says "not attempted, and deliberately", and both of those move the
+output schema and its goldens. It is a contract change to the one tool whose contract is about
+what survives failure, and it deserves its own review rather than a third round on somebody
+else's PR.
+
+**Where it picks up.** `batch::run`'s between-steps checks and its `ended` flag
+(`src/batch.rs`), `batch::Debuggee` and the worker's implementation of it, `BatchOutcome` and
+`structured::BatchReportInfo`'s `rollback_complete`. The fingerprint to ask is
+`worker::replacement_now`, which already answers exactly this question for an op and would need to
+answer it for a step. `docs/debug-batch.md` states the rollback contract and would move with it.
