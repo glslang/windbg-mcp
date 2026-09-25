@@ -91,6 +91,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outbound TCP and DNS leave the Hyper-V NAT segment, so a debugger host behind that NAT can reach
   such a box, which is the opposite direction from the inbound path E0 itself needs.
 
+- **E2 is reordered oracle-first, because an EXDI route into VTL1 is reported to exist already.**
+  LiveCloudKd registers its own EXDI servers — `ExdiKdSample.dll`, CLSIDs
+  `{53838F70-0936-44A9-AB4E-ABB568401508}` passive and `{67030926-1754-4FDA-9788-7F731CBDAE42}`
+  active — **with no gdbstub in it at all**, and reports live read access to secure-kernel memory
+  (windows-internals.com, read 2026-09-25). Read access is the solid claim; breakpoints and
+  single-stepping are described there but not demonstrated, so the active mode is recorded as
+  untested. The stub plan's exclusion of LiveCloudKd stands for what this server would **ship** and
+  is now stated as not extending to what may be used to **answer a question**: E2 splits into E2a,
+  the oracle, and E2b, the existing stub path, whose purpose becomes a shippable backend rather
+  than the answer. A negative from the oracle would retire the stub programme rather than reorder
+  it, which is why it goes first. Its constraints also decide the lab's shape — it runs on the
+  Hyper-V host **of the target**, with the guest's VBS on and nested virtualisation off — so a
+  debugger that is to drive it must be the machine hosting that target's hypervisor, which is the
+  nested layout rather than the sibling one. And both routes ride the same dbgeng plumbing, so E2
+  now says to check EXDI activation first: E0 found it stalling here, with registration writing an
+  `AppID` whose `DllSurrogate` is empty and a bare `CreateInstance` blocking past 17 s having
+  launched no surrogate. Whether `ExdiKdSample.dll` registers the same way is unestablished and
+  cheap to read off its registration.
+
 - **A VBS target was never what this hardware lacked — a gdbstub-backed one was.** The E2 entry
   above closed with "why the single-box arrangement cannot work", which overstates its own
   evidence and is the failure mode `.claude/skills/handoff` names: the tidy sentence at the end of
