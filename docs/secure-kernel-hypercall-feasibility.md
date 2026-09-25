@@ -23,8 +23,11 @@ silently:
 | DbgEng's `sk` record is EXDI-gated and its selector unreferenced | exdi-stub-plan E1, 2026-09-23 | measured |
 | The hypercall surface is VTL-parameterised — `HV_INPUT_VTL`, `HV_TRANSLATE_GVA_INPUT_VTL_MASK` | header survey, 2026-09-25 | measured |
 | EXDI activation stalls on this bench; registration is surrogate-hosted | exdi-stub-plan E0, 2026-09-25 | measured |
+| `HvCallGetVpRegisters` is documented as callable **by the parent** of the target partition, and carries a `TargetVtl` | TLFS, H0 2026-09-25 | measured |
+| CR3 is **VTL-private** state, so a VTL1 CR3 is a real and distinct value to ask for | TLFS VSM, H0 2026-09-25 | measured |
 | VBS defends a guest's VTL1 from that guest's VTL0, not from its host | architecture | **assumed** — H3 tests it |
-| The hypervisor permits a *root* partition to read a guest's VTL1 registers | — | **assumed, and the likeliest thing to be wrong** |
+| The hypervisor permits a parent to name a child's **VTL1** specifically | — | **assumed; H0 found no prohibition, which is not permission** |
+| `HvCallTranslateVirtualAddress` is parent-callable and VTL-parameterised | — | **assumed, and less documented than the register read** |
 
 ## Two disciplines that apply throughout
 
@@ -59,6 +62,48 @@ VTLs.
   what a given build permits at runtime — the same distinction that made an earlier revision of the
   EXDI plan claim DbgEng self-registers. H0 decides whether H3 is worth building for; only H3
   answers it.
+
+### H0 result, 2026-09-25: pass, and H3 is worth building for
+
+Read from the TLFS on Microsoft Learn — `tlfs/hypercalls/hvcallgetvpregisters`,
+`tlfs/datatypes/hv_input_vtl`, `tlfs/vsm`, `tlfs/hypercalls/hvcalltranslatevirtualaddress`.
+
+**The pivotal call is documented as parent-callable.** `HvCallGetVpRegisters`, call code `0x0050`,
+states under *Restrictions*:
+
+> The caller must either be the parent of the partition specified by PartitionId, or the partition
+> specified must be "self" and the partition must have the AccessVpRegisters privilege.
+
+Two things follow. A parent may read a child's VP registers at all, which is the premise the route
+rests on. And **the `AccessVpRegisters` privilege is attached to the *self* case** — being the
+parent is itself the authorization in this text, so the privilege is not obviously the gating
+factor for our caller.
+
+**It is VTL-parameterised, and the register we want is VTL-private.** The input carries `TargetVtl`
+at offset 12, and `HV_INPUT_VTL` is `TargetVtl : 4` with `UseTargetVtl : 1`, documented as "allows
+specifying a target virtual trust level for hypercall operations that operate across VTL
+boundaries". The VSM page lists **CR3 among the private registers** each VTL maintains — so a VTL1
+CR3 is a genuinely distinct value rather than the VTL0 one under another name, and H3's pass
+condition is meaningful.
+
+**The prohibition in the VSM page does not by its terms cover a parent.** It reads *"Software
+running at a lower VTL cannot access the higher VTL's private virtual processor's register state"*
+— a rule about software **within** a partition. A parent partition is not a VTL of its child, and
+the hypercall's own restriction text contemplates exactly that caller.
+
+**What H0 did not establish, and H3 must.** No TLFS text says a parent may name a child's **VTL1**
+specifically; what was found is the absence of a prohibition, which is not permission. That
+distinction is the whole reason H3 exists and it should not be softened on the strength of this
+reading.
+
+**And one design consequence, which is the useful part of a pass.**
+`HvCallTranslateVirtualAddress`, call code `0x0052`, takes a `PartitionId` and `VpIndex` and an
+opaque 8-byte `HV_TRANSLATE_GVA_CONTROL_FLAGS`, but its page documents **no Restrictions section at
+all** and does not expand those flags — so parent-calling and VTL selection are *not* established
+for it to the standard the register read reached. **H4 must therefore not assume the hypervisor
+will perform the VTL1 translation**, and should carry the swizzled page-table walk as its expected
+cost rather than its fallback. That raises H4's estimate and lowers the risk of discovering it
+late.
 
 ## H1 — a target that actually has a Secure Kernel, and a control that does not
 
@@ -119,8 +164,12 @@ Everything rests here. `HvCallGetVpRegisters` with `HV_INPUT_VTL` set to `Vtl1`,
 
 ## H4 — does what comes back look like Secure Kernel
 
-Only meaningful once H3 passes. `HvCallTranslateVirtualAddress` with
-`HV_TRANSLATE_GVA_INPUT_VTL_MASK`, then read.
+Only meaningful once H3 passes. **Budget for walking SK's page tables rather than for the
+hypervisor doing it**: H0 found `HvCallTranslateVirtualAddress` documented without a Restrictions
+section and without its control flags expanded, so parent-calling and VTL selection are unproven
+there. Try the hypercall first, since it is cheap and would remove the swizzle problem outright —
+but a design that only works if it succeeds is a design with an unmeasured dependency. The
+`SkdInitDebuggerDataBlock` PTE swizzle bit is the fallback's key input and was already measured.
 
 - **Pass, weak:** at the claimed SK base there is a valid PE header, and its section names and
   sizes match the `securekernel.exe` image on disk for that guest's build.
