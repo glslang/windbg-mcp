@@ -91,6 +91,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outbound TCP and DNS leave the Hyper-V NAT segment, so a debugger host behind that NAT can reach
   such a box, which is the opposite direction from the inbound path E0 itself needs.
 
+- **The EXDI server registers as an out-of-process surrogate, so the job object that gate E0 relies
+  on never contained it.** Run 2026-09-25: `regsvr32` writes the CLSID with `InprocServer32` and
+  `ThreadingModel = Apartment` **and** an `AppID` (`ExdiTestServer1`) whose `DllSurrogate` is the
+  empty string, which hosts the server in `dllhost.exe`. Across two bounded `kd` runs the surrogate
+  had **svchost (RPCSS) as its parent**, not `kd`, so a job carrying
+  `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` could not reach it and both runs left one alive after the
+  job was torn down — E0 step 4 now says the harness needs the job *and* a sweep by `AppID`. Two
+  more consequences of the same fact: the DLL cannot be registered where it ships, because
+  `LoadLibraryExW` on the package copy returns error 5 under three flag sets (WindowsApps ACLs) and
+  `regsvr32` then exits 3 having written nothing, visible only in the registry rather than the exit
+  code; and `EXDI_GDBSRV_XML_CONFIG_FILE` cannot configure a surrogate at all, since RPCSS spawns
+  it with the service's environment, leaving `PathToSrvCfgFiles` — which travels in the connection
+  string — as the only one of the two that reaches it. Step 2 had presented them as equivalent.
+  **The transport half of E0 did not pass**: against a minimal RSP responder on loopback the
+  responder logged no connection at either 75 s or 60 s, the surrogate held no socket, and a bare
+  `CreateInstance` reproduced the stall without `kd`, blocking past 17 s having launched no
+  surrogate, with no DCOM `10010` logged in that window. What the run does pin is the register
+  block the gate depends on — **66 entries, 608 bytes, 1216 hex characters** for a `g` reply, with
+  `Size` decimal and `Order` hex in that file — matching the validation record independently. E0 is
+  now written as two halves, the first of which needs no guest, and the step that would drop the
+  surrogate for an in-process load is left untried on purpose: it is materially what `Inproc=`
+  arranges, and that is what the 2026-09-22 host reset points at.
+
 ## [0.20.0] - 2026-09-24
 
 ### Added

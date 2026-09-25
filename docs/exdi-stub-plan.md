@@ -128,6 +128,23 @@ Nothing to do with Secure Kernel. Establishes the rig.
    and the machine did not recover. Nothing was left registered, so there was no cleanup to do.
    This is the same hazard class as a `cdb -server` spinning on a broken pipe: a debugger child
    that cannot be killed from outside takes the host with it.
+
+   **What the registration actually produces is an out-of-process server, and that shapes the
+   rest of this gate.** Run 2026-09-25 on this bench, elevated: `regsvr32` writes
+   `HKLM\SOFTWARE\Classes\CLSID\{29f9906e-…}` as `LiveExdiGdbSrvServer Class`, with
+   `InprocServer32` naming the DLL and `ThreadingModel = Apartment` — **and an `AppID`
+   `{1FC9AD2A-EEC4-467E-AA40-951987327C81}` (`ExdiTestServer1`) whose `DllSurrogate` is the empty
+   string**, which is the registration that asks COM to host the server in `dllhost.exe`. So on
+   the registered path the "EXDI server" is a separate process owned by RPCSS rather than a DLL
+   inside the debugger.
+
+   **And it cannot be registered where it ships.** `LoadLibraryExW` against the package's own copy
+   returns error 5, `Access is denied`, under plain flags, `ALTERED_SEARCH_PATH` and
+   `SEARCH_DEFAULT_DIRS` alike — WindowsApps ACLs — so `regsvr32` exits 3 and writes nothing, which
+   shows up only in the registry and not in the exit code. Copy the DLL to an ordinary directory
+   and register it there; its imports are `ADVAPI32`, `KERNEL32`, `OLEAUT32`, `SHLWAPI`, `USER32`,
+   `WS2_32`, `XmlLite` and `ole32`, all system DLLs, so it travels alone. `kd.exe` runs from
+   WindowsApps unchanged, so only the DLL needs moving.
 2. Point the engine at **your own copy** of the config rather than editing the package's, with the
    `PathToSrvCfgFiles` connection option or the `EXDI_GDBSRV_XML_CONFIG_FILE` environment variable
    (both read out of `dbgeng.dll`). Add an `<ExdiTarget Name="WindbgMcp">` entry and set
@@ -141,6 +158,14 @@ Nothing to do with Secure Kernel. Establishes the rig.
    copy beside the debugger binaries has it as `X64`. `QEMU` is identical in both. Measured
    2026-09-24 and tabulated in
    [the validation record](secure-kernel-debugging-validation.md#exdi-transport-experiments-and-the-host-reset-2026-09-23).
+
+   **Those two ways of naming the config are not interchangeable once the server is
+   surrogate-hosted, and this step used to present them as equivalent.**
+   `EXDI_GDBSRV_XML_CONFIG_FILE` is read from the *server's* environment; a surrogate is spawned by
+   RPCSS rather than by the debugger, so it inherits that service's environment and never sees a
+   variable set for `kd`. `PathToSrvCfgFiles` travels inside the connection string, across the COM
+   boundary, and is the one that can reach an out-of-process server. Measured 2026-09-25 with the
+   variable set for `kd` and a private config naming a listener on loopback: nothing connected.
 3. Boot an ordinary Windows guest under QEMU with its gdbstub on `1234`, and attach with the
    documented form: `-kx exdi:CLSID={29f9906e-…},Kd=Guess,DataBreaks=Exdi` — no `Inproc`.
 4. **Bound the debugger so a spin cannot take the host.** Run `kd` in a job object that can be
@@ -148,9 +173,46 @@ Nothing to do with Secure Kernel. Establishes the rig.
    60-second kill on it and the kill did not save the machine. And make the far end answer
    *unmapped* reads with an RSP error rather than zeroes, so a scan terminates on its own.
 
+   **The job object does not contain the EXDI server, which is the gap this step was written to
+   close.** Measured 2026-09-25 over two runs: `kd` was created suspended, assigned to a job
+   carrying `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`, then resumed — and the `dllhost.exe` holding the
+   EXDI server had **svchost (RPCSS) as its parent**, so it was never in the job. Both runs left a
+   surrogate running after the job was terminated and its handle closed, and each had to be swept
+   afterwards by matching `DllHost.exe` command lines against the `/Processid:` of that `AppID`.
+   So a harness needs the job **and** that sweep. Whether the September host reset involved a
+   surrogate is not established: nothing was registered then, so that attempt had none to leave
+   behind, and the two failures are not being claimed as one.
+
 **Pass:** `lm` lists `nt`, `!process 0 0` returns, a breakpoint on a kernel routine hits, and
 resume works. **Control:** the same guest debugged over ordinary KDNET, to show the guest and
 symbols are not the variable.
+
+#### E0 splits in two, and the first half needs no guest
+
+Only the pass criteria above need a kernel. Whether the rig *connects and negotiates* —
+registration, config parsing, the RSP handshake, the register contract — can be answered against a
+bare TCP listener, which is worth doing first because it is the half that has twice ended in a hang
+rather than an error.
+
+Run 2026-09-25 on this bench, against a minimal RSP responder on loopback, `Kd=Guess`, no `Inproc`,
+`kd` bounded in a job object. **The transport half did not pass.** Two runs, 75 s and 60 s: the
+responder logged **no connection at all**, and the surrogate, where one appeared, held **no
+socket** — so the stall is before anything is dialled, not in the exchange. Activation alone
+reproduces it without `kd` in the picture: a bare `CreateInstance` on the CLSID blocked for more
+than 17 s having launched **no surrogate at all**, with no DCOM `10010` in the System log inside
+that window. An earlier reading of this as a hung `CoCreateInstance` rested on a test that also
+called `Get-Member`, which can block on COM type info by itself; the call was then timed in
+isolation, and it does block, but the first evidence for it did not show that.
+
+What the run *did* establish, beyond the registration and ACL facts in step 1: the register block
+this gate depends on is **66 entries, 608 bytes, 1216 hex characters for a `g` reply** — `Size` is
+decimal and `Order` is hex in that file, so a reader treating both as one radix gets 752 or 776
+bytes instead. That figure matches the validation record's independently.
+
+**The untried step is deliberate.** Removing the `AppID` from the CLSID key would drop the
+surrogate and load the server in-process, which is materially what `Inproc=` arranges — and step 1
+records a host reset pointing at exactly that. It needs a window where losing the host is
+affordable, not a slot in a sequence of experiments.
 
 ### E1 — how DbgEng locates the kernel over EXDI — answered 2026-09-22
 
