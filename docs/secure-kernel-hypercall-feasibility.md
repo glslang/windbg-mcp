@@ -185,6 +185,22 @@ Two mechanisms, cheapest first:
 1. **`winhvr.sys` as it stands**, which LiveCloudKd's `ReadInterfaceWinHv` suggests is sufficient
    for some operations. Probe with LiveCloudKd configured to that method — running it is licence-
    safe and answers whether the route exists on this Hyper-V build before any driver is written.
+
+   The configuration is a registry key, read from the tool's own published schema
+   (`cfg/HvlibSettingsEditor/config.json`, 2026-09-25) rather than inferred — under
+   `HKLM\SOFTWARE\LiveCloudKd\Parameters`:
+
+   | Value | Set to | Why |
+   |---|---|---|
+   | `ReadMethod` (dword) | **2** = `ReadInterfaceWinHv` | default is `1`, the driver; `2` needs none, so HVCI on the debugger host does not apply |
+   | `WriteMethod` (dword) | **2** = `WriteInterfaceWinHv` | same, and the gate needs no writes — set it so a stray write cannot silently take the driver path |
+   | `VSMScan` (bool) | `1` (its default) | "Virtual Secure Mode scan" — the VTL1 discovery this gate is about, already on by default |
+   | `LogLevel` (dword) | `3` | maximum diagnostics; a probe's value is in what it says when it fails |
+
+   **Set `ReloadDriver` to `0` and confirm no driver service was created**, because the pass
+   condition for this step is *"read guest memory with no driver loaded"* and a tool that quietly
+   falls back to loading one would satisfy the reading while destroying its meaning. Check for the
+   service afterwards rather than trusting the setting.
 2. **A minimal root-partition driver** issuing `HvCallReadGpa`, written only if the above is
    insufficient. Signable by whoever runs it; the revoked-certificate driver that ships with
    LiveCloudKd is not a dependency of this plan and should not be loaded to satisfy it.
