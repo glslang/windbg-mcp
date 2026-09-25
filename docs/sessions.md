@@ -231,8 +231,13 @@ line — they reach the debugger, and would reach whatever it is holding now —
 
 Two more things follow that are worth knowing at the tool surface. The retirement can arrive on a
 call that did nothing wrong — the one that happened to be running when the swap was noticed answers
-normally, and the *next* call naming that handle is refused. And a target that has simply **gone** —
-a launched program that ran to completion, a `.detach` — is not reported this way: that is an
-ending, carried by the stop itself, and the session refuses further work with a stale-session error
-rather than a retired handle. Either way `end_session` still accepts the handle, and opening again
-is how you get a target.
+normally, and the *next* call naming that handle is refused. And a target that has simply **gone**
+is not reported this way at all: that is an ending, carried by the stop itself, and the session
+refuses further work with a stale-session error rather than a retired handle. Either way
+`end_session` still accepts the handle, and opening again is how you get a target.
+
+Note which `.detach` that last sentence is about. `execute { "command": ".detach" }` names a command
+on the list above, so it **retires the handle before it runs** — that is the ordinary path and it
+ends in a retired handle, not a stale-session error. What ends in a stale-session error is a target
+that went without this server being able to see it coming: a launched program running to
+completion, or a `.detach` hidden inside a wrapper where the scan cannot read it.
