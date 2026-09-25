@@ -91,6 +91,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   outbound TCP and DNS leave the Hyper-V NAT segment, so a debugger host behind that NAT can reach
   such a box, which is the opposite direction from the inbound path E0 itself needs.
 
+- **The oracle was read from its own release, and what it needs for VTL1 is eleven functions and
+  four values.** Static inspection 2026-09-25 of `v3.3.2.20260720` (zip sha256 `c8dff9409ad896ec…`),
+  nothing registered or run. The server is `ExdiHvSrv.dll`, not the `ExdiKdSample.dll` the write-up
+  names. It **registers exactly as `ExdiGdbSrv.dll` does** — identical exports, and `DllSurrogate`,
+  `AppID`, `InprocServer32`, `ThreadingModel` in the binary — so E0's activation stall is a shared
+  risk rather than a separate problem; its own installer script sweeps `dllhost` processes holding
+  the DLL and says it derives from Microsoft's `WinDbg-Samples` script, which makes the
+  surrogate-outlives-the-debugger behaviour upstream-known and the job object insufficient by
+  design rather than by our error. It ships `hvmm.sys` signed `CN=Atheros Communications Inc.`,
+  expired 2013, no timestamp, and Windows reports the certificate *explicitly revoked* — so it
+  implies test signing or weakened code integrity on whichever host runs it, though
+  `READ_MEMORY_METHOD`/`WRITE_MEMORY_METHOD` name `WinHv` beside `HvmmDrvInternal`, making the
+  driver one of three pluggable backends rather than a requirement. **Why a VTL0 driver reaches
+  VTL1 at all** is that the boundary crossed is partition-to-partition, not VTL-to-VTL: the tool
+  runs in the root partition and reads a *guest's* memory, and VBS defends a guest's VTL1 from that
+  guest's VTL0 rather than from its host — so no IUM trustlet is involved, and the technique
+  reaches a guest's Secure Kernel and never the host's own. The public SDK is `SdkEnumPartitions`,
+  `SdkSelectPartition`, `SdkCloseAllPartitions`, `SdkGetDefaultConfig`, `SdkGetData`,
+  `SdkControlVmState` and four memory read/write entry points, with the secure-kernel-specific part
+  being `InfoSecureKernelBase`, `InfoSecureKernelSize`, `InfoHvddGetCr3Securekernel` and
+  `Cr3SecureKernel`. **That reopens the choice that produced the hardware problem**: the stub route
+  exists to avoid implementing an EXDI COM interface, and that is what forces a gdbstub-exposing
+  hypervisor, which Hyper-V is not. Recorded with two cautions rather than as a decided re-plan —
+  `SdkControlVmState` pauses a VM and is not VTL1 stepping, the active CLSID's breakpoints are
+  undemonstrated, EXDI's value here was DbgEng's SK awareness which E1 found EXDI-gated with an
+  unreferenced selector, and the licence has not been checked.
+
 - **E2 is reordered oracle-first, because an EXDI route into VTL1 is reported to exist already.**
   LiveCloudKd registers its own EXDI servers — `ExdiKdSample.dll`, CLSIDs
   `{53838F70-0936-44A9-AB4E-ABB568401508}` passive and `{67030926-1754-4FDA-9788-7F731CBDAE42}`
