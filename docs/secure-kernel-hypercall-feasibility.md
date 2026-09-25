@@ -172,8 +172,32 @@ host the oracle's default driver path is blocked by the very feature under study
 weakening the debugger host*. Disabling HVCI here remains possible and would become a condition of
 every measurement taken afterwards, so it is recorded rather than assumed away.
 
-**Still outstanding for H1:** the VBS-off twin, which is the control for H3 and H4 and without
-which a plausible-looking VTL1 read cannot be distinguished from a real one.
+**H1 complete, 2026-09-25.** The control twin was cloned from the target *after* pinning, so both
+are on the same build by construction rather than by two separate acts of configuration:
+
+```text
+TARGET   DESKTOP-PR0QOQF   VBS=2  Running=2  Secure System present
+CONTROL  LAB-VBSOFF        VBS=0  Running=0  Secure System absent
+```
+
+Both are Generation 2, Secure Boot on with the `MicrosoftWindows` template, vTPM enabled, 2 vCPU,
+4 GB static, nesting off, build **26200.9457** with `securekernel.exe` and `ntoskrnl.exe` both
+**10.0.26100.9457**, and both have `wuauserv` disabled with `NoAutoUpdate=1`. The single difference
+is `VirtualizationBasedSecurityOptOut` on the VM. Each is checkpointed.
+
+**The control's guest OS is still *configured* for HVCI**, reporting `Configured=2` while
+`Running=0`, and that is deliberate. Turning HVCI off inside the control as well would have made
+the twins differ in two ways, and a later failure could then be attributed to either. Leaving the
+guest configuration identical means the only variable is whether the hypervisor grants VBS at all.
+
+**Three procedural notes, each of which cost something to learn.** A clone reports its parent's
+computer name, so the control was renamed before any reading was taken from it — without that,
+`$env:COMPUTERNAME` attribution silently fails in exactly the situation it exists for. A live
+export carries saved state, so the copy had to be cold-booted rather than resumed, since resuming
+would have restored a VTL1 that the opt-out is supposed to prevent. And `Import-VM -GenerateNewId`
+requires `-Copy`, which preserves the source VHDX filename — so the destination must be a folder
+that does not already hold the original's disk, and the copy costs a second full-size allocation
+rather than none.
 
 ## H2 — can the root read the guest's physical memory at all
 
