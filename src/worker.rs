@@ -1693,6 +1693,19 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
 /// over a KD link — so one of them failing is the engine in trouble, not a slow wire. The bias
 /// matches [`crate::server::changes_debug_target`]'s: over-matching costs a caller one re-open,
 /// under-matching lets a handle go on certifying a target it does not name.
+///
+/// What the three actually answer, measured on dbgeng 10.0.26100.1 (ARM64, 2026-09-25) through
+/// dbgscope's `examples/held_target_probe.rs`, which is where each of these fields' limits came
+/// from rather than from reading the API:
+///
+/// | target | kind | dumps | process |
+/// |---|---|---|---|
+/// | a launched process at its first break | class 2, qualifier 0 | `[]` | its pid |
+/// | a loaded kernel dump | class 1, qualifier 1024 | `[<the path>]` | not asked — `E_NOTIMPL` |
+/// | an engine holding nothing | class 0, qualifier 0 | *refused* | `E_UNEXPECTED` |
+///
+/// The last row is why [`watch_the_target`] asks `has_target` first and this is never read there:
+/// `GetNumberDumpFiles` on an engine with no debuggee is an access violation **inside** DbgEng.
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct TargetFingerprint {
     /// `GetDebuggeeType`'s class and qualifier. Separates a live kernel from a kernel dump and a
@@ -1744,11 +1757,11 @@ fn fingerprints_the_process(kind: Option<DebuggeeType>) -> bool {
 /// The reading taken when this worker's target was opened, which every later op is measured
 /// against.
 ///
-/// Set at most once, by [`watch_the_target`], and only for an opener that succeeded. A worker
-/// whose open failed has no baseline and is never watched: there is nothing to compare, and the
-/// one open that can finish *after* it reported failure is a kernel attach, where a later reading
-/// would differ from a baseline taken over an empty engine and retire a session that had just
-/// become usable.
+/// Set at most once, by [`watch_the_target`], and only for an opener that succeeded **and left a
+/// target behind**. A worker with no baseline is never watched: there is nothing to compare, and
+/// the one open that can finish *after* it reported failure is a kernel attach, where a later
+/// reading would differ from a baseline taken over an empty engine and retire a session that had
+/// just become usable.
 static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
 
 /// Takes the baseline after an opener, and after every other op checks that the engine is still
@@ -1774,22 +1787,37 @@ static OPENED_AS: OnceLock<TargetFingerprint> = OnceLock::new();
 fn watch_the_target(e: &DebugEngine, id: u64, opener: bool, teardown: bool, succeeded: bool) {
     // A teardown's whole job is to let the target go, and it is the one op allowed to run after
     // the answer below would have been taken.
-    if teardown {
+    if teardown || (opener && !succeeded) {
+        return;
+    }
+    // **Asked before a fingerprint is read, on both paths, and that ordering is the whole of it.**
+    // Driving DbgEng with no debuggee faults *inside* DbgEng — a structured exception
+    // `catch_unwind` cannot trap, so it takes the worker process down instead of failing the call,
+    // which is why [`refuse_when_the_target_is_gone`] exists and why dbgscope guards its own raw
+    // path. Reading engine queries off an engine whose debuggee has just exited is that, and it
+    // was measured here rather than reasoned about: with the reads ahead of this check, the
+    // debugger tier's two "target ends during a run" tests came back as *the engine worker
+    // process holding session `sess-…` is gone* (ARM64 26100, 2026-09-25) — a launched program
+    // running to completion, killing the session that was watching it.
+    //
+    // So this is a guard and not an optimisation, and [`replacement`] is given the answer anyway
+    // so the *rule* — that a target which has gone is not one that has been replaced — is stated
+    // in one place and testable there.
+    let holds_a_target = e.has_target().ok();
+    if holds_a_target != Some(true) {
         return;
     }
     if opener {
-        if succeeded {
-            // `set` rather than an assignment because a worker is sent exactly one opener; if
-            // that ever stops being true, the *first* target is the one the handles name.
-            let _ = OPENED_AS.set(TargetFingerprint::read(e));
-        }
+        // `set` rather than an assignment because a worker is sent exactly one opener; if
+        // that ever stops being true, the *first* target is the one the handles name.
+        let _ = OPENED_AS.set(TargetFingerprint::read(e));
         return;
     }
     let Some(opened_as) = OPENED_AS.get() else {
         return;
     };
     let now = TargetFingerprint::read(e);
-    let Some(why) = replacement(opened_as, &now, e.has_target().ok()) else {
+    let Some(why) = replacement(opened_as, &now, holds_a_target) else {
         return;
     };
     tracing::warn!(

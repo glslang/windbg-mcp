@@ -4978,6 +4978,19 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
   and is not supposed to. The assertions stay `!` and now say why, with a pointer to the observer
   that makes the gap survivable. A prescription written beside three options can only be right for
   one of them.
+- **Reading the fingerprint is not safe on every engine, and only the tier said so.** The first
+  run of the debugger tier killed the engine worker on the two tests where a launched program runs
+  to completion — *the engine worker process holding session `sess-…` is gone*. `dump_files`'s
+  `GetNumberDumpFiles` on an engine with no debuggee is a `STATUS_ACCESS_VIOLATION` **inside**
+  DbgEng, which `catch_unwind` cannot trap, so it takes the process rather than failing the call;
+  `debuggee_type` in the same state answers `DEBUG_CLASS_UNINITIALIZED` without complaint. Two
+  queries beside each other behaving differently is exactly how they come to be read in one place.
+  `has_target` is now asked before either, and dbgscope guards `dump_files` as well, so the
+  downstream guard is defence in depth rather than the only thing between a caller and a dead
+  process. It is also the reason a probe was committed upstream
+  (`examples/held_target_probe.rs`): every claim this entry makes about what a field answers per
+  target kind is a line of its output rather than a reading of the API.
+
 - **`SessionState::Retired`'s message claimed something that was already untrue.** It told a caller
   "the worker still holds a target, but it is not the one this handle names" — false for `.detach`,
   `q` and `qd`, which are on the by-name list and leave none. It now says only what is true either
