@@ -677,40 +677,86 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
     why a page it could not read has to be counted rather than skipped.** The control's entire
     result is "no Secure Kernel here", and a scan that silently omitted some fraction of its pages
     would produce that reading whether or not one of them held the image.
+
+    **`KDBG` records are searched across the page boundary, images are not, and the asymmetry is
+    structural rather than an oversight.** A PE image is page-aligned, so its `MZ` is always at
+    offset 0 of some page and a per-page test cannot miss one. A debugger data block sits wherever
+    it sits: a page-local search cannot see a tag split across the boundary, and rejects one whose
+    header starts in the page before or whose fields continue into the page after. That is about
+    1.4% of placements silently absent from a negative the control rests on -- and the image-side
+    search has read a contiguous buffer since the first commit for exactly this reason, so the two
+    searches for one needle disagreed. Each page is therefore paired with its physical successor,
+    and a record is attributed to the page its **header** starts in, so no pairing reports it
+    twice. A header at the end of the scanned range with nowhere to continue is counted in
+    `boundary_incomplete` rather than dropped.
     """
+    if page_size != PAGE:
+        # The reads below are PAGE-sized and the pairing assumes a PAGE stride. A capture with a
+        # different chunk granularity is a shape this scanner has never seen; refusing beats
+        # striding wrongly and reporting the result as a clean negative.
+        raise ProbeError(f"memory chunk page size {page_size} is not {PAGE}")
     images, kdbg = [], []
     scanned = 0
     unreadable = 0
+    boundary_incomplete = 0
+
+    def emit(page_gpa, buffer):
+        """Record every `KDBG` whose header starts in this page, decoding into the next."""
+        nonlocal boundary_incomplete
+        at = buffer.find(b"KDBG")
+        while at != -1:
+            header = at - 0x10
+            if 0 <= header < PAGE:
+                if header + 0x20 <= len(buffer):
+                    kdbg.append(
+                        {
+                            "gpa": page_gpa + header,
+                            "size": struct.unpack_from("<I", buffer, header + 0x14)[0],
+                            "kern_base": struct.unpack_from("<Q", buffer, header + 0x18)[0],
+                        }
+                    )
+                else:
+                    boundary_incomplete += 1
+            at = buffer.find(b"KDBG", at + 1)
+
+    def outcome(capped):
+        return {
+            "scanned": scanned,
+            "unreadable": unreadable,
+            "boundary_incomplete": boundary_incomplete,
+            "capped": capped,
+        }
+
     for chunk in chunks:
         base = chunk["start_page"] * page_size
+        pending = None  # (gpa, bytes) of the previous readable page, awaiting its successor
         for page_index in range(chunk["pages"]):
             if scanned >= limit_pages:
-                return images, kdbg, {"scanned": scanned, "unreadable": unreadable, "capped": True}
+                if pending:
+                    emit(*pending)
+                return images, kdbg, outcome(True)
             gpa = base + page_index * page_size
             data, reason = state.read(gpa, PAGE)
             scanned += 1
             if reason:
                 unreadable += 1
+                if pending:
+                    emit(*pending)  # no successor to decode into; take what fits
+                    pending = None
                 continue
             if data[:2] == b"MZ":
                 identity = pe_identity(data)
                 if identity:
                     identity.update({"gpa": gpa, "matches_disk": same_image(identity, disk)})
                     images.append(identity)
-            offset = data.find(b"KDBG")
-            while offset != -1:
-                if offset >= 0x10 and offset + 0x28 <= PAGE:
-                    size = struct.unpack_from("<I", data, offset + 4)[0]
-                    kern_base = struct.unpack_from("<Q", data, offset + 8)[0]
-                    kdbg.append(
-                        {
-                            "gpa": gpa + offset - 0x10,
-                            "size": size,
-                            "kern_base": kern_base,
-                        }
-                    )
-                offset = data.find(b"KDBG", offset + 1)
-    return images, kdbg, {"scanned": scanned, "unreadable": unreadable, "capped": False}
+            if pending and pending[0] + PAGE == gpa:
+                emit(pending[0], pending[1] + data)
+            elif pending:
+                emit(*pending)
+            pending = (gpa, data)
+        if pending:
+            emit(*pending)
+    return images, kdbg, outcome(False)
 
 
 def gather_image(reader, base_va, size_of_image):
