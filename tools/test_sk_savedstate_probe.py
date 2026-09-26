@@ -244,15 +244,136 @@ class VtlSwitch(unittest.TestCase):
         # return one register must not be able to manufacture that reading.
         vtl1 = probe.read_vtl1(FakeVp(failing_register="X64_RegisterEfer"), 0, 0x7D5000)
         self.assertTrue(vtl1["forced"], "the switch succeeded and the report must keep saying so")
-        self.assertIn("query_error", vtl1)
+        self.assertEqual(sorted(vtl1["errors"]), ["efer"])
         self.assertNotIn("force_error", vtl1)
-        self.assertEqual(vtl1["cr3"], 0x1201000, "what was read before the failure is kept")
+        self.assertEqual(vtl1["cr3"], 0x1201000, "the fields that answered are kept")
 
     def test_a_clean_switch_carries_the_comparison_against_vtl0(self):
         vtl1 = probe.read_vtl1(FakeVp(), 0, 0x7D5000)
         self.assertTrue(vtl1["forced"])
         self.assertTrue(vtl1["differs_from_vtl0_cr3"])
-        self.assertNotIn("query_error", vtl1)
+        self.assertNotIn("errors", vtl1)
+
+
+class FailingVp(FakeVp):
+    """A VP where any named query raises, to check one cannot suppress the others."""
+
+    def __init__(self, failing=()):
+        super().__init__()
+        self.failing = set(failing)
+
+    def active_vtl_enabled(self, vp):
+        if "enabled" in self.failing:
+            raise probe.ProbeError("IsActiveVirtualTrustLevelEnabled failed: 0x80004001")
+        return super().active_vtl_enabled(vp)
+
+    def paging_mode(self, vp):
+        if "paging_mode" in self.failing:
+            raise probe.ProbeError("GetPagingMode failed: 0x80004001")
+        return super().paging_mode(vp)
+
+    def register(self, vp, name):
+        if name in self.failing:
+            raise probe.ProbeError(f"GetRegisterValue({name}) failed: 0x80004001")
+        return super().register(vp, name)
+
+
+class DiagnosticsDoNotSuppressTheRoot(unittest.TestCase):
+    def test_an_earlier_failing_query_does_not_cost_the_page_table_root(self):
+        # The CR3 is the run's primary output. A provider that cannot answer an optional
+        # diagnostic must not be able to take it down, which a single try/except did.
+        vtl1 = probe.read_vtl1(
+            FailingVp(failing={"enabled", "paging_mode", "X64_RegisterCr0"}), 0, 0x7D5000
+        )
+        self.assertTrue(vtl1["forced"])
+        self.assertEqual(vtl1["cr3"], 0x1201000)
+        self.assertTrue(vtl1["differs_from_vtl0_cr3"])
+        self.assertEqual(sorted(vtl1["errors"]), ["cr0", "enabled", "paging_mode"])
+        self.assertTrue(probe.walkable(vtl1)[0], "the walk still has what it needs")
+
+    def test_a_failure_is_recorded_per_field_rather_than_as_one_flag(self):
+        record = {}
+        probe.probed(record, "good", lambda: 7)
+        probe.probed(record, "bad", lambda: (_ for _ in ()).throw(probe.ProbeError("nope")))
+        self.assertEqual(record["good"], 7)
+        self.assertNotIn("bad", record)
+        self.assertEqual(record["errors"], {"bad": "nope"})
+
+
+class WalkableGate(unittest.TestCase):
+    def test_a_refused_switch_blocks_the_walk(self):
+        proceed, why = probe.walkable({"forced": False, "force_error": "refused"})
+        self.assertFalse(proceed)
+        self.assertIn("not switched", why)
+
+    def test_a_provider_saying_the_vtl_is_not_enabled_blocks_the_walk(self):
+        proceed, why = probe.walkable({"forced": True, "enabled": False, "cr3": 0x1201000})
+        self.assertFalse(proceed)
+        self.assertIn("not enabled", why)
+
+    def test_an_unreadable_enabled_flag_does_not_block_the_walk(self):
+        # Unknown is not False. The walk's own output is the stronger evidence, and the report
+        # already says the question went unanswered.
+        proceed, why = probe.walkable(
+            {"forced": True, "cr3": 0x1201000, "errors": {"enabled": "0x80004001"}}
+        )
+        self.assertTrue(proceed)
+        self.assertIsNone(why)
+
+    def test_no_root_blocks_the_walk(self):
+        proceed, why = probe.walkable({"forced": True, "enabled": True})
+        self.assertFalse(proceed)
+        self.assertIn("no VTL1 CR3", why)
+
+
+class FakeChunkLib:
+    """Stands in for the provider on `GetGuestPhysicalMemoryChunks` alone."""
+
+    def __init__(self, sizing_hr, sizing_count, chunks=(), fill_hr=0):
+        self.sizing_hr = sizing_hr
+        self.sizing_count = sizing_count
+        self.chunks = chunks
+        self.fill_hr = fill_hr
+
+    def GetGuestPhysicalMemoryChunks(self, _handle, page_size_ref, buffer, count_ref):
+        if buffer is None:
+            count_ref._obj.value = self.sizing_count
+            return self.sizing_hr
+        page_size_ref._obj.value = PAGE
+        for index, (start, pages) in enumerate(self.chunks):
+            buffer[index].StartPageIndex = start
+            buffer[index].PageCount = pages
+        count_ref._obj.value = len(self.chunks)
+        return self.fill_hr
+
+
+class MemoryChunkSizing(unittest.TestCase):
+    @staticmethod
+    def state(lib):
+        state = probe.SavedState.__new__(probe.SavedState)
+        state.lib = lib
+        state.handle = None
+        return state
+
+    def test_the_documented_sizing_failure_is_not_treated_as_a_failure(self):
+        # Measured on this bench: the null-buffer call answers 0x8007000E with the count filled
+        # in. Checking that HRESULT would reject every healthy capture.
+        lib = FakeChunkLib(sizing_hr=-2147024882, sizing_count=2, chunks=((0, 100), (200, 50)))
+        page_size, chunks = self.state(lib).memory_chunks()
+        self.assertEqual(page_size, PAGE)
+        self.assertEqual(chunks, [{"start_page": 0, "pages": 100}, {"start_page": 200, "pages": 50}])
+
+    def test_a_sizing_failure_with_no_count_is_propagated(self):
+        # Otherwise it arrives as memory_pages: 0, and --scan-pages turns a provider failure into
+        # a clean-looking negative on a capture nothing was ever read from.
+        lib = FakeChunkLib(sizing_hr=-2147467259, sizing_count=0)
+        with self.assertRaises(probe.ProbeError):
+            self.state(lib).memory_chunks()
+
+    def test_an_honest_empty_map_is_not_an_error(self):
+        lib = FakeChunkLib(sizing_hr=0, sizing_count=0)
+        page_size, chunks = self.state(lib).memory_chunks()
+        self.assertEqual(chunks, [])
 
 
 class ImageIdentification(unittest.TestCase):

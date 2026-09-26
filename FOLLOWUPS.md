@@ -2070,8 +2070,11 @@ and every number, is the **S0 result** section of
 - **Control, on the VBS-off twin**: the partition reports VTL0 only,
   `ForceActiveVirtualTrustLevel(vp0, 1)` is **refused by name** —
   `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` (`0xC0370509`) — and the same 32768-page physical scan
-  finds **143** PE images against the VBS guest's 101, with **0** `securekernel.exe` and **0**
-  `KDBG` tags. The positive arm is what makes the negative mean anything.
+  finds **more** PE images than the VBS guest — 143 against 101, and 100 against 86 on a second
+  capture of the same boot — with **0** `securekernel.exe` and **0** `KDBG` tags either time.
+  The header counts move because a running guest's memory does; what is stable is 1-against-0
+  matching images and 4-against-0 tags. The positive arm is what makes the negative mean
+  anything.
 - **A third boot broke a landmark this plan believed.** An older capture of the same guest carries
   VTL1 `CR3` `0x107593000`, self-map index 309, 29 present entries and SK based at
   `0xFFFFF8070EDA9000` — while the image-relative offsets and the GPA are unchanged. So the `CR3` is
