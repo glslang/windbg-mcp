@@ -5,8 +5,10 @@ guest's Secure Kernel state well enough to drive a debugger?** It is not a plan 
 Every gate below can fail, each says how, and the stop conditions are written before the work
 starts so that a sunk cost does not decide.
 
-**Answer, as of 2026-09-26: probably yes, but not with the hypercall the plan was built around.**
-The two halves of the route need different mechanisms, and only one of them is documented.
+**Answer, as of 2026-09-26: yes — `securekernel.exe` was located in a VBS guest's VTL1 address
+space from the root partition and identified against the image on disk (18/18 section names,
+timestamp and `SizeOfImage` all matching).** It takes two mechanisms rather than one, and only the
+first is documented.
 
 - **Registers: granted.** H3 passed — `HvCallGetVpRegisters` returns a child's **VTL1** `CR3` to the
   parent, on a documented, parent-callable hypercall.
@@ -21,8 +23,14 @@ The two halves of the route need different mechanisms, and only one of them is d
   its self-map entry — so the register half and the memory half join up, and SK's address space is
   walkable from the root.
 
-Gates H0, H1 and H3 passed; H2 failed with a known cause; H4 is a negative **about the instrument**,
-narrowed by the oracle in the revised section below; H5 was never reached.
+- **Result: `securekernel.exe` at VA `0xFFFFF80220D89000`** in the VBS guest, walked from the root
+  via SK's own page tables, matching the on-disk image on all 18 section names, timestamp and
+  `SizeOfImage`. The identification is independent of the mechanism that produced it.
+
+Gates H0, H1, H3 and H4 passed; H2 failed with a known cause; H5 was never reached. H4's sections
+below are kept in the order they were measured — a negative, then its narrowing by an independent
+oracle, then a correction about the sampling window, then the pass — because how the negative was
+overturned is as much the result as the pass is.
 
 This is a sibling of [`docs/exdi-stub-plan.md`](exdi-stub-plan.md) rather than a replacement. That
 document's route reaches SK through a GDB stub and needs a hypervisor that exposes one; this route
@@ -465,7 +473,7 @@ merely warned about, so results are gathered into locals and assigned afterwards
 
 ## H4 — does what comes back look like Secure Kernel
 
-### H4 result, 2026-09-26: FAIL, cleanly — the hypervisor withholds VTL1 memory from the parent
+### H4 first finding, 2026-09-26: the *hypercall* withholds VTL1 memory — later narrowed, then passed
 
 **The memory half of the route is refused, and the refusal is measured rather than inferred.** A
 parent may read a VBS-enabled child's VTL0 memory freely; the pages VTL1 protects come back as
@@ -686,6 +694,68 @@ contents of the bytes requested. The defect is one level up: **the window was to
 representative, and no control established that it was.** The check that would have caught it is
 the same one that caught everything else here — read something whose shape is known independently,
 in this case a whole page rather than a fixed prefix of one.
+
+### H4 result, 2026-09-26: PASS — Secure Kernel located and identified from the root
+
+**`securekernel.exe` was found in the VBS guest's VTL1 address space, walked from the root
+partition, and positively identified against the image on disk.** This is the pass condition this
+section was written to test, and it is met on the strong form rather than the weak one.
+
+| | in the guest's VTL1 space | `C:\Windows\System32\securekernel.exe` |
+|---|---|---|
+| sections | 18 | 18 |
+| timestamp | `0x94DED27F` | `0x94DED27F` |
+| `SizeOfImage` | `0x175000` | `0x175000` |
+| section names | *(all 18, below)* | **identical** |
+
+```text
+.text KVASCODE TRNS PAGELK fothk ZEROPAGE CACHEALI .rdata .data
+.pdata TABLERO ALMOSTRO MIRRDATA nlsdata FUNCTBL CFGRO .rsrc .reloc
+```
+
+Found at **VA `0xFFFFF80220D89000`**, backed by **GPA `0x00CD0000`** — inside the `0x0C00000`
+withheld run, one of the seven the hypercall refuses. The names carry the identification on their
+own: `KVASCODE`, `TRNS`, `ALMOSTRO`, `MIRRDATA`, `CFGRO` and `FUNCTBL` are Secure Kernel's, and a
+coincidental match on all eighteen plus timestamp plus image size is not a reading anyone has to
+argue about. **The identification is also independent of the mechanism that produced it** — the
+on-disk image was written by neither the hypercall nor the driver — which is the control this plan
+required before believing any of it.
+
+**The route, end to end, as measured.** Two primitives with different permission models, joined at
+a physical address:
+
+1. `HvCallGetVpRegisters`, `TargetVtl = 1` → the guest's **VTL1 `CR3`** (`0x1201000`). Documented,
+   parent-callable, granted (H3).
+2. That GPA holds SK's **PML4** — read whole, not 16 bytes at a time.
+3. A four-level walk over SK's page tables, read by a **non-hypercall** memory route, since
+   `HvCallReadGpa` refuses these pages.
+4. Scan the walked leaves for a PE header; identify it against the on-disk image.
+
+So the hypervisor guards one door and hands over the key to the building through another. **That
+asymmetry is the finding**, and it is what makes the route viable: registers by documented
+hypercall, memory by driver mapping.
+
+**Cost, which decides whether this can drive a debugger.** The walk itself took **167 page reads**:
+11 PDPTs, 24 PDs, 130 PTs, yielding **11,326 leaf pages** in 9,201 contiguous VA runs. Finding the
+image cost more than the walk, because scanning leaves for `MZ` is one read per page. Six PE images
+were found in total; the other five are SK-side modules and are not yet identified.
+
+**Walking a page table is walking a cyclic graph, and the self-map is the cycle.** SK's PML4
+self-maps at index 388, so an unguarded descent re-enters the table at every level — 512× per
+level. The first attempt at this walk grew its leaf list until Python exhausted the machine's
+memory, which starved every other process on the host: `msedge.exe` died with `0xe0000008`, an
+allocation failure, and the bench needed a reboot. Twice. It was **not** a kernel fault, a driver
+leak or a pool exhaustion — the pool and PTE counters were clean throughout — it was an unguarded
+graph walk in a Python script. Three guards fix it and all three are load-bearing: skip any entry
+whose target PFN is the table it came from, keep a visited set per level, and put hard budgets on
+both reads and collected leaves so that exceeding them is *reported* rather than absorbed. With
+them the same walk costs 167 reads.
+
+**What this does to the plan.** H4's pass criteria below ask for SK's `KdDebuggerDataBlock` and
+`SkLoadedModuleList` as the strong form; the image identification is achieved and those two are the
+next step, both now reachable as ordinary reads of a known VA range. H5 — driving DbgEng off it —
+remains untouched, and the EXDI activation problem E0 found is still the blocker there rather than
+anything measured here.
 
 ### H4 pass criteria, as written before the run
 
