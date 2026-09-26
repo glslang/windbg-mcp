@@ -33,14 +33,14 @@ is archived and prepared as a blog post. No host changes, VM reconfiguration or 
 live debugging are authorized by this publication step. The entries below preserve the
 investigation chronologically; their proposed next actions are historical unless reaffirmed.
 
-The public [evidence bundle](samples/secure-kernel-debugger-investigation/README.md) preserves
+The public [evidence bundle](../samples/secure-kernel-debugger-investigation/README.md) preserves
 selected offline disassembly and exact-image identities without raw credentials or binaries.
 
 ## Initial status, 2026-09-14: Phase 1 on-disk gate passed, lab pending
 
 Measured on 2026-09-14. WinDbg was upgraded with the exact-version command below; winget verified
 the installer hash and reported a successful install. The new x64 engine was bundled into both
-`target/release` and `target/debug`, following [engine setup](install.md#bundling-the-windbg-engine).
+`target/release` and `target/debug`, following [engine setup](../install.md#bundling-the-windbg-engine).
 The six top-level DLL signatures were valid before copying. The preflight compared `dbgeng.dll`
 to the installed payload by SHA-256 and found an exact match in the release directory.
 
@@ -1560,7 +1560,7 @@ The engine-side plumbing is two changes, both in existing shapes:
   than permissive; a new `Endpoint` variant carrying the stub’s host and port is still the
   fix, for coexistence rather than for safety. The first reading of this was taken from the
   variant’s name without opening `conflicts`, which is the failure
-  [`measurement-provenance.md`](../.claude/rules/measurement-provenance.md) opens with.
+  [`measurement-provenance.md`](../../.claude/rules/measurement-provenance.md) opens with.
 
 Neither code change has been made, and no EXDI component was installed or registered. **An
 attach was attempted on 2026-09-22 and it reset this workspace** — see
@@ -1597,7 +1597,7 @@ go away.
 #### Evidence
 
 Published: `secure-call-dispatch-29648.1000.txt` in the
-[evidence bundle](samples/secure-kernel-debugger-investigation/README.md), recorded under
+[evidence bundle](../samples/secure-kernel-debugger-investigation/README.md), recorded under
 `supplementary` in `images.json`. The six pre-existing `evidence_sha256` values were re-verified
 before that file was added and all still match, so the earlier excerpts are unchanged.
 

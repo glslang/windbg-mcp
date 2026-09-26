@@ -3360,7 +3360,7 @@ analysis/comparison acceptance remain unvalidated; the older-version fallback st
 - **What would close it:** verify an upstream version decodes `df2203d5` as CLRBHB and provides
   instruction text, then check the affected function analysis and comparison output. Keep the
   fallback for older supported versions unless their support is explicitly dropped.
-- **Where it picks up:** [diagnosis and retained graph evidence](docs/securekernel-export-followup.md).
+- **Where it picks up:** [diagnosis and retained graph evidence](docs/secure-kernel/securekernel-export-followup.md).
   Check upstream decoder status before proposing or removing a workaround.
 
 **Closure — 2026-09-15:** the user chose a companion-maintained native replacement

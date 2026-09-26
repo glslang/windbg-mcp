@@ -218,7 +218,7 @@ The owned debugger session and tunnel were closed, and BN exited normally.
 This closes the generic Personal handoff acceptance; it does not establish a live
 securekernel/CVE handoff.
 
-The [2026-09-11 securekernel exporter follow-up](securekernel-export-followup.md)
+The [2026-09-11 securekernel exporter follow-up](secure-kernel/securekernel-export-followup.md)
 identified BN's unsupported `CLRBHB` instruction as the cause of the eight omitted
 functions per side. A narrowly scoped export fallback preserves those instructions
 without changing BN analysis or weakening import guards. The real recapture passed:

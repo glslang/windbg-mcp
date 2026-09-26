@@ -44,6 +44,10 @@ Operator and reference material: [remote listener](docs/remote-listener.md),
 [smoke test](docs/smoke-test.md), [token budget](docs/token-budget.md),
 [releasing](docs/releasing.md).
 
+Research, not shipped features: [Secure Kernel (VTL1)](docs/secure-kernel/README.md) — whether a
+debugger can reach a VBS guest's Secure Kernel, recorded gate by gate with the controls and the
+dead ends.
+
 ## Quick start
 
 Windows x64, with `dbgeng.dll` from `System32` — enough for live user-mode, kernel and crash-dump

@@ -321,7 +321,7 @@ This phase is a **gate**. It needs no VM and should be finished before any lab w
 
 1. Install WinDbg 1.2606.22001.0 or newer.
 2. Re-bundle the engine DLLs beside the server executable, following "Bundling the WinDbg engine" in
-   [install.md](install.md). A connected MCP session holds those DLLs open through its workers, so
+   [install.md](../install.md). A connected MCP session holds those DLLs open through its workers, so
    replacing them needs the same rename-then-reconnect sequence that `CLAUDE.md` documents for the
    executable itself. Confirm the new `dbgeng.dll` file version afterwards.
 3. Run `kdnet.exe -?` from the new package and record the actual `-s` syntax verbatim, along with
@@ -428,7 +428,7 @@ bench-state table is the historical 2026-09-13 measurement, not the current depe
 
 Try the existing `attach_kernel` tool first, naming the target through a **connection profile**.
 Profiles are the machine-local mechanism: the key is resolved on this host and never appears in the
-request. See [kernel-profiles.md](kernel-profiles.md).
+request. See [kernel-profiles.md](../kernel-profiles.md).
 
 - `attach_kernel` in `src/server.rs` takes `ConnectionArgs` in the same file, whose
   `connection` and `profile` fields are mutually exclusive, enforced at runtime by `kdconn::select`
@@ -518,12 +518,12 @@ Each of these has an existing form in this repo. Follow it rather than inventing
   gate so an ordinary live-kernel run never assumes the target is installed. Follow that shape, reuse
   the `with_live_kernel_session` helper, and name the new gate here once chosen.
 - **Version-pinned setup runbook.** The pattern is `.claude/skills/live-kernel/SKILL.md` for KDNET
-  wiring and symbol placement, plus [install.md](install.md) and [kernel-profiles.md](kernel-profiles.md),
-  with operating prose added to [smoke-test.md](smoke-test.md) beside the live-kernel section.
+  wiring and symbol placement, plus [install.md](../install.md) and [kernel-profiles.md](../kernel-profiles.md),
+  with operating prose added to [smoke-test.md](../smoke-test.md) beside the live-kernel section.
 - **Redacted validation transcript.** Record with `WINDBG_MCP_TRANSCRIPT` and render with
   `--render-cast`, committing the reviewed `.cast` as `docs/flareauthenticator.cast` does. The raw
   `.jsonl` is gitignored and is as sensitive as the machine it came from, so it is never the
-  committed artifact. See [transcripts.md](transcripts.md).
+  committed artifact. See [transcripts.md](../transcripts.md).
 - **Capability matrix.** Which tools are meaningful against a VTL1 target, and which silently answer
   for VTL0 instead. This is the finding most likely to affect users, and it belongs in the
   deliverables rather than in a footnote.
