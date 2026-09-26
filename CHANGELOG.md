@@ -208,7 +208,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   noticing. Inputs are resolved in one step that runs first and does nothing else. Codex added
   the register-level half of the paging gate: `GetPagingMode` is the provider's reading, and
   when `CR0.PG`/`PE`, `CR4.PAE` or `EFER.LMA` disagree with it the registers win, since a
-  four-level walk of tables that are not four-level yields leaves rather than an error. No Rust and no MCP
+  four-level walk of tables that are not four-level yields leaves rather than an error.
+  **A fifteenth round found the worst defect of the set, and it was in the output path rather
+  than anything the provider does**: `--json` naming one of the capture files truncated that
+  saved state and wrote the report over it, destroying it -- under a module docstring whose
+  first paragraph says nothing here writes to the capture. The output is now compared against
+  every input before the analysis begins, by `samefile` where both exist and by the normcased
+  absolute path where the output does not yet, and the docstring records that the sentence was
+  once false. Beside it, a missing `--vmrs` or a stale path from `LocateSavedStateFiles` raised
+  `FileNotFoundError` from `stat()` rather than a refusal -- the sibling of the `--image` case
+  fixed the round before, which should have been found by enumerating the inputs then. And
+  `complete` on the walk no longer reads as exhaustive: alias pruning is deliberate and happens
+  on every capture, so rather than a flag that is never true, the walk states what it excludes
+  with the count in the sentence. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
