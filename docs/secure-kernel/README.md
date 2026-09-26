@@ -23,29 +23,46 @@ pages against **0** in a VBS-off control — but it belongs to that one hypercal
 parameter to ask with. A memory route that is not that hypercall reads the same pages. So the
 hypervisor guards one door and hands over the key to the building through another.
 
-Measured on the bench, 2026-09-26. The **Repeated** column is not decoration: only two of these
-were re-measured after a host reset, and the rest are single-boot observations that should not be
-read as reboot-stable.
+**And a third route needs no door at all.** A **Hyper-V saved state** — an ordinary standard
+checkpoint, written by the host — carries the guest's VTL1 pages *and* its VTL1 `CR3`, readable
+through Microsoft's own `vmsavedstatedumpprovider.dll` from the Windows SDK. No driver, no
+test-signing, no hypercall, and the file can be copied off the host and read anywhere: everything
+in the table below reproduces from one. That decides *who* can do this work rather than whether it
+can be done, since the live driver route remains the only way to read a guest **as it runs**.
+
+Measured on the bench, 2026-09-26. The **Repeated** column is not decoration, and it is where this
+table was wrong once: a landmark seen twice is not thereby stable.
 
 | landmark | value | repeated across a reboot |
 |---|---|---|
-| VTL1 `CR3` (guest physical) | `0x1201000` | **yes** — identical |
+| VTL1 `CR3` (guest physical) | `0x1201000` | **no** — identical on two boots, `0x107593000` on a third |
 | pages the hypercall withholds | 18 MiB in 7 runs, every run 2 MiB-aligned | **yes** — same runs, same 4608 pages, control still 0 |
-| `securekernel.exe` base | `0xFFFFF80220D89000` (GPA `0x00CD0000`) | no — measured once |
-| `KdDebuggerDataBlock` | `securekernel.exe` **+0x1335E0**, `Size` = `0x3A0` | no — measured once |
-| `SkLoadedModuleList` | `securekernel.exe` **+0x127770** | no — measured once |
-| VTL1 modules | `securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`, `vmsvc.dll`, `vmsvcext.sys` | no — measured once |
+| `securekernel.exe` GPA | `0x00CD0000` | **yes** — two boots |
+| `securekernel.exe` base VA | `0xFFFFF80220D89000` | **no** — `0xFFFFF8070EDA9000` on another boot |
+| `KdDebuggerDataBlock` | `securekernel.exe` **+0x1335E0**, `Size` = `0x3A0` | **yes** — two boots |
+| `SkLoadedModuleList` | `securekernel.exe` **+0x127770** | **yes** — two boots |
+| VTL1 modules | `securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`, `vmsvc.dll`, `vmsvcext.sys` | **yes** — same six, same sizes |
 
 The two image-relative **offsets** are properties of the build rather than of the boot, so they are
-the coordinates to carry forward; the VAs beside them depend on the load base.
+the coordinates to carry forward; the VAs beside them depend on the load base, and **the `CR3` has
+to be read, never remembered** — the third boot above is what a hard-coded `0x1201000` would have
+walked from.
 
-**What is still open:** turning those reads into tools (gate H5), which is not started. Its route is
-decided, though, and the decision is the opposite of where this work began. Driving a live Secure
-Kernel target through **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does
-not work on this bench and is unresolved, and — measured separately — DbgEng's Secure Kernel record
-is unreachable, so even a working EXDI would supply a generic memory target rather than any SK
-awareness. Since the reads now exist, that is a trade with nothing on one side. What it costs is
-DbgEng's symbol handling, most of which is recoverable against the *image* without a live target.
+**What is still open:** turning those reads into tools (gate H5), which is scoped as `FOLLOWUPS.md`
+item 103 and has begun — its first gate, S0, is answered above, and what remains is the decode
+layer, symbols against the image, and the tool surface itself. Its route is decided, and the
+decision is the opposite of where this work began. Driving a live Secure Kernel target through
+**DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
+and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even
+a working EXDI would supply a generic memory target rather than any SK awareness. Since the reads
+now exist, that is a trade with nothing on one side. What it costs is DbgEng's symbol handling, most
+of which is recoverable against the *image* without a live target.
+
+**Two things are open beneath that.** Whether VTL1 *execution* can be controlled at all is
+unresolved and decides inspector versus debugger: the hypervisor's VTL1 debug port is up and Secure
+Kernel does not connect to it. And whether VTL1 can be *written* is settled per route —
+`HvCallWriteGpa` refuses it symmetrically with the read, the direct driver route accepts it — so the
+patch half of a software breakpoint exists and the catch half does not.
 
 ## The documents
 
@@ -56,7 +73,7 @@ Read them in this order; each assumes the one before it.
 | 1 | [Secure Kernel debugging plan](secure-kernel-debugging-plan.md) | The original plan: validate software-only SK debugging, then integrate whichever route works. Carries the handoff status and the `Kd=` option set read out of `dbgeng.dll` — six kernel-discovery modes, of which `Kd=VerAddr:<addr>` is the one a Secure Kernel bind would use. |
 | 2 | [Secure Kernel debugging validation](secure-kernel-debugging-validation.md) | The measurement record behind everything else. NT and hypervisor debugging pass; **native SK attachment does not**. Why post-26100 `securekernel.exe` ships no KD transport, and what `SkdInitDebuggerDataBlock` does instead. The longest document here and the one to cite. |
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
-| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5 is not started, but its route is decided: **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness. |
+| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, and **S0**, which finds a driver-free source that carries VTL1 and its page-table root. |
 
 Two older side-investigations, kept because they are about the same binary:
 
@@ -101,8 +118,8 @@ happily. Running the identical scan in both guests settles it — 1 SK image and
 VBS guest, **0 and 0** in the VBS-off one, which yields *more* PE headers overall (152 against 112)
 and so is not simply failing to read.
 
-Reproducing gate 3 onward needs a bench that is **deliberately weakened**, and the instruments live
-outside this repository on purpose:
+Reproducing the **live** route from gate 3 onward needs a bench that is **deliberately
+weakened**, and the instruments live outside this repository on purpose:
 
 - **Test-signing on, Secure Boot off, HVCI off.** A driver that reads another partition's memory is
   not something Microsoft will sign.
@@ -113,3 +130,10 @@ outside this repository on purpose:
 None of that is a configuration to leave running. The feasibility document's stop conditions and
 its record of which Code Integrity policy actually blocks what are part of the result, not
 housekeeping.
+
+**The saved-state route needs none of it**, which is what S0 was run to find out: Hyper-V
+administrator on the host, a standard checkpoint, and the Windows SDK's
+`vmsavedstatedumpprovider.dll`. Nothing is signed, nothing is loaded, and the capture is a file
+that can be read on another machine. The probe that does it is checked in as
+[`tools/sk_savedstate_probe.py`](../../tools/sk_savedstate_probe.py) — the one instrument from
+this investigation that can be, because it needs no driver to go with it.
