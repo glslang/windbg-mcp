@@ -952,18 +952,65 @@ another hat, so the return value got its own control:
 
 It refuses unmapped memory and accepts VTL1, so `True` discriminates rather than rubber-stamping.
 
-**What is established, and what is not.** Established: the direct route *accepts* a write to a
-VTL1-protected page that the hypercall refuses, and refuses one to memory that cannot be written.
-**Not** established: that the bytes land. Only a write of **differing** bytes can show that, and
-that is the destructive test this gate excluded by design — on a Secure Kernel image page it is
-also precisely what SKPG exists to notice. The gap is recorded rather than closed, because closing
-it is a decision about risking the guest rather than a measurement anyone can take for free.
+**What this first pass established, and the gap it left.** Established: the direct route *accepts*
+a write to a VTL1-protected page that the hypercall refuses, and refuses one to memory that cannot
+be written. **Not** established at that point: that the bytes land — every write so far having
+written bytes that were already there, which makes "unchanged afterwards" the expected outcome of
+both a real write and a silent no-op. Only a write of **differing** bytes shows it, and the first
+pass excluded that deliberately rather than reach for it on a Secure Kernel image page.
 
-**For the route, the practical consequence does not depend on that gap.** Reading VTL1 needs the
-direct route, writing VTL1 is refused outright by the hypercall, and a software breakpoint is a
-memory patch — so `int 3` in VTL1 is not available through hypercalls at all, and through the
-direct route it is unproven. Breakpoints still need S5's transport question answered regardless of
-how the remaining gap closes.
+**That gap was then closed, with a target chosen so the risk was small rather than accepted** —
+see the completion below. The short version: it lands.
+
+**S4 completed, 2026-09-26: VTL1 is writable from the root by the direct route.** The gap left
+above — that "accepts a write" is not "the bytes land" — is closed, by writing **differing** bytes
+and reading them back.
+
+| test | route | result |
+|---|---|---|
+| ordinary scratch page, differing bytes | hypercall | **lands** — pattern read back, and read back *identically through the direct route* |
+| ordinary scratch page, differing bytes | direct | **lands** — pattern read back, and read back identically through the hypercall |
+| VTL1 (`securekernel.exe` `.text` padding) | hypercall | **refused**, `AccessResult = 3 WriteIntercept`, page unchanged |
+| VTL1 (same address) | **direct** | **LANDS** — `deadbeef…` written and read back, then restored |
+
+**The mechanism check came first and it mattered.** Every VTL1 write before this one wrote bytes
+that were already there, so neither route had been shown to write *anything* — the hypercall's
+`AccessResult = Success` on VTL0 was as unproven as the direct route's `True`. A scratch page —
+4096 bytes of zero, stable across two reads, outside every withheld run and every image — settled
+both, and incidentally showed the two routes addressing the same memory: each read back the other's
+pattern.
+
+**The VTL1 target was alignment padding inside Secure Kernel's own code.** Compilers pad between
+functions with `0xCC`, which is never executed and never read. The cave was located in the
+**on-disk** `securekernel.exe` first — a run of at least 96 `0xCC` bytes in `.text`, written to at
+its centre — so what belonged there was known independently, the in-memory pre-state could be
+checked against it before writing, and the restore was exact rather than remembered. VA
+`0xFFFFF80220E79280`, GPA `0x00DC0280`, restored and verified.
+
+**Step 3 is a control worth keeping:** the hypercall was attempted on *that* address too and
+refused there as well, so `WriteIntercept` is a per-page property and not an artefact of the
+earlier PE-header target.
+
+**What the guest surviving does and does not show.** It ran on, uptime advancing, with no bugcheck.
+That is **not** evidence that SKPG/HyperGuard does not checksum SK's code — the modification existed
+for milliseconds between two reads, and a periodic integrity check has no particular reason to fall
+inside that window. A *persistent* modification is an entirely different experiment and this says
+nothing about it.
+
+**The consequence for the route.** A software breakpoint is a memory patch, and the patch half is
+now solved: an `int 3` can be planted in Secure Kernel by the direct route. What is missing is the
+other half — **catching the trap** — which is exactly S5, and which nothing here advances. The
+asymmetry is now complete and symmetrical in an unexpected way:
+
+| | hypercall | direct route |
+|---|---|---|
+| VTL0 read | yes | yes |
+| VTL0 write | yes | yes |
+| **VTL1 read** | **ReadIntercept** | yes |
+| **VTL1 write** | **WriteIntercept** | **yes** |
+
+The hypervisor refuses the parent both directions on VTL1 through its own interface, and the
+root's direct mapping of the guest's memory is subject to neither refusal.
 
 ### H4 pass criteria, as written before the run
 
@@ -1094,11 +1141,12 @@ worth stating here, because both were overstatements in the direction of closing
 - **Whether VTL1 can be *written* was measured as S4 on 2026-09-26, and the answer is per route.**
   `HvCallWriteGpa` (`0x0054`) writes VTL0 from the parent and is **refused on VTL1 with
   `AccessResult = 3 WriteIntercept`** — symmetric with the read, and predicted from the ABI before
-  it was run. The direct route **accepts** a VTL1 write while refusing an unmapped one; whether the
-  bytes land is unproven, since only a differing-bytes write shows that and S4 excluded it by
-  design. So **a software breakpoint is unavailable through hypercalls outright**, and through the
-  direct route it is unproven — and breakpoints need S5's transport answered in any case, since
-  planting an `int 3` nobody can catch bugchecks the guest. The full result is under H4 above.
+  it was run. **The direct route writes VTL1** — differing bytes landed in `securekernel.exe`'s
+  `.text` alignment padding and read back, then were restored and verified, with the guest running
+  on. So VTL1 is **fully read/write from the root** by that route and refused in both directions by
+  the hypercall. For a debugger that means the **patch** half of a software breakpoint is solved —
+  an `int 3` can be planted — and the **catch** half is not, which is S5. Planting one before S5 is
+  answered bugchecks the guest. The full result is under H4 above.
 
 ## Explicitly out of scope
 

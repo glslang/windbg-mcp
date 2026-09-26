@@ -2039,9 +2039,11 @@ overstated the first two into blockers and got the third wrong.**
   (`HV_ACCESS_GPA_RESULT_CODE` defines `HvAccessGpaWriteIntercept` (3) beside the `ReadIntercept`
   (2) H4 measured), and the ABI was right. **`HvCallWriteGpa` writes VTL0 and is refused on VTL1
   with `WriteIntercept`** — symmetric with the read, and with `HV_STATUS` reading `SUCCESS` on the
-  refusal, so a refused write looks like one that landed. **The direct route accepts a VTL1 write**
-  while refusing an unmapped one, so its return value discriminates; whether the bytes land is
-  unproven and needs a differing-bytes write, which S4 excluded by design.
+  refusal, so a refused write looks like one that landed. **The direct route writes VTL1** —
+  differing bytes landed in `securekernel.exe`'s `.text` padding and read back, then restored. So
+  VTL1 is fully read/write from the root by that route and refused both directions by the
+  hypercall, and the **patch** half of a software breakpoint is solved while the **catch** half
+  (S5) is not.
 
 ### S0 — the gate that decides how much setup a user needs. Do it first
 
@@ -2115,13 +2117,16 @@ assumption that there is none.
 
 ### S4 — settle the write routes — **RUN 2026-09-26, mostly settled**
 
-**Result in the feasibility record.** The hypercall refuses VTL1 writes symmetrically with the read
-(`AccessResult = 3 WriteIntercept`), writes VTL0 fine, and honours the address field — so
-`HvCallWriteGpa` cannot patch VTL1 and a software breakpoint is not available through hypercalls at
-all. The direct route **accepts** a VTL1 write while **refusing** an unmapped one, so its return
-value discriminates; what remains open is whether the bytes land, which only a **differing-bytes**
-write can show and which this gate excluded by design. That residue is a decision about risking the
-guest, not a measurement. The original specification follows.
+**Result in the feasibility record. Settled, both routes.** `HvCallWriteGpa` writes VTL0, honours
+the address field, and is **refused on VTL1 with `AccessResult = 3 WriteIntercept`** — per-page,
+confirmed on two different pages — so a software breakpoint is unavailable through hypercalls
+outright. The **direct route writes VTL1**: differing bytes (`deadbeef…`) were written into
+`securekernel.exe`'s `.text` alignment padding and read back, then restored to `0xCC` and verified,
+with the guest running on. The mechanism was proven first on an ordinary scratch page, since until
+then *neither* route had been shown to write anything — every prior write wrote bytes already
+there. **So the patch half of a software breakpoint is solved and the catch half is not**: planting
+an `int 3` in Secure Kernel is now a question of S5's transport, not of the write. The original
+specification follows.
 
 #### S4 as specified — settle the write routes, with a test that changes nothing
 
