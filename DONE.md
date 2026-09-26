@@ -5173,6 +5173,17 @@ Three things about the shape of it are worth keeping.
   restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
   now, and the rendering has a line for a block where nought of the steps failed and the rollback
   is still not complete.
+- **And a moved selection is not a replacement, which the first version of that said it was.** A
+  report keys the caller's next move off the difference: a replaced target retires this session's
+  handle through the post-op fingerprint check, while a moved selection leaves it good — so
+  reporting the second as the first told a caller their session was finished when it was not.
+  `BatchTarget::moved` answers `Held::Replaced` or `Held::Uncertain` rather than a sentence, the
+  outcome and the session state follow it, and `Held::Uncertain` is now *"cannot certify, and the
+  session is not going away"* rather than *"the engine would not say"* — two causes under one
+  answer, with the sentence saying which. Raised by Codex, along with the seal that was still a
+  loop away from the detection that needed it, and two model-facing promises this had missed: the
+  `always` field's own description, which is served in the input schema, and the shipped plugin
+  skill, both still saying cleanup runs on every path.
 - **Two more from the same review, both about what "the same target" means to a *writer*.** The
   identity probe was the one call into the host outside `guarded`, so a panic in any of its four
   engine queries would have unwound past the `always` block and the seal — the rollback loss

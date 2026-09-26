@@ -828,23 +828,33 @@ pub enum Held {
     Same,
     /// It is holding something else, and the sentence names what kind of change it was.
     Replaced(String),
-    /// It would not say, so nothing may be concluded about what it holds.
+    /// It cannot be certified as the same one — **and the session is not going away**, which is
+    /// the whole of what separates this from [`Self::Replaced`].
+    ///
+    /// Two causes, and the sentence says which. The engine may refuse to say what it is holding,
+    /// where nothing at all may be concluded. Or it may be holding the same target *pointed
+    /// somewhere else*: a session with two user-mode processes whose current one moved is still
+    /// debugging exactly what it was, and a write now lands in the other address space
+    /// (`worker::BatchTarget`).
     ///
     /// **Stops the batch and withholds the cleanup exactly as [`Self::Replaced`] does**, and the
     /// reason is that the two costs are not symmetric. Running cleanup here risks aiming a
-    /// restore at a target nothing has identified; withholding it leaves the mutation in place on
-    /// a target that is very likely still the right one — but *that* is reported, in the
+    /// restore at something nothing has identified; withholding it leaves the mutation in place
+    /// on a target that is very likely still the right one — but *that* is reported, in the
     /// `always` block and in the outcome, while a misdirected write is silent and irreversible.
-    /// And an engine that cannot answer `GetExecutionStatus` — an engine-local call that never
-    /// goes over the wire — is an engine in trouble, so the cleanup it would have run was
-    /// unlikely to land anyway: the same argument that makes this rare makes withholding cheap.
     ///
-    /// The *handle* half of this mechanism decides the other way on the same reading
-    /// (`worker::replacement`: an engine that will not answer is not evidence of a replacement,
-    /// so no session is retired on it), and that is deliberate rather than an inconsistency to
-    /// tidy: a wrong retirement costs a caller one re-open, and a wrong restore costs whatever
-    /// that address means in somebody else's target. Same predicate, different price.
-    Unknown(String),
+    /// **What it must not do is claim a replacement**, and that is not a nicety: the worker
+    /// retires a session's handle from the *fingerprint*, which neither of these two causes
+    /// moves — so a report saying "replaced, this handle is retired" would be describing a
+    /// retirement that is not going to happen. Raised by Codex on
+    /// [#392](https://github.com/glslang/windbg-mcp/pull/392) against exactly that.
+    ///
+    /// The *handle* half of this mechanism ignores both readings
+    /// (`worker::replacement_now`: neither is evidence of a replacement, so no session is retired
+    /// on one), and that is deliberate rather than an inconsistency to tidy: a wrong retirement
+    /// costs a caller one re-open, and a wrong restore costs whatever that address means
+    /// somewhere else. Same predicate, different price.
+    Uncertain(String),
 }
 
 /// Why a batch is closing itself to breaks — [`Debuggee::sealing`]'s argument.
@@ -923,7 +933,7 @@ pub trait Debuggee {
     /// [`Held::Same`] for a target that has **gone**, which is terminal and is carried by the
     /// step itself ([`Ran::target_gone`]): an engine holding nothing refuses every cleanup step,
     /// so that path can still attempt one. An engine that will **not say** is
-    /// [`Held::Unknown`] and is not the same answer, for the reason
+    /// [`Held::Uncertain`] and is not the same answer, for the reason
     /// [`crate::batch::run`] acts on rather than states — see that variant. Engine-local
     /// bookkeeping either way, not a trip over the wire, which is what makes it affordable after
     /// every step.
@@ -1014,7 +1024,7 @@ fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     })
 }
 
-/// [`Debuggee::replaced`] with a panic turned into [`Held::Unknown`].
+/// [`Debuggee::replaced`] with a panic turned into [`Held::Uncertain`].
 ///
 /// **Every other call into the host on this path goes through [`guarded`], and this one has to for
 /// the same reason and one more.** Several dbgscope methods use `.expect`, and this asks four
@@ -1027,7 +1037,7 @@ fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
 /// an identity probe that crashed has told us nothing about what the engine holds, which is
 /// exactly what that variant is for.
 fn held(d: &mut impl Debuggee) -> Held {
-    guarded(|| Ok(d.replaced())).unwrap_or_else(Held::Unknown)
+    guarded(|| Ok(d.replaced())).unwrap_or_else(Held::Uncertain)
 }
 
 // ---- results --------------------------------------------------------------
@@ -1162,15 +1172,15 @@ pub enum BatchOutcome {
     /// [`BatchReport::rollback`] says `NotAttempted` rather than `Incomplete` for the same
     /// reason: nothing was undone, and nothing here tried to.
     TargetReplaced { at: usize },
-    /// After the step at `at` the engine **stopped saying** what it is holding, so the batch can
-    /// no longer certify that its target is the one its steps ran against. The steps after it
-    /// were not attempted and neither was the rollback.
+    /// After the step at `at` the batch could **no longer certify** that the debugger is holding
+    /// the target its steps ran against — it would not say, or it is pointed at a different
+    /// process of the same session. The steps after it were not attempted and neither was the
+    /// rollback.
     ///
-    /// Distinct from [`Self::TargetReplaced`] because the report may not claim what it does not
-    /// know, and because the next move differs: a replaced target is gone for this session and
-    /// the original is still out there patched, while this session may simply be wedged and its
-    /// target may be exactly where it was. See [`Held::Unknown`] for why the cleanup is dropped
-    /// on a reading this weak.
+    /// Distinct from [`Self::TargetReplaced`] because nothing identified a second target, and
+    /// because the next move differs: a replaced target is gone for this session and its handle
+    /// is retired, while here the session is very likely still exactly what it was — which is
+    /// also why this must not be reported as the other. See [`Held::Uncertain`].
     TargetUncertain { at: usize },
 }
 
@@ -1304,7 +1314,7 @@ impl BatchReport {
 #[derive(Debug, Clone)]
 pub struct Unverified {
     /// Whether the host **identified** a different target. `false` is the engine declining to
-    /// answer, where nothing may be concluded — see [`Held::Unknown`]. Both withhold the cleanup;
+    /// answer, where nothing may be concluded — see [`Held::Uncertain`]. Both withhold the cleanup;
     /// they differ in what may be reported and in what the caller does next.
     pub identified: bool,
     /// Whether it was first seen while the **`always` block** was running, which is what stops
@@ -1474,12 +1484,20 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         // for a target that has gone — so the order of these two branches is presentation.
         let held = held(d);
         let identified = matches!(held, Held::Replaced(_));
-        if let Held::Replaced(why) | Held::Unknown(why) = held {
+        if let Held::Replaced(why) | Held::Uncertain(why) = held {
             // Outranks every other reading of this step, and for a reason none of them share:
             // the others leave a batch whose remaining work is *pointless*, this one leaves a
             // batch whose remaining work is *harmful*. A step that failed or was cut short still
             // ran against the target the caller meant; everything after this would not — and a
             // target nothing can identify is the same problem with less to say about it.
+            // **Sealed here rather than after the loop**, which is where the seal below would
+            // have got to it — after every remaining step had been rendered as skipped. That is
+            // in-process work, so the window is short, and it is a window all the same: the
+            // worker's latch is not published until the op ends, so an `interrupt` arriving in it
+            // reaches `SetInterrupt` and whatever the engine is holding. Raised by Codex on
+            // [#392](https://github.com/glslang/windbg-mcp/pull/392), twice — the first time
+            // against a path that was never sealed at all.
+            d.sealing(Sealed::TargetLost);
             unverified = Some(Unverified {
                 identified,
                 during_cleanup: false,
@@ -1540,18 +1558,15 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     // refuses interrupts from this point and clears any already pending
     // (`worker::BatchEngine::rolling_back`).
     //
-    // **On every path, with the reason as an argument** — deliberately not an `if`, which is what
-    // this was for one review round and which left the one path that needs it most unsealed. A
-    // batch that has lost its target sends nothing more, so there is no restore for a break to
-    // cut short; what a break would reach instead is the engine, through `SetInterrupt`, which
-    // acts on whatever it is holding now. The worker's own latch is not set until this op *ends*,
-    // so between here and there the seal is the only thing standing between an `interrupt` and
-    // somebody else's target. What it costs is a pending break drained without being reported, on
-    // a batch already reporting something worse.
-    d.sealing(match &unverified {
-        Some(_) => Sealed::TargetLost,
-        None => Sealed::Rollback,
-    });
+    // **The rollback's own seal, and the only path that still needs one here**: a batch that lost
+    // its target sealed at the moment it found out, above, which is earlier than this by every
+    // remaining step. Re-sealing would say the same thing again and drain a second time, so the
+    // condition is *having already sealed* rather than a reason to skip it — the version that
+    // skipped it outright left that path unsealed for the whole of the report, which is what
+    // Codex found on [#392](https://github.com/glslang/windbg-mcp/pull/392).
+    if unverified.is_none() {
+        d.sealing(Sealed::Rollback);
+    }
     let mut always: Vec<StepOutcome> = Vec::with_capacity(op.always.len());
     for (index, step) in op.always.iter().enumerate() {
         let position = index + 1;
@@ -1572,12 +1587,12 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
                         seen.why
                     ),
                     false => format!(
-                        "the debugger stopped saying what target it holds while this batch was \
-                         running, so its cleanup was not attempted: {}. A restore that cannot be \
-                         aimed at the target the steps ran against is worse than one that is \
-                         missing, and this is the missing one: nothing was undone. Whatever the \
-                         steps above changed is very likely still in place on a target that is \
-                         very likely still there.",
+                        "nothing could certify that the debugger is still holding the target this \
+                         batch's steps ran against, so its cleanup was not attempted: {}. A \
+                         restore that cannot be aimed at the target the steps ran against is \
+                         worse than one that is missing, and this is the missing one: nothing was \
+                         undone. Whatever the steps above changed is very likely still in place \
+                         on a target that is very likely still there.",
                         seen.why
                     ),
                 },
@@ -1603,7 +1618,10 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         // ran.
         let held = held(d);
         let identified = matches!(held, Held::Replaced(_));
-        if let Held::Replaced(why) | Held::Unknown(why) = held {
+        if let Held::Replaced(why) | Held::Uncertain(why) = held {
+            // The same seal, for the same reason, one block later: from here the batch sends
+            // nothing more, and a break would reach the engine rather than this job.
+            d.sealing(Sealed::TargetLost);
             unverified = Some(Unverified {
                 identified,
                 during_cleanup: true,
@@ -1623,11 +1641,13 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             by: seen.by.clone(),
         },
         // Not probed either, and here the probe is the thing that cannot be trusted rather than
-        // its subject: an engine that has stopped saying what it holds is not one to ask where
-        // it is stopped. Reported as not knowing, which is what this variant is for.
+        // its subject: an engine that cannot be certified is not one to ask where it is stopped,
+        // and `? @$ip` would answer from wherever it is now pointed. Reported as not knowing,
+        // which is what this variant is for — and **not** as detached, because nothing on this
+        // path retires this session's handle.
         Some(seen) => SessionAfter::Uncertain {
             why: format!(
-                "the debugger stopped saying what target it holds while {} was running: {}",
+                "the batch could no longer certify its target while {} was running: {}",
                 seen.by, seen.why
             ),
         },
@@ -2202,16 +2222,16 @@ pub fn render(report: &BatchReport) -> String {
             )
         ),
         BatchOutcome::TargetUncertain { at } => format!(
-            "BATCH: TARGET UNCERTAIN at step {at} of {total} — after that step the debugger \
-             stopped saying what target it is holding, so nothing can certify that it is still \
-             the one the steps ran against, and the steps after it were not attempted{}. {} This \
-             is a reading the batch did not get rather than a target it lost: the session may \
-             simply be wedged, and what the steps changed is very likely still in place on a \
-             target that is very likely still there. Read `mutations` above for what that is, and \
-             ask what this session holds before deciding whether to put it back from here or from \
-             a new one.\n",
+            "BATCH: TARGET UNCERTAIN at step {at} of {total} — after that step nothing could \
+             certify that the debugger is still holding the target the steps ran against, so the \
+             steps after it were not attempted{}. {} Nothing identified a *second* target, which \
+             is what separates this from TARGET REPLACED: this session's handle is not being \
+             retired, and what the steps changed is very likely still in place on a target that \
+             is very likely still there. Read `mutations` above for what that is, and ask what \
+             this session holds before deciding whether to put it back from here or from a new \
+             one.\n",
             withheld(report),
-            why_unverified(report, "The debugger would not answer what it is holding.")
+            why_unverified(report, "Nothing said what the debugger is holding now.")
         ),
     };
 
@@ -2661,7 +2681,7 @@ mod tests {
             // `has_target` that will not answer is read before any fingerprint, so an engine
             // that has stopped saying cannot also be reporting a replacement.
             if self.silent {
-                return Held::Unknown(SILENT.to_string());
+                return Held::Uncertain(SILENT.to_string());
             }
             // `Same` once the target has gone, which is the rule the real host follows
             // (`worker::replacement`): a target that is not there has not been replaced.
@@ -3114,25 +3134,35 @@ mod tests {
             "and the job is sealed for that reason rather than for a rollback it will not run"
         );
         assert!(
-            matches!(&report.after, SessionAfter::Uncertain { why } if why.contains("stopped saying")),
-            "the session state reports not knowing rather than guessing: {:?}",
+            matches!(&report.after, SessionAfter::Uncertain { why }
+                if why.contains("could no longer certify") && why.contains("would not say")),
+            "the session state reports not knowing rather than guessing, and carries the host's \
+             own reason: {:?}",
             report.after
         );
         assert!(
             report.always[0]
                 .result
                 .detail()
-                .is_some_and(|why| why.contains("stopped saying")),
-            "and the withheld cleanup says which of the two reasons it was: {:?}",
+                .is_some_and(|why| why.contains("would not say")),
+            "and the withheld cleanup carries which of the reasons it was: {:?}",
             report.always[0]
         );
 
         let text = render(&report);
         assert!(text.contains("TARGET UNCERTAIN at step 2"), "{text}");
         assert!(text.contains("rollback: NOT ATTEMPTED"), "{text}");
+        // The headline names the other outcome to say what this one is *not*, so the check is on
+        // the verdict rather than on the word — and on the one claim that would be false: nothing
+        // here retires the session's handle, because the fingerprint did not move.
+        let headline = text.lines().next().unwrap_or_default();
         assert!(
-            !text.contains("TARGET REPLACED"),
-            "nothing may claim a replacement here: {text}"
+            !headline.starts_with("BATCH: TARGET REPLACED"),
+            "nothing may claim a replacement here: {headline}"
+        );
+        assert!(
+            !text.contains("DETACHED/REPLACED") && text.contains("handle is not being retired"),
+            "and the report must not say this session is finished when it is not: {text}"
         );
     }
 
