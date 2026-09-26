@@ -336,6 +336,66 @@ class FailedReadsAreCounted(unittest.TestCase):
         self.assertEqual(scan["unreadable"], 1, "a refused page is not a page with no header")
         self.assertFalse(scan["capped"])
 
+    def test_a_kdbg_record_split_across_a_page_boundary_is_found(self):
+        # A PE image is page-aligned so its MZ never straddles; a debugger data block sits
+        # wherever it sits, and the control's negative is over both.
+        joined = bytearray(b"\x00" * (2 * PAGE))
+        joined[PAGE - 2 : PAGE + 2] = b"KDBG"  # the tag itself is split across the boundary
+        header = PAGE - 2 - 0x10
+        struct.pack_into("<I", joined, header + 0x14, 0x3A0)
+        struct.pack_into("<Q", joined, header + 0x18, BASE_VA)
+        source = FakeSource({0x0: bytes(joined[:PAGE]), PAGE: bytes(joined[PAGE:])})
+        _images, kdbg, scan = probe.scan_physical_for_images(
+            source, [{"start_page": 0, "pages": 2}], PAGE, {"sections": 1}, 10
+        )
+        self.assertEqual([hit["gpa"] for hit in kdbg], [header])
+        self.assertEqual(kdbg[0]["size"], 0x3A0)
+        self.assertEqual(kdbg[0]["kern_base"], BASE_VA)
+        self.assertEqual(scan["boundary_incomplete"], 0)
+
+    def test_a_record_whose_fields_continue_into_the_next_page_is_decoded(self):
+        first = bytearray(b"\x00" * PAGE)
+        second = bytearray(b"\x00" * PAGE)
+        at = PAGE - 0x14  # tag near the end: size and kern_base land in the next page
+        first[at : at + 4] = b"KDBG"
+        joined = bytearray(first + second)
+        struct.pack_into("<I", joined, at - 0x10 + 0x14, 0x3A0)
+        struct.pack_into("<Q", joined, at - 0x10 + 0x18, BASE_VA)
+        source = FakeSource({0x0: bytes(joined[:PAGE]), PAGE: bytes(joined[PAGE:])})
+        _images, kdbg, _scan = probe.scan_physical_for_images(
+            source, [{"start_page": 0, "pages": 2}], PAGE, {"sections": 1}, 10
+        )
+        self.assertEqual(len(kdbg), 1)
+        self.assertEqual(kdbg[0]["size"], 0x3A0)
+        self.assertEqual(kdbg[0]["kern_base"], BASE_VA)
+
+    def test_a_record_is_reported_once_and_not_by_both_pairings(self):
+        page = bytearray(b"\x00" * PAGE)
+        page[0x100 : 0x100 + 4] = b"KDBG"
+        struct.pack_into("<I", page, 0xF0 + 0x14, 0x3A0)
+        pages = {0: b"\x00" * PAGE, PAGE: bytes(page), 2 * PAGE: b"\x00" * PAGE}
+        source = FakeSource(pages)
+        _images, kdbg, _scan = probe.scan_physical_for_images(
+            source, [{"start_page": 0, "pages": 3}], PAGE, {"sections": 1}, 10
+        )
+        self.assertEqual([hit["gpa"] for hit in kdbg], [PAGE + 0xF0])
+
+    def test_a_record_with_nowhere_to_continue_is_counted_not_dropped(self):
+        page = bytearray(b"\x00" * PAGE)
+        page[PAGE - 8 : PAGE - 4] = b"KDBG"  # header at PAGE-0x18: its fields run off the end
+        source = FakeSource({0: bytes(page)})
+        _images, kdbg, scan = probe.scan_physical_for_images(
+            source, [{"start_page": 0, "pages": 1}], PAGE, {"sections": 1}, 10
+        )
+        self.assertEqual(kdbg, [])
+        self.assertEqual(scan["boundary_incomplete"], 1, "the end of the range, not an absence")
+
+    def test_an_unexpected_chunk_granularity_is_refused(self):
+        with self.assertRaises(probe.ProbeError):
+            probe.scan_physical_for_images(
+                FakeSource({}), [{"start_page": 0, "pages": 1}], 0x2000, {"sections": 1}, 10
+            )
+
     def test_an_unreadable_physical_page_is_counted_by_the_control_scan(self):
         pages = {0x0: b"\x00" * PAGE, 0x2000: b"\x00" * PAGE}
         source = FakeSource(pages, unreadable=[0x1000])

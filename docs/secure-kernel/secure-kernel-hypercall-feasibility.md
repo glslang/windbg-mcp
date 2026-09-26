@@ -1356,6 +1356,17 @@ scan, so the control found no Secure Kernel in 32,768 pages it actually read. A 
 had quietly skipped some fraction of them would have produced the same zero, and until this
 round nothing in the output could tell the two apart.
 
+**The `KDBG` half of that scan searches across page boundaries, and doing so found a tag that had
+been invisible.** A PE image is page-aligned, so a per-page test for `MZ` cannot miss one; a
+debugger data block sits at an arbitrary offset, and a page-local search cannot see a tag split
+across the boundary or decode one whose fields continue into the next page — about 1.4% of
+placements, silently absent from a negative the control rests on. Pairing each page with its
+physical successor turned up a **fifth** tag on the 2026-09-25 capture, at GPA `0x39E3F90`, which
+is another coincidental byte sequence with a junk `KernBase` rather than a block. The 2026-09-26
+capture still has exactly four, and the control still has **none** — so nothing in the table above
+moves, and the reason it does not is now something that was checked rather than something the
+search was incapable of noticing.
+
 **The refusal is named, not silent.** `0xC0370509` is
 `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` — the provider ships a typed error for exactly this
 condition, and the probe keeps it apart from a *query* that fails after a switch that worked. That

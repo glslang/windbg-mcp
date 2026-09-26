@@ -124,7 +124,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   tags and refused all four reported none -- and threw away the `confirmed`/`rejected_by`
   annotations that are the only thing distinguishing a coincidental tag from a stale module
   list. The tags now travel inside each candidate's attempt record, one home whether or not a
-  candidate was accepted. No Rust and no MCP
+  candidate was accepted. **A seventh round found the `KDBG` half of the control scan searching
+  page by page**, so a tag split across a 4 KiB boundary was invisible and one whose fields
+  continued into the next page was rejected -- roughly 1.4% of placements, absent from a
+  negative the control rests on, while the image-side search had read a contiguous buffer since
+  the first commit. Pairing each page with its physical successor, and attributing a record to
+  the page its header starts in so no pairing reports it twice, turned up a **fifth** tag on the
+  2026-09-25 capture that no previous run could see -- another coincidental byte sequence, so
+  the conclusion is unchanged and the control still finds none, but it is now a negative the
+  search was capable of falsifying. A header at the end of the scanned range is counted in
+  `boundary_incomplete` rather than dropped, and a chunk granularity other than 4 KiB is
+  refused rather than strided over. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
