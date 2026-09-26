@@ -525,6 +525,20 @@ class FailedReadsAreCounted(unittest.TestCase):
         self.assertTrue(stats["complete"])
         self.assertNotIn("incomplete_reason", stats)
 
+    def test_complete_does_not_claim_every_virtual_address(self):
+        # Alias pruning is deliberate and happens on every real capture, so making `complete`
+        # false for it would leave a flag that is never true. The exclusion is stated instead,
+        # and the count rides in the sentence so a reader cannot take `complete` for exhaustive.
+        source = four_level_tree()
+        source.pages[ROOT] = table(
+            {SELF_MAP_INDEX: entry(ROOT), UPPER_INDEX: entry(0x2000), UPPER_INDEX + 1: entry(0x2000)}
+        )
+        _leaves, stats = probe.walk(source, ROOT)
+        self.assertTrue(stats["complete"], "nothing went wrong")
+        self.assertEqual(stats["alias_prefixes_skipped"], 1)
+        self.assertIn("1 alias prefix", stats["limitation"])
+        self.assertIn("not every virtual address", stats["limitation"])
+
     def test_an_exhausted_budget_also_answers_complete(self):
         with unittest.mock.patch.object(probe, "MAX_TABLE_READS", 2):
             _leaves, stats = probe.walk(four_level_tree(), ROOT)
@@ -1141,6 +1155,83 @@ class InputsAreResolvedFirst(unittest.TestCase):
             not_an_image.write_bytes(b"\xAA" * 0x2000)
             with self.assertRaises(probe.ProbeError):
                 probe.resolve_inputs(root, "v", str(not_an_image))
+
+
+class OutputMustNotDestroyAnInput(unittest.TestCase):
+    """`--json <the .vmrs>` truncated the capture and wrote the report over it."""
+
+    def test_an_output_naming_a_capture_is_refused(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = pathlib.Path(directory, "guest.vmrs")
+            capture.write_bytes(b"a capture")
+            with self.assertRaises(probe.ProbeError) as raised:
+                probe.check_output_is_not_an_input(str(capture), [("capture", capture)])
+            self.assertIn("would overwrite", str(raised.exception))
+            self.assertEqual(capture.read_bytes(), b"a capture", "and it is still there")
+
+    def test_the_same_file_by_another_spelling_is_still_refused(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = pathlib.Path(directory, "guest.vmrs")
+            capture.write_bytes(b"a capture")
+            for spelling in (
+                str(capture).upper(),
+                str(capture).replace("\\", "/"),
+                str(pathlib.Path(directory, ".", "guest.vmrs")),
+            ):
+                with self.subTest(spelling=spelling):
+                    with self.assertRaises(probe.ProbeError):
+                        probe.check_output_is_not_an_input(spelling, [("capture", capture)])
+
+    def test_spellings_are_compared_when_the_output_does_not_exist_yet(self):
+        # The real case: `--json` names a file that is not there yet, so `samefile` -- which needs
+        # both ends -- cannot answer, and the normcased absolute comparison is the whole guard.
+        # The tests above pass through `samefile` because both their paths exist, so they say
+        # nothing about this; a mutation reducing it to string equality left them green.
+        import os
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = pathlib.Path(directory, "report.json")
+            self.assertFalse(missing.exists())
+            self.assertTrue(probe.same_path(str(missing), str(missing)))
+            self.assertTrue(
+                probe.same_path(str(missing), str(pathlib.Path(directory, ".", "report.json")))
+            )
+            if os.path.normcase("A") == "a":  # only where the filesystem folds case
+                self.assertTrue(probe.same_path(str(missing), str(missing).upper()))
+            self.assertFalse(
+                probe.same_path(str(missing), str(pathlib.Path(directory, "other.json")))
+            )
+
+    def test_an_ordinary_output_path_is_allowed(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            capture = pathlib.Path(directory, "guest.vmrs")
+            capture.write_bytes(b"a capture")
+            probe.check_output_is_not_an_input(
+                str(pathlib.Path(directory, "report.json")), [("capture", capture)]
+            )
+            probe.check_output_is_not_an_input(None, [("capture", capture)])
+
+    def test_a_missing_capture_is_a_refusal_rather_than_a_traceback(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(probe.ProbeError) as raised:
+                probe.require_readable_files(
+                    [pathlib.Path(directory, "gone.vmrs")], "capture file"
+                )
+            self.assertIn("missing capture file", str(raised.exception))
 
 
 class CaptureSelection(unittest.TestCase):

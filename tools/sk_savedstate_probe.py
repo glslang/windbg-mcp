@@ -16,7 +16,10 @@ supply one -- a remembered `CR3` from a live run is the failure this gate exists
 the two captures it was first run against had different ones.
 
 Nothing here writes to the guest or to the capture. `--apply-replay-log` is the one exception and
-is off by default; it opens the file read-write, so point it at a throwaway checkpoint.
+is off by default; it opens the file read-write, so point it at a throwaway checkpoint. **That
+sentence was once false for a reason that had nothing to do with the provider**: `--json` naming a
+capture truncated it and wrote the report over it, so the output path is now checked against every
+input before the analysis starts.
 
 **What a failed provider call does, enumerated once rather than decided per call site.** Three
 review rounds each found another place where a *failure* could arrive looking like an *answer* --
@@ -599,6 +602,14 @@ def walk(state, root_gpa):
         )
     else:
         stats["complete"] = True
+    # `complete` is about whether anything went *wrong*. Pruning aliases is deliberate and happens
+    # on every real capture -- 6,773 prefixes on one of the measured ones -- so making it false
+    # would leave a flag that is never true and says nothing. The exclusion is stated instead, the
+    # way the physical scan states the split it cannot join.
+    stats["limitation"] = (
+        f"expands one prefix per (table, level); {stats['alias_prefixes_skipped']} alias "
+        "prefix(es) were not expanded, so this is not every virtual address that maps these pages"
+    )
     return leaves, stats
 
 
@@ -1057,6 +1068,48 @@ def resolve_inputs(kit_root, kit_version, image_path):
     return dll, header, image_on_disk(image_path)
 
 
+def same_path(left, right):
+    """Whether two paths name one file, for a target that may not exist yet.
+
+    `samefile` is exact and needs both to exist, which the report's output does not; the normcased
+    absolute form catches the ordinary cases on a filesystem whose paths are case-insensitive.
+    """
+    try:
+        if Path(left).exists() and Path(right).exists():
+            return os.path.samefile(left, right)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(left)) == os.path.normcase(os.path.abspath(right))
+
+
+def check_output_is_not_an_input(output, inputs):
+    """Refuse an output path that names one of this run's inputs.
+
+    **`--json <the .vmrs>` truncated the capture and wrote the report over it.** The module
+    docstring says nothing here writes to the guest or to the capture; that was true of every
+    provider call and false of the report, and a destroyed saved state is not recoverable from the
+    JSON that replaced it. Checked before the analysis rather than after, so the refusal costs a
+    second instead of a minute -- and so it happens before `--apply-replay-log` can touch anything.
+    """
+    if not output:
+        return
+    for label, candidate in inputs:
+        if candidate and same_path(output, candidate):
+            raise ProbeError(f"--json would overwrite the {label}: {candidate}")
+
+
+def require_readable_files(files, label):
+    """Turn a missing or unreadable input into a refusal rather than a traceback.
+
+    `Path.stat()` raises `FileNotFoundError`, which the top-level handler does not catch, so a
+    mistyped `--vmrs` or a stale path out of `LocateSavedStateFiles` printed a traceback instead of
+    the `refused:` line -- and did it after the provider had been constructed.
+    """
+    for path in files:
+        if not Path(path).is_file():
+            raise ProbeError(f"missing {label}: {path}")
+
+
 def describe_file(path):
     """Path, size and mtime of one capture file, read at the moment it is called."""
     stat = path.stat()
@@ -1320,6 +1373,13 @@ def main(argv=None):
         report["vm"] = {"name": None, "snapshot": None, "located": {"vmrs": args.vmrs}}
 
     files = [Path(path) for path in paths]
+    require_readable_files(files, "capture file")
+    # Before the analysis, and before --apply-replay-log can rewrite anything: an output path that
+    # names an input destroys it, and this tool's one documented mutation is not meant to be that.
+    check_output_is_not_an_input(
+        args.json,
+        [("capture", path) for path in files] + [("on-disk image", args.image)],
+    )
     if args.apply_replay_log and form != "vmrs":
         raise ProbeError("a replay log belongs to a .vmrs; this capture is a .bin/.vsv pair")
     report["capture"] = capture_provenance(
