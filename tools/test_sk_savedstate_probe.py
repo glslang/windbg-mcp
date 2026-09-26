@@ -390,6 +390,36 @@ class FailedReadsAreCounted(unittest.TestCase):
         self.assertEqual(kdbg, [])
         self.assertEqual(scan["boundary_incomplete"], 1, "the end of the range, not an absence")
 
+    def test_the_scan_states_the_split_it_cannot_join(self):
+        # A reader who sees `kdbg_tags: 0` is reading a negative and is owed its bound. Joining
+        # frames that are virtually adjacent and physically apart needs page tables, which is the
+        # one thing this route is defined as not having.
+        _images, _kdbg, scan = probe.scan_physical_for_images(
+            FakeSource({0: b"\x00" * PAGE}), [{"start_page": 0, "pages": 1}], PAGE, {"sections": 1}, 10
+        )
+        self.assertIn("physically adjacent", scan["limitation"])
+        self.assertIn("not detectable", scan["limitation"])
+
+    def test_a_record_split_across_non_adjacent_frames_is_missed_and_the_limit_says_so(self):
+        # Pinning the *known* hole rather than implying there is none: two chunks that are not
+        # physically contiguous, with a record straddling them.
+        first = bytearray(b"\x00" * PAGE)
+        second = bytearray(b"\x00" * PAGE)
+        first[PAGE - 2 :] = b"KD"
+        second[0:2] = b"BG"
+        source = FakeSource({0x0: bytes(first), 0x9000: bytes(second)})
+        _images, kdbg, scan = probe.scan_physical_for_images(
+            source,
+            [{"start_page": 0, "pages": 1}, {"start_page": 9, "pages": 1}],
+            PAGE,
+            {"sections": 1},
+            10,
+        )
+        self.assertEqual(kdbg, [], "the split record is beyond a physical scan")
+        self.assertEqual(scan["unreadable"], 0)
+        self.assertEqual(scan["boundary_incomplete"], 0)
+        self.assertTrue(scan["limitation"], "so the zero has to carry its bound")
+
     def test_an_unexpected_chunk_granularity_is_refused(self):
         with self.assertRaises(probe.ProbeError):
             probe.scan_physical_for_images(

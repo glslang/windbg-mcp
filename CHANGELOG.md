@@ -150,7 +150,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   VTL1 modules would trigger it unaided. The finding's own second option is taken instead: a
   separate `complete`, with `incomplete_reason` naming which of the four ways it stopped --
   unreadable entry, entry limit, null forward link, or a walk that left the list. The declined
-  remedy is pinned as a mutation, so applying it fails three tests. No Rust and no MCP
+  remedy is pinned as a mutation, so applying it fails three tests. **A tenth round asked the
+  physical scan to follow page tables, and that is declined on what the scan is**: it is the
+  route defined as needing no `CR3`, which is why the VBS-off control -- whose VTL1 is refused
+  outright, so there is no mapping to follow even in principle -- can run it at all, and making
+  it virtual would delete the independence that makes it a cross-check of the walk rather than a
+  second reading of it. The finding's second option is taken: the scan states in a `limitation`
+  field, beside its counts, that it joins physically adjacent frames only. The exposure was then
+  measured rather than left as a worry -- `securekernel.exe` spans 373 pages with **one**
+  physical discontinuity, and the debugger data block sits at page 307 offset `0x5E0`, inside a
+  frame with an adjacent successor -- and the image-side search, which reads by VA through the
+  translator, has no such blind spot and is the authoritative one. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

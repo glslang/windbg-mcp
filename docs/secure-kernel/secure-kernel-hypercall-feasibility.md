@@ -1367,6 +1367,19 @@ capture still has exactly four, and the control still has **none** — so nothin
 moves, and the reason it does not is now something that was checked rather than something the
 search was incapable of noticing.
 
+**What the physical scan still cannot see is stated rather than fixed, and its size was
+measured.** Two pages adjacent in *virtual* memory can sit in frames that are not adjacent, and
+a record split across them cannot be joined without page tables — which is the one thing this
+route is defined as not having, and which the VBS-off control does not possess at all. Making
+the physical scan virtual would delete the independence that makes it a cross-check of the walk
+rather than a second reading of it, so the scan carries the limit in a `limitation` field beside
+its counts. The exposure on this build: `securekernel.exe` spans **373 pages with one physical
+discontinuity**, in runs of 304 and 69, and the debugger data block sits at page 307 offset
+`0x5E0` — inside a frame rather than across one, with an adjacent successor. The image-side
+search reads by VA through the translator and has no such blind spot; it is the authoritative
+one, and the control's own result rests first on `GetGuestEnabledVirtualTrustLevels` answering
+`0b1` and the VTL1 switch being refused by name, with the scan as corroboration.
+
 **The refusal is named, not silent.** `0xC0370509` is
 `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` — the provider ships a typed error for exactly this
 condition, and the probe keeps it apart from a *query* that fails after a switch that worked. That
