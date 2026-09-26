@@ -429,7 +429,14 @@ pieces a read-side backend needs, each taking a VTL:
   performs the VTL1 GVA-to-GPA translation, which removes the need to reimplement SK's swizzled
   page-table walk and so retires the PTE swizzle bit `SkdInitDebuggerDataBlock` records as a
   problem to solve.
-- **`HvCallReadGpa`/`HvCallWriteGpa`** — the bytes themselves.
+- **`HvCallReadGpa`/`HvCallWriteGpa`** — the bytes themselves, **for VTL0 memory only**. Measured
+  2026-09-26: `HvCallReadGpa` (`0x0053`) reads a VBS guest's ordinary pages from the parent, and is
+  what this plan's own H2 fallback used — but it **refuses the VTL1-protected pages**, which are the
+  ones this backend exists to read. It refuses them as `HV_STATUS_SUCCESS` with a per-access
+  `HvAccessGpaReadIntercept` and zeros, and it has no VTL parameter to ask with, so this is not a
+  privilege to be found. A read-side backend therefore needs a **second, non-hypercall memory
+  route** for VTL1; the register and translation bullets above are unaffected. See
+  [the feasibility record](secure-kernel-hypercall-feasibility.md).
 
 `HvRegisterVsmVpStatus`, `HvRegisterVsmPartitionStatus` and `HvRegisterVsmCapabilities` answer
 whether VTL1 is enabled on a given VP before any of that is attempted.

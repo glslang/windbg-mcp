@@ -23,16 +23,21 @@ pages against **0** in a VBS-off control — but it belongs to that one hypercal
 parameter to ask with. A memory route that is not that hypercall reads the same pages. So the
 hypervisor guards one door and hands over the key to the building through another.
 
-Measured on the bench, 2026-09-26, and **confirmed identical across a reboot**:
+Measured on the bench, 2026-09-26. The **Repeated** column is not decoration: only two of these
+were re-measured after a host reset, and the rest are single-boot observations that should not be
+read as reboot-stable.
 
-| landmark | value |
-|---|---|
-| VTL1 `CR3` (guest physical) | `0x1201000` — stable across boots |
-| `securekernel.exe` base | `0xFFFFF80220D89000` (GPA `0x00CD0000`) |
-| `KdDebuggerDataBlock` | `securekernel.exe` **+0x1335E0**, `Size` = `0x3A0` |
-| `SkLoadedModuleList` | `securekernel.exe` **+0x127770** |
-| VTL1 modules | `securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`, `vmsvc.dll`, `vmsvcext.sys` |
-| pages the hypercall withholds | 18 MiB in 7 runs, every run 2 MiB-aligned |
+| landmark | value | repeated across a reboot |
+|---|---|---|
+| VTL1 `CR3` (guest physical) | `0x1201000` | **yes** — identical |
+| pages the hypercall withholds | 18 MiB in 7 runs, every run 2 MiB-aligned | **yes** — same runs, same 4608 pages, control still 0 |
+| `securekernel.exe` base | `0xFFFFF80220D89000` (GPA `0x00CD0000`) | no — measured once |
+| `KdDebuggerDataBlock` | `securekernel.exe` **+0x1335E0**, `Size` = `0x3A0` | no — measured once |
+| `SkLoadedModuleList` | `securekernel.exe` **+0x127770** | no — measured once |
+| VTL1 modules | `securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`, `vmsvc.dll`, `vmsvcext.sys` | no — measured once |
+
+The two image-relative **offsets** are properties of the build rather than of the boot, so they are
+the coordinates to carry forward; the VAs beside them depend on the load base.
 
 **What is still open:** driving DbgEng off it. That is gated on the EXDI activation problem, not on
 anything about reaching Secure Kernel.
@@ -46,7 +51,7 @@ Read them in this order; each assumes the one before it.
 | 1 | [Secure Kernel debugging plan](secure-kernel-debugging-plan.md) | The original plan: validate software-only SK debugging, then integrate whichever route works. Carries the handoff status and the `Kd=` option set read out of `dbgeng.dll` — six kernel-discovery modes, of which `Kd=VerAddr:<addr>` is the one a Secure Kernel bind would use. |
 | 2 | [Secure Kernel debugging validation](secure-kernel-debugging-validation.md) | The measurement record behind everything else. NT and hypervisor debugging pass; **native SK attachment does not**. Why post-26100 `securekernel.exe` ships no KD transport, and what `SkdInitDebuggerDataBlock` does instead. The longest document here and the one to cite. |
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
-| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0, H1, H3 and H4 pass; H2 fails with a known cause; H5 is unreached. |
+| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass; H5 is unreached. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. |
 
 Two older side-investigations, kept because they are about the same binary:
 

@@ -191,9 +191,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control, every protected run 2 MiB-aligned. Call codes were confirmed from `winhvr.sys`'s own
   wrappers on the bench build rather than from a header, which also showed `0x0054` to be
   `WriteGpa`: in this ABI read/write pairs are **adjacent** call codes, so an off-by-one mutates
-  where it meant to inspect. H0, H1, H3 and H4 pass; H2 fails with a known cause — the blocking Code
-  Integrity policy is not the one it looks like — and H5 is unreached, gated on EXDI activation
-  rather than on anything about reaching Secure Kernel. The six VTL1 documents now live under
+  where it meant to inspect. H0 to H4 pass and H5 is unreached, gated on EXDI activation rather
+  than on anything about reaching Secure Kernel. **H2 passes on its second mechanism**: its cheap
+  driver-free probe failed — and the Code Integrity policy that blocked it is not the one it looks
+  like, which matters because acting on the obvious guess means disabling a protection that was not
+  in the way — while the minimal root-partition driver it named as its own fallback reads a child
+  partition's physical memory and carries every GPA measurement in H3 and H4. The six VTL1
+  documents now live under
   [`docs/secure-kernel/`](docs/secure-kernel/README.md) with an index.
 
 ## [0.20.0] - 2026-09-24
