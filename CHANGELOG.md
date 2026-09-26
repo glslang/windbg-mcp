@@ -134,7 +134,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the conclusion is unchanged and the control still finds none, but it is now a negative the
   search was capable of falsifying. A header at the end of the scanned range is counted in
   `boundary_incomplete` rather than dropped, and a chunk granularity other than 4 KiB is
-  refused rather than strided over. No Rust and no MCP
+  refused rather than strided over. **An eighth round found the last of that class**, exposed by
+  the sixth's own change: `walk_module_list`'s unreadable-head exit reported under `error` while
+  the caller reads `invalid_reason`, so a hit rejected for an unreadable list was retained with
+  `rejected_by: null` -- a rejection indistinguishable from an unexplained one, in the field
+  added two rounds earlier to explain rejections. Every exit now states `valid` and every
+  failing one its reason in one field, across all four ways it can fail: unreadable head, empty
+  list, unreadable first entry (which previously fell through to a confusing `DllBase 0x0`
+  message), and a first `DllBase` that is not the identified base. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
