@@ -18,18 +18,19 @@
 //!   the `always` block before it starts, so "the steps ran out of time" and "the rollback ran out
 //!   of time" are different events. The supervisor sizes that budget from the caller's remaining
 //!   patience (`worker::batch_budget`) so the report lands *before* the tool call gives up.
-//! * **`always` is reached on every path but one.** Success, a debugger error, an assertion that
-//!   did not hold, an expired deadline, a panic out of the debugger — all of them fall through to
-//!   the same block, cleanup continues past its own failures, and a failure inside it is recorded
-//!   beside the original rather than replacing it. What the reserve buys is *time to run*, not a
-//!   guarantee: a step that overruns far enough to consume the reserve too leaves cleanup with no
-//!   budget, so the block is skipped and the report says the rollback is incomplete. What it is
-//!   deliberately **not** reached on is a batch that can no longer say what the engine is holding
-//!   ([`Debuggee::replaced`]) — replaced under it, or an engine that stopped answering: a restore
-//!   that cannot be aimed at the target the steps ran against is worse than one that is missing,
-//!   so losing the cleanup is the safe direction there and running it is not. Stated as the rule
-//!   rather than as its causes, because the causes are two and were one for a review round. Every
-//!   edge here is pinned by a test rather than left to be discovered.
+//! * **`always` is reached on every path it can be aimed at.** Success, a debugger error, an
+//!   assertion that did not hold, an expired deadline, a panic out of the debugger — all of them
+//!   fall through to the same block, cleanup continues past its own failures, and a failure inside
+//!   it is recorded beside the original rather than replacing it. What the reserve buys is *time
+//!   to run*, not a guarantee: a step that overruns far enough to consume the reserve too leaves
+//!   cleanup with no budget, so the block is skipped and the report says the rollback is
+//!   incomplete. What it is deliberately **not** reached on is a batch that can no longer certify
+//!   what the engine is holding ([`Debuggee::replaced`]) — replaced under it, an engine that
+//!   stopped answering, or a session left pointed at another process: a restore that cannot be
+//!   aimed at the target the steps ran against is worse than one that is missing, so losing the
+//!   cleanup is the safe direction there and running it is not. Stated as the rule rather than as
+//!   its causes, because the causes have been one, then two, then three over as many review
+//!   rounds. Every edge here is pinned by a test rather than left to be discovered.
 //! * **The executor never touches DbgEng.** It drives a [`Debuggee`], which the worker implements
 //!   over a real engine and the tests implement over a script. Assertion failure, a command failure
 //!   after a mutation, deadline expiry and a rollback that itself fails are therefore all testable
@@ -1336,8 +1337,9 @@ pub struct Unverified {
 ///
 /// Never returns early and never propagates: every path — including an expired deadline — falls
 /// through to the state probe, because the report is the product here and a half-written one is
-/// the failure mode this tool exists to remove. The `always` block is reached on every path but
-/// one, [`BatchOutcome::TargetReplaced`], where it is dropped on purpose.
+/// the failure mode this tool exists to remove. The `always` block is reached on every path it
+/// can be *aimed* at; where nothing can certify the target any more it is dropped on purpose —
+/// [`BatchOutcome::TargetReplaced`] and [`BatchOutcome::TargetUncertain`].
 pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport {
     // Reserved before a single step runs. Taken from what is left afterwards it would routinely
     // be nothing, which is exactly the case the rollback is for.
@@ -1538,7 +1540,24 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         steps.push(done);
     }
 
-    // The rollback block, on every path but a replaced target. Its own deadline is the *whole*
+    // **A break that landed after the last step's action** — during the identity probe, or in the
+    // gap before this line — stopped nothing: every step ran. It is reported all the same, because
+    // the worker tells the caller their result was cut short when it releases the job, and a
+    // verdict of `committed` printed beside that sentence is a report disagreeing with its own
+    // reply. Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392), against a
+    // window this change widened: the probe is engine calls, and `Ran::interrupted` was sampled
+    // before them.
+    //
+    // Only asked when nothing else has already decided the outcome — every other verdict here
+    // outranks a break that stopped nothing, and each of them was reached by a step rather than
+    // by a clock.
+    if outcome == BatchOutcome::Committed && d.interrupted() {
+        outcome = BatchOutcome::Interrupted {
+            at: steps.len().max(1),
+        };
+    }
+
+    // The rollback block, on every path it can be aimed at. Its own deadline is the *whole*
     // budget, which is what the reserve above bought it — and that holds when the batch is
     // abandoned too, rather than the rollback being cut short to fit a teardown's grace. The grace
     // is sized from this budget instead (`worker::BatchSignal::abandon`), so shortening the block
@@ -2211,9 +2230,10 @@ pub fn render(report: &BatchReport) -> String {
         BatchOutcome::Interrupted { at } => format!(
             "BATCH: INTERRUPTED at step {at} of {total} — `interrupt` was called on this session, \
              so the batch stopped there and ran its rollback. The step list says whether step {at} \
-             was cut short mid-flight or never started. Nothing was wrong with the steps or the \
-             budget, and the session is still open and still holds its target; resubmit the whole \
-             batch on it once whatever prompted the interrupt is dealt with.\n"
+             was cut short mid-flight, never started, or had already finished when the break \
+             landed. Nothing was wrong with the steps or the budget, and the session is still open \
+             and still holds its target; resubmit the whole batch on it once whatever prompted the \
+             interrupt is dealt with.\n"
         ),
         BatchOutcome::TargetGone { at } => format!(
             "BATCH: TARGET GONE at step {at} of {total} — that step ended the target (it ran to \
@@ -3371,6 +3391,59 @@ mod tests {
             d.sealed,
             Some(Sealed::TargetLost),
             "and the job is sealed from the moment the action returned, not after the checks"
+        );
+    }
+
+    /// A break that lands **after the last step's action** is still reported, though it stopped
+    /// nothing.
+    ///
+    /// Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392) against a window
+    /// this change widened: the identity probe is engine calls, `Ran::interrupted` is sampled
+    /// before them, and a one-step batch has no next iteration to consult `Debuggee::interrupted`
+    /// at. The break was then drained by the rollback's seal and the report read `committed` —
+    /// while the worker, releasing the job, appended a sentence saying the operation was
+    /// interrupted before completion. Two channels of one reply contradicting each other is the
+    /// defect; the target is fine either way.
+    ///
+    /// The cleanup still runs, which is what separates this from every other way a batch stops:
+    /// nothing is wrong with the session, and the batch had already finished its work.
+    #[test]
+    fn a_break_that_lands_after_the_last_step_is_still_reported() {
+        let mut d = stopped()
+            .on("eq hevd!Guard 0", Ok(""))
+            .on("eq hevd!Guard 0x1", Ok(""))
+            // One call answered — the step's action — and the break lands after it, which for a
+            // one-step batch is after everything.
+            .interrupted_between_calls(1);
+
+        let report = run(
+            &mut d,
+            &op(vec![cmd("eq hevd!Guard 0")], vec![cmd("eq hevd!Guard 0x1")]),
+            BUDGET,
+        );
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::Interrupted { at: 1 },
+            "the verdict has to agree with the reply the worker appends: {report:?}"
+        );
+        assert!(
+            report.steps[0].ok() && !report.steps[0].cut_short,
+            "and the step itself was not cut short — it had finished: {:?}",
+            report.steps[0]
+        );
+        assert!(
+            d.ran("eq hevd!Guard 0x1"),
+            "the cleanup still runs: {:?}",
+            d.calls
+        );
+        assert_eq!(report.rollback(), Rollback::Complete);
+
+        let text = render(&report);
+        assert!(
+            text.contains("had already finished when the break landed"),
+            "and the rendering offers that as one of the three things the step list may show: \
+             {text}"
         );
     }
 

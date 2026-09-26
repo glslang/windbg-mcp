@@ -5340,8 +5340,9 @@ const GROUP_INSTRUCTIONS: &[(&[&str], &str)] = &[
     (
         &["debug_batch"],
         "When a sequence *mutates* the target - a patched byte, an armed breakpoint, a resumed thread - \
-     run it as one `debug_batch`: its `always` block runs on every path, including a failed \
-     assertion, an expired deadline and a client disconnect, so cleanup cannot be lost.",
+     run it as one `debug_batch`: its `always` block runs on every path it can be aimed at, \
+     including a failed assertion, an expired deadline and a client disconnect, so cleanup cannot \
+     be lost.",
     ),
 ];
 

@@ -3978,8 +3978,10 @@ pub struct BatchReportInfo {
     pub elapsed_ms: u64,
     /// The `steps` block, in order.
     pub steps: Vec<BatchStepInfo>,
-    /// The `always` block, in order. Present whatever the outcome: it runs on every path, which
-    /// is what a batch is for.
+    /// The `always` block, in order. Present whatever the outcome — including the one where it
+    /// was **not run**, whose steps are listed as skipped with the reason, so this is the block to
+    /// read for what is still owed rather than evidence that anything was undone. `rollback` is
+    /// the field that says which.
     pub always: Vec<BatchStepInfo>,
 }
 
@@ -4012,12 +4014,14 @@ pub enum BatchOutcomeName {
     /// dropping it is the safe direction. Whatever the steps changed is still in place on the
     /// original target, which this session can no longer reach: open one on it to put it back.
     TargetReplaced,
-    /// The debugger stopped saying what target it is holding, so the batch could no longer
-    /// certify that it is the one its steps ran against. The steps after that point were not
+    /// Nothing could certify that the debugger is still holding the target the batch's steps ran
+    /// against — it would not say what it holds, or the session is left pointed at a different
+    /// process, where a write lands in another address space. The steps after that point were not
     /// attempted and the `always` block was deliberately not run — `rollback` says
     /// `not_attempted`. Kept apart from [`Self::TargetReplaced`] because nothing identified a
-    /// second target: this session may simply be wedged, and what the steps changed is likely
-    /// still in place on a target that is likely still there.
+    /// second target and **this session's handle is not retired**: it may be perfectly usable,
+    /// and what the steps changed is likely still in place on a target that is likely still
+    /// there.
     TargetUncertain,
 }
 
