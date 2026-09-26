@@ -3614,20 +3614,25 @@ impl WindbgServer {
     /// Run an ordered sequence of debugger steps as one transaction, with assertions and a
     /// rollback block the engine process owns. Use this whenever a sequence *mutates* the
     /// target — a patched byte, an armed breakpoint, a resumed thread — and something has to be
-    /// put back afterwards: the `always` block runs inside the worker on every path, including
-    /// an assertion that does not hold and the deadline expiring, so cleanup cannot be lost to a
-    /// call that times out. The result names every step that ran, the exact one that failed, what
+    /// put back afterwards: the `always` block runs inside the worker on every path but one,
+    /// including an assertion that does not hold and the deadline expiring, so cleanup cannot be
+    /// lost to a call that times out. The result names every step that ran, the exact one that failed, what
     /// each changed, whether the rollback completed, and whether the target is left stopped,
     /// running, detached, or uncertain (the last when the debugger could not be asked — which is
     /// reported as not knowing, never guessed at). Tearing the session down while a batch runs —
     /// `end_session`, or a client disconnect — stops it at its next step and runs the rollback
     /// first, reported as `BATCH: ABANDONED`; the teardown waits for the step in flight as well as
     /// the rollback, but it cannot cut that step short, so a batch of long steps unwinds only once
-    /// the current one ends. One edge remains: a step that overruns far enough to consume the
-    /// reserved cleanup budget too leaves the rollback unrun, and the result says
-    /// `rollback: INCOMPLETE`.
+    /// the current one ends. Two things stop the rollback, both reported: a step that overruns
+    /// far enough to consume the reserved cleanup budget leaves it unrun
+    /// (`rollback: INCOMPLETE`), and a step that *replaces* the debug target — a `.opendump` or
+    /// `.attach` reached through a wrapper no reading of the command text can catch — ends the
+    /// batch as `BATCH: TARGET REPLACED` and drops the cleanup deliberately
+    /// (`rollback: NOT ATTEMPTED`), a restore applied to a target that never had the mutation
+    /// being a write into whatever that address means there.
     /// The structured half carries all of that as values — `outcome`, the position it stopped at,
-    /// `committed`, `rollback_complete`, what each step changed, and what the session holds now.
+    /// `committed`, `rollback_complete`, `rollback`, what each step changed, and what the session
+    /// holds now.
     /// Note the pairing: a batch that *ran* and did not commit answers with `status: "ok"` (the
     /// report is the answer) on a result flagged `isError`, because the transaction is what
     /// failed, not the call. `status: "error"` means the batch never ran at all.

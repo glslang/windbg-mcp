@@ -117,7 +117,7 @@ Sixty-three tools in eight `--tools` groups; the rows below split some of those 
 | Crash   | `crash` | `crash_triage` — a bug check as fields: code and parameters, crashing process, the stack as `module+RVA`, and the faulting driver frame; `exception_triage` — the user-mode counterpart: the exception record decoded, what kind of fault it is, the thrown C++ object and the HRESULT it carries, and the stack walked from the crash context; `decode_error_reporting` — an HRESULT, NTSTATUS or Win32 error as fields, with the message the system's own tables give it |
 | Control | `exec` | `go`, `step_over`, `step_into`, `set_breakpoint`, `breakpoints` (the session's whole inventory, as records — what to check before resuming or detaching a live target), `clear_breakpoints` (by `ids`, or `all: true`), `run_to_address` |
 | Async control | `exec` | `continue_async` (resume and return a handle), `wait_for_stop` (collect the stop; running out of the wait is a poll, not a failure), `break_in` |
-| Transaction | `batch` | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path |
+| Transaction | `batch` | `debug_batch` — an ordered sequence with assertions and a rollback the engine process runs on every path but a replaced target |
 | TTD nav | `ttd` | `step_back` (`t-`), `step_over_back` (`p-`), `reverse_go` (`g-`), `goto_position` (`!tt`) |
 | TTD analysis | `ttd` | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Driver IOCTL | `ioctl` | `decode_ioctl`, `driver_object`, `device_object`, `irp_stack`, `ioctl_trace`, `reachable_from_dispatch`, `driver_hazards`, `ioctl_map` — the control codes a dispatch routine accepts, recovered from its own code and decoded; `device_security` — who may open a device: its descriptor as principals and access masks, `FILE_DEVICE_SECURE_OPEN`, and the symbolic links that reach it; `driver_surface` — one driver in one call: its dispatch table, its devices with the gate on each (no symbolic links), `ioctl_map`'s answer and `driver_hazards`', each section reporting its own status |
@@ -126,8 +126,8 @@ Sixty-three tools in eight `--tools` groups; the rows below split some of those 
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
 
-All of them are served unless you say otherwise, and the definitions cost the model **94,921 bytes —
-about 24k tokens — before it has asked anything** (measured 2026-09-20). `--tools
+All of them are served unless you say otherwise, and the definitions cost the model **95,355 bytes —
+about 24k tokens — before it has asked anything** (measured 2026-09-26). `--tools
 session,inspect,crash` cuts that to 33,187 B for twenty-three tools, and a `--listen` client can be
 given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
 is always included, and what a typed operand may not contain.

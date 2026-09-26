@@ -1,7 +1,7 @@
 //! Which of this server's sixty-three tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 94,921 bytes — roughly 24k tokens (measured 2026-09-20; every figure here moves with any edit
+//! 95,355 bytes — roughly 24k tokens (measured 2026-09-26; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -24,15 +24,15 @@
 //!   inspect       10   13,152  registers, stacks, memory, modules, symbols, location, raw commands
 //!   session       10   13,682  opening a target, ending it, and watching this server
 //!   exec          10   14,876  breakpoints and execution control
-//!   batch          1   10,021  `debug_batch`
+//!   batch          1   10,405  `debug_batch`
 //!   crash          3    7,427  a bug check, a user-mode fault, and an error code
 //!   ttd            9    6,829  recording, indexing and querying a Time Travel trace
 //!   ioctl         10   12,435  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                device security and the whole-driver survey
 //! ```
 //!
-//! Those bytes are a measurement of **2026-09-20** and move with any edit to a description — the
-//! whole surface they are shares of is 63 tools and 94,921 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-09-26** and move with any edit to a description — the
+//! whole surface they are shares of is 63 tools and 95,355 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
