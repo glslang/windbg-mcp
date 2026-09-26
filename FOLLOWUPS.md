@@ -2062,8 +2062,15 @@ on it is **the audience and the setup cost**, not whether the item ships — con
 failure branch below and with the first constraint above, where the operator-supplied transport
 carries S1–S3 either way.
 
+**Two things have to come out of the source, not one.** Bytes are the obvious half; the other is the
+**VTL1 page-table root**, which on the live path came from `HvCallGetVpRegisters` against a running
+VP. A saved state has no VP to ask, so S0 is only a pass if the capture also yields VTL1's `CR3` —
+from saved register state, or from a structure the walk can start at. Without it there is nothing
+to walk *from*, and hard-coding the one measured `0x1201000` is not an answer.
+
 - **Pass:** SK's PML4, `securekernel.exe` and the `KDBG` block are reachable from a saved state of
-  the VBS guest, with no driver loaded, matching what the live path found for the same boot.
+  the VBS guest, with no driver loaded, matching what the live path found for the same boot —
+  **with the page-table root obtained from the capture** rather than carried over from a live run.
 - **Control:** the same read against a saved state of the **VBS-off** guest finds no SK — H4's
   Control 1 repeated on the new source, which is what separates "read the guest" from "read
   something".
@@ -2073,13 +2080,29 @@ carries S1–S3 either way.
 
 ### S1 — the decode layer, source-agnostic. The bulk of the work, and offline-testable
 
-Everything H4 did, expressed over a single `read(gpa, len)` seam so the byte source is a parameter:
-the guarded four-level page-table walk, PE identification against an on-disk image, the
-`KdDebuggerDataBlock` decode, and the `SkLoadedModuleList` walk.
+Everything H4 did, expressed over a source seam so the byte source is a parameter: the guarded
+four-level page-table walk, PE identification against an on-disk image, the `KdDebuggerDataBlock`
+decode, and the `SkLoadedModuleList` walk.
 
-**It is testable with no bench, no driver and no VM** — recorded pages as fixtures — which is what
-makes it worth building even if S0 fails. Three things must be pinned by tests rather than
-discovered again:
+**The seam is not `read(gpa, len)` alone, and saying it was left a hole.** The decode cannot start
+from reads: it starts from the **VTL1 page-table root**, which H4 obtained from
+`HvCallGetVpRegisters` at `TargetVtl=1` — a hypercall against a **live VP**. A saved state has no
+live VP to issue it on, so a source that is a captured image must either surface the saved register
+state or supply the root directly. **The page-table root is therefore part of the source contract**
+(`root() -> Gpa` beside `read(gpa, len)`), not something the decode layer derives. The alternative
+is hard-coding the one measured `0x1201000`, which is a single build on a single boot and is
+exactly what unknown 4 says not to rely on. S0 has to answer this for whatever source it finds.
+
+**It is testable with no bench, no driver and no VM**, which is what makes it worth building even if
+S0 fails — but **not with pages recorded off a live Secure Kernel.** Those are machine-specific
+memory-dump material and would carry whatever guest and host state happened to be in them, and
+`AGENTS.md` requires dumps and credentials to stay out of version control. Fixtures must be
+**synthetic** — page tables and a PE header constructed to exercise each rule — or demonstrably
+minimized and scrubbed, with what was removed stated. A synthetic fixture is better on the merits
+anyway: it can be built to hit the self-map, the 16-byte window and the refusal path deliberately,
+which a captured page only does by luck.
+
+Three things must be pinned by tests rather than discovered again:
 
 - **Cycle guards.** SK's PML4 self-maps (index 388 on the measured build), so an unguarded descent
   re-enters the table 512× per level. Unguarded, this took the bench down twice and needed a
@@ -2115,7 +2138,24 @@ surface is a real design question, and **S0 and S5 both move it**: a live driver
 not a fixed snapshot, and an S5 pass would bring execution state back into a surface shaped on the
 assumption that there is none.
 
-### S4 — settle the write routes — **RUN 2026-09-26, mostly settled**
+### S4 — settle the write routes — **RUN 2026-09-26, settled; do not repeat as written**
+
+**Repeating it needs a quiesced guest or disposable state, which the run did not have.** Two
+defects in the method, both real and neither fatal to the result:
+
+- **"Identical bytes" is only identical at the instant of the first read.** The run reduced that
+  window with a stability check — read twice, require agreement — but a running guest can change
+  those 16 bytes between the read and the write, and then the write restores *stale* bytes. On a
+  page-table or kernel-state page that is corruption, dressed as a no-op.
+- **A scratch page was chosen from two all-zero reads and exclusion from known images, and that
+  does not establish the page is unowned.** The guest can be using it for anonymous data, or can
+  allocate it between the check and the write. The differing-bytes pattern makes this sharper than
+  the identical-bytes case it replaced.
+
+Neither invalidates what was measured — the writes landed and were verified restored, and the guest
+ran on — but a repeat should **pause the guest**, or use a page the guest explicitly reserved, or
+run against a snapshot that is thrown away afterwards. Detecting an intervening write (re-read and
+compare immediately before the write) is the cheap partial mitigation and is not a substitute.
 
 **Result in the feasibility record. Settled, both routes.** `HvCallWriteGpa` writes VTL0, honours
 the address field, and is **refused on VTL1 with `AccessResult = 3 WriteIntercept`** — per-page,
@@ -2152,18 +2192,40 @@ patched.
 ### S5 — can VTL1 execution be controlled at all? Independent of S0–S3, and worth its own answer
 
 Not required for S1–S3 to be useful, and it decides whether this ends as an inspector or a
-debugger. The thread to pull is the one the validation record left open rather than a new idea:
-the hypervisor's **root VTL1 debug context was configured and did not activate**, the failure was
-never named, and a port (`0xC35C`, 50012) was already allocated. Two things were explicitly not
-done and are the cheapest next steps — an early-boot trace capturing the activation return
-directly, and the earlier handler guards that the bounded trace narrowed to. `kdnet.exe` reports
-network debugging supported for this VM, so the transport side is not obviously the blocker.
+debugger.
 
-- **Pass:** a VTL1 execution stop is delivered to a debugger, by any route.
-- **Stop condition:** an activation failure that is named and is a deliberate refusal — that is an
-  answer, and it retires the question rather than leaving it open.
-- **Do not** plant an `int 3` in VTL1 to test this. Without a delivered trap it bugchecks the guest
-  and is a plausible SKPG trip; the write primitive existing is not a reason to use it here.
+**An earlier draft of this section started at the wrong boundary and would have cost a reboot to
+find out.** It said the hypervisor's root VTL1 debug context "was configured and did not activate"
+with "the failure never named", and asked for an early-boot trace of the activation return. All
+three are wrong, because they read the validation record's state at one point and missed its
+resolution two experiments later:
+
+- the activation return **was** captured directly — `0x1D`, propagated from the debug buffer
+  allocator when the **debug free-page list is exhausted**;
+- raising the `hypervisordebugpages` reservation from 1000 to 2000 **fixed it**: active port moved
+  from `0xFFFF` to `0xC35C` (50012) and both buffers allocated (`0x1000`/2 and `0x1000`/`0xA0`),
+  and the activation routine assigns the port only after both allocations succeed;
+- the record's own conclusion is **"the allocation failure is resolved, but Secure Kernel
+  attachment is not"**, and it names where to go next: *"Secure Kernel-side debugger
+  startup/transport beyond the initialized hypervisor port, not another unsupported increase in
+  reservation or VM RAM."*
+
+**So the hypervisor side works and the Secure Kernel side does not connect to it.** That is a much
+more specific question, and it sits uncomfortably beside a fact this plan already established:
+post-26100 `securekernel.exe` ships no KD transport, every `Kd`-prefixed symbol in it being data.
+S5 should start by asking whether those are the same wall — a hypervisor port with nothing on the
+guest side to speak to it — rather than by re-running a completed experiment.
+
+- **Do not** re-capture the activation return, and **do not** raise the reservation further. Both
+  are done, and the record says the second is unsupported.
+- **Pass:** a VTL1 execution stop is delivered to a debugger.
+- **Necessary but not sufficient for software breakpoints.** A stop arriving by *some* route does
+  not show that a VTL1 `int 3` reaches a debugger, and those can differ — the trap has to be routed
+  by whatever handles VTL1 exceptions, which is not the same question as whether a debug transport
+  exists. So S4 (we can write) plus a generic S5 pass is still **not** a licence to plant one;
+  breakpoints stay excluded until **route-specific trap delivery** is demonstrated.
+- **Do not** plant an `int 3` in VTL1 to test S5 itself. Without a delivered trap it bugchecks the
+  guest and is a plausible SKPG trip; S4 having shown the write lands is not a reason to use it.
 
 ### Out of scope, with the reason rather than as a list
 
