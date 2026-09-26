@@ -1239,12 +1239,12 @@ different provenance, which matters:
 | table reads | 166 | 179 | 215 |
 | tables decoded | 166 | **215** — 36 served at more than one level | — |
 | alias prefixes skipped | **6,773** | 7,803 | — |
-| leaf mappings / distinct pages | 11,326 / **~4,190** | 16,437 / 4,545 | — |
+| leaf mappings / distinct pages | 11,326 / **~4,200** | 16,437 / 4,545 | — |
 | worst-case fan-in | — | — | one PD referenced **1023×**, one PT **2300×**, the root present at all four levels |
 
-The leaf/distinct-page ratio is a reading rather than a constant — 4,189 on one capture of the
-2026-09-26 boot and 4,194 on another two hours later, the guest having run in between, while the
-11,326 mappings and 166 reads were identical on both. The third column is a deliberate
+The leaf/distinct-page ratio is a reading rather than a constant — 4,189, 4,194 and 4,217 on
+three captures of the 2026-09-26 boot, the guest having run in between, while the 11,326
+mappings and 166 table reads were identical on all three. The third column is a deliberate
 diagnostic, not the production walk: it does **not** skip the
 self-map entry, which is how it reaches the page tables *as* mapped data and shows why enumerating
 every prefix is combinatorial rather than merely expensive. The first two are the walk as it runs,
@@ -1303,9 +1303,17 @@ by it. Recorded rather than explained, and it is the counterexample that makes t
 rule non-obvious: **matching the disk image says the bytes are that image, not that this VA is the
 base it was loaded at.** A duplicate mapping matches on all three fields, and which of two
 mappings the walk reaches first is prefix order. So the probe tries **every** matching candidate
-until one carries a data block whose `KernBase` names it, and reports the attempt for each. One
-candidate on both captures here — but the mechanism that would have produced two is in the table
-above.
+until one is confirmed, and reports the attempt for each. One candidate on both captures here —
+but the mechanism that would have produced two is in the table above.
+
+**Confirmation is two independent things agreeing, not one.** A `KDBG` block whose `KernBase`
+equals the candidate's base is necessary and is *not* sufficient: the block is populated
+selectively — 26 of its 116 qwords — so a `PsLoadedModuleList` that is stale, zero or read at
+the wrong alignment still yields plausible names and sizes rather than an error. A candidate is
+accepted only when the list walked from that field has a **first entry whose `DllBase` is the
+candidate's base**; a hit that fails it is recorded with its reason and the search moves to the
+next hit, then the next candidate. On every capture taken here exactly one of the four `KDBG`
+tags passes both.
 
 #### It is a file, not a live channel
 

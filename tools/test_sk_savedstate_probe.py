@@ -495,6 +495,143 @@ class ImageIdentification(unittest.TestCase):
         self.assertEqual([a["kdbg_hits"] for a in attempts], [1, 0])
 
 
+def module_list_reader(pages):
+    return lambda va: pages.get(va)
+
+
+def kldr_entry(flink, dll_base, size_of_image):
+    record = bytearray(0x70)
+    struct.pack_into("<Q", record, 0x00, flink)
+    struct.pack_into("<Q", record, 0x30, dll_base)
+    struct.pack_into("<I", record, 0x40, size_of_image)
+    return bytes(record)
+
+
+class ModuleListValidation(unittest.TestCase):
+    """The docstring claimed the first `DllBase` was checked; the code only decoded."""
+
+    HEAD_VA = 0xFFFFF80220EB0770
+    ENTRY_VA = 0xFFFFF80220EB1000
+
+    def pages_for(self, dll_base):
+        head_page = bytearray(PAGE)
+        struct.pack_into("<Q", head_page, self.HEAD_VA & (PAGE - 1), self.ENTRY_VA)
+        entry_page = bytearray(PAGE)
+        entry_page[0:0x70] = kldr_entry(self.HEAD_VA, dll_base, 0x175000)
+        return {
+            self.HEAD_VA & ~(PAGE - 1): bytes(head_page),
+            self.ENTRY_VA & ~(PAGE - 1): bytes(entry_page),
+        }
+
+    def test_a_list_whose_first_entry_names_the_image_is_valid(self):
+        listing = probe.walk_module_list(
+            module_list_reader(self.pages_for(BASE_VA)), self.HEAD_VA, BASE_VA
+        )
+        self.assertTrue(listing["valid"])
+        self.assertTrue(listing["closed"])
+        self.assertEqual(listing["entries"][0]["dll_base"], BASE_VA)
+
+    def test_a_list_reached_through_a_stale_pointer_is_rejected(self):
+        # It still decodes: plausible entries, a closed list, sensible sizes. Only the base says
+        # it is somebody else's list.
+        listing = probe.walk_module_list(
+            module_list_reader(self.pages_for(0xFFFFF80299999000)), self.HEAD_VA, BASE_VA
+        )
+        self.assertFalse(listing["valid"])
+        self.assertIn("is not the identified base", listing["invalid_reason"])
+        self.assertEqual(len(listing["entries"]), 1, "the entries are still reported")
+
+    def test_an_unreadable_head_is_not_a_valid_list(self):
+        listing = probe.walk_module_list(lambda _va: None, self.HEAD_VA, BASE_VA)
+        self.assertNotEqual(listing.get("valid"), True)
+
+
+class ConfirmationGetsTheLastWord(unittest.TestCase):
+    def test_a_rejected_hit_is_recorded_and_the_next_one_tried(self):
+        # Both tags name the right image; only one leads to a list that names it back.
+        image = image_with_kdbg(
+            [
+                (0x100, 0x3A0, BASE_VA, 0xDEAD0000),
+                (0x1000, 0x3A0, BASE_VA, BASE_VA + 0x127770),
+            ]
+        )
+        candidates = [{"va": BASE_VA, "gpa": 0xCD0000, "size_of_image": 0x4000}]
+
+        def confirm(_candidate, hit):
+            ok = hit["ps_loaded_module_list"] == BASE_VA + 0x127770
+            return ok, {"valid": ok, "invalid_reason": None if ok else "wrong list"}
+
+        chosen, attempts = probe.identify_image(
+            candidates, lambda _va, _size: (image, []), confirm=confirm
+        )
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen["block"]["ps_loaded_module_list"], BASE_VA + 0x127770)
+        self.assertEqual(chosen["hits"][0]["rejected_by"], "wrong list")
+        self.assertEqual(attempts[0]["kern_base_matches"], 2)
+
+    def test_a_candidate_whose_every_hit_is_rejected_is_not_chosen(self):
+        image = image_with_kdbg([(0x100, 0x3A0, BASE_VA, 0xDEAD0000)])
+        candidates = [{"va": BASE_VA, "gpa": 0xCD0000, "size_of_image": 0x4000}]
+        chosen, attempts = probe.identify_image(
+            candidates,
+            lambda _va, _size: (image, []),
+            confirm=lambda _c, _h: (False, {"invalid_reason": "no"}),
+        )
+        self.assertIsNone(chosen)
+        self.assertEqual(attempts[0]["kern_base_matches"], 1)
+        self.assertFalse(attempts[0]["validated"])
+
+
+class DistinctLeafPages(unittest.TestCase):
+    def test_a_large_leaf_counts_every_frame_it_covers(self):
+        # Counting base GPAs reports 1 where leaf_pages reports 512, so the two figures would be
+        # in different units the first time a large mapping appears.
+        self.assertEqual(probe.distinct_leaf_pages([(0, 0x400000, 1 << 21)]), 512)
+        self.assertEqual(probe.distinct_leaf_pages([(0, 0x40000000, 1 << 30)]), 262144)
+
+    def test_overlapping_and_repeated_spans_are_counted_once(self):
+        leaves = [(0, 0x1000, PAGE), (1, 0x1000, PAGE), (2, 0x2000, PAGE)]
+        self.assertEqual(probe.distinct_leaf_pages(leaves), 2)
+        self.assertEqual(probe.distinct_leaf_pages([(0, 0x400000, 1 << 21), (1, 0x400000, PAGE)]), 512)
+
+    def test_no_leaves_is_zero(self):
+        self.assertEqual(probe.distinct_leaf_pages([]), 0)
+
+
+class CaptureProvenance(unittest.TestCase):
+    """The rule is an *ordering*, so it is tested through the function that owns the ordering.
+
+    A first version of this tested `describe_file` instead, which was never where the defect was:
+    backing the re-stat out of `main` left that test green.
+    """
+
+    def test_the_recorded_size_is_the_file_the_results_come_from(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, "capture.vmrs")
+            path.write_bytes(b"before")
+            record = probe.capture_provenance(
+                [path], "vmrs", lambda: path.write_bytes(b"after the replay log")
+            )
+        self.assertTrue(record["replay_log_applied"])
+        self.assertEqual(record["files"][0]["size"], 20, "the bytes that were analysed")
+        self.assertEqual(record["files_before_replay"][0]["size"], 6, "and what arrived")
+
+    def test_without_a_replay_log_there_is_one_reading_and_no_before(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = pathlib.Path(directory, "capture.vmrs")
+            path.write_bytes(b"untouched")
+            record = probe.capture_provenance([path], "vmrs")
+        self.assertEqual(record["files"][0]["size"], 9)
+        self.assertNotIn("files_before_replay", record)
+        self.assertNotIn("replay_log_applied", record)
+
+
 class CaptureSelection(unittest.TestCase):
     def test_a_vmrs_is_chosen_when_one_is_located(self):
         located = {"bin": "", "vsv": "", "vmrs": r"D:\s\a.vmrs"}

@@ -2167,12 +2167,19 @@ Three things must be pinned by tests rather than discovered again:
   one level. Expanding them all is combinatorial on a self-mapped tree — measured by building it,
   which exhausted a 200,000-leaf budget over 509 pages and identified nothing — so the guard stays
   and the omission is counted rather than silent.
-- **Identification is per candidate, not per first match.** Section names, timestamp and
-  `SizeOfImage` say the bytes *are* the image; they do not say the VA is the base it was loaded
-  at, and a second mapping of one image matches all three (the 2026-09-25 capture has a duplicate
-  `symcryptk.dll` the module list does not name). `KernBase` inside the data block is what
-  distinguishes them, so iterate the candidates until one names itself and report the attempt for
-  each. Which candidate the walk reaches first is prefix order and means nothing.
+- **Identification is per candidate, not per first match, and acceptance is two things agreeing.**
+  Section names, timestamp and `SizeOfImage` say the bytes *are* the image; they do not say the VA
+  is the base it was loaded at, and a second mapping of one image matches all three (the
+  2026-09-25 capture has a duplicate `symcryptk.dll` the module list does not name). `KernBase`
+  inside the data block distinguishes them and is **necessary, not sufficient**: the block is
+  populated selectively, so a stale or zero `PsLoadedModuleList` still walks into plausible names
+  and sizes. Accept a candidate only when the list's first `DllBase` names it back, record the
+  reason for each rejection, and move to the next hit and then the next candidate. Which candidate
+  the walk reaches first is prefix order and means nothing.
+- **A docstring that states an invariant is a claim to check against the code.** `walk_module_list`
+  said in prose that the first `DllBase` had to equal the identified base and then only decoded,
+  for four rounds. Auditing every docstring in the probe found that one and no other, which is
+  the cheap version of waiting for review to find them one at a time.
 - **A refused VTL switch and a failed register read are different answers.** Collapsing them makes
   a provider that cannot return one register look like a guest with no Secure Kernel — the same
   *refused*-as-*absent* collapse the read seam is guarded against, one level up.
