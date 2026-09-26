@@ -1169,6 +1169,163 @@ worth stating here, because both were overstatements in the direction of closing
   an `int 3` can be planted — and the **catch** half is not, which is S5. Planting one before S5 is
   answered bugchecks the guest. The full result is under H4 above.
 
+### S0 result, 2026-09-26: PASS — a Hyper-V saved state carries VTL1, and hands over the root
+
+**A capture written by the host reaches everything H4 reached, with no driver, no test-signing and
+no hypercall — and the page-table root comes out of the capture rather than being carried in.**
+That is the strong form of the gate, and it moves the audience for S1–S3 from "an operator who has
+weakened their bench" to "an operator who can take a checkpoint".
+
+**The instrument is Microsoft's own and was already on this machine.**
+`vmsavedstatedumpprovider.dll`, from the Windows Kit's `bin\10.0.26100.0\x64`, declared in
+`VmSavedStateDump.h` beside it. It is **VTL-aware by declaration** —
+`GetGuestEnabledVirtualTrustLevels`, `GetEnabledVirtualTrustLevels`,
+`ForceActiveVirtualTrustLevel`, `IsActiveVirtualTrustLevelEnabled` — and the whole of this result is
+whether that declaration extends to VTL1's *memory* and its `CR3`. It does. The probe is
+[`tools/sk_savedstate_probe.py`](../../tools/sk_savedstate_probe.py), which reads the `REGISTER_ID`
+enum out of the SDK header rather than hand-counting to `X64_RegisterCr3` (it is 46), and reads
+`CR0`/`CR4`/`EFER` beside `CR3` so that a long-mode-consistent control register set says the
+indexing is right rather than off by one.
+
+**The captures.** Standard checkpoints (`CheckpointType = Standard`, so memory is included) of both
+running guests, taken 2026-09-26 19:28:13Z and 19:28:23Z, ~1.7 GB each. Both guests stayed
+`Running` throughout and were still `Operating normally` afterwards; both checkpoints were removed
+when the run finished, and the H1 pinned ones were left alone.
+
+#### The same boot, two routes
+
+Every H4 landmark reproduces. The left column is the live route — a test-signed driver plus
+`HvCallGetVpRegisters` — and the right is a file.
+
+| landmark | H4, live (driver + hypercall) | S0, saved state (neither) |
+|---|---|---|
+| VTL1 `CR3` | `0x1201000` | `0x1201000` |
+| PML4 self-map index | 388 | 388 |
+| present entries in the PML4 | 26 | 26 |
+| non-zero bytes in that page | 123 | 123 |
+| first present entry's byte offset | `0x850` | `0x850` |
+| reads to walk the page tables | 167 | **166** |
+| leaf pages | 11,326 | 11,326 |
+| `securekernel.exe` | VA `0xFFFFF80220D89000`, GPA `0x00CD0000` | identical |
+| identified against the on-disk image | 18 sections, `0x94DED27F`, `0x175000` | identical |
+| `KdDebuggerDataBlock` | `+0x1335E0`, `Size` `0x3A0` | identical |
+| `SkLoadedModuleList` | `+0x127770` | identical |
+| VTL1 modules | 6, named | identical — same six, same bases, same sizes |
+| `KDBG` tags in a 32768-page scan | 4, exactly one with `Size` `0x3A0` | 4, exactly one with `Size` `0x3A0` |
+
+The one cell that is not a repeat is **166 against 167**, and it is not worth chasing: H4's own
+breakdown — 11 PDPTs, 24 PDs, 130 PTs, plus the root — sums to 166.
+
+**The provider's translator agrees with our walk.** `GuestVirtualAddressToPhysicalAddress` at the
+forced VTL1, given SK's base VA, returns `0x00CD0000` — the GPA the four-level descent had already
+reached from the `CR3`. Two translators sharing only the capture is what makes either believable,
+and it gives S1's decode layer a differential oracle that costs nothing.
+
+**The `KDBG` search found four tags and three of them are noise**, which is the argument for
+reporting `Size` instead of matching it. The three carry a `Size` of `0x2C058948`, `0` and `0`, and
+`KernBase` values that are plainly instruction bytes; the fourth carries `Size` `0x3A0` and a
+`KernBase` equal to the base the PE walk established independently. Validation against the base is
+the step that separates them, and an exact-match needle built from a remembered constant would have
+returned the noise or nothing at all.
+
+#### A different boot, and why the root has to come from the capture
+
+The H1 checkpoint of the same guest, taken 2026-09-25 20:32Z, is a **different boot**, and reading
+it is the control that says this is a file being read rather than a channel to the running guest.
+
+| | capture of 2026-09-25 | capture of 2026-09-26 |
+|---|---|---|
+| VTL1 `CR3` | **`0x107593000`** | **`0x1201000`** |
+| PML4 self-map index | **309** | **388** |
+| present entries | **29** | **26** |
+| `securekernel.exe` VA | **`0xFFFFF8070EDA9000`** | **`0xFFFFF80220D89000`** |
+| `securekernel.exe` GPA | `0x00CD0000` | `0x00CD0000` |
+| `KdDebuggerDataBlock` | `+0x1335E0`, `Size` `0x3A0` | same |
+| `SkLoadedModuleList` | `+0x127770` | same |
+| VTL1 modules | the same six | the same six |
+| leaf pages from the walk | 16,437 | 11,326 |
+
+**So the VTL1 `CR3` is not reboot-stable, and this plan's own landmark table said it was.** H4
+measured it identical across the two boots it compared and recorded *"repeated across a reboot:
+yes"*; a third boot has a different one. Nothing about H4 falls — it measured what it measured —
+but the generalisation does, and it is the exact generalisation an implementer would have
+hard-coded. The **image-relative offsets** are the coordinates that survive, as the README already
+said; the GPA `0x00CD0000` survived these two boots as well, which was previously a single
+observation and is now two.
+
+**A seventh PE image appears on the earlier boot** — identity-identical to `symcryptk.dll`
+(`0xD000`, `0x98293ECD`) at VA `0xFFFFB300199C3000`, outside the module list's range and not named
+by it. Recorded rather than explained.
+
+#### It is a file, not a live channel
+
+The capture was copied out of `D:\Hyper-V\Virtual Machines\Snapshots\` into a scratch directory and
+read there with `--vmrs` and **no VM named**, so neither WMI nor Hyper-V was consulted. Same
+`CR3` `0x107593000`, same SK, same six modules, same `KDBG`. Together with the different-boot
+result above — the running guest's VTL1 `CR3` is `0x1201000`, and that copy insists on
+`0x107593000` — the source is demonstrably the bytes on disk. **Capture on the Hyper-V host,
+analyse anywhere.**
+
+**And nothing was loaded to do it.** No `hvmm` or `h3probe` service exists on this host, and the
+CodeIntegrity log's most recent entries are from boot with none during any of these runs — which is
+worth checking rather than assuming, because H2's driver-free probe failed precisely by installing
+a driver while configured not to.
+
+#### The control: the VBS-off twin
+
+H4's Control 1, repeated on the new source, one procedure against both captures.
+
+| | VBS **on** | VBS **off** |
+|---|---|---|
+| `GetGuestEnabledVirtualTrustLevels` | `0b11` | **`0b1`** |
+| `ForceActiveVirtualTrustLevel(vp0, 1)` | succeeds, VTL enabled | **refused**, `0xC0370509` |
+| pages scanned physically | 32768 | 32768 |
+| PE image headers | 101 | **143** |
+| matching `securekernel.exe` | **1**, GPA `0x00CD0000` | **0** |
+| `KDBG` tags | 4 | **0** |
+
+**The refusal is named, not silent.** `0xC0370509` is
+`VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` — the provider ships a typed error for exactly this
+condition. That answers S1's third fixture requirement from the source side rather than from our
+own code: this source does not collapse *refused*, *not captured* and *zeros* into an empty buffer.
+Short reads are reported as a byte count too, so the seam can carry *why* rather than only
+bytes-or-not.
+
+**And the positive arm is load-bearing.** The control guest yields **more** PE headers than the VBS
+guest, 143 against 101, so the scan demonstrably works there; it simply finds no Secure Kernel and
+not one `KDBG` tag of any size. A scan that found nothing anywhere would be indistinguishable from
+a broken one.
+
+#### What this does not establish
+
+- **It is a snapshot.** There is no execution control here and S5 is untouched by it — if anything
+  a fixed capture makes the inspector-versus-debugger question sharper rather than answering it.
+- **It says nothing about writes.** S4's result is about the two *live* routes; a capture is not
+  the guest, and writing to a `.vmrs` would change a file, not VTL1.
+- **It does not retire the driver.** The live route is still the only one that reads a guest as it
+  runs. What this adds is a second source with a much lower setup cost, not a replacement.
+- **Only the checkpoint form was run.** `Save-VM` also produces a `.vmrs` and
+  `LocateSavedStateFiles` handles the older `.bin`/`.vsv` pair as well; neither was measured.
+- **One host, one Hyper-V version, one guest build**, and a guest that is not hardware-isolated. A
+  confidential VM's memory is not the host's to write into a capture, so nothing here should be
+  read as reaching one.
+- **The operator still needs the SDK** for the provider DLL — a download, not a posture change, and
+  the interesting half of the comparison.
+
+#### What it changes downstream
+
+- **S1's source contract is confirmed and satisfied.** `read(gpa, len)` plus `root()` is exactly
+  what this source offers, the root arriving as a register read rather than as a constant. The
+  different-boot table above is the measured reason the root belongs in the contract.
+- **S1 gains a differential oracle for free** in the provider's own VA→GPA translator, which is not
+  our code and agreed on the one address it was asked about.
+- **The audience widens.** An operator with no test-signing, no weakened Code Integrity and no
+  loaded driver can run S1–S3 against a captured guest. The driver-backed live source remains for
+  work a snapshot cannot do.
+- **S3's design question gets a default.** A saved state is a fixed snapshot with no debuggee, which
+  is the sessionless shape — so the awkward fit with this server's session model is now the common
+  case rather than a hypothetical, and S5 remains the thing that could bring execution state back.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility

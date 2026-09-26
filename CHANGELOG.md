@@ -19,6 +19,41 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **A guest's Secure Kernel is readable from a Hyper-V checkpoint, with no driver and nothing
+  signed.** `FOLLOWUPS.md` item 103's first gate, S0, asked whether a driver-free memory source
+  contains VTL1 pages -- a question about *how much setup a user needs*, since the live route H0-H4
+  established needs test-signing off, Secure Boot off and a kernel driver loaded. It does, and the
+  reader is Microsoft's own: `vmsavedstatedumpprovider.dll` from the Windows SDK, declared in
+  `VmSavedStateDump.h`, which is VTL-aware by declaration (`GetGuestEnabledVirtualTrustLevels`,
+  `ForceActiveVirtualTrustLevel`) and turns out to be VTL-aware in fact. A standard checkpoint of
+  the running VBS guest reproduces **every** landmark the driver route measured on the same boot:
+  VTL1 `CR3` `0x1201000` read back out of the capture, a PML4 self-mapping at index 388 with 26
+  present entries and 123 non-zero bytes, 11,326 leaf pages from 166 table reads,
+  `securekernel.exe` at GPA `0x00CD0000` identified against the on-disk image on 18 section names
+  plus timestamp plus `SizeOfImage`, `KdDebuggerDataBlock` at `+0x1335E0` with `Size` `0x3A0`,
+  `SkLoadedModuleList` at `+0x127770`, and the same six VTL1 modules. The **control** is the
+  VBS-off twin, whose partition reports VTL0 only and refuses `ForceActiveVirtualTrustLevel(vp0, 1)`
+  **by name** -- `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` -- while the same 32768-page physical
+  scan finds 143 PE images against the VBS guest's 101 and not one `KDBG` tag, so the scan
+  demonstrably works there and simply finds no Secure Kernel. The capture was also copied out of
+  Hyper-V's directory and read with no VM named, which makes it **a file rather than a channel**:
+  capture on the host, analyse anywhere. And an older capture of the same guest **broke a landmark
+  this work had believed** -- it carries VTL1 `CR3` `0x107593000` and SK based at
+  `0xFFFFF8070EDA9000`, with the image-relative offsets and the GPA unchanged -- so the `CR3` is not
+  reboot-stable, `docs/secure-kernel/README.md`'s "repeated across a reboot: yes" was a
+  generalisation from two boots, and an implementation carrying `0x1201000` forward would have
+  walked from the wrong root and not been told. That is the measured case for item 103's source
+  contract, which requires the page-table root to come from the capture. The probe is
+  `tools/sk_savedstate_probe.py`: it reads the `REGISTER_ID` enum out of the SDK header rather than
+  hand-counting to `X64_RegisterCr3`, checks `CR0`/`CR4`/`EFER` for long-mode consistency so the
+  register indexing is verified rather than assumed, judges a page-table root on all 4096 bytes
+  rather than a 16-byte prefix, poisons what it cannot read with `0xAA` so a missing page cannot
+  read as zeros, and guards the descent three ways -- skip an entry whose target is the table it
+  came from, a visited set per level, and budgets on reads and leaves that *report* a truncation --
+  because an unguarded walk of a self-mapping PML4 took this bench down twice. No Rust and no MCP
+  transport changed. The full record, both arms and what it does not establish, is the **S0 result**
+  section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
+
 - **Secure Kernel: why the native route is dead, and what an EXDI route would actually cost.** The
   stub finding was re-derived from the retained `securekernel.exe` samples rather than recalled, and
   the routine was traced to its caller: `IumpDebugBreakRequestedByVtl0` is the handler for **secure

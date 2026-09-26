@@ -41,3 +41,7 @@ package-lock.json
 # Output of the local-model eval (`tools/local_model_eval.py`), which the checked-in plan
 # writes here: run logs and one JSON record per task. Measurements, not sources.
 eval-out/
+
+# Python bytecode from the `tools/` scripts and their unittest discovery. The acceptance docs
+# pass `PYTHONDONTWRITEBYTECODE=1` for this; ignoring it means a plain run leaves nothing behind.
+__pycache__/

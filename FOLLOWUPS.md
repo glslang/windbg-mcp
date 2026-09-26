@@ -2025,7 +2025,9 @@ overstated the first two into blockers and got the third wrong.**
   needs a one-time copy. So H5b ships as an **opt-in research feature with manual steps**, where the
   repo distributes no driver and the operator supplies the transport. That is an install step and a
   security-posture note to write down, not a reason to build less. **Once it is in place, the rest
-  is drivable from it.**
+  is drivable from it.** And **S0 has since found that most users will not need it at all**: a
+  Hyper-V saved state carries VTL1 and its page-table root with no driver in the picture, so the
+  operator-supplied transport is what buys a *live* target rather than what buys access.
 - **Execution control is an open question, and the hypervisor half of it already works.** What is
   established is narrower than "there is none": post-26100 `securekernel.exe` ships no KD transport
   **of its own**, every `Kd`-prefixed symbol in it being data. The **hypervisor's** VTL1 debug
@@ -2048,7 +2050,45 @@ overstated the first two into blockers and got the third wrong.**
   hypercall, and the **patch** half of a software breakpoint is solved while the **catch** half
   (S5) is not.
 
-### S0 — the gate that decides how much setup a user needs. Do it first
+### S0 — the gate that decides how much setup a user needs — **RUN 2026-09-26, PASS**
+
+**Yes, and it is Microsoft's own.** A Hyper-V **standard checkpoint** carries the guest's VTL1 pages
+*and* its VTL1 `CR3`, read through `vmsavedstatedumpprovider.dll` from the Windows SDK — a
+user-mode DLL with a documented header (`VmSavedStateDump.h`) and explicit VTL support
+(`GetGuestEnabledVirtualTrustLevels`, `ForceActiveVirtualTrustLevel`). No driver, no test-signing,
+no hypercall, no HVCI concession; the capture is a **file**, which was copied off Hyper-V's own
+directory and read there with no VM named. The probe is
+[`tools/sk_savedstate_probe.py`](tools/sk_savedstate_probe.py) and the full record, with both arms
+and every number, is the **S0 result** section of
+[`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
+
+- **Same-boot agreement with the live route, landmark for landmark**: VTL1 `CR3` `0x1201000`,
+  self-map index 388, 26 present entries, 123 non-zero bytes, first present entry at `0x850`, 11,326
+  leaf pages from 166 table reads, `securekernel.exe` at GPA `0x00CD0000` identified against the
+  on-disk image, `KdDebuggerDataBlock` at `+0x1335E0` with `Size` `0x3A0`, `SkLoadedModuleList` at
+  `+0x127770`, the same six VTL1 modules, and the same four `KDBG` tags of which one is real.
+- **Control, on the VBS-off twin**: the partition reports VTL0 only,
+  `ForceActiveVirtualTrustLevel(vp0, 1)` is **refused by name** —
+  `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` (`0xC0370509`) — and the same 32768-page physical scan
+  finds **143** PE images against the VBS guest's 101, with **0** `securekernel.exe` and **0**
+  `KDBG` tags. The positive arm is what makes the negative mean anything.
+- **A third boot broke a landmark this plan believed.** An older capture of the same guest carries
+  VTL1 `CR3` `0x107593000`, self-map index 309, 29 present entries and SK based at
+  `0xFFFFF8070EDA9000` — while the image-relative offsets and the GPA are unchanged. So the `CR3` is
+  **not** reboot-stable, `docs/secure-kernel/README.md` said it was, and the correction is now
+  there. **This is the measured case for the source contract**: an implementation carrying
+  `0x1201000` forward would have walked from the wrong root on that capture and not been told.
+
+**What it changes.** Not whether H5b ships — the manual-setup route already decided that — but who
+can run it: an operator with no weakened bench can now do S1–S3 against a capture, and the
+driver-backed live source is kept for what a snapshot cannot do. S1's source contract is confirmed
+and satisfied as written, and it gains a free differential oracle in the provider's own VA→GPA
+translator, which agreed with our walk. S3's design question gets a default: the common source is a
+fixed snapshot with no debuggee, so the sessionless shape is the case to design for. **S5 is
+untouched** — a capture has no execution to control, and if anything that sharpens the
+inspector-versus-debugger question rather than answering it. The specification as written follows.
+
+#### S0 as specified
 
 **Is there a driver-free memory source that contains VTL1 pages?** Everything below is the same
 code with a different byte source, so this does not decide whether H5b ships — the manual-setup
@@ -2096,6 +2136,13 @@ state or supply the root directly. **The page-table root is therefore part of th
 is hard-coding the one measured `0x1201000`, which is a single build on a single boot and is
 exactly what unknown 4 says not to rely on. S0 has to answer this for whatever source it finds.
 
+**S0 answered it, and the hole this paragraph was written to close turned out to be real.** The
+saved-state provider supplies the root as a register read — `GetRegisterValue` for `CR3` with the VP
+forced to VTL1 — so `root()` is satisfied by the source rather than derived by the decode layer, as
+specified. And a second capture of the same guest from an earlier boot carries `0x107593000`, so an
+implementation that had hard-coded `0x1201000` would have walked from the wrong root on it. The
+contract is measured, not argued.
+
 **It is testable with no bench, no driver and no VM**, which is what makes it worth building even if
 S0 fails — but **not with pages recorded off a live Secure Kernel.** Those are machine-specific
 memory-dump material and would carry whatever guest and host state happened to be in them, and
@@ -2139,7 +2186,8 @@ server's existing session model awkwardly — the one-worker-per-debuggee reason
 process does not apply — so whether this is a session kind, a sessionless tool group or a separate
 surface is a real design question, and **S0 and S5 both move it**: a live driver-backed source is
 not a fixed snapshot, and an S5 pass would bring execution state back into a surface shaped on the
-assumption that there is none.
+assumption that there is none. **S0 has moved it**: the source most users will have is a capture, so
+the sessionless shape is the case to design for and the live one is the variant.
 
 ### S4 — settle the write routes — **RUN 2026-09-26, settled; do not repeat as written**
 
@@ -2242,8 +2290,10 @@ guest side to speak to it — rather than by re-running a completed experiment.
 
 ### Unknowns, in the order they change the plan
 
-1. **S0's saved-state source** — decides how much setup a user needs, not whether it ships.
-   Cheapest, and first.
+1. ~~**S0's saved-state source**~~ — **answered 2026-09-26**: a Hyper-V standard checkpoint carries
+   VTL1 and its `CR3`, read driver-free through the SDK's `vmsavedstatedumpprovider.dll`. The
+   remaining setup is Hyper-V administrator on the host plus the SDK, and the live driver route is
+   now what a *running* target costs rather than what access costs.
 2. **Image-only symbol resolution** — decides whether S2 is small or is a `dbgscope` change.
 3. **S5's unresolved Secure Kernel *attachment*** — not its activation, which is done: the port is
    up and SK does not connect to it. Decides inspector versus debugger, and is the one that would
