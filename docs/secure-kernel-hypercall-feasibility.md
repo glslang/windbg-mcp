@@ -306,6 +306,19 @@ Two mechanisms, cheapest first:
    naming a policy ID is naming *which* gate, and reading past it to the gate one expected is how a
    security posture gets weakened for nothing.
 
+   **Why weakening this particular host is acceptable, which is a separate question from whether a
+   given change helps.** The debugger host is itself a Hyper-V guest, and its parent is hardened
+   independently with kCET enabled. So the blast radius of test signing, Secure Boot off, or HVCI
+   off is one rebuildable VM sitting behind a hardened boundary, not the lab's trust anchor. That
+   makes the concessions route 1 needs defensible. It does **not** make a concession that buys
+   nothing defensible, which is the distinction the HVCI misdiagnosis above failed: the question is
+   never only *"can we afford to weaken this host"* but also *"does weakening it achieve the thing
+   we are weakening it for"*, and the second question was not asked.
+
+   HVCI was restored after that finding. Expect to disable it again if route 1 proceeds — a
+   test-signed driver generally will not load with HVCI active even under `testsigning` — so the
+   revert is correctness about *this* attempt rather than a permanent posture.
+
    **What actually gates a driver here**, measured after that reboot: Secure Boot is **on**, so
    `bcdedit /set testsigning on` is refused until it is turned off on the VM; the WDK is absent —
    `Include\10.0.26100.0\km` and `Lib\10.0.26100.0\km` do not exist, only the user-mode SDK — while
