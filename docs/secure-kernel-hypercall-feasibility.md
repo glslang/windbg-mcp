@@ -225,6 +225,43 @@ Two mechanisms, cheapest first:
    condition for this step is *"read guest memory with no driver loaded"* and a tool that quietly
    falls back to loading one would satisfy the reading while destroying its meaning. Check for the
    service afterwards rather than trusting the setting.
+
+   **Result, 2026-09-26: the driver-free path does not exist in this tool.**
+
+   Probed through the release's own Python SDK over `hvlib.dll` — running it, not deriving from
+   it — with `ReadMethod = WriteMethod = 2` (`ReadInterfaceWinHv`, confirmed from the shipped enum),
+   `ReloadDriver = False`, `LogLevel = 3`. `hvlib.dll` loaded and `SdkGetDefaultConfig` answered, so
+   the library itself works. Then:
+
+   ```text
+   SdkEnumPartitions        -> 0 partitions (with two guests running)
+   hvmm service             -> ABSENT before, created during the call, failed to start
+   CodeIntegrity 3077       -> hvmm.sys "did not meet the Authenticode signing level
+                               requirements or violated code integrity policy"
+   CodeIntegrity 3004       -> "unable to verify the image integrity ... file hash could
+                               not be found on the system"
+   SCM 7045 / 7000          -> service installed, then failed to start
+   ```
+
+   **`SdkEnumPartitions` installs the driver regardless of the read method and regardless of
+   `ReloadDriver`.** So the WinHv setting selects how memory is *read* and does not make the tool
+   driver-free: enumeration is gated on `hvmm.sys` loading, and on an HVCI host it does not. The
+   zero partitions is a downstream symptom of the blocked load rather than an independent result,
+   and `NestedScan` — false by default and plausible on a nested host — was never reached as a
+   variable. `hvlib` removed the service after the failed start, leaving no residue.
+
+   **What this does and does not establish.** It establishes that **the oracle is unusable on a
+   host running HVCI**, which this debugger host is, and that the conflict predicted from the
+   driver's revoked certificate is real rather than theoretical. It does **not** establish anything
+   about whether `ReadInterfaceWinHv` can read guest memory once a partition handle exists — that
+   path was never exercised, and cannot be without enumeration succeeding first. Treat "WinHv needs
+   no driver" as untested rather than disproven.
+
+   **So H2's cheap probe is spent, and the remaining options both require the same concession.**
+   Disabling HVCI on the debugger host makes the oracle usable and becomes a recorded condition of
+   every measurement taken afterwards. Writing our own driver — H2's stated fallback — needs either
+   the same concession or a properly signed binary. The decision rule this gate was written with
+   held: HVCI stayed on until a driver was *demonstrably* needed, and it now demonstrably is.
 2. **A minimal root-partition driver** issuing `HvCallReadGpa`, written only if the above is
    insufficient. Signable by whoever runs it; the revoked-certificate driver that ships with
    LiveCloudKd is not a dependency of this plan and should not be loaded to satisfy it.
