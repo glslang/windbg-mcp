@@ -45,7 +45,9 @@ silently:
 | Fact | Where from | Standing |
 |---|---|---|
 | SK ships no KD transport; every `Kd`-prefixed symbol in post-26100 `securekernel.exe` is data | exdi-stub-plan, 2026-09-22 | measured |
-| `SkdInitDebuggerDataBlock` fills `KdDebuggerDataBlock` completely — `KDBG`, size `0x3A8`, `SkLoadedModuleList`, PTE swizzle bit | exdi-stub-plan, 2026-09-22 | measured |
+| `SkdInitDebuggerDataBlock` fills `KdDebuggerDataBlock` — `KDBG`, `SkLoadedModuleList`, PTE swizzle bit | exdi-stub-plan, 2026-09-22 | measured **from the image** |
+| That block's `Size` field reads **`0x3A0`** in a live guest, not the `0x3A8` read from the image | H4, 2026-09-26 | measured **live**; an exact-match search on `0x3A8` found nothing |
+| `KdDebuggerDataBlock` at `securekernel.exe` **+0x1335E0**, `SkLoadedModuleList` at **+0x127770** | H4, 2026-09-26 | measured — each found independently, and they agree |
 | `Kd=VerAddr:<addr>` is parsed and range-checked, mode 3 of six | exdi-stub-plan E1, 2026-09-22 | measured |
 | DbgEng's `sk` record is EXDI-gated and its selector unreferenced | exdi-stub-plan E1, 2026-09-23 | measured |
 | The hypercall surface is VTL-parameterised — `HV_INPUT_VTL`, `HV_TRANSLATE_GVA_INPUT_VTL_MASK` | header survey, 2026-09-25 | measured |
@@ -756,6 +758,62 @@ them the same walk costs 167 reads.
 next step, both now reachable as ordinary reads of a known VA range. H5 — driving DbgEng off it —
 remains untouched, and the EXDI activation problem E0 found is still the blocker there rather than
 anything measured here.
+
+### H4 strong pass, 2026-09-26: `KdDebuggerDataBlock` and `SkLoadedModuleList` located
+
+**Both of the strong-form pass criteria are met, and each was found by a route that does not depend
+on the other.** Addresses are given as offsets into `securekernel.exe` as well as VAs, because the
+VA depends on the load base and the offset does not.
+
+| what | VA | image offset |
+|---|---|---|
+| `securekernel.exe` base | `0xFFFFF80220D89000` | — |
+| `KdDebuggerDataBlock` | `0xFFFFF80220EBC5E0` | **+0x1335E0** |
+| `SkLoadedModuleList` | `0xFFFFF80220EB0770` | **+0x127770** |
+
+**The two findings confirm each other.** The list head was found *structurally* — searching SK's
+address space for a `KLDR_DATA_TABLE_ENTRY` whose `DllBase` is the SK base and whose `SizeOfImage`
+is `0x175000` sixteen bytes later, then following that entry's `Blink` — while the data block was
+found by its `KDBG` owner tag. The block's `PsLoadedModuleList` field equals the structurally-found
+head exactly, and its `KernBase` equals the base the PE walk had already established. Three
+independent agreements, none of them assumed.
+
+**The loaded-module list, walked:**
+
+| # | `DllBase` | `SizeOfImage` | name |
+|---|---|---|---|
+| 1 | `0xFFFFF80220D89000` | `0x175000` | `securekernel.exe` |
+| 2 | `0xFFFFF80220F03000` | `0x54000` | `skci.dll` |
+| 3 | `0xFFFFF8022104A000` | `0xD000` | `symcryptk.dll` |
+| 4 | `0xFFFFF80220F5C000` | `0xE9000` | `cng.sys` |
+| 5 | `0xFFFFF8022105C000` | `0x15000` | `vmsvc.dll` |
+| 6 | `0xFFFFF8021C5B1000` | `0xA000` | `vmsvcext.sys` |
+
+**That table is itself a cross-check.** The PE-header scan of the walked pages found six images and
+could name only one; the module list names all six, and the two agree base for base and size for
+size. Neither method was told about the other's results.
+
+**Correction to this plan's established-facts table: the block's `Size` is `0x3A0`, not `0x3A8`.**
+The table carries `0x3A8` as *measured*, from static analysis of `SkdInitDebuggerDataBlock` on
+2026-09-22; read out of a live guest on 2026-09-26 the field holds `0x3A0`. The offset is not in
+doubt — `OwnerTag` at +0x10 and `Size` at +0x14 are fixed by `DBGKD_DEBUG_DATA_HEADER64`, and
+`KernBase` at +0x18 lands exactly on the SK base found independently, which pins the alignment. The
+discrepancy cost a run: **a first scan searching the image for the eight bytes `KDBG` + `0x3A8`
+reported zero occurrences**, and the tag was three pages away the whole time. An exact-match needle
+built from a remembered constant fails silently; searching for the tag alone and *reporting* the
+size found is what recovered it.
+
+**The block is populated selectively, which is correct rather than partial.** 26 of its 116 qwords
+are non-zero. `KernBase`, `PsLoadedModuleList` and `BreakpointWithStatus`
+(`0xFFFFF80220DA8A70`) are filled; `PsActiveProcessHead`, `PspCidTable`, `KiCallUserMode`,
+`KeUserCallbackDispatcher` and `MmLoadedUserImageList` are all zero. Those are NT concepts Secure
+Kernel has no equivalent for, so their absence is the expected shape of an SK debugger block and
+not evidence that the block is uninitialised. **This also retires a hypothesis raised when the
+first scan failed** — that `SkdInitDebuggerDataBlock` might only run when secure debugging is
+enabled. It has run: the fields that mean anything for SK carry live pointers.
+
+**Cost:** the whole confirmation took **10 page reads**, against 13,769 for the structural search
+that preceded it. Once the coordinates are known, this is cheap enough to do on every attach.
 
 ### H4 pass criteria, as written before the run
 
