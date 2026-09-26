@@ -173,7 +173,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were truncated, but a page ending in `K`, `KD` or `KDB` with no successor to join cannot be
   recognised at all, so nothing-found read as nothing-there at exactly the boundaries the
   counter exists for. A trailing prefix at an unpaired boundary is now counted, and the
-  measured captures still report **0** of them with the control's zero tags intact. No Rust and no MCP
+  measured captures still report **0** of them with the control's zero tags intact. **A
+  thirteenth round found the same shape in a module entry's name**: a `BaseDllName` whose
+  buffer could not be read fell through to `""`, which reads as a loader entry with no name,
+  and the enumeration could still be reported complete while omitting one. `read_module_name`
+  now answers the name or `None` with the reason, naming the implausible cases -- a length above
+  512, a null buffer -- rather than letting them reach the same empty string, and the list
+  carries `names_unreadable` beside its entries. `complete` deliberately stays true when only a
+  name is missing: every link was followed, and a name is an attribute rather than a link. The
+  measured list still names all six modules with the count at 0. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

@@ -1049,6 +1049,28 @@ def choose_capture(located):
     return None, ()
 
 
+def read_module_name(read_span, record):
+    """`BaseDllName` out of a loader entry: the name, or None with the reason there is none.
+
+    Returning `""` on a failed read made "this entry has no name" and "I could not read its name"
+    the same record -- and an enumeration could then be reported complete while quietly omitting
+    names. The length and buffer are attacker-shaped fields like every other one here, so the
+    implausible cases are named too rather than falling through to the same empty string.
+    """
+    length, = struct.unpack_from("<H", record, 0x58)
+    buffer, = struct.unpack_from("<Q", record, 0x60)
+    if length == 0:
+        return "", None
+    if length > 512:
+        return None, f"implausible BaseDllName length 0x{length:X}"
+    if not buffer:
+        return None, f"BaseDllName has length 0x{length:X} and a null buffer"
+    raw = read_span(buffer, length)
+    if raw is None:
+        return None, f"BaseDllName buffer at 0x{buffer:X} is not readable"
+    return raw.decode("utf-16-le", errors="replace"), None
+
+
 def walk_module_list(reader, head_va, expected_base, limit=32):
     """Walk the `LIST_ENTRY` the debugger data block points at, as `KLDR_DATA_TABLE_ENTRY`.
 
@@ -1098,6 +1120,7 @@ def walk_module_list(reader, head_va, expected_base, limit=32):
             "invalid_reason": f"list head at 0x{head_va:X} is not readable",
         }
     entries = []
+    names_unreadable = 0
     current = struct.unpack_from("<Q", head, 0)[0]
     while current and current != head_va and len(entries) < limit:
         record = read_span(current, 0x70)
@@ -1106,23 +1129,24 @@ def walk_module_list(reader, head_va, expected_base, limit=32):
             break
         dll_base, = struct.unpack_from("<Q", record, 0x30)
         size_of_image, = struct.unpack_from("<I", record, 0x40)
-        name_length, = struct.unpack_from("<H", record, 0x58)
-        name_buffer, = struct.unpack_from("<Q", record, 0x60)
-        name = ""
-        if 0 < name_length <= 512 and name_buffer:
-            raw = read_span(name_buffer, name_length)
-            if raw is not None:
-                name = raw.decode("utf-16-le", errors="replace")
-        entries.append(
-            {
-                "entry_va": current,
-                "dll_base": dll_base,
-                "size_of_image": size_of_image,
-                "name": name,
-            }
-        )
+        name, name_error = read_module_name(read_span, record)
+        entry = {
+            "entry_va": current,
+            "dll_base": dll_base,
+            "size_of_image": size_of_image,
+            "name": name,
+        }
+        if name_error:
+            entry["name_error"] = name_error
+            names_unreadable += 1
+        entries.append(entry)
         current = struct.unpack_from("<Q", record, 0)[0]
-    result = {"head_va": head_va, "entries": entries, "closed": current == head_va}
+    result = {
+        "head_va": head_va,
+        "entries": entries,
+        "closed": current == head_va,
+        "names_unreadable": names_unreadable,
+    }
     if result["closed"]:
         result["complete"] = True
     else:
