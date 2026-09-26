@@ -1029,10 +1029,16 @@ worth stating here, because both were overstatements in the direction of closing
   machinery is a separate thing, and the validation record measured a root VTL1 debug context with
   an allocated port that was configured and did not activate, with the failure never named — while
   explicitly declining the stronger claim, *"they do not establish that this Windows build lacks
-  Secure Kernel debugging support"*. Item 103 carries that as S5. **And memory can be written as
-  well as read**: `HvCallWriteGpa` (`0x0054`) and the direct route's write path both exist, so a
-  software breakpoint is a patch away — which is precisely why S5 says not to plant one until a
-  trap can be delivered.
+  Secure Kernel debugging support"*. Item 103 carries that as S5.
+- **Whether VTL1 can be *written* is a separate unknown, and this plan measured neither route.**
+  `HvCallWriteGpa` (`0x0054`) exists and the direct route exposes a write path, but neither was
+  exercised, here or anywhere in this document. The ABI argues against assuming symmetry with the
+  read: `HV_ACCESS_GPA_RESULT_CODE` defines **`HvAccessGpaWriteIntercept` (3)** beside the
+  `ReadIntercept` (2) that H4 measured, so the hypervisor has a named answer for an intercepted
+  write. Item 103 carries the test as S4 — a round-trip that writes the bytes it just read, so a
+  refusal costs nothing and a success changes nothing. **A software breakpoint is a memory patch,
+  so breakpoints need S4 *and* S5**, and neither answer alone is a licence to plant an `int 3` in a
+  running Secure Kernel.
 
 ## Explicitly out of scope
 

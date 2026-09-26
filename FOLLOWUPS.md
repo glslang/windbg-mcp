@@ -2034,17 +2034,16 @@ overstated the first two into blockers and got the third wrong.**
   the stronger claim in terms: *"They do not establish that this Windows build lacks Secure Kernel
   debugging support."* And `kdnet.exe` on this bench reports network debugging supported for the VM.
   So stepping is **an item to settle** (S5), not a door to close.
-- **Memory can be read *and* written.** "Read-only inspector" was simply wrong. `HvCallWriteGpa`
-  (`0x0054`) is confirmed from `winhvr.sys`'s own wrapper, and the direct route exposes
-  `SdkWritePhysicalMemory` with its own `WriteMethod` selector. Patching VTL1 memory is available by
-  both routes; it is untested here only because nothing needed it.
-
-**Those last two interact, and that is where the hazard is.** A software breakpoint *is* a memory
-patch. With the write primitive an `int 3` can be planted in VTL1 — but with no way to catch the
-resulting trap it bugchecks the guest, and SKPG/HyperGuard is in the business of noticing exactly
-that. So the write capability is real and its use **for breakpoints** is gated on S5's transport
-question rather than on the write. Patching for any other purpose is available immediately and
-should be treated as the destructive primitive it is.
+- **Writes are an unknown, not a capability** — and a previous draft of this item said otherwise,
+  inferring one from the existence of a wrapper. What is *measured*: `HvCallWriteGpa` (`0x0054`) is
+  confirmed from `winhvr.sys`'s own wrapper, and the direct route exposes `SdkWritePhysicalMemory`
+  with its own `WriteMethod` selector. **Neither has been exercised — on VTL1 or on VTL0.** The ABI
+  also argues against the optimistic reading: `HV_ACCESS_GPA_RESULT_CODE` defines
+  **`HvAccessGpaWriteIntercept` (3)** beside the `ReadIntercept` (2) that H4 measured, so the
+  hypervisor has a *named* answer for an intercepted write and a symmetric refusal is the thing to
+  expect rather than a surprise. `exdi-stub-plan.md` already limits the GPA hypercalls to VTL0 for
+  the read, and nothing has been done to show the write differs. Read-only is therefore not the
+  right description of the *route*, but "VTL1 is patchable" is not established either.
 
 ### S0 — the gate that decides how much setup a user needs. Do it first
 
@@ -2058,8 +2057,10 @@ than a design choice, and it is cheap, so it goes first.
 The asymmetry to test, and the reason it is not obvious: **a guest kernel crash dump cannot work**,
 because the guest's own NT cannot read VTL1 memory and therefore cannot write it into a dump — the
 same refusal H4 measured from the outside. A **Hyper-V saved state** is written by the *host*, so
-it is the candidate that could contain those pages. Whether it does is unmeasured, and the whole
-shippability of this item turns on it.
+it is the candidate that could contain those pages. Whether it does is unmeasured, and what turns
+on it is **the audience and the setup cost**, not whether the item ships — consistent with the
+failure branch below and with the first constraint above, where the operator-supplied transport
+carries S1–S3 either way.
 
 - **Pass:** SK's PML4, `securekernel.exe` and the `KDBG` block are reachable from a saved state of
   the VBS guest, with no driver loaded, matching what the live path found for the same boot.
@@ -2114,6 +2115,27 @@ surface is a real design question, and **S0 and S5 both move it**: a live driver
 not a fixed snapshot, and an S5 pass would bring execution state back into a surface shaped on the
 assumption that there is none.
 
+### S4 — settle the write routes, with a test that changes nothing
+
+Run this before anything in the repo tells an implementer that patching is available, and note it
+is **not** a prerequisite for S0–S3, which need no writes at all. The test is a round-trip that is
+a no-op on success: **read 16 bytes, write the identical bytes back, read again.** It exercises
+the whole path and returns an `AccessResult` either way, while leaving the guest byte-for-byte as
+it was — so a refusal costs nothing and a success corrupts nothing. Run it on a VTL0 page as the
+control, then on a VTL1-protected page, on each of the two routes independently, since H4 already
+showed the two routes disagree about VTL1 for reads.
+
+- **Pass / fail is per route**, and the interesting outcome is the asymmetry: the direct route
+  reading VTL1 where the hypercall will not says nothing about whether it *writes* there.
+- **Do not** write different bytes into a running guest to test this.
+
+**And the hazard, stated conditionally because the premise is unproven.** A software breakpoint
+*is* a memory patch, so **if** S4 finds VTL1 writable, an `int 3` is one write away — and without a
+delivered trap it bugchecks the guest, with SKPG/HyperGuard in the business of noticing exactly
+that. So breakpoints are gated on **both** S4 (can we write?) and S5 (can we catch it?), and
+neither answer alone is a licence. Until S4 runs, nothing here should be read as saying VTL1 can be
+patched.
+
 ### S5 — can VTL1 execution be controlled at all? Independent of S0–S3, and worth its own answer
 
 Not required for S1–S3 to be useful, and it decides whether this ends as an inspector or a
@@ -2148,8 +2170,23 @@ network debugging supported for this VM, so the transport side is not obviously 
 3. **S5's activation failure** — decides inspector versus debugger, and is the one that would
    change the shape of S3's tool surface rather than its contents. Independent of the rest, so it
    can run in parallel or not at all.
-4. **Build stability of the offsets.** `KdDebuggerDataBlock` at `+0x1335E0` and
-   `SkLoadedModuleList` at `+0x127770` are **one build**, and the block's `Size` already disagreed
-   with an earlier static reading (`0x3A0` live against `0x3A8` from the image). So the decode layer
-   must locate them by signature and treat the offsets as a fast path to verify, never as the
-   lookup itself.
+4. **Build stability of the offsets, and the derivation that replaces them.**
+   `KdDebuggerDataBlock` at `+0x1335E0` and `SkLoadedModuleList` at `+0x127770` are **one build**,
+   and the block's `Size` already disagreed with an earlier static reading (`0x3A0` live against
+   `0x3A8` from the image). So the offsets are a fast path to *verify*, never the lookup — but
+   "locate them by signature" is not the instruction either, and an earlier draft of this item said
+   it: **`SkLoadedModuleList` is a bare `LIST_ENTRY` with nothing to search for.** Only the block
+   has a signature. The derivation H4 actually used, and which an implementation should follow:
+
+   1. Find `KdDebuggerDataBlock` by its **`KDBG` owner tag** within SK's address space, and *report*
+      the `Size` found rather than matching a remembered constant — matching `0x3A8` exactly is
+      what made a first scan report zero occurrences while the tag sat three pages away.
+   2. **Validate it**: `KernBase` at `+0x18` must equal the SK base the PE walk established.
+   3. **`SkLoadedModuleList` is then read out of it** — the `PsLoadedModuleList` field at `+0x48` —
+      rather than located independently.
+   4. **Validate that**: walk one entry and check its `DllBase` equals the same SK base.
+
+   Keep the structural route — search for a `KLDR_DATA_TABLE_ENTRY` whose `DllBase` is the SK base
+   with `SizeOfImage` sixteen bytes later, then follow its `Blink` — as the **cross-check** rather
+   than the primary. It is what found the head independently in H4, and the two agreeing is what
+   made either believable.
