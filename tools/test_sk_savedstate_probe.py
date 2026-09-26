@@ -411,6 +411,41 @@ class FailedReadsAreCounted(unittest.TestCase):
         self.assertEqual(kdbg[0]["kern_base"], BASE_VA)
         self.assertEqual(scan["boundary_incomplete"], 0)
 
+    def test_a_trailing_tag_prefix_at_an_unpaired_boundary_is_counted(self):
+        # The search is for four bytes, so a page ending in "KDB" cannot be recognised at all
+        # when there is no successor to join -- and nothing found reads the same as nothing there.
+        for prefix in (b"K", b"KD", b"KDB"):
+            with self.subTest(prefix=prefix):
+                page = bytearray(b"\x00" * PAGE)
+                page[PAGE - len(prefix) :] = prefix
+                _images, kdbg, scan = probe.scan_physical_for_images(
+                    FakeSource({0: bytes(page)}),
+                    [{"start_page": 0, "pages": 1}],
+                    PAGE,
+                    {"sections": 1},
+                    10,
+                )
+                self.assertEqual(kdbg, [])
+                self.assertEqual(scan["boundary_incomplete"], 1)
+
+    def test_a_prefix_that_the_successor_completes_is_not_counted_as_incomplete(self):
+        # Three adjacent pages with the record split between the second and third. The pairing of
+        # the first two ends in "KD", and counting *that* would be premature -- the page owning it
+        # has not been emitted yet and its successor does complete the tag. Without the `paired`
+        # guard this scan reports one boundary_incomplete beside a record it also found.
+        joined = bytearray(b"\x00" * (3 * PAGE))
+        joined[2 * PAGE - 2 : 2 * PAGE + 2] = b"KDBG"
+        header = 2 * PAGE - 2 - 0x10
+        struct.pack_into("<I", joined, header + 0x14, 0x3A0)
+        struct.pack_into("<Q", joined, header + 0x18, BASE_VA)
+        pages = {index * PAGE: bytes(joined[index * PAGE : (index + 1) * PAGE]) for index in range(3)}
+        _images, kdbg, scan = probe.scan_physical_for_images(
+            FakeSource(pages), [{"start_page": 0, "pages": 3}], PAGE, {"sections": 1}, 10
+        )
+        self.assertEqual(len(kdbg), 1, "it was joined, so it is a find and not a boundary")
+        self.assertEqual(kdbg[0]["kern_base"], BASE_VA)
+        self.assertEqual(scan["boundary_incomplete"], 0)
+
     def test_the_scan_states_the_split_it_cannot_join(self):
         # A reader who sees `kdbg_tags: 0` is reading a negative and is owed its bound. Joining
         # frames that are virtually adjacent and physically apart needs page tables, which is the
@@ -438,8 +473,10 @@ class FailedReadsAreCounted(unittest.TestCase):
         )
         self.assertEqual(kdbg, [], "the split record is beyond a physical scan")
         self.assertEqual(scan["unreadable"], 0)
-        self.assertEqual(scan["boundary_incomplete"], 0)
-        self.assertTrue(scan["limitation"], "so the zero has to carry its bound")
+        # The record is still missed -- joining those frames needs page tables -- but the trailing
+        # `KD` at an unpaired boundary is now counted, so the miss is reported rather than silent.
+        self.assertEqual(scan["boundary_incomplete"], 1)
+        self.assertTrue(scan["limitation"], "and the zero still carries its bound")
 
     def test_an_unexpected_chunk_granularity_is_refused(self):
         with self.assertRaises(probe.ProbeError):

@@ -713,8 +713,17 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
     unreadable = 0
     boundary_incomplete = 0
 
-    def emit(page_gpa, buffer):
-        """Record every `KDBG` whose header starts in this page, decoding into the next."""
+    def emit(page_gpa, buffer, paired=False):
+        """Record every `KDBG` whose header starts in this page, decoding into the next.
+
+        `paired` says the successor's bytes are in `buffer`. When they are not -- at the scan's
+        cap, at the end of the last chunk, or where the next page was unreadable or not adjacent
+        -- a tag that *begins* in the last three bytes cannot be recognised at all, since the
+        search is for four. A trailing prefix of `KDBG` is therefore counted as an incomplete
+        boundary rather than passing as nothing found: it is the same "something may be here that
+        I could not finish reading" that the counter exists for, one step earlier than a complete
+        tag with truncated fields.
+        """
         nonlocal boundary_incomplete
         at = buffer.find(b"KDBG")
         while at != -1:
@@ -731,6 +740,8 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
                 else:
                     boundary_incomplete += 1
             at = buffer.find(b"KDBG", at + 1)
+        if not paired and any(buffer.endswith(b"KDBG"[:n]) for n in (3, 2, 1)):
+            boundary_incomplete += 1
 
     def outcome(capped):
         return {
@@ -775,7 +786,7 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
                     identity.update({"gpa": gpa, "matches_disk": same_image(identity, disk)})
                     images.append(identity)
             if pending and pending[0] + PAGE == gpa:
-                emit(pending[0], pending[1] + data)
+                emit(pending[0], pending[1] + data, paired=True)
             elif pending:
                 emit(*pending)
             pending = (gpa, data)
