@@ -5,6 +5,15 @@ guest's Secure Kernel state well enough to drive a debugger?** It is not a plan 
 Every gate below can fail, each says how, and the stop conditions are written before the work
 starts so that a sunk cost does not decide.
 
+**Answer, as of 2026-09-26: no — not by this route, and the blocker is the hypervisor itself.**
+H3 passed and H4 failed, and together they give a clean asymmetry: the hypervisor **grants** a
+parent a child's VTL1 *register* state and **denies** it that child's VTL1 *memory*. You can read
+Secure Kernel's `CR3` and you cannot read the page it points at. The denial is not a permissions
+setting — `HvCallReadGpa` has no VTL parameter to ask with — and it is delivered as
+`HV_STATUS_SUCCESS` with a per-access `ReadIntercept` and zeros, so a consumer checking only the
+status sees silent zeros where the protected memory is. Gates H0, H1 and H3 passed; H2 failed with
+a known cause; H4 is a clean negative; H5 was never reached.
+
 This is a sibling of [`docs/exdi-stub-plan.md`](exdi-stub-plan.md) rather than a replacement. That
 document's route reaches SK through a GDB stub and needs a hypervisor that exposes one; this route
 reaches it through hypercalls and needs the Hyper-V already present. The two share E4's integration
@@ -25,8 +34,11 @@ silently:
 | EXDI activation stalls on this bench; registration is surrogate-hosted | exdi-stub-plan E0, 2026-09-25 | measured |
 | `HvCallGetVpRegisters` is documented as callable **by the parent** of the target partition, and carries a `TargetVtl` | TLFS, H0 2026-09-25 | measured |
 | CR3 is **VTL-private** state, so a VTL1 CR3 is a real and distinct value to ask for | TLFS VSM, H0 2026-09-25 | measured |
-| VBS defends a guest's VTL1 from that guest's VTL0, not from its host | architecture | **assumed** — H3 tests it |
-| The hypervisor permits a parent to name a child's **VTL1** specifically | — | **assumed; H0 found no prohibition, which is not permission** |
+| VBS defends a guest's VTL1 from that guest's VTL0, not from its host | architecture | **partly false** — H4 measured the hypervisor defending VTL1 *memory* from the host too |
+| The hypervisor permits a parent to name a child's **VTL1** specifically | H3, 2026-09-26 | measured — **for registers**; `HvCallGetVpRegisters` returned a child's VTL1 `CR3` |
+| The hypervisor **refuses** a parent a child's VTL1 **memory** | H4, 2026-09-26 | measured — `HvAccessGpaReadIntercept` and zeros, 4608 protected pages against 0 in a VBS-off control |
+| `HvCallReadGpa` = `0x0053`, `HvCallWriteGpa` = `0x0054`; read/write pairs are **adjacent** call codes | `hvgdk.h` + H3/H4 behaviour | measured — corroborated on this build at four call codes |
+| `HvCallReadGpa` moves at most **16 bytes** per call and carries **no VTL field** | H4, 2026-09-26 | measured |
 | `HvCallTranslateVirtualAddress` is parent-callable and VTL-parameterised | — | **assumed, and less documented than the register read** |
 
 ## Two disciplines that apply throughout
@@ -443,69 +455,114 @@ merely warned about, so results are gathered into locals and assigned afterwards
 
 ## H4 — does what comes back look like Secure Kernel
 
-**Update, 2026-09-26: a GPA read hypercall exists and was confirmed by behaviour, but the data is
-not yet interpretable.** Two secondary sources offered call codes, hedged and disagreeing with each
-other -- one "often documented as" 0x0053, one "typically mapped to" 0x0054. Neither was trusted;
-0x0053 was tried and the hypervisor's own responses establish it:
+### H4 result, 2026-09-26: FAIL, cleanly — the hypervisor withholds VTL1 memory from the parent
 
-| test | result | what it shows |
+**The memory half of the route is refused, and the refusal is measured rather than inferred.** A
+parent may read a VBS-enabled child's VTL0 memory freely; the pages VTL1 protects come back as
+`HvAccessGpaReadIntercept` with actively-written zeros. Taken with H3 this gives the route's
+governing asymmetry: **the hypervisor grants a parent a child's VTL1 *registers* and denies it that
+child's VTL1 *memory*.** You can obtain VTL1's `CR3` and you cannot read the page it points at.
+
+**Three corrections to what this section said before.**
+
+**The call code was never in doubt, and the earlier hedging was mine.** `hvgdk.h` from the HDK — a
+Microsoft-authored header, published under their academic licence — names `HvCallReadGpa = 0x0053`
+and `HvCallWriteGpa = 0x0054`. Its numbering is confirmed correct *on this build* at three
+independent points already measured here: `0x0047` GetNextChildPartition and `0x0050`
+GetVpRegisters both worked in H3, and `/live-hypervisor` separately measured a running guest's
+traffic at `0x005C`/`0x005D`, which this header names PostMessage and SignalEvent — exactly what a
+live guest emits constantly. The header is old and the V1 block has not renumbered.
+
+**That retires a near-miss worth stating plainly.** The secondary source proposing `0x0054` as "the
+newer call code" was proposing the **write**. Firing it blind would have written into a child
+partition's physical memory. And the hazard is structural rather than a one-off: **this ABI places
+read/write pairs adjacently** — `0x0053`/`0x0054` ReadGpa/WriteGpa, `0x00CC`/`0x00CD`
+QueryVtlProtectionMaskRange/**Modify**VtlProtectionMaskRange. An off-by-one on a call code in this
+range mutates a partition where it meant to inspect one. No call code in this family is fired
+without corroboration.
+
+**The "wrong output layout" hypothesis was wrong, and it was wrong because of how I measured.** The
+probe **zeroed** the hypercall output page before each call, so "the VTL1 page reads as all zeros"
+could not be told apart from "the hypervisor wrote nothing" — and the instrument manufactured the
+very ambiguity the section recorded as a finding. Filling the page with `0xAA` instead makes every
+byte answer for itself:
+
+| probe | written span | reading |
 |---|---|---|
-| six different GPAs, one partition | five distinct results | the address is honoured at input offset 16 |
-| one GPA, partitions 1/2/3 | different data per partition | the partition id is honoured at offset 0 |
-| partition 0x1 | `HV_STATUS 0x0006 ACCESS_DENIED` | a sensible refusal, not noise |
+| `ReadGpa`, `ByteCount=16` | `+0 .. +23` | `AccessResult` at `+0`, `Data[16]` at `+8` |
+| `ByteCount` = 1 / 2 / 4 / 8 | `+0 .. +23` | that many real bytes at `+8`, remainder zero-filled |
+| bogus call code `0x0FFF` | **none** — page still pure poison | the control: a rejected call writes nothing |
 
-So the call is a partition-scoped guest-physical read, derived from its behaviour rather than from
-either source -- and 0x0054, plausibly the *write* counterpart, never had to be fired blind.
+The layout the driver already used was correct all along. The bogus-code row is what makes every
+other row mean something: it demonstrates that "written" is a real observation and not an artefact
+of the buffer.
 
-**The oracle nevertheless fails, and that is the state to hand on rather than paper over.** Reading
-the GPA held in a guest's VTL0 CR3 should yield a PML4: mostly zero, a few present entries. Both
-guests instead return dense bytes that read as x86-64 code (`48 99`, `48 c1 e9 0c`, runs of `CC`).
-And the **VTL1 CR3's GPA reads as all zeros**. Those admit at least two readings that this run
-cannot separate:
+**The refusal is a named result code that was on screen and undecoded.** The output's `AccessResult`
+field is `HV_ACCESS_GPA_RESULT_CODE`, and `2` is `HvAccessGpaReadIntercept`. Every earlier run
+printed `AccessResult=0x2` and no table existed to read it with, so it was recorded as "all zeros".
 
-- the **output layout** is wrong, so the bytes examined are not the bytes read; or
-- VTL1 memory is **withheld from the root**, zeros being what withholding looks like here.
+| read | `HV_STATUS` | `AccessResult` | data |
+|---|---|---|---|
+| partition 0x3 VTL0 `CR3` page | `SUCCESS` | `0` Success | real contents |
+| partition 0x3 **VTL1** `CR3` page | `SUCCESS` | **`2` ReadIntercept** | zeros, actively written |
+| partition 0x1 (root) | `ACCESS_DENIED` | — | — |
 
-Those differ enormously -- the first is a bug in the instrument, the second would be a finding
-about the route -- so neither is recorded as the answer.
+**`HV_STATUS` is SUCCESS on the refused read.** A consumer that checks only the status renders
+zeros for exactly the memory it exists to inspect, with no error anywhere. That is the single most
+important operational fact in this section, and it is a property of the interface rather than of
+this probe.
 
-**An attempt to identify the bytes by matching them against on-disk images was inconclusive, and
-the method is weaker than it looks.** A 32-byte run from that GPA matched none of `ntoskrnl.exe`,
-`securekernel.exe`, `hvix64.exe`, `hvax64.exe`, `ntdll.dll`, `winhvr.sys` or `vid.sys`. A 16-byte
-run did "hit" `hvix64.exe`, and that hit should be discarded: the bytes are
-`48 89 5c 24 08 / 48 89 6c 24 10 / 48 89 74 24 18 / 57`, the standard x64 prologue, which occurs in
-every large image. **Verbatim matching is in any case a poor test for code pages**, because code in
-memory has had relocations applied and may be hotpatched, so a true read of a code page is expected
-to miss its own file. Identification needs either a page whose contents are invariant under
-relocation, or disassembly and structural recognition rather than byte equality. The next step is to settle the output
-layout against a GPA whose contents are known independently, **before** reading anything about VTL1
-into a page of zeros.
+**The effect tracks VBS, measured against a control partition at page granularity.** The same fixed
+grid was walked in both guests, so the columns are comparable by construction:
 
-**H4's blocker is different in kind from H3's, found 2026-09-26.** H3 succeeded on a **documented**
-hypercall: `HvCallGetVpRegisters` has a Learn page, a call code, an input layout and an explicit
-statement that a parent may call it. **`HvCallReadGpa` has no such page.** It appears in the
-`hvgdk.h` shipped with the GPL oracle, but the TLFS on Learn does not document it — the hypercall
-reference slug 404s and the hypercall interface page does not index it. So the two halves of this
-route are not equally supported: *reading a child's VTL1 registers is a documented capability;
-reading that child's memory is not.*
+| partition | pages scanned | `ReadIntercept` | contiguous runs |
+|---|---|---|---|
+| 0x2 — VBS **off** (control) | 32768 | **0** | 0 |
+| 0x3 — VBS **on** | 32768 | **4608** (18 MiB) | 7 |
 
-That matters beyond convenience. The clean-room condition this plan set says implementation facts
-come from the TLFS, and for the memory half there is no TLFS to take them from. The options are
-therefore narrower than H3's success suggests:
+A sparser 4 GiB sweep agrees and extends it: 0 of 1984 mapped samples in the control against 11 in
+the VBS guest, with two further protected regions above the 128 MiB the dense scan covered, so
+18 MiB is a floor and not the footprint. Both partitions returned **identical** unmapped counts
+(63/63), which is the check that the two guests' memory maps are comparable and the split is not an
+artefact of different layouts.
 
-- **Take the call code from somewhere other than Microsoft's documentation**, which breaks the
-  clean-room condition and is the reason it is not simply done here.
-- **Reach guest memory the way the root already does**, through `vid.sys` and the VM worker
-  process's mapping — the route the backend table prices as "undocumented; a large
-  reverse-engineering effort", and the reason LiveCloudKd carries a driver at all.
-- **Determine whether a documented path exists** that was not looked for, `HvCallTranslateVirtualAddress`
-  yielding a GPA but not its contents.
+**The shape carries more evidence than the rate.** Every run is 2 MiB-aligned and a whole multiple
+of 2 MiB (512 and 1536 pages). That is large-page-granular protection. Scattered single pages would
+have indicated device overlays instead, which is the reading the control was there to exclude.
 
-**So H3's pass should not be read as "the route works".** It establishes that the hypervisor grants
-a parent VTL1 *register* state — genuinely the pivotal unknown, and now answered — while leaving
-the memory half resting on an interface Microsoft has not published. A plan that assumed both
-halves were equally documented would have discovered this after building the instrument rather
-than before.
+**Why the call cannot be talked round: `HV_INPUT_READ_GPA` has no VTL field.** `PartitionId`,
+`VpIndex`, `ByteCount`, `BaseGpa`, `ControlFlags` — and `ControlFlags` is `CacheType:8` and reserved
+bits. There is no parameter with which to request VTL1, so the read is performed as a VTL0-class
+access and VTL1-protected pages intercept it. This is not a permissions setting to be found.
+
+**One hard throughput fact for any design built on this call:** `ByteCount` is capped at **16**.
+`n = 17` and above return `INVALID_PARAMETER`. A 4 KiB page therefore costs 256 hypercalls.
+
+**What this does to the route.** H3's pass must not be read as "the route works". The register half
+is granted and documented; the memory half is refused by the hypervisor itself, through the only
+guest-physical read this interface offers. A Secure Kernel debugger needs to read SK's memory, and
+this call will not do it. The remaining avenues, none of them started:
+
+- **`HvCallQueryVtlProtectionMaskRange` (`0x00CC`)** would turn this correlation into mechanism by
+  asking the hypervisor directly which VTL protections cover the withheld runs. `hvgdk.h` carries
+  the enum entry but **no input structure**, so its layout has to come from the dispatch table in
+  `hvix64.exe` before it is fired — see the adjacency hazard above, since `0x00CD` modifies.
+- **`HvCallReadSystemMemory` (`0x00F5`)**, likewise undocumented here, and unexamined.
+- **The `vid.sys` route**, which is what LiveCloudKd carries a driver for, priced in the backend
+  table as a large reverse-engineering effort.
+
+**The instrument, and what it is worth reusing for.** `h3probe.sys` gained an
+`IOCTL_H3_RAWGPA` that parameterises call code, partition, VP index, GPA, byte count, rep count and
+control flags, poisons the output page, and returns the raw first 64 bytes with the full hypercall
+return value. It is a general hypercall bench rather than a ReadGpa client, and the poisoning is
+the part to keep: **a zeroed output buffer cannot distinguish data from silence.**
+
+### H4 pass criteria, as written before the run
+
+**Kept for comparison, and not reached.** These describe what a successful read of SK's memory
+would have had to show. The run never got to test any of them: the memory could not be read at all,
+so "does what comes back look like Secure Kernel" was answered one step earlier than this plan
+expected. The controls below are still the right ones for any future instrument that *can* read it.
 
 Only meaningful once H3 passes. **Budget for walking SK's page tables rather than for the
 hypervisor doing it**: H0 found `HvCallTranslateVirtualAddress` documented without a Restrictions
