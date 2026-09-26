@@ -959,6 +959,11 @@ def walkable(vtl1):
         return False, f"paging mode {mode} is not the four-level long mode this walk decodes"
     if vtl1.get("cr4") is not None and vtl1["cr4"] & (1 << 12):
         return False, "CR4.LA57 is set: five-level paging is not decoded by this walk"
+    if long_mode_consistent(vtl1) is False:
+        # `GetPagingMode` is the provider's reading; these are the registers themselves. When they
+        # disagree, the registers win -- a four-level walk of tables that are not four-level
+        # produces leaves rather than an error, and nothing downstream can tell.
+        return False, "the VTL1 control registers do not describe long mode (CR0.PG/PE, CR4.PAE, EFER.LMA)"
     return True, None
 
 
@@ -1029,6 +1034,27 @@ def identify_image(candidates, gather, confirm=None):
                 attempts,
             )
     return None, attempts
+
+
+def resolve_inputs(kit_root, kit_version, image_path):
+    """Every file this run reads as *input*, checked before the provider is touched.
+
+    The on-disk image used to be read after the capture had been loaded and -- with
+    `--apply-replay-log` -- after the `.vmrs` had been rewritten. A typo in `--image` therefore
+    raised `FileNotFoundError` rather than a refusal, threw away the whole report including the
+    VTL1 `CR3` it had already obtained, and had already mutated the one file this tool ever
+    writes to. Input validation belongs before any of that, so it lives in one step that runs
+    first and does nothing else.
+    """
+    kit = Path(kit_root)
+    dll = kit / "bin" / kit_version / "x64" / "vmsavedstatedumpprovider.dll"
+    header = kit / "Include" / kit_version / "um" / "VmSavedStateDumpDefs.h"
+    for path in (dll, header):
+        if not path.exists():
+            raise ProbeError(f"missing {path}")
+    if not Path(image_path).is_file():
+        raise ProbeError(f"missing on-disk image {image_path}")
+    return dll, header, image_on_disk(image_path)
 
 
 def describe_file(path):
@@ -1263,12 +1289,7 @@ def main(argv=None):
     parser.add_argument("--json", help="write the full report here")
     args = parser.parse_args(argv)
 
-    kit = Path(args.kit)
-    dll = kit / "bin" / args.kit_version / "x64" / "vmsavedstatedumpprovider.dll"
-    header = kit / "Include" / args.kit_version / "um" / "VmSavedStateDumpDefs.h"
-    for path in (dll, header):
-        if not path.exists():
-            raise ProbeError(f"missing {path}")
+    dll, header, disk = resolve_inputs(args.kit, args.kit_version, args.image)
 
     state = SavedState(dll, header)
     report = {
@@ -1337,9 +1358,9 @@ def main(argv=None):
         report["vtl0"] = vtl0
 
         vtl1 = read_vtl(state, vp, 1, compare_cr3=vtl0.get("cr3"))
+        vtl1["long_mode_consistent"] = long_mode_consistent(vtl1)
         report["vtl1"] = vtl1
 
-        disk = image_on_disk(args.image)
         report["disk_image"] = disk
 
         proceed, refusal = walkable(vtl1)

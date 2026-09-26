@@ -196,7 +196,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can succeed while reporting an unmapped span, which would have page 0's bytes read as a
   mapping: **measured false on this provider** — an unmapped VA fails outright with
   `0xC0370505` and a mapped one reports a span of zero, over five cases — and the check is in
-  anyway, pinned by a fake provider, because the alternative is depending on that. No Rust and no MCP
+  anyway, pinned by a fake provider, because the alternative is depending on that. **And
+  CodeRabbit, rate-limited for this PR's whole life until now, ran once and found two** -- one
+  of them a claim in this repository's own prose: `docs/secure-kernel/README.md` said every
+  landmark in its table reproduces from a checkpoint, and one row is a measurement **of**
+  `HvCallReadGpa`, which a capture involves no hypercall to perform. The row is marked *live
+  route* and the sentence scoped to capture-derived landmarks. The other: `--image` was read
+  after the capture had loaded and, with `--apply-replay-log`, after the `.vmrs` had been
+  rewritten, so a typo raised `FileNotFoundError` rather than a refusal, discarded a report
+  that already held the VTL1 `CR3`, and had mutated the one file this tool writes to before
+  noticing. Inputs are resolved in one step that runs first and does nothing else. Codex added
+  the register-level half of the paging gate: `GetPagingMode` is the provider's reading, and
+  when `CR0.PG`/`PE`, `CR4.PAE` or `EFER.LMA` disagree with it the registers win, since a
+  four-level walk of tables that are not four-level yields leaves rather than an error. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

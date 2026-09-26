@@ -26,9 +26,12 @@ hypervisor guards one door and hands over the key to the building through anothe
 **And a third route needs no door at all.** A **Hyper-V saved state** — an ordinary standard
 checkpoint, written by the host — carries the guest's VTL1 pages *and* its VTL1 `CR3`, readable
 through Microsoft's own `vmsavedstatedumpprovider.dll` from the Windows SDK. No driver, no
-test-signing, no hypercall, and the file can be copied off the host and read anywhere: everything
-in the table below reproduces from one. That decides *who* can do this work rather than whether it
-can be done, since the live driver route remains the only way to read a guest **as it runs**.
+test-signing, no hypercall, and the file can be copied off the host and read anywhere. Every
+**capture-derived** landmark below reproduces from one — which is all of them except the
+withheld-pages row, marked *live route*: that one is a measurement **of** `HvCallReadGpa`, and a
+capture involves no hypercall to refuse anything. That decides *who* can do this work rather
+than whether it can be done, since the live driver route remains the only way to read a guest
+**as it runs**.
 
 Measured on the bench, 2026-09-26. The **Repeated** column is not decoration, and it is where this
 table was wrong once: a landmark seen twice is not thereby stable.
@@ -36,7 +39,7 @@ table was wrong once: a landmark seen twice is not thereby stable.
 | landmark | value | repeated across a reboot |
 |---|---|---|
 | VTL1 `CR3` (guest physical) | `0x1201000` | **no** — identical on two boots, `0x107593000` on a third |
-| pages the hypercall withholds | 18 MiB in 7 runs, every run 2 MiB-aligned | **yes** — same runs, same 4608 pages, control still 0 |
+| pages the hypercall withholds *(live route only)* | 18 MiB in 7 runs, every run 2 MiB-aligned | **yes** — same runs, same 4608 pages, control still 0 |
 | `securekernel.exe` GPA | `0x00CD0000` | **yes** — two boots |
 | `securekernel.exe` base VA | `0xFFFFF80220D89000` | **no** — `0xFFFFF8070EDA9000` on another boot |
 | `KdDebuggerDataBlock` | `securekernel.exe` **+0x1335E0**, `Size` = `0x3A0` | **yes** — two boots |
