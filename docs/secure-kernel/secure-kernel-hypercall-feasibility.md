@@ -27,7 +27,13 @@ first is documented.
   via SK's own page tables, matching the on-disk image on all 18 section names, timestamp and
   `SizeOfImage`. The identification is independent of the mechanism that produced it.
 
-Gates H0, H1, H3 and H4 passed; H2 failed with a known cause; H5 was never reached. H4's sections
+Gates H0, H1, H2, H3 and H4 passed; H5 was never reached. **H2's status is stated carefully,
+because an earlier draft of this line called the gate failed and that contradicted the two gates
+built on it:** H2 asked whether the root can read the guest's physical memory *at all*, offering two
+mechanisms. Mechanism 1, the driver-free probe, **failed** — and its cause is worth reading, since
+the Code Integrity policy that blocks is not the one it looks like. Mechanism 2, H2's own stated
+fallback of a minimal root-partition driver, **succeeded**, and every GPA measurement in H3 and H4
+is taken through it. So the cheap probe failed and the gate passed. H4's sections
 below are kept in the order they were measured — a negative, then its narrowing by an independent
 oracle, then a correction about the sampling window, then the pass — because how the negative was
 overturned is as much the result as the pass is.
@@ -360,11 +366,20 @@ Two mechanisms, cheapest first:
    so reaching that interface is the reverse-engineering effort the backend table already priced
    and not a shortcut.
 
-   **So H2's cheap probe is spent, and the remaining options both require the same concession.**
-   Disabling HVCI on the debugger host makes the oracle usable and becomes a recorded condition of
-   every measurement taken afterwards. Writing our own driver — H2's stated fallback — needs either
-   the same concession or a properly signed binary. The decision rule this gate was written with
-   held: HVCI stayed on until a driver was *demonstrably* needed, and it now demonstrably is.
+   **So H2's cheap probe is spent, and the remaining options both require a concession — but not
+   the one written here at the time.** This paragraph said *"disabling HVCI on the debugger host
+   makes the oracle usable"*. **It does not, and the sentence is left corrected rather than deleted
+   because acting on it would weaken a host for nothing.** HVCI was disabled and the probe failed
+   identically, with the same policy id; the blocker is the **Cross Certificates for Code Integrity
+   Exceptions** policy `{8f9cb695-5d48-48d6-a329-7202b44607e3}`, which rejects the revoked
+   certificate the oracle's driver ships with. What actually loads it, measured 2026-09-26, is
+   **test-signing plus re-signing the driver** — and the vulnerable-driver blocklist
+   `{784c4414-…}` only *audits*, so that is not the blocker either. HVCI was reverted. See the
+   correction below, and the H4 record of which policy blocks what.
+
+   Writing our own driver — H2's stated fallback — needs test-signing or a properly signed binary.
+   The decision rule this gate was written with held: HVCI stayed on until a driver was
+   *demonstrably* needed; what the gate got wrong was **which** setting was in the way.
 2. **A minimal root-partition driver** issuing `HvCallReadGpa`, written only if the above is
    insufficient. Signable by whoever runs it; the revoked-certificate driver that ships with
    LiveCloudKd is not a dependency of this plan and should not be loaded to satisfy it.
@@ -378,6 +393,37 @@ Two mechanisms, cheapest first:
 - **Control 2:** a GPA the guest does not have backed must **fail** rather than return zeroes.
   A reader that returns zeroes for unmapped memory will later report SK as "all zeroes" and be
   believed.
+
+### H2 result, 2026-09-26: mechanism 1 fails, mechanism 2 passes, so the gate passes
+
+**The cheap probe failed and the gate did not.** Mechanism 1 — reading guest memory with no driver
+loaded — does not exist in this tool, for the Code Integrity reason recorded above. Mechanism 2,
+this gate's own stated fallback, was built as `h3probe` in H3 and **reads a child partition's
+physical memory from the root**: single reads, a 22-address grid, and page-granular scans of 32768
+pages in each of two guests. Every GPA measurement in H3 and H4 is taken through it, so reporting
+H2 as failed would contradict the two gates that rest on it.
+
+**The pass condition as written was not the procedure run**, and that is worth stating rather than
+quietly counting it. It asked for a run-time random signature planted in a guest buffer and found
+from the root, which needs a driver *inside* the guest; no such signature was planted. What was
+used instead is a stronger oracle arriving later: `securekernel.exe` read out of the guest and
+matched against the on-disk image on 18 section names, timestamp and `SizeOfImage` — contents known
+independently, and known to a source that is neither the hypercall nor the driver.
+
+**Both controls did run, and Control 2 is the one that earned its place.**
+
+| control | outcome |
+|---|---|
+| 1 — the same read against the *other* guest differs | **passed** — the partition id is honoured: partitions 0x2 and 0x3 return different data at one GPA, and partition 0x1 is refused `ACCESS_DENIED` |
+| 2 — an unbacked GPA must fail rather than return zeroes | **passed** — unmapped GPAs answer `HvAccessGpaUnmapped`, 63 of them per guest in the dense scan |
+
+Control 2 was written against a reader that "returns zeroes for unmapped memory" and would later
+"report SK as all zeroes and be believed". The real instrument does something one step subtler and
+the control still caught it: a VTL1-protected page returns **`HV_STATUS_SUCCESS` with zeros**, and
+only the per-access `AccessResult` distinguishes it — `HvAccessGpaReadIntercept` rather than
+`Success`. A reader checking the status alone fails exactly as this control predicted. It was
+nevertheless believed for a while, because the *data* was being read 16 bytes at a time; see the
+H4 correction.
 
 ## H3 — can the root read the guest's VTL1 registers (the pivotal gate)
 
@@ -817,10 +863,22 @@ that preceded it. Once the coordinates are known, this is cheap enough to do on 
 
 ### H4 pass criteria, as written before the run
 
-**Kept for comparison, and not reached.** These describe what a successful read of SK's memory
-would have had to show. The run never got to test any of them: the memory could not be read at all,
-so "does what comes back look like Secure Kernel" was answered one step earlier than this plan
-expected. The controls below are still the right ones for any future instrument that *can* read it.
+**Kept for comparison, and — unlike an earlier draft of this paragraph said — subsequently met.**
+These describe what a successful read of SK's memory would have to show. They were written before
+the run, and the sections above record them being reached out of order: the memory looked
+unreadable first, which is why this paragraph once said the run "never got to test any of them".
+It did.
+
+| criterion, as written below | outcome |
+|---|---|
+| valid PE header at the claimed SK base, section names and sizes matching the on-disk image | **met** — 18/18 names, timestamp and `SizeOfImage` |
+| `KdDebuggerDataBlock` located, `KDBG` signature | **met** — image +0x1335E0; its `Size` is `0x3A0`, not the `0x3A8` the criterion assumed |
+| `SkLoadedModuleList` points at plausible module records | **met** — image +0x127770, six modules |
+| Control 1: the same procedure finds no SK data block in the VBS-off guest | **not run** |
+| Control 2: an oracle that is not this mechanism | **met** — the on-disk image, written by neither the hypercall nor the driver |
+
+Control 1 is the one still owed. The criteria are left below in their original wording so that what
+was asked for before the run can be read against what was found.
 
 Only meaningful once H3 passes. **Budget for walking SK's page tables rather than for the
 hypervisor doing it**: H0 found `HvCallTranslateVirtualAddress` documented without a Restrictions
