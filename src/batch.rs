@@ -939,6 +939,20 @@ pub trait Debuggee {
     /// bookkeeping either way, not a trip over the wire, which is what makes it affordable after
     /// every step.
     ///
+    /// **The window between this reading and the seal it may trigger is deliberately left open**,
+    /// and it is the one place in this mechanism where that is the answer rather than a gap.
+    /// Closing it means holding the worker's interrupt lock across these four DbgEng queries, so
+    /// that the request reader blocks on the engine thread — which is the thing `AGENTS.md`'s one
+    /// approved cross-thread exception exists to avoid, *"a request routed through it would be
+    /// read only once there was nothing left to interrupt"*. And it would buy nothing: this
+    /// reading runs immediately after the call that changed the target, so a break that could
+    /// land here could have landed a moment earlier, **inside** that call, where nothing in this
+    /// process has observed anything yet. The window asked about is strictly contained in one that
+    /// cannot be closed at all. Raised by Codex on
+    /// [#392](https://github.com/glslang/windbg-mcp/pull/392) and declined for those two reasons
+    /// together; what *was* closable — the gap between the final break check and the rollback's
+    /// seal, which needs no DbgEng call — is closed, by [`Debuggee::sealing`] answering both.
+    ///
     /// **Measured live, and half of the intuition above is wrong about the engine.** On dbgeng
     /// 10.0.26100.1742 (ARM64, 2026-09-26, the dev build driven over stdio): a wrapped `.create`
     /// on a launched process is caught, at the **`g`** rather than at the `.create` — the command
@@ -1001,7 +1015,13 @@ pub trait Debuggee {
     /// [#392](https://github.com/glslang/windbg-mcp/pull/392): the worker's own latch is not set
     /// until the op *ends*, so until then `worker::refuse_a_break_for_a_replaced_target` lets an
     /// interrupt through and there is nothing else between it and the replacement.
-    fn sealing(&mut self, why: Sealed);
+    ///
+    /// **Answers whether a break was already pending for this batch's job, read in the same
+    /// transition that seals it.** Asking separately leaves a window in which a break is recorded
+    /// and then drained by the seal: the host reports it when the job is released, so a batch
+    /// whose own verdict was decided before that window says it committed while the reply it
+    /// travels on says it was cut short. One transition cannot disagree with itself.
+    fn sealing(&mut self, why: Sealed) -> bool;
 }
 
 /// Runs one engine call, turning a panic into a step failure so [`run`] still reaches `always`.
@@ -1540,23 +1560,6 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         steps.push(done);
     }
 
-    // **A break that landed after the last step's action** — during the identity probe, or in the
-    // gap before this line — stopped nothing: every step ran. It is reported all the same, because
-    // the worker tells the caller their result was cut short when it releases the job, and a
-    // verdict of `committed` printed beside that sentence is a report disagreeing with its own
-    // reply. Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392), against a
-    // window this change widened: the probe is engine calls, and `Ran::interrupted` was sampled
-    // before them.
-    //
-    // Only asked when nothing else has already decided the outcome — every other verdict here
-    // outranks a break that stopped nothing, and each of them was reached by a step rather than
-    // by a clock.
-    if outcome == BatchOutcome::Committed && d.interrupted() {
-        outcome = BatchOutcome::Interrupted {
-            at: steps.len().max(1),
-        };
-    }
-
     // The rollback block, on every path it can be aimed at. Its own deadline is the *whole*
     // budget, which is what the reserve above bought it — and that holds when the batch is
     // abandoned too, rather than the rollback being cut short to fit a teardown's grace. The grace
@@ -1576,8 +1579,23 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     // condition is *having already sealed* rather than a reason to skip it — the version that
     // skipped it outright left that path unsealed for the whole of the report, which is what
     // Codex found on [#392](https://github.com/glslang/windbg-mcp/pull/392).
-    if unverified.is_none() {
-        d.sealing(Sealed::Rollback);
+    //
+    // **A break that landed after the last step's action** — during the identity probe, or in the
+    // gap before this line — stopped nothing: every step ran. It is reported all the same, because
+    // the host tells the caller their result was cut short when it releases the job, and a verdict
+    // of `committed` printed beside that sentence is a report disagreeing with its own reply. The
+    // seal is what answers it, in the same transition that closes the job, so there is no window
+    // between asking and sealing for one more to arrive in — which is the second half of the same
+    // finding. Only read when nothing else has decided the outcome: every other verdict here was
+    // reached by a step, and outranks a break that stopped nothing.
+    let broke_late = match unverified.is_none() {
+        true => d.sealing(Sealed::Rollback),
+        false => false,
+    };
+    if outcome == BatchOutcome::Committed && broke_late {
+        outcome = BatchOutcome::Interrupted {
+            at: steps.len().max(1),
+        };
     }
     let mut always: Vec<StepOutcome> = Vec::with_capacity(op.always.len());
     for (index, step) in op.always.iter().enumerate() {
@@ -2741,10 +2759,13 @@ mod tests {
                 false => Held::Same,
             }
         }
-        fn sealing(&mut self, why: Sealed) {
+        fn sealing(&mut self, why: Sealed) -> bool {
             // A real host seals the job against further breaks here; the script only records that
-            // it was told and which reason it was given, which is what the executor owes it.
+            // it was told and which reason it was given, which is what the executor owes it —
+            // and answers the same question it does, from the same state, in one call.
             self.sealed = Some(why);
+            self.interrupt_after
+                .is_some_and(|after| self.calls.len() >= after)
         }
     }
 

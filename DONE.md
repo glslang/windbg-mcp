@@ -5173,6 +5173,18 @@ Three things about the shape of it are worth keeping.
   restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
   now, and the rendering has a line for a block where nought of the steps failed and the rollback
   is still not complete.
+- **One window is closed and one is declined, and the difference is what the critical section
+  would have to hold.** Asking the host for a pending break and then sealing the job are two
+  transitions, and a break arriving between them is recorded, drained by the seal, and reported
+  when the job is released — beside a verdict that was decided before it. `Debuggee::sealing`
+  answers both now, read under the lock that already seals and drains, with no DbgEng call added
+  to the critical section. The *other* window — between the identity probe and the seal it may
+  trigger — is left open on purpose: closing it means holding the worker's interrupt lock across
+  four DbgEng queries, so the request reader blocks on the engine thread, which is exactly what
+  `AGENTS.md`'s one approved cross-thread exception exists to avoid. And it would buy nothing:
+  that reading runs immediately after the call that changed the target, so a break that could land
+  in it could have landed a moment earlier **inside** that call, where nothing has observed
+  anything yet. The window is strictly contained in one that cannot be closed at all.
 - **The promise lived in five places and a `head` hid two of them.** The sweep that was supposed
   to be the enumeration — grep the tree for "every path" — was piped through `head`, which stopped
   at exactly ten matches and cut off `src/server.rs` entirely. Two rounds then arrived one copy at
