@@ -15,9 +15,11 @@ The two halves of the route need different mechanisms, and only one of them is d
   VBS-off control — and it refuses them as `HV_STATUS_SUCCESS` with a per-access `ReadIntercept`
   and zeros, so a consumer checking only the status sees silent zeros exactly where the protected
   memory is. It is not a permission to be found: `HvCallReadGpa` has no VTL parameter to ask with.
-  **But an independent oracle then read three of five of those same ranges** from the root by a
-  direct-mapping route, so the withholding belongs to that hypercall rather than to the root's
-  access. The VTL1 `CR3` page itself is not yet among the pages recovered.
+  **But an independent oracle then read those same ranges** from the root by a direct-mapping
+  route, so the withholding belongs to that hypercall rather than to the root's access. Read whole
+  rather than 16 bytes at a time, the VTL1 `CR3`'s page is Secure Kernel's **PML4**, identified by
+  its self-map entry — so the register half and the memory half join up, and SK's address space is
+  walkable from the root.
 
 Gates H0, H1 and H3 passed; H2 failed with a known cause; H4 is a negative **about the instrument**,
 narrowed by the oracle in the revised section below; H5 was never reached.
@@ -634,6 +636,56 @@ stating plainly because the obvious guess — "the vulnerable driver blocklist s
 wrong here, and acting on it would have meant disabling a protection that was not in the way. This
 is the second time in this investigation that a CodeIntegrity refusal was nearly attributed to the
 wrong policy; the log names the policy, so read it.
+
+### H4 correction, 2026-09-26: the VTL1 CR3 page was never zero — the sample was 16 bytes
+
+**`HvCallReadGpa` moves at most 16 bytes, so every probe in this investigation read bytes 0–15 of a
+4096-byte page and judged the page on them.** Secure Kernel maps nothing in the low canonical half,
+so its PML4's first entries are legitimately zero. **Every "all zeros" recorded above therefore
+means "the first 16 bytes are zero" and nothing more.** The 16-byte cap is documented two sections
+up as a throughput fact; it is also a *sampling* fact, and that was missed.
+
+Read whole, GPA `0x1201000` is a page table root, and it identifies itself structurally:
+
+| property | value |
+|---|---|
+| self-map entry | index **388** = `0x8000000001201063` → PFN `0x1201`, **its own** |
+| present entries | 26 |
+| non-zero bytes in the page | 123 of 4096 |
+| first present entry's byte offset | `0x850` — past every probe's 16-byte window |
+
+A self-referencing entry is decisive: it is the signature of an x64 paging root, it survives
+relocation, and it needs no address known in advance. So the VTL1 `CR3` returned by
+`HvCallGetVpRegisters` is correct, current and points where it says — **H3's result needed no
+qualification after all.**
+
+**Two neighbouring claims fall with it.** The "2 of 5 withheld ranges unreadable even directly" in
+the section above was an artefact of sampling each run's **first** address only. Measured page by
+page, the run holding the `CR3` is **424 of 512 pages readable** by the direct route, and
+`0x1205000` in that run holds PTEs with consecutive PFNs (`0xd47, 0xd48, 0xd49, 0xd4a`, flags
+`0x121` = Present|Accessed|Global). The direct route is reading Secure Kernel's page tables.
+
+| run | pages | DATA | first-16-zero |
+|---|---|---|---|
+| `0x0C00000` | 512 | 455 | 57 |
+| `0x1200000` (holds the `CR3`) | 512 | **424** | 88 |
+| `0x3600000` | 512 | 13 | 499 |
+| `0x3A00000` | 512 | 445 | 67 |
+| `0x3E00000` | 1536 | 496 | 1040 |
+| `0x4800000` | 512 | 396 | 116 |
+| `0x4E00000` | 512 | 403 | 109 |
+
+**The layout is deterministic across a reboot**, which was measured rather than assumed: after an
+unrelated host reset the VBS guest came back with the **same seven runs at the same addresses**,
+the same 4608 intercepted pages, the control partition still at 0, and the VTL1 `CR3` still
+`0x1201000`. That makes these usable as landmarks rather than as one boot's accident.
+
+**Why the poison discipline did not catch this one.** Poisoning separates *written* from
+*unwritten*, and every one of these reads genuinely was written — with zeros, which were the real
+contents of the bytes requested. The defect is one level up: **the window was too small to be
+representative, and no control established that it was.** The check that would have caught it is
+the same one that caught everything else here — read something whose shape is known independently,
+in this case a whole page rather than a fixed prefix of one.
 
 ### H4 pass criteria, as written before the run
 
