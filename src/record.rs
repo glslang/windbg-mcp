@@ -729,6 +729,18 @@ pub enum Event {
         committed: bool,
         /// Whether the `always` block completed. The one an unattended run is read for.
         rollback_complete: bool,
+        /// What became of that block — `complete`, `incomplete`, `not_supplied`, or
+        /// `not_attempted` for cleanup the batch withheld on purpose.
+        ///
+        /// Beside the flag rather than instead of it, and `Option` rather than defaulted: a
+        /// record written before this field existed says only whether the block finished, and a
+        /// reader has to be able to tell that from one that says it was never tried. Raised by
+        /// Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392), against a renderer
+        /// that had been deriving the distinction by matching on `outcome` — which is a list
+        /// that grows every time an outcome learns to withhold cleanup, and had already fallen
+        /// one behind.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rollback: Option<String>,
         /// What the session holds now: `stopped`, `running`, `detached`, `uncertain`.
         after: String,
         elapsed_ms: u64,
@@ -877,6 +889,7 @@ fn batch_events(request: u64, session: Option<String>, data: &Value, limit: usiz
         at_step: report.at,
         committed: report.committed,
         rollback_complete: report.rollback_complete,
+        rollback: Some(name_of(&report.rollback)),
         after: name_of(&report.after),
         elapsed_ms: report.elapsed_ms,
     });

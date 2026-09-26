@@ -10,7 +10,7 @@ $env:WINDBG_MCP_TRANSCRIPT = "$env:USERPROFILE\.windbg-mcp\session.jsonl"
 ```jsonc
 {"v":1,"run":4158027124358305144,"seq":1,"at":"2026-08-16T12:05:20.549Z","mono_ms":1,"event":"tool_request","request":1,"tool":"open_dump","args":{"path":"C:\\dumps\\a.dmp"}}
 {"v":1,"run":4158027124358305144,"seq":2,"at":"2026-08-16T12:05:20.672Z","mono_ms":125,"event":"session_open","session":"sess-18cc47a3b2779cc8-1","kind":"crash dump","target":{"text":"C:\\dumps\\a.dmp"},"engine_pid":832}
-{"v":1,"run":4158027124358305144,"seq":11,"at":"2026-08-16T12:05:23.129Z","mono_ms":2582,"event":"batch","request":3,"session":"sess-18cc47a3b2779cc8-1","outcome":"failed","at_step":2,"committed":false,"rollback_complete":true,"after":"stopped","elapsed_ms":402}
+{"v":1,"run":4158027124358305144,"seq":11,"at":"2026-08-16T12:05:23.129Z","mono_ms":2582,"event":"batch","request":3,"session":"sess-18cc47a3b2779cc8-1","outcome":"failed","at_step":2,"committed":false,"rollback_complete":true,"rollback":"complete","after":"stopped","elapsed_ms":402}
 ```
 
 Every record carries the format version, the run that wrote it, a sequence number, a wall clock
@@ -24,7 +24,9 @@ The events are the tool call and its result; a session opening, changing state a
 a wait abandoned, an `interrupt`, a worker process dying; and — derived from each result's *typed*
 half, never scraped from the text beside it — where execution stopped, what a `run_to_address`
 concluded, every breakpoint or memory mutation, each assertion that did not hold, and how a
-`debug_batch` ended with whether its rollback completed. See [`src/record.rs`](../src/record.rs).
+`debug_batch` ended with what became of its rollback — the flag saying whether it finished and,
+beside it, the disposition that separates cleanup which ran short from cleanup the batch withheld
+on purpose (`rollback: "not_attempted"`), which a flag cannot. See [`src/record.rs`](../src/record.rs).
 
 A record's `session` is the one the call was **routed** to, not the one it named: omitting
 `session_id` accepts the current session rather than none, so the field answers "which target was

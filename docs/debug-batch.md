@@ -91,7 +91,9 @@ Five honest limits, none of them hidden in the report:
   Two edges of that rule are worth knowing, because the report reads differently in each. A
   **cleanup step** can be the one that replaces the target: the steps themselves committed, so the
   outcome stands and only the cleanup *after* it is skipped — `rollback: INCOMPLETE`, because part
-  of the block ran. And an engine that **stops saying** what it holds is treated the same way as
+  of the block ran. That holds when the step in question is the **last** one and there is nothing
+  left to skip: every `always` step then reads `OK`, and the rollback is still not `complete`,
+  because nothing can say where that last restore landed. And an engine that **stops saying** what it holds is treated the same way as
   one holding something else, under its own outcome (`BATCH: TARGET UNCERTAIN`): nothing has
   identified a second target, so the report claims none, but a restore that cannot be aimed at the
   target the steps ran against is still worse than one that is missing. A batch that cannot get
