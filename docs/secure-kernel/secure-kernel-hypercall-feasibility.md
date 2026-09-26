@@ -980,12 +980,26 @@ that were already there, so neither route had been shown to write *anything* —
 both, and incidentally showed the two routes addressing the same memory: each read back the other's
 pattern.
 
-**The VTL1 target was alignment padding inside Secure Kernel's own code.** Compilers pad between
-functions with `0xCC`, which is never executed and never read. The cave was located in the
-**on-disk** `securekernel.exe` first — a run of at least 96 `0xCC` bytes in `.text`, written to at
-its centre — so what belonged there was known independently, the in-memory pre-state could be
-checked against it before writing, and the restore was exact rather than remembered. VA
-`0xFFFFF80220E79280`, GPA `0x00DC0280`, restored and verified.
+**That scratch page was not *reserved*, and the difference matters if anyone repeats this.** Two
+all-zero reads and exclusion from known images are evidence that a page looks unused; they do not
+establish that the guest does not own it, and the guest can allocate it between the check and the
+write. The identical-bytes probes that preceded this were forgiving of being wrong about that; a
+**differing-bytes** pattern is not. Repeat this against a **paused** guest, a page the guest has
+explicitly reserved, or a snapshot that is discarded afterwards — not against a live guest on the
+strength of the page looking quiet.
+
+**The VTL1 target was alignment padding inside Secure Kernel's own code**, chosen as the
+**lowest-risk** VTL1 memory rather than as inert memory, which is a distinction worth keeping.
+Compilers pad between functions with `0xCC`, and that padding is *not guaranteed* never to be
+executed or read: control can reach it through a mispredicted or unusual path, and the paragraph
+below says outright that SKPG/HyperGuard may checksum the region it sits in. So "never executed and
+never read" would be an overstatement; "the least consequential VTL1 bytes available, and still SK's
+code section" is the accurate description.
+
+The cave was located in the **on-disk** `securekernel.exe` first — a run of at least 96 `0xCC`
+bytes in `.text`, written to at its centre — so what belonged there was known independently, the
+in-memory pre-state could be checked against it before writing, and the restore was exact rather
+than remembered. VA `0xFFFFF80220E79280`, GPA `0x00DC0280`, restored and verified.
 
 **Step 3 is a control worth keeping:** the hypercall was attempted on *that* address too and
 refused there as well, so `WriteIntercept` is a per-page property and not an artefact of the
@@ -1132,12 +1146,19 @@ worth stating here, because both were overstatements in the direction of closing
   dump cannot be one, since the guest's own NT cannot read VTL1 memory and so cannot write it into
   a dump — the same refusal H4 measured from outside. A **Hyper-V saved state** is written by the
   host and is the candidate.
-- **Execution control is unresolved, not impossible.** What this plan established is narrower than
-  it was first written: SK ships no KD transport *of its own*. The **hypervisor's** VTL1 debug
-  machinery is a separate thing, and the validation record measured a root VTL1 debug context with
-  an allocated port that was configured and did not activate, with the failure never named — while
-  explicitly declining the stronger claim, *"they do not establish that this Windows build lacks
-  Secure Kernel debugging support"*. Item 103 carries that as S5.
+- **Execution control is unresolved, not impossible — and the hypervisor half of it already
+  works.** What this plan established is narrower than it was first written: SK ships no KD
+  transport *of its own*. The **hypervisor's** VTL1 debug machinery is a separate thing, and the
+  validation record took it further than a first reading of that record suggests: the activation
+  failure **was** captured (`0x1D`, the debug free-page list exhausted), raising
+  `hypervisordebugpages` from 1000 to 2000 **resolved** it — active port `0xC35C`, both buffers
+  allocated — and its conclusion is *"the allocation failure is resolved, but Secure Kernel
+  attachment is not"*, naming the next boundary as **Secure Kernel-side debugger
+  startup/transport beyond the initialized hypervisor port**. So there is a working port with
+  nothing on the guest side connecting to it, which sits uncomfortably beside SK shipping no KD
+  transport — plausibly the same wall, and unproven either way, the record explicitly declining
+  *"they do not establish that this Windows build lacks Secure Kernel debugging support"*. Item 103
+  carries that as S5, which starts there rather than by re-running the completed trace.
 - **Whether VTL1 can be *written* was measured as S4 on 2026-09-26, and the answer is per route.**
   `HvCallWriteGpa` (`0x0054`) writes VTL0 from the parent and is **refused on VTL1 with
   `AccessResult = 3 WriteIntercept`** — symmetric with the read, and predicted from the ABI before
