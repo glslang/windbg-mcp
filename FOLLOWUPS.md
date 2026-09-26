@@ -2180,6 +2180,12 @@ Three things must be pinned by tests rather than discovered again:
   said in prose that the first `DllBase` had to equal the identified base and then only decoded,
   for four rounds. Auditing every docstring in the probe found that one and no other, which is
   the cheap version of waiting for review to find them one at a time.
+- **Gate the walk on the paging shape, not just on having a root.** The four-level descent
+  hard-codes nine-bit indices and a 48-bit canonical form; a capture in any other mode, or with
+  `CR4.LA57` set, would be traversed with the wrong strides and yield missing or invented leaves
+  rather than an error — the walk cannot tell it is reading the wrong tables. Refuse and say
+  which mode it was. An *unread* paging mode does not block it, for the same reason an unread
+  `enabled` does not: unknown is not wrong.
 - **A refused VTL switch and a failed register read are different answers.** Collapsing them makes
   a provider that cannot return one register look like a guest with no Secure Kernel — the same
   *refused*-as-*absent* collapse the read seam is guarded against, one level up.
