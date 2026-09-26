@@ -564,6 +564,7 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
             outcome,
             at_step,
             rollback_complete,
+            rollback,
             after,
             ..
         } => note(
@@ -579,13 +580,17 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
                 at_step
                     .map(|at| format!(" at step {at}"))
                     .unwrap_or_default(),
-                match (*rollback_complete, outcome.as_str()) {
-                    (true, _) => "complete",
-                    // Read off the outcome rather than a field of its own: `target_replaced` is
-                    // the one verdict whose cleanup is dropped on purpose, and a viewer told
-                    // INCOMPLETE there would go looking for a restore that half ran.
-                    (false, "target_replaced") => "NOT ATTEMPTED",
-                    (false, _) => "INCOMPLETE",
+                // The record's own disposition decides the one case the flag cannot express,
+                // and the flag decides the rest. It was a match on `outcome` for one round, which
+                // is a list that grows with every outcome that learns to withhold cleanup — and
+                // it was already one behind, rendering a withheld cleanup as INCOMPLETE on
+                // `target_uncertain` and sending a viewer to look for a restore that half ran.
+                // A record from before the field carries no disposition and falls back to the
+                // flag, which is all such a record ever said.
+                match (rollback.as_deref(), *rollback_complete) {
+                    (Some("not_attempted"), _) => "NOT ATTEMPTED",
+                    (_, true) => "complete",
+                    (_, false) => "INCOMPLETE",
                 }
             ),
         ),
@@ -1176,19 +1181,27 @@ mod tests {
         let _ = std::fs::remove_file(&named_cast);
     }
 
-    /// A rollback that was **withheld** is not rendered as one that failed.
+    /// A rollback that was **withheld** is not rendered as one that failed — on every outcome
+    /// that withholds one, and on a record written before the distinction existed.
     ///
-    /// Raised by CodeRabbit on [#392](https://github.com/glslang/windbg-mcp/pull/392): the
-    /// mapping is one match arm and nothing constructed the event that reaches it, so simplifying
-    /// it back to `if rollback_complete` would have rendered `INCOMPLETE` — sending a viewer to
-    /// look for a half-run restore that was never started. Both arms are asserted in one test,
-    /// because the value of either is that it is not the other.
+    /// Raised by CodeRabbit on [#392](https://github.com/glslang/windbg-mcp/pull/392) as a branch
+    /// nothing constructed, then by Codex on the same PR as a branch that was *wrong*: it keyed on
+    /// `outcome == "target_replaced"`, which is a list that grows with every outcome that learns
+    /// to withhold cleanup, and it had already fallen one behind `target_uncertain`. So the record
+    /// carries the disposition and this reads it — and the third row is the reason it is an
+    /// `Option`: a transcript from before the field says only whether the block finished.
     #[test]
     fn a_withheld_rollback_is_not_rendered_as_an_incomplete_one() {
         let input = scratch("withheld-rollback");
         let _ = std::fs::remove_file(&input);
         let rec = Recorder::to_file(&input, 0).expect("a transcript");
-        for (outcome, at_step) in [("target_replaced", 2u32), ("failed", 3)] {
+        let rows = [
+            ("target_replaced", 2u32, Some("not_attempted")),
+            ("target_uncertain", 3, Some("not_attempted")),
+            ("failed", 4, Some("incomplete")),
+            ("failed", 5, None),
+        ];
+        for (outcome, at_step, rollback) in rows {
             rec.write(Event::Batch {
                 request: 1,
                 session: Some("sess-1".to_string()),
@@ -1196,6 +1209,7 @@ mod tests {
                 at_step: Some(at_step),
                 committed: false,
                 rollback_complete: false,
+                rollback: rollback.map(str::to_string),
                 after: "detached".to_string(),
                 elapsed_ms: 12,
             });
@@ -1206,14 +1220,16 @@ mod tests {
         let (_, events) = read_cast(&options.output);
         let rendered: String = events.iter().map(|(_, _, data)| data.as_str()).collect();
 
-        assert!(
-            rendered.contains("batch TARGET_REPLACED at step 2 — rollback NOT ATTEMPTED"),
-            "a withheld cleanup says so: {rendered}"
-        );
-        assert!(
-            rendered.contains("batch FAILED at step 3 — rollback INCOMPLETE"),
-            "and a cleanup that ran short still says that: {rendered}"
-        );
+        for (outcome, at_step, expected) in [
+            ("TARGET_REPLACED", 2, "NOT ATTEMPTED"),
+            ("TARGET_UNCERTAIN", 3, "NOT ATTEMPTED"),
+            ("FAILED", 4, "INCOMPLETE"),
+            // No disposition recorded: the flag is all such a record ever said.
+            ("FAILED", 5, "INCOMPLETE"),
+        ] {
+            let line = format!("batch {outcome} at step {at_step} — rollback {expected}");
+            assert!(rendered.contains(&line), "expected `{line}` in: {rendered}");
+        }
     }
 
     /// An empty or non-transcript file is refused with an explanation rather than producing a cast

@@ -5166,7 +5166,13 @@ Three things about the shape of it are worth keeping.
 - **The cleanup block can be where it is first seen, and that is not the same news.** An `always`
   step that replaces the target stops the rest of the cleanup, but the steps themselves ran, so the
   outcome stays `Committed` and the disposition is `Incomplete` — part of the block ran. This was
-  not in the item and is the same hazard one block later; it cost four lines.
+  not in the item and is the same hazard one block later; it cost four lines, and then a review
+  round, because the **last** cleanup step is the case those four lines got wrong: with nothing
+  left to skip, every `always` step reads `Ok` and a predicate over the step list alone answers
+  "complete" — which `server::batch_settled` turns into "nothing is owed", on a batch whose last
+  restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
+  now, and the rendering has a line for a block where nought of the steps failed and the rollback
+  is still not complete.
 - **"The engine would not say" is a third answer, and the first version spelled it as the first.**
   Raised by Codex in review, and correct: `has_target` failing came back as `None` from a function
   returning `Option`, which the executor could not tell from *nothing has changed* — so a step that

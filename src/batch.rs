@@ -1178,14 +1178,13 @@ pub struct BatchReport {
     pub steps: Vec<StepOutcome>,
     pub always: Vec<StepOutcome>,
     pub outcome: BatchOutcome,
-    /// Why the batch stopped being able to certify its target, when it stopped — the host's own
-    /// sentence, whether it named a replacement or declined to say what the engine holds.
+    /// What the batch saw when it stopped being able to certify its target, if it stopped.
     ///
     /// On the report rather than on [`BatchOutcome::TargetReplaced`] because the `always` block
     /// can be where it is first seen, and that block's own steps are not what the outcome is
     /// about: a cleanup step reaching `.opendump` leaves the *steps* committed and stops the rest
     /// of the cleanup.
-    pub unverified: Option<String>,
+    pub unverified: Option<Unverified>,
     pub after: SessionAfter,
     /// Total budget the worker was given, for the report's header.
     pub budget: Duration,
@@ -1200,7 +1199,17 @@ impl BatchReport {
     /// Whether every `always` step completed. A rollback that did not is the thing a caller most
     /// needs to see, so it gets its own predicate rather than being inferred from the list.
     pub fn rollback_complete(&self) -> bool {
+        // **Both halves, and the second is not tidiness.** A cleanup step that ran and returned
+        // `Ok` is not evidence that it landed where it was aimed if the target stopped being
+        // identifiable while it ran — and when that step is the *last* one there is nothing left
+        // to mark skipped, so the step list alone reads "every step completed" and this predicate
+        // is what `server::batch_settled` turns into "nothing is owed". See
+        // [`Unverified::during_cleanup`].
         self.always.iter().all(StepOutcome::ok)
+            && !self
+                .unverified
+                .as_ref()
+                .is_some_and(|seen| seen.during_cleanup)
     }
 
     /// What became of the `always` block, at the resolution [`Self::rollback_complete`] cannot
@@ -1245,18 +1254,29 @@ impl BatchReport {
 /// What [`run`] saw when it could no longer certify that the engine holds the target this batch
 /// started against — because it is holding something else, or because it stopped saying.
 ///
-/// One value rather than three locals, because they must agree: the sentence explains the
-/// decision, the step names where it was taken, and the flag decides what the report may *claim*.
-/// A report carrying one without the others is a rollback that vanished with no attribution.
-struct Unverified {
+/// One value rather than four locals, because they must agree: the sentence explains the
+/// decision, the step names where it was taken, and the two flags decide what the report may
+/// *claim*. A report carrying one without the others is a rollback that vanished with no
+/// attribution.
+#[derive(Debug, Clone)]
+pub struct Unverified {
     /// Whether the host **identified** a different target. `false` is the engine declining to
     /// answer, where nothing may be concluded — see [`Held::Unknown`]. Both withhold the cleanup;
     /// they differ in what may be reported and in what the caller does next.
-    identified: bool,
+    pub identified: bool,
+    /// Whether it was first seen while the **`always` block** was running, which is what stops
+    /// the cleanup that *did* run from being called complete.
+    ///
+    /// Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392) against the
+    /// case with nothing left to skip: when the **last** cleanup step is the one the target
+    /// changed under, every `always` step reads `Ok`, so a predicate over the step list alone
+    /// answers "complete" and `server::batch_settled` tells the caller nothing is owed — on a
+    /// batch whose last restore may have landed in whatever the engine is holding now.
+    pub during_cleanup: bool,
     /// The host's sentence, as [`Debuggee::replaced`] gave it.
-    why: String,
+    pub why: String,
     /// The step that was running when it was first seen, rendered for the report.
-    by: String,
+    pub by: String,
 }
 
 /// Runs a batch to completion and reports what happened.
@@ -1419,6 +1439,7 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             // target nothing can identify is the same problem with less to say about it.
             unverified = Some(Unverified {
                 identified,
+                during_cleanup: false,
                 why,
                 by: format!("`{}`", done.rendered),
             });
@@ -1537,6 +1558,7 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         if let Held::Replaced(why) | Held::Unknown(why) = held {
             unverified = Some(Unverified {
                 identified,
+                during_cleanup: true,
                 why,
                 by: format!("`{}`", done.rendered),
             });
@@ -1567,7 +1589,7 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         steps,
         always,
         outcome,
-        unverified: unverified.map(|seen| seen.why),
+        unverified,
         after,
         budget,
         elapsed: d.elapsed(),
@@ -2037,6 +2059,17 @@ fn render_block(out: &mut String, title: &str, block: &[StepOutcome]) {
     }
 }
 
+/// The host's own sentence about why the target could not be certified, or `fallback`.
+///
+/// Carried rather than restated, so the report cannot come to describe the change differently
+/// from the refusal the caller's next call will get.
+fn why_unverified<'a>(report: &'a BatchReport, fallback: &'a str) -> &'a str {
+    report
+        .unverified
+        .as_ref()
+        .map_or(fallback, |seen| seen.why.as_str())
+}
+
 /// The headline's clause about the cleanup, for the two outcomes that drop it.
 ///
 /// Empty when there was no `always` block, because the rollback line below the headline then says
@@ -2115,7 +2148,8 @@ pub fn render(report: &BatchReport) -> String {
             // The host's own sentence, which says *what kind* of swap it was. Carried here rather
             // than restated, so the report cannot come to describe the replacement differently
             // from the refusal the caller's next call will get.
-            report.unverified.as_deref().unwrap_or(
+            why_unverified(
+                report,
                 "A command replaced it; the engine no longer holds what this session named."
             )
         ),
@@ -2129,10 +2163,7 @@ pub fn render(report: &BatchReport) -> String {
              ask what this session holds before deciding whether to put it back from here or from \
              a new one.\n",
             withheld(report),
-            report
-                .unverified
-                .as_deref()
-                .unwrap_or("The debugger would not answer what it is holding.")
+            why_unverified(report, "The debugger would not answer what it is holding.")
         ),
     };
 
@@ -2188,13 +2219,29 @@ pub fn render(report: &BatchReport) -> String {
         }
         Rollback::Incomplete => {
             let stuck = report.always.iter().filter(|s| !s.ok()).count();
-            let _ = writeln!(
-                out,
-                "rollback: INCOMPLETE — {stuck} of {} `always` step(s) did not complete. See the \
-                 `always` block below; this is reported beside the batch's own outcome, not \
-                 instead of it.",
-                report.always.len()
-            );
+            // **Nought of them is a real reading here, and it needs its own sentence.** When the
+            // target stops being identifiable while the *last* cleanup step runs, every step in
+            // the block reports `Ok` and the count below is zero — "0 of 1 step(s) did not
+            // complete" would be a line contradicting itself, and worse, it would send a reader
+            // looking for a failed step that does not exist.
+            let _ = match stuck {
+                0 => writeln!(
+                    out,
+                    "rollback: INCOMPLETE — all {} `always` step(s) ran, but the debug target \
+                     stopped being identifiable while the last of them was running, so nothing \
+                     here can certify that the restore landed on the target the steps patched: \
+                     {}. Treat what the steps changed as still changed until you have looked.",
+                    report.always.len(),
+                    why_unverified(report, "the debugger stopped saying what it holds")
+                ),
+                _ => writeln!(
+                    out,
+                    "rollback: INCOMPLETE — {stuck} of {} `always` step(s) did not complete. See \
+                     the `always` block below; this is reported beside the batch's own outcome, \
+                     not instead of it.",
+                    report.always.len()
+                ),
+            };
         }
     }
 
@@ -3047,6 +3094,59 @@ mod tests {
         assert!(
             text.contains("no `always` block was supplied"),
             "and the rollback line is the one that says so: {text}"
+        );
+    }
+
+    /// The **last** cleanup step losing the target is not a rollback that completed, though every
+    /// `always` step reads `Ok`.
+    ///
+    /// Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392), against the
+    /// version that asked the step list alone: with nothing left to skip, `rollback_complete`
+    /// stayed true, and `server::batch_settled` turns exactly that — beside a committed steps
+    /// block — into "nothing is owed", on a batch whose last restore may have landed in whatever
+    /// the engine is holding now. Mutation-verified against the `during_cleanup` half of the
+    /// predicate, which is the only thing standing between this report and a clean one.
+    #[test]
+    fn a_cleanup_step_that_loses_the_target_last_is_not_a_rollback_that_completed() {
+        let mut d = stopped()
+            .on("eq hevd!Guard 0", Ok(""))
+            .on("eq hevd!Guard 0x1", Ok(""))
+            .replaces_the_target_on("eq hevd!Guard 0x1");
+
+        let report = run(
+            &mut d,
+            &op(vec![cmd("eq hevd!Guard 0")], vec![cmd("eq hevd!Guard 0x1")]),
+            BUDGET,
+        );
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::Committed,
+            "the steps themselves ran and their assertions held: {report:?}"
+        );
+        assert!(
+            report.always.iter().all(StepOutcome::ok),
+            "and every cleanup step reports Ok, which is the trap: {:?}",
+            report.always
+        );
+        assert!(
+            !report.rollback_complete(),
+            "but the batch cannot certify where the last restore landed, and this predicate is \
+             what `server::batch_settled` turns into \"nothing is owed\": {report:?}"
+        );
+        assert_eq!(report.rollback(), Rollback::Incomplete);
+
+        let text = render(&report);
+        assert!(
+            text.contains(
+                "all 1 `always` step(s) ran, but the debug target stopped being \
+                           identifiable"
+            ),
+            "and the line says so rather than counting zero failures: {text}"
+        );
+        assert!(
+            !text.contains("0 of 1"),
+            "a count of nought would send a reader looking for a step that does not exist: {text}"
         );
     }
 
