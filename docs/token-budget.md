@@ -92,7 +92,7 @@ The two halves moved independently, which is the whole argument for measuring th
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
 have accumulated since.
 
-Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,507
+Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,842
 model-visible bytes (2026-09-26), because its `inputSchema` pulls the whole `StepAction`/`Check`
 vocabulary out of `src/batch.rs`. It is dated because it is the one figure in this section that has
 been kept current rather than frozen — it was updated 9,746 → 10,021 on 2026-08-30, which the
@@ -344,17 +344,17 @@ None of these is a bug. They are recorded because they were invisible, and
    | group | tools | bytes | share |
    |---|---:|---:|---:|
    | `allocator` | 10 | 16,549 | 17.3% |
-   | `inspect` | 10 | 13,152 | 13.8% |
+   | `inspect` | 10 | 13,152 | 13.7% |
    | `session` | 10 | 13,682 | 14.3% |
    | `ioctl` | 10 | 12,435 | 13.0% |
-   | `exec` | 10 | 14,876 | 15.6% |
-   | `batch` | 1 | 10,507 | 11.0% |
+   | `exec` | 10 | 14,876 | 15.5% |
+   | `batch` | 1 | 10,842 | 11.3% |
    | `crash` | 3 | 7,427 | 7.8% |
-   | `ttd` | 9 | 6,829 | 7.2% |
+   | `ttd` | 9 | 6,829 | 7.1% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 63 | 95,457 |
+   | *(absent)* | 63 | 95,792 |
    | `session,inspect,exec,crash` | 33 | 48,216 |
    | `session,inspect,crash` | 23 | 33,187 |
    | `crash` | 13 | 19,943 |

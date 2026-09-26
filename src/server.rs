@@ -1685,11 +1685,15 @@ pub struct DebugBatchArgs {
     /// (on an `eval` step) to bind its value for later steps as `{{name}}`.
     /// The batch stops at the first step that fails or whose assertions do not hold.
     pub steps: Vec<batch::BatchStep>,
-    /// Cleanup/rollback steps, same shape as `steps`. They run **on every path** — success, a
-    /// debugger error, an assertion that did not hold, or the deadline expiring — inside the
-    /// engine process, before this call returns. This is where an unpatch, a `bc *`, or a
-    /// re-`go` belongs: a client cannot be relied on to send it after a call that timed out.
-    /// Their failures are reported separately and never replace the batch's own outcome.
+    /// Cleanup/rollback steps, same shape as `steps`. They run **on every path this batch can
+    /// still aim them at** — success, a debugger error, an assertion that did not hold, the
+    /// deadline expiring — inside the engine process, before this call returns. This is where an
+    /// unpatch, a `bc *`, or a re-`go` belongs: a client cannot be relied on to send it after a
+    /// call that timed out. Their failures are reported separately and never replace the batch's
+    /// own outcome. The exception is a step after which nothing can certify that the debugger
+    /// still holds the target the steps ran against: the block is then dropped on purpose
+    /// (`rollback: NOT ATTEMPTED`), a restore that cannot be aimed being worse than one that is
+    /// missing.
     #[serde(default)]
     pub always: Vec<batch::BatchStep>,
     /// Deadline for the whole batch in milliseconds (default 120000). Part of it is reserved for
@@ -3625,12 +3629,13 @@ impl WindbgServer {
     /// the rollback, but it cannot cut that step short, so a batch of long steps unwinds only once
     /// the current one ends. Two things stop the rollback, both reported: a step that overruns
     /// far enough to consume the reserved cleanup budget leaves it unrun
-    /// (`rollback: INCOMPLETE`), and a step in `steps` after which the debugger is no longer
-    /// holding the target the batch started against — one *replaced* through a wrapper no
-    /// reading of the command text can catch, or an engine that stops saying what it holds —
-    /// ends the batch (`BATCH: TARGET REPLACED` or `TARGET UNCERTAIN`) and drops the cleanup
-    /// deliberately (`rollback: NOT ATTEMPTED`), a restore that cannot be aimed at the target
-    /// the steps ran against being worse than one that is missing.
+    /// (`rollback: INCOMPLETE`), and a step in `steps` after which nothing can certify that the
+    /// debugger still holds the target the batch started against — *replaced* through a wrapper
+    /// no reading of the command text can catch, an engine that stops saying, or a session left
+    /// pointed at a different process — ends the batch (`BATCH: TARGET REPLACED` or
+    /// `TARGET UNCERTAIN`) and drops the cleanup deliberately (`rollback: NOT ATTEMPTED`), a
+    /// restore that cannot be aimed at the target the steps ran against being worse than one
+    /// that is missing.
     /// The structured half carries all of that as values — `outcome`, the position it stopped at,
     /// `committed`, `rollback_complete`, `rollback`, what each step changed, and what the session
     /// holds now.

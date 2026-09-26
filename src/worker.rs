@@ -2048,7 +2048,7 @@ fn replacement_now(e: &DebugEngine) -> Option<String> {
         // that will not say — the second being this caller's decision rather than the other's:
         // retiring a session on a reading nobody got costs a caller their handle in the one state
         // where nothing can be checked. [`crate::batch`] decides the opposite way on the same
-        // value ([`Held::Unknown`]) because what it is deciding is whether to *write*.
+        // value ([`Held::Uncertain`]) because what it is deciding is whether to *write*.
         Ok(None) | Err(_) => None,
     }
 }
@@ -2097,15 +2097,12 @@ fn engine_reading(e: &DebugEngine) -> Result<Option<TargetFingerprint>, String> 
 /// leaves out and a batch's cannot.
 fn held_now(e: &DebugEngine, baseline: &BatchTarget) -> Held {
     match engine_reading(e) {
-        Err(why) => Held::Unknown(why),
+        Err(why) => Held::Uncertain(why),
         // Gone, not replaced — and `Same` rather than a fourth value, because the ending is
         // already carried by the step that caused it and refused by
         // [`refuse_when_the_target_is_gone`], both of which say more about it than this could.
         Ok(None) => Held::Same,
-        Ok(Some(now)) => match baseline.moved(&BatchTarget::read(e, now)) {
-            Some(why) => Held::Replaced(why),
-            None => Held::Same,
-        },
+        Ok(Some(now)) => baseline.moved(&BatchTarget::read(e, now)),
     }
 }
 
@@ -2150,25 +2147,34 @@ impl BatchTarget {
         }
     }
 
-    /// What changed between this reading and a later one, as a sentence, or `None` for a target
-    /// that is still the one the batch started against.
+    /// What changed between this reading and a later one, as the answer a batch acts on.
     ///
-    /// Its own function so the rule is testable without an engine, and so the two questions are
-    /// asked in one place: a replaced *target* and a moved *selection* are both "not what the
-    /// steps ran against", and only the sentence differs. The target is asked first, because a
-    /// session whose target was swapped has a new selection as well and the swap is the news.
-    fn moved(&self, now: &Self) -> Option<String> {
+    /// **The two answers are not the same news and must not be spelled the same**, which is the
+    /// second thing Codex found here on
+    /// [#392](https://github.com/glslang/windbg-mcp/pull/392). A replaced *target* retires this
+    /// session's handle, through the post-op fingerprint check — so the report may say the
+    /// session is finished. A moved *selection* does not: the fingerprint is unchanged, the
+    /// handle stays good, and a report claiming a retirement would be describing one that is not
+    /// going to happen. Both withhold the cleanup; only one of them ends the session.
+    ///
+    /// Its own function so the rule is testable without an engine, and so both questions are
+    /// asked in one place. The target is asked first, because a session whose target was swapped
+    /// has a new selection as well and the swap is the news.
+    fn moved(&self, now: &Self) -> Held {
         if let Some(why) = replacement(&self.fingerprint, &now.fingerprint, Some(true)) {
-            return Some(why);
+            return Held::Replaced(why);
         }
-        (self.current_process != now.current_process).then(|| {
-            "the debugger is pointed at a different process in this session than the one this \
-             batch's steps ran against. Nothing replaced the session's target — the set of \
-             processes it holds is unchanged — but memory and register writes land in whichever \
-             process is current, so a restore taken from one and applied in another would be \
-             written at an address that means something else there"
-                .to_string()
-        })
+        if self.current_process != now.current_process {
+            return Held::Uncertain(
+                "the debugger is pointed at a different process in this session than the one \
+                 this batch's steps ran against. Nothing replaced the session's target — the set \
+                 of processes it holds is unchanged — but memory and register writes land in \
+                 whichever process is current, so a restore taken in one and applied in another \
+                 would be written at an address that means something else there"
+                    .to_string(),
+            );
+        }
+        Held::Same
     }
 }
 
@@ -10479,9 +10485,12 @@ mod tests {
             },
             current_process: Some(pid),
         };
-        let moved = with_selection(2368)
-            .moved(&with_selection(1000))
-            .expect("the selection moved, so a restore would land in the other process");
+        let Held::Uncertain(moved) = with_selection(2368).moved(&with_selection(1000)) else {
+            panic!(
+                "a moved selection stops the batch, and is not a replacement: nothing retires \
+                 this session's handle for one"
+            )
+        };
         assert!(
             moved.contains("different process in this session"),
             "{moved}"
@@ -10492,7 +10501,7 @@ mod tests {
         );
         assert_eq!(
             with_selection(2368).moved(&with_selection(2368)),
-            None,
+            Held::Same,
             "an unmoved selection is not news"
         );
 
@@ -10507,11 +10516,12 @@ mod tests {
             },
             current_process: None,
         };
-        assert_eq!(kernel(vec![]).moved(&kernel(vec![])), None);
+        assert_eq!(kernel(vec![]).moved(&kernel(vec![])), Held::Same);
         assert!(
-            kernel(vec![])
-                .moved(&kernel(vec!["other.dmp".to_string()]))
-                .is_some(),
+            matches!(
+                kernel(vec![]).moved(&kernel(vec!["other.dmp".to_string()])),
+                Held::Replaced(_)
+            ),
             "and the target half still answers for one"
         );
     }
