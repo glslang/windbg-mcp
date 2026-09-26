@@ -86,7 +86,11 @@ calls free and the heap tools call allocated. That run filed two more, both now 
 [`DONE.md`](./DONE.md) — item 96, the pool walker's LFH reading, which it showed is not `nt`'s,
 and the ARM64 pool gate behind it; and item 98, the uncommitted memory that kept every live walk
 measured at `Partial` once the diagnostics were gone, which turned out to want the memory
-manager's answer rather than the allocator's. And items 100–101 from checking its fixes end to
+manager's answer rather than the allocator's. And item 104 from closing item 102 (2026-09-26): the target fingerprint spells
+*"this field does not apply"* and *"this field could not be read"* the same way, so two failures
+compare equal and a recovery reads as a replacement — which a handle survives and a batch's
+rollback does not.
+And items 100–101 from checking its fixes end to
 end through the tool surface once they had merged (2026-09-23) — the VS chunk chain coming apart
 on **29671**, found while confirming those fixes were not fitted to 26100, which they are not; and
 the same chain drifting 0x10 on 26100, which is all that is left of item 99 now that it too is in
@@ -2470,3 +2474,59 @@ guest side to speak to it — rather than by re-running a completed experiment.
    with `SizeOfImage` sixteen bytes later, then follow its `Blink` — as the **cross-check** rather
    than the primary. It is what found the head independently in H4, and the two agreeing is what
    made either believable.
+
+## 104. [windbg-mcp] A fingerprint field that was *refused* is indistinguishable from one that does not apply
+
+**Repo:** `windbg-mcp`. **Origin:** raised by Codex on
+[#392](https://github.com/glslang/windbg-mcp/pull/392) while item 102 was in review, against a
+hazard item 81 introduced and item 102 made more expensive.
+
+`worker::TargetFingerprint::read` builds its four fields with `.ok()`, so every query's **error**
+becomes `None` — the same value a field takes when the question does not apply to that kind of
+target. `connection` is `None` on every non-kernel target because `GetKernelConnectionOptions`
+*refuses* there, and `processes` is `None` on every kernel target because the gate never asks. The
+comparison then treats `None == None` as agreement, which is two different claims sharing a
+spelling: *"neither reading has one of these"* and *"neither reading could get one"*.
+
+Two consequences, and they point in opposite directions:
+
+- **Two failures compare equal.** A query that fails at the baseline *and* again afterwards leaves
+  the two readings agreeing on that field, so a swap only that field would have caught goes
+  unseen — two dumps of one process if `dump_files` is the one failing, two live kernels if it is
+  `kernel_connection_options`. For a *handle* that costs a stale handle; since item 102 it also
+  costs a `debug_batch` rollback written into the replacement, which is the whole hazard that item
+  was filed for.
+- **A recovery reads as a replacement.** A field that starts failing and then answers makes the
+  readings differ with nothing having happened to the target: the handle is retired and, since
+  item 102, the batch's cleanup is withheld and a replacement it cannot see is reported.
+
+- **Why deferred:** the obvious fix is not available, and the available one is a change to a type
+  both halves of the mechanism share. **The error cannot be read to tell the two apart**: DbgEng
+  answers `E_UNEXPECTED` both for a question that does not apply to this target and for one asked
+  at the wrong time — dbgscope measures the second on `GetNumberProcesses` with no debuggee and on
+  `WaitForEvent` after an ending, and the first is what `GetKernelConnectionOptions` gives on every
+  user-mode target. So separating them needs a **per-target-kind table of which fields are
+  required**, and that is the claim `TargetFingerprint`'s own doc records as having been wrong
+  three review rounds running — which is why that doc states *what is covered* rather than what
+  the gaps are. It also needs a decision **per caller**, as the readings already do: a handle
+  over-matches on purpose (a wrong retirement costs one re-open) while a batch withholds (a wrong
+  restore costs whatever that address means in somebody else's target), so one answer will not do
+  for both.
+- **What is already closed, and it is the cheap half.** A batch will not start against a reading
+  whose `kind` is missing (`worker::usable_baseline`), because that field decides which of the
+  others are even asked for — so a reading without it has a *shape* chosen by a guess, and the
+  next reading differs because the guess changed rather than because the target did. That is one
+  field and needs no table; the rest of this entry is the fields whose absence is legitimate.
+- **What would close it:** a reading that records, per field, whether the query was *not asked*,
+  *answered*, or *refused* — the first two from the gates that already exist
+  (`fingerprints_the_process`, and a second one for the connection query, which is the one that
+  needs the per-kind judgement) — and a comparison in which a `refused` on either side answers
+  *cannot tell* rather than *same*. `batch::Held::Unknown` is already that answer on the batch
+  side and already withholds cleanup; the handle side needs its own, since "cannot tell" there
+  must not become a retirement on no evidence, which `worker::replacement` deliberately refuses
+  today.
+- **Where it picks up:** `TargetFingerprint`, `TargetFingerprint::read`, `replacement` and
+  `usable_baseline` in `src/worker.rs`; `batch::Held` and `Debuggee::replaced` in `src/batch.rs`
+  for the batch's half of the decision. The measurement to take first is whether any of the three
+  always-required queries can actually fail on an engine that answers `GetExecutionStatus` — none
+  of this is reachable if they cannot, and nothing here has been able to make one do it.

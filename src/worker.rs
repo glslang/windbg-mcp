@@ -2087,13 +2087,44 @@ fn held_now(e: &DebugEngine, baseline: &TargetFingerprint) -> Held {
 
 /// The reading a batch measures its own steps against, taken before its first step runs.
 ///
-/// `None` when the engine does not answer that it is holding a target, which is the same guard
-/// [`held_now`] applies and for the same reason — reading a fingerprint off an engine with no
-/// debuggee is an access violation *inside* DbgEng. **A batch with no baseline is refused rather
-/// than run**: see [`run_batch`], where the alternative is an executor that checks nothing for
-/// the batch's whole length.
+/// `None` when the engine does not answer that it is holding a target — the same guard
+/// [`held_now`] applies, for the same reason: reading a fingerprint off an engine with no
+/// debuggee is an access violation *inside* DbgEng — or when the reading it gives back is not
+/// one a later reading can be compared against ([`usable_baseline`]). **A batch with no baseline
+/// is refused rather than run**: see [`run_batch`], where the alternative is an executor that
+/// checks nothing for the batch's whole length.
 fn batch_baseline(e: &DebugEngine) -> Option<TargetFingerprint> {
-    matches!(e.has_target(), Ok(true)).then(|| TargetFingerprint::read(e))
+    if !matches!(e.has_target(), Ok(true)) {
+        return None;
+    }
+    let reading = TargetFingerprint::read(e);
+    usable_baseline(&reading).then_some(reading)
+}
+
+/// Whether a reading is one a batch can measure its steps against.
+///
+/// **The `kind` is the field that decides which of the others are even asked for**
+/// ([`fingerprints_the_process`]), so a reading without it is not a fainter reading of the same
+/// thing — it is a reading whose *shape* was chosen by a guess, and one that will therefore differ
+/// from the next reading because the guess changed rather than because the target did. Everything
+/// downstream of that is unsound in both directions: a `.attach` that the process set would have
+/// caught goes unseen if the set was never asked for, and an unchanged target reads as replaced
+/// the moment `debuggee_type` starts answering again.
+///
+/// **This is the cheap half of a wider hole, and the rest is `FOLLOWUPS.md` item 104.**
+/// [`TargetFingerprint::read`] maps every query's error to `None`, so a field that was *refused*
+/// is indistinguishable from one that does not apply — and two refusals compare equal, which is
+/// the direction that matters. It cannot be fixed by reading the error: DbgEng answers
+/// `E_UNEXPECTED` both for a question that does not apply to this target and for one asked at the
+/// wrong time (dbgscope measures the second on `GetNumberProcesses` and `WaitForEvent`), so
+/// telling them apart needs a per-target-kind table of which fields are *required* — which is
+/// precisely the claim [`TargetFingerprint`]'s own doc records as having been wrong three review
+/// rounds running, and a change to a type both halves of this mechanism share. Raised by Codex on
+/// [#392](https://github.com/glslang/windbg-mcp/pull/392).
+///
+/// Its own function so the rule is testable without an engine, which the reading itself is not.
+fn usable_baseline(reading: &TargetFingerprint) -> bool {
+    reading.kind.is_some()
 }
 
 /// Takes the baseline after an opener, and after every other op checks that the engine is still
@@ -6249,13 +6280,14 @@ fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result
     // earlier by [`refuse_when_the_target_is_gone`], which every non-opener op passes through.
     let Some(started_on) = batch_baseline(e) else {
         return Err(
-            "This batch was not started: the debugger did not answer that it is holding a \
-             target, so there is no reading of it for the batch to measure its steps against — \
-             and a rollback must not be run against a target the batch cannot identify as the one \
-             its steps ran against. Nothing was run and nothing was changed — no step, no \
-             assertion, no rollback — so the target is exactly as it was and resubmitting is safe. \
-             Ask what this session holds; an engine that will not say what it is debugging \
-             usually wants the session ended and opened again."
+            "This batch was not started: the debugger did not give a reading of the target it is \
+             holding — it did not say whether it holds one, or would not say what kind — so there \
+             is nothing for the batch to measure its steps against, and a rollback must not be \
+             run against a target the batch cannot identify as the one its steps ran against. \
+             Nothing was run and nothing was changed — no step, no assertion, no rollback — so \
+             the target is exactly as it was and resubmitting is safe. Ask what this session \
+             holds; an engine that will not say what it is debugging usually wants the session \
+             ended and opened again."
                 .to_string(),
         );
     };
@@ -10321,6 +10353,45 @@ mod tests {
             processes: Some(vec![pid]),
             connection: None,
         }
+    }
+
+    /// **A batch may not start against a reading with no `kind`**, because that field decides
+    /// which of the others were asked for.
+    ///
+    /// Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392) as the cheap half
+    /// of a wider hole (`FOLLOWUPS.md` item 104). The shape it prevents: `debuggee_type` fails, so
+    /// `fingerprints_the_process(None)` conservatively says no and the process set is never read —
+    /// and then either the target is swapped by a `.attach` the set would have caught, or
+    /// `debuggee_type` recovers and the *same* target reads as replaced because the next reading
+    /// asks a question the baseline never did. Both are decided before a step runs, so refusing
+    /// costs a retry and nothing else.
+    ///
+    /// Mutation-verified: making `usable_baseline` answer `true` unconditionally fails the first
+    /// assertion here and no other test.
+    #[test]
+    fn a_batch_baseline_needs_the_field_that_decides_the_others() {
+        let unreadable = TargetFingerprint {
+            kind: None,
+            dumps: Some(vec![]),
+            processes: None,
+            connection: None,
+        };
+        assert!(
+            !super::usable_baseline(&unreadable),
+            "a reading whose shape was chosen by a guess cannot be compared against"
+        );
+        assert!(
+            super::usable_baseline(&of_a_process(2368)),
+            "an ordinary reading is usable, `connection` being absent on every user target"
+        );
+        // And a kernel one, where the *process set* is the field that is legitimately absent —
+        // so "usable" cannot be "every field answered", which is the wider hole item 104 keeps.
+        assert!(super::usable_baseline(&TargetFingerprint {
+            kind: kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_CONNECTION),
+            dumps: Some(vec![]),
+            processes: None,
+            connection: Some(0x1234),
+        }));
     }
 
     /// **A kernel target's fingerprint must not carry a process id**, and that is the one field
