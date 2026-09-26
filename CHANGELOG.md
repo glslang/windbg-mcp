@@ -141,7 +141,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   added two rounds earlier to explain rejections. Every exit now states `valid` and every
   failing one its reason in one field, across all four ways it can fail: unreadable head, empty
   list, unreadable first entry (which previously fell through to a confusing `DllBase 0x0`
-  message), and a first `DllBase` that is not the identified base. No Rust and no MCP
+  message), and a first `DllBase` that is not the identified base. **A ninth round asked for a
+  list that never closes to be rejected outright, and that half is declined**: `valid` answers
+  "is this the right block", which two independent structures agreeing on one address already
+  settles, while closing cleanly answers "is this the whole enumeration". Conflating them would
+  reject a genuine block and report *no debugger data block* for a capture that has one --
+  the round-2 defect from the other side, and a build with more than the walk's entry limit of
+  VTL1 modules would trigger it unaided. The finding's own second option is taken instead: a
+  separate `complete`, with `incomplete_reason` naming which of the four ways it stopped --
+  unreadable entry, entry limit, null forward link, or a walk that left the list. The declined
+  remedy is pinned as a mutation, so applying it fails three tests. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
