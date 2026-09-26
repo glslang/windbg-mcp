@@ -629,6 +629,31 @@ class WalkableGate(unittest.TestCase):
         self.assertFalse(proceed)
         self.assertIn("LA57", why)
 
+    def test_registers_that_disprove_long_mode_block_the_walk(self):
+        # `GetPagingMode` is the provider's reading; these are the registers. When they disagree
+        # the registers win, because a four-level walk of tables that are not four-level yields
+        # leaves rather than an error.
+        base = {"forced": True, "enabled": True, "cr3": 0x1201000, "paging_mode": "Long"}
+        long_mode = {"cr0": 0x80010033, "cr4": 0x1506B8, "efer": 0xD01}
+        self.assertTrue(probe.walkable({**base, **long_mode})[0])
+        for field, value, label in (
+            ("cr0", 0x00010033, "paging off"),
+            ("cr4", 0x1506B8 & ~(1 << 5), "PAE off"),
+            ("efer", 0xD01 & ~(1 << 10), "LMA off"),
+        ):
+            with self.subTest(register=label):
+                proceed, why = probe.walkable({**base, **long_mode, field: value})
+                self.assertFalse(proceed)
+                self.assertIn("long mode", why)
+
+    def test_an_unreadable_control_register_leaves_long_mode_unknown_and_permissive(self):
+        proceed, why = probe.walkable(
+            {"forced": True, "enabled": True, "cr3": 0x1201000, "paging_mode": "Long",
+             "cr0": 0x80010033, "cr4": 0x1506B8, "errors": {"efer": "0x80004001"}}
+        )
+        self.assertTrue(proceed, "unknown is not a disproof")
+        self.assertIsNone(why)
+
     def test_an_unreadable_paging_mode_does_not_block_the_walk(self):
         # Unknown is not "wrong", the same way an unreadable `enabled` is not False: the walk's
         # own output is the evidence, and the report says the question went unanswered.
@@ -1064,6 +1089,58 @@ class CaptureProvenance(unittest.TestCase):
         self.assertEqual(record["files"][0]["size"], 9)
         self.assertNotIn("files_before_replay", record)
         self.assertNotIn("replay_log_applied", record)
+
+
+class InputsAreResolvedFirst(unittest.TestCase):
+    """The rule is an ordering, so it is tested by watching what does *not* happen."""
+
+    def kit(self, directory, with_files=True):
+        import pathlib
+
+        root = pathlib.Path(directory)
+        if with_files:
+            (root / "bin" / "v" / "x64").mkdir(parents=True)
+            (root / "Include" / "v" / "um").mkdir(parents=True)
+            (root / "bin" / "v" / "x64" / "vmsavedstatedumpprovider.dll").write_bytes(b"")
+            (root / "Include" / "v" / "um" / "VmSavedStateDumpDefs.h").write_bytes(b"")
+        return root
+
+    def test_a_missing_image_is_a_refusal_rather_than_a_traceback(self):
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.kit(directory)
+            with self.assertRaises(probe.ProbeError) as raised:
+                probe.resolve_inputs(root, "v", str(root / "nope.exe"))
+        self.assertIn("missing on-disk image", str(raised.exception))
+
+    def test_the_provider_is_never_constructed_when_an_input_is_bad(self):
+        # The defect was ordering: --image was read after the capture had loaded and, with
+        # --apply-replay-log, after the .vmrs had been rewritten. Patching the provider to explode
+        # on construction is what pins "nothing was touched before the inputs were checked".
+        import pathlib
+        import tempfile
+
+        class NeverConstructed:
+            def __init__(self, *_args, **_kwargs):
+                raise AssertionError("the provider was constructed before inputs were validated")
+
+        with tempfile.TemporaryDirectory() as directory:
+            missing = str(pathlib.Path(directory, "nope.exe"))
+            with unittest.mock.patch.object(probe, "SavedState", NeverConstructed):
+                with self.assertRaises(probe.ProbeError):
+                    probe.main(["--vmrs", str(pathlib.Path(directory, "x.vmrs")), "--image", missing])
+
+    def test_a_file_that_is_not_a_pe64_image_is_refused_too(self):
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = self.kit(directory)
+            not_an_image = pathlib.Path(directory, "notpe.bin")
+            not_an_image.write_bytes(b"\xAA" * 0x2000)
+            with self.assertRaises(probe.ProbeError):
+                probe.resolve_inputs(root, "v", str(not_an_image))
 
 
 class CaptureSelection(unittest.TestCase):
