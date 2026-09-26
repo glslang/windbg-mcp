@@ -579,10 +579,13 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
                 at_step
                     .map(|at| format!(" at step {at}"))
                     .unwrap_or_default(),
-                if *rollback_complete {
-                    "complete"
-                } else {
-                    "INCOMPLETE"
+                match (*rollback_complete, outcome.as_str()) {
+                    (true, _) => "complete",
+                    // Read off the outcome rather than a field of its own: `target_replaced` is
+                    // the one verdict whose cleanup is dropped on purpose, and a viewer told
+                    // INCOMPLETE there would go looking for a restore that half ran.
+                    (false, "target_replaced") => "NOT ATTEMPTED",
+                    (false, _) => "INCOMPLETE",
                 }
             ),
         ),

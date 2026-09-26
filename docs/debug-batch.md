@@ -6,10 +6,11 @@ cleanup is exactly the call that times out, and a disconnect sends nothing at al
 that costs the VM: an un-restored patch, or a target left halted.
 
 `debug_batch` submits the whole sequence as one op. It runs **inside the session's engine process**,
-which owns the deadline, so the `always` block is reached on every path — success, a debugger error,
-an assertion that did not hold, the deadline expiring, the session being torn down under it — before
-the tool call returns. Part of the budget is reserved for it up front, because "what is left" after a
-step that ran to its own deadline is nothing.
+which owns the deadline, so the `always` block is reached on every path but one — success, a debugger
+error, an assertion that did not hold, the deadline expiring, the session being torn down under it —
+before the tool call returns. Part of the budget is reserved for it up front, because "what is left"
+after a step that ran to its own deadline is nothing. The exception is a target *replaced* under the
+batch, where the cleanup is dropped on purpose; it is the last of the limits below.
 
 ```jsonc
 {
@@ -52,19 +53,21 @@ batch with no rollback block at all: mutations applied, nothing restored, `COMMI
 same goes for a misspelt `expect`, which is a step that asserts nothing and lets the batch commit.
 Both fail *open*, so both are refused by name.
 
-The report names every step that ran, the exact one that failed, what each step changed, whether the
-rollback completed — reported *beside* the original failure, never instead of it — and whether the
+The report names every step that ran, the exact one that failed, what each step changed, what became
+of the rollback — reported *beside* the original failure, never instead of it — and whether the
 session is left stopped, running, detached, or uncertain. A batch that did not commit comes back as a
 tool error carrying that whole report.
 
 It carries the same report as values (see [Structured results](./structured-results.md)), and the
 pairing is worth reading once: a batch that **ran** answers `status: "ok"` — the report is the
 answer — on a result flagged `isError` when the transaction did not commit or its rollback did not
-finish. `status: "error"` is the batch that never ran at all: refused for a malformed step, a stale
+finish. `rollback_complete` stays the flag to branch on and `rollback` is the finer answer beside it
+(`not_supplied`, `complete`, `incomplete`, `not_attempted`), because a bare `false` cannot tell
+cleanup that failed from cleanup that was withheld. `status: "error"` is the batch that never ran at all: refused for a malformed step, a stale
 handle, too little budget left to start. Reading only `isError` cannot tell those apart, and it is
 the difference between "resubmit" and "check what the target is left holding".
 
-Four honest limits, none of them hidden in the report:
+Five honest limits, none of them hidden in the report:
 
 - A raw command that prints an error and returns success is a step that *succeeded* with that text
   (DbgEng reports most failures that way), so assert on it if it matters.
@@ -74,6 +77,16 @@ Four honest limits, none of them hidden in the report:
 - The reserve buys the rollback *time*, not a guarantee. A step that overruns far enough to consume
   the reserve as well leaves cleanup with no budget; the block is then skipped and the result says
   `rollback: INCOMPLETE`, naming each step that did not run.
+- **A step that *replaces* the debug target stops the batch and the rollback is deliberately not
+  run.** A wrapper hides the command that does it — `.if (1) { .opendump … }`, a `.foreach`, an
+  alias resolved at execution time, a breakpoint command run at a hit — so neither the by-name scan
+  that retires a handle nor `validate` can see one, and the engine process compares what it is
+  holding against what the batch started against instead, between every step and after the last.
+  What it protects is the cleanup: a target that has *gone* refuses a restore, while a target that
+  has been *replaced* accepts it, at an address that means something else there. The outcome is
+  `BATCH: TARGET REPLACED`, the disposition is `rollback: NOT ATTEMPTED` rather than `INCOMPLETE`,
+  and every `always` step is listed as skipped with the reason — so what the steps changed is still
+  in place on the original target, which needs a session of its own to put back.
 - Against a **call timeout** the guarantee is arithmetic: the batch budget is clamped so the
   rollback finishes and the report is written before the caller gives up. Against a **teardown** —
   `end_session`, or a client disconnect, both of which release the target — it is a signal instead.

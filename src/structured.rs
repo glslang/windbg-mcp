@@ -3966,6 +3966,10 @@ pub struct BatchReportInfo {
     /// rollback that did not finish is a target left patched, and it is independent of how the
     /// steps themselves went.
     pub rollback_complete: bool,
+    /// What became of the `always` block, which the flag above cannot say on its own: `false`
+    /// there covers both cleanup that ran and did not finish and cleanup that was deliberately
+    /// **not attempted**, and those send a caller to opposite places.
+    pub rollback: RollbackDisposition,
     /// What the session holds now — the question the step list cannot answer.
     pub after: SessionAfterInfo,
     /// The budget the batch was given.
@@ -4002,6 +4006,28 @@ pub enum BatchOutcomeName {
     /// against and its `always` block ran against a target that was not there: read `always` for
     /// what could not be undone, and open a new session.
     TargetGone,
+    /// A step **replaced** the debug target, so the steps after it were not attempted and the
+    /// `always` block was deliberately not run — `rollback` says `not_attempted`. Cleanup applied
+    /// to a target that never had the mutation writes into whatever that address means there, so
+    /// dropping it is the safe direction. Whatever the steps changed is still in place on the
+    /// original target, which this session can no longer reach: open one on it to put it back.
+    TargetReplaced,
+}
+
+/// What became of a batch's `always` block. Mirrors [`crate::batch::Rollback`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum RollbackDisposition {
+    /// No `always` block was supplied, so nothing was undone and nothing was owed.
+    NotSupplied,
+    /// Every `always` step completed.
+    Complete,
+    /// The block was attempted and at least one step did not complete — it failed, or the budget
+    /// ran out before it started. Something may be half restored.
+    Incomplete,
+    /// The block was dropped on purpose: the target was replaced under the batch. Nothing was
+    /// tried and nothing was undone, which is not the same news as a rollback that failed.
+    NotAttempted,
 }
 
 /// One step, as the report tells it.
@@ -4076,6 +4102,9 @@ impl From<&crate::batch::BatchReport> for BatchReportInfo {
             BatchOutcome::Abandoned { at } => (BatchOutcomeName::Abandoned, Some(at as u32)),
             BatchOutcome::Interrupted { at } => (BatchOutcomeName::Interrupted, Some(at as u32)),
             BatchOutcome::TargetGone { at } => (BatchOutcomeName::TargetGone, Some(at as u32)),
+            BatchOutcome::TargetReplaced { at } => {
+                (BatchOutcomeName::TargetReplaced, Some(at as u32))
+            }
         };
         Self {
             outcome,
@@ -4084,6 +4113,12 @@ impl From<&crate::batch::BatchReport> for BatchReportInfo {
             // the text is rendered from, so this cannot disagree with what a reader is told.
             committed: report.committed(),
             rollback_complete: report.rollback_complete(),
+            rollback: match report.rollback() {
+                crate::batch::Rollback::NotSupplied => RollbackDisposition::NotSupplied,
+                crate::batch::Rollback::Complete => RollbackDisposition::Complete,
+                crate::batch::Rollback::Incomplete => RollbackDisposition::Incomplete,
+                crate::batch::Rollback::NotAttempted => RollbackDisposition::NotAttempted,
+            },
             after: (&report.after).into(),
             budget_ms: ms(report.budget),
             elapsed_ms: ms(report.elapsed),

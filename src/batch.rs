@@ -18,13 +18,16 @@
 //!   the `always` block before it starts, so "the steps ran out of time" and "the rollback ran out
 //!   of time" are different events. The supervisor sizes that budget from the caller's remaining
 //!   patience (`worker::batch_budget`) so the report lands *before* the tool call gives up.
-//! * **`always` is reached on every path.** Success, a debugger error, an assertion that did not
-//!   hold, an expired deadline, a panic out of the debugger — all of them fall through to the same
-//!   block, cleanup continues past its own failures, and a failure inside it is recorded beside the
-//!   original rather than replacing it. What the reserve buys is *time to run*, not a guarantee: a
-//!   step that overruns far enough to consume the reserve too leaves cleanup with no budget, and
-//!   skipped and the report says the rollback is incomplete. That is the honest edge, and it is
-//!   pinned by a test rather than left to be discovered.
+//! * **`always` is reached on every path but one.** Success, a debugger error, an assertion that
+//!   did not hold, an expired deadline, a panic out of the debugger — all of them fall through to
+//!   the same block, cleanup continues past its own failures, and a failure inside it is recorded
+//!   beside the original rather than replacing it. What the reserve buys is *time to run*, not a
+//!   guarantee: a step that overruns far enough to consume the reserve too leaves cleanup with no
+//!   budget, so the block is skipped and the report says the rollback is incomplete. The one path
+//!   that deliberately **drops** it is a target *replaced* under the batch
+//!   ([`Debuggee::replaced`]): a restore run there lands in a target that never had the mutation,
+//!   at an address that means something else in it, so losing the cleanup is the safe direction
+//!   and running it is not. Both edges are pinned by tests rather than left to be discovered.
 //! * **The executor never touches DbgEng.** It drives a [`Debuggee`], which the worker implements
 //!   over a real engine and the tests implement over a script. Assertion failure, a command failure
 //!   after a mutation, deadline expiry and a rollback that itself fails are therefore all testable
@@ -846,6 +849,44 @@ pub trait Debuggee {
     /// process exit: the failure is what the step returns, and the ending would otherwise survive
     /// only in appended prose.
     fn has_target(&mut self) -> Option<bool>;
+    /// Whether the engine is holding a **different target** from the one this batch started
+    /// against — the sentence to report, or `None` when it is still the same one.
+    ///
+    /// **Asked between steps, and what it is for is the `always` block.** A target that has
+    /// *gone* is already terminal ([`Ran::target_gone`]) and is survivable without this: an engine
+    /// holding nothing refuses every cleanup step, so a restore that cannot land is reported as a
+    /// step that failed. A target that has been **replaced** accepts one. So a batch whose step
+    /// reached `.opendump`, `.attach`, `.create` or `.restart` — inside a `.if`, a `.foreach`, an
+    /// alias, or a breakpoint command run at a hit, none of which
+    /// [`crate::server::changes_debug_target`] can read in the text — would write its rollback
+    /// into somebody else's target, at an address that means something else there. On a live
+    /// kernel that is a write into another machine.
+    ///
+    /// **Against what this batch started with, not what the session was opened for.** The two are
+    /// different questions and the difference is a documented route rather than an edge: a call
+    /// naming no `session_id` is served by whatever the worker now holds, retired handles and all
+    /// (`docs/sessions.md`), so a batch can legitimately be running against a target that already
+    /// replaced the session's original — and measuring against the *session's* baseline would
+    /// refuse every such batch for the life of the worker. What a rollback needs is narrower and
+    /// is exactly this: the target the steps ran against is the target the cleanup runs against.
+    ///
+    /// `None` for a target that has **gone** and for an engine that will not answer, neither of
+    /// which is a replacement — `worker::replacement` states that rule and is where both are
+    /// tested. Engine-local bookkeeping either way, not a trip over the wire, which is what makes
+    /// it affordable after every step.
+    ///
+    /// **Measured live, and half of the intuition above is wrong about the engine.** On dbgeng
+    /// 10.0.26100.1742 (ARM64, 2026-09-26, the dev build driven over stdio): a wrapped `.create`
+    /// on a launched process is caught, at the **`g`** rather than at the `.create` — the command
+    /// only arms it (*"Create will proceed with next execution"*), so the resume is the step that
+    /// changed the process set and the step this names. A wrapped `.opendump` of a second kernel
+    /// dump is **not** caught, and correctly so: `||` then lists two systems with the original
+    /// still current, `? @$ip`, `version` and `lm` all still answer from it, and the fingerprint
+    /// reads the current system — so nothing has been replaced yet, only added. Switching to it
+    /// is what would do it, and `||1s` through `ExecuteWide` fails here with `0x80040205`. The
+    /// list above is the class of commands that can *reach* a replacement, not a list of ones
+    /// that each make one on their own.
+    fn replaced(&mut self) -> Option<String>;
 
     /// How long this batch has been running.
     fn elapsed(&self) -> Duration;
@@ -1028,6 +1069,40 @@ pub enum BatchOutcome {
     /// session; `after` says what happened and the `always` block says which cleanup could not
     /// run.
     TargetGone { at: usize },
+    /// A step **replaced** the debug target, so the steps from `at` were not attempted and
+    /// neither was the rollback. `at` is the 1-based position of the step it was first seen
+    /// after — which is the step that did it, the question being asked after every one.
+    ///
+    /// The one outcome whose `always` block does not run, and the reason is that running it is
+    /// worse than losing it: every cleanup step would be applied to a target that never had the
+    /// mutation, at an address that means something else in it. Kept apart from
+    /// [`Self::TargetGone`] because the two differ in exactly that — an engine holding *nothing*
+    /// refuses the cleanup, which is why that path can still attempt it — and because the
+    /// original target is still out there, patched, with this session no longer able to reach it.
+    /// [`BatchReport::rollback`] says `NotAttempted` rather than `Incomplete` for the same
+    /// reason: nothing was undone, and nothing here tried to.
+    TargetReplaced { at: usize },
+}
+
+/// What became of the `always` block — the answer [`BatchReport::rollback_complete`] cannot give
+/// on its own.
+///
+/// A `false` there is two different pieces of news: cleanup that **ran and did not finish**, and
+/// cleanup that was **deliberately not run**. They call for opposite next moves — go and look at
+/// what is half-restored, against go and look at a target this session can no longer reach — so
+/// they are separated here rather than in the prose a reader would have to match on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Rollback {
+    /// No `always` block was supplied, so there was nothing to run and nothing was undone.
+    NotSupplied,
+    /// Every `always` step completed.
+    Complete,
+    /// The block was attempted and at least one step did not complete — it failed, or the budget
+    /// ran out before it started.
+    Incomplete,
+    /// The block was dropped on purpose: the target was replaced under the batch, so cleanup
+    /// would have been applied to something that never had the mutation.
+    NotAttempted,
 }
 
 /// What the session holds once the batch is done — the question a caller cannot answer from the
@@ -1055,6 +1130,14 @@ pub struct BatchReport {
     pub steps: Vec<StepOutcome>,
     pub always: Vec<StepOutcome>,
     pub outcome: BatchOutcome,
+    /// How the target was replaced, when it was — the sentence the host produced by comparing
+    /// what the engine holds against what this batch started against.
+    ///
+    /// On the report rather than on [`BatchOutcome::TargetReplaced`] because the `always` block
+    /// can be where it is first seen, and that block's own steps are not what the outcome is
+    /// about: a cleanup step reaching `.opendump` leaves the *steps* committed and stops the rest
+    /// of the cleanup.
+    pub replaced: Option<String>,
     pub after: SessionAfter,
     /// Total budget the worker was given, for the report's header.
     pub budget: Duration,
@@ -1072,6 +1155,30 @@ impl BatchReport {
         self.always.iter().all(StepOutcome::ok)
     }
 
+    /// What became of the `always` block, at the resolution [`Self::rollback_complete`] cannot
+    /// reach. See [`Rollback`].
+    ///
+    /// **Both halves are asked for `NotAttempted`** — the outcome, which says the executor
+    /// decided to drop the block, and the step list, which says it actually did. Reading the
+    /// outcome alone would let this report a decision rather than what happened, which is the
+    /// one thing a rollback verdict must never do.
+    pub fn rollback(&self) -> Rollback {
+        if self.always.is_empty() {
+            return Rollback::NotSupplied;
+        }
+        if self.rollback_complete() {
+            return Rollback::Complete;
+        }
+        let untouched = self
+            .always
+            .iter()
+            .all(|step| matches!(step.result, StepResult::Skipped(_)));
+        match matches!(self.outcome, BatchOutcome::TargetReplaced { .. }) && untouched {
+            true => Rollback::NotAttempted,
+            false => Rollback::Incomplete,
+        }
+    }
+
     fn mutations(&self) -> Vec<&StepOutcome> {
         self.steps
             .iter()
@@ -1083,11 +1190,24 @@ impl BatchReport {
 
 // ---- execution ------------------------------------------------------------
 
+/// What [`run`] saw when the engine stopped holding the target the batch started against.
+///
+/// One value rather than two locals, because the two must agree: the sentence explains the
+/// decision and the step names where it was taken, and a report carrying one without the other
+/// is a rollback that vanished with no attribution.
+struct Replacement {
+    /// The host's sentence, as [`Debuggee::replaced`] gave it.
+    why: String,
+    /// The step that was running when it was first seen, rendered for the report.
+    by: String,
+}
+
 /// Runs a batch to completion and reports what happened.
 ///
 /// Never returns early and never propagates: every path — including an expired deadline — falls
-/// through to the `always` block and then to the state probe, because the report is the product
-/// here and a half-written one is the failure mode this tool exists to remove.
+/// through to the state probe, because the report is the product here and a half-written one is
+/// the failure mode this tool exists to remove. The `always` block is reached on every path but
+/// one, [`BatchOutcome::TargetReplaced`], where it is dropped on purpose.
 pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport {
     // Reserved before a single step runs. Taken from what is left afterwards it would routinely
     // be nothing, which is exactly the case the rollback is for.
@@ -1100,6 +1220,9 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     // Threaded through both blocks rather than re-derived from the step list each time, because
     // the `always` block needs the main block's answer as well as its own.
     let mut ended = false;
+    // Threaded for the same reason and one more: the `always` block is also a place this can
+    // *first* be true, and what it decides there is whether the rest of the cleanup runs.
+    let mut replaced: Option<Replacement> = None;
 
     for (index, step) in op.steps.iter().enumerate() {
         let position = index + 1;
@@ -1156,6 +1279,21 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
                 ));
                 continue;
             }
+            // The short form here and the whole sentence on the cleanup steps below, which is
+            // where it is owed: these steps were merely not run, while those were *withheld*, and
+            // a reader deciding whether to go and undo something by hand needs the reason beside
+            // the step that would have done it.
+            BatchOutcome::TargetReplaced { at } => {
+                steps.push(StepOutcome::skipped(
+                    position,
+                    step,
+                    format!(
+                        "step {at} replaced the debug target, so the batch stopped there rather \
+                         than running this against something else"
+                    ),
+                ));
+                continue;
+            }
         }
         // Before the deadline check, because the two are not the same news and this one is the
         // more urgent: something is tearing this session down and the rollback is what is left
@@ -1197,12 +1335,23 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         }
         let done = run_step(d, step, position, steps_deadline, &mut bound, ended);
         ended |= done.target_gone;
-        // The step says whether a break reached it, so this needs no separate question and covers
-        // every shape at once: a step cut short that still succeeded (including the *last* one,
-        // which no between-steps check can ever see), and one whose assertions stopped holding
-        // *because* the output was truncated — which would otherwise read as `FAILED` and send the
-        // caller to debug a step that was fine.
-        if done.target_gone {
+        // Asked after **every** step, including the last one, and that is the half that matters:
+        // a check only at the top of the loop would see every replacement except the one made by
+        // the final step, which is precisely the batch whose next act is its rollback. Mutually
+        // exclusive with the ending below rather than ranked against it — the host answers `None`
+        // for a target that has gone — so the order of these two branches is presentation.
+        let swapped = d.replaced();
+        if let Some(why) = swapped {
+            // Outranks every other reading of this step, and for a reason none of them share:
+            // the others leave a batch whose remaining work is *pointless*, this one leaves a
+            // batch whose remaining work is *harmful*. A step that failed or was cut short still
+            // ran against the target the caller meant; everything after this would not.
+            replaced = Some(Replacement {
+                why,
+                by: format!("`{}`", done.rendered),
+            });
+            outcome = BatchOutcome::TargetReplaced { at: position };
+        } else if done.target_gone {
             // Outranks every other reading of the same step, because it is the only one that is
             // terminal: a break can be resubmitted to the same session and a teardown to a fresh
             // one, while a target that has ended leaves nothing for either to be true of. The
@@ -1210,6 +1359,12 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             // nothing below would otherwise stop the batch.
             outcome = BatchOutcome::TargetGone { at: position };
         } else if done.cut_short {
+            // The step says whether a break reached it, so this needs no separate question and
+            // covers every shape at once: a step cut short that still succeeded (including the
+            // *last* one, which no between-steps check can ever see), and one whose assertions
+            // stopped holding *because* the output was truncated — which would otherwise read as
+            // `FAILED` and send the caller to debug a step that was fine.
+            //
             // A teardown outranks a break that reached the same step: the session is going away,
             // so "resubmit on a fresh session" is the advice, and `Interrupted` would send the
             // caller back to one that will not be there. Only asked here, where both can be true
@@ -1233,11 +1388,11 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         steps.push(done);
     }
 
-    // The rollback block, on every path. Its own deadline is the *whole* budget, which is what the
-    // reserve above bought it — and that holds when the batch is abandoned too, rather than the
-    // rollback being cut short to fit a teardown's grace. The grace is sized from this budget
-    // instead (`worker::BatchSignal::abandon`), so shortening the block here would only mean
-    // skipping cleanup the teardown was already waiting for.
+    // The rollback block, on every path but a replaced target. Its own deadline is the *whole*
+    // budget, which is what the reserve above bought it — and that holds when the batch is
+    // abandoned too, rather than the rollback being cut short to fit a teardown's grace. The grace
+    // is sized from this budget instead (`worker::BatchSignal::abandon`), so shortening the block
+    // here would only mean skipping cleanup the teardown was already waiting for.
     //
     // Announced first, and this is a safety boundary rather than bookkeeping: from here the host
     // must not let a Ctrl+Break reach the engine. An interrupted command returns `Ok` with whatever
@@ -1245,10 +1400,35 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     // reported as undone, which is the one outcome this whole tool exists to prevent. The host
     // refuses interrupts from this point and clears any already pending
     // (`worker::BatchEngine::rolling_back`).
-    d.rolling_back();
+    //
+    // **Not announced when nothing will be sent**, which is not tidiness: the announcement exists
+    // to protect cleanup commands from a break, and on the replaced path there are none — the
+    // batch issues no further engine call at all, the state probe below included. Announcing it
+    // anyway would drain a pending break that nothing then reports.
+    if replaced.is_none() {
+        d.rolling_back();
+    }
     let mut always: Vec<StepOutcome> = Vec::with_capacity(op.always.len());
     for (index, step) in op.always.iter().enumerate() {
         let position = index + 1;
+        // The whole sentence, on every withheld step: this is the block a caller reads to decide
+        // whether to go and undo something by hand, and "not attempted" without the reason is
+        // indistinguishable from the budget case two lines down, which means the opposite.
+        if let Some(seen) = &replaced {
+            always.push(StepOutcome::skipped(
+                position,
+                step,
+                format!(
+                    "the debug target was replaced while this batch was running, so its cleanup \
+                     was not attempted: {}. Running it would have applied the restore to a target \
+                     that never had the mutation, at an address that means something else there. \
+                     Whatever the steps above changed is still in place on the original target, \
+                     which this session can no longer reach.",
+                    seen.why
+                ),
+            ));
+            continue;
+        }
         if d.elapsed() >= budget {
             always.push(StepOutcome::skipped(
                 position,
@@ -1261,14 +1441,35 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         // patch that cannot be restored must not stop a breakpoint from being cleared.
         let done = run_step(d, step, position, budget, &mut bound, ended);
         ended |= done.target_gone;
+        // And stops outright at a replacement, which is the one thing a failure is not: the
+        // remaining cleanup would land somewhere else. The outcome is left alone — a cleanup step
+        // that swapped the target says nothing about whether the *steps* committed — so this is
+        // reported by the block itself, and `rollback()` reads `Incomplete` because part of it
+        // ran.
+        if let Some(why) = d.replaced() {
+            replaced = Some(Replacement {
+                why,
+                by: format!("`{}`", done.rendered),
+            });
+        }
         always.push(done);
     }
 
-    let after = probe_state(d, &steps, &always, budget);
+    let after = match &replaced {
+        // Not probed, deliberately. `? @$ip` would answer perfectly well — about the
+        // *replacement* — so the probe cannot be asked here without reporting somebody else's
+        // target as this session's state. What is still true is what this says: the thing this
+        // session named is not what the engine holds.
+        Some(seen) => SessionAfter::Detached {
+            by: seen.by.clone(),
+        },
+        None => probe_state(d, &steps, &always, budget),
+    };
     BatchReport {
         steps,
         always,
         outcome,
+        replaced: replaced.map(|seen| seen.why),
         after,
         budget,
         elapsed: d.elapsed(),
@@ -1786,6 +1987,21 @@ pub fn render(report: &BatchReport) -> String {
                 _ => "Nothing failed: the step did what it was asked.",
             }
         ),
+        BatchOutcome::TargetReplaced { at } => format!(
+            "BATCH: TARGET REPLACED at step {at} of {total} — that step swapped the debug target \
+             for another one, so the steps after it were not attempted and the `always` block was \
+             NOT RUN. {} Nothing has been undone: a restore applied to a target that never had \
+             the mutation writes into whatever that address means there, so the cleanup was \
+             dropped rather than misdirected. Read `mutations` above for what is still in place \
+             on the original target — this session cannot reach it any more, so putting it back \
+             means a session opened on it again. This one only wants ending.\n",
+            // The host's own sentence, which says *what kind* of swap it was. Carried here rather
+            // than restated, so the report cannot come to describe the replacement differently
+            // from the refusal the caller's next call will get.
+            report.replaced.as_deref().unwrap_or(
+                "A command replaced it; the engine no longer holds what this session named."
+            )
+        ),
     };
 
     let mutations = report.mutations();
@@ -1813,26 +2029,41 @@ pub fn render(report: &BatchReport) -> String {
         }
     }
 
-    if report.always.is_empty() {
-        out.push_str(
+    match report.rollback() {
+        Rollback::NotSupplied => out.push_str(
             "rollback: no `always` block was supplied, so nothing was undone. Anything listed \
              above is still in place.\n",
-        );
-    } else if report.rollback_complete() {
-        let _ = writeln!(
-            out,
-            "rollback: COMPLETE — all {} `always` step(s) ran",
-            report.always.len()
-        );
-    } else {
-        let stuck = report.always.iter().filter(|s| !s.ok()).count();
-        let _ = writeln!(
-            out,
-            "rollback: INCOMPLETE — {stuck} of {} `always` step(s) did not complete. See the \
-             `always` block below; this is reported beside the batch's own outcome, not instead \
-             of it.",
-            report.always.len()
-        );
+        ),
+        Rollback::Complete => {
+            let _ = writeln!(
+                out,
+                "rollback: COMPLETE — all {} `always` step(s) ran",
+                report.always.len()
+            );
+        }
+        // Its own line rather than a footnote on INCOMPLETE, because the two send a reader to
+        // opposite places: an incomplete rollback is a target half put back, and this is a target
+        // untouched by cleanup that went somewhere this session can no longer follow.
+        Rollback::NotAttempted => {
+            let _ = writeln!(
+                out,
+                "rollback: NOT ATTEMPTED — all {} `always` step(s) were skipped, on purpose. The \
+                 debug target was replaced under this batch, so cleanup would have been applied \
+                 to something that never had the mutation. This is not a rollback that failed: \
+                 nothing was tried and nothing was undone.",
+                report.always.len()
+            );
+        }
+        Rollback::Incomplete => {
+            let stuck = report.always.iter().filter(|s| !s.ok()).count();
+            let _ = writeln!(
+                out,
+                "rollback: INCOMPLETE — {stuck} of {} `always` step(s) did not complete. See the \
+                 `always` block below; this is reported beside the batch's own outcome, not \
+                 instead of it.",
+                report.always.len()
+            );
+        }
     }
 
     let _ = writeln!(
@@ -1905,7 +2136,19 @@ mod tests {
         /// target, which is precisely the case a script that only marked successful calls could
         /// not express.
         target_ended: bool,
+        /// Which call swaps the target for another; see [`Script::replaces_the_target_on`]. Keyed
+        /// on the call for the reason `ends_target_on` is: which step did it is what the report
+        /// has to name.
+        replaces_target_on: Option<String>,
+        /// Whether that call has now been answered, so [`Debuggee::replaced`] can say so.
+        replaced: bool,
     }
+
+    /// What the scripted host reports when its target has been swapped — the shape of
+    /// `worker::replacement_sentence`'s answer, which names the *kind* of change and not the
+    /// readings behind it.
+    const REPLACED: &str = "a command replaced the debug target with a different dump or trace \
+                            file";
 
     /// The message a scripted panic carries, so the report can be asserted to have kept it.
     const PANIC: &str = "called `Option::unwrap()` on a `None` value";
@@ -1930,6 +2173,8 @@ mod tests {
                 running: Some(false),
                 ends_target_on: None,
                 target_ended: false,
+                replaces_target_on: None,
+                replaced: false,
             }
         }
 
@@ -1999,6 +2244,18 @@ mod tests {
             self
         }
 
+        /// Makes the call containing `matching` **replace** the target — the scripted stand-in
+        /// for a wrapped `.opendump`, an alias, or a breakpoint command run at a hit, none of
+        /// which the command scan can read.
+        ///
+        /// A successful call, like [`Self::ends_the_target_on`] and for the same reason: the step
+        /// did what it was asked, so nothing in its result stops the batch. That is the whole
+        /// difficulty — a replacement is invisible in every value a step returns.
+        fn replaces_the_target_on(mut self, matching: &str) -> Self {
+            self.replaces_target_on = Some(matching.to_string());
+            self
+        }
+
         /// A break that lands in the gap *between* calls: the host knows, but no call carries it.
         /// The narrow case `Debuggee::interrupted` still exists for, now that a break during a call
         /// travels back on the call.
@@ -2052,6 +2309,16 @@ mod tests {
                 .is_some_and(|matching| call.contains(matching))
             {
                 self.target_ended = true;
+            }
+            // Before the `?` for the same reason, and it is the sharper case here: a wrapped
+            // `.opendump` inside a command list can leave the engine on the new target and still
+            // report an error from a later segment.
+            if self
+                .replaces_target_on
+                .as_deref()
+                .is_some_and(|matching| call.contains(matching))
+            {
+                self.replaced = true;
             }
             let output = self.answer(call)?;
             let interrupted = self
@@ -2108,6 +2375,15 @@ mod tests {
         }
         fn has_target(&mut self) -> Option<bool> {
             Some(!self.target_ended)
+        }
+        fn replaced(&mut self) -> Option<String> {
+            // Deliberately **not** recorded in `calls`: this is the host asking its own engine
+            // what it is holding, not a step's command, and the assertion that matters most here
+            // is that nothing further was *sent to the debugger* after a replacement.
+            //
+            // `None` once the target has gone, which is the rule the real host follows
+            // (`worker::replacement`): a target that is not there has not been replaced.
+            (self.replaced && !self.target_ended).then(|| REPLACED.to_string())
         }
         fn rolling_back(&mut self) {
             // A real host seals the job against further breaks here; the script only records that
@@ -2246,6 +2522,252 @@ mod tests {
                 by: "`.detach`".to_string()
             },
             "a released target is detached, not ended: {report:?}"
+        );
+    }
+
+    /// A step that **replaces** the target stops the batch and the rollback is **not run** —
+    /// which is the opposite of what every other path here does, and deliberately.
+    ///
+    /// `FOLLOWUPS.md` item 102, reached independently by Codex on
+    /// [#389](https://github.com/glslang/windbg-mcp/pull/389). Item 81's fingerprint retires the
+    /// *handle* when an op ends holding a different target; what it does not do is stop a batch
+    /// that is already running, and the sharper half is the `always` block. A replaced target
+    /// accepts a restore. So the cleanup would write the saved byte back at an address that means
+    /// something else in whatever the engine now holds — on a live kernel, into another machine.
+    /// Nothing upstream catches it: `validate` says nothing about command text, and
+    /// `retires_handle` reads the first token of each segment, which a `.if` wrapper does not
+    /// present.
+    ///
+    /// Asserted through the whole chain, because each link was separately capable of letting the
+    /// cleanup through: the outcome, the steps not attempted, the `always` steps skipped rather
+    /// than run, the disposition that says so, and — the one that pins the *safety* claim rather
+    /// than the reporting — that no further call reached the debugger at all.
+    #[test]
+    fn a_step_that_replaces_the_target_stops_the_batch_and_drops_the_rollback() {
+        let swap = r".if (1) { .opendump C:\other.dmp }";
+        let mut d = stopped()
+            .on("eq hevd!Guard 0", Ok(""))
+            .on(".opendump", Ok("Loading Dump File"))
+            .on("lm", Ok("modules"))
+            .on("eq hevd!Guard 0x1", Ok(""))
+            .on("bc *", Ok(""))
+            .replaces_the_target_on(".opendump");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![cmd("eq hevd!Guard 0"), cmd(swap), cmd("lm")],
+                vec![cmd("eq hevd!Guard 0x1"), cmd("bc *")],
+            ),
+            BUDGET,
+        );
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::TargetReplaced { at: 2 },
+            "the step that swapped the target must stop the batch and be named: {report:?}"
+        );
+        assert!(!report.committed());
+        assert!(
+            matches!(report.steps[2].result, StepResult::Skipped(_)),
+            "the step after the swap must not be attempted: {:?}",
+            report.steps[2].result
+        );
+        assert!(!d.ran("lm"), "and must not have reached the debugger");
+
+        // The half this item is actually about.
+        assert_eq!(
+            report.rollback(),
+            Rollback::NotAttempted,
+            "cleanup was withheld on purpose, which is not the same news as cleanup that failed"
+        );
+        assert!(
+            !report.rollback_complete(),
+            "nothing was put back, so the predicate every caller branches on must say so"
+        );
+        assert!(
+            report.always.iter().all(|s| matches!(
+                &s.result,
+                StepResult::Skipped(why) if why.contains("was not attempted")
+            )),
+            "every cleanup step says it was withheld, and why: {:?}",
+            report.always
+        );
+        assert!(
+            report.always[0]
+                .result
+                .detail()
+                .is_some_and(|why| why.contains("replaced")),
+            "the reason travels with the step that would have run: {:?}",
+            report.always[0]
+        );
+        assert!(
+            !d.ran("eq hevd!Guard 0x1") && !d.ran("bc *"),
+            "no cleanup may reach the replacement: {:?}",
+            d.calls
+        );
+
+        // Nothing further is asked of the engine at all — the state probe included, since
+        // `? @$ip` would answer about the *replacement* and be reported as this session's state.
+        assert!(
+            !d.ran("? @$ip"),
+            "the probe must not be sent: {:?}",
+            d.calls
+        );
+        assert!(
+            !d.sealed,
+            "there is no cleanup to protect from a break, so the rollback is never announced"
+        );
+        assert_eq!(
+            report.after,
+            SessionAfter::Detached {
+                by: format!("`{swap}`"),
+            },
+            "the session state names the step that took the target: {report:?}"
+        );
+
+        let text = render(&report);
+        assert!(text.contains("TARGET REPLACED at step 2"), "{text}");
+        assert!(text.contains("rollback: NOT ATTEMPTED"), "{text}");
+        assert!(
+            text.contains("a different dump or trace file"),
+            "the host's own sentence reaches the report: {text}"
+        );
+    }
+
+    /// The replacement is caught when the **last** step makes it, which is the only placement
+    /// that matters and the one a between-steps check alone would miss.
+    ///
+    /// Mutation-verified against exactly that. Moving the check to the top of the loop, beside
+    /// `abandoned` and `interrupted`, fails **both** replacement tests and fails them differently,
+    /// which is the useful part: this one comes back `Committed` with its restore written into the
+    /// new target — there being no later step for a top-of-loop check to catch it at — while the
+    /// test above stops the batch at the wrong step, naming `lm` as what took the target and
+    /// reporting `TargetReplaced { at: 3 }`. Two failures, one saying the guard does not hold and
+    /// one saying it misattributes. That is also the shape the item describes: a batch whose
+    /// second act is its rollback.
+    #[test]
+    fn a_replacement_made_by_the_last_step_still_drops_the_rollback() {
+        let mut d = stopped()
+            .on("eq hevd!Guard 0", Ok(""))
+            .on(".opendump", Ok("Loading Dump File"))
+            .on("eq hevd!Guard 0x1", Ok(""))
+            .replaces_the_target_on(".opendump");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![
+                    cmd("eq hevd!Guard 0"),
+                    cmd(r".foreach (x { .echo 1 }) { .opendump C:\other.dmp }"),
+                ],
+                vec![cmd("eq hevd!Guard 0x1")],
+            ),
+            BUDGET,
+        );
+
+        assert_eq!(report.outcome, BatchOutcome::TargetReplaced { at: 2 });
+        assert!(
+            !d.ran("eq hevd!Guard 0x1"),
+            "the restore must not be written into the new target: {:?}",
+            d.calls
+        );
+        assert_eq!(report.rollback(), Rollback::NotAttempted);
+    }
+
+    /// A **cleanup** step can replace the target too, and the cleanup behind it stops there.
+    ///
+    /// The same hazard one block later, and it is not the same news: the steps themselves ran and
+    /// committed, so the outcome stays `Committed` and it is the rollback that is short. That
+    /// makes it `Incomplete` rather than `NotAttempted` — part of it ran — which is the
+    /// distinction the disposition exists to carry.
+    #[test]
+    fn a_cleanup_step_that_replaces_the_target_stops_the_rest_of_the_cleanup() {
+        let mut d = stopped()
+            .on("eq hevd!Guard 0", Ok(""))
+            .on("bc *", Ok(""))
+            .on(".opendump", Ok("Loading Dump File"))
+            .on("eq hevd!Guard 0x1", Ok(""))
+            .replaces_the_target_on(".opendump");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![cmd("eq hevd!Guard 0")],
+                vec![
+                    cmd("bc *"),
+                    cmd(r".if (1) { .opendump C:\other.dmp }"),
+                    cmd("eq hevd!Guard 0x1"),
+                ],
+            ),
+            BUDGET,
+        );
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::Committed,
+            "a cleanup step says nothing about whether the steps committed: {report:?}"
+        );
+        assert!(d.ran("bc *"), "the cleanup before it ran");
+        assert!(
+            !d.ran("eq hevd!Guard 0x1"),
+            "the cleanup after it must not reach the replacement: {:?}",
+            d.calls
+        );
+        assert_eq!(
+            report.rollback(),
+            Rollback::Incomplete,
+            "part of the block ran, so this is a rollback that is short rather than one withheld"
+        );
+        assert_eq!(
+            report.after,
+            SessionAfter::Detached {
+                by: r"`.if (1) { .opendump C:\other.dmp }`".to_string(),
+            },
+            "and the session state names the cleanup step that did it: {report:?}"
+        );
+    }
+
+    /// A target that merely **went away** still gets its rollback attempted — the fail-safe
+    /// direction, and the line between the two paths.
+    ///
+    /// Stated as its own test because the distinction is what makes dropping the cleanup above
+    /// defensible rather than lossy: an engine holding nothing *refuses* every restore, so
+    /// attempting them costs a failure report, while an engine holding something else *accepts*
+    /// them. Mutation-verified by making the host answer a replacement for a gone target, which
+    /// this fake refuses to do for the reason `worker::replacement` gives.
+    #[test]
+    fn a_target_that_has_gone_is_not_a_replacement_and_keeps_its_rollback() {
+        let mut d = stopped()
+            .on("g", Ok("the process exited"))
+            .on("bc *", Err("No active debuggee"))
+            .ends_the_target_on("g")
+            // Both at once, which is the case the rule is about: the engine answers `has_target`
+            // no, so nothing may be concluded about *what* it holds.
+            .replaces_the_target_on("g");
+
+        let report = run(
+            &mut d,
+            &op(
+                vec![step(StepAction::Resume {
+                    command: "g".to_string(),
+                    timeout_ms: None,
+                })],
+                vec![cmd("bc *")],
+            ),
+            BUDGET,
+        );
+
+        assert_eq!(report.outcome, BatchOutcome::TargetGone { at: 1 });
+        assert!(
+            d.ran("bc *"),
+            "the cleanup is still attempted: {:?}",
+            d.calls
+        );
+        assert_eq!(
+            report.rollback(),
+            Rollback::Incomplete,
+            "and its refusal is reported as a rollback that did not finish: {report:?}"
         );
     }
 

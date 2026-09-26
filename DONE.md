@@ -71,7 +71,10 @@ written for a different one of the three shapes it weighed: flip two assertions 
 which is right if you parse the command language and wrong if you read the target instead — and
 reading the target is the shape it called the only sound one. It also records the primitive that
 reads as though it already answered the question and does not (`dbgscope`'s `target_identity`),
-and the one case that looks identical to a replacement and must not be treated as one.
+and the one case that looks identical to a replacement and must not be treated as one. **Item 102**
+(2026-09-26) is here for a measurement that contradicts its own example: the command every draft of
+it used to illustrate a replacement, a wrapped `.opendump`, turns out not to make one on this
+engine — it adds a target and leaves the current one alone. The entry records what does.
 
 ## What is in here
 
@@ -133,6 +136,7 @@ and the one case that looks identical to a replacement and must not be treated a
 - [Item 80](#80-windbg-mcp-identity-re-derives-the-backend-distinction-once-per-field--done-2026-09-25) — [windbg-mcp] `identity()` re-derives the backend distinction once per field — done (2026-09-25)
 - [Item 32](#32-windbg-mcp-two-arm64-ci-entries-one-of-which-expires--done-2026-09-25) — [windbg-mcp] Two ARM64 CI entries, one of which expires — done (2026-09-25)
 - [Item 81](#81-windbg-mcp--dbgscope-changes_debug_target-reads-a-name-and-a-wrapper-does-not-say-one--done-2026-09-25) — [windbg-mcp + dbgscope] `changes_debug_target` reads a name, and a wrapper does not say one — done (2026-09-25)
+- [Item 102](#102-windbg-mcp-a-debug_batch-runs-its-rollback-against-whatever-target-it-ends-up-holding--done-2026-09-26) — [windbg-mcp] A `debug_batch` runs its rollback against whatever target it ends up holding — done (2026-09-26)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -5111,3 +5115,93 @@ The fingerprint is three engine reads, and what each is for is worth keeping:
 and `set_breakpoint` in `src/server.rs` — all four of which described the gap and now describe the
 division of labour. Upstream: `DebugEngine::debuggee_type`, `DebuggeeType` and
 `DebugEngine::dump_files` in dbgscope.
+
+## 102. [windbg-mcp] A `debug_batch` runs its rollback against whatever target it ends up holding — **done** (2026-09-26)
+
+**Filed while closing item 81, and not introduced by it.** That item's fingerprint retires a
+session's handles when an op ends holding a different target, which is the *handle* guarantee. What
+it does not do is stop a batch that is already running, and that is the sharper half: `batch::run`
+watched one thing between steps, `done.target_gone`, so a target that had been **replaced** rather
+than released read as an ordinary step. Every remaining step ran against the replacement — and so
+did the `always` block, whose whole job is to put a mutation back, writing a restore into a target
+that never had the mutation, at an address that means something else there. On a live kernel that
+is a write into somebody else's machine.
+
+Nothing upstream stopped it. `batch::validate` refuses unknown fields and bad operands and says
+nothing about command text; `batch::retires_handle` and `batch::mutation` both ask
+`server::changes_debug_target`, which matches the first token of each `;`-separated segment and so
+cannot see a wrapper — and `retires_handle` retires the *handle* in any case, which does not stop a
+batch that is already running. **Reached independently by Codex** on
+[#389](https://github.com/glslang/windbg-mcp/pull/389) while that PR was in review, with the same
+remedy: recheck at step boundaries and abort the remaining steps *including* the cleanup.
+
+**What landed.** `Debuggee::replaced` — one more question the executor asks its host, answered in
+the worker by the same fingerprint comparison item 81 built. `batch::run` asks it after **every**
+step, and on a `Some` it stops the batch as `BatchOutcome::TargetReplaced { at }`, lists every
+remaining step as skipped, and **drops the `always` block**, listing each of its steps as skipped
+with the reason. From that moment the batch issues no further engine call at all: it does not
+announce the rollback (`rolling_back` exists to protect cleanup commands from a break, and there
+are none), and it does not run the state probe (`? @$ip` would answer perfectly well — about the
+*replacement*), reporting `SessionAfter::Detached` naming the step instead.
+
+Three things about the shape of it are worth keeping.
+
+- **The baseline is the batch's, not the session's.** `replacement_now` compares against
+  `OPENED_AS`, the reading taken when the *session's* target was opened; the batch compares against
+  what it found when it started (`worker::batch_baseline`, `replacement_since`). The two are
+  different questions and the difference is a documented route rather than an edge: a call naming
+  no `session_id` is deliberately served by whatever the worker now holds, retired handles and all,
+  so a batch can legitimately be running against a target that already replaced the session's
+  original. Measured against `OPENED_AS`, every such batch would have refused to roll back for the
+  life of the worker — the same over-reach `refuse_when_the_target_was_replaced` was narrowed to
+  avoid on #389, arrived at from the other direction.
+- **The rollback verdict needed a third value, and `rollback_complete` had to stay.** A `false`
+  there is now two pieces of news — cleanup that ran and did not finish, and cleanup that was
+  deliberately not run — and they send a caller to opposite places. So `BatchReport::rollback`
+  answers `NotSupplied`/`Complete`/`Incomplete`/`NotAttempted` and
+  `structured::BatchReportInfo` carries both: the flag is what `server::batch_settled` branches on
+  to decide `isError`, and removing it would have moved that decision as a side effect of a
+  reporting change. `NotAttempted` is asked of the outcome **and** of the step list, so the report
+  states what happened rather than what the executor decided.
+- **The cleanup block can be where it is first seen, and that is not the same news.** An `always`
+  step that replaces the target stops the rest of the cleanup, but the steps themselves ran, so the
+  outcome stays `Committed` and the disposition is `Incomplete` — part of the block ran. This was
+  not in the item and is the same hazard one block later; it cost four lines.
+
+**What measuring it disproved — the item's own example.** Every draft of this entry, and the
+paragraph in `CLAUDE.md`-adjacent prose that came with item 81, illustrated a replacement with
+`.if (1) { .opendump C:\other.dmp }`. Driven live against the dev build over stdio (dbgeng
+10.0.26100.1742, ARM64, 2026-09-26) that command does **not** replace anything: `||` afterwards
+lists two systems with the original still current, and `? @$ip`, `version` and `lm` all still
+answer from it, so the fingerprint reads the current system and correctly says nothing has changed.
+`.opendump` *adds* a target; switching to it is what would replace one, and `||1s` through
+`ExecuteWide` fails here with `0x80040205`. What does reproduce it, end to end, is a wrapped
+`.create` on a launched process — and it is caught at the **`g`**, not at the `.create`, because
+the command only arms the creation (*"Create will proceed with next execution"*). The live run
+reported `TARGET REPLACED at step 3`, `rollback: NOT ATTEMPTED`, the cleanup listed as skipped with
+its reason, **DETACHED/REPLACED by `g`**, and item 81's supervisor retirement firing at the end of
+the same op — the two halves agreeing about one event. `end_session` still worked on the retired
+handle (item 55) and the launched process did not outlive it.
+
+**Mutation-verified, and the first attempt at stating that was wrong too.** Moving the check to the
+top of the loop, beside `abandoned` and `interrupted`, fails **both** replacement tests rather than
+the one the comment first claimed, and fails them differently: the two-step batch comes back
+`Committed` with its restore written into the new target, having no later step for such a check to
+catch it at, while the three-step batch stops at the wrong step and names `lm` as what took the
+target. Making the scripted host report a replacement for a target that has *gone* fails exactly
+the test that pins that rule and no other.
+
+**What it cost the surface.** The tool description owes two more sentences, so `debug_batch` goes
+10,021 → 10,405 model-visible bytes (+384, still under the 11,200 ceiling) and the whole surface
+94,971 → 95,355. The output schema grows 3,223 → 3,521 for the `rollback` field and the new outcome
+name. Re-recorded in `tests/golden/tool_budget.json`; the group and spec tables in
+`src/toolset.rs`, `docs/tool-surface.md` and `docs/token-budget.md` move with it, and three shares
+round differently. Worth noting while re-deriving them: the *prose* totals in `README.md`,
+`src/toolset.rs` and `docs/remote-listener.md` were already 50 B behind the served surface before
+this change (94,921 against 94,971), which is what "prose is not swept" buys and costs.
+
+**Where it picked up.** `batch::run`'s between-steps checks, `batch::Debuggee::replaced`,
+`BatchOutcome::TargetReplaced`, `BatchReport::replaced` and `BatchReport::rollback` in
+`src/batch.rs`; `BatchEngine`, `batch_baseline` and `replacement_since` in `src/worker.rs`;
+`BatchOutcomeName::TargetReplaced` and `RollbackDisposition` in `src/structured.rs`; the batch
+verdict's rendering in `src/cast.rs`; `docs/debug-batch.md`, which states the rollback contract.
