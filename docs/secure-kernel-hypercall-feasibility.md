@@ -265,6 +265,25 @@ Two mechanisms, cheapest first:
    operator reconfigures their machine, and none of which ships. **That makes it a research
    capability and not a feature**, however well it works.
 
+   **The oracle ships both answers to that wall, and the second one is worth naming so it is not
+   re-derived as a good idea.** Beside the revoked-certificate `hvmm.sys`, `MEMORY_ACCESS_TYPE`
+   carries `MmAccessRtCore64`, and `hvlib.dll` contains the string `RTCore64` twice — MSI
+   Afterburner's driver, whose CVE-2019-16098 gives arbitrary physical read and write to any caller
+   that can reach it. That is the bring-your-own-vulnerable-driver route: if you cannot get signed,
+   ride something that already is.
+
+   **This plan does not take it**, for reasons that are practical before they are anything else.
+   RTCore64 is on Microsoft's vulnerable-driver blocklist and HVCI refuses it by name, so it fails
+   on exactly the hosts where a bypass would be wanted — the same wall as `hvmm.sys`, reached by
+   another road. It is among the most closely monitored binaries in existence, so EDR flags it and
+   a blocklist update breaks it. And the asymmetry runs the wrong way: a purpose-built driver needs
+   to issue *specific hypercalls against a named partition*, where RTCore64 hands arbitrary
+   physical memory to anyone who asks. Avoiding a driver of our own would produce the **larger**
+   attack surface, not the smaller one.
+
+   So where a driver is unavoidable it is **ours, minimal, and test-signed** — the operator
+   reconfigures their machine either way, and only one of the two is auditable.
+
    What survives that constraint is being a **client of drivers Microsoft already signs**:
    `winhvr.sys` and `vid.sys`, or the documented user-mode **WHP** API. Those carry no signing
    problem at all, because we ship no driver. The backend table in
