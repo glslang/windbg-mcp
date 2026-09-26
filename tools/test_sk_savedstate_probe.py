@@ -601,9 +601,64 @@ class ModuleListValidation(unittest.TestCase):
         self.assertIn("is not the identified base", listing["invalid_reason"])
         self.assertEqual(len(listing["entries"]), 1, "the entries are still reported")
 
-    def test_an_unreadable_head_is_not_a_valid_list(self):
-        listing = probe.walk_module_list(lambda _va: None, self.HEAD_VA, BASE_VA)
-        self.assertNotEqual(listing.get("valid"), True)
+    def test_every_failing_exit_says_why_in_the_same_field(self):
+        # The caller records `invalid_reason` and nothing else, so an exit that reports its
+        # failure anywhere else is a rejection with no explanation -- which reads the same as an
+        # unexplained one.
+        unreadable_head = probe.walk_module_list(lambda _va: None, self.HEAD_VA, BASE_VA)
+
+        empty_page = bytearray(PAGE)
+        struct.pack_into("<Q", empty_page, self.HEAD_VA & (PAGE - 1), self.HEAD_VA)
+        empty = probe.walk_module_list(
+            module_list_reader({self.HEAD_VA & ~(PAGE - 1): bytes(empty_page)}),
+            self.HEAD_VA,
+            BASE_VA,
+        )
+
+        head_only = bytearray(PAGE)
+        struct.pack_into("<Q", head_only, self.HEAD_VA & (PAGE - 1), self.ENTRY_VA)
+        unreadable_entry = probe.walk_module_list(
+            module_list_reader({self.HEAD_VA & ~(PAGE - 1): bytes(head_only)}),
+            self.HEAD_VA,
+            BASE_VA,
+        )
+
+        wrong_base = probe.walk_module_list(
+            module_list_reader(self.pages_for(0xFFFFF80299999000)), self.HEAD_VA, BASE_VA
+        )
+
+        for name, listing in (
+            ("unreadable head", unreadable_head),
+            ("empty list", empty),
+            ("unreadable first entry", unreadable_entry),
+            ("wrong base", wrong_base),
+        ):
+            with self.subTest(exit=name):
+                self.assertIs(listing["valid"], False)
+                self.assertTrue(listing["invalid_reason"], "a rejection with no reason")
+        self.assertIn("not readable", unreadable_head["invalid_reason"])
+        self.assertIn("empty", empty["invalid_reason"])
+        self.assertIn("not readable", unreadable_entry["invalid_reason"])
+        self.assertIn("identified base", wrong_base["invalid_reason"])
+
+    def test_an_unreadable_list_is_rejected_with_its_reason_carried_to_the_hit(self):
+        image = image_with_kdbg([(0x100, 0x3A0, BASE_VA, 0xDEAD0000)])
+        candidates = [{"va": BASE_VA, "gpa": 0xCD0000, "size_of_image": 0x4000}]
+
+        def confirm(candidate, hit):
+            listing = probe.walk_module_list(
+                lambda _va: None, hit["ps_loaded_module_list"], candidate["va"]
+            )
+            return bool(listing.get("valid")), listing
+
+        chosen, attempts = probe.identify_image(
+            candidates, lambda _va, _size: (image, []), confirm=confirm
+        )
+        self.assertIsNone(chosen)
+        hit = attempts[0]["hits"][0]
+        self.assertIs(hit["confirmed"], False)
+        self.assertIsNotNone(hit["rejected_by"], "an unreadable list is not an unexplained one")
+        self.assertIn("not readable", hit["rejected_by"])
 
 
 class ConfirmationGetsTheLastWord(unittest.TestCase):

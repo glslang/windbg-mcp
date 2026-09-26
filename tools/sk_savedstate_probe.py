@@ -1023,6 +1023,13 @@ def walk_module_list(reader, head_va, expected_base, limit=32):
     yields plausible names and sizes, which is exactly why it has to be checked rather than
     looked at. The result carries `valid`, and a caller that gets `False` should move on to the
     next hit or the next candidate rather than publish the entries.
+
+    **Every exit says `valid`, and every failing one says why in the same field.** An earlier
+    version returned the unreadable-head case under `error` instead, so the caller -- which reads
+    `invalid_reason` -- recorded the rejection with no reason at all, making an unreadable list
+    indistinguishable from a list that named somebody else. One field, four ways to fail:
+    unreadable head, empty list, unreadable first entry, and a first `DllBase` that is not the
+    identified base.
     """
 
     def read_span(va, size):
@@ -1037,7 +1044,13 @@ def walk_module_list(reader, head_va, expected_base, limit=32):
 
     head = read_span(head_va, 0x10)
     if head is None:
-        return {"head_va": head_va, "error": "list head not readable"}
+        return {
+            "head_va": head_va,
+            "entries": [],
+            "closed": False,
+            "valid": False,
+            "invalid_reason": f"list head at 0x{head_va:X} is not readable",
+        }
     entries = []
     current = struct.unpack_from("<Q", head, 0)[0]
     while current and current != head_va and len(entries) < limit:
@@ -1067,6 +1080,11 @@ def walk_module_list(reader, head_va, expected_base, limit=32):
     first = entries[0] if entries else None
     if first is None:
         result.update(valid=False, invalid_reason="the list is empty")
+    elif "dll_base" not in first:
+        result.update(
+            valid=False,
+            invalid_reason=f"first entry at 0x{first['entry_va']:X} is not readable",
+        )
     elif first.get("dll_base") != expected_base:
         result.update(
             valid=False,
