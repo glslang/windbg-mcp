@@ -1012,6 +1012,17 @@ so it is not done here.
 walks, symbol resolution against the image — with H5a parked behind the two-part reversal condition
 above.
 
+**H5b is scoped as `FOLLOWUPS.md` item 103**, and the scoping surfaced one gate worth naming here
+because it decides whether H5b is a shippable feature at all. **The live driver transport cannot
+ship** — H2 already established that a driver of this kind is a research capability rather than a
+feature — so the question is whether a **driver-free source containing VTL1 pages** exists. A guest
+kernel crash dump cannot be one: the guest's own NT cannot read VTL1 memory and so cannot write it
+into a dump, which is the same refusal H4 measured from outside. A **Hyper-V saved state** is
+written by the host and is therefore the candidate. That measurement is item 103's first task, and
+its outcome decides whether H5b is a feature or an offline library with recorded fixtures. Also
+noted there: with no KD transport in SK there is **no execution control over VTL1 at all**, so H5b
+is a read-only inspector and never a debug session.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility

@@ -2006,3 +2006,106 @@ else's PR.
 `structured::BatchReportInfo`'s `rollback_complete`. The fingerprint to ask is
 `worker::replacement_now`, which already answers exactly this question for an op and would need to
 answer it for a step. `docs/debug-batch.md` states the rollback contract and would move with it.
+
+## 103. [windbg-mcp] H5b — expose the Secure Kernel reads, without forcing them through DbgEng
+
+**Repo:** `windbg-mcp`. **Origin:** the H5 route decision in
+[`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md),
+2026-09-26. H0–H4 passed: a root partition can read a VBS guest's VTL1 and `securekernel.exe`,
+`KdDebuggerDataBlock` and `SkLoadedModuleList` were all located and identified. H5a — driving
+DbgEng through EXDI — is parked behind a two-part reversal condition, so this is the route.
+
+**Two measured constraints bound the scope before any design, and both narrow it sharply.**
+
+- **The live transport cannot ship.** A driver whose purpose is handing user mode a read of memory
+  it could not otherwise reach will not be WHQL-signed, and every alternative — test-signed,
+  self-signed, enterprise policy — means the operator reconfigures their machine. H2 already
+  recorded the conclusion: *a research capability and not a feature, however well it works*. So
+  **the repo ships no driver**, and any design that assumes one is designing a thing nobody can
+  install.
+- **There is no execution control over VTL1 at all.** Post-26100 `securekernel.exe` ships no KD
+  transport; every `Kd`-prefixed symbol in it is data. So there is nothing to break into, step, or
+  resume. **H5b is a read-only inspector rather than a debug session**, which takes execution
+  control, the two waits, async runs, breakpoints and teardown-on-resume out of scope entirely
+  rather than leaving them as later work.
+
+### S0 — the gate that decides whether any of this ships. Do it first
+
+**Is there a driver-free memory source that contains VTL1 pages?** Everything below is the same
+code with a different byte source, so this decides whether H5b is a feature or a library with
+fixtures — and it is a measurement, not a design choice.
+
+The asymmetry to test, and the reason it is not obvious: **a guest kernel crash dump cannot work**,
+because the guest's own NT cannot read VTL1 memory and therefore cannot write it into a dump — the
+same refusal H4 measured from the outside. A **Hyper-V saved state** is written by the *host*, so
+it is the candidate that could contain those pages. Whether it does is unmeasured, and the whole
+shippability of this item turns on it.
+
+- **Pass:** SK's PML4, `securekernel.exe` and the `KDBG` block are reachable from a saved state of
+  the VBS guest, with no driver loaded, matching what the live path found for the same boot.
+- **Control:** the same read against a saved state of the **VBS-off** guest finds no SK — H4's
+  Control 1 repeated on the new source, which is what separates "read the guest" from "read
+  something".
+- **If it fails:** stop, and scope collapses to S1 as an offline library plus recorded fixtures.
+  Say so rather than shipping a feature whose only transport the operator cannot obtain.
+
+### S1 — the decode layer, source-agnostic. The bulk of the work, and offline-testable
+
+Everything H4 did, expressed over a single `read(gpa, len)` seam so the byte source is a parameter:
+the guarded four-level page-table walk, PE identification against an on-disk image, the
+`KdDebuggerDataBlock` decode, and the `SkLoadedModuleList` walk.
+
+**It is testable with no bench, no driver and no VM** — recorded pages as fixtures — which is what
+makes it worth building even if S0 fails. Three things must be pinned by tests rather than
+discovered again:
+
+- **Cycle guards.** SK's PML4 self-maps (index 388 on the measured build), so an unguarded descent
+  re-enters the table 512× per level. Unguarded, this took the bench down twice and needed a
+  reboot each time. Pin: skip entries whose target PFN is the table they came from, a visited set
+  per level, and hard budgets on reads *and* collected leaves that **report** a partial result.
+- **Read width.** `HvCallReadGpa` moves at most 16 bytes, and judging a 4096-byte page on its first
+  sixteen is what made SK's PML4 read as all-zero for most of a session. Any source-side chunking
+  must not leak into the decode layer's view of a page.
+- **The status/result split.** A refused read can answer `HV_STATUS_SUCCESS` with a per-access
+  `ReadIntercept` and zeros. A source that collapses the two produces silent zeros exactly where
+  the protected memory is; the seam must carry *why* a read failed, not just bytes-or-not.
+
+### S2 — symbols, which is the one place DbgEng earns its keep
+
+Resolve `securekernel.exe`'s symbols and types against a base supplied by S1. This is the part
+worth keeping DbgEng for, and **the only part**: the remaining primitives are reads this server
+already has from S1, and routing those through an engine that has no target buys nothing.
+
+**Unknown to settle before committing:** `dbgscope`'s symbol methods (`symbol_offset`,
+`symbol_for`, `module_symbol_file`) all assume a session with a target. Image-only resolution —
+load `securekernel.exe` at a given base with no debuggee and resolve against it — is not obviously
+available, and if it needs an engine call it is a **typed `dbgscope` method**, per this repo's rule
+that a new DbgEng primitive belongs there rather than behind the `execute` text hatch. Size that
+before promising symbols.
+
+### S3 — the tool surface
+
+Shape it after S0 and S2 answer, not now. What the plan asked for is SK base and size, structure
+walks, and symbol resolution against the image. Note that a read-only inspector over a fixed
+snapshot fits this server's existing session model awkwardly — there is no debuggee, so the
+one-worker-per-debuggee reason for the worker process does not apply — and deciding whether it is a
+session kind, a sessionless tool group, or a separate surface is a real design question that S0's
+answer changes.
+
+### Out of scope, with the reason rather than as a list
+
+- **Execution control, breakpoints, stepping**: impossible against SK, per above.
+- **Writes**: `HvCallWriteGpa` exists (`0x0054`, adjacent to the read — an off-by-one mutates), and
+  nothing here needs it. Reading is the capability; writing into a live guest's VTL1 is not.
+- **H5a / EXDI**: parked with its reversal condition recorded. Not re-litigated here.
+- **Shipping any driver**: see the first constraint.
+
+### Unknowns, in the order they change the plan
+
+1. **S0's saved-state source** — decides feature-or-library. Cheapest, and first.
+2. **Image-only symbol resolution** — decides whether S2 is small or is a `dbgscope` change.
+3. **Build stability of the offsets.** `KdDebuggerDataBlock` at `+0x1335E0` and
+   `SkLoadedModuleList` at `+0x127770` are **one build**, and the block's `Size` already disagreed
+   with an earlier static reading (`0x3A0` live against `0x3A8` from the image). So the decode layer
+   must locate them by signature and treat the offsets as a fast path to verify, never as the
+   lookup itself.
