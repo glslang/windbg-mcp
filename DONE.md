@@ -5173,6 +5173,17 @@ Three things about the shape of it are worth keeping.
   restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
   now, and the rendering has a line for a block where nought of the steps failed and the rollback
   is still not complete.
+- **The promise lived in five places and a `head` hid two of them.** The sweep that was supposed
+  to be the enumeration — grep the tree for "every path" — was piped through `head`, which stopped
+  at exactly ten matches and cut off `src/server.rs` entirely. Two rounds then arrived one copy at
+  a time: the `always` field's own description, served in the *input* schema; the shipped plugin
+  skill; and `GROUP_INSTRUCTIONS`, assembled separately from both. The last of those is
+  budget-bound — a client truncates the instructions at **2,048 characters** and they were at
+  2,003, so the exception had to fit in nineteen of the remaining forty-five ("on every path *it
+  can be aimed at*") with the contract left to the tool's own description, which is what
+  `discover_opens_a_session_without_initialize` refuses to let fall off the end. The lesson is the
+  cheap one: `| head` turns an enumeration back into a sample, and a sample is what this rule
+  exists to stop.
 - **And the same false claim again, one channel over.** The refusal an `interrupt` racing a
   stopped batch reads said "this session's handle is being retired with it" — true when the target
   was replaced and false for the other two ways of losing it, which retire nothing. Caught in the
