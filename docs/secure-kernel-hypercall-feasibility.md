@@ -467,7 +467,17 @@ cannot separate:
 - VTL1 memory is **withheld from the root**, zeros being what withholding looks like here.
 
 Those differ enormously -- the first is a bug in the instrument, the second would be a finding
-about the route -- so neither is recorded as the answer. The next step is to settle the output
+about the route -- so neither is recorded as the answer.
+
+**An attempt to identify the bytes by matching them against on-disk images was inconclusive, and
+the method is weaker than it looks.** A 32-byte run from that GPA matched none of `ntoskrnl.exe`,
+`securekernel.exe`, `hvix64.exe`, `hvax64.exe`, `ntdll.dll`, `winhvr.sys` or `vid.sys`. A 16-byte
+run did "hit" `hvix64.exe`, and that hit should be discarded: the bytes are
+`48 89 5c 24 08 / 48 89 6c 24 10 / 48 89 74 24 18 / 57`, the standard x64 prologue, which occurs in
+every large image. **Verbatim matching is in any case a poor test for code pages**, because code in
+memory has had relocations applied and may be hotpatched, so a true read of a code page is expected
+to miss its own file. Identification needs either a page whose contents are invariant under
+relocation, or disassembly and structural recognition rather than byte equality. The next step is to settle the output
 layout against a GPA whose contents are known independently, **before** reading anything about VTL1
 into a page of zeros.
 
