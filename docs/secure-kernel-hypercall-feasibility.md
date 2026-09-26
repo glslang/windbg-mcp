@@ -443,6 +443,32 @@ merely warned about, so results are gathered into locals and assigned afterwards
 
 ## H4 — does what comes back look like Secure Kernel
 
+**H4's blocker is different in kind from H3's, found 2026-09-26.** H3 succeeded on a **documented**
+hypercall: `HvCallGetVpRegisters` has a Learn page, a call code, an input layout and an explicit
+statement that a parent may call it. **`HvCallReadGpa` has no such page.** It appears in the
+`hvgdk.h` shipped with the GPL oracle, but the TLFS on Learn does not document it — the hypercall
+reference slug 404s and the hypercall interface page does not index it. So the two halves of this
+route are not equally supported: *reading a child's VTL1 registers is a documented capability;
+reading that child's memory is not.*
+
+That matters beyond convenience. The clean-room condition this plan set says implementation facts
+come from the TLFS, and for the memory half there is no TLFS to take them from. The options are
+therefore narrower than H3's success suggests:
+
+- **Take the call code from somewhere other than Microsoft's documentation**, which breaks the
+  clean-room condition and is the reason it is not simply done here.
+- **Reach guest memory the way the root already does**, through `vid.sys` and the VM worker
+  process's mapping — the route the backend table prices as "undocumented; a large
+  reverse-engineering effort", and the reason LiveCloudKd carries a driver at all.
+- **Determine whether a documented path exists** that was not looked for, `HvCallTranslateVirtualAddress`
+  yielding a GPA but not its contents.
+
+**So H3's pass should not be read as "the route works".** It establishes that the hypervisor grants
+a parent VTL1 *register* state — genuinely the pivotal unknown, and now answered — while leaving
+the memory half resting on an interface Microsoft has not published. A plan that assumed both
+halves were equally documented would have discovered this after building the instrument rather
+than before.
+
 Only meaningful once H3 passes. **Budget for walking SK's page tables rather than for the
 hypervisor doing it**: H0 found `HvCallTranslateVirtualAddress` documented without a Restrictions
 section and without its control flags expanded, so parent-calling and VTL selection are unproven
