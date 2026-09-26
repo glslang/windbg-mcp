@@ -5,14 +5,22 @@ guest's Secure Kernel state well enough to drive a debugger?** It is not a plan 
 Every gate below can fail, each says how, and the stop conditions are written before the work
 starts so that a sunk cost does not decide.
 
-**Answer, as of 2026-09-26: no — not by this route, and the blocker is the hypervisor itself.**
-H3 passed and H4 failed, and together they give a clean asymmetry: the hypervisor **grants** a
-parent a child's VTL1 *register* state and **denies** it that child's VTL1 *memory*. You can read
-Secure Kernel's `CR3` and you cannot read the page it points at. The denial is not a permissions
-setting — `HvCallReadGpa` has no VTL parameter to ask with — and it is delivered as
-`HV_STATUS_SUCCESS` with a per-access `ReadIntercept` and zeros, so a consumer checking only the
-status sees silent zeros where the protected memory is. Gates H0, H1 and H3 passed; H2 failed with
-a known cause; H4 is a clean negative; H5 was never reached.
+**Answer, as of 2026-09-26: probably yes, but not with the hypercall the plan was built around.**
+The two halves of the route need different mechanisms, and only one of them is documented.
+
+- **Registers: granted.** H3 passed — `HvCallGetVpRegisters` returns a child's **VTL1** `CR3` to the
+  parent, on a documented, parent-callable hypercall.
+- **Memory: refused by the hypercall, reachable by a driver.** H4 measured `HvCallReadGpa`
+  (`0x0053`) refusing a VBS guest's VTL1-protected pages — 4608 protected pages against **0** in a
+  VBS-off control — and it refuses them as `HV_STATUS_SUCCESS` with a per-access `ReadIntercept`
+  and zeros, so a consumer checking only the status sees silent zeros exactly where the protected
+  memory is. It is not a permission to be found: `HvCallReadGpa` has no VTL parameter to ask with.
+  **But an independent oracle then read three of five of those same ranges** from the root by a
+  direct-mapping route, so the withholding belongs to that hypercall rather than to the root's
+  access. The VTL1 `CR3` page itself is not yet among the pages recovered.
+
+Gates H0, H1 and H3 passed; H2 failed with a known cause; H4 is a negative **about the instrument**,
+narrowed by the oracle in the revised section below; H5 was never reached.
 
 This is a sibling of [`docs/exdi-stub-plan.md`](exdi-stub-plan.md) rather than a replacement. That
 document's route reaches SK through a GDB stub and needs a hypervisor that exposes one; this route
@@ -556,6 +564,76 @@ this call will not do it. The remaining avenues, none of them started:
 control flags, poisons the output page, and returns the raw first 64 bytes with the full hypercall
 return value. It is a general hypercall bench rather than a ReadGpa client, and the poisoning is
 the part to keep: **a zeroed output buffer cannot distinguish data from silence.**
+
+### H4 revised, 2026-09-26: the withholding is route-specific, and the route is not dead
+
+**An independent oracle overturns the scope of the result above.** VTL1 memory is withheld from
+`HvCallReadGpa`, **not** from the root partition. A root-partition driver reading guest physical
+memory by direct mapping sees pages the hypercall refuses. H4's negative is a fact about the
+instrument, and the earlier heading's "the hypervisor withholds VTL1 memory from the parent" was
+true only of the call it was measured with.
+
+**The oracle is LiveCloudKd's published SDK, and it is independent in the one way that matters:**
+`SdkReadPhysicalMemory` takes the read route as a **parameter**, so the same library, the same
+partition and the same addresses can be read both ways.
+
+| `ReadMemoryMethod` | route |
+|---|---|
+| `2` `ReadInterfaceWinHv` | `winhvr.sys!WinHvReadGpa` — hypercall `0x0053`, i.e. exactly this plan's route |
+| `1` `ReadInterfaceHvmmDrvInternal` | `hvmm.sys`'s own mapping — `MmMapIoSpaceEx`, `MmGetPhysicalMemoryRanges`, `ZwMapViewOfSection` |
+
+That the two are one argument apart makes this a **within-instrument** differential rather than a
+comparison of two tools that could differ for a hundred irrelevant reasons.
+
+**The oracle validated itself against this plan's own instrument before being believed.** On method
+2 it returned `008b4b2841b800100000489948c1e90c` at partition 0x3 GPA `0x1A75000` — byte-identical
+to what `h3probe` returned for the same address — and "all zeros" on precisely the ranges the page
+scan found intercepted. Two independently built instruments agreeing on both a positive and a
+negative is what makes the next table evidence rather than an anecdote.
+
+| GPA | method 2 (hypercall) | method 1 (direct) |
+|---|---|---|
+| `0x00C00000` | all zeros | `b03f641d02f8ffff…` — **read** |
+| `0x01201000` (the VTL1 `CR3` page) | all zeros | all zeros |
+| `0x03600000` | all zeros | all zeros |
+| `0x03E00000` | all zeros | `ff01000000010000…` — **read** |
+| `0x04800000` | all zeros | `0000000000000060…` — **read** |
+| four control GPAs both routes can read | data | **identical** to method 2 |
+
+The controls are what license the reading: where both routes work they agree byte for byte, so the
+disagreement above is about the pages and not about the tools. `b03f641d02f8ffff` is
+`0xfffff8021d643fb0`, a canonical kernel pointer — real content, not noise.
+
+**What is established, and what is not.** Established: at least three of the five sampled withheld
+ranges are readable from the root by a non-hypercall route, so the hypervisor's refusal is a
+property of `HvCallReadGpa` rather than a property of the root's access to VTL1 memory. **Not**
+established: that the direct route reaches *all* of VTL1. Two ranges — including the VTL1 `CR3`
+page itself, which is the one a debugger would need first — still read as zeros by **both** routes.
+Whether that is a limit of `hvmm.sys`'s mapping, a fallback to the hypercall inside method 1, or
+genuinely zero memory is unmeasured, and it is the next thing to settle.
+
+**What this does to the route.** The backend table's pricing stands and its conclusion changes: the
+memory half needs the `vid.sys`/direct-mapping route that LiveCloudKd carries a driver for, and
+that route demonstrably works against a VBS guest. The register half is already granted and
+documented (H3). So the two halves can both be served — one by a documented hypercall, the other by
+an undocumented driver route — which is a materially better position than the hypercall-only
+finding suggested.
+
+**Loading `hvmm.sys` needed one change, and the blocking policy was not the one it looks like.**
+As shipped it is signed with a **revoked** certificate (`CN=Atheros Communications Inc.`, expired
+2013), and `sc start` fails with *"An Application Control policy has blocked this file"*. The
+CodeIntegrity log separates two policies, and only one of them blocked:
+
+| policy | event | effect |
+|---|---|---|
+| `{8f9cb695-5d48-48d6-a329-7202b44607e3}` | 3077 | **blocked** — the same policy that blocked `h3probe` before it was test-signed |
+| `{784c4414-79f4-4c32-a6a5-f0fb42a51d0d}` (vulnerable-driver blocklist) | 3076 | **audit only** — logged, did not block |
+
+Re-signing the driver with this bench's own test certificate loads it, testsigning being on. Worth
+stating plainly because the obvious guess — "the vulnerable driver blocklist stopped it" — is
+wrong here, and acting on it would have meant disabling a protection that was not in the way. This
+is the second time in this investigation that a CodeIntegrity refusal was nearly attributed to the
+wrong policy; the log names the policy, so read it.
 
 ### H4 pass criteria, as written before the run
 
