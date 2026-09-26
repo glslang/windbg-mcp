@@ -366,7 +366,48 @@ Everything rests here. `HvCallGetVpRegisters` with `HV_INPUT_VTL` set to `Vtl1`,
   designed is closed, and what remains is the scanning fallback, which is a different plan with a
   different cost and should be re-decided rather than drifted into.
 
-### H3 instrument, built 2026-09-26, blocked on one setting
+### H3 result, 2026-09-26: PASS — the hypervisor grants a parent a child's VTL1 registers
+
+**This is the assumption the whole route rested on, and it holds.** H0 could establish only that the
+TLFS does not prohibit a parent naming a child's VTL1; `h3probe.sys` converts that into a fact.
+Both guests were enumerated as children of the root and probed identically:
+
+```text
+child partition 0x2                       child partition 0x3
+  VTL0 CR3 : SUCCESS 0x00007D5000           VTL0 CR3 : SUCCESS 0x0001A75000
+  VTL1 CR3 : 0x0015  (refused)              VTL1 CR3 : SUCCESS 0x0001201000
+  VsmVpStatus       EnabledVtlSet=0x0001    VsmVpStatus       EnabledVtlSet=0x0003
+  VsmPartitionStatus EnabledVtlSet=0x0001   VsmPartitionStatus EnabledVtlSet=0x0003
+                     MaximumVtl=0                              MaximumVtl=1
+```
+
+**The control discriminated exactly as designed, which is what makes the positive readable.** On
+partition 0x2 the VTL0 read succeeded while VTL1 was refused — so the refusal is a statement about
+VTL1 and not about privilege or plumbing, which is the distinction the VTL0 control exists to draw.
+On 0x3 the VTL1 read returned a CR3 **distinct from** that partition's VTL0 CR3, so it is not the
+VTL0 value under another name.
+
+**The interpretation does not depend on decoding the refusal.** `0x0015` is not enumerated on the
+TLFS `HV_STATUS` page and is left unnamed here rather than guessed at. It does not need naming: the
+two VSM status registers say independently that partition 0x2 has only VTL0 enabled and a maximum
+VTL of 0, so there is no VTL1 there to read. Those registers were included as corroboration and are
+now carrying the reading — which is the argument for gathering corroborating state even when the
+primary measurement looks self-explanatory.
+
+**Identification is by VSM state, not by partition number.** Partition 0x3 is the VBS guest because
+its `EnabledVtlSet` is `0x0003`, not because 3 sorts after 2; the ids are the hypervisor's and carry
+no ordering guarantee worth relying on.
+
+**Confirmed incidentally: the inferred `HvlInvokeHypercall` signature is right.** It was flagged as
+the one piece taken from convention rather than documentation — control word, input physical
+address, output physical address — and four hypercalls per partition returning coherent, correct
+values settles it.
+
+**What this does not establish.** VTL1 **register** access is granted; VTL1 **memory** is untouched.
+Whether `0x1201000` is Secure Kernel's CR3 and whether translating through it reaches readable SK
+pages is H4, which now has a concrete input rather than an assumption.
+
+### H3 instrument, as built
 
 **`nt!HvlInvokeHypercall` is exported and resolvable at runtime**, which is what makes a small
 driver sufficient: it issues arbitrary hypercalls without the driver building its own hypercall
@@ -387,7 +428,7 @@ VTL1* only when the VTL0 control succeeded, a double failure is reported as bein
 or plumbing, and a VTL1 "success" returning the VTL0 value is flagged as suspect rather than
 counted.
 
-**Blocked on Secure Boot, which is a parent-side setting.** `bcdedit /set testsigning on` is
+**Secure Boot had to come off first, from the parent.** `bcdedit /set testsigning on` was
 refused with *"The value is protected by Secure Boot policy and cannot be modified or deleted."*
 The debugger host is itself a Hyper-V guest, so Secure Boot is turned off from its parent with the
 VM powered down (`Set-VMFirmware -EnableSecureBoot Off`), not from inside. The driver is built and
