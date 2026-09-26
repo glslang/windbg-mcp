@@ -815,17 +815,25 @@ fn claim_pump(id: u64) -> Result<(), PumpRefused> {
 /// same lock, so every break is either lodged before this — and drained here, before the first
 /// cleanup command runs — or refused after it. Called by a batch as it enters its `always` block;
 /// a teardown is sealed by [`claim`] instead, having no phase to enter.
-fn seal_against_interrupts(e: &DebugEngine, id: u64, cleanup: Cleanup) {
-    seal_locked(&mut running(), e, id, cleanup);
+fn seal_against_interrupts(e: &DebugEngine, id: u64, cleanup: Cleanup) -> bool {
+    seal_locked(&mut running(), e, id, cleanup)
 }
 
 /// [`seal_against_interrupts`] for a caller that already holds the lock — which [`claim`] does,
 /// that being the point of it.
-fn seal_locked(running: &mut Running, e: &DebugEngine, id: u64, cleanup: Cleanup) {
+fn seal_locked(running: &mut Running, e: &DebugEngine, id: u64, cleanup: Cleanup) -> bool {
     running.seal(id, cleanup);
     // Under the lock deliberately: a break raised between the seal and the drain would survive
     // both and land on the first restore command.
     let _ = e.interrupted();
+    // **Read under the same lock, and returned rather than left for the caller to ask about.**
+    // A caller that sealed and then asked separately has a window between the two in which a
+    // break is recorded, drained here and reported by [`release`] — so its own verdict says the
+    // operation finished while the reply it travels on says it was cut short. One transition
+    // cannot disagree with itself. Raised by Codex on
+    // [#392](https://github.com/glslang/windbg-mcp/pull/392); no DbgEng call is added to the
+    // critical section that was not already in it.
+    running.interrupt_pending(id)
 }
 
 /// [`Running::release`] on this process's one tracker.
@@ -6320,7 +6328,7 @@ impl Debuggee for BatchEngine<'_> {
         interrupt_pending(self.job)
     }
 
-    fn sealing(&mut self, why: Sealed) {
+    fn sealing(&mut self, why: Sealed) -> bool {
         seal_against_interrupts(
             self.e,
             self.job,
@@ -6328,7 +6336,7 @@ impl Debuggee for BatchEngine<'_> {
                 Sealed::Rollback => Cleanup::Rollback,
                 Sealed::TargetLost => Cleanup::TargetLost,
             },
-        );
+        )
     }
 }
 
