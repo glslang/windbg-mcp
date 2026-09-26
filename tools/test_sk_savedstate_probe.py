@@ -1173,17 +1173,24 @@ class OutputMustNotDestroyAnInput(unittest.TestCase):
             self.assertEqual(capture.read_bytes(), b"a capture", "and it is still there")
 
     def test_the_same_file_by_another_spelling_is_still_refused(self):
+        import os
         import pathlib
         import tempfile
 
         with tempfile.TemporaryDirectory() as directory:
             capture = pathlib.Path(directory, "guest.vmrs")
             capture.write_bytes(b"a capture")
-            for spelling in (
-                str(capture).upper(),
+            spellings = [
                 str(capture).replace("\\", "/"),
                 str(pathlib.Path(directory, ".", "guest.vmrs")),
-            ):
+            ]
+            # An uppercase path names a *different*, nonexistent file where the filesystem does
+            # not fold case, and this repo is edited from a Mac and run on Linux as well as
+            # Windows. The later nonexistent-output test guards this and the first draft of this
+            # one did not, which would have failed the documented offline discovery command.
+            if os.path.normcase("A") == "a":
+                spellings.append(str(capture).upper())
+            for spelling in spellings:
                 with self.subTest(spelling=spelling):
                     with self.assertRaises(probe.ProbeError):
                         probe.check_output_is_not_an_input(spelling, [("capture", capture)])
@@ -1221,6 +1228,62 @@ class OutputMustNotDestroyAnInput(unittest.TestCase):
                 str(pathlib.Path(directory, "report.json")), [("capture", capture)]
             )
             probe.check_output_is_not_an_input(None, [("capture", capture)])
+
+    def test_the_sdk_files_are_inputs_too(self):
+        # They are read early and closed, which is exactly what makes them truncatable when the
+        # report is written. The first version of the guard listed the capture and the image only.
+        import pathlib
+        import tempfile
+
+        with tempfile.TemporaryDirectory() as directory:
+            header = pathlib.Path(directory, "VmSavedStateDumpDefs.h")
+            header.write_bytes(b"typedef enum REGISTER_ID {} REGISTER_ID;")
+            dll = pathlib.Path(directory, "vmsavedstatedumpprovider.dll")
+            dll.write_bytes(b"MZ")
+            for label, path in (("SDK header", header), ("SDK provider", dll)):
+                with self.subTest(input=label):
+                    with self.assertRaises(probe.ProbeError) as raised:
+                        probe.check_output_is_not_an_input(str(path), [(label, path)])
+                    self.assertIn(label, str(raised.exception))
+            self.assertTrue(header.read_bytes().startswith(b"typedef"), "and it is still there")
+
+    def test_main_passes_every_input_to_the_guard(self):
+        # The guard can only refuse what it is given, so the list `main` builds is the rule --
+        # captured here by patching the guard and reading back the labels it was handed.
+        import pathlib
+        import tempfile
+
+        seen = []
+
+        def record(output, inputs):
+            seen.extend(label for label, _candidate in inputs)
+            raise probe.ProbeError("stop here")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = pathlib.Path(directory)
+            (root / "bin" / "v" / "x64").mkdir(parents=True)
+            (root / "Include" / "v" / "um").mkdir(parents=True)
+            (root / "bin" / "v" / "x64" / "vmsavedstatedumpprovider.dll").write_bytes(b"")
+            (root / "Include" / "v" / "um" / "VmSavedStateDumpDefs.h").write_bytes(b"")
+            image = root / "securekernel.exe"
+            image.write_bytes(pe64([".text"], 1, 0x1000))
+            capture = root / "guest.vmrs"
+            capture.write_bytes(b"capture")
+            import types
+
+            # Enough of a provider to reach the guard: `main` records the CR3 register id from it
+            # before locating anything, and the guard runs after that but before any write.
+            stand_in = lambda *_a, **_k: types.SimpleNamespace(ids={}, release=lambda: None)
+            with unittest.mock.patch.object(probe, "SavedState", stand_in):
+                with unittest.mock.patch.object(probe, "check_output_is_not_an_input", record):
+                    with self.assertRaises(probe.ProbeError):
+                        probe.main(
+                            ["--vmrs", str(capture), "--image", str(image), "--json",
+                             str(root / "out.json"), "--kit", str(root), "--kit-version", "v"]
+                        )
+        self.assertEqual(
+            sorted(set(seen)), ["SDK header", "SDK provider", "capture", "on-disk image"]
+        )
 
     def test_a_missing_capture_is_a_refusal_rather_than_a_traceback(self):
         import pathlib

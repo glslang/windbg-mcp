@@ -220,7 +220,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fixed the round before, which should have been found by enumerating the inputs then. And
   `complete` on the walk no longer reads as exhaustive: alias pruning is deliberate and happens
   on every capture, so rather than a flag that is never true, the walk states what it excludes
-  with the count in the sentence. No Rust and no MCP
+  with the count in the sentence. **A sixteenth round found that guard's own list incomplete**:
+  it held the capture and the on-disk image and not the SDK header or provider, which are read
+  early and closed and are therefore just as truncatable -- a function promising *every* input
+  and given a subset, which is the shape it was written to fix. All four are in it now, and a
+  test reads the labels back out of `main` so dropping any one of them fails. The same round
+  caught a test of mine that would fail on a case-sensitive filesystem: an uppercase path names
+  a different, nonexistent file there, and the assertion was ungated -- in the file whose
+  offline discovery command this repository documents, edited from a Mac. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
