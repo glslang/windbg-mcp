@@ -604,8 +604,15 @@ enum Cleanup {
     /// the release is bounded by the server's own grace either way, and the engine's watchdog
     /// still bounds each resume, the seal being a boundary against *hosts* and not against time.
     Teardown,
-    /// A [`crate::batch`] that has stopped because it can no longer say what the engine is
-    /// holding — its target replaced under it, or an engine that will not answer.
+    /// A [`crate::batch`] that has stopped because nothing could certify that the engine is
+    /// still holding what it started against — the target replaced under it, an engine that will
+    /// not answer, or a session left pointed at a different process.
+    ///
+    /// **One reason for all three, and the message must therefore claim only what all three
+    /// share.** Only the first retires this session's handle, so a refusal saying so would tell a
+    /// caller racing an interrupt to throw away a session that is about to come back perfectly
+    /// usable — which is the same false claim the *report* made for a round, caught in the same
+    /// place twice. The batch's own reply carries the distinction; this says where to read it.
     ///
     /// Sealed although **nothing further runs**, which is the opposite of the two above and is
     /// the point: what a break would reach here is not this job's work but the *engine*, and
@@ -1586,12 +1593,12 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
                 // engine is holding something this session cannot name.
                 Cleanup::TargetLost => format!(
                     "Not interrupted. The operation on this session (job {job}) is a \
-                     `debug_batch` that stopped because the debugger is no longer holding the \
-                     target it started against, and it is sending nothing further — so there is \
-                     nothing left to interrupt, and a break raised now would act on whatever the \
-                     engine is holding instead. Its reply is on its way and says what the batch \
-                     changed and what it could not undo; this session's handle is being retired \
-                     with it."
+                     `debug_batch` that stopped because nothing could certify that the debugger \
+                     is still holding the target it started against, and it is sending nothing \
+                     further — so there is nothing left to interrupt, and a break raised now \
+                     would act on whatever the engine is holding instead. Its reply is on its way \
+                     and says what the batch changed, what it could not undo, and whether this \
+                     session's handle survives it."
                 ),
                 // Deliberately not offering `end_session` as the way out, which is the advice
                 // above and is void here: this *is* that teardown.
