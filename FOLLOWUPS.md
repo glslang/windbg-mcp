@@ -2015,25 +2015,45 @@ answer it for a step. `docs/debug-batch.md` states the rollback contract and wou
 `KdDebuggerDataBlock` and `SkLoadedModuleList` were all located and identified. H5a — driving
 DbgEng through EXDI — is parked behind a two-part reversal condition, so this is the route.
 
-**Two measured constraints bound the scope before any design, and both narrow it sharply.**
+**One setup constraint, one open question, and two capabilities — an earlier draft of this item
+overstated the first two into blockers and got the third wrong.**
 
-- **The live transport cannot ship.** A driver whose purpose is handing user mode a read of memory
-  it could not otherwise reach will not be WHQL-signed, and every alternative — test-signed,
-  self-signed, enterprise policy — means the operator reconfigures their machine. H2 already
-  recorded the conclusion: *a research capability and not a feature, however well it works*. So
-  **the repo ships no driver**, and any design that assumes one is designing a thing nobody can
-  install.
-- **There is no execution control over VTL1 at all.** Post-26100 `securekernel.exe` ships no KD
-  transport; every `Kd`-prefixed symbol in it is data. So there is nothing to break into, step, or
-  resume. **H5b is a read-only inspector rather than a debug session**, which takes execution
-  control, the two waits, async runs, breakpoints and teardown-on-resume out of scope entirely
-  rather than leaving them as later work.
+- **The driver is a setup cost, not a shipping blocker.** It remains true that no such driver can
+  be WHQL-signed and that every alternative makes the operator reconfigure their machine. What does
+  **not** follow is that nothing ships: this repo already ships capabilities behind documented
+  manual setup — the live-kernel tier needs KDNET wiring and a local profile, and the engine bundle
+  needs a one-time copy. So H5b ships as an **opt-in research feature with manual steps**, where the
+  repo distributes no driver and the operator supplies the transport. That is an install step and a
+  security-posture note to write down, not a reason to build less. **Once it is in place, the rest
+  is drivable from it.**
+- **Execution control is an open question, not a settled impossibility.** What is established is
+  narrower than "there is none": post-26100 `securekernel.exe` ships no KD transport **of its own**,
+  every `Kd`-prefixed symbol in it being data. But the **hypervisor** carries VTL1 debug machinery —
+  a root VTL1 debug context and an active port `0xC35C` (50012) were measured; it was configured,
+  did not activate, and the initialization failure was never named. The validation record declines
+  the stronger claim in terms: *"They do not establish that this Windows build lacks Secure Kernel
+  debugging support."* And `kdnet.exe` on this bench reports network debugging supported for the VM.
+  So stepping is **an item to settle** (S5), not a door to close.
+- **Memory can be read *and* written.** "Read-only inspector" was simply wrong. `HvCallWriteGpa`
+  (`0x0054`) is confirmed from `winhvr.sys`'s own wrapper, and the direct route exposes
+  `SdkWritePhysicalMemory` with its own `WriteMethod` selector. Patching VTL1 memory is available by
+  both routes; it is untested here only because nothing needed it.
 
-### S0 — the gate that decides whether any of this ships. Do it first
+**Those last two interact, and that is where the hazard is.** A software breakpoint *is* a memory
+patch. With the write primitive an `int 3` can be planted in VTL1 — but with no way to catch the
+resulting trap it bugchecks the guest, and SKPG/HyperGuard is in the business of noticing exactly
+that. So the write capability is real and its use **for breakpoints** is gated on S5's transport
+question rather than on the write. Patching for any other purpose is available immediately and
+should be treated as the destructive primitive it is.
+
+### S0 — the gate that decides how much setup a user needs. Do it first
 
 **Is there a driver-free memory source that contains VTL1 pages?** Everything below is the same
-code with a different byte source, so this decides whether H5b is a feature or a library with
-fixtures — and it is a measurement, not a design choice.
+code with a different byte source, so this does not decide whether H5b ships — the manual-setup
+route does that — but **how far the audience reaches**: a driver-free source means an operator with
+no weakened bench, no test-signing and no loaded driver can use S1–S3 against a captured guest,
+while a driver-only answer means every user pays the full posture cost. It is a measurement rather
+than a design choice, and it is cheap, so it goes first.
 
 The asymmetry to test, and the reason it is not obvious: **a guest kernel crash dump cannot work**,
 because the guest's own NT cannot read VTL1 memory and therefore cannot write it into a dump — the
@@ -2046,8 +2066,9 @@ shippability of this item turns on it.
 - **Control:** the same read against a saved state of the **VBS-off** guest finds no SK — H4's
   Control 1 repeated on the new source, which is what separates "read the guest" from "read
   something".
-- **If it fails:** stop, and scope collapses to S1 as an offline library plus recorded fixtures.
-  Say so rather than shipping a feature whose only transport the operator cannot obtain.
+- **If it fails:** S1–S3 still ship, behind the operator-supplied transport and its documented
+  setup. What changes is the install instructions and who can follow them, so write that down
+  rather than treating a driver-only answer as a failure of the item.
 
 ### S1 — the decode layer, source-agnostic. The bulk of the work, and offline-testable
 
@@ -2086,25 +2107,48 @@ before promising symbols.
 ### S3 — the tool surface
 
 Shape it after S0 and S2 answer, not now. What the plan asked for is SK base and size, structure
-walks, and symbol resolution against the image. Note that a read-only inspector over a fixed
-snapshot fits this server's existing session model awkwardly — there is no debuggee, so the
-one-worker-per-debuggee reason for the worker process does not apply — and deciding whether it is a
-session kind, a sessionless tool group, or a separate surface is a real design question that S0's
-answer changes.
+walks, and symbol resolution against the image. Note that a reader with no debuggee fits this
+server's existing session model awkwardly — the one-worker-per-debuggee reason for the worker
+process does not apply — so whether this is a session kind, a sessionless tool group or a separate
+surface is a real design question, and **S0 and S5 both move it**: a live driver-backed source is
+not a fixed snapshot, and an S5 pass would bring execution state back into a surface shaped on the
+assumption that there is none.
+
+### S5 — can VTL1 execution be controlled at all? Independent of S0–S3, and worth its own answer
+
+Not required for S1–S3 to be useful, and it decides whether this ends as an inspector or a
+debugger. The thread to pull is the one the validation record left open rather than a new idea:
+the hypervisor's **root VTL1 debug context was configured and did not activate**, the failure was
+never named, and a port (`0xC35C`, 50012) was already allocated. Two things were explicitly not
+done and are the cheapest next steps — an early-boot trace capturing the activation return
+directly, and the earlier handler guards that the bounded trace narrowed to. `kdnet.exe` reports
+network debugging supported for this VM, so the transport side is not obviously the blocker.
+
+- **Pass:** a VTL1 execution stop is delivered to a debugger, by any route.
+- **Stop condition:** an activation failure that is named and is a deliberate refusal — that is an
+  answer, and it retires the question rather than leaving it open.
+- **Do not** plant an `int 3` in VTL1 to test this. Without a delivered trap it bugchecks the guest
+  and is a plausible SKPG trip; the write primitive existing is not a reason to use it here.
 
 ### Out of scope, with the reason rather than as a list
 
-- **Execution control, breakpoints, stepping**: impossible against SK, per above.
-- **Writes**: `HvCallWriteGpa` exists (`0x0054`, adjacent to the read — an off-by-one mutates), and
-  nothing here needs it. Reading is the capability; writing into a live guest's VTL1 is not.
-- **H5a / EXDI**: parked with its reversal condition recorded. Not re-litigated here.
-- **Shipping any driver**: see the first constraint.
+- **Writes as a *tool surface***: the primitive exists and S1's seam should not pretend otherwise,
+  but exposing "patch a live guest's VTL1" as a tool needs its own justification and confirmation,
+  and nothing in S0–S3 needs it. Note the adjacency hazard when it is built: `HvCallWriteGpa` is
+  `0x0054`, one off the read.
+- **H5a / EXDI**: parked with its two-part reversal condition recorded. Not re-litigated here.
+- **Distributing a driver**: the repo ships none; the operator supplies the transport, per the
+  first constraint.
 
 ### Unknowns, in the order they change the plan
 
-1. **S0's saved-state source** — decides feature-or-library. Cheapest, and first.
+1. **S0's saved-state source** — decides how much setup a user needs, not whether it ships.
+   Cheapest, and first.
 2. **Image-only symbol resolution** — decides whether S2 is small or is a `dbgscope` change.
-3. **Build stability of the offsets.** `KdDebuggerDataBlock` at `+0x1335E0` and
+3. **S5's activation failure** — decides inspector versus debugger, and is the one that would
+   change the shape of S3's tool surface rather than its contents. Independent of the rest, so it
+   can run in parallel or not at all.
+4. **Build stability of the offsets.** `KdDebuggerDataBlock` at `+0x1335E0` and
    `SkLoadedModuleList` at `+0x127770` are **one build**, and the block's `Size` already disagreed
    with an earlier static reading (`0x3A0` live against `0x3A8` from the image). So the decode layer
    must locate them by signature and treat the offsets as a fast path to verify, never as the

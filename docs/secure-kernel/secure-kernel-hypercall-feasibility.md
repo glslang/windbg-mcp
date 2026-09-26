@@ -1012,16 +1012,27 @@ so it is not done here.
 walks, symbol resolution against the image — with H5a parked behind the two-part reversal condition
 above.
 
-**H5b is scoped as `FOLLOWUPS.md` item 103**, and the scoping surfaced one gate worth naming here
-because it decides whether H5b is a shippable feature at all. **The live driver transport cannot
-ship** — H2 already established that a driver of this kind is a research capability rather than a
-feature — so the question is whether a **driver-free source containing VTL1 pages** exists. A guest
-kernel crash dump cannot be one: the guest's own NT cannot read VTL1 memory and so cannot write it
-into a dump, which is the same refusal H4 measured from outside. A **Hyper-V saved state** is
-written by the host and is therefore the candidate. That measurement is item 103's first task, and
-its outcome decides whether H5b is a feature or an offline library with recorded fixtures. Also
-noted there: with no KD transport in SK there is **no execution control over VTL1 at all**, so H5b
-is a read-only inspector and never a debug session.
+**H5b is scoped as `FOLLOWUPS.md` item 103.** Two things the scoping got wrong on the first pass are
+worth stating here, because both were overstatements in the direction of closing doors:
+
+- **The driver is a setup cost, not a shipping blocker.** H2's conclusion — that such a driver is a
+  research capability rather than a feature — is about *distribution*, and this repo already ships
+  capabilities behind documented manual setup. H5b ships as an opt-in research feature where the
+  operator supplies the transport, and once that is in place the rest is drivable from it. What
+  item 103's first measurement decides is therefore **how much setup a user needs**, not whether
+  anything ships: is there a **driver-free source containing VTL1 pages**? A guest kernel crash
+  dump cannot be one, since the guest's own NT cannot read VTL1 memory and so cannot write it into
+  a dump — the same refusal H4 measured from outside. A **Hyper-V saved state** is written by the
+  host and is the candidate.
+- **Execution control is unresolved, not impossible.** What this plan established is narrower than
+  it was first written: SK ships no KD transport *of its own*. The **hypervisor's** VTL1 debug
+  machinery is a separate thing, and the validation record measured a root VTL1 debug context with
+  an allocated port that was configured and did not activate, with the failure never named — while
+  explicitly declining the stronger claim, *"they do not establish that this Windows build lacks
+  Secure Kernel debugging support"*. Item 103 carries that as S5. **And memory can be written as
+  well as read**: `HvCallWriteGpa` (`0x0054`) and the direct route's write path both exist, so a
+  software breakpoint is a patch away — which is precisely why S5 says not to plant one until a
+  trap can be delivered.
 
 ## Explicitly out of scope
 
