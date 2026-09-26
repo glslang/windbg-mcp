@@ -5173,6 +5173,17 @@ Three things about the shape of it are worth keeping.
   restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
   now, and the rendering has a line for a block where nought of the steps failed and the rollback
   is still not complete.
+- **A batch that stops still has to close itself to breaks, and the first version stopped doing
+  it.** Skipping the seal on the replaced path looked free — there is no cleanup left for a break
+  to cut short — and the thing it left open is not this job's work but the *engine*: `SetInterrupt`
+  acts on whatever it is holding, the worker's own latch is not published until the op **ends**, so
+  between the batch seeing the replacement and the worker saying so, `refuse_a_break_for_a_replaced_target`
+  lets an interrupt straight through to somebody else's target — a live kernel, in the case that
+  matters. Raised by Codex in review. The seal is unconditional now, with the reason as an argument
+  (`batch::Sealed`, `worker::Cleanup::TargetLost`), and the refusal a caller reads says which of the
+  two it is — a rollback that must finish, or a batch that is sending nothing and whose break would
+  land elsewhere. Deleting the `if` is the fix rather than adding a second call: what went wrong was
+  that the call was conditional at all.
 - **"The engine would not say" is a third answer, and the first version spelled it as the first.**
   Raised by Codex in review, and correct: `has_target` failing came back as `None` from a function
   returning `Option`, which the executor could not tell from *nothing has changed* — so a step that

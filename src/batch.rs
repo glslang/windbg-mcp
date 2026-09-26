@@ -847,6 +847,20 @@ pub enum Held {
     Unknown(String),
 }
 
+/// Why a batch is closing itself to breaks — [`Debuggee::sealing`]'s argument.
+///
+/// Two reasons and not a bool, because the host tells an interrupter which it is and the two
+/// sentences say opposite things about what is about to happen: one is work that must be allowed
+/// to finish, the other is no work at all.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sealed {
+    /// The `always` block is about to run and must not be cut short.
+    Rollback,
+    /// The batch has stopped because it can no longer say what the engine is holding, and will
+    /// send nothing more. A break from here would land on whatever that is.
+    TargetLost,
+}
+
 /// What [`run`] needs from a debugger. Implemented over a real engine by the worker, and over a
 /// script by the tests — see the module docs for why that seam is where it is.
 pub trait Debuggee {
@@ -960,12 +974,23 @@ pub trait Debuggee {
     /// report said `committed`, `rollback_complete` and `stopped`, on a session whose every later
     /// `go` failed.
     fn running(&mut self) -> Option<bool>;
-    /// Announces that the main steps are over and the `always` block is about to run.
+    /// Announces that the batch will issue no further work a break may reach, and why.
     ///
-    /// A safety boundary, not bookkeeping: cleanup must not be interruptible, because a restore cut
-    /// short comes back as a step that ran and would be reported as a rollback that completed.
-    /// Implementations refuse interrupts from here on.
-    fn rolling_back(&mut self);
+    /// A safety boundary, not bookkeeping, and it has two reasons rather than one.
+    /// [`Sealed::Rollback`] is the original: cleanup must not be interruptible, because a restore
+    /// cut short comes back as a step that ran and would be reported as a rollback that
+    /// completed. [`Sealed::TargetLost`] is the sharper one — a break raised after the target
+    /// stopped being identifiable reaches the engine through `SetInterrupt`, which acts on
+    /// **whatever it is holding now**, so on a live kernel it would break into a machine nobody
+    /// asked about.
+    ///
+    /// Called on every path and exactly once, with the reason as an argument rather than the call
+    /// itself being conditional. The conditional version shipped for one review round and left
+    /// the replaced path unsealed, which is the window Codex found on
+    /// [#392](https://github.com/glslang/windbg-mcp/pull/392): the worker's own latch is not set
+    /// until the op *ends*, so until then `worker::refuse_a_break_for_a_replaced_target` lets an
+    /// interrupt through and there is nothing else between it and the replacement.
+    fn sealing(&mut self, why: Sealed);
 }
 
 /// Runs one engine call, turning a panic into a step failure so [`run`] still reaches `always`.
@@ -1499,13 +1524,18 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
     // refuses interrupts from this point and clears any already pending
     // (`worker::BatchEngine::rolling_back`).
     //
-    // **Not announced when nothing will be sent**, which is not tidiness: the announcement exists
-    // to protect cleanup commands from a break, and on the replaced path there are none — the
-    // batch issues no further engine call at all, the state probe below included. Announcing it
-    // anyway would drain a pending break that nothing then reports.
-    if unverified.is_none() {
-        d.rolling_back();
-    }
+    // **On every path, with the reason as an argument** — deliberately not an `if`, which is what
+    // this was for one review round and which left the one path that needs it most unsealed. A
+    // batch that has lost its target sends nothing more, so there is no restore for a break to
+    // cut short; what a break would reach instead is the engine, through `SetInterrupt`, which
+    // acts on whatever it is holding now. The worker's own latch is not set until this op *ends*,
+    // so between here and there the seal is the only thing standing between an `interrupt` and
+    // somebody else's target. What it costs is a pending break drained without being reported, on
+    // a batch already reporting something worse.
+    d.sealing(match &unverified {
+        Some(_) => Sealed::TargetLost,
+        None => Sealed::Rollback,
+    });
     let mut always: Vec<StepOutcome> = Vec::with_capacity(op.always.len());
     for (index, step) in op.always.iter().enumerate() {
         let position = index + 1;
@@ -2302,9 +2332,11 @@ mod tests {
         /// `interrupt_after` because the two are separately reachable on a real engine: a break
         /// landing during a call comes back on the call, and one landing between calls does not.
         cut_short_after: Option<usize>,
-        /// Whether the executor announced its rollback — the notification a host turns into "no
-        /// break may reach this job any more".
-        sealed: bool,
+        /// Why the executor sealed the job, if it did — the notification a host turns into "no
+        /// break may reach this job any more". Kept as the *reason* rather than a flag, because
+        /// the two reasons produce different refusals and the one that seals with no cleanup to
+        /// protect is the one that went missing for a review round.
+        sealed: Option<Sealed>,
         /// What the engine answers about its own run state; see [`Script::left_running`].
         running: Option<bool>,
         /// Which call ends the target; see [`Script::ends_the_target_on`]. Keyed on the call
@@ -2360,7 +2392,7 @@ mod tests {
                 abandon_after: None,
                 interrupt_after: None,
                 cut_short_after: None,
-                sealed: false,
+                sealed: None,
                 running: Some(false),
                 ends_target_on: None,
                 target_ended: false,
@@ -2606,10 +2638,10 @@ mod tests {
                 false => Held::Same,
             }
         }
-        fn rolling_back(&mut self) {
+        fn sealing(&mut self, why: Sealed) {
             // A real host seals the job against further breaks here; the script only records that
-            // it was told, which is what the executor owes it.
-            self.sealed = true;
+            // it was told and which reason it was given, which is what the executor owes it.
+            self.sealed = Some(why);
         }
     }
 
@@ -2835,9 +2867,11 @@ mod tests {
             "the probe must not be sent: {:?}",
             d.calls
         );
-        assert!(
-            !d.sealed,
-            "there is no cleanup to protect from a break, so the rollback is never announced"
+        assert_eq!(
+            d.sealed,
+            Some(Sealed::TargetLost),
+            "the job is still sealed, and for the other reason: nothing further runs, but a break \
+             from here would reach the engine — which is holding somebody else's target"
         );
         assert_eq!(
             report.after,
@@ -3042,7 +3076,11 @@ mod tests {
             "nor may the probe be asked: {:?}",
             d.calls
         );
-        assert!(!d.sealed, "and there is no cleanup to seal against a break");
+        assert_eq!(
+            d.sealed,
+            Some(Sealed::TargetLost),
+            "and the job is sealed for that reason rather than for a rollback it will not run"
+        );
         assert!(
             matches!(&report.after, SessionAfter::Uncertain { why } if why.contains("stopped saying")),
             "the session state reports not knowing rather than guessing: {:?}",
@@ -3797,10 +3835,12 @@ mod tests {
 
         run(&mut d, &batch, BUDGET);
 
-        assert!(
+        assert_eq!(
             d.sealed,
+            Some(Sealed::Rollback),
             "the executor must tell its host that cleanup is starting, or the host cannot know \
-             when to stop letting breaks through"
+             when to stop letting breaks through — and which of the two reasons it is, since the \
+             refusal a caller reads differs"
         );
     }
 

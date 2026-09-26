@@ -64,7 +64,10 @@ and the session keeps its target, unlike `end_session`, which also stops a batch
 session with it. Its **rollback is not interruptible**: cleanup runs as part of the same call, and a
 restore cut short would come back `Ok` with partial output and be reported as a rollback that
 completed while the target was still changed — so an `interrupt` aimed at a batch that is unwinding
-says so and sends nothing, as does one repeated while a batch is still stopping.
+says so and sends nothing, as does one repeated while a batch is still stopping. A batch that has
+**lost** its target is closed to breaks for the opposite reason: it runs nothing further, so there
+is nothing left to cut short, and what a break would reach instead is the engine — which is holding
+something this session cannot name, and on a live kernel would be a machine nobody asked about.
 
 ## Running a target asynchronously
 
