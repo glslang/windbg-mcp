@@ -747,9 +747,14 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
             ),
         }
 
+    # `pending` lives across chunks on purpose: two chunks the provider reports separately can
+    # still be physically adjacent, and resetting per chunk would flush the last page of one
+    # before the first page of the next could join it -- a split record missed at a boundary the
+    # stated limitation does not cover, since those frames *are* adjacent. The GPA check below
+    # already decides join-or-flush correctly, so it is the only thing that needs to.
+    pending = None  # (gpa, bytes) of the previous readable page, awaiting its successor
     for chunk in chunks:
         base = chunk["start_page"] * page_size
-        pending = None  # (gpa, bytes) of the previous readable page, awaiting its successor
         for page_index in range(chunk["pages"]):
             if scanned >= limit_pages:
                 if pending:
@@ -774,8 +779,8 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
             elif pending:
                 emit(*pending)
             pending = (gpa, data)
-        if pending:
-            emit(*pending)
+    if pending:
+        emit(*pending)
     return images, kdbg, outcome(False)
 
 

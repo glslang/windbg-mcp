@@ -390,6 +390,27 @@ class FailedReadsAreCounted(unittest.TestCase):
         self.assertEqual(kdbg, [])
         self.assertEqual(scan["boundary_incomplete"], 1, "the end of the range, not an absence")
 
+    def test_two_chunks_that_abut_are_joined_across_the_boundary(self):
+        # The provider may report one physically contiguous region as two chunks. Those frames
+        # *are* adjacent, so a record split across them is inside what this scan can see -- and
+        # the stated limitation, which is about frames physically apart, would not cover it.
+        joined = bytearray(b"\x00" * (2 * PAGE))
+        joined[PAGE - 2 : PAGE + 2] = b"KDBG"
+        header = PAGE - 2 - 0x10
+        struct.pack_into("<I", joined, header + 0x14, 0x3A0)
+        struct.pack_into("<Q", joined, header + 0x18, BASE_VA)
+        source = FakeSource({0x0: bytes(joined[:PAGE]), PAGE: bytes(joined[PAGE:])})
+        _images, kdbg, scan = probe.scan_physical_for_images(
+            source,
+            [{"start_page": 0, "pages": 1}, {"start_page": 1, "pages": 1}],
+            PAGE,
+            {"sections": 1},
+            10,
+        )
+        self.assertEqual([hit["gpa"] for hit in kdbg], [header])
+        self.assertEqual(kdbg[0]["kern_base"], BASE_VA)
+        self.assertEqual(scan["boundary_incomplete"], 0)
+
     def test_the_scan_states_the_split_it_cannot_join(self):
         # A reader who sees `kdbg_tags: 0` is reading a negative and is owed its bound. Joining
         # frames that are virtually adjacent and physically apart needs page tables, which is the
