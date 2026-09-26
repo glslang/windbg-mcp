@@ -689,6 +689,19 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
     and a record is attributed to the page its **header** starts in, so no pairing reports it
     twice. A header at the end of the scanned range with nowhere to continue is counted in
     `boundary_incomplete` rather than dropped.
+
+    **What that pairing still cannot see, stated rather than fixed.** Two pages that are adjacent
+    in *virtual* memory can sit in frames that are not adjacent, and a record split across them is
+    invisible here. Following the mapping to join them would need page tables -- which is the one
+    thing this route is defined as not having, and which the VBS-off control does not possess at
+    all, its VTL1 being refused outright. Making the physical scan virtual would delete the
+    independence that makes it a cross-check of the walk rather than a second reading of it. So
+    the limit is reported in `limitation` instead, and the exposure was measured rather than
+    guessed: `securekernel.exe` on the measured build spans 373 pages with **one** physical
+    discontinuity, in two runs of 304 and 69 pages, and the debugger data block sits at page 307
+    offset `0x5E0` -- inside a frame, not across one, with an adjacent successor. The image-side
+    search has no such blind spot, reading the image by VA through the translator, and it is the
+    authoritative one.
     """
     if page_size != PAGE:
         # The reads below are PAGE-sized and the pairing assumes a PAGE stride. A capture with a
@@ -725,6 +738,13 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
             "unreadable": unreadable,
             "boundary_incomplete": boundary_incomplete,
             "capped": capped,
+            # Stated beside the count, because a reader who sees `kdbg_tags: 0` is reading a
+            # negative and is owed its bound. See the docstring: joining non-adjacent frames
+            # needs page tables, which is the one thing this route is defined as not having.
+            "limitation": (
+                "joins physically adjacent frames only; a record split across frames that are "
+                "virtually adjacent but physically apart is not detectable by this route"
+            ),
         }
 
     for chunk in chunks:
