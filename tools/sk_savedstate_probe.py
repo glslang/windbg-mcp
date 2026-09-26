@@ -18,6 +18,25 @@ the two captures it was first run against had different ones.
 Nothing here writes to the guest or to the capture. `--apply-replay-log` is the one exception and
 is off by default; it opens the file read-write, so point it at a throwaway checkpoint.
 
+**What a failed provider call does, enumerated once rather than decided per call site.** Three
+review rounds each found another place where a *failure* could arrive looking like an *answer* --
+an alias silently dropped, a refused VTL switch indistinguishable from an unreadable register, an
+unchecked sizing call turning into an empty memory map -- so every entry point into the DLL is
+listed here with which of four contracts it is under. A new one joins a row; it does not get a
+decision of its own.
+
+| contract | calls | on failure |
+|---|---|---|
+| **fatal** -- nothing downstream means anything without it | `LocateSavedStateFiles`, `LoadSavedStateFile(s)`, `ApplyPendingSavedStateFileReplayLog` | raise `ProbeError`; the run ends |
+| **diagnostic** -- recorded per field, never fatal, never silent | `GetVpCount`, `GetGuestEnabledVirtualTrustLevels`, `GetEnabledVirtualTrustLevels`, `GetActiveVirtualTrustLevel`, `GetArchitecture`, `GetPagingMode`, `IsActiveVirtualTrustLevelEnabled`, `GetRegisterValue` | `probed()` writes the reason under `errors[<field>]`; every other field is still asked for |
+| **bulk** -- called thousands of times, must never raise | `ReadGuestPhysicalAddress`, `GuestVirtualAddressToPhysicalAddress` | return `(nothing, reason)`; the caller decides |
+| **sized** -- a failure HRESULT is part of the protocol | `GetGuestPhysicalMemoryChunks` | see its own docstring: measured `0x8007000E` on the sizing call, so the count decides |
+
+`ForceActiveVirtualTrustLevel` is deliberately in none of them: its failure **is** the control
+arm's result, so it is caught at one call site and reported as itself. And the provider is never
+handed a handle it did not give us -- an experiment that passed it a fabricated one hung inside the
+DLL and had to be killed.
+
 Run against a capture (a checkpoint taken with `CheckpointType = Standard`, or a saved VM):
 
     python tools/sk_savedstate_probe.py --vm "Lab Guest Hyper-V" --snapshot "S0 capture" \
@@ -342,12 +361,6 @@ class SavedState:
             return bytes(buffer[: read.value]), f"short read {read.value}/{size}"
         return bytes(buffer), None
 
-    def read_exact(self, gpa, size, what):
-        data, reason = self.read(gpa, size)
-        if reason:
-            raise ProbeError(f"read of {what} at GPA 0x{gpa:X} failed: {reason}")
-        return data
-
     def va_to_gpa(self, vp, va):
         gpa = ctypes.c_uint64()
         unmapped = ctypes.c_uint64()
@@ -359,13 +372,24 @@ class SavedState:
         return gpa.value, None
 
     def memory_chunks(self):
+        """The guest's physical memory layout, refusing to read a failure as an empty map.
+
+        The sizing call **returns a failure HRESULT by design** -- measured `0x8007000E`,
+        `E_OUTOFMEMORY`, with `count` filled in and `page_size` left at zero -- because passing a
+        null buffer is how the caller asks how big one to allocate. So neither checking it nor
+        ignoring it is right: checking rejects every healthy capture, and ignoring lets a genuine
+        provider failure arrive as `memory_pages: 0`, which `--scan-pages` then turns into a
+        clean-looking negative on a capture nothing was ever read from. What distinguishes them is
+        whether a count came back with the failure.
+        """
         page_size = ctypes.c_uint64()
         count = ctypes.c_uint64(0)
-        self.lib.GetGuestPhysicalMemoryChunks(
+        hr = self.lib.GetGuestPhysicalMemoryChunks(
             self.handle, ctypes.byref(page_size), None, ctypes.byref(count)
         )
         if count.value == 0:
-            return page_size.value, []
+            self._check(hr, "GetGuestPhysicalMemoryChunks (sizing)")
+            return page_size.value, []  # succeeded, and the guest really has no chunks
         chunks = (GpaMemoryChunk * count.value)()
         self._check(
             self.lib.GetGuestPhysicalMemoryChunks(
@@ -689,15 +713,32 @@ def find_kdbg(image, base_va):
     return hits
 
 
+def probed(record, field, call):
+    """Ask the provider one question, recording either the answer or why there was none.
+
+    **A diagnostic must not be able to suppress the primary output.** The fields below are asked
+    for one at a time precisely so that a provider which cannot answer, say, `GetPagingMode` does
+    not take the VTL1 `CR3` -- the whole point of the run -- down with it. A failure is written
+    into `errors` beside the fields that did answer, so the report says which question went
+    unanswered rather than looking like a guest that had nothing to say.
+    """
+    try:
+        record[field] = call()
+    except ProbeError as error:
+        record.setdefault("errors", {})[field] = str(error)
+        return None
+    return record[field]
+
+
 def read_vtl1(state, vp, vtl0_cr3):
-    """Force a VP to VTL1 and read what it then reports, keeping two failures apart.
+    """Force a VP to VTL1 and read what it then reports, one question at a time.
 
     **A refused switch and a failed query have the same shape and opposite meanings.** "The
     provider will not put this VP in VTL1" is the control arm's entire result; "the switch worked
-    and a later register did not come back" says nothing at all about whether VTL1 is enabled. One
-    handler over both writes `forced: false` beside a `cr3` it had already read, and turns a
-    provider that cannot answer one register into evidence that a guest has no Secure Kernel --
-    which is the same collapsing of *refused* into *absent* that this probe exists to avoid.
+    and a register did not come back" says nothing at all about whether VTL1 is enabled. Reporting
+    one as the other writes `forced: false` beside a `cr3` already read, and turns a provider that
+    cannot answer one query into evidence that a guest has no Secure Kernel -- the same collapse of
+    *refused* into *absent* that the read seam is guarded against, one level up.
     """
     vtl1 = {"requested": True}
     try:
@@ -707,18 +748,37 @@ def read_vtl1(state, vp, vtl0_cr3):
         vtl1["force_error"] = str(error)
         return vtl1
     vtl1["forced"] = True
-    try:
-        vtl1["enabled"] = state.active_vtl_enabled(vp)
-        vtl1["paging_mode"] = state.paging_mode(vp)
-        vtl1["cr0"] = state.register(vp, "X64_RegisterCr0")
-        vtl1["cr3"] = state.register(vp, "X64_RegisterCr3")
-        vtl1["cr4"] = state.register(vp, "X64_RegisterCr4")
-        vtl1["efer"] = state.register(vp, "X64_RegisterEfer")
-        vtl1["rip"] = state.register(vp, "X64_RegisterRip")
+    probed(vtl1, "enabled", lambda: state.active_vtl_enabled(vp))
+    probed(vtl1, "paging_mode", lambda: state.paging_mode(vp))
+    for field, register in (
+        ("cr0", "X64_RegisterCr0"),
+        ("cr3", "X64_RegisterCr3"),
+        ("cr4", "X64_RegisterCr4"),
+        ("efer", "X64_RegisterEfer"),
+        ("rip", "X64_RegisterRip"),
+    ):
+        probed(vtl1, field, lambda r=register: state.register(vp, r))
+    if "cr3" in vtl1:
         vtl1["differs_from_vtl0_cr3"] = vtl1["cr3"] != vtl0_cr3
-    except ProbeError as error:
-        vtl1["query_error"] = str(error)
     return vtl1
+
+
+def walkable(vtl1):
+    """Whether this VTL1 reading is one to walk from, and if not, why not.
+
+    `enabled` is the provider's own warning that a *forced* VTL is not actually on the VP, in
+    which case its register state is meaningless -- so a `False` there blocks the walk. An
+    `enabled` that could not be read does **not**: the walk's own output, a root page that
+    self-maps and an image that matches the one on disk, is the stronger evidence anyway, and the
+    report says the question went unanswered.
+    """
+    if not vtl1.get("forced"):
+        return False, "the VP was not switched to VTL1"
+    if vtl1.get("enabled") is False:
+        return False, "the provider reports VTL1 not enabled on this VP"
+    if not vtl1.get("cr3"):
+        return False, "no VTL1 CR3 came back from the capture"
+    return True, None
 
 
 def identify_image(candidates, gather):
@@ -918,16 +978,19 @@ def main(argv=None):
     try:
         vp = args.vp
         page_size, chunks = state.memory_chunks()
-        report["guest"] = {
-            "vp_count": state.vp_count(),
-            "guest_enabled_vtls": state.guest_vtls(),
-            "vp_enabled_vtls": state.vp_vtls(vp),
-            "vp_active_vtl": state.active_vtl(vp),
-            "architecture": state.architecture(vp),
+        guest = {
             "memory_page_size": page_size,
             "memory_chunks": chunks,
             "memory_pages": sum(c["pages"] for c in chunks),
         }
+        # Each asked for separately: these are diagnostics, and one an older provider cannot
+        # answer must not abort a run that would otherwise produce the reads this gate is about.
+        probed(guest, "vp_count", state.vp_count)
+        probed(guest, "guest_enabled_vtls", state.guest_vtls)
+        probed(guest, "vp_enabled_vtls", lambda: state.vp_vtls(vp))
+        probed(guest, "vp_active_vtl", lambda: state.active_vtl(vp))
+        probed(guest, "architecture", lambda: state.architecture(vp))
+        report["guest"] = guest
 
         # VTL0 first, as the control that says the register indexing is right: a CR0 with PG and
         # PE set, CR4 with PAE, and EFER with LMA is a long-mode processor and not an off-by-one.
@@ -953,7 +1016,9 @@ def main(argv=None):
         disk = image_on_disk(args.image)
         report["disk_image"] = disk
 
-        if vtl1.get("enabled") and vtl1.get("cr3"):
+        proceed, refusal = walkable(vtl1)
+        report["walk_refused"] = refusal
+        if proceed:
             root_gpa = vtl1["cr3"] & PFN_MASK
             vtl1["root"] = describe_root(state, root_gpa)
             leaves, walk_stats = walk(state, root_gpa)

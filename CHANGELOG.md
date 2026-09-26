@@ -34,8 +34,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `SkLoadedModuleList` at `+0x127770`, and the same six VTL1 modules. The **control** is the
   VBS-off twin, whose partition reports VTL0 only and refuses `ForceActiveVirtualTrustLevel(vp0, 1)`
   **by name** -- `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` -- while the same 32768-page physical
-  scan finds 143 PE images against the VBS guest's 101 and not one `KDBG` tag, so the scan
-  demonstrably works there and simply finds no Secure Kernel. The capture was also copied out of
+  scan finds more PE images than the VBS guest -- 143 against 101, and 100 against 86 on a
+  second capture of the same boot, those counts being a reading of what was resident rather
+  than a property -- and not one `KDBG` tag either time, so the scan demonstrably works there
+  and simply finds no Secure Kernel. The capture was also copied out of
   Hyper-V's directory and read with no VM named, which makes it **a file rather than a channel**:
   capture on the host, analyse anywhere. And an older capture of the same guest **broke a landmark
   this work had believed** -- it carries VTL1 `CR3` `0x107593000` and SK based at
@@ -73,7 +75,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reads after it, so a provider that could not return one register would have reported `forced:
   false` beside a `cr3` it had already read -- the control arm's entire result is that
   distinction, and the two now have separate fields. Enumerating the report's other fields
-  found no third case. No Rust and no MCP
+  found no third case -- but a third round found two more in a place that enumeration had not
+  looked: the **provider seam** rather than the report. An older provider rejecting one optional
+  diagnostic took the VTL1 `CR3` down with it, because the queries shared one `try`; and the
+  count-only `GetGuestPhysicalMemoryChunks` call had its HRESULT discarded, so a provider
+  failure would have arrived as `memory_pages: 0` and `--scan-pages` would have turned it into
+  a clean-looking negative. Both are fixed by enumerating every entry point into the DLL and
+  putting each under one of four named contracts, written into the module docstring so a new
+  call joins a row instead of getting a decision of its own: **fatal** (nothing downstream means
+  anything without it), **diagnostic** (recorded per field by `probed()`, never fatal),
+  **bulk** (never raises; returns a reason), and **sized** (a failure HRESULT is part of the
+  protocol). That last one had to be measured rather than reasoned about: the sizing call
+  answers `0x8007000E` by design with the count filled in, so the finding's literal remedy --
+  check it -- would have rejected every healthy capture, and the rule is that a failure **with
+  no count** propagates. Two tests hold that seam from opposite sides. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
