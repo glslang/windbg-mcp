@@ -191,8 +191,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control, every protected run 2 MiB-aligned. Call codes were confirmed from `winhvr.sys`'s own
   wrappers on the bench build rather than from a header, which also showed `0x0054` to be
   `WriteGpa`: in this ABI read/write pairs are **adjacent** call codes, so an off-by-one mutates
-  where it meant to inspect. H0 to H4 pass and H5 is unreached, gated on EXDI activation rather
-  than on anything about reaching Secure Kernel. **H2 passes on its second mechanism**: its cheap
+  where it meant to inspect. H0 to H4 pass. **H5 is not started and its route is now decided —
+  against the one this work set out to build.** Driving a live Secure Kernel target through
+  DbgEng/EXDI is parked for two independent measured reasons: EXDI activation does not work on this
+  bench and is unresolved, and DbgEng's own `sk` record is unreachable — only EXDI-referencing
+  functions reach its table readers, **0 of 91** KD-transport strings appear in any function
+  touching it, and its `hv`-vs-`sk` selector has no callers and its address is never taken. So a
+  working EXDI would have supplied a generic memory target rather than Secure Kernel awareness, and
+  H4 already supplies the memory. The reversal condition is written down as two things that must
+  change together, so it stays checkable. **H2 passes on its second mechanism**: its cheap
   driver-free probe failed — and the Code Integrity policy that blocked it is not the one it looks
   like, which matters because acting on the obvious guess means disabling a protection that was not
   in the way — while the minimal root-partition driver it named as its own fallback reads a child

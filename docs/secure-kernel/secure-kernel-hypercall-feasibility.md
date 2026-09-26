@@ -27,7 +27,12 @@ first is documented.
   via SK's own page tables, matching the on-disk image on all 18 section names, timestamp and
   `SizeOfImage`. The identification is independent of the mechanism that produced it.
 
-Gates H0, H1, H2, H3 and H4 passed; H5 was never reached. **H2's status is stated carefully,
+Gates H0, H1, H2, H3 and H4 passed. **H5 is not started, but its route is now decided**: of its two
+sub-paths, H5a (drive DbgEng through EXDI) is blocked on E0's unresolved activation stall *and*
+would contribute no Secure Kernel awareness if it were unblocked — E1 measured its `sk` record
+unreachable — so H5 proceeds as **H5b**, exposing the reads directly. The decision, its evidence
+and the two-part condition that would reverse it are recorded under H5. **H2's status is stated
+carefully,
 because an earlier draft of this line called the gate failed and that contradicted the two gates
 built on it:** H2 asked whether the root can read the guest's physical memory *at all*, offering two
 mechanisms. Mechanism 1, the driver-free probe, **failed** — and its cause is worth reading, since
@@ -957,6 +962,55 @@ a working EXDI server on the debugger host.
   is the part we would already have.
 
 Deciding between them is a result of H4 and E1, not a preference to settle now.
+
+### H5 decision, 2026-09-26: take H5b, and H5a is blocked rather than merely harder
+
+**The plan deferred this choice to "a result of H4 and E1". H4 is now done, so it is decidable, and
+it decides for H5b.** The reasoning is three measurements, none of them new:
+
+| question | measurement | where |
+|---|---|---|
+| Can an EXDI server be activated on this host at all? | **No, unresolved.** E0's transport half did not pass: the RSP responder logged no connection at 75 s or 60 s, the surrogate held no socket, and a bare `CreateInstance` reproduced the stall without `kd`, blocking past 17 s having launched no surrogate | E0, 2026-09-25 |
+| If it were, would DbgEng contribute Secure Kernel *awareness*? | **Not reachably.** Only functions that also reference EXDI strings reach the `sk` table readers; **0 of 91** KD-transport strings appear in any function touching the table; the `hv`-vs-`sk` selector has no direct callers and its address is never taken | E1, 2026-09-23 |
+| Do we already have the memory plumbing DbgEng would otherwise supply? | **Yes.** VTL1 registers by documented hypercall, SK's page tables walked, `securekernel.exe` identified against the on-disk image, `KdDebuggerDataBlock` and `SkLoadedModuleList` both located | H4, 2026-09-26 |
+
+Put together: **DbgEng's marginal contribution on this path is close to nothing, and its price is an
+activation stall that has already cost a host reset.** H5a's own text anticipated the first half —
+"if DbgEng contributes no SK awareness, it is contributing only its memory plumbing, which is the
+part we would already have" — and H4 is what turned *would* into *do*.
+
+**This is not "EXDI is a dead end".** It is narrower: **for reaching Secure Kernel**, EXDI buys a
+generic memory target we can already produce, at the cost of an unresolved stall. E0 remains worth
+resolving on its own merits, and H5a becomes attractive again the moment two things change
+together — which is the reversal condition, written here so it is checkable rather than remembered:
+
+- **E0's activation stall is resolved**, by something other than the in-process load, which is
+  materially what `Inproc=` arranges and is what the 2026-09-22 host reset points at; **and**
+- **the `sk` record turns out reachable after all.** E1's own caveat is the place to look: absence
+  of a direct caller is not proof of dead code, since a computed jump table would not show in that
+  scan, and it was one engine build.
+
+Either alone is not enough. Resolving E0 while the record stays unreachable buys a generic target;
+a reachable record with no activation buys nothing at all.
+
+**What H5b gives up, and how much of it is recoverable.** Dropping the live-target path through
+DbgEng costs its symbol handling — `lm`, PDB type resolution, structure formatting against
+`securekernel.pdb` — which is real value and the main thing H5a was for. It is **not** all lost:
+symbol resolution against the *image* needs no live target, so the engine can still resolve
+`securekernel.exe` statically and have the base applied from H4's walk. The part genuinely given up
+is DbgEng driving a live SK session, which E1 says it would not have driven knowledgeably anyway.
+
+**Consequence for the sibling plan, recorded but not yet applied.**
+[`exdi-stub-plan.md`](exdi-stub-plan.md) is written around the H5a route and its hypercall section
+predates H4. It is **not** superseded wholesale — E0's activation problem and E4's integration work
+are shared with any route — but its read-side design should be re-derived against H4's result
+rather than patched, and until that happens its hypercall-only assumptions should be read with this
+decision beside them. That re-derivation is deliberately scoped to whatever H5b turns out to need,
+so it is not done here.
+
+**So H5 proceeds as H5b**: expose the reads as `windbg-mcp` tools — SK base and size, structure
+walks, symbol resolution against the image — with H5a parked behind the two-part reversal condition
+above.
 
 ## Explicitly out of scope
 
