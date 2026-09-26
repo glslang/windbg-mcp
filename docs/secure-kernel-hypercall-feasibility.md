@@ -443,6 +443,34 @@ merely warned about, so results are gathered into locals and assigned afterwards
 
 ## H4 — does what comes back look like Secure Kernel
 
+**Update, 2026-09-26: a GPA read hypercall exists and was confirmed by behaviour, but the data is
+not yet interpretable.** Two secondary sources offered call codes, hedged and disagreeing with each
+other -- one "often documented as" 0x0053, one "typically mapped to" 0x0054. Neither was trusted;
+0x0053 was tried and the hypervisor's own responses establish it:
+
+| test | result | what it shows |
+|---|---|---|
+| six different GPAs, one partition | five distinct results | the address is honoured at input offset 16 |
+| one GPA, partitions 1/2/3 | different data per partition | the partition id is honoured at offset 0 |
+| partition 0x1 | `HV_STATUS 0x0006 ACCESS_DENIED` | a sensible refusal, not noise |
+
+So the call is a partition-scoped guest-physical read, derived from its behaviour rather than from
+either source -- and 0x0054, plausibly the *write* counterpart, never had to be fired blind.
+
+**The oracle nevertheless fails, and that is the state to hand on rather than paper over.** Reading
+the GPA held in a guest's VTL0 CR3 should yield a PML4: mostly zero, a few present entries. Both
+guests instead return dense bytes that read as x86-64 code (`48 99`, `48 c1 e9 0c`, runs of `CC`).
+And the **VTL1 CR3's GPA reads as all zeros**. Those admit at least two readings that this run
+cannot separate:
+
+- the **output layout** is wrong, so the bytes examined are not the bytes read; or
+- VTL1 memory is **withheld from the root**, zeros being what withholding looks like here.
+
+Those differ enormously -- the first is a bug in the instrument, the second would be a finding
+about the route -- so neither is recorded as the answer. The next step is to settle the output
+layout against a GPA whose contents are known independently, **before** reading anything about VTL1
+into a page of zeros.
+
 **H4's blocker is different in kind from H3's, found 2026-09-26.** H3 succeeded on a **documented**
 hypercall: `HvCallGetVpRegisters` has a Learn page, a call code, an input layout and an explicit
 statement that a parent may call it. **`HvCallReadGpa` has no such page.** It appears in the
