@@ -1096,6 +1096,9 @@ def check_output_is_not_an_input(output, inputs):
     for label, candidate in inputs:
         if candidate and same_path(output, candidate):
             raise ProbeError(f"--json would overwrite the {label}: {candidate}")
+    # "Every input" has to mean every input: the first version of this list held the capture and
+    # the on-disk image and left out the SDK header and provider, which are read early, closed,
+    # and therefore just as truncatable when the report is written.
 
 
 def require_readable_files(files, label):
@@ -1378,7 +1381,8 @@ def main(argv=None):
     # names an input destroys it, and this tool's one documented mutation is not meant to be that.
     check_output_is_not_an_input(
         args.json,
-        [("capture", path) for path in files] + [("on-disk image", args.image)],
+        [("capture", path) for path in files]
+        + [("on-disk image", args.image), ("SDK provider", dll), ("SDK header", header)],
     )
     if args.apply_replay_log and form != "vmrs":
         raise ProbeError("a replay log belongs to a .vmrs; this capture is a .bin/.vsv pair")
