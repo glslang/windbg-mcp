@@ -92,12 +92,12 @@
     },
     {
       "annotations": 134,
-      "description": 2098,
+      "description": 2200,
       "inputSchema": 8255,
-      "modelVisible": 10405,
+      "modelVisible": 10507,
       "name": "debug_batch",
-      "outputSchema": 3521,
-      "wire": 14091
+      "outputSchema": 3566,
+      "wire": 14238
     },
     {
       "annotations": 85,
@@ -570,15 +570,15 @@
   ],
   "totals": {
     "annotations": 6672,
-    "description": 37002,
+    "description": 37104,
     "inputSchema": 55035,
     "instructions": 2003,
-    "modelVisible": 95355,
-    "outputSchema": 163145,
-    "payload": 266959,
+    "modelVisible": 95457,
+    "outputSchema": 163190,
+    "payload": 267106,
     "tools": 63,
-    "wire": 266885,
+    "wire": 267032,
     "worstTool": "debug_batch",
-    "worstToolModelVisible": 10405
+    "worstToolModelVisible": 10507
   }
 }

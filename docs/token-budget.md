@@ -92,8 +92,12 @@ The two halves moved independently, which is the whole argument for measuring th
 fell by 55% and the model-visible column did not move at all except for what the tools themselves
 have accumulated since.
 
-Worst single tool: `debug_batch` at 10,405 model-visible bytes, because its `inputSchema` pulls the
-whole `StepAction`/`Check` vocabulary out of `src/batch.rs`.
+Worst single tool, **today** rather than at the baseline above: `debug_batch` at 10,507
+model-visible bytes (2026-09-26), because its `inputSchema` pulls the whole `StepAction`/`Check`
+vocabulary out of `src/batch.rs`. It is dated because it is the one figure in this section that has
+been kept current rather than frozen — it was updated 9,746 → 10,021 on 2026-08-30, which the
+finding below refers to as "the figure above" — and a reader reconstructing the 51-tool surface
+should take the table, not this line.
 
 The payload is measured as the **serialized result**, not as the sum of its tools, and the 118-byte
 gap between those two is the reason. Result-level fields live in it, and on `2026-07-28` those are
@@ -339,18 +343,18 @@ None of these is a bug. They are recorded because they were invisible, and
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,549 | 17.4% |
+   | `allocator` | 10 | 16,549 | 17.3% |
    | `inspect` | 10 | 13,152 | 13.8% |
    | `session` | 10 | 13,682 | 14.3% |
    | `ioctl` | 10 | 12,435 | 13.0% |
    | `exec` | 10 | 14,876 | 15.6% |
-   | `batch` | 1 | 10,405 | 10.9% |
+   | `batch` | 1 | 10,507 | 11.0% |
    | `crash` | 3 | 7,427 | 7.8% |
    | `ttd` | 9 | 6,829 | 7.2% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 63 | 95,355 |
+   | *(absent)* | 63 | 95,457 |
    | `session,inspect,exec,crash` | 33 | 48,216 |
    | `session,inspect,crash` | 23 | 33,187 |
    | `crash` | 13 | 19,943 |
