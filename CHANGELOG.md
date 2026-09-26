@@ -176,6 +176,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   now written as two halves, the first of which needs no guest, and the step that would drop the
   surrogate for an in-process load is left untried on purpose: it is materially what `Inproc=`
   arranges, and that is what the 2026-09-22 host reset points at.
+- **Secure Kernel is reachable from the root partition, measured gate by gate.** A falsifiable plan
+  — H0 to H5, each gate with a pass condition, a control and a stop condition written before the
+  work — establishes that **the hypervisor grants a parent a child's VTL1 registers and refuses it
+  that child's VTL1 memory through `HvCallReadGpa`**, and that the refusal belongs to that one
+  hypercall rather than to the root's access. `HvCallGetVpRegisters` at `TargetVtl=1` returns the
+  guest's VTL1 `CR3`; that GPA holds Secure Kernel's PML4; walking SK's own page tables by a
+  non-hypercall memory route reaches **`securekernel.exe`**, identified against the on-disk image on
+  all 18 section names, timestamp and `SizeOfImage`, together with its `KdDebuggerDataBlock`
+  (`+0x1335E0`, `Size` `0x3A0`) and `SkLoadedModuleList` (`+0x127770`), each found by a route that
+  does not depend on the other and agreeing exactly. The memory refusal is `HV_STATUS_SUCCESS` with
+  a per-access `ReadIntercept`, so a consumer checking only the status renders zeros for precisely
+  the memory it exists to inspect — 4608 protected pages in the VBS guest against **0** in a VBS-off
+  control, every protected run 2 MiB-aligned. Call codes were confirmed from `winhvr.sys`'s own
+  wrappers on the bench build rather than from a header, which also showed `0x0054` to be
+  `WriteGpa`: in this ABI read/write pairs are **adjacent** call codes, so an off-by-one mutates
+  where it meant to inspect. H0, H1, H3 and H4 pass; H2 fails with a known cause — the blocking Code
+  Integrity policy is not the one it looks like — and H5 is unreached, gated on EXDI activation
+  rather than on anything about reaching Secure Kernel. The six VTL1 documents now live under
+  [`docs/secure-kernel/`](docs/secure-kernel/README.md) with an index.
 
 ## [0.20.0] - 2026-09-24
 
