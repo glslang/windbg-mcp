@@ -89,6 +89,13 @@ so that every VTL1 claim has a control. The control is what makes the numbers me
 `ReadIntercept` appears 4608 times in the VBS guest and **zero** times in the other, across the same
 fixed grid.
 
+**It also guards a failure that would invalidate everything else, and that is not obvious:** the
+*host* runs VBS too, so the root partition has its own Secure Kernel in memory. A read path landing
+in host memory would find `securekernel.exe` and confirm it against the on-disk image just as
+happily. Running the identical scan in both guests settles it — 1 SK image and 1 `KDBG` block in the
+VBS guest, **0 and 0** in the VBS-off one, which yields *more* PE headers overall (152 against 112)
+and so is not simply failing to read.
+
 Reproducing gate 3 onward needs a bench that is **deliberately weakened**, and the instruments live
 outside this repository on purpose:
 
