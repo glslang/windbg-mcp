@@ -366,6 +366,40 @@ Everything rests here. `HvCallGetVpRegisters` with `HV_INPUT_VTL` set to `Vtl1`,
   designed is closed, and what remains is the scanning fallback, which is a different plan with a
   different cost and should be re-decided rather than drifted into.
 
+### H3 instrument, built 2026-09-26, blocked on one setting
+
+**`nt!HvlInvokeHypercall` is exported and resolvable at runtime**, which is what makes a small
+driver sufficient: it issues arbitrary hypercalls without the driver building its own hypercall
+page, and `MmGetSystemRoutineAddress` reaches it without depending on it being in the public
+`ntoskrnl.lib`. `HvlInvokeFastExtendedHypercall` is exported beside it.
+
+`h3probe.sys` enumerates child partitions with `HvCallGetNextChildPartition` (`0x0047`, Simple) and
+for each child's VP 0 issues `HvCallGetVpRegisters` (`0x0050`, Rep, rep count 1) four times: CR3 at
+`TargetVtl=0` — the control — CR3 at `TargetVtl=1` — the test — then `HvRegisterVsmVpStatus` and
+`HvRegisterVsmPartitionStatus` as independent corroboration that VTL1 exists on that VP at all. The
+register codes are `HvX64RegisterCr3 = 0x00040002`, `HvRegisterVsmVpStatus = 0x000D0003`,
+`HvRegisterVsmPartitionStatus = 0x000D0004`, and `HV_INPUT_VTL` packs `TargetVtl:4` with
+`UseTargetVtl:1` at input offset 12. **Every constant is from the TLFS**, not from the GPL headers,
+which is the clean-room condition this plan set for itself.
+
+The client refuses to over-read its own result: a VTL1 failure is reported as a negative *about
+VTL1* only when the VTL0 control succeeded, a double failure is reported as being about privilege
+or plumbing, and a VTL1 "success" returning the VTL0 value is flagged as suspect rather than
+counted.
+
+**Blocked on Secure Boot, which is a parent-side setting.** `bcdedit /set testsigning on` is
+refused with *"The value is protected by Secure Boot policy and cannot be modified or deleted."*
+The debugger host is itself a Hyper-V guest, so Secure Boot is turned off from its parent with the
+VM powered down (`Set-VMFirmware -EnableSecureBoot Off`), not from inside. The driver is built and
+test-signed with a certificate trusted in `LocalMachine\Root` and `TrustedPublisher`, and HVCI is
+staged off again for the same attempt.
+
+**Three build traps, recorded because each cost a cycle.** `CL` and `LINK` are *reserved* MSVC
+environment variables — setting them to tool paths makes `cl.exe` treat its own binary as a source
+file. Kernel sources still need the **UCRT** include directory, or `ntdef.h` fails on `ctype.h`.
+And taking the address of a member of a `#pragma pack(1)` struct is genuinely unsafe rather than
+merely warned about, so results are gathered into locals and assigned afterwards.
+
 ## H4 — does what comes back look like Secure Kernel
 
 Only meaningful once H3 passes. **Budget for walking SK's page tables rather than for the
