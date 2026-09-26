@@ -1222,8 +1222,8 @@ pub enum Rollback {
     /// ran out before it started.
     Incomplete,
     /// The block was dropped on purpose: the batch could no longer certify that the engine holds
-    /// the target its steps ran against — it was replaced, or the engine stopped saying — so
-    /// cleanup could not be aimed.
+    /// the target its steps ran against — replaced, an engine that would not say, or a session
+    /// left pointed at another process — so cleanup could not be aimed.
     NotAttempted,
 }
 
@@ -1326,7 +1326,8 @@ impl BatchReport {
 // ---- execution ------------------------------------------------------------
 
 /// What [`run`] saw when it could no longer certify that the engine holds the target this batch
-/// started against — because it is holding something else, or because it stopped saying.
+/// started against — because it is holding something else, because it would not say, or because
+/// the process a write would land in has moved.
 ///
 /// One value rather than four locals, because they must agree: the sentence explains the
 /// decision, the step names where it was taken, and the two flags decide what the report may
@@ -1451,9 +1452,9 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
                     position,
                     step,
                     format!(
-                        "after step {at} the debugger stopped saying what target it holds, so \
-                         the batch stopped there rather than running this against something it \
-                         could not identify"
+                        "after step {at} nothing could certify that the debugger is still \
+                         holding the target this batch's steps ran against, so it stopped there \
+                         rather than running this against something it could not identify"
                     ),
                 ));
                 continue;
@@ -2369,7 +2370,7 @@ pub fn render(report: &BatchReport) -> String {
                      here can certify that the restore landed on the target the steps patched: \
                      {}. Treat what the steps changed as still changed until you have looked.",
                     report.always.len(),
-                    why_unverified(report, "the debugger stopped saying what it holds")
+                    why_unverified(report, "nothing said what the debugger is holding now")
                 ),
                 _ => writeln!(
                     out,
