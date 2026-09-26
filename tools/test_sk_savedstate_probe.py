@@ -647,12 +647,49 @@ def module_list_reader(pages):
     return lambda va: pages.get(va)
 
 
-def kldr_entry(flink, dll_base, size_of_image):
+def kldr_entry(flink, dll_base, size_of_image, name_length=0, name_buffer=0):
     record = bytearray(0x70)
     struct.pack_into("<Q", record, 0x00, flink)
     struct.pack_into("<Q", record, 0x30, dll_base)
     struct.pack_into("<I", record, 0x40, size_of_image)
+    struct.pack_into("<H", record, 0x58, name_length)
+    struct.pack_into("<Q", record, 0x60, name_buffer)
     return bytes(record)
+
+
+class ModuleNames(unittest.TestCase):
+    """A failed name read used to be indistinguishable from an entry with no name."""
+
+    NAME_VA = 0xFFFFF80220EC0000
+
+    def test_a_name_that_reads_is_returned(self):
+        raw = "skci.dll".encode("utf-16-le")
+        record = kldr_entry(0, BASE_VA, 0x54000, len(raw), self.NAME_VA)
+        name, error = probe.read_module_name(lambda _va, _size: raw, record)
+        self.assertEqual(name, "skci.dll")
+        self.assertIsNone(error)
+
+    def test_an_unreadable_name_buffer_is_not_an_empty_name(self):
+        record = kldr_entry(0, BASE_VA, 0x54000, 16, self.NAME_VA)
+        name, error = probe.read_module_name(lambda _va, _size: None, record)
+        self.assertIsNone(name, "an empty string would read as a module with no name")
+        self.assertIn("not readable", error)
+
+    def test_a_genuinely_unnamed_entry_is_not_an_error(self):
+        name, error = probe.read_module_name(lambda _va, _size: None, kldr_entry(0, BASE_VA, 0x1000))
+        self.assertEqual(name, "")
+        self.assertIsNone(error)
+
+    def test_implausible_length_and_null_buffer_are_named_rather_than_blanked(self):
+        long_name = kldr_entry(0, BASE_VA, 0x1000, 0x4000, self.NAME_VA)
+        name, error = probe.read_module_name(lambda _va, _size: b"", long_name)
+        self.assertIsNone(name)
+        self.assertIn("implausible", error)
+
+        no_buffer = kldr_entry(0, BASE_VA, 0x1000, 16, 0)
+        name, error = probe.read_module_name(lambda _va, _size: b"", no_buffer)
+        self.assertIsNone(name)
+        self.assertIn("null buffer", error)
 
 
 class ModuleListValidation(unittest.TestCase):
@@ -755,6 +792,30 @@ class ModuleListValidation(unittest.TestCase):
         self.assertTrue(listing["valid"], "the block is still identified by the first entry")
         self.assertFalse(listing["complete"])
         self.assertEqual(listing["incomplete_reason"], "the forward link is null")
+
+    def test_an_unreadable_name_is_counted_on_the_list_as_well_as_the_entry(self):
+        # The linkage was walked, so `complete` stays true -- a name is an attribute, not a link.
+        # What must not happen is the omission going unsaid, so the list carries the count.
+        name_va = 0xFFFFF80220EC0000
+        head_page = bytearray(PAGE)
+        struct.pack_into("<Q", head_page, self.HEAD_VA & (PAGE - 1), self.ENTRY_VA)
+        entry_page = bytearray(PAGE)
+        entry_page[0:0x70] = kldr_entry(self.HEAD_VA, BASE_VA, 0x175000, 16, name_va)
+        listing = probe.walk_module_list(
+            module_list_reader(
+                {
+                    self.HEAD_VA & ~(PAGE - 1): bytes(head_page),
+                    self.ENTRY_VA & ~(PAGE - 1): bytes(entry_page),
+                }
+            ),
+            self.HEAD_VA,
+            BASE_VA,
+        )
+        self.assertTrue(listing["valid"])
+        self.assertTrue(listing["complete"], "every link was followed")
+        self.assertEqual(listing["names_unreadable"], 1)
+        self.assertIsNone(listing["entries"][0]["name"])
+        self.assertIn("not readable", listing["entries"][0]["name_error"])
 
     def test_a_list_that_closes_is_complete(self):
         listing = probe.walk_module_list(
