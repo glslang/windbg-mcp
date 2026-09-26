@@ -589,6 +589,12 @@ fn frame(record: &Record, max_lines: usize) -> Option<String> {
                 // flag, which is all such a record ever said.
                 match (rollback.as_deref(), *rollback_complete) {
                     (Some("not_attempted"), _) => "NOT ATTEMPTED",
+                    // A block that was never supplied completed vacuously, so the flag says
+                    // `true` and said "complete" here for as long as this line has existed —
+                    // on a batch that undid nothing and may have left every mutation it made in
+                    // place. Lower case, because a committed batch with no cleanup block is not
+                    // an alarm; distinct, because "complete" claims a restore that never ran.
+                    (Some("not_supplied"), _) => "none supplied",
                     (_, true) => "complete",
                     (_, false) => "INCOMPLETE",
                 }
@@ -1196,19 +1202,22 @@ mod tests {
         let _ = std::fs::remove_file(&input);
         let rec = Recorder::to_file(&input, 0).expect("a transcript");
         let rows = [
-            ("target_replaced", 2u32, Some("not_attempted")),
-            ("target_uncertain", 3, Some("not_attempted")),
-            ("failed", 4, Some("incomplete")),
-            ("failed", 5, None),
+            ("target_replaced", Some(2u32), Some("not_attempted"), false),
+            ("target_uncertain", Some(3), Some("not_attempted"), false),
+            ("failed", Some(4), Some("incomplete"), false),
+            ("failed", Some(5), None, false),
+            // The one the flag gets wrong in the other direction: an empty block completes
+            // vacuously, so `rollback_complete` is true and nothing was undone.
+            ("committed", None, Some("not_supplied"), true),
         ];
-        for (outcome, at_step, rollback) in rows {
+        for (outcome, at_step, rollback, complete) in rows {
             rec.write(Event::Batch {
                 request: 1,
                 session: Some("sess-1".to_string()),
                 outcome: outcome.to_string(),
-                at_step: Some(at_step),
-                committed: false,
-                rollback_complete: false,
+                at_step,
+                committed: complete,
+                rollback_complete: complete,
                 rollback: rollback.map(str::to_string),
                 after: "detached".to_string(),
                 elapsed_ms: 12,
@@ -1221,13 +1230,17 @@ mod tests {
         let rendered: String = events.iter().map(|(_, _, data)| data.as_str()).collect();
 
         for (outcome, at_step, expected) in [
-            ("TARGET_REPLACED", 2, "NOT ATTEMPTED"),
-            ("TARGET_UNCERTAIN", 3, "NOT ATTEMPTED"),
-            ("FAILED", 4, "INCOMPLETE"),
+            ("TARGET_REPLACED", Some(2), "NOT ATTEMPTED"),
+            ("TARGET_UNCERTAIN", Some(3), "NOT ATTEMPTED"),
+            ("FAILED", Some(4), "INCOMPLETE"),
             // No disposition recorded: the flag is all such a record ever said.
-            ("FAILED", 5, "INCOMPLETE"),
+            ("FAILED", Some(5), "INCOMPLETE"),
+            // And the flag's other blind spot: nothing was undone, so this must not read
+            // "complete".
+            ("COMMITTED", None, "none supplied"),
         ] {
-            let line = format!("batch {outcome} at step {at_step} — rollback {expected}");
+            let at = at_step.map_or(String::new(), |n| format!(" at step {n}"));
+            let line = format!("batch {outcome}{at} — rollback {expected}");
             assert!(rendered.contains(&line), "expected `{line}` in: {rendered}");
         }
     }
