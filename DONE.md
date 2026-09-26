@@ -5173,6 +5173,13 @@ Three things about the shape of it are worth keeping.
   restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
   now, and the rendering has a line for a block where nought of the steps failed and the rollback
   is still not complete.
+- **And the same false claim again, one channel over.** The refusal an `interrupt` racing a
+  stopped batch reads said "this session's handle is being retired with it" — true when the target
+  was replaced and false for the other two ways of losing it, which retire nothing. Caught in the
+  report first and in the request reader a round later, which is the tell that a distinction made
+  in one place has to be carried to every sentence that depends on it: one seal reason covers three
+  causes, so its message may claim only what all three share, and the batch's own reply is what
+  says which it was.
 - **Six review rounds asked one question — *how soon does the batch find out* — and the answer
   is where the probe sits, not how many places it is repeated in.** It began after the loop, moved
   to after each step, then to the detection point for the seal, and finally to between a step's
