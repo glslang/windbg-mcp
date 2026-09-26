@@ -6,11 +6,12 @@ cleanup is exactly the call that times out, and a disconnect sends nothing at al
 that costs the VM: an un-restored patch, or a target left halted.
 
 `debug_batch` submits the whole sequence as one op. It runs **inside the session's engine process**,
-which owns the deadline, so the `always` block is reached on every path but one — success, a debugger
-error, an assertion that did not hold, the deadline expiring, the session being torn down under it —
-before the tool call returns. Part of the budget is reserved for it up front, because "what is left"
-after a step that ran to its own deadline is nothing. The exception is a target *replaced* under the
-batch, where the cleanup is dropped on purpose; it is the last of the limits below.
+which owns the deadline, so the `always` block is reached on every path it can be *aimed* at —
+success, a debugger error, an assertion that did not hold, the deadline expiring, the session being
+torn down under it — before the tool call returns. Part of the budget is reserved for it up front,
+because "what is left" after a step that ran to its own deadline is nothing. The exception is a
+batch that can no longer say what the debugger is holding, where the cleanup is dropped on purpose;
+it is the last of the limits below.
 
 ```jsonc
 {

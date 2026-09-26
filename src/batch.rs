@@ -23,11 +23,13 @@
 //!   the same block, cleanup continues past its own failures, and a failure inside it is recorded
 //!   beside the original rather than replacing it. What the reserve buys is *time to run*, not a
 //!   guarantee: a step that overruns far enough to consume the reserve too leaves cleanup with no
-//!   budget, so the block is skipped and the report says the rollback is incomplete. The one path
-//!   that deliberately **drops** it is a target *replaced* under the batch
-//!   ([`Debuggee::replaced`]): a restore run there lands in a target that never had the mutation,
-//!   at an address that means something else in it, so losing the cleanup is the safe direction
-//!   and running it is not. Both edges are pinned by tests rather than left to be discovered.
+//!   budget, so the block is skipped and the report says the rollback is incomplete. What it is
+//!   deliberately **not** reached on is a batch that can no longer say what the engine is holding
+//!   ([`Debuggee::replaced`]) — replaced under it, or an engine that stopped answering: a restore
+//!   that cannot be aimed at the target the steps ran against is worse than one that is missing,
+//!   so losing the cleanup is the safe direction there and running it is not. Stated as the rule
+//!   rather than as its causes, because the causes are two and were one for a review round. Every
+//!   edge here is pinned by a test rather than left to be discovered.
 //! * **The executor never touches DbgEng.** It drives a [`Debuggee`], which the worker implements
 //!   over a real engine and the tests implement over a script. Assertion failure, a command failure
 //!   after a mutation, deadline expiry and a rollback that itself fails are therefore all testable
