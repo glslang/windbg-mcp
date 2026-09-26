@@ -103,7 +103,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that number is **0**, so the control's zero is over 32,768 pages it actually read. Two more
   published figures become readings rather than properties: the PE-header counts span 86-101 and
   100-143 over three captures of one boot, and the walk's distinct leaf pages 4,189 and 4,194,
-  while the 11,326 mappings and 166 table reads were identical every time. No Rust and no MCP
+  while the 11,326 mappings and 166 table reads were identical every time. **A fifth round found
+  four more, and the theme had moved**: from a failure reading as a result to prose asserting a
+  property the code did not enforce. `walk_module_list`'s docstring said the first `DllBase` had
+  to equal the independently identified base; the code only decoded, so a stale or coincidental
+  pointer yielded plausible names and sizes instead of an error. It now returns `valid` and the
+  candidate search takes it as the last word -- `KernBase` matching is necessary and was being
+  treated as sufficient, and a rejected hit is recorded and the next one tried. Auditing every
+  docstring in the file for invariants it claims found that one and no other. Beside it:
+  `distinct_leaf_gpas` counted a 2 MiB leaf as one page where `leaf_pages` counted 512, and the
+  obvious repair -- a set of every frame -- would allocate 262,144 entries per 1 GiB leaf against
+  a 200,000-leaf budget, which is the memory explosion the walk's guards exist for, so the spans
+  are merged instead; and `--apply-replay-log` mutates the `.vmrs` *after* its size and mtime
+  were recorded, so the provenance described the input rather than the analysed bytes. That last
+  one is also the round's own lesson about tests: the first attempt pinned `describe_file`, which
+  was never where the defect was, and backing the re-stat out of `main` left it green -- so the
+  ordering moved into `capture_provenance`, a function a test can drive. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

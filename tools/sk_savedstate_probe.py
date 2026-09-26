@@ -849,7 +849,7 @@ def walkable(vtl1):
     return True, None
 
 
-def identify_image(candidates, gather):
+def identify_image(candidates, gather, confirm=None):
     """Try each candidate mapping until one is vouched for by a data block's own `KernBase`.
 
     `matches_disk` says the bytes at this VA *are* that image; it does not say this VA is the base
@@ -861,31 +861,88 @@ def identify_image(candidates, gather):
 
     Returns the chosen candidate with its hits, and an attempt record for **every** candidate
     tried, so a report says which mappings were examined rather than implying there was one.
+
+    **`KernBase` matching is necessary and was being treated as sufficient.** A block can name the
+    right image and still carry a stale or uninitialised `PsLoadedModuleList` -- the measured block
+    has 26 of its 116 qwords non-zero, so fields that mean nothing here legitimately are -- and a
+    list walked from a bad pointer yields plausible names and sizes rather than an error. So a
+    caller may supply `confirm`, which gets the last word; a hit it rejects is recorded and the
+    search moves to the next hit, then to the next candidate.
     """
     attempts = []
     for candidate in candidates:
         image, missing = gather(candidate["va"], candidate["size_of_image"])
         hits = find_kdbg(image, candidate["va"])
+        accepted = None
         for hit in hits:
             # Only meaningful once `KernBase` has vouched for the alignment; on a coincidental
             # tag the field is whatever bytes happened to sit at +0x48.
-            if hit["kern_base_matches"]:
-                hit["ps_loaded_module_list_image_offset"] = (
-                    hit["ps_loaded_module_list"] - candidate["va"]
-                )
-        validated = [hit for hit in hits if hit["kern_base_matches"]]
+            if not hit["kern_base_matches"]:
+                continue
+            hit["ps_loaded_module_list_image_offset"] = (
+                hit["ps_loaded_module_list"] - candidate["va"]
+            )
+            if confirm is None:
+                accepted = {"hit": hit, "confirmation": None}
+                break
+            ok, detail = confirm(candidate, hit)
+            hit["confirmed"] = ok
+            if ok:
+                accepted = {"hit": hit, "confirmation": detail}
+                break
+            hit["rejected_by"] = detail.get("invalid_reason") if isinstance(detail, dict) else detail
         attempts.append(
             {
                 "va": candidate["va"],
                 "gpa": candidate["gpa"],
                 "image_pages_unreadable": len(missing),
                 "kdbg_hits": len(hits),
-                "validated": bool(validated),
+                "kern_base_matches": sum(1 for hit in hits if hit["kern_base_matches"]),
+                "validated": accepted is not None,
             }
         )
-        if validated:
-            return {"candidate": candidate, "hits": hits, "block": validated[0]}, attempts
+        if accepted:
+            return (
+                {
+                    "candidate": candidate,
+                    "hits": hits,
+                    "block": accepted["hit"],
+                    "confirmation": accepted["confirmation"],
+                },
+                attempts,
+            )
     return None, attempts
+
+
+def describe_file(path):
+    """Path, size and mtime of one capture file, read at the moment it is called."""
+    stat = path.stat()
+    return {
+        "path": str(path),
+        "size": stat.st_size,
+        "mtime_utc": datetime.fromtimestamp(stat.st_mtime, timezone.utc).isoformat(
+            timespec="seconds"
+        ),
+    }
+
+
+def capture_provenance(files, form, apply_replay_log=None):
+    """Describe the capture, **after** anything that rewrites it has run.
+
+    `--apply-replay-log` opens the `.vmrs` read-write and mutates it, so a stat taken before that
+    describes the input and not the bytes the results come from -- provenance for a different
+    file, in a report whose whole subject is which bytes answered. The ordering is the rule here,
+    so it lives in a function a test can drive rather than inline in `main`, where the defect was
+    and where nothing could reach it.
+    """
+    record = {"form": form, "files": [describe_file(path) for path in files]}
+    if apply_replay_log is None:
+        return record
+    apply_replay_log()
+    record["replay_log_applied"] = True
+    record["files_before_replay"] = record["files"]
+    record["files"] = [describe_file(path) for path in files]
+    return record
 
 
 def choose_capture(located):
@@ -906,12 +963,16 @@ def choose_capture(located):
     return None, ()
 
 
-def walk_module_list(reader, head_va, limit=32):
+def walk_module_list(reader, head_va, expected_base, limit=32):
     """Walk the `LIST_ENTRY` the debugger data block points at, as `KLDR_DATA_TABLE_ENTRY`.
 
-    Validation rather than discovery: the first entry's `DllBase` has to equal the base the PE
-    walk established, or the block was read at the wrong alignment and everything above it is a
-    coincidence.
+    **Validation rather than discovery**, and this function is where a docstring said that while
+    the code below only decoded. The first entry's `DllBase` has to equal the base the PE walk
+    established independently, or the list was read at the wrong alignment, or through a stale
+    pointer, or through a coincidental `KDBG` hit -- and in every one of those cases it still
+    yields plausible names and sizes, which is exactly why it has to be checked rather than
+    looked at. The result carries `valid`, and a caller that gets `False` should move on to the
+    next hit or the next candidate rather than publish the entries.
     """
 
     def read_span(va, size):
@@ -952,7 +1013,45 @@ def walk_module_list(reader, head_va, limit=32):
             }
         )
         current = struct.unpack_from("<Q", record, 0)[0]
-    return {"head_va": head_va, "entries": entries, "closed": current == head_va}
+    result = {"head_va": head_va, "entries": entries, "closed": current == head_va}
+    first = entries[0] if entries else None
+    if first is None:
+        result.update(valid=False, invalid_reason="the list is empty")
+    elif first.get("dll_base") != expected_base:
+        result.update(
+            valid=False,
+            invalid_reason=(
+                f"first DllBase 0x{first.get('dll_base', 0):X} is not the identified base "
+                f"0x{expected_base:X}"
+            ),
+        )
+    else:
+        result["valid"] = True
+    return result
+
+
+def distinct_leaf_pages(leaves):
+    """How many 4 KiB frames the leaves cover, counted without materialising them.
+
+    `len({gpa for ...})` counts a 2 MiB leaf as one page while `leaf_pages` counts it as 512, so
+    the two figures would be in different units the first time a large mapping appears. The
+    obvious repair -- a set of every frame -- is the wrong one here: a single 1 GiB leaf is
+    262,144 frames and the leaf budget allows 200,000 leaves, which is the memory explosion this
+    walk's guards exist to prevent. Merging the spans instead is bounded by the leaf count.
+    """
+    spans = sorted((gpa, gpa + size) for _va, gpa, size in leaves)
+    total = 0
+    current_start = current_end = None
+    for start, end in spans:
+        if current_end is None or start > current_end:
+            if current_end is not None:
+                total += current_end - current_start
+            current_start, current_end = start, end
+        else:
+            current_end = max(current_end, end)
+    if current_end is not None:
+        total += current_end - current_start
+    return total // PAGE
 
 
 def main(argv=None):
@@ -1019,25 +1118,13 @@ def main(argv=None):
         report["vm"] = {"name": None, "snapshot": None, "located": {"vmrs": args.vmrs}}
 
     files = [Path(path) for path in paths]
-    report["capture"] = {
-        "form": form,
-        "files": [
-            {
-                "path": str(path),
-                "size": path.stat().st_size,
-                "mtime_utc": datetime.fromtimestamp(
-                    path.stat().st_mtime, timezone.utc
-                ).isoformat(timespec="seconds"),
-            }
-            for path in files
-        ],
-    }
-
-    if args.apply_replay_log:
-        if form != "vmrs":
-            raise ProbeError("a replay log belongs to a .vmrs; this capture is a .bin/.vsv pair")
-        state.apply_replay_log(files[0])
-        report["capture"]["replay_log_applied"] = True
+    if args.apply_replay_log and form != "vmrs":
+        raise ProbeError("a replay log belongs to a .vmrs; this capture is a .bin/.vsv pair")
+    report["capture"] = capture_provenance(
+        files,
+        form,
+        (lambda: state.apply_replay_log(files[0])) if args.apply_replay_log else None,
+    )
 
     if form == "vmrs":
         state.load(vmrs=files[0])
@@ -1085,7 +1172,7 @@ def main(argv=None):
                 "root_from": "GetRegisterValue at forced VTL1, this capture",
                 "leaf_pages": sum(leaf[2] // PAGE for leaf in leaves),
                 "leaf_entries": len(leaves),
-                "distinct_leaf_gpas": len({leaf[1] for leaf in leaves}),
+                "distinct_leaf_pages": distinct_leaf_pages(leaves),
                 **walk_stats,
             }
             images, leaf_scan = scan_leaves_for_images(state, leaves, disk)
@@ -1107,19 +1194,28 @@ def main(argv=None):
                     reader_cache[va] = page
                     return page
 
+                def confirm(candidate, hit):
+                    # The last word on a candidate: a block naming the right image still has to
+                    # produce a module list whose first entry names it back.
+                    listing = walk_module_list(
+                        read_va, hit["ps_loaded_module_list"], candidate["va"]
+                    )
+                    return bool(listing.get("valid")), listing
+
                 chosen, attempts = identify_image(
-                    matches, lambda va, size: gather_image(read_va, va, size)
+                    matches,
+                    lambda va, size: gather_image(read_va, va, size),
+                    confirm=confirm,
                 )
                 report["kdbg"] = {"candidates": attempts}
                 if chosen:
                     found = chosen["candidate"]
                     report["kdbg"]["chosen_va"] = found["va"]
                     report["kdbg"]["hits"] = chosen["hits"]
-                    report["module_list"] = walk_module_list(
-                        read_va, chosen["block"]["ps_loaded_module_list"]
-                    )
+                    report["module_list"] = chosen["confirmation"]
                 else:
-                    # Every matching mapping was examined and none carried a block naming itself.
+                    # Every matching mapping was examined and none produced a block that named
+                    # itself *and* a module list that named it back.
                     found = matches[0]
                     report["kdbg"]["hits"] = []
 
