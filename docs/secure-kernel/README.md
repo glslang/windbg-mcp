@@ -39,8 +39,13 @@ read as reboot-stable.
 The two image-relative **offsets** are properties of the build rather than of the boot, so they are
 the coordinates to carry forward; the VAs beside them depend on the load base.
 
-**What is still open:** driving DbgEng off it. That is gated on the EXDI activation problem, not on
-anything about reaching Secure Kernel.
+**What is still open:** turning those reads into tools (gate H5), which is not started. Its route is
+decided, though, and the decision is the opposite of where this work began. Driving a live Secure
+Kernel target through **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does
+not work on this bench and is unresolved, and — measured separately — DbgEng's Secure Kernel record
+is unreachable, so even a working EXDI would supply a generic memory target rather than any SK
+awareness. Since the reads now exist, that is a trade with nothing on one side. What it costs is
+DbgEng's symbol handling, most of which is recoverable against the *image* without a live target.
 
 ## The documents
 
@@ -51,7 +56,7 @@ Read them in this order; each assumes the one before it.
 | 1 | [Secure Kernel debugging plan](secure-kernel-debugging-plan.md) | The original plan: validate software-only SK debugging, then integrate whichever route works. Carries the handoff status and the `Kd=` option set read out of `dbgeng.dll` — six kernel-discovery modes, of which `Kd=VerAddr:<addr>` is the one a Secure Kernel bind would use. |
 | 2 | [Secure Kernel debugging validation](secure-kernel-debugging-validation.md) | The measurement record behind everything else. NT and hypervisor debugging pass; **native SK attachment does not**. Why post-26100 `securekernel.exe` ships no KD transport, and what `SkdInitDebuggerDataBlock` does instead. The longest document here and the one to cite. |
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
-| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass; H5 is unreached. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. |
+| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5 is not started, but its route is decided: **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness. |
 
 Two older side-investigations, kept because they are about the same binary:
 
