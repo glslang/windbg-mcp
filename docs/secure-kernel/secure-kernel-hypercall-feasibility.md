@@ -861,6 +861,44 @@ enabled. It has run: the fields that mean anything for SK carry live pointers.
 **Cost:** the whole confirmation took **10 page reads**, against 13,769 for the structural search
 that preceded it. Once the coordinates are known, this is cheap enough to do on every attach.
 
+### H4 Control 1, 2026-09-26: run, and it passes
+
+**This was the criterion still owed, and it is the one that decides whether anything above counts.**
+The risk it guards is specific: **this host runs VBS itself** (`VirtualizationBasedSecurityStatus`
+is `2`), so the root partition has its own Secure Kernel resident in memory. A read path that was
+landing in *host* memory — or in any partition other than the one named — would find
+`securekernel.exe` regardless, and the identification against the on-disk image would confirm it
+just as happily. Nothing measured above distinguishes those two worlds. This does.
+
+One procedure, two partitions, the same fixed GPA grid, in one process:
+
+| | partition 0x3 — VBS **on** | partition 0x2 — VBS **off** |
+|---|---|---|
+| pages scanned | 32768 | 32768 |
+| pages with content | 32768 | 32768 |
+| PE image headers | 112 | **152** |
+| matching `securekernel.exe` (sections + timestamp + `SizeOfImage`) | **1**, at GPA `0x00CD0000` | **0** |
+| `KDBG` tags | 4 | **0** |
+| `KDBG` with `Size` `0x3A0` | **1**, at GPA `0x03A035F0` | **0** |
+
+**The positive arm is not decoration.** A scan that finds nothing anywhere is indistinguishable
+from a broken scan, so the negative is worth nothing on its own — which is why both arms run
+together and both are reported. The control guest yields **more** PE headers than the VBS guest
+(152 against 112), so the procedure demonstrably works there. It simply finds no Secure Kernel, and
+not one `KDBG` tag of any size.
+
+**A second result falls out of it.** This scan reached `securekernel.exe` by walking raw physical
+pages and testing PE headers — touching no page table and using none of the VTL1 `CR3`. It landed on
+GPA `0x00CD0000`, **the same GPA the four-level walk reported** from an entirely different
+direction. Two methods that share only the partition handle agreeing on one address is a stronger
+statement than either made alone.
+
+**What the control does not establish.** It shows the reads are scoped to the partition named and
+that SK's presence tracks VBS. It says nothing about *which* mechanism reads VTL1 pages — that is
+the hypercall-versus-direct-route question settled separately — and the two guests differ in more
+than one respect besides VBS, so this is a control against a specific confusion rather than a
+general one.
+
 ### H4 pass criteria, as written before the run
 
 **Kept for comparison, and — unlike an earlier draft of this paragraph said — subsequently met.**
@@ -874,11 +912,11 @@ It did.
 | valid PE header at the claimed SK base, section names and sizes matching the on-disk image | **met** — 18/18 names, timestamp and `SizeOfImage` |
 | `KdDebuggerDataBlock` located, `KDBG` signature | **met** — image +0x1335E0; its `Size` is `0x3A0`, not the `0x3A8` the criterion assumed |
 | `SkLoadedModuleList` points at plausible module records | **met** — image +0x127770, six modules |
-| Control 1: the same procedure finds no SK data block in the VBS-off guest | **not run** |
+| Control 1: the same procedure finds no SK data block in the VBS-off guest | **met** — 0 SK images and 0 `KDBG` tags there, against 1 of each in the VBS guest, same grid |
 | Control 2: an oracle that is not this mechanism | **met** — the on-disk image, written by neither the hypercall nor the driver |
 
-Control 1 is the one still owed. The criteria are left below in their original wording so that what
-was asked for before the run can be read against what was found.
+Every criterion and both controls are now met. The criteria are left below in their original
+wording so that what was asked for before the run can be read against what was found.
 
 Only meaningful once H3 passes. **Budget for walking SK's page tables rather than for the
 hypervisor doing it**: H0 found `HvCallTranslateVirtualAddress` documented without a Restrictions
