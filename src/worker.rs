@@ -56,7 +56,7 @@ use dbgscope::pool::{
 };
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
-use crate::batch::{self, BatchOp, Debuggee, Ran};
+use crate::batch::{self, BatchOp, Debuggee, Held, Ran};
 use crate::device;
 use crate::driver::{
     fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_lm_base,
@@ -2017,21 +2017,36 @@ fn watch_for(op: &EngineOp) -> Watch {
 /// one way. It answers `None` for a worker with no baseline, for a target that has gone, and for
 /// an engine that will not say — see [`replacement`] for why the last two are not replacements.
 fn replacement_now(e: &DebugEngine) -> Option<String> {
-    replacement_since(e, OPENED_AS.get()?)
+    match held_now(e, OPENED_AS.get()?) {
+        Held::Replaced(why) => Some(why),
+        // **An engine that will not say is not evidence of a replacement**, which is this
+        // caller's decision and not the other one's: retiring a session on a reading nobody got
+        // costs a caller their handle in the one state where nothing can be checked. The batch
+        // decides the opposite way on the same value ([`Held::Unknown`]) because what it is
+        // deciding is whether to *write*.
+        Held::Same | Held::Unknown(_) => None,
+    }
 }
 
-/// [`replacement_now`] against a baseline the caller holds, rather than the session's.
+/// What the engine is holding, against a baseline the caller holds — the reading both halves of
+/// this mechanism share, with the *decision* left to each of them.
 ///
-/// The split exists for [`BatchEngine::replaced`], and the two baselines answer different
-/// questions rather than the same one at different times. [`OPENED_AS`] asks *is this still what
-/// the handles name*, which is what retires a handle. A batch asks *is this still what my steps
-/// ran against*, which is what decides whether its rollback may run — and it has to, because a
-/// call naming no `session_id` is deliberately served by whatever this worker now holds
-/// (`SessionState::accepts_default`, `docs/sessions.md`). Measured against `OPENED_AS`, every
-/// such batch on a worker whose target had already been swapped would refuse to roll back for the
-/// life of the worker, which is the same over-reach
+/// **The two baselines answer different questions rather than the same one at different times.**
+/// [`OPENED_AS`] asks *is this still what the handles name*, which is what retires a handle. A
+/// batch asks *is this still what my steps ran against*, which is what decides whether its
+/// rollback may run — and it has to, because a call naming no `session_id` is deliberately served
+/// by whatever this worker now holds (`SessionState::accepts_default`, `docs/sessions.md`).
+/// Measured against `OPENED_AS`, every such batch on a worker whose target had already been
+/// swapped would refuse to roll back for the life of the worker, which is the same over-reach
 /// [`refuse_when_the_target_was_replaced`] was narrowed to avoid.
-fn replacement_since(e: &DebugEngine, baseline: &TargetFingerprint) -> Option<String> {
+///
+/// **And the three-way answer is dbgscope's instruction rather than a refinement of it.**
+/// `DebugEngine::has_target` says so on itself: *"an unreadable status is not an answer, and this
+/// does not collapse one into `true`: what to do when the engine cannot be asked differs by
+/// caller, and each one below decides."* An `Option` here spelled *"it would not say"* and
+/// *"nothing has changed"* the same way, and [`crate::batch`] needs them apart — raised by Codex
+/// on [#392](https://github.com/glslang/windbg-mcp/pull/392).
+fn held_now(e: &DebugEngine, baseline: &TargetFingerprint) -> Held {
     // **Asked before a fingerprint is read, and that ordering is the whole of it.** Driving
     // DbgEng with no debuggee faults *inside* DbgEng — a structured exception `catch_unwind`
     // cannot trap, so it takes the worker process down instead of failing the call, which is why
@@ -2045,20 +2060,38 @@ fn replacement_since(e: &DebugEngine, baseline: &TargetFingerprint) -> Option<St
     // So this is a guard and not an optimisation, and [`replacement`] is given the answer anyway
     // so the *rule* — that a target which has gone is not one that has been replaced — is stated
     // in one place and testable there.
-    let holds_a_target = e.has_target().ok();
+    let holds_a_target = match e.has_target() {
+        Ok(holds) => Some(holds),
+        Err(why) => {
+            return Held::Unknown(format!(
+                "the debugger would not say whether it is holding a target: {}",
+                es(why)
+            ));
+        }
+    };
     if holds_a_target != Some(true) {
-        return None;
+        // Gone, not replaced — and `Same` rather than a fourth value, because the ending is
+        // already carried by the step that caused it and refused by
+        // [`refuse_when_the_target_is_gone`], both of which say more about it than this could.
+        return Held::Same;
     }
-    replacement(baseline, &TargetFingerprint::read(e), holds_a_target)
+    // `holds_a_target` is `Some(true)` by here, and [`replacement`] is still handed it: that
+    // function is where the rule — a target gone or unreadable is not one replaced — is stated
+    // and tested, and narrowing its input to what this arm knows would move the rule to the call
+    // site.
+    match replacement(baseline, &TargetFingerprint::read(e), holds_a_target) {
+        Some(why) => Held::Replaced(why),
+        None => Held::Same,
+    }
 }
 
 /// The reading a batch measures its own steps against, taken before its first step runs.
 ///
-/// `None` when the engine holds nothing or will not say, which is the same guard
-/// [`replacement_since`] applies and for the same reason — reading a fingerprint off an engine
-/// with no debuggee is an access violation *inside* DbgEng. A batch cannot ordinarily start in
-/// that state at all ([`refuse_when_the_target_is_gone`] turns it away), so what this really
-/// covers is an engine that would not answer, where nothing may be concluded either way.
+/// `None` when the engine does not answer that it is holding a target, which is the same guard
+/// [`held_now`] applies and for the same reason — reading a fingerprint off an engine with no
+/// debuggee is an access violation *inside* DbgEng. **A batch with no baseline is refused rather
+/// than run**: see [`run_batch`], where the alternative is an executor that checks nothing for
+/// the batch's whole length.
 fn batch_baseline(e: &DebugEngine) -> Option<TargetFingerprint> {
     matches!(e.has_target(), Ok(true)).then(|| TargetFingerprint::read(e))
 }
@@ -6008,9 +6041,11 @@ struct BatchEngine<'a> {
     /// What the engine was holding when this batch started, which every step is measured
     /// against — see [`Debuggee::replaced`] and [`batch_baseline`].
     ///
-    /// Deliberately not named after [`OPENED_AS`], which is the *session's* baseline and answers
-    /// a different question: see [`replacement_since`].
-    started_on: Option<TargetFingerprint>,
+    /// Not an `Option`: a batch that could not be given one is refused before it runs, so there
+    /// is no state in which this executor checks nothing. Deliberately not named after
+    /// [`OPENED_AS`], which is the *session's* baseline and answers a different question — see
+    /// [`held_now`].
+    started_on: TargetFingerprint,
 }
 
 impl BatchEngine<'_> {
@@ -6092,8 +6127,8 @@ impl Debuggee for BatchEngine<'_> {
         self.e.has_target().ok()
     }
 
-    fn replaced(&mut self) -> Option<String> {
-        replacement_since(self.e, self.started_on.as_ref()?)
+    fn replaced(&mut self) -> Held {
+        held_now(self.e, &self.started_on)
     }
 
     fn run_to(&mut self, address: &str, timeout_ms: u32) -> Result<Ran, String> {
@@ -6202,6 +6237,28 @@ fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result
     // budget bounds what a batch may start, and an operation started a moment before it still gets
     // a watchdog floor. Advertising the bare budget would have a teardown terminate this worker
     // while the last restore was still running — see [`batch::OVERRUN_ALLOWANCE`].
+    // **Before the batch is claimed, because a batch with no baseline must not start.** Every
+    // step is measured against this reading, so without it the executor would check nothing for
+    // the batch's whole length and then run its rollback against a target nothing had identified
+    // — which is the hole this refusal closes, raised by Codex on
+    // [#392](https://github.com/glslang/windbg-mcp/pull/392). Refusing costs a caller one retry
+    // and leaves the target untouched; the alternative costs a write into whatever the engine
+    // turns out to be holding.
+    //
+    // Only reachable on an engine that will not answer: one that answers *no* is turned away
+    // earlier by [`refuse_when_the_target_is_gone`], which every non-opener op passes through.
+    let Some(started_on) = batch_baseline(e) else {
+        return Err(
+            "This batch was not started: the debugger did not answer that it is holding a \
+             target, so there is no reading of it for the batch to measure its steps against — \
+             and a rollback must not be run against a target the batch cannot identify as the one \
+             its steps ran against. Nothing was run and nothing was changed — no step, no \
+             assertion, no rollback — so the target is exactly as it was and resubmitting is safe. \
+             Ask what this session holds; an engine that will not say what it is debugging \
+             usually wants the session ended and opened again."
+                .to_string(),
+        );
+    };
     let Some(_running) = BATCH.enter(budget + batch::OVERRUN_ALLOWANCE) else {
         // The same answer as an unaffordable budget above, and for the same reason: nothing ran, so
         // there is nothing to undo and resubmitting is safe. This is the queue-wait case — the
@@ -6220,10 +6277,7 @@ fn run_batch(e: &DebugEngine, job: u64, op: BatchOp, queued: Duration) -> Result
         started: Instant::now(),
         signal: &BATCH,
         job,
-        // Read before the first step, not lazily at the first check: a baseline taken after a
-        // step has already swapped the target would be a reading of the replacement, and every
-        // later comparison would agree with it.
-        started_on: batch_baseline(e),
+        started_on,
     };
     let report = batch::run(&mut engine, &op, budget);
     let rendered = batch::render(&report);

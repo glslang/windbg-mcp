@@ -5148,7 +5148,7 @@ Three things about the shape of it are worth keeping.
 
 - **The baseline is the batch's, not the session's.** `replacement_now` compares against
   `OPENED_AS`, the reading taken when the *session's* target was opened; the batch compares against
-  what it found when it started (`worker::batch_baseline`, `replacement_since`). The two are
+  what it found when it started (`worker::batch_baseline`, `held_now`). The two are
   different questions and the difference is a documented route rather than an edge: a call naming
   no `session_id` is deliberately served by whatever the worker now holds, retired handles and all,
   so a batch can legitimately be running against a target that already replaced the session's
@@ -5167,6 +5167,26 @@ Three things about the shape of it are worth keeping.
   step that replaces the target stops the rest of the cleanup, but the steps themselves ran, so the
   outcome stays `Committed` and the disposition is `Incomplete` — part of the block ran. This was
   not in the item and is the same hazard one block later; it cost four lines.
+- **"The engine would not say" is a third answer, and the first version spelled it as the first.**
+  Raised by Codex in review, and correct: `has_target` failing came back as `None` from a function
+  returning `Option`, which the executor could not tell from *nothing has changed* — so a step that
+  swapped the target while the engine went quiet would have had its cleanup run against the
+  replacement anyway, and a batch whose *baseline* could not be read checked nothing for its whole
+  length. dbgscope says the same thing from the other end, on `has_target` itself: *"an unreadable
+  status is not an answer, and this does not collapse one into `true`: what to do when the engine
+  cannot be asked differs by caller, and each one below decides."* So `Held` has three values,
+  `Held::Unknown` withholds the cleanup under its own outcome (`BatchOutcome::TargetUncertain`,
+  which claims no second target because none was identified), and a batch that cannot read a
+  baseline **before its first step is refused outright** — nothing run, nothing changed,
+  resubmitting safe, which is the one answer that costs the caller a retry rather than a write.
+
+  **The two halves of the mechanism now decide this reading differently, deliberately.** The
+  handle half retires nothing on an engine that will not answer (`worker::replacement_now`), and
+  the batch withholds. Same predicate, different price: a wrong retirement costs a caller one
+  re-open, a wrong restore costs whatever that address means in somebody else's target. And the
+  argument that makes `Unknown` rare is the same one that makes withholding cheap — an engine that
+  cannot answer `GetExecutionStatus`, an engine-local call that never reaches the wire, was
+  unlikely to execute the restore either.
 
 **What measuring it disproved — the item's own example.** Every draft of this entry, and the
 paragraph in `CLAUDE.md`-adjacent prose that came with item 81, illustrated a replacement with
@@ -5200,8 +5220,9 @@ round differently. Worth noting while re-deriving them: the *prose* totals in `R
 `src/toolset.rs` and `docs/remote-listener.md` were already 50 B behind the served surface before
 this change (94,921 against 94,971), which is what "prose is not swept" buys and costs.
 
-**Where it picked up.** `batch::run`'s between-steps checks, `batch::Debuggee::replaced`,
-`BatchOutcome::TargetReplaced`, `BatchReport::replaced` and `BatchReport::rollback` in
-`src/batch.rs`; `BatchEngine`, `batch_baseline` and `replacement_since` in `src/worker.rs`;
-`BatchOutcomeName::TargetReplaced` and `RollbackDisposition` in `src/structured.rs`; the batch
-verdict's rendering in `src/cast.rs`; `docs/debug-batch.md`, which states the rollback contract.
+**Where it picked up.** `batch::run`'s between-steps checks, `batch::Held`,
+`batch::Debuggee::replaced`, `BatchOutcome::TargetReplaced`/`TargetUncertain`,
+`BatchReport::unverified` and `BatchReport::rollback` in `src/batch.rs`; `BatchEngine`,
+`batch_baseline`, `held_now` and `run_batch`'s baseline refusal in `src/worker.rs`;
+`BatchOutcomeName` and `RollbackDisposition` in `src/structured.rs`; the batch verdict's rendering
+in `src/cast.rs`; `docs/debug-batch.md`, which states the rollback contract.

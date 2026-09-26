@@ -4012,6 +4012,13 @@ pub enum BatchOutcomeName {
     /// dropping it is the safe direction. Whatever the steps changed is still in place on the
     /// original target, which this session can no longer reach: open one on it to put it back.
     TargetReplaced,
+    /// The debugger stopped saying what target it is holding, so the batch could no longer
+    /// certify that it is the one its steps ran against. The steps after that point were not
+    /// attempted and the `always` block was deliberately not run — `rollback` says
+    /// `not_attempted`. Kept apart from [`Self::TargetReplaced`] because nothing identified a
+    /// second target: this session may simply be wedged, and what the steps changed is likely
+    /// still in place on a target that is likely still there.
+    TargetUncertain,
 }
 
 /// What became of a batch's `always` block. Mirrors [`crate::batch::Rollback`].
@@ -4104,6 +4111,9 @@ impl From<&crate::batch::BatchReport> for BatchReportInfo {
             BatchOutcome::TargetGone { at } => (BatchOutcomeName::TargetGone, Some(at as u32)),
             BatchOutcome::TargetReplaced { at } => {
                 (BatchOutcomeName::TargetReplaced, Some(at as u32))
+            }
+            BatchOutcome::TargetUncertain { at } => {
+                (BatchOutcomeName::TargetUncertain, Some(at as u32))
             }
         };
         Self {

@@ -3625,11 +3625,12 @@ impl WindbgServer {
     /// the rollback, but it cannot cut that step short, so a batch of long steps unwinds only once
     /// the current one ends. Two things stop the rollback, both reported: a step that overruns
     /// far enough to consume the reserved cleanup budget leaves it unrun
-    /// (`rollback: INCOMPLETE`), and a step that *replaces* the debug target — a `.opendump` or
-    /// `.attach` reached through a wrapper no reading of the command text can catch — ends the
-    /// batch as `BATCH: TARGET REPLACED` and drops the cleanup deliberately
-    /// (`rollback: NOT ATTEMPTED`), a restore applied to a target that never had the mutation
-    /// being a write into whatever that address means there.
+    /// (`rollback: INCOMPLETE`), and a step in `steps` after which the debugger is no longer
+    /// holding the target the batch started against — one *replaced* through a wrapper no
+    /// reading of the command text can catch, or an engine that stops saying what it holds —
+    /// ends the batch (`BATCH: TARGET REPLACED` or `TARGET UNCERTAIN`) and drops the cleanup
+    /// deliberately (`rollback: NOT ATTEMPTED`), a restore that cannot be aimed at the target
+    /// the steps ran against being worse than one that is missing.
     /// The structured half carries all of that as values — `outcome`, the position it stopped at,
     /// `committed`, `rollback_complete`, `rollback`, what each step changed, and what the session
     /// holds now.

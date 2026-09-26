@@ -2096,7 +2096,7 @@ const MODEL_VISIBLE_CEILING: usize = 96_500;
 // explicit handoff field make the measured payload 254,925 B. No schema descriptions added.
 const WIRE_CEILING: usize = 268_000;
 
-/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,405
+/// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,507
 /// bytes (2026-09-26), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
 /// from `src/batch.rs` — and, since item 102, its description owes a second sentence about the
 /// one path that drops the rollback. A tool costing more than this is not necessarily wrong, but it should be a

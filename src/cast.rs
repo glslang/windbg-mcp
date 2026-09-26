@@ -1176,6 +1176,46 @@ mod tests {
         let _ = std::fs::remove_file(&named_cast);
     }
 
+    /// A rollback that was **withheld** is not rendered as one that failed.
+    ///
+    /// Raised by CodeRabbit on [#392](https://github.com/glslang/windbg-mcp/pull/392): the
+    /// mapping is one match arm and nothing constructed the event that reaches it, so simplifying
+    /// it back to `if rollback_complete` would have rendered `INCOMPLETE` — sending a viewer to
+    /// look for a half-run restore that was never started. Both arms are asserted in one test,
+    /// because the value of either is that it is not the other.
+    #[test]
+    fn a_withheld_rollback_is_not_rendered_as_an_incomplete_one() {
+        let input = scratch("withheld-rollback");
+        let _ = std::fs::remove_file(&input);
+        let rec = Recorder::to_file(&input, 0).expect("a transcript");
+        for (outcome, at_step) in [("target_replaced", 2u32), ("failed", 3)] {
+            rec.write(Event::Batch {
+                request: 1,
+                session: Some("sess-1".to_string()),
+                outcome: outcome.to_string(),
+                at_step: Some(at_step),
+                committed: false,
+                rollback_complete: false,
+                after: "detached".to_string(),
+                elapsed_ms: 12,
+            });
+        }
+        drop(rec);
+        let options = Options::parse(&[input.display().to_string()]).expect("parse");
+        render(&options).expect("the render succeeds");
+        let (_, events) = read_cast(&options.output);
+        let rendered: String = events.iter().map(|(_, _, data)| data.as_str()).collect();
+
+        assert!(
+            rendered.contains("batch TARGET_REPLACED at step 2 — rollback NOT ATTEMPTED"),
+            "a withheld cleanup says so: {rendered}"
+        );
+        assert!(
+            rendered.contains("batch FAILED at step 3 — rollback INCOMPLETE"),
+            "and a cleanup that ran short still says that: {rendered}"
+        );
+    }
+
     /// An empty or non-transcript file is refused with an explanation rather than producing a cast
     /// of nothing, which would look like a session in which nothing happened.
     #[test]
