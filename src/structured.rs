@@ -4032,8 +4032,10 @@ pub enum RollbackDisposition {
     /// The block was attempted and at least one step did not complete — it failed, or the budget
     /// ran out before it started. Something may be half restored.
     Incomplete,
-    /// The block was dropped on purpose: the target was replaced under the batch. Nothing was
-    /// tried and nothing was undone, which is not the same news as a rollback that failed.
+    /// The block was dropped on purpose: the batch could no longer certify that the debugger
+    /// holds the target its steps ran against — it was replaced, or the debugger stopped saying
+    /// what it holds. Nothing was tried and nothing was undone, which is not the same news as a
+    /// rollback that failed.
     NotAttempted,
 }
 

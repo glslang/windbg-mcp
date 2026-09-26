@@ -2478,8 +2478,10 @@ guest side to speak to it — rather than by re-running a completed experiment.
 ## 104. [windbg-mcp] A fingerprint field that was *refused* is indistinguishable from one that does not apply
 
 **Repo:** `windbg-mcp`. **Origin:** raised by Codex on
-[#392](https://github.com/glslang/windbg-mcp/pull/392) while item 102 was in review, against a
-hazard item 81 introduced and item 102 made more expensive.
+[#392](https://github.com/glslang/windbg-mcp/pull/392) while item 102 was in review, and reached
+independently by CodeRabbit on the same PR two rounds later, against a hazard item 81 introduced
+and item 102 made more expensive. Two readings converging on one remedy is the part worth keeping:
+neither priced it, and pricing it is what this entry is.
 
 `worker::TargetFingerprint::read` builds its four fields with `.ok()`, so every query's **error**
 becomes `None` — the same value a field takes when the question does not apply to that kind of
@@ -2522,9 +2524,20 @@ Two consequences, and they point in opposite directions:
   (`fingerprints_the_process`, and a second one for the connection query, which is the one that
   needs the per-kind judgement) — and a comparison in which a `refused` on either side answers
   *cannot tell* rather than *same*. `batch::Held::Unknown` is already that answer on the batch
-  side and already withholds cleanup; the handle side needs its own, since "cannot tell" there
-  must not become a retirement on no evidence, which `worker::replacement` deliberately refuses
-  today.
+  side and already withholds cleanup.
+
+  **Most of it needs no table, and that is the part to build first.** `kind` and `dumps` are asked
+  of every target and `processes` is asked behind a gate that already exists, so a baseline that
+  *refused* any of those three can be rejected without deciding anything per kind — which closes
+  the double-failure for a swapped dump and for a `.attach`, and leaves only `connection`, whose
+  absence is legitimate on every target but a live kernel. And a field whose **readability flips**
+  between the two readings can answer *cannot tell* for any of the four, table or no table.
+
+  **The handle's half is what makes it a redesign rather than a patch.** `Held::Unknown` would
+  have to say *why*: a flip is the case `worker::replacement` retires on today (a field that stops
+  answering has changed what the engine says), while an unreadable `has_target` is the case it
+  deliberately does **not** retire on — so one value cannot serve both, and the variant needs a
+  reason the two callers can read differently.
 - **Where it picks up:** `TargetFingerprint`, `TargetFingerprint::read`, `replacement` and
   `usable_baseline` in `src/worker.rs`; `batch::Held` and `Debuggee::replaced` in `src/batch.rs`
   for the batch's half of the decision. The measurement to take first is whether any of the three
