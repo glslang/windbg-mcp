@@ -441,12 +441,34 @@ pieces a read-side backend needs, each taking a VTL:
 `HvRegisterVsmVpStatus`, `HvRegisterVsmPartitionStatus` and `HvRegisterVsmCapabilities` answer
 whether VTL1 is enabled on a given VP before any of that is attempted.
 
-**Locating SK may then need no scan.** Three findings meet: `HvCallGetVpRegisters` at `Vtl1` gives
-CR3; E1 established that `SkdInitDebuggerDataBlock` fills SK's `KdDebuggerDataBlock` completely,
-`SkLoadedModuleList` included; and E1's mode 3, **`Kd=VerAddr:<addr>`**, takes an arbitrary
-`KdVersionBlock` address and is parsed and range-checked rather than merely recognised. So the
-block is located through hypercalls and its address handed to DbgEng directly — no gdbstub, and no
-`Kd=Guess` heuristic scan.
+**Locating SK needs no `Kd=Guess` heuristic scan — but it is not done through hypercalls alone,
+and an earlier version of this paragraph said it was.** Three findings meet: `HvCallGetVpRegisters`
+at `Vtl1` gives CR3; E1 established that `SkdInitDebuggerDataBlock` fills SK's
+`KdDebuggerDataBlock` completely, `SkLoadedModuleList` included; and E1's mode 3,
+**`Kd=VerAddr:<addr>`**, takes an arbitrary `KdVersionBlock` address and is parsed and
+range-checked rather than merely recognised.
+
+**What the three do not supply between them is the block's address.** `HvCallGetVpRegisters`
+returns a `CR3`, which is a guest-physical address of a page table and not an image base; the
+block's image-relative offset is unusable until that base is known; and the hypercall that would
+close the gap is refused — `HvCallReadGpa` will not read these pages, per the bullet above, while
+VTL1 `HvCallTranslateVirtualAddress` remains unproven as this document says two paragraphs down.
+So a hypercall-only implementer gets a `CR3` and stops.
+
+The route that **was** measured, 2026-09-26, inserts one step that is not a hypercall:
+
+1. `HvCallGetVpRegisters` at `Vtl1` → the guest's VTL1 `CR3`. *(hypercall)*
+2. That GPA holds SK's PML4; walk SK's page tables from it. ***(requires the non-hypercall memory
+   route — this is the step the three findings do not cover.)***
+3. A PE header among the walked pages gives the **image base**, identifiable against
+   `securekernel.exe` on disk.
+4. `KdDebuggerDataBlock` is then `base + 0x1335E0` on the measured build, or a tag search inside
+   that one image on a build whose offset is unknown — bounded by the image, not a scan of memory.
+5. Hand that address to `Kd=VerAddr:<addr>`.
+
+So the claim that survives is the narrow one: **no gdbstub and no heuristic scan of memory**, with
+the address arrived at by a bounded walk rather than by hypercalls. See
+[the feasibility record](secure-kernel-hypercall-feasibility.md).
 
 **What is unestablished is permission, not interface.** The TLFS documents VTL-parameterised
 register access; whether the hypervisor grants a *root* partition VTL1 register access for a VBS
