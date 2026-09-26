@@ -689,6 +689,77 @@ def find_kdbg(image, base_va):
     return hits
 
 
+def read_vtl1(state, vp, vtl0_cr3):
+    """Force a VP to VTL1 and read what it then reports, keeping two failures apart.
+
+    **A refused switch and a failed query have the same shape and opposite meanings.** "The
+    provider will not put this VP in VTL1" is the control arm's entire result; "the switch worked
+    and a later register did not come back" says nothing at all about whether VTL1 is enabled. One
+    handler over both writes `forced: false` beside a `cr3` it had already read, and turns a
+    provider that cannot answer one register into evidence that a guest has no Secure Kernel --
+    which is the same collapsing of *refused* into *absent* that this probe exists to avoid.
+    """
+    vtl1 = {"requested": True}
+    try:
+        state.force_vtl(vp, 1)
+    except ProbeError as error:
+        vtl1["forced"] = False
+        vtl1["force_error"] = str(error)
+        return vtl1
+    vtl1["forced"] = True
+    try:
+        vtl1["enabled"] = state.active_vtl_enabled(vp)
+        vtl1["paging_mode"] = state.paging_mode(vp)
+        vtl1["cr0"] = state.register(vp, "X64_RegisterCr0")
+        vtl1["cr3"] = state.register(vp, "X64_RegisterCr3")
+        vtl1["cr4"] = state.register(vp, "X64_RegisterCr4")
+        vtl1["efer"] = state.register(vp, "X64_RegisterEfer")
+        vtl1["rip"] = state.register(vp, "X64_RegisterRip")
+        vtl1["differs_from_vtl0_cr3"] = vtl1["cr3"] != vtl0_cr3
+    except ProbeError as error:
+        vtl1["query_error"] = str(error)
+    return vtl1
+
+
+def identify_image(candidates, gather):
+    """Try each candidate mapping until one is vouched for by a data block's own `KernBase`.
+
+    `matches_disk` says the bytes at this VA *are* that image; it does not say this VA is the base
+    the image was **loaded** at. A second mapping of one image carries the same section names,
+    timestamp and `SizeOfImage` -- the 2026-09-25 capture has exactly that, a duplicate of
+    `symcryptk.dll` at a VA the module list does not name -- and which of them the walk reaches
+    first is decided by prefix order, not by anything meaningful. Stopping at the first therefore
+    reports "no debugger data block" for an image whose block is under the next candidate.
+
+    Returns the chosen candidate with its hits, and an attempt record for **every** candidate
+    tried, so a report says which mappings were examined rather than implying there was one.
+    """
+    attempts = []
+    for candidate in candidates:
+        image, missing = gather(candidate["va"], candidate["size_of_image"])
+        hits = find_kdbg(image, candidate["va"])
+        for hit in hits:
+            # Only meaningful once `KernBase` has vouched for the alignment; on a coincidental
+            # tag the field is whatever bytes happened to sit at +0x48.
+            if hit["kern_base_matches"]:
+                hit["ps_loaded_module_list_image_offset"] = (
+                    hit["ps_loaded_module_list"] - candidate["va"]
+                )
+        validated = [hit for hit in hits if hit["kern_base_matches"]]
+        attempts.append(
+            {
+                "va": candidate["va"],
+                "gpa": candidate["gpa"],
+                "image_pages_unreadable": len(missing),
+                "kdbg_hits": len(hits),
+                "validated": bool(validated),
+            }
+        )
+        if validated:
+            return {"candidate": candidate, "hits": hits, "block": validated[0]}, attempts
+    return None, attempts
+
+
 def choose_capture(located):
     """Pick which of the located files to load, and name the form.
 
@@ -876,21 +947,7 @@ def main(argv=None):
         vtl0["root"] = describe_root(state, vtl0["cr3"] & PFN_MASK)
         report["vtl0"] = vtl0
 
-        vtl1 = {"requested": True}
-        try:
-            state.force_vtl(vp, 1)
-            vtl1["forced"] = True
-            vtl1["enabled"] = state.active_vtl_enabled(vp)
-            vtl1["paging_mode"] = state.paging_mode(vp)
-            vtl1["cr0"] = state.register(vp, "X64_RegisterCr0")
-            vtl1["cr3"] = state.register(vp, "X64_RegisterCr3")
-            vtl1["cr4"] = state.register(vp, "X64_RegisterCr4")
-            vtl1["efer"] = state.register(vp, "X64_RegisterEfer")
-            vtl1["rip"] = state.register(vp, "X64_RegisterRip")
-            vtl1["differs_from_vtl0_cr3"] = vtl1["cr3"] != vtl0["cr3"]
-        except ProbeError as error:
-            vtl1["forced"] = False
-            vtl1["error"] = str(error)
+        vtl1 = read_vtl1(state, vp, vtl0["cr3"])
         report["vtl1"] = vtl1
 
         disk = image_on_disk(args.image)
@@ -915,7 +972,6 @@ def main(argv=None):
             matches = [i for i in images if i["matches_disk"]]
             report["walk"]["matching_images"] = len(matches)
             if matches:
-                found = matches[0]
                 reader_cache = {}
 
                 def read_va(va):
@@ -929,6 +985,22 @@ def main(argv=None):
                     reader_cache[va] = page
                     return page
 
+                chosen, attempts = identify_image(
+                    matches, lambda va, size: gather_image(read_va, va, size)
+                )
+                report["kdbg"] = {"candidates": attempts}
+                if chosen:
+                    found = chosen["candidate"]
+                    report["kdbg"]["chosen_va"] = found["va"]
+                    report["kdbg"]["hits"] = chosen["hits"]
+                    report["module_list"] = walk_module_list(
+                        read_va, chosen["block"]["ps_loaded_module_list"]
+                    )
+                else:
+                    # Every matching mapping was examined and none carried a block naming itself.
+                    found = matches[0]
+                    report["kdbg"]["hits"] = []
+
                 # The provider's own translator, at the forced VTL, cross-checked against the
                 # walk: two routes to the same GPA agreeing is what makes either believable.
                 provider_gpa, provider_reason = state.va_to_gpa(vp, found["va"])
@@ -939,26 +1011,6 @@ def main(argv=None):
                     "provider_reason": provider_reason,
                     "agree": provider_gpa == found["gpa"],
                 }
-                image, missing = gather_image(
-                    read_va, found["va"], found["size_of_image"]
-                )
-                hits = find_kdbg(image, found["va"])
-                for hit in hits:
-                    # Only meaningful once `KernBase` has vouched for the alignment; on a
-                    # coincidental tag the field is whatever bytes happened to sit at +0x48.
-                    if hit["kern_base_matches"]:
-                        hit["ps_loaded_module_list_image_offset"] = (
-                            hit["ps_loaded_module_list"] - found["va"]
-                        )
-                report["kdbg"] = {
-                    "image_pages_unreadable": len(missing),
-                    "hits": hits,
-                }
-                validated = [h for h in hits if h["kern_base_matches"]]
-                if validated:
-                    report["module_list"] = walk_module_list(
-                        read_va, validated[0]["ps_loaded_module_list"]
-                    )
 
         if args.scan_pages:
             images, kdbg, scanned, hit_limit = scan_physical_for_images(

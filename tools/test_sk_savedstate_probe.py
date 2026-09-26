@@ -208,6 +208,96 @@ class WalkGuards(unittest.TestCase):
         self.assertEqual(len(leaves), 2)
 
 
+class FakeVp:
+    """A VP whose force and whose register reads can be made to fail independently."""
+
+    def __init__(self, force_error=None, failing_register=None):
+        self.force_error = force_error
+        self.failing_register = failing_register
+
+    def force_vtl(self, _vp, _vtl):
+        if self.force_error:
+            raise probe.ProbeError(self.force_error)
+
+    def active_vtl_enabled(self, _vp):
+        return True
+
+    def paging_mode(self, _vp):
+        return "Long"
+
+    def register(self, _vp, name):
+        if name == self.failing_register:
+            raise probe.ProbeError(f"GetRegisterValue({name}) failed: 0x80004001")
+        return {"X64_RegisterCr3": 0x1201000}.get(name, 0x1234)
+
+
+class VtlSwitch(unittest.TestCase):
+    def test_a_refused_switch_is_reported_as_a_refusal(self):
+        vtl1 = probe.read_vtl1(FakeVp(force_error="VTL not enabled"), 0, 0x7D5000)
+        self.assertFalse(vtl1["forced"])
+        self.assertIn("VTL not enabled", vtl1["force_error"])
+        self.assertNotIn("enabled", vtl1)
+        self.assertNotIn("cr3", vtl1)
+
+    def test_a_failed_query_after_a_good_switch_is_not_a_refusal(self):
+        # The control arm's whole result is "the provider refused VTL1". A provider that cannot
+        # return one register must not be able to manufacture that reading.
+        vtl1 = probe.read_vtl1(FakeVp(failing_register="X64_RegisterEfer"), 0, 0x7D5000)
+        self.assertTrue(vtl1["forced"], "the switch succeeded and the report must keep saying so")
+        self.assertIn("query_error", vtl1)
+        self.assertNotIn("force_error", vtl1)
+        self.assertEqual(vtl1["cr3"], 0x1201000, "what was read before the failure is kept")
+
+    def test_a_clean_switch_carries_the_comparison_against_vtl0(self):
+        vtl1 = probe.read_vtl1(FakeVp(), 0, 0x7D5000)
+        self.assertTrue(vtl1["forced"])
+        self.assertTrue(vtl1["differs_from_vtl0_cr3"])
+        self.assertNotIn("query_error", vtl1)
+
+
+class ImageIdentification(unittest.TestCase):
+    @staticmethod
+    def gatherer(blocks_by_va):
+        def gather(va, size):
+            return image_with_kdbg(blocks_by_va.get(va, []))[:size], []
+
+        return gather
+
+    def test_a_second_mapping_is_tried_when_the_first_does_not_name_itself(self):
+        # Two mappings of one image: the alias's block still names the real base, so its KernBase
+        # check fails. Stopping at the first candidate reports no data block for an image that has
+        # one -- and which candidate the walk reaches first is prefix order, not meaning.
+        alias_va, real_va = 0xFFFFB300199C3000, BASE_VA
+        candidates = [
+            {"va": alias_va, "gpa": 0x10746A000, "size_of_image": 0x4000},
+            {"va": real_va, "gpa": 0xCD0000, "size_of_image": 0x4000},
+        ]
+        gather = self.gatherer(
+            {
+                alias_va: [(0x100, 0x3A0, real_va, real_va + 0x127770)],
+                real_va: [(0x100, 0x3A0, real_va, real_va + 0x127770)],
+            }
+        )
+        chosen, attempts = probe.identify_image(candidates, gather)
+        self.assertIsNotNone(chosen)
+        self.assertEqual(chosen["candidate"]["va"], real_va)
+        self.assertEqual(chosen["block"]["ps_loaded_module_list_image_offset"], 0x127770)
+        self.assertEqual([a["validated"] for a in attempts], [False, True])
+        self.assertEqual(len(attempts), 2, "every candidate examined is reported")
+
+    def test_no_candidate_validating_is_reported_for_all_of_them(self):
+        candidates = [
+            {"va": BASE_VA, "gpa": 0xCD0000, "size_of_image": 0x4000},
+            {"va": BASE_VA + 0x10000, "gpa": 0xCE0000, "size_of_image": 0x4000},
+        ]
+        gather = self.gatherer({BASE_VA: [(0x100, 0x3A0, 0xDEADBEEF, 0)]})
+        chosen, attempts = probe.identify_image(candidates, gather)
+        self.assertIsNone(chosen)
+        self.assertEqual(len(attempts), 2)
+        self.assertEqual([a["validated"] for a in attempts], [False, False])
+        self.assertEqual([a["kdbg_hits"] for a in attempts], [1, 0])
+
+
 class CaptureSelection(unittest.TestCase):
     def test_a_vmrs_is_chosen_when_one_is_located(self):
         located = {"bin": "", "vsv": "", "vmrs": r"D:\s\a.vmrs"}

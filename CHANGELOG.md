@@ -63,7 +63,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   one PD referenced 1023 times -- it exhausted a 200,000-leaf budget over 509 distinct pages and
   identified nothing, against 166 reads and a positive identification for the walk it replaced.
   So the guard stays and the omission is now counted: **6,773 alias prefixes** reported beside
-  11,326 leaf mappings over 4,189 distinct pages. No Rust and no MCP
+  11,326 leaf mappings over 4,189 distinct pages. **A second round found the two remaining
+  places the report collapsed several inputs into one answer**, which is the same shape as the
+  alias: identification stopped at the first mapping that matched the disk image, where
+  matching says the bytes *are* that image and not that this VA is the base it was loaded at --
+  a duplicate mapping matches all three fields, and one is in the 2026-09-25 capture -- so every
+  candidate is now tried until one carries a block whose `KernBase` names it, with the attempt
+  reported for each; and one exception handler covered both the VTL1 switch and the register
+  reads after it, so a provider that could not return one register would have reported `forced:
+  false` beside a `cr3` it had already read -- the control arm's entire result is that
+  distinction, and the two now have separate fields. Enumerating the report's other fields
+  found no third case. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

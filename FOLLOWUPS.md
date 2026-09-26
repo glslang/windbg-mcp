@@ -2159,11 +2159,20 @@ Three things must be pinned by tests rather than discovered again:
   reboot each time. Pin: skip entries whose target PFN is the table they came from, a visited set
   per level, and hard budgets on reads *and* collected leaves that **report** a partial result.
   **And report what the visited set skips**, which S0's run had to add after review asked for it:
-  36 tables appear at more than one level, one PD is referenced 1023 times, and 6,773 alias
-  prefixes go unexpanded on a walk whose 11,326 leaf mappings cover 4,189 distinct pages.
-  Expanding them all is combinatorial on a self-mapped tree — measured by building it, which
-  exhausted a 200,000-leaf budget over 509 pages and identified nothing — so the guard stays and
-  the omission is counted rather than silent.
+  6,773 alias prefixes go unexpanded on a walk whose 11,326 leaf mappings cover 4,189 distinct
+  pages, and on the other capture 215 decodes come from 179 reads — 36 tables serving at more than
+  one level. Expanding them all is combinatorial on a self-mapped tree — measured by building it,
+  which exhausted a 200,000-leaf budget over 509 pages and identified nothing — so the guard stays
+  and the omission is counted rather than silent.
+- **Identification is per candidate, not per first match.** Section names, timestamp and
+  `SizeOfImage` say the bytes *are* the image; they do not say the VA is the base it was loaded
+  at, and a second mapping of one image matches all three (the 2026-09-25 capture has a duplicate
+  `symcryptk.dll` the module list does not name). `KernBase` inside the data block is what
+  distinguishes them, so iterate the candidates until one names itself and report the attempt for
+  each. Which candidate the walk reaches first is prefix order and means nothing.
+- **A refused VTL switch and a failed register read are different answers.** Collapsing them makes
+  a provider that cannot return one register look like a guest with no Secure Kernel — the same
+  *refused*-as-*absent* collapse the read seam is guarded against, one level up.
 - **Read width.** `HvCallReadGpa` moves at most 16 bytes, and judging a 4096-byte page on its first
   sixteen is what made SK's PML4 read as all-zero for most of a session. Any source-side chunking
   must not leak into the decode layer's view of a page.

@@ -1231,15 +1231,27 @@ returned the noise or nothing at all.
 #### What the walk leaves out, and why enumerating every VA is the wrong target
 
 **Secure Kernel's VTL1 page tables are recursively self-mapped, so one physical page is a PML4, a
-PDPT, a PD *and* a PT depending on the route taken to it.** Measured on this capture: **36** tables
-appear at more than one level, one PD is referenced **1023** times and one PT **2300** times, and
-the 11,326 leaf mappings cover only **4,189 distinct physical pages**. Expanding every prefix is
-therefore combinatorial rather than merely expensive.
+PDPT, a PD *and* a PT depending on the route taken to it.** Two measurements, and they have
+different provenance, which matters:
 
-So the walk expands each table **once per level** and now **counts** what that skips —
-**6,773 alias prefixes** on this capture, reported beside the leaves rather than passed over in
-silence. The distinction matters because the walk's own contract is that an incomplete answer says
-so; before this round it did not, and a review finding said exactly that.
+| | guarded walk, 2026-09-26 | guarded walk, 2026-09-25 | sweep that **follows** the self-map |
+|---|---|---|---|
+| table reads | 166 | 179 | 215 |
+| tables decoded | 166 | **215** — 36 served at more than one level | — |
+| alias prefixes skipped | **6,773** | 7,803 | — |
+| leaf mappings / distinct pages | 11,326 / **4,189** | 16,437 / 4,545 | — |
+| worst-case fan-in | — | — | one PD referenced **1023×**, one PT **2300×**, the root present at all four levels |
+
+The third column is a deliberate diagnostic, not the production walk: it does **not** skip the
+self-map entry, which is how it reaches the page tables *as* mapped data and shows why enumerating
+every prefix is combinatorial rather than merely expensive. The first two are the walk as it runs,
+and the middle column's 215 decodes against 179 reads is the same phenomenon seen from inside it —
+36 tables genuinely serving at more than one level on that boot, and none on the other.
+
+So the walk expands each table **once per level** and now **counts** what that skips — 6,773 alias
+prefixes on the 2026-09-26 capture, reported beside the leaves rather than passed over in silence.
+The distinction matters because the walk's own contract is that an incomplete answer says so;
+before this round it did not, and a review finding said exactly that.
 
 **The remedy that finding proposed was built and measured, and it does not work here.** Cutting
 cycles by descent path instead — so an aliased table is walked again under each prefix — turned a
@@ -1284,7 +1296,13 @@ observation and is now two.
 
 **A seventh PE image appears on the earlier boot** — identity-identical to `symcryptk.dll`
 (`0xD000`, `0x98293ECD`) at VA `0xFFFFB300199C3000`, outside the module list's range and not named
-by it. Recorded rather than explained.
+by it. Recorded rather than explained, and it is the counterexample that makes the identification
+rule non-obvious: **matching the disk image says the bytes are that image, not that this VA is the
+base it was loaded at.** A duplicate mapping matches on all three fields, and which of two
+mappings the walk reaches first is prefix order. So the probe tries **every** matching candidate
+until one carries a data block whose `KernBase` names it, and reports the attempt for each. One
+candidate on both captures here — but the mechanism that would have produced two is in the table
+above.
 
 #### It is a file, not a live channel
 
@@ -1315,7 +1333,10 @@ H4's Control 1, repeated on the new source, one procedure against both captures.
 
 **The refusal is named, not silent.** `0xC0370509` is
 `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` — the provider ships a typed error for exactly this
-condition. That answers S1's third fixture requirement from the source side rather than from our
+condition, and the probe keeps it apart from a *query* that fails after a switch that worked. That
+separation is the whole of this arm: one handler over both would let a provider that cannot return
+some register report a guest as having no Secure Kernel, which is the same collapse of *refused*
+into *absent* the read seam is guarded against, one level up. That answers S1's third fixture requirement from the source side rather than from our
 own code: this source does not collapse *refused*, *not captured* and *zeros* into an empty buffer.
 Short reads are reported as a byte count too, so the seam can carry *why* rather than only
 bytes-or-not.
