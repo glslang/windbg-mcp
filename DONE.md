@@ -5173,6 +5173,18 @@ Three things about the shape of it are worth keeping.
   restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
   now, and the rendering has a line for a block where nought of the steps failed and the rollback
   is still not complete.
+- **Two more from the same review, both about what "the same target" means to a *writer*.** The
+  identity probe was the one call into the host outside `guarded`, so a panic in any of its four
+  engine queries would have unwound past the `always` block and the seal — the rollback loss
+  `guarded` exists to prevent, arriving through the check added to prevent a worse one; it answers
+  `Held::Unknown` now, which withholds and reports rather than vanishing. And the *fingerprint* is
+  the wrong granularity for this caller: it carries the process **set** and deliberately not the
+  selection, which is right for a handle and not for a batch, since `eb <addr>` writes into
+  DbgEng's current process — so on a session holding two user-mode processes a step that moves the
+  selection would have had its restore applied in the other address space, with the session
+  holding exactly the target it always did. `BatchTarget` is the batch's own baseline, and it
+  stops at the line worth stating: the current **thread** is not in it, because a thread moves at
+  every stop and that is what a `resume` step is for.
 - **A batch that stops still has to close itself to breaks, and the first version stopped doing
   it.** Skipping the seal on the replaced path looked free — there is no cleanup left for a break
   to cut short — and the thing it left open is not this job's work but the *engine*: `SetInterrupt`
