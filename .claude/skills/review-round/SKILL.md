@@ -37,6 +37,21 @@ So the order is: findings at the head (act on them), else the summary comment's 
 head even reviewed?), else the 👍 (did it finish clean?). Reviews re-trigger on new commits, and
 `@codex review` / `@codex security review` in a comment asks for one.
 
+**A round is not a moment, and reading it as one loses findings.** Codex posts a round's comments
+over a minute or two, so a watcher that fires on the *first* comment reads a partial round. On
+[#393](https://github.com/glslang/windbg-mcp/pull/393) that dropped four findings across three
+rounds — 20:26:11 and then 20:27:03, 21:54:52 and then 21:55:33 — each reported to the user as one
+finding when there were two. Wait for the summary row to say **Completed** at the head, then let it
+settle before counting. And CodeRabbit, which is usually rate-limited, posted two findings **three
+minutes after** Codex's 👍 on that PR, one of them a real overclaim in checked-in prose: a clean
+round from one reviewer is not a clean round.
+
+**Reconcile the totals before calling a PR done.** `gh api --paginate
+repos/<owner>/<repo>/pulls/<n>/comments --jq '.[] | .original_commit_id[0:7]' | sort | uniq -c`
+against the count you actually worked. Both misses above were invisible in every per-round signal
+and obvious the moment the totals disagreed — 25 comments against 21 worked. It costs one command
+at the end.
+
 **Codex is the bot to watch, and CodeRabbit's green is not evidence.** Its check reports `pass` with
 *"Review rate limited"* beside it when it has not reviewed at all. Measured on
 [#349](https://github.com/glslang/windbg-mcp/pull/349): across the PR's eight commits it filed **no
