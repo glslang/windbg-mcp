@@ -1030,6 +1030,16 @@ def walk_module_list(reader, head_va, expected_base, limit=32):
     indistinguishable from a list that named somebody else. One field, four ways to fail:
     unreadable head, empty list, unreadable first entry, and a first `DllBase` that is not the
     identified base.
+
+    **`valid` and `complete` are deliberately two answers, not one.** `valid` is about the
+    *block*: does the list this `KDBG` points at begin with an entry naming the image whose base
+    the block already claims? Two independent structures agreeing on one address is what makes the
+    identification implausible as a coincidence. `complete` is about the *enumeration*: did the
+    walk close back on its head without running out of entries or readable memory? A review round
+    asked for a list that does not close to be rejected outright, and that would be the round-2
+    defect from the other side -- refusing a genuine block and reporting "no debugger data block"
+    on a capture that has one, which a build with more than `limit` VTL1 modules would trigger by
+    itself. So a truncated or broken enumeration confirms the block and says it is partial.
     """
 
     def read_span(va, size):
@@ -1077,6 +1087,18 @@ def walk_module_list(reader, head_va, expected_base, limit=32):
         )
         current = struct.unpack_from("<Q", record, 0)[0]
     result = {"head_va": head_va, "entries": entries, "closed": current == head_va}
+    if result["closed"]:
+        result["complete"] = True
+    else:
+        result["complete"] = False
+        if entries and "dll_base" not in entries[-1]:
+            result["incomplete_reason"] = f"entry at 0x{entries[-1]['entry_va']:X} is not readable"
+        elif len(entries) >= limit:
+            result["incomplete_reason"] = f"stopped at the {limit}-entry limit"
+        elif not current:
+            result["incomplete_reason"] = "the forward link is null"
+        else:
+            result["incomplete_reason"] = f"the walk left the list at 0x{current:X}"
     first = entries[0] if entries else None
     if first is None:
         result.update(valid=False, invalid_reason="the list is empty")

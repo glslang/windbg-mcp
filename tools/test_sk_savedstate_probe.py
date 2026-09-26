@@ -641,6 +641,57 @@ class ModuleListValidation(unittest.TestCase):
         self.assertIn("not readable", unreadable_entry["invalid_reason"])
         self.assertIn("identified base", wrong_base["invalid_reason"])
 
+    def chain(self, bases, close=True):
+        """Pages for a list of `len(bases)` entries, optionally not linked back to the head."""
+        entry_vas = [self.ENTRY_VA + i * PAGE for i in range(len(bases))]
+        pages = {}
+        head_page = bytearray(PAGE)
+        struct.pack_into("<Q", head_page, self.HEAD_VA & (PAGE - 1), entry_vas[0])
+        pages[self.HEAD_VA & ~(PAGE - 1)] = bytes(head_page)
+        for index, (va, base) in enumerate(zip(entry_vas, bases)):
+            nxt = entry_vas[index + 1] if index + 1 < len(entry_vas) else (self.HEAD_VA if close else 0)
+            page = bytearray(PAGE)
+            page[0:0x70] = kldr_entry(nxt, base, 0x175000)
+            pages[va & ~(PAGE - 1)] = bytes(page)
+        return pages
+
+    def test_a_list_that_does_not_close_still_confirms_the_block_and_says_it_is_partial(self):
+        # Rejecting it outright is the round-2 defect from the other side: it would report "no
+        # debugger data block" for a capture that has one, and a build with more than `limit`
+        # VTL1 modules would trigger that by itself.
+        listing = probe.walk_module_list(
+            module_list_reader(self.chain([BASE_VA, BASE_VA + 0x200000], close=False)),
+            self.HEAD_VA,
+            BASE_VA,
+        )
+        self.assertTrue(listing["valid"], "the block is still identified by the first entry")
+        self.assertFalse(listing["complete"])
+        self.assertEqual(listing["incomplete_reason"], "the forward link is null")
+
+    def test_a_list_that_closes_is_complete(self):
+        listing = probe.walk_module_list(
+            module_list_reader(self.chain([BASE_VA, BASE_VA + 0x200000])), self.HEAD_VA, BASE_VA
+        )
+        self.assertTrue(listing["valid"])
+        self.assertTrue(listing["complete"])
+        self.assertNotIn("incomplete_reason", listing)
+
+    def test_the_entry_limit_is_named_as_the_reason_it_stopped(self):
+        listing = probe.walk_module_list(
+            module_list_reader(self.chain([BASE_VA] * 4)), self.HEAD_VA, BASE_VA, limit=2
+        )
+        self.assertTrue(listing["valid"])
+        self.assertFalse(listing["complete"])
+        self.assertIn("2-entry limit", listing["incomplete_reason"])
+
+    def test_an_unreadable_later_entry_is_named_rather_than_folded_into_the_limit(self):
+        pages = self.chain([BASE_VA, BASE_VA + 0x200000])
+        del pages[(self.ENTRY_VA + PAGE) & ~(PAGE - 1)]
+        listing = probe.walk_module_list(module_list_reader(pages), self.HEAD_VA, BASE_VA)
+        self.assertTrue(listing["valid"])
+        self.assertFalse(listing["complete"])
+        self.assertIn("is not readable", listing["incomplete_reason"])
+
     def test_an_unreadable_list_is_rejected_with_its_reason_carried_to_the_hit(self):
         image = image_with_kdbg([(0x100, 0x3A0, BASE_VA, 0xDEAD0000)])
         candidates = [{"va": BASE_VA, "gpa": 0xCD0000, "size_of_image": 0x4000}]
