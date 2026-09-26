@@ -94,7 +94,15 @@ Five honest limits, none of them hidden in the report:
   outcome stands and only the cleanup *after* it is skipped — `rollback: INCOMPLETE`, because part
   of the block ran. That holds when the step in question is the **last** one and there is nothing
   left to skip: every `always` step then reads `OK`, and the rollback is still not `complete`,
-  because nothing can say where that last restore landed. And an engine that **stops saying** what it holds is treated the same way as
+  because nothing can say where that last restore landed.
+
+  What counts as "the same target" here is the session's target **and the process a write would
+  land in**: on a session holding more than one user-mode process, a step that moves the current
+  process — `|Ns`, or a stop in the other one — stops the batch too, because a restore taken in one
+  address space and applied in another is written at an address that means something else there.
+  The current *thread* is deliberately not part of it: a thread moves at every stop, which is what
+  a `resume` step is for, so a batch certifies where its writes land and not which thread's
+  registers they came from. And an engine that **stops saying** what it holds is treated the same way as
   one holding something else, under its own outcome (`BATCH: TARGET UNCERTAIN`): nothing has
   identified a second target, so the report claims none, but a restore that cannot be aimed at the
   target the steps ran against is still worse than one that is missing. A batch that cannot get

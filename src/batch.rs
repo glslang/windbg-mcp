@@ -1014,6 +1014,22 @@ fn guarded<T>(call: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
     })
 }
 
+/// [`Debuggee::replaced`] with a panic turned into [`Held::Unknown`].
+///
+/// **Every other call into the host on this path goes through [`guarded`], and this one has to for
+/// the same reason and one more.** Several dbgscope methods use `.expect`, and this asks four
+/// engine queries — so an unwind here would pass through the whole of [`run`] to
+/// `worker::engine_thread`'s op-level guard, taking the `always` block *and* the seal with it:
+/// the rollback loss that `guarded` exists to prevent, arriving through the check added to prevent
+/// a worse one. Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392).
+///
+/// A panic answers `Unknown` rather than `Same`, which stops the batch and withholds the cleanup:
+/// an identity probe that crashed has told us nothing about what the engine holds, which is
+/// exactly what that variant is for.
+fn held(d: &mut impl Debuggee) -> Held {
+    guarded(|| Ok(d.replaced())).unwrap_or_else(Held::Unknown)
+}
+
 // ---- results --------------------------------------------------------------
 
 /// How one step ended.
@@ -1456,7 +1472,7 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         // the final step, which is precisely the batch whose next act is its rollback. Mutually
         // exclusive with the ending below rather than ranked against it — the host answers `None`
         // for a target that has gone — so the order of these two branches is presentation.
-        let held = d.replaced();
+        let held = held(d);
         let identified = matches!(held, Held::Replaced(_));
         if let Held::Replaced(why) | Held::Unknown(why) = held {
             // Outranks every other reading of this step, and for a reason none of them share:
@@ -1585,7 +1601,7 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         // that swapped the target says nothing about whether the *steps* committed — so this is
         // reported by the block itself, and `rollback()` reads `Incomplete` because part of it
         // ran.
-        let held = d.replaced();
+        let held = held(d);
         let identified = matches!(held, Held::Replaced(_));
         if let Held::Replaced(why) | Held::Unknown(why) = held {
             unverified = Some(Unverified {
@@ -2355,6 +2371,9 @@ mod tests {
         replaces_target_on: Option<String>,
         /// Whether that call has now been answered, so [`Debuggee::replaced`] can say so.
         replaced: bool,
+        /// Whether the identity probe itself panics, the way a dbgscope `.expect` would; see
+        /// [`Script::panics_in_the_identity_probe`].
+        panic_on_the_probe: bool,
         /// Which call makes the engine stop saying what it holds; see
         /// [`Script::stops_saying_what_it_holds_on`].
         stops_saying_on: Option<String>,
@@ -2400,6 +2419,7 @@ mod tests {
                 replaced: false,
                 stops_saying_on: None,
                 silent: false,
+                panic_on_the_probe: false,
             }
         }
 
@@ -2490,6 +2510,13 @@ mod tests {
         /// cleanup is withheld all the same.
         fn stops_saying_what_it_holds_on(mut self, matching: &str) -> Self {
             self.stops_saying_on = Some(matching.to_string());
+            self
+        }
+
+        /// Makes the identity probe panic, which is what a dbgscope `.expect` inside one of its
+        /// four engine queries would do.
+        fn panics_in_the_identity_probe(mut self) -> Self {
+            self.panic_on_the_probe = true;
             self
         }
 
@@ -2621,6 +2648,11 @@ mod tests {
             Some(!self.target_ended)
         }
         fn replaced(&mut self) -> Held {
+            // The one call a host makes that is not a step, so the script panics on it by its own
+            // flag rather than by matching a call's text.
+            if self.panic_on_the_probe {
+                panic!("{PANIC}");
+            }
             // Deliberately **not** recorded in `calls`: this is the host asking its own engine
             // what it is holding, not a step's command, and the assertion that matters most here
             // is that nothing further was *sent to the debugger* after a replacement.
@@ -3187,6 +3219,51 @@ mod tests {
         assert!(
             !text.contains("0 of 1"),
             "a count of nought would send a reader looking for a step that does not exist: {text}"
+        );
+    }
+
+    /// A panic **inside the identity probe** must not take the rollback with it.
+    ///
+    /// Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392): the probe was
+    /// the one call into the host on this path outside `guarded`, and several dbgscope methods use
+    /// `.expect` — so an unwind would pass through the whole executor to the worker's op-level
+    /// guard, taking the `always` block *and* the seal with it. That is the rollback loss
+    /// `guarded` exists to prevent, arriving through the check added to prevent a worse one.
+    ///
+    /// The cleanup is withheld rather than run, which is the same reading the unreadable case
+    /// gets and for the same reason: a probe that crashed has said nothing about what the engine
+    /// is holding. What the test pins is that the batch **reported** rather than vanished.
+    #[test]
+    fn a_panic_in_the_identity_probe_does_not_take_the_batch_with_it() {
+        let mut d = stopped()
+            .on("eq hevd!Guard 0", Ok(""))
+            .on("eq hevd!Guard 0x1", Ok(""))
+            .panics_in_the_identity_probe();
+
+        let report = run(
+            &mut d,
+            &op(vec![cmd("eq hevd!Guard 0")], vec![cmd("eq hevd!Guard 0x1")]),
+            BUDGET,
+        );
+
+        assert_eq!(
+            report.outcome,
+            BatchOutcome::TargetUncertain { at: 1 },
+            "a probe that panicked knows nothing, which is exactly `Unknown`: {report:?}"
+        );
+        assert_eq!(report.rollback(), Rollback::NotAttempted);
+        assert_eq!(
+            d.sealed,
+            Some(Sealed::TargetLost),
+            "and the job is still sealed, which an unwind would have skipped"
+        );
+        assert!(
+            report.always[0]
+                .result
+                .detail()
+                .is_some_and(|why| why.contains(PANIC)),
+            "the panic's own message reaches the report: {:?}",
+            report.always[0]
         );
     }
 

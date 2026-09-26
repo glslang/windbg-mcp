@@ -2041,19 +2041,49 @@ fn watch_for(op: &EngineOp) -> Watch {
 /// one way. It answers `None` for a worker with no baseline, for a target that has gone, and for
 /// an engine that will not say — see [`replacement`] for why the last two are not replacements.
 fn replacement_now(e: &DebugEngine) -> Option<String> {
-    match held_now(e, OPENED_AS.get()?) {
-        Held::Replaced(why) => Some(why),
-        // **An engine that will not say is not evidence of a replacement**, which is this
-        // caller's decision and not the other one's: retiring a session on a reading nobody got
-        // costs a caller their handle in the one state where nothing can be checked. The batch
-        // decides the opposite way on the same value ([`Held::Unknown`]) because what it is
-        // deciding is whether to *write*.
-        Held::Same | Held::Unknown(_) => None,
+    let opened_as = OPENED_AS.get()?;
+    match engine_reading(e) {
+        Ok(Some(now)) => replacement(opened_as, &now, Some(true)),
+        // **A target that has gone is not one that has been replaced**, and neither is an engine
+        // that will not say — the second being this caller's decision rather than the other's:
+        // retiring a session on a reading nobody got costs a caller their handle in the one state
+        // where nothing can be checked. [`crate::batch`] decides the opposite way on the same
+        // value ([`Held::Unknown`]) because what it is deciding is whether to *write*.
+        Ok(None) | Err(_) => None,
     }
 }
 
-/// What the engine is holding, against a baseline the caller holds — the reading both halves of
-/// this mechanism share, with the *decision* left to each of them.
+/// The engine's own reading, with the two states that are **not** a fingerprint kept apart from
+/// one that is.
+///
+/// `Err` is *would not say*, `Ok(None)` is *holds nothing*, and only `Ok(Some(_))` is a target to
+/// compare. Shared by the two callers so the engine is asked one way, with the decision left to
+/// each of them — which is dbgscope's instruction rather than a refinement of it:
+/// `DebugEngine::has_target` says on itself that *"an unreadable status is not an answer, and this
+/// does not collapse one into `true`: what to do when the engine cannot be asked differs by
+/// caller, and each one below decides."*
+///
+/// **The `has_target` guard is asked first, and that ordering is the whole of it.** Driving DbgEng
+/// with no debuggee faults *inside* DbgEng — a structured exception `catch_unwind` cannot trap, so
+/// it takes the worker process down instead of failing the call, which is why
+/// [`refuse_when_the_target_is_gone`] exists and why dbgscope guards its own raw path. Reading
+/// engine queries off an engine whose debuggee has just exited is that, and it was measured here
+/// rather than reasoned about: with the reads ahead of this check, the debugger tier's two "target
+/// ends during a run" tests came back as *the engine worker process holding session `sess-…` is
+/// gone* (ARM64 26100, 2026-09-25) — a launched program running to completion, killing the session
+/// that was watching it.
+fn engine_reading(e: &DebugEngine) -> Result<Option<TargetFingerprint>, String> {
+    match e.has_target() {
+        Err(why) => Err(format!(
+            "the debugger would not say whether it is holding a target: {}",
+            es(why)
+        )),
+        Ok(false) => Ok(None),
+        Ok(true) => Ok(Some(TargetFingerprint::read(e))),
+    }
+}
+
+/// What the engine is holding, against the baseline a **batch** holds.
 ///
 /// **The two baselines answer different questions rather than the same one at different times.**
 /// [`OPENED_AS`] asks *is this still what the handles name*, which is what retires a handle. A
@@ -2062,78 +2092,112 @@ fn replacement_now(e: &DebugEngine) -> Option<String> {
 /// by whatever this worker now holds (`SessionState::accepts_default`, `docs/sessions.md`).
 /// Measured against `OPENED_AS`, every such batch on a worker whose target had already been
 /// swapped would refuse to roll back for the life of the worker, which is the same over-reach
-/// [`refuse_when_the_target_was_replaced`] was narrowed to avoid.
-///
-/// **And the three-way answer is dbgscope's instruction rather than a refinement of it.**
-/// `DebugEngine::has_target` says so on itself: *"an unreadable status is not an answer, and this
-/// does not collapse one into `true`: what to do when the engine cannot be asked differs by
-/// caller, and each one below decides."* An `Option` here spelled *"it would not say"* and
-/// *"nothing has changed"* the same way, and [`crate::batch`] needs them apart — raised by Codex
-/// on [#392](https://github.com/glslang/windbg-mcp/pull/392).
-fn held_now(e: &DebugEngine, baseline: &TargetFingerprint) -> Held {
-    // **Asked before a fingerprint is read, and that ordering is the whole of it.** Driving
-    // DbgEng with no debuggee faults *inside* DbgEng — a structured exception `catch_unwind`
-    // cannot trap, so it takes the worker process down instead of failing the call, which is why
-    // [`refuse_when_the_target_is_gone`] exists and why dbgscope guards its own raw path.
-    // Reading engine queries off an engine whose debuggee has just exited is that, and it was
-    // measured here rather than reasoned about: with the reads ahead of this check, the debugger
-    // tier's two "target ends during a run" tests came back as *the engine worker process holding
-    // session `sess-…` is gone* (ARM64 26100, 2026-09-25) — a launched program running to
-    // completion, killing the session that was watching it.
-    //
-    // So this is a guard and not an optimisation, and [`replacement`] is given the answer anyway
-    // so the *rule* — that a target which has gone is not one that has been replaced — is stated
-    // in one place and testable there.
-    let holds_a_target = match e.has_target() {
-        Ok(holds) => Some(holds),
-        Err(why) => {
-            return Held::Unknown(format!(
-                "the debugger would not say whether it is holding a target: {}",
-                es(why)
-            ));
-        }
-    };
-    if holds_a_target != Some(true) {
+/// [`refuse_when_the_target_was_replaced`] was narrowed to avoid. It is also the finer question:
+/// see [`BatchTarget`] for the process selection, which the session's baseline deliberately
+/// leaves out and a batch's cannot.
+fn held_now(e: &DebugEngine, baseline: &BatchTarget) -> Held {
+    match engine_reading(e) {
+        Err(why) => Held::Unknown(why),
         // Gone, not replaced — and `Same` rather than a fourth value, because the ending is
         // already carried by the step that caused it and refused by
         // [`refuse_when_the_target_is_gone`], both of which say more about it than this could.
-        return Held::Same;
+        Ok(None) => Held::Same,
+        Ok(Some(now)) => match baseline.moved(&BatchTarget::read(e, now)) {
+            Some(why) => Held::Replaced(why),
+            None => Held::Same,
+        },
     }
-    // `holds_a_target` is `Some(true)` by here, and [`replacement`] is still handed it: that
-    // function is where the rule — a target gone or unreadable is not one replaced — is stated
-    // and tested, and narrowing its input to what this arm knows would move the rule to the call
-    // site.
-    match replacement(baseline, &TargetFingerprint::read(e), holds_a_target) {
-        Some(why) => Held::Replaced(why),
-        None => Held::Same,
+}
+
+/// What a **batch** measures its steps against: the session's target, and the process inside it
+/// that a write would land in.
+///
+/// **The fingerprint alone is the wrong granularity for this caller, and deliberately so.**
+/// [`TargetFingerprint`] carries the process *set* and not the selection, because the selection
+/// moves on its own at a child-process event and by hand on `|Ns`, neither of which changes what
+/// the *session* is debugging — that is item 81's finding and it is right about handles. A batch
+/// asks a narrower question: `eb <addr>` writes into DbgEng's **current** process, so a restore
+/// aimed at the address a step patched lands somewhere else the moment the selection moves, with
+/// the session holding exactly the target it always did. Raised by Codex on
+/// [#392](https://github.com/glslang/windbg-mcp/pull/392).
+///
+/// **The current *thread* is deliberately not here, and that is the line.** Memory is per process
+/// and registers are per thread, so by the same argument a register restore wants the thread —
+/// but the thread moves at every stop, which is what a batch's `resume` and `run_to` steps are
+/// *for*, so comparing it would refuse the ordinary case rather than a wrong one. What is left is
+/// a bound worth stating plainly: a batch certifies the target and the address space its writes
+/// land in, and not which thread's registers they were taken from.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BatchTarget {
+    /// The session's target, as every other caller of this mechanism sees it.
+    fingerprint: TargetFingerprint,
+    /// DbgEng's current process, for a user-mode target only — the same gate
+    /// [`fingerprints_the_process`] applies to the set, for its reason: on a kernel target this
+    /// is whatever the machine was running at the last break and moves across every `g`.
+    current_process: Option<u32>,
+}
+
+impl BatchTarget {
+    /// Reads the selection beside a fingerprint already taken.
+    fn read(e: &DebugEngine, fingerprint: TargetFingerprint) -> Self {
+        let current_process = match fingerprints_the_process(fingerprint.kind) {
+            true => e.current_process_system_id().ok(),
+            false => None,
+        };
+        Self {
+            fingerprint,
+            current_process,
+        }
+    }
+
+    /// What changed between this reading and a later one, as a sentence, or `None` for a target
+    /// that is still the one the batch started against.
+    ///
+    /// Its own function so the rule is testable without an engine, and so the two questions are
+    /// asked in one place: a replaced *target* and a moved *selection* are both "not what the
+    /// steps ran against", and only the sentence differs. The target is asked first, because a
+    /// session whose target was swapped has a new selection as well and the swap is the news.
+    fn moved(&self, now: &Self) -> Option<String> {
+        if let Some(why) = replacement(&self.fingerprint, &now.fingerprint, Some(true)) {
+            return Some(why);
+        }
+        (self.current_process != now.current_process).then(|| {
+            "the debugger is pointed at a different process in this session than the one this \
+             batch's steps ran against. Nothing replaced the session's target — the set of \
+             processes it holds is unchanged — but memory and register writes land in whichever \
+             process is current, so a restore taken from one and applied in another would be \
+             written at an address that means something else there"
+                .to_string()
+        })
     }
 }
 
 /// The reading a batch measures its own steps against, taken before its first step runs.
 ///
 /// `None` when the engine does not answer that it is holding a target — the same guard
-/// [`held_now`] applies, for the same reason: reading a fingerprint off an engine with no
-/// debuggee is an access violation *inside* DbgEng — or when the reading it gives back is not
-/// one a later reading can be compared against ([`usable_baseline`]). **A batch with no baseline
-/// is refused rather than run**: see [`run_batch`], where the alternative is an executor that
-/// checks nothing for the batch's whole length.
-fn batch_baseline(e: &DebugEngine) -> Option<TargetFingerprint> {
+/// [`engine_reading`] applies, for the same reason: reading a fingerprint off an engine with no
+/// debuggee is an access violation *inside* DbgEng — or when the reading it gives back is not one
+/// a later reading can be compared against ([`usable_baseline`]). **A batch with no baseline is
+/// refused rather than run**: see [`run_batch`], where the alternative is an executor that checks
+/// nothing for the batch's whole length.
+fn batch_baseline(e: &DebugEngine) -> Option<BatchTarget> {
     if !matches!(e.has_target(), Ok(true)) {
         return None;
     }
     let reading = TargetFingerprint::read(e);
-    usable_baseline(&reading).then_some(reading)
+    usable_baseline(&reading).then(|| BatchTarget::read(e, reading))
 }
 
 /// Whether a reading is one a batch can measure its steps against.
 ///
 /// **The `kind` is the field that decides which of the others are even asked for**
-/// ([`fingerprints_the_process`]), so a reading without it is not a fainter reading of the same
-/// thing — it is a reading whose *shape* was chosen by a guess, and one that will therefore differ
-/// from the next reading because the guess changed rather than because the target did. Everything
-/// downstream of that is unsound in both directions: a `.attach` that the process set would have
-/// caught goes unseen if the set was never asked for, and an unchanged target reads as replaced
-/// the moment `debuggee_type` starts answering again.
+/// ([`fingerprints_the_process`], and so also the selection in [`BatchTarget`]), so a reading
+/// without it is not a fainter reading of the same thing — it is a reading whose *shape* was
+/// chosen by a guess, and one that will therefore differ from the next reading because the guess
+/// changed rather than because the target did. Everything downstream of that is unsound in both
+/// directions: a `.attach` that the process set would have caught goes unseen if the set was never
+/// asked for, and an unchanged target reads as replaced the moment `debuggee_type` starts
+/// answering again.
 ///
 /// **This is the cheap half of a wider hole, and the rest is `FOLLOWUPS.md` item 104.**
 /// [`TargetFingerprint::read`] maps every query's error to `None`, so a field that was *refused*
@@ -6099,8 +6163,9 @@ struct BatchEngine<'a> {
     /// Not an `Option`: a batch that could not be given one is refused before it runs, so there
     /// is no state in which this executor checks nothing. Deliberately not named after
     /// [`OPENED_AS`], which is the *session's* baseline and answers a different question — see
-    /// [`held_now`].
-    started_on: TargetFingerprint,
+    /// [`held_now`] — and a [`BatchTarget`] rather than a bare fingerprint, because where a write
+    /// lands is the batch's question and not the handle's.
+    started_on: BatchTarget,
 }
 
 impl BatchEngine<'_> {
@@ -10384,6 +10449,71 @@ mod tests {
             processes: Some(vec![pid]),
             connection: None,
         }
+    }
+
+    /// **A batch's baseline carries the current process, and the session's must not.**
+    ///
+    /// Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392). A session can
+    /// hold more than one user-mode process, and a step can move the selection between them with
+    /// `|Ns` or by stopping in the other one — leaving the process *set* unchanged, so the
+    /// fingerprint agrees and the `always` block writes its restore into the wrong address space.
+    /// The set is what a *handle* should be measured by (item 81: the selection moves on its own
+    /// at a child-process event, and retiring on that would retire a live handle for nothing);
+    /// where a write lands is what a *batch* has to be measured by.
+    ///
+    /// The kernel row is the one that would break if the gate were dropped: there the current
+    /// process is whatever the machine was running at the last break, so it moves across every
+    /// `g`. Mutation-verified — removing the `fingerprints_the_process` gate in
+    /// `BatchTarget::read` cannot fail this test, which reads the rule rather than the engine, so
+    /// what pins that half is `only_a_user_mode_target_is_fingerprinted_by_its_process_id` beside
+    /// it and the `None` this constructs for a kernel target.
+    #[test]
+    fn a_batchs_baseline_moves_when_the_selection_does_and_a_sessions_does_not() {
+        let with_selection = |pid| super::BatchTarget {
+            fingerprint: TargetFingerprint {
+                kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_PROCESS),
+                dumps: Some(vec![]),
+                // **The set is the same in both**, which is the whole point of the case.
+                processes: Some(vec![1000, 2368]),
+                connection: None,
+            },
+            current_process: Some(pid),
+        };
+        let moved = with_selection(2368)
+            .moved(&with_selection(1000))
+            .expect("the selection moved, so a restore would land in the other process");
+        assert!(
+            moved.contains("different process in this session"),
+            "{moved}"
+        );
+        assert!(
+            moved.contains("Nothing replaced the session's target"),
+            "and it must not claim a replacement that did not happen: {moved}"
+        );
+        assert_eq!(
+            with_selection(2368).moved(&with_selection(2368)),
+            None,
+            "an unmoved selection is not news"
+        );
+
+        // A kernel target carries no selection at all, so a batch on one is not stopped by a
+        // machine that broke in somewhere else — which is every `g`.
+        let kernel = |dumps: Vec<String>| super::BatchTarget {
+            fingerprint: TargetFingerprint {
+                kind: kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_CONNECTION),
+                dumps: Some(dumps),
+                processes: None,
+                connection: Some(0x1234),
+            },
+            current_process: None,
+        };
+        assert_eq!(kernel(vec![]).moved(&kernel(vec![])), None);
+        assert!(
+            kernel(vec![])
+                .moved(&kernel(vec!["other.dmp".to_string()]))
+                .is_some(),
+            "and the target half still answers for one"
+        );
     }
 
     /// **A batch may not start against a reading with no `kind`**, because that field decides
