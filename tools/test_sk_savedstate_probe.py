@@ -233,7 +233,7 @@ class FakeVp:
 
 class VtlSwitch(unittest.TestCase):
     def test_a_refused_switch_is_reported_as_a_refusal(self):
-        vtl1 = probe.read_vtl1(FakeVp(force_error="VTL not enabled"), 0, 0x7D5000)
+        vtl1 = probe.read_vtl(FakeVp(force_error="VTL not enabled"), 0, 1, compare_cr3=0x7D5000)
         self.assertFalse(vtl1["forced"])
         self.assertIn("VTL not enabled", vtl1["force_error"])
         self.assertNotIn("enabled", vtl1)
@@ -242,14 +242,14 @@ class VtlSwitch(unittest.TestCase):
     def test_a_failed_query_after_a_good_switch_is_not_a_refusal(self):
         # The control arm's whole result is "the provider refused VTL1". A provider that cannot
         # return one register must not be able to manufacture that reading.
-        vtl1 = probe.read_vtl1(FakeVp(failing_register="X64_RegisterEfer"), 0, 0x7D5000)
+        vtl1 = probe.read_vtl(FakeVp(failing_register="X64_RegisterEfer"), 0, 1, compare_cr3=0x7D5000)
         self.assertTrue(vtl1["forced"], "the switch succeeded and the report must keep saying so")
         self.assertEqual(sorted(vtl1["errors"]), ["efer"])
         self.assertNotIn("force_error", vtl1)
         self.assertEqual(vtl1["cr3"], 0x1201000, "the fields that answered are kept")
 
     def test_a_clean_switch_carries_the_comparison_against_vtl0(self):
-        vtl1 = probe.read_vtl1(FakeVp(), 0, 0x7D5000)
+        vtl1 = probe.read_vtl(FakeVp(), 0, 1, compare_cr3=0x7D5000)
         self.assertTrue(vtl1["forced"])
         self.assertTrue(vtl1["differs_from_vtl0_cr3"])
         self.assertNotIn("errors", vtl1)
@@ -282,8 +282,11 @@ class DiagnosticsDoNotSuppressTheRoot(unittest.TestCase):
     def test_an_earlier_failing_query_does_not_cost_the_page_table_root(self):
         # The CR3 is the run's primary output. A provider that cannot answer an optional
         # diagnostic must not be able to take it down, which a single try/except did.
-        vtl1 = probe.read_vtl1(
-            FailingVp(failing={"enabled", "paging_mode", "X64_RegisterCr0"}), 0, 0x7D5000
+        vtl1 = probe.read_vtl(
+            FailingVp(failing={"enabled", "paging_mode", "X64_RegisterCr0"}),
+            0,
+            1,
+            compare_cr3=0x7D5000,
         )
         self.assertTrue(vtl1["forced"])
         self.assertEqual(vtl1["cr3"], 0x1201000)
@@ -298,6 +301,79 @@ class DiagnosticsDoNotSuppressTheRoot(unittest.TestCase):
         self.assertEqual(record["good"], 7)
         self.assertNotIn("bad", record)
         self.assertEqual(record["errors"], {"bad": "nope"})
+
+
+class Vtl0IsReadTheSameWay(unittest.TestCase):
+    def test_a_failing_vtl0_diagnostic_does_not_abort_the_run(self):
+        # The VTL0 block used to be a second copy of this code that still raised, so a provider
+        # that could not answer one diagnostic lost the VTL1 CR3 three screens later.
+        vtl0 = probe.read_vtl(FailingVp(failing={"paging_mode", "X64_RegisterEfer"}), 0, 0)
+        self.assertTrue(vtl0["forced"])
+        self.assertEqual(vtl0["cr3"], 0x1201000)
+        self.assertEqual(sorted(vtl0["errors"]), ["efer", "paging_mode"])
+        self.assertEqual(vtl0["vtl"], 0)
+
+    def test_long_mode_is_unknown_rather_than_false_when_a_register_is_missing(self):
+        # Answering False would make a provider that cannot return EFER look like a machine that
+        # is not in long mode -- the control for the register indexing, inverted.
+        self.assertIsNone(probe.long_mode_consistent({"cr0": 0x80050033, "cr4": 0xB50EF8}))
+        self.assertTrue(
+            probe.long_mode_consistent({"cr0": 0x80050033, "cr4": 0xB50EF8, "efer": 0xD01})
+        )
+        self.assertFalse(
+            probe.long_mode_consistent({"cr0": 0x33, "cr4": 0xB50EF8, "efer": 0xD01})
+        )
+
+
+class FailedReadsAreCounted(unittest.TestCase):
+    def test_an_unreadable_leaf_is_not_a_leaf_without_an_image(self):
+        pages = {0x5000: b"\x00" * PAGE}
+        source = FakeSource(pages, unreadable=[0x6000])
+        leaves = [(BASE_VA, 0x5000, PAGE), (BASE_VA + PAGE, 0x6000, PAGE)]
+        images, scan = probe.scan_leaves_for_images(source, leaves, {"sections": 1})
+        self.assertEqual(images, [])
+        self.assertEqual(scan["scanned"], 2)
+        self.assertEqual(scan["unreadable"], 1, "a refused page is not a page with no header")
+        self.assertFalse(scan["capped"])
+
+    def test_an_unreadable_physical_page_is_counted_by_the_control_scan(self):
+        pages = {0x0: b"\x00" * PAGE, 0x2000: b"\x00" * PAGE}
+        source = FakeSource(pages, unreadable=[0x1000])
+        chunks = [{"start_page": 0, "pages": 3}]
+        _images, _kdbg, scan = probe.scan_physical_for_images(
+            source, chunks, PAGE, {"sections": 1}, 10
+        )
+        self.assertEqual(scan["scanned"], 3)
+        self.assertEqual(scan["unreadable"], 1)
+
+    def test_an_unreadable_table_is_counted_by_the_walk(self):
+        source = four_level_tree(extra_pdpt_entries={1: entry(0x7000)})
+        source.unreadable.add(0x7000)
+        _leaves, stats = probe.walk(source, ROOT)
+        self.assertEqual(stats["unreadable_tables"], 1)
+
+    def test_the_source_counts_failures_no_consumer_can_hide(self):
+        class FakeReadLib:
+            def __init__(self, results):
+                self.results = list(results)
+
+            def ReadGuestPhysicalAddress(self, _handle, _gpa, _buffer, size, read_ref):
+                hr, got = self.results.pop(0)
+                read_ref._obj.value = size if got is None else got
+                return hr
+
+        state = probe.SavedState.__new__(probe.SavedState)
+        state.lib = FakeReadLib([(0, None), (-2147467259, 0), (0, 8)])
+        state.handle = None
+        state.reads = state.failed_reads = state.failed_translations = 0
+        state.read_bytes = 0
+        state.failure_kinds = {}
+        self.assertIsNone(state.read(0x1000, 16)[1])
+        self.assertIn("hresult", state.read(0x2000, 16)[1])
+        self.assertIn("short read", state.read(0x3000, 16)[1])
+        self.assertEqual(state.reads, 3)
+        self.assertEqual(state.failed_reads, 2)
+        self.assertEqual(state.failure_kinds, {"hresult": 1, "short": 1})
 
 
 class WalkableGate(unittest.TestCase):
