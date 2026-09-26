@@ -1228,6 +1228,35 @@ reporting `Size` instead of matching it. The three carry a `Size` of `0x2C058948
 the step that separates them, and an exact-match needle built from a remembered constant would have
 returned the noise or nothing at all.
 
+#### What the walk leaves out, and why enumerating every VA is the wrong target
+
+**Secure Kernel's VTL1 page tables are recursively self-mapped, so one physical page is a PML4, a
+PDPT, a PD *and* a PT depending on the route taken to it.** Measured on this capture: **36** tables
+appear at more than one level, one PD is referenced **1023** times and one PT **2300** times, and
+the 11,326 leaf mappings cover only **4,189 distinct physical pages**. Expanding every prefix is
+therefore combinatorial rather than merely expensive.
+
+So the walk expands each table **once per level** and now **counts** what that skips —
+**6,773 alias prefixes** on this capture, reported beside the leaves rather than passed over in
+silence. The distinction matters because the walk's own contract is that an incomplete answer says
+so; before this round it did not, and a review finding said exactly that.
+
+**The remedy that finding proposed was built and measured, and it does not work here.** Cutting
+cycles by descent path instead — so an aliased table is walked again under each prefix — turned a
+166-read, 11,326-leaf walk that identifies the image into one that **exhausted a 200,000-leaf
+budget over 509 distinct pages and identified nothing**. Recorded because the finding's *fact* is
+right and its remedy is not: on a self-mapped tree, the complete VA enumeration it asks for is the
+thing that cannot terminate usefully. What the identification rests on instead is two independent
+agreements — the provider's own translator on the GPA, and `KernBase` inside the data block — both
+of which hold.
+
+Two smaller readings from the same instrumentation. **No large-page mapping appears in SK's VTL1
+tables on this build** (`malformed_entries` 0, every leaf 4 KiB), which is why an address-masking
+defect in the large-page path stayed latent until review found it by reading: in a large PDPTE or
+PDE bit 12 is the PAT flag rather than the low bit of the frame, so masking at 4 KiB granularity
+lands a page high. And the physical scan's four `KDBG` tags are the same four the image search
+finds, three of them coincidental byte sequences.
+
 #### A different boot, and why the root has to come from the capture
 
 The H1 checkpoint of the same guest, taken 2026-09-25 20:32Z, is a **different boot**, and reading
@@ -1304,8 +1333,11 @@ a broken one.
   the guest, and writing to a `.vmrs` would change a file, not VTL1.
 - **It does not retire the driver.** The live route is still the only one that reads a guest as it
   runs. What this adds is a second source with a much lower setup cost, not a replacement.
-- **Only the checkpoint form was run.** `Save-VM` also produces a `.vmrs` and
-  `LocateSavedStateFiles` handles the older `.bin`/`.vsv` pair as well; neither was measured.
+- **Only the checkpoint form was run.** `Save-VM` also produces a `.vmrs`, and
+  `LocateSavedStateFiles` answers with the older `.bin`/`.vsv` pair for a capture written by an
+  earlier Hyper-V. The probe selects that pair and loads it through `LoadSavedStateFiles` — the
+  **selection** is pinned by a test, and the **provider call** is unexercised, because this bench
+  has never produced a capture of that form.
 - **One host, one Hyper-V version, one guest build**, and a guest that is not hardware-isolated. A
   confidential VM's memory is not the host's to write into a capture, so nothing here should be
   read as reaching one.

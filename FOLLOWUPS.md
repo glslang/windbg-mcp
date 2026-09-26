@@ -2158,6 +2158,12 @@ Three things must be pinned by tests rather than discovered again:
   re-enters the table 512× per level. Unguarded, this took the bench down twice and needed a
   reboot each time. Pin: skip entries whose target PFN is the table they came from, a visited set
   per level, and hard budgets on reads *and* collected leaves that **report** a partial result.
+  **And report what the visited set skips**, which S0's run had to add after review asked for it:
+  36 tables appear at more than one level, one PD is referenced 1023 times, and 6,773 alias
+  prefixes go unexpanded on a walk whose 11,326 leaf mappings cover 4,189 distinct pages.
+  Expanding them all is combinatorial on a self-mapped tree — measured by building it, which
+  exhausted a 200,000-leaf budget over 509 pages and identified nothing — so the guard stays and
+  the omission is counted rather than silent.
 - **Read width.** `HvCallReadGpa` moves at most 16 bytes, and judging a 4096-byte page on its first
   sixteen is what made SK's PML4 read as all-zero for most of a session. Any source-side chunking
   must not leak into the decode layer's view of a page.
