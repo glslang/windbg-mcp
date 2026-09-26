@@ -56,7 +56,7 @@ use dbgscope::pool::{
 };
 use windows_sys::Win32::Foundation::{HANDLE_FLAG_INHERIT, SetHandleInformation};
 
-use crate::batch::{self, BatchOp, Debuggee, Held, Ran};
+use crate::batch::{self, BatchOp, Debuggee, Held, Ran, Sealed};
 use crate::device;
 use crate::driver::{
     fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_lm_base,
@@ -604,6 +604,18 @@ enum Cleanup {
     /// the release is bounded by the server's own grace either way, and the engine's watchdog
     /// still bounds each resume, the seal being a boundary against *hosts* and not against time.
     Teardown,
+    /// A [`crate::batch`] that has stopped because it can no longer say what the engine is
+    /// holding — its target replaced under it, or an engine that will not answer.
+    ///
+    /// Sealed although **nothing further runs**, which is the opposite of the two above and is
+    /// the point: what a break would reach here is not this job's work but the *engine*, and
+    /// `SetInterrupt` acts on whatever it is holding now — on a live kernel, a machine nobody
+    /// asked about. [`refuse_a_break_for_a_replaced_target`] is the same rule on the same path
+    /// and cannot cover this, because it reads [`REPLACED`], which is not set until the op ends;
+    /// this closes the interval between the batch seeing the replacement and the worker
+    /// publishing it. Raised by Codex on
+    /// [#392](https://github.com/glslang/windbg-mcp/pull/392).
+    TargetLost,
 }
 
 static RUNNING: Mutex<Running> = Mutex::new(Running {
@@ -1568,6 +1580,18 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
                      success while leaving the target changed. It is bounded by the batch's own \
                      budget and will return shortly. If it does not, `end_session` ends the \
                      session outright, at the cost of the target."
+                ),
+                // Nothing is running, and that is *why* it is sealed rather than a reason it
+                // need not be: the break would reach the engine rather than this job, and the
+                // engine is holding something this session cannot name.
+                Cleanup::TargetLost => format!(
+                    "Not interrupted. The operation on this session (job {job}) is a \
+                     `debug_batch` that stopped because the debugger is no longer holding the \
+                     target it started against, and it is sending nothing further — so there is \
+                     nothing left to interrupt, and a break raised now would act on whatever the \
+                     engine is holding instead. Its reply is on its way and says what the batch \
+                     changed and what it could not undo; this session's handle is being retired \
+                     with it."
                 ),
                 // Deliberately not offering `end_session` as the way out, which is the advice
                 // above and is void here: this *is* that teardown.
@@ -6218,8 +6242,15 @@ impl Debuggee for BatchEngine<'_> {
         interrupt_pending(self.job)
     }
 
-    fn rolling_back(&mut self) {
-        seal_against_interrupts(self.e, self.job, Cleanup::Rollback);
+    fn sealing(&mut self, why: Sealed) {
+        seal_against_interrupts(
+            self.e,
+            self.job,
+            match why {
+                Sealed::Rollback => Cleanup::Rollback,
+                Sealed::TargetLost => Cleanup::TargetLost,
+            },
+        );
     }
 }
 
