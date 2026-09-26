@@ -153,7 +153,7 @@ instruction's microarchitectural security effect.
 Close 63 with native CLRBHB text, valid instruction information, inspected function
 analysis and comparison evidence. Exported fallback bytes alone cannot close it.
 Record the first verified upstream version in
-[the export follow-up](securekernel-export-followup.md).
+[the export follow-up](secure-kernel/securekernel-export-followup.md).
 
 ## 64 — Verify the FirstSetupDialog shutdown fix
 

@@ -87,7 +87,7 @@ startup/quit guards as documented in the [shutdown investigation](bn-shutdown-in
 This capture closes the plan's generic Personal similarity-to-debugger acceptance,
 including live run-to and breakpoint checks. It does not execute securekernel or
 establish a live CVE-specific handoff. The eight unresolved securekernel rows were
-subsequently resolved in the separate [exporter follow-up](securekernel-export-followup.md);
+subsequently resolved in the separate [exporter follow-up](secure-kernel/securekernel-export-followup.md);
 native Ultimate execution stays tentative.
 
 ## Cleanup review follow-up — 2026-09-12

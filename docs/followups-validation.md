@@ -11,7 +11,7 @@ Rust or companion API change was needed for these checks.
 | Item | Delivered | Remaining closure condition |
 |---|---|---|
 | 61 | Fresh CVRF and artifact verification, complete retained comparison review, exact-byte stale-pointer checker and a competing-CVE investigation. [Report](cve-2026-83498-attribution.md). | The real cleanup fix is not yet attributable to CVE-2026-83498; exact discriminating artifacts could not be acquired from the colliding symbol-server key. |
-| 62 | Read-only guarded handoff probe, refusal/preservation tests, authenticated live session discovery. [Report](securekernel-handoff-acceptance.md). | No existing debugger sessions were available for Secure Kernel handoff. |
+| 62 | Read-only guarded handoff probe, refusal/preservation tests, authenticated live session discovery. [Report](secure-kernel/securekernel-handoff-acceptance.md). | No existing debugger sessions were available for Secure Kernel handoff. |
 | 63 | Companion-maintained, SDK-pinned native ARM64 replacement; all sixteen endpoints and the complete external comparison pass. [Report](clrbhb-native-validation.md). | **Closed locally.** Upstream PR draft prepared for later submission. |
 | 64 | Isolated launcher; wizard crash, safe control, modal guard and active export/matching shutdown captures. | Upstream #8549 is still open; the original scenario still crashes. |
 | 65 | Real GUI capability discovery confirms native BinDiff/WARP unavailable; conditional native checklist below. | Appropriate Ultimate access without purchase. |

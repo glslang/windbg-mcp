@@ -1061,7 +1061,7 @@ serving a third hash. Attribution to CVE-2026-83498 remains unresolved.
   applicable fix boundary to the CVE; retain alternative explanations and distinguish inferred
   attribution from authoritative confirmation. No exploit trigger is required.
 - **Where it picks up:** [CVE acceptance](docs/cve-patch-diff-acceptance.md),
-  [securekernel export follow-up](docs/securekernel-export-followup.md), and the
+  [securekernel export follow-up](docs/secure-kernel/securekernel-export-followup.md), and the
   [MSRC patch-diff skill](skills/msrc-patch-diff/SKILL.md). Under Codex the investigation uses
   `gpt-daybreak-blue-latest` as the skill specifies.
 
@@ -1072,7 +1072,7 @@ a live securekernel handoff. Existing evidence identifies no disposable, paused 
 the exact selected securekernel build already loaded.
 
 **2026-09-15 implementation:** the maintained
-[read-only probe and offline checks](docs/securekernel-handoff-acceptance.md) are implemented.
+[read-only probe and offline checks](docs/secure-kernel/securekernel-handoff-acceptance.md) are implemented.
 Authenticated discovery found no sessions on the existing WinDbg listener; live handoff
 remains `not_run`. The probe leaves supplied sessions open and restricts debugger calls
 to inspection, including a fixed `bl` command for breakpoint comparison.
@@ -1084,7 +1084,7 @@ to inspection, including a fixed `bl` command for breakpoint comparison.
   for the other build's identity. Preserve execution state and unrelated sessions. Record
   breakpoint/run-to evidence separately if such execution is subsequently authorized.
 - **Where it picks up:** [generic handoff](docs/similarity-windbg-acceptance.md),
-  [securekernel capture](docs/securekernel-export-followup.md), and the skill's live-handoff
+  [securekernel capture](docs/secure-kernel/securekernel-export-followup.md), and the skill's live-handoff
   preconditions. This is an optional CVE-specific extension, not a Personal release gate.
 
 ## 64. [Binary Ninja upstream] Verify the FirstSetupDialog shutdown fix

@@ -2,8 +2,8 @@
 
 Collected 2026-09-18 through 2026-09-19, with a second offline pass on 2026-09-22. This is a
 sanitized research archive, not a
-successful VTL1 debugging transcript. See the [chronological validation record](../../secure-kernel-debugging-validation.md)
-and [current plan](../../secure-kernel-debugging-plan.md).
+successful VTL1 debugging transcript. See the [chronological validation record](../../secure-kernel/secure-kernel-debugging-validation.md)
+and [current plan](../../secure-kernel/secure-kernel-debugging-plan.md).
 
 ## What is preserved
 

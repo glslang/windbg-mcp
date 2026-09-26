@@ -20,20 +20,20 @@ RVAs `0x10fc00`–`0x10ff80` and target RVAs `0x11ac00`–`0x11af80`, spaced by 
 This observation does not associate those entries with the CVE fix. The same
 instruction bytes occur on both sides.
 
-The [diagnostic capture](samples/securekernel-export-diagnostic-20260911.json)
+The [diagnostic capture](../samples/securekernel-export-diagnostic-20260911.json)
 records each function's name, bounds, bytes, empty instruction list, and absent
 exported flow graph, together with the input hashes and normal GUI exit. Its
 binary-list snapshot precedes analysis completion; the per-function and export
 observations were collected after `update_analysis_and_wait`. The
-[recorded source](samples/securekernel-export-diagnostic-20260911-recorded.py.txt)
+[recorded source](../samples/securekernel-export-diagnostic-20260911-recorded.py.txt)
 is retained byte-for-byte with its source hash as a text archive, not a runnable
 reproduction tool. It assumes a disposable GUI: it does not check for existing
 views before opening inputs and requests application Quit even after a diagnostic
 failure. For new comparison captures, use the maintained
-[capture helper](../skills/msrc-patch-diff/scripts/gui_capture.py), whose `start()`
+[capture helper](../../skills/msrc-patch-diff/scripts/gui_capture.py), whose `start()`
 checks for an empty GUI on the UI thread before scheduling work and defaults to
 `quit_on_finish=False`. The earlier full comparison remains preserved in the
-[ARM64 acceptance record](cve-patch-diff-acceptance.md#arm64-generation-follow-up--2026-09-10).
+[ARM64 acceptance record](../cve-patch-diff-acceptance.md#arm64-generation-follow-up--2026-09-10).
 
 ## Validation scope
 
@@ -75,25 +75,25 @@ the baseline, and all existing acceptance checks remained enabled.
 | Overall capture | `ok: false` | `ok: true` |
 
 All eight previously unresolved pairs are now imported with their original build
-identities and RVAs. The [complete capture](samples/securekernel-export-capture-20260911.json.gz)
+identities and RVAs. The [complete capture](../samples/securekernel-export-capture-20260911.json.gz)
 preserves every match, both unmatched lists, sampled textual diffs, target
 navigation, and before/after state. Cleanup reported no errors; the disposable
 GUI exited 0 without forced termination.
 
-The [follow-up manifest](samples/securekernel-export-followup-20260911.json) records
+The [follow-up manifest](../samples/securekernel-export-followup-20260911.json) records
 the recovered pairs, source/helper/export hashes, fixed diagnostic, validation
 results, and separate process exits. Earlier partial captures remain unchanged.
-An independent [protobuf inspection](samples/securekernel-export-graph-inspection-20260911-recorded.py.txt)
+An independent [protobuf inspection](../samples/securekernel-export-graph-inspection-20260911-recorded.py.txt)
 followed each graph's entry block and instruction index in the retained BinExport
 files. All sixteen entries have the expected addresses, raw bytes `df2203d5`, and
 mnemonic `clrbhb`; there are 3,120 reference graphs and 3,143 target graphs.
 The manifest retains those observations and export hashes. No BN or BinDiff
 process remained after the final diagnostic.
 `graph_inspection_raw_output_sha256` hashes the original `graph-inspection.json`
-[raw output](samples/securekernel-export-graph-inspection-20260911-raw.json) before
+[raw output](../samples/securekernel-export-graph-inspection-20260911-raw.json) before
 export paths were reduced to basenames in the manifest;
 `graph_inspection_script.sha256` separately hashes the archived executed script.
-The [reproduction inspector](samples/securekernel-export-graph-inspection-20260911.py)
+The [reproduction inspector](../samples/securekernel-export-graph-inspection-20260911.py)
 now rejects optimized Python (`-O`, `-OO`, or `PYTHONOPTIMIZE`) before validation;
 those modes remove its acceptance assertions. Offline CLI regressions with empty
 export graphs reproduced false-positive output in all four optimized-mode cases

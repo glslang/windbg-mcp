@@ -30,7 +30,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   matters before anyone arms one live. Of the eleven `Kd`-prefixed symbols in each post-26100
   image **none is a function**, while `SkdInitDebuggerDataBlock` fills the block completely: SK
   ships the metadata a debugger keys off and no transport to deliver it. That split is what makes
-  EXDI the interesting route and is written up as [`docs/exdi-stub-plan.md`](docs/exdi-stub-plan.md),
+  EXDI the interesting route and is written up as [`docs/exdi-stub-plan.md`](docs/secure-kernel/exdi-stub-plan.md),
   which Phase 4 of the Secure Kernel plan now defers to.
 
   **The EXDI reading is measured, including where it was first wrong.** `ExdiGdbSrv.dll` ships

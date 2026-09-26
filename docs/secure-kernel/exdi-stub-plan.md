@@ -145,7 +145,7 @@ Nothing to do with Secure Kernel. Establishes the rig.
    claimed the opposite, reading the registration strings in `dbgeng.dll` as proof the engine
    self-registers; it has the code and did not run it. **The strings were evidence of a code path,
    not of when it executes** — the same mistake
-   [`measurement-provenance.md`](../.claude/rules/measurement-provenance.md) is about.
+   [`measurement-provenance.md`](../../.claude/rules/measurement-provenance.md) is about.
 
    **Do not reach for `Inproc=` to avoid registering.** It exists, and it is a trap. The value is a
    *bare filename* resolved against the debugger's own directory — an absolute path is
@@ -544,7 +544,7 @@ sketch](secure-kernel-debugging-plan.md) still stands; these are the concrete ed
   Worth a test that it round-trips unredacted *and* that a `password=` added to it is masked, so
   the exemption is the string's content rather than its transport.
 - **Tool surface.** `attach_kernel` gains the argument; read
-  [`.claude/rules/tool-surface.md`](../.claude/rules/tool-surface.md) first — the group in
+  [`.claude/rules/tool-surface.md`](../../.claude/rules/tool-surface.md) first — the group in
   `src/toolset.rs` is the half that fails silently, and any prose naming another tool belongs in
   `TOOL_NOTES`, not in a doc comment.
 - **Capability matrix.** The deliverable the Secure Kernel plan already names, and EXDI is what
@@ -552,7 +552,7 @@ sketch](secure-kernel-debugging-plan.md) still stands; these are the concrete ed
   list, so `crash_triage`, `driver_object`, `device_object` and the pool tools will either fail or
   answer for something else. **Which of those two it is has to be measured per tool**, because a
   tool that answers wrongly is worse than one that refuses.
-- **Test tier.** A new opt-in gate, per [`.claude/skills/tiers/SKILL.md`](../.claude/skills/tiers/SKILL.md),
+- **Test tier.** A new opt-in gate, per [`.claude/skills/tiers/SKILL.md`](../../.claude/skills/tiers/SKILL.md),
   keyed on an env var naming a reachable stub.
 
 ## Stop conditions
@@ -577,7 +577,7 @@ Write these down before starting, so a sunk cost does not decide:
 ## Deliverables
 
 - The `<ExdiTarget>` entry, version-pinned, as a file rather than as prose.
-- A runbook in the shape of [`.claude/skills/live-kernel/SKILL.md`](../.claude/skills/live-kernel/SKILL.md),
+- A runbook in the shape of [`.claude/skills/live-kernel/SKILL.md`](../../.claude/skills/live-kernel/SKILL.md),
   written from a cold bench rather than a warm one.
 - The capability matrix above, measured.
 - A redacted transcript, recorded with `WINDBG_MCP_TRANSCRIPT` and rendered with `--render-cast`.

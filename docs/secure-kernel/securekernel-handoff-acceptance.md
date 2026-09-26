@@ -2,15 +2,15 @@
 
 ## Status — 2026-09-15
 
-The maintained [handoff probe](../tools/securekernel_handoff_probe.py) and offline
+The maintained [handoff probe](../../tools/securekernel_handoff_probe.py) and offline
 refusal/preservation tests are implemented. Live acceptance is **not run**: the
 existing WinDbg MCP listener returned an empty session inventory during
 authenticated, read-only discovery. The temporary SSH tunnel was closed. No
 debugger session was attached, interrupted, resumed or ended.
 
-[Discovery evidence](samples/securekernel-handoff-discovery-20260915.json) records
+[Discovery evidence](../samples/securekernel-handoff-discovery-20260915.json) records
 the retrieval time, available tools and empty inventory. This leaves follow-up
-62 open. The earlier [generic fixture acceptance](similarity-windbg-acceptance.md)
+62 open. The earlier [generic fixture acceptance](../similarity-windbg-acceptance.md)
 remains independent evidence.
 
 ## Preconditions and invocation
