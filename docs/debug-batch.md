@@ -82,7 +82,10 @@ Five honest limits, none of them hidden in the report:
   run.** A wrapper hides the command that does it — `.if (1) { .opendump … }`, a `.foreach`, an
   alias resolved at execution time, a breakpoint command run at a hit — so neither the by-name scan
   that retires a handle nor `validate` can see one, and the engine process compares what it is
-  holding against what the batch started against instead, between every step and after the last.
+  holding against what the batch started against instead — after every step's *action*, before
+  that step's own assertions, so an `eval` expectation is never answered by the replacement and
+  reported as the step's verdict. What cannot be caught is a change made *inside* one engine call,
+  which nothing in the server has observed until that call returns.
   What it protects is the cleanup: a target that has *gone* refuses a restore, while a target that
   has been *replaced* accepts it, at an address that means something else there. The outcome is
   `BATCH: TARGET REPLACED`, the disposition is `rollback: NOT ATTEMPTED` rather than `INCOMPLETE`,
