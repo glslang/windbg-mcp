@@ -5194,6 +5194,19 @@ Three things about the shape of it are worth keeping.
   cannot answer `GetExecutionStatus`, an engine-local call that never reaches the wire, was
   unlikely to execute the restore either.
 
+**What it rests on, and what it therefore does not close.** The reading is item 81's fingerprint,
+which maps every query's error to `None` — the same value a field takes when the question does not
+apply to that target kind. So two *failures* of one query compare equal and a swap only that field
+would have caught goes unseen, and a query that recovers reads as a replacement that did not
+happen. Raised by Codex in review, and half-closed here: a batch will not start against a reading
+whose `kind` is missing (`worker::usable_baseline`), that being the field which decides which of
+the others are even asked for. The rest is `FOLLOWUPS.md` **item 104**, because the error cannot
+be read to tell "does not apply" from "could not be read" — DbgEng answers `E_UNEXPECTED` to both —
+so it needs a per-target-kind table of required fields, which is the claim `TargetFingerprint`'s
+doc records as having been wrong three review rounds running, and a decision per caller besides.
+Filing it was the proportionate move for the same reason this item was not folded into item 81: it
+is a change to a type both halves share and deserves its own review.
+
 **What measuring it disproved — the item's own example.** Every draft of this entry, and the
 paragraph in `CLAUDE.md`-adjacent prose that came with item 81, illustrated a replacement with
 `.if (1) { .opendump C:\other.dmp }`. Driven live against the dev build over stdio (dbgeng
