@@ -1239,10 +1239,13 @@ different provenance, which matters:
 | table reads | 166 | 179 | 215 |
 | tables decoded | 166 | **215** — 36 served at more than one level | — |
 | alias prefixes skipped | **6,773** | 7,803 | — |
-| leaf mappings / distinct pages | 11,326 / **4,189** | 16,437 / 4,545 | — |
+| leaf mappings / distinct pages | 11,326 / **~4,190** | 16,437 / 4,545 | — |
 | worst-case fan-in | — | — | one PD referenced **1023×**, one PT **2300×**, the root present at all four levels |
 
-The third column is a deliberate diagnostic, not the production walk: it does **not** skip the
+The leaf/distinct-page ratio is a reading rather than a constant — 4,189 on one capture of the
+2026-09-26 boot and 4,194 on another two hours later, the guest having run in between, while the
+11,326 mappings and 166 reads were identical on both. The third column is a deliberate
+diagnostic, not the production walk: it does **not** skip the
 self-map entry, which is how it reaches the page tables *as* mapped data and shows why enumerating
 every prefix is combinatorial rather than merely expensive. The first two are the walk as it runs,
 and the middle column's 215 decodes against 179 reads is the same phenomenon seen from inside it —
@@ -1327,17 +1330,23 @@ H4's Control 1, repeated on the new source, one procedure against both captures.
 | `GetGuestEnabledVirtualTrustLevels` | `0b11` | **`0b1`** |
 | `ForceActiveVirtualTrustLevel(vp0, 1)` | succeeds, VTL enabled | **refused**, `0xC0370509` |
 | pages scanned physically | 32768 | 32768 |
-| PE image headers | 101, then 86 | **143, then 100** |
+| PE image headers | 86-101 | **100-143** |
 | matching `securekernel.exe` | **1**, GPA `0x00CD0000` | **0** |
 | `KDBG` tags | 4 | **0** |
 
 **The two PE-header counts move and the other rows do not, which is worth saying rather than
-picking one.** Those are two captures of the *same boot* an hour apart, and a running guest's
+picking one.** Those are three captures of the *same boot* across two hours, and a running guest's
 physical memory changes between them — so a count of PE headers in a fixed 32768-page window is a
 reading of what happened to be resident, not a property of the guest. What is stable across every
 capture taken here is what the control actually rests on: **1 against 0** matching
 `securekernel.exe`, **4 against 0** `KDBG` tags, and the direction of the header count, the
-VBS-off guest yielding more both times.
+VBS-off guest yielding more every time.
+
+**And the negatives are earned rather than assumed**, which is a separate claim and now a
+measured one: every capture reports `reads.failed: 0` with no unreadable page in either
+scan, so the control found no Secure Kernel in 32,768 pages it actually read. A scan that
+had quietly skipped some fraction of them would have produced the same zero, and until this
+round nothing in the output could tell the two apart.
 
 **The refusal is named, not silent.** `0xC0370509` is
 `VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED` — the provider ships a typed error for exactly this

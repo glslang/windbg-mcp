@@ -29,13 +29,20 @@ decision of its own.
 |---|---|---|
 | **fatal** -- nothing downstream means anything without it | `LocateSavedStateFiles`, `LoadSavedStateFile(s)`, `ApplyPendingSavedStateFileReplayLog` | raise `ProbeError`; the run ends |
 | **diagnostic** -- recorded per field, never fatal, never silent | `GetVpCount`, `GetGuestEnabledVirtualTrustLevels`, `GetEnabledVirtualTrustLevels`, `GetActiveVirtualTrustLevel`, `GetArchitecture`, `GetPagingMode`, `IsActiveVirtualTrustLevelEnabled`, `GetRegisterValue` | `probed()` writes the reason under `errors[<field>]`; every other field is still asked for |
-| **bulk** -- called thousands of times, must never raise | `ReadGuestPhysicalAddress`, `GuestVirtualAddressToPhysicalAddress` | return `(nothing, reason)`; the caller decides |
+| **bulk** -- called thousands of times, must never raise | `ReadGuestPhysicalAddress`, `GuestVirtualAddressToPhysicalAddress` | return `(nothing, reason)`, **and count the failure at the source**; every consumer also counts its own |
 | **sized** -- a failure HRESULT is part of the protocol | `GetGuestPhysicalMemoryChunks` | see its own docstring: measured `0x8007000E` on the sizing call, so the count decides |
 
 `ForceActiveVirtualTrustLevel` is deliberately in none of them: its failure **is** the control
 arm's result, so it is caught at one call site and reported as itself. And the provider is never
 handed a handle it did not give us -- an experiment that passed it a fabricated one hung inside the
 DLL and had to be killed.
+
+**The table binds the producer; it took another round to bind the consumers.** A contract saying
+"return a reason" leaves every caller free to write `if reason: continue` and report a clean zero,
+and two of them did. So `read()` counts its own failures in `reads.failed` -- a number no consumer
+can suppress and no section can explain away -- and each scan carries its own `unreadable` count
+beside its findings. A run reporting nothing found with a non-zero `reads.failed` is a run whose
+negative has not been earned.
 
 Run against a capture (a checkpoint taken with `CheckpointType = Standard`, or a saved VM):
 
@@ -126,6 +133,9 @@ class SavedState:
         self.handle = ctypes.c_void_p()
         self.reads = 0
         self.read_bytes = 0
+        self.failed_reads = 0
+        self.failed_translations = 0
+        self.failure_kinds = {}
         self._declare()
 
     def _declare(self):
@@ -356,10 +366,26 @@ class SavedState:
         self.reads += 1
         self.read_bytes += read.value
         if hr < 0:
-            return b"", f"hresult 0x{hr & 0xFFFFFFFF:08X}"
+            return b"", self._failed(f"hresult 0x{hr & 0xFFFFFFFF:08X}")
         if read.value != size:
-            return bytes(buffer[: read.value]), f"short read {read.value}/{size}"
+            return bytes(buffer[: read.value]), self._failed(f"short read {read.value}/{size}")
         return bytes(buffer), None
+
+    def _failed(self, reason):
+        """Count a failed read at the source, and hand the reason on unchanged.
+
+        **A caller that drops the reason cannot also drop the fact.** Three review rounds have now
+        found a failed call arriving as a negative result, and the contract that says "return a
+        reason" only binds the producer -- a consumer is still free to write `if reason: continue`
+        and report a clean zero. Counting here is the backstop that no consumer can bypass: a run
+        whose scans found nothing while `reads.failed` is non-zero is a run to distrust, whatever
+        any individual section says. Per-section counts still matter for locality and are kept
+        beside this one.
+        """
+        kind = reason.split()[0]
+        self.failed_reads += 1
+        self.failure_kinds[kind] = self.failure_kinds.get(kind, 0) + 1
+        return reason
 
     def va_to_gpa(self, vp, va):
         gpa = ctypes.c_uint64()
@@ -368,6 +394,7 @@ class SavedState:
             self.handle, vp, va, ctypes.byref(gpa), ctypes.byref(unmapped)
         )
         if hr < 0:
+            self.failed_translations += 1
             return None, f"hresult 0x{hr & 0xFFFFFFFF:08X}"
         return gpa.value, None
 
@@ -486,6 +513,7 @@ def walk(state, root_gpa):
         "tables_decoded": 0,
         "alias_prefixes_skipped": 0,
         "malformed_entries": 0,
+        "unreadable_tables": 0,
         "truncated": None,
     }
     visited = [set(), set(), set(), set()]
@@ -504,6 +532,11 @@ def walk(state, root_gpa):
             return None
         page, reason = state.read(table_gpa, PAGE)
         stats["table_reads"] += 1
+        if reason:
+            # A table that could not be read is a subtree that is not in this answer. Counted,
+            # because "the walk found no image" and "the walk could not read part of the tree"
+            # are different results and the leaf list does not distinguish them.
+            stats["unreadable_tables"] += 1
         cache[table_gpa] = None if reason else struct.unpack("<512Q", page)
         return cache[table_gpa]
 
@@ -601,18 +634,27 @@ def scan_leaves_for_images(state, leaves, disk):
 
     A prefix is the right window here -- an image base is page-aligned and the header sits at
     offset 0, so this is reading the thing itself, not judging a page by a sample of it.
+
+    **A leaf that could not be read is not a leaf without an image.** Dropping the reason here
+    lets a refused or short read arrive as "no PE header", and the section then reports zero
+    matching images with nothing capped -- an incomplete scan wearing the shape of a negative
+    result. So failures are counted and the scan says whether it was complete.
     """
     images = []
     scanned = 0
+    unreadable = 0
     for va, gpa, size in leaves:
         # A large-page leaf covers many page-aligned bases, so it is expanded rather than
         # sampled at its first page -- an image inside one would otherwise be invisible.
         for offset in range(0, size, PAGE):
             if scanned >= MAX_LEAVES:
-                return images, scanned, True
+                return images, {"scanned": scanned, "unreadable": unreadable, "capped": True}
             head, reason = state.read(gpa + offset, PAGE)
             scanned += 1
-            if reason or head[:2] != b"MZ":
+            if reason:
+                unreadable += 1
+                continue
+            if head[:2] != b"MZ":
                 continue
             identity = pe_identity(head)
             if not identity:
@@ -625,25 +667,30 @@ def scan_leaves_for_images(state, leaves, disk):
                 }
             )
             images.append(identity)
-    return images, scanned, False
+    return images, {"scanned": scanned, "unreadable": unreadable, "capped": False}
 
 
 def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
     """The route that needs no CR3: walk backed physical pages testing for a PE header.
 
-    This is what the VBS-off control runs, since it has no VTL1 root to walk from.
+    This is what the VBS-off control runs, since it has no VTL1 root to walk from -- **which is
+    why a page it could not read has to be counted rather than skipped.** The control's entire
+    result is "no Secure Kernel here", and a scan that silently omitted some fraction of its pages
+    would produce that reading whether or not one of them held the image.
     """
     images, kdbg = [], []
     scanned = 0
+    unreadable = 0
     for chunk in chunks:
         base = chunk["start_page"] * page_size
         for page_index in range(chunk["pages"]):
             if scanned >= limit_pages:
-                return images, kdbg, scanned, True
+                return images, kdbg, {"scanned": scanned, "unreadable": unreadable, "capped": True}
             gpa = base + page_index * page_size
             data, reason = state.read(gpa, PAGE)
             scanned += 1
             if reason:
+                unreadable += 1
                 continue
             if data[:2] == b"MZ":
                 identity = pe_identity(data)
@@ -663,7 +710,7 @@ def scan_physical_for_images(state, chunks, page_size, disk, limit_pages):
                         }
                     )
                 offset = data.find(b"KDBG", offset + 1)
-    return images, kdbg, scanned, False
+    return images, kdbg, {"scanned": scanned, "unreadable": unreadable, "capped": False}
 
 
 def gather_image(reader, base_va, size_of_image):
@@ -730,26 +777,30 @@ def probed(record, field, call):
     return record[field]
 
 
-def read_vtl1(state, vp, vtl0_cr3):
-    """Force a VP to VTL1 and read what it then reports, one question at a time.
+def read_vtl(state, vp, vtl, compare_cr3=None):
+    """Force a VP to one VTL and read what it then reports, one question at a time.
+
+    **One function for both VTLs, because two copies of this block drifted apart.** The VTL1 copy
+    was made per-field after review found that a shared `try` let an optional diagnostic cost the
+    `CR3`; the VTL0 copy, three screens away, kept raising -- and review found that too, one round
+    later. A contract that says "diagnostics are recorded per field" and lives only in prose binds
+    nothing; there is now one place where a VP's registers are read and it is the place the rule
+    is written into.
 
     **A refused switch and a failed query have the same shape and opposite meanings.** "The
     provider will not put this VP in VTL1" is the control arm's entire result; "the switch worked
-    and a register did not come back" says nothing at all about whether VTL1 is enabled. Reporting
-    one as the other writes `forced: false` beside a `cr3` already read, and turns a provider that
-    cannot answer one query into evidence that a guest has no Secure Kernel -- the same collapse of
-    *refused* into *absent* that the read seam is guarded against, one level up.
+    and a register did not come back" says nothing about whether the VTL is enabled.
     """
-    vtl1 = {"requested": True}
+    record = {"vtl": vtl, "requested": True}
     try:
-        state.force_vtl(vp, 1)
+        state.force_vtl(vp, vtl)
     except ProbeError as error:
-        vtl1["forced"] = False
-        vtl1["force_error"] = str(error)
-        return vtl1
-    vtl1["forced"] = True
-    probed(vtl1, "enabled", lambda: state.active_vtl_enabled(vp))
-    probed(vtl1, "paging_mode", lambda: state.paging_mode(vp))
+        record["forced"] = False
+        record["force_error"] = str(error)
+        return record
+    record["forced"] = True
+    probed(record, "enabled", lambda: state.active_vtl_enabled(vp))
+    probed(record, "paging_mode", lambda: state.paging_mode(vp))
     for field, register in (
         ("cr0", "X64_RegisterCr0"),
         ("cr3", "X64_RegisterCr3"),
@@ -757,10 +808,27 @@ def read_vtl1(state, vp, vtl0_cr3):
         ("efer", "X64_RegisterEfer"),
         ("rip", "X64_RegisterRip"),
     ):
-        probed(vtl1, field, lambda r=register: state.register(vp, r))
-    if "cr3" in vtl1:
-        vtl1["differs_from_vtl0_cr3"] = vtl1["cr3"] != vtl0_cr3
-    return vtl1
+        probed(record, field, lambda r=register: state.register(vp, r))
+    if compare_cr3 is not None and "cr3" in record:
+        record["differs_from_vtl0_cr3"] = record["cr3"] != compare_cr3
+    return record
+
+
+def long_mode_consistent(record):
+    """Whether this register set is a long-mode processor, or None if it cannot be judged.
+
+    The control that says the `REGISTER_ID` indexing is right rather than off by one -- and it has
+    to answer *unknown* rather than *false* when a register did not come back, or a provider that
+    cannot return `EFER` would read as a machine that is not in long mode.
+    """
+    if any(field not in record for field in ("cr0", "cr4", "efer")):
+        return None
+    return bool(
+        record["cr0"] & (1 << 31)
+        and record["cr0"] & 1
+        and record["cr4"] & (1 << 5)
+        and record["efer"] & (1 << 10)
+    )
 
 
 def walkable(vtl1):
@@ -994,23 +1062,13 @@ def main(argv=None):
 
         # VTL0 first, as the control that says the register indexing is right: a CR0 with PG and
         # PE set, CR4 with PAE, and EFER with LMA is a long-mode processor and not an off-by-one.
-        state.force_vtl(vp, 0)
-        vtl0 = {
-            "enabled": state.active_vtl_enabled(vp),
-            "paging_mode": state.paging_mode(vp),
-            "cr0": state.register(vp, "X64_RegisterCr0"),
-            "cr3": state.register(vp, "X64_RegisterCr3"),
-            "cr4": state.register(vp, "X64_RegisterCr4"),
-            "efer": state.register(vp, "X64_RegisterEfer"),
-            "rip": state.register(vp, "X64_RegisterRip"),
-        }
-        vtl0["long_mode_consistent"] = bool(
-            vtl0["cr0"] & (1 << 31) and vtl0["cr0"] & 1 and vtl0["cr4"] & (1 << 5) and vtl0["efer"] & (1 << 10)
-        )
-        vtl0["root"] = describe_root(state, vtl0["cr3"] & PFN_MASK)
+        vtl0 = read_vtl(state, vp, 0)
+        vtl0["long_mode_consistent"] = long_mode_consistent(vtl0)
+        if "cr3" in vtl0:
+            vtl0["root"] = describe_root(state, vtl0["cr3"] & PFN_MASK)
         report["vtl0"] = vtl0
 
-        vtl1 = read_vtl1(state, vp, vtl0["cr3"])
+        vtl1 = read_vtl(state, vp, 1, compare_cr3=vtl0.get("cr3"))
         report["vtl1"] = vtl1
 
         disk = image_on_disk(args.image)
@@ -1030,10 +1088,9 @@ def main(argv=None):
                 "distinct_leaf_gpas": len({leaf[1] for leaf in leaves}),
                 **walk_stats,
             }
-            images, page_scanned, capped = scan_leaves_for_images(state, leaves, disk)
+            images, leaf_scan = scan_leaves_for_images(state, leaves, disk)
             report["walk"]["pe_images"] = images
-            report["walk"]["leaf_pages_scanned"] = page_scanned
-            report["walk"]["leaf_scan_capped"] = capped
+            report["walk"]["leaf_scan"] = leaf_scan
             matches = [i for i in images if i["matches_disk"]]
             report["walk"]["matching_images"] = len(matches)
             if matches:
@@ -1078,18 +1135,25 @@ def main(argv=None):
                 }
 
         if args.scan_pages:
-            images, kdbg, scanned, hit_limit = scan_physical_for_images(
+            images, kdbg, physical_scan = scan_physical_for_images(
                 state, chunks, page_size, disk, args.scan_pages
             )
             report["physical_scan"] = {
-                "pages_scanned": scanned,
-                "hit_limit": hit_limit,
+                **physical_scan,
                 "pe_images": len(images),
                 "matching_images": [i for i in images if i["matches_disk"]],
                 "kdbg_tags": kdbg,
             }
 
-        report["reads"] = {"count": state.reads, "bytes": state.read_bytes}
+        # The backstop the per-section counts cannot replace: any section can forget to report
+        # its own failures, and none of them can make this one read zero.
+        report["reads"] = {
+            "count": state.reads,
+            "bytes": state.read_bytes,
+            "failed": state.failed_reads,
+            "failure_kinds": state.failure_kinds,
+            "failed_translations": state.failed_translations,
+        }
     finally:
         state.release()
 

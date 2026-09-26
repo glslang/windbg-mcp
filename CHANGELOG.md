@@ -88,7 +88,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protocol). That last one had to be measured rather than reasoned about: the sizing call
   answers `0x8007000E` by design with the count filled in, so the finding's literal remedy --
   check it -- would have rejected every healthy capture, and the rule is that a failure **with
-  no count** propagates. Two tests hold that seam from opposite sides. No Rust and no MCP
+  no count** propagates. Two tests hold that seam from opposite sides. **A fourth round landed on
+  the same theme again, which was the signal the contract was prose rather than code**: the VTL0
+  register block was a second copy of the VTL1 one that had never been made per-field, so a
+  provider rejecting one VTL0 diagnostic still aborted before the VTL1 `CR3` was read; and both
+  PE-header scans wrote `if reason: continue`, so a refused page arrived as a page with no image
+  and an incomplete scan wore the shape of a clean negative -- under the **control arm**, whose
+  entire result is that negative. Both VTLs are now read by one `read_vtl`, so there is no second
+  copy to drift; `long_mode_consistent` answers *unknown* rather than *false* when a register is
+  missing, since answering false would invert the control for the register indexing; each scan
+  carries its own `unreadable` count; and `read()` counts every failure at the source in
+  `reads.failed`, which no consumer can suppress -- a run reporting nothing found with a non-zero
+  `reads.failed` is a run whose negative has not been earned. Measured on the captures taken here
+  that number is **0**, so the control's zero is over 32,768 pages it actually read. Two more
+  published figures become readings rather than properties: the PE-header counts span 86-101 and
+  100-143 over three captures of one boot, and the walk's distinct leaf pages 4,189 and 4,194,
+  while the 11,326 mappings and 166 table reads were identical every time. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

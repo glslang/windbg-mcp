@@ -2176,6 +2176,12 @@ Three things must be pinned by tests rather than discovered again:
 - **A refused VTL switch and a failed register read are different answers.** Collapsing them makes
   a provider that cannot return one register look like a guest with no Secure Kernel — the same
   *refused*-as-*absent* collapse the read seam is guarded against, one level up.
+- **Count failed reads at the source, not only at each caller.** Four review rounds on S0's probe
+  each found another place where a failure arrived as a result, and a per-caller contract in prose
+  did not stop the fifth: two scans wrote `if reason: continue` and reported a clean negative.
+  A counter inside the read primitive is the one thing no consumer can bypass, and a run that
+  found nothing with a non-zero count is a run whose negative has not been earned. Each scan keeps
+  its own count beside it for locality.
 - **Read width.** `HvCallReadGpa` moves at most 16 bytes, and judging a 4096-byte page on its first
   sixteen is what made SK's PML4 read as all-zero for most of a session. Any source-side chunking
   must not leak into the decode layer's view of a page.
