@@ -581,6 +581,35 @@ class ConfirmationGetsTheLastWord(unittest.TestCase):
         self.assertEqual(attempts[0]["kern_base_matches"], 1)
         self.assertFalse(attempts[0]["validated"])
 
+    def test_the_rejected_hits_and_their_reasons_survive_the_rejection(self):
+        # "Four tags found, all refused" and "no tags found" are different results, and the
+        # reasons are the only thing that tells a coincidental tag from a stale module list.
+        image = image_with_kdbg(
+            [(0x100, 0x2C058948, 0xDEADBEEF, 0), (0x1000, 0x3A0, BASE_VA, 0xDEAD0000)]
+        )
+        candidates = [{"va": BASE_VA, "gpa": 0xCD0000, "size_of_image": 0x4000}]
+        chosen, attempts = probe.identify_image(
+            candidates,
+            lambda _va, _size: (image, []),
+            confirm=lambda _c, _h: (False, {"invalid_reason": "the list names somebody else"}),
+        )
+        self.assertIsNone(chosen)
+        hits = attempts[0]["hits"]
+        self.assertEqual(len(hits), 2, "both tags are reported, not just the plausible one")
+        self.assertFalse(hits[0]["kern_base_matches"])
+        self.assertIs(hits[1]["confirmed"], False)
+        self.assertEqual(hits[1]["rejected_by"], "the list names somebody else")
+
+    def test_a_chosen_candidate_carries_its_hits_in_the_same_place(self):
+        image = image_with_kdbg([(0x1000, 0x3A0, BASE_VA, BASE_VA + 0x127770)])
+        candidates = [{"va": BASE_VA, "gpa": 0xCD0000, "size_of_image": 0x4000}]
+        chosen, attempts = probe.identify_image(
+            candidates, lambda _va, _size: (image, []), confirm=lambda _c, _h: (True, {"valid": True})
+        )
+        self.assertIsNotNone(chosen)
+        self.assertEqual(len(attempts[0]["hits"]), 1)
+        self.assertIs(attempts[0]["hits"][0]["confirmed"], True)
+
 
 class DistinctLeafPages(unittest.TestCase):
     def test_a_large_leaf_counts_every_frame_it_covers(self):

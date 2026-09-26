@@ -899,6 +899,10 @@ def identify_image(candidates, gather, confirm=None):
                 "kdbg_hits": len(hits),
                 "kern_base_matches": sum(1 for hit in hits if hit["kern_base_matches"]),
                 "validated": accepted is not None,
+                # The hits travel with the attempt, annotated with why each was rejected. A run
+                # where every tag was found and every one refused is the case those reasons exist
+                # for, and it is exactly the case that used to report no tags at all.
+                "hits": hits,
             }
         )
         if accepted:
@@ -1207,17 +1211,20 @@ def main(argv=None):
                     lambda va, size: gather_image(read_va, va, size),
                     confirm=confirm,
                 )
-                report["kdbg"] = {"candidates": attempts}
+                # One home for the tags, always populated: every candidate's hits ride in its own
+                # attempt record, so a run that found four tags and refused all four says so
+                # instead of reporting none.
+                report["kdbg"] = {
+                    "candidates": attempts,
+                    "chosen_va": chosen["candidate"]["va"] if chosen else None,
+                }
                 if chosen:
                     found = chosen["candidate"]
-                    report["kdbg"]["chosen_va"] = found["va"]
-                    report["kdbg"]["hits"] = chosen["hits"]
                     report["module_list"] = chosen["confirmation"]
                 else:
                     # Every matching mapping was examined and none produced a block that named
                     # itself *and* a module list that named it back.
                     found = matches[0]
-                    report["kdbg"]["hits"] = []
 
                 # The provider's own translator, at the forced VTL, cross-checked against the
                 # walk: two routes to the same GPA agreeing is what makes either believable.
