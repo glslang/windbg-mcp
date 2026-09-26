@@ -294,6 +294,27 @@ Two mechanisms, cheapest first:
    `ReadInterfaceWinHv` was going to exercise, which makes the untested status of that path the
    thing to resolve first rather than a loose end.
 
+   **Correction, 2026-09-26: HVCI was never the blocker, and disabling it bought nothing.** The
+   first diagnosis read "CodeIntegrity refused the driver" as "HVCI refused the driver". Those are
+   different claims and the event named which policy all along. With HVCI disabled on the debugger
+   host and the host rebooted, the probe produced the **identical** failure — `SdkEnumPartitions`
+   returned 0, the service was installed and failed to start, and CodeIntegrity 3077 cited the same
+   `{8f9cb695-5d48-48d6-a329-7202b44607e3}`, which event 3099 identifies as *"Microsoft Windows
+   Cross Certificates for Code Integrity Exceptions Policy"*. That policy is refreshed and
+   activated at boot independently of HVCI and refuses the revoked 2013 certificate regardless.
+   The concession was made on a misdiagnosis and should be reverted; the lesson is that an event
+   naming a policy ID is naming *which* gate, and reading past it to the gate one expected is how a
+   security posture gets weakened for nothing.
+
+   **What actually gates a driver here**, measured after that reboot: Secure Boot is **on**, so
+   `bcdedit /set testsigning on` is refused until it is turned off on the VM; the WDK is absent —
+   `Include\10.0.26100.0\km` and `Lib\10.0.26100.0\km` do not exist, only the user-mode SDK — while
+   VS Build Tools 18 with MSVC 14.50 and an x64 `cl.exe` **is** present, so the compiler is not the
+   gap. `vid.sys` does publish a device interface (`ROOT#VID#0000#{7896e901-…}` and `VidExo` are
+   present in `\GLOBAL??`), but a user-mode `CreateFileW` against them returns `FILE_NOT_FOUND`,
+   so reaching that interface is the reverse-engineering effort the backend table already priced
+   and not a shortcut.
+
    **So H2's cheap probe is spent, and the remaining options both require the same concession.**
    Disabling HVCI on the debugger host makes the oracle usable and becomes a recorded condition of
    every measurement taken afterwards. Writing our own driver — H2's stated fallback — needs either
