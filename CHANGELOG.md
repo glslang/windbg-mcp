@@ -50,7 +50,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   rather than a 16-byte prefix, poisons what it cannot read with `0xAA` so a missing page cannot
   read as zeros, and guards the descent three ways -- skip an entry whose target is the table it
   came from, a visited set per level, and budgets on reads and leaves that *report* a truncation --
-  because an unguarded walk of a self-mapping PML4 took this bench down twice. No Rust and no MCP
+  because an unguarded walk of a self-mapping PML4 took this bench down twice. **Review moved
+  three things and declined one remedy.** A large-page PDPTE or PDE carries the PAT flag in bit
+  12 rather than the low bit of its frame, so masking at 4 KiB granularity lands a page high --
+  latent here, since SK's VTL1 tables contain no large mapping on this build, and now held with
+  the reserved-bit check in one `decode_entry` rather than spread across the descent. The older
+  `.bin`/`.vsv` capture form is selected and loaded instead of being refused; the selection is
+  pinned by a test and the provider call is unexercised, this bench producing only `.vmrs`. And
+  a finding that the per-level visited set drops aliased prefixes *silently* was right about the
+  silence and wrong about the fix: replacing it with path-based cycle cutting was built and
+  measured, and on a recursively self-mapped tree -- 36 tables appearing at more than one level,
+  one PD referenced 1023 times -- it exhausted a 200,000-leaf budget over 509 distinct pages and
+  identified nothing, against 166 reads and a positive identification for the walk it replaced.
+  So the guard stays and the omission is now counted: **6,773 alias prefixes** reported beside
+  11,326 leaf mappings over 4,189 distinct pages. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

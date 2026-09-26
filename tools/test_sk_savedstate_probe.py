@@ -80,52 +80,149 @@ def four_level_tree(extra_pdpt_entries=None, pd_large=False):
     return FakeSource(pages)
 
 
+class EntryDecoding(unittest.TestCase):
+    def test_a_large_leaf_with_pat_set_keeps_its_own_alignment(self):
+        # Bit 12 is PAT on a large mapping, not the low bit of the frame. Masking at 4 KiB puts
+        # the base one page high, so the leaf starts inside the mapping and ends past it.
+        for level, size in ((1, 1 << 30), (2, 1 << 21)):
+            with self.subTest(size=size):
+                base = size * 3
+                decoded = probe.decode_entry(entry(base | 0x1000, large=True), level)
+                self.assertEqual(decoded.kind, probe.LEAF)
+                self.assertEqual(decoded.size, size)
+                self.assertEqual(decoded.address, base)
+                self.assertFalse(decoded.malformed)
+
+    def test_a_large_leaf_with_a_reserved_bit_set_is_malformed(self):
+        for level, size in ((1, 1 << 30), (2, 1 << 21)):
+            with self.subTest(size=size):
+                decoded = probe.decode_entry(entry((size * 3) | 0x2000, large=True), level)
+                self.assertTrue(decoded.malformed, "bit 13 is reserved on every large mapping")
+
+    def test_the_page_size_bit_has_no_meaning_in_a_pml4_entry(self):
+        self.assertTrue(probe.decode_entry(entry(0x2000, large=True), 0).malformed)
+        self.assertFalse(probe.decode_entry(entry(0x2000), 0).malformed)
+
+    def test_a_table_entry_keeps_four_kilobyte_granularity(self):
+        decoded = probe.decode_entry(entry(0x1234000), 2)
+        self.assertEqual(decoded.kind, probe.TABLE)
+        self.assertEqual(decoded.address, 0x1234000)
+        self.assertIsNone(decoded.size)
+
+    def test_an_absent_entry_decodes_to_nothing(self):
+        self.assertIsNone(probe.decode_entry(entry(0x2000, present=False), 2))
+
+
 class WalkGuards(unittest.TestCase):
     def test_a_self_mapping_root_is_not_descended_into(self):
         source = four_level_tree()
-        leaves, reads, truncated = probe.walk(source, ROOT)
-        self.assertIsNone(truncated)
-        # Exactly the two real leaves. Dropping the PFN-equality guard makes the descent take the
-        # self-map down three levels and collect that table's own entries as leaves too.
+        leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNone(stats["truncated"])
+        # Exactly the two real leaves. Dropping the path guard takes the self-map down three
+        # levels and collects that table's own entries as leaves too.
         self.assertEqual(len(leaves), 2)
-        self.assertEqual(reads, 4)
+        self.assertEqual(stats["table_reads"], 4)
+
+    def test_a_loop_back_to_an_ancestor_terminates_within_the_budgets(self):
+        # Four-level paging bounds the depth, so a loop cannot recurse forever; what it can do is
+        # multiply leaves, and that is what the budgets and the visited set are between us and.
+        source = four_level_tree(extra_pdpt_entries={1: entry(ROOT)})
+        leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNone(stats["truncated"])
+        self.assertLess(stats["table_reads"], 10)
+        self.assertLess(len(leaves), 10)
+
+    def test_an_alias_is_skipped_once_and_counted(self):
+        # Two parents legitimately point at one table, and this walk expands it under the first
+        # prefix only -- deliberately, because Secure Kernel's tables are recursively self-mapped
+        # and expanding every prefix is combinatorial. What it owes is to say so, not to be silent.
+        source = four_level_tree()
+        source.pages[ROOT] = table(
+            {SELF_MAP_INDEX: entry(ROOT), UPPER_INDEX: entry(0x2000), UPPER_INDEX + 1: entry(0x2000)}
+        )
+        leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNone(stats["truncated"])
+        self.assertEqual(len(leaves), 2)
+        self.assertEqual(stats["alias_prefixes_skipped"], 1)
+
+    def test_the_visited_set_is_per_level_so_a_shared_page_serves_at_each(self):
+        # One physical page used as both a PD and a PT is ordinary in a self-mapped tree; a single
+        # global visited set would decode it at the first level it appeared on and never again.
+        pages = {
+            ROOT: table({UPPER_INDEX: entry(0x2000)}),
+            0x2000: table({0: entry(0x3000), 1: entry(0x4000)}),
+            0x3000: table({5: entry(0x5000)}),  # reached at level 2 here, and at level 3 below
+            0x4000: table({0: entry(0x3000)}),
+            0x5000: table({7: entry(0x6000)}),
+            0x6000: b"\x00" * PAGE,
+        }
+        leaves, stats = probe.walk(FakeSource(pages), ROOT)
+        self.assertIsNone(stats["truncated"])
+        self.assertEqual(stats["tables_decoded"], 6, "0x3000 is decoded as a PD and again as a PT")
+        self.assertEqual(stats["alias_prefixes_skipped"], 0)
+        # 0x6000 comes from the level-2 reading of 0x3000; 0x5000 is a leaf only because 0x3000 is
+        # also decoded at level 3, which a single global visited set would never reach.
+        self.assertEqual(sorted(gpa for _va, gpa, _size in leaves), [0x5000, 0x6000])
 
     def test_leaf_virtual_addresses_are_canonical_and_unsigned(self):
         source = four_level_tree()
-        leaves, _, _ = probe.walk(source, ROOT)
+        leaves, _stats = probe.walk(source, ROOT)
         for va, _gpa, _size in leaves:
             self.assertGreater(va, 0, "a sign-extended VA compares false against a guest pointer")
             self.assertEqual(va >> 48, 0xFFFF)
 
     def test_a_large_page_leaf_reports_its_own_size(self):
         source = four_level_tree(pd_large=True)
-        leaves, _, truncated = probe.walk(source, ROOT)
-        self.assertIsNone(truncated)
+        leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNone(stats["truncated"])
         self.assertEqual([size for _va, _gpa, size in leaves], [1 << 21])
+
+    def test_a_malformed_entry_is_counted_rather_than_walked(self):
+        source = four_level_tree(extra_pdpt_entries={1: entry((1 << 30) | 0x2000, large=True)})
+        leaves, stats = probe.walk(source, ROOT)
+        self.assertEqual(stats["malformed_entries"], 1)
+        self.assertEqual(len(leaves), 2, "the reserved-bit mapping is not invented as a leaf")
 
     def test_exhausting_the_read_budget_is_reported_not_absorbed(self):
         source = four_level_tree()
         with unittest.mock.patch.object(probe, "MAX_TABLE_READS", 2):
-            leaves, reads, truncated = probe.walk(source, ROOT)
-        self.assertIsNotNone(truncated)
-        self.assertIn("table read budget", truncated)
-        self.assertLessEqual(reads, 2)
+            leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNotNone(stats["truncated"])
+        self.assertIn("table read budget", stats["truncated"])
+        self.assertLessEqual(stats["table_reads"], 2)
         self.assertEqual(leaves, [])
 
     def test_exhausting_the_leaf_budget_is_reported_not_absorbed(self):
         source = four_level_tree()
         with unittest.mock.patch.object(probe, "MAX_LEAVES", 1):
-            leaves, _reads, truncated = probe.walk(source, ROOT)
-        self.assertIsNotNone(truncated)
-        self.assertIn("leaf budget", truncated)
+            leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNotNone(stats["truncated"])
+        self.assertIn("leaf budget", stats["truncated"])
         self.assertEqual(len(leaves), 1)
 
     def test_an_unreadable_table_is_skipped_rather_than_ending_the_walk(self):
         source = four_level_tree(extra_pdpt_entries={1: entry(0x7000)})
         source.unreadable.add(0x7000)
-        leaves, _reads, truncated = probe.walk(source, ROOT)
-        self.assertIsNone(truncated)
+        leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNone(stats["truncated"])
         self.assertEqual(len(leaves), 2)
+
+
+class CaptureSelection(unittest.TestCase):
+    def test_a_vmrs_is_chosen_when_one_is_located(self):
+        located = {"bin": "", "vsv": "", "vmrs": r"D:\s\a.vmrs"}
+        self.assertEqual(probe.choose_capture(located), ("vmrs", (r"D:\s\a.vmrs",)))
+
+    def test_the_legacy_pair_is_chosen_when_there_is_no_vmrs(self):
+        # `LoadSavedStateFiles` exists for this form, and requiring a .vmrs made it unreachable.
+        located = {"bin": r"D:\s\a.bin", "vsv": r"D:\s\a.vsv", "vmrs": ""}
+        self.assertEqual(
+            probe.choose_capture(located), ("bin+vsv", (r"D:\s\a.bin", r"D:\s\a.vsv"))
+        )
+
+    def test_a_half_located_pair_is_not_chosen(self):
+        self.assertEqual(probe.choose_capture({"bin": r"D:\s\a.bin", "vsv": "", "vmrs": ""}), (None, ()))
+        self.assertEqual(probe.choose_capture({"bin": "", "vsv": "", "vmrs": ""}), (None, ()))
 
 
 class RootDescription(unittest.TestCase):

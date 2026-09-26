@@ -33,12 +33,15 @@ import os
 import re
 import struct
 import sys
+from collections import namedtuple
 from ctypes import wintypes
 from datetime import datetime, timezone
 from pathlib import Path
 
 PAGE = 0x1000
 PFN_MASK = 0x000FFFFFFFFFF000
+ENTRY_PRESENT = 1
+ENTRY_LARGE = 0x80
 
 DEFAULT_KIT = Path(r"C:\Program Files (x86)\Windows Kits\10")
 
@@ -400,59 +403,123 @@ def describe_root(state, root_gpa):
     }
 
 
-def walk(state, root_gpa):
-    """A guarded four-level descent, returning leaf (va, gpa, size) runs.
+DecodedEntry = namedtuple("DecodedEntry", "kind address size malformed")
+LEAF = "leaf"
+TABLE = "table"
 
-    Three guards, all load-bearing: an entry whose target is the table it came from is skipped,
-    each level keeps a visited set, and both reads and leaves are budgeted so that exhausting
-    one is reported rather than silently truncating the answer.
+
+def decode_entry(entry, level):
+    """One paging-structure entry: where it points, whether that is a leaf, and whether it is legal.
+
+    **The address field is not `entry & PFN_MASK` for every entry**, and holding that in one place
+    is the point of this function. In a large-page PDPTE or PDE, bit 12 is the **PAT** flag rather
+    than the low bit of the frame, and the frame is aligned to the mapping's own size -- so masking
+    at 4 KiB granularity lands one page high on any large mapping with PAT set, and a scan of that
+    leaf then starts a page inside the mapping and runs a page past its end.
+
+    `malformed` means the processor would fault on this entry rather than follow it: reserved bits
+    set between bit 13 and the mapping's alignment on a large leaf, or the page-size bit set in a
+    PML4E where it has no meaning. The walk skips those and **counts** them.
+    """
+    if not entry & ENTRY_PRESENT:
+        return None
+    if level == 0:
+        return DecodedEntry(TABLE, entry & PFN_MASK, None, bool(entry & ENTRY_LARGE))
+    if level == 3:
+        return DecodedEntry(LEAF, entry & PFN_MASK, PAGE, False)
+    if entry & ENTRY_LARGE:
+        size = 1 << (39 - 9 * level)
+        frame = entry & PFN_MASK
+        reserved = frame & (size - 1) & ~0x1FFF  # bit 12 is PAT and is legal; 13 and up are not
+        return DecodedEntry(LEAF, frame & ~(size - 1), size, reserved != 0)
+    return DecodedEntry(TABLE, entry & PFN_MASK, None, False)
+
+
+def walk(state, root_gpa):
+    """A guarded four-level descent, returning leaf (va, gpa, size) runs and how the walk went.
+
+    **Each table is expanded once per level, and the prefixes that would have re-expanded it are
+    counted rather than passed over in silence.** Three guards: an entry pointing at the table it
+    came from is skipped, each level keeps a visited set, and reads and leaves are budgeted so that
+    exhausting one sets `truncated` rather than quietly returning a short answer.
+
+    A reviewer asked for the visited set to be replaced by path-based cycle cutting, on the correct
+    ground that two parents may legitimately point at one table and a visited set drops the second
+    prefix. **That was built and measured, and it does not work here**: Secure Kernel's VTL1 tables
+    are recursively self-mapped, so one page is a PML4, a PDPT, a PD *and* a PT depending on the
+    route taken to it -- 36 tables appear at more than one level on the measured build, one PD is
+    referenced 1023 times and one PT 2300 times. Walking every prefix is therefore 512-ish paths
+    per level: the path-based walk exhausted a 200,000-leaf budget over **509 distinct pages** and
+    identified nothing, where this one costs 166 reads and finds the image. Complete VA enumeration
+    of a self-mapped address space is combinatorial by construction and is not what this walk is
+    for; what it owes instead is to **say how much it left out**, which `alias_prefixes_skipped`
+    does. The identification that rests on it is cross-checked twice over -- against the provider's
+    own translator, and against `KernBase` inside the data block.
     """
     leaves = []
+    stats = {
+        "table_reads": 0,
+        "tables_decoded": 0,
+        "alias_prefixes_skipped": 0,
+        "malformed_entries": 0,
+        "truncated": None,
+    }
     visited = [set(), set(), set(), set()]
-    truncated = None
-    reads = 0
+    cache = {}
 
     def canonical(va):
         # Kept as an unsigned 64-bit value. Sign-extending into a negative Python int prints
         # correctly and then fails every comparison against a pointer read out of the guest.
         return va | 0xFFFF000000000000 if va & (1 << 47) else va
 
+    def table_entries(table_gpa):
+        if table_gpa in cache:
+            return cache[table_gpa]
+        if stats["table_reads"] >= MAX_TABLE_READS:
+            stats["truncated"] = f"table read budget {MAX_TABLE_READS} exhausted"
+            return None
+        page, reason = state.read(table_gpa, PAGE)
+        stats["table_reads"] += 1
+        cache[table_gpa] = None if reason else struct.unpack("<512Q", page)
+        return cache[table_gpa]
+
     def descend(table_gpa, level, va):
-        nonlocal truncated, reads
-        if truncated:
+        if stats["truncated"]:
             return
         if table_gpa in visited[level]:
+            stats["alias_prefixes_skipped"] += 1
             return
         visited[level].add(table_gpa)
-        if reads >= MAX_TABLE_READS:
-            truncated = f"table read budget {MAX_TABLE_READS} exhausted"
+        entries = table_entries(table_gpa)
+        if entries is None:
             return
-        page, reason = state.read(table_gpa, PAGE)
-        reads += 1
-        if reason:
-            return
+        stats["tables_decoded"] += 1
         shift = 39 - 9 * level
-        for index, entry in enumerate(struct.unpack("<512Q", page)):
-            if not entry & 1:
+        for index, entry in enumerate(entries):
+            decoded = decode_entry(entry, level)
+            if decoded is None:
                 continue
-            target = entry & PFN_MASK
-            if target == (table_gpa & PFN_MASK):  # the self-map, and any other cycle of one
+            if decoded.malformed:
+                stats["malformed_entries"] += 1
                 continue
             child_va = va | (index << shift)
-            large = bool(entry & 0x80) and level in (1, 2)
-            if level == 3 or large:
-                size = PAGE if level == 3 else (1 << shift)
+            if decoded.kind == LEAF:
                 if len(leaves) >= MAX_LEAVES:
-                    truncated = f"leaf budget {MAX_LEAVES} exhausted"
-                    return
-                leaves.append((canonical(child_va), target, size))
+                    stats["truncated"] = f"leaf budget {MAX_LEAVES} exhausted"
+                    break
+                leaves.append((canonical(child_va), decoded.address, decoded.size))
                 continue
-            descend(target, level + 1, child_va)
-            if truncated:
-                return
+            if decoded.address == (table_gpa & PFN_MASK):
+                # The self-map, and any other cycle of one. The per-level visited set would
+                # otherwise let it through once at each of the three levels beneath this one. A
+                # *leaf* landing on this page is ordinary data and is kept, above.
+                continue
+            descend(decoded.address, level + 1, child_va)
+            if stats["truncated"]:
+                break
 
     descend(root_gpa & PFN_MASK, 0, 0)
-    return leaves, reads, truncated
+    return leaves, stats
 
 
 def pe_identity(header_bytes):
@@ -622,6 +689,24 @@ def find_kdbg(image, base_va):
     return hits
 
 
+def choose_capture(located):
+    """Pick which of the located files to load, and name the form.
+
+    `LocateSavedStateFiles` answers with **either** a `.vmrs` **or** a `.bin`/`.vsv` pair, the
+    other fields coming back as empty strings -- so the caller has to choose, and requiring a
+    `.vmrs` makes the older form unreachable even though the provider loads it.
+
+    Returning the form beside the paths is what makes the choice testable without a capture of
+    each kind, which matters because **this bench has only ever produced the first**: the
+    `.bin`/`.vsv` branch below is selected correctly and its provider call is unexercised here.
+    """
+    if located.get("vmrs"):
+        return "vmrs", (located["vmrs"],)
+    if located.get("bin") and located.get("vsv"):
+        return "bin+vsv", (located["bin"], located["vsv"])
+    return None, ()
+
+
 def walk_module_list(reader, head_va, limit=32):
     """Walk the `LIST_ENTRY` the debugger data block points at, as `KLDR_DATA_TABLE_ENTRY`.
 
@@ -723,31 +808,42 @@ def main(argv=None):
     if args.vm:
         located = state.locate(args.vm, args.snapshot)
         report["vm"] = {"name": args.vm, "snapshot": args.snapshot, "located": located}
-        vmrs = located["vmrs"]
-        if not vmrs:
+        form, paths = choose_capture(located)
+        if form is None:
             raise ProbeError(
-                f"no .vmrs for {args.vm!r}"
+                f"no saved state for {args.vm!r}"
                 + (f" snapshot {args.snapshot!r}" if args.snapshot else "")
-                + f" (bin={located['bin']!r} vsv={located['vsv']!r})"
+                + f" (bin={located['bin']!r} vsv={located['vsv']!r} vmrs={located['vmrs']!r})"
             )
     else:
-        vmrs = args.vmrs
-        report["vm"] = {"name": None, "snapshot": None, "located": {"vmrs": vmrs}}
+        form, paths = "vmrs", (args.vmrs,)
+        report["vm"] = {"name": None, "snapshot": None, "located": {"vmrs": args.vmrs}}
 
-    capture = Path(vmrs)
+    files = [Path(path) for path in paths]
     report["capture"] = {
-        "path": str(capture),
-        "size": capture.stat().st_size,
-        "mtime_utc": datetime.fromtimestamp(
-            capture.stat().st_mtime, timezone.utc
-        ).isoformat(timespec="seconds"),
+        "form": form,
+        "files": [
+            {
+                "path": str(path),
+                "size": path.stat().st_size,
+                "mtime_utc": datetime.fromtimestamp(
+                    path.stat().st_mtime, timezone.utc
+                ).isoformat(timespec="seconds"),
+            }
+            for path in files
+        ],
     }
 
     if args.apply_replay_log:
-        state.apply_replay_log(capture)
+        if form != "vmrs":
+            raise ProbeError("a replay log belongs to a .vmrs; this capture is a .bin/.vsv pair")
+        state.apply_replay_log(files[0])
         report["capture"]["replay_log_applied"] = True
 
-    state.load(vmrs=capture)
+    if form == "vmrs":
+        state.load(vmrs=files[0])
+    else:
+        state.load(bin_file=files[0], vsv_file=files[1])
     try:
         vp = args.vp
         page_size, chunks = state.memory_chunks()
@@ -803,14 +899,14 @@ def main(argv=None):
         if vtl1.get("enabled") and vtl1.get("cr3"):
             root_gpa = vtl1["cr3"] & PFN_MASK
             vtl1["root"] = describe_root(state, root_gpa)
-            leaves, table_reads, truncated = walk(state, root_gpa)
+            leaves, walk_stats = walk(state, root_gpa)
             report["walk"] = {
                 "root_gpa": root_gpa,
                 "root_from": "GetRegisterValue at forced VTL1, this capture",
-                "table_reads": table_reads,
                 "leaf_pages": sum(leaf[2] // PAGE for leaf in leaves),
                 "leaf_entries": len(leaves),
-                "truncated": truncated,
+                "distinct_leaf_gpas": len({leaf[1] for leaf in leaves}),
+                **walk_stats,
             }
             images, page_scanned, capped = scan_leaves_for_images(state, leaves, disk)
             report["walk"]["pe_images"] = images
