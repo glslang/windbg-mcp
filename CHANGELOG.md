@@ -168,7 +168,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   loop and the GPA-adjacency check, which was already there, is the only thing deciding
   join-or-flush. Measured on this bench the case does not arise -- the two chunks are
   `0x0..0xF8000000` and `0x100000000..0x108000000`, the PCI hole between them -- so no reported
-  number moves; the structure no longer depends on that. No Rust and no MCP
+  number moves; the structure no longer depends on that. **A twelfth round found the same
+  counter one step short**: `boundary_incomplete` counted a complete four-byte tag whose fields
+  were truncated, but a page ending in `K`, `KD` or `KDB` with no successor to join cannot be
+  recognised at all, so nothing-found read as nothing-there at exactly the boundaries the
+  counter exists for. A trailing prefix at an unpaired boundary is now counted, and the
+  measured captures still report **0** of them with the control's zero tags intact. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
