@@ -2034,16 +2034,14 @@ overstated the first two into blockers and got the third wrong.**
   the stronger claim in terms: *"They do not establish that this Windows build lacks Secure Kernel
   debugging support."* And `kdnet.exe` on this bench reports network debugging supported for the VM.
   So stepping is **an item to settle** (S5), not a door to close.
-- **Writes are an unknown, not a capability** — and a previous draft of this item said otherwise,
-  inferring one from the existence of a wrapper. What is *measured*: `HvCallWriteGpa` (`0x0054`) is
-  confirmed from `winhvr.sys`'s own wrapper, and the direct route exposes `SdkWritePhysicalMemory`
-  with its own `WriteMethod` selector. **Neither has been exercised — on VTL1 or on VTL0.** The ABI
-  also argues against the optimistic reading: `HV_ACCESS_GPA_RESULT_CODE` defines
-  **`HvAccessGpaWriteIntercept` (3)** beside the `ReadIntercept` (2) that H4 measured, so the
-  hypervisor has a *named* answer for an intercepted write and a symmetric refusal is the thing to
-  expect rather than a surprise. `exdi-stub-plan.md` already limits the GPA hypercalls to VTL0 for
-  the read, and nothing has been done to show the write differs. Read-only is therefore not the
-  right description of the *route*, but "VTL1 is patchable" is not established either.
+- **Writes: measured by S4 on 2026-09-26, and the answer differs per route.** An earlier draft of
+  this item asserted VTL1 was patchable from the existence of a wrapper; the ABI argued otherwise
+  (`HV_ACCESS_GPA_RESULT_CODE` defines `HvAccessGpaWriteIntercept` (3) beside the `ReadIntercept`
+  (2) H4 measured), and the ABI was right. **`HvCallWriteGpa` writes VTL0 and is refused on VTL1
+  with `WriteIntercept`** — symmetric with the read, and with `HV_STATUS` reading `SUCCESS` on the
+  refusal, so a refused write looks like one that landed. **The direct route accepts a VTL1 write**
+  while refusing an unmapped one, so its return value discriminates; whether the bytes land is
+  unproven and needs a differing-bytes write, which S4 excluded by design.
 
 ### S0 — the gate that decides how much setup a user needs. Do it first
 
@@ -2115,7 +2113,17 @@ surface is a real design question, and **S0 and S5 both move it**: a live driver
 not a fixed snapshot, and an S5 pass would bring execution state back into a surface shaped on the
 assumption that there is none.
 
-### S4 — settle the write routes, with a test that changes nothing
+### S4 — settle the write routes — **RUN 2026-09-26, mostly settled**
+
+**Result in the feasibility record.** The hypercall refuses VTL1 writes symmetrically with the read
+(`AccessResult = 3 WriteIntercept`), writes VTL0 fine, and honours the address field — so
+`HvCallWriteGpa` cannot patch VTL1 and a software breakpoint is not available through hypercalls at
+all. The direct route **accepts** a VTL1 write while **refusing** an unmapped one, so its return
+value discriminates; what remains open is whether the bytes land, which only a **differing-bytes**
+write can show and which this gate excluded by design. That residue is a decision about risking the
+guest, not a measurement. The original specification follows.
+
+#### S4 as specified — settle the write routes, with a test that changes nothing
 
 Run this before anything in the repo tells an implementer that patching is available, and note it
 is **not** a prerequisite for S0–S3, which need no writes at all. The test is a round-trip that is

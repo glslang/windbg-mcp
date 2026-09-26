@@ -904,6 +904,67 @@ the hypercall-versus-direct-route question settled separately — and the two gu
 than one respect besides VBS, so this is a control against a specific confusion rather than a
 general one.
 
+### S4 result, 2026-09-26: the hypercall refuses VTL1 writes symmetrically; the direct route accepts them
+
+**The hypercall half is settled and the refusal is exactly symmetric with the read.** The direct
+half is strongly evidenced and deliberately stops short of proof, for a reason recorded below.
+
+The input layout came from `winhvr.sys!WinHvWriteGpa`'s disassembly on this build rather than from
+the header that agrees with it — `PartitionId` +0x00, `VpIndex` +0x08, `ByteCount` +0x0C,
+`BaseGpa` +0x10, `ControlFlags` +0x18, **`Data[16]` at +0x20**, call code `0x54`, `ByteCount`
+capped at 16 — because a wrong layout here writes the right bytes to the wrong address.
+
+**The method was a round-trip that changes nothing: read 16 bytes, write the *identical* bytes
+back, read again.** Every write issued in this gate wrote bytes that were already there.
+
+| probe | result |
+|---|---|
+| `ByteCount = 0` | `INVALID_PARAMETER` — nothing written whatever the layout |
+| unmapped GPA, hypercall **write** | `SUCCESS` / `AccessResult = 1 Unmapped` — **the address field is honoured on the write path**, and nothing was written |
+| VTL0 page, hypercall write | `SUCCESS` / `AccessResult = 0 Success` — page unchanged |
+| VTL1 page, hypercall **read** | `SUCCESS` / `AccessResult = 2 ReadIntercept` |
+| VTL1 page, hypercall **write** | `SUCCESS` / **`AccessResult = 3 WriteIntercept`** — page unchanged |
+
+**So `HvCallWriteGpa` is refused on VTL1 exactly as `HvCallReadGpa` is**, with the result code the
+ABI defines for it. The prediction made from `HV_ACCESS_GPA_RESULT_CODE` — that
+`HvAccessGpaWriteIntercept` existing meant symmetric refusal was the thing to expect — held. And
+`HV_STATUS` is `SUCCESS` on the refused write too, so the trap that makes a read look like zeros
+makes a *write* look like it landed.
+
+**The VTL1 target was chosen to be the most stable memory in the guest**: `securekernel.exe`'s PE
+header page at GPA `0x00CD0000`, never written after load, verified stable across two reads, and
+independently known since it must match the on-disk image — it read `4d5a9000…`, `MZ`. It is also
+read through the **direct** route, because the hypercall cannot read it, making that a cross-route
+round trip.
+
+**The direct route accepts a VTL1 write, and the return value was checked before being believed.**
+`SdkWritePhysicalMemory` returned `True` on that page — but writing identical bytes makes
+"unchanged afterwards" the expected outcome of both a real write and a silent no-op, so the safe
+round trip is also the one that cannot tell them apart. That is the zeroed-buffer defect wearing
+another hat, so the return value got its own control:
+
+| target | `SdkWritePhysicalMemory` |
+|---|---|
+| unmapped `0xFEC00000` | **False** |
+| unmapped `0xFFFFF000` | **False** |
+| VTL0 `0x00001000` | True |
+| VTL1 `0x00CD0000` | **True** |
+
+It refuses unmapped memory and accepts VTL1, so `True` discriminates rather than rubber-stamping.
+
+**What is established, and what is not.** Established: the direct route *accepts* a write to a
+VTL1-protected page that the hypercall refuses, and refuses one to memory that cannot be written.
+**Not** established: that the bytes land. Only a write of **differing** bytes can show that, and
+that is the destructive test this gate excluded by design — on a Secure Kernel image page it is
+also precisely what SKPG exists to notice. The gap is recorded rather than closed, because closing
+it is a decision about risking the guest rather than a measurement anyone can take for free.
+
+**For the route, the practical consequence does not depend on that gap.** Reading VTL1 needs the
+direct route, writing VTL1 is refused outright by the hypercall, and a software breakpoint is a
+memory patch — so `int 3` in VTL1 is not available through hypercalls at all, and through the
+direct route it is unproven. Breakpoints still need S5's transport question answered regardless of
+how the remaining gap closes.
+
 ### H4 pass criteria, as written before the run
 
 **Kept for comparison, and — unlike an earlier draft of this paragraph said — subsequently met.**
@@ -1030,15 +1091,14 @@ worth stating here, because both were overstatements in the direction of closing
   an allocated port that was configured and did not activate, with the failure never named — while
   explicitly declining the stronger claim, *"they do not establish that this Windows build lacks
   Secure Kernel debugging support"*. Item 103 carries that as S5.
-- **Whether VTL1 can be *written* is a separate unknown, and this plan measured neither route.**
-  `HvCallWriteGpa` (`0x0054`) exists and the direct route exposes a write path, but neither was
-  exercised, here or anywhere in this document. The ABI argues against assuming symmetry with the
-  read: `HV_ACCESS_GPA_RESULT_CODE` defines **`HvAccessGpaWriteIntercept` (3)** beside the
-  `ReadIntercept` (2) that H4 measured, so the hypervisor has a named answer for an intercepted
-  write. Item 103 carries the test as S4 — a round-trip that writes the bytes it just read, so a
-  refusal costs nothing and a success changes nothing. **A software breakpoint is a memory patch,
-  so breakpoints need S4 *and* S5**, and neither answer alone is a licence to plant an `int 3` in a
-  running Secure Kernel.
+- **Whether VTL1 can be *written* was measured as S4 on 2026-09-26, and the answer is per route.**
+  `HvCallWriteGpa` (`0x0054`) writes VTL0 from the parent and is **refused on VTL1 with
+  `AccessResult = 3 WriteIntercept`** — symmetric with the read, and predicted from the ABI before
+  it was run. The direct route **accepts** a VTL1 write while refusing an unmapped one; whether the
+  bytes land is unproven, since only a differing-bytes write shows that and S4 excluded it by
+  design. So **a software breakpoint is unavailable through hypercalls outright**, and through the
+  direct route it is unproven — and breakpoints need S5's transport answered in any case, since
+  planting an `int 3` nobody can catch bugchecks the guest. The full result is under H4 above.
 
 ## Explicitly out of scope
 
