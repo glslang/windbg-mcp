@@ -181,7 +181,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   512, a null buffer -- rather than letting them reach the same empty string, and the list
   carries `names_unreadable` beside its entries. `complete` deliberately stays true when only a
   name is missing: every link was followed, and a name is an attribute rather than a link. The
-  measured list still names all six modules with the count at 0. No Rust and no MCP
+  measured list still names all six modules with the count at 0. **Four findings were then
+  found to have been missed rather than answered**: the review posts its comments over a minute
+  or two and the watcher used here read the head on the *first* one to appear, so a second or
+  third arriving later was never read — twenty-five comments against twenty-one worked. Of the
+  four, one was already fixed and one partly so; the two that were live are now closed. The
+  walk is gated on the **paging shape** rather than only on having a root, since its four
+  levels, nine-bit indices and 48-bit canonical form would traverse any other mode with the
+  wrong strides and invent or lose leaves instead of erroring — a non-`Long` mode or `CR4.LA57`
+  now refuses by name, while a paging mode that could not be *read* does not block it, unknown
+  not being wrong. And the walk answers `complete` in the module list's vocabulary, because
+  `truncated` named a budget and a reader checking that one flag would have read a walk with an
+  omitted subtree as whole. The third finding claimed `GuestVirtualAddressToPhysicalAddress`
+  can succeed while reporting an unmapped span, which would have page 0's bytes read as a
+  mapping: **measured false on this provider** — an unmapped VA fails outright with
+  `0xC0370505` and a mapped one reports a span of zero, over five cases — and the check is in
+  anyway, pinned by a fake provider, because the alternative is depending on that. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 

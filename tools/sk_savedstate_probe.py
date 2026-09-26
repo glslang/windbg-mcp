@@ -396,6 +396,15 @@ class SavedState:
         if hr < 0:
             self.failed_translations += 1
             return None, f"hresult 0x{hr & 0xFFFFFFFF:08X}"
+        if unmapped.value:
+            # Measured on this provider, an unmapped VA fails outright with 0xC0370505
+            # (VM_SAVED_STATE_DUMP_E_VA_NOT_MAPPED) and a mapped one reports an unmapped span of
+            # zero -- so this branch is unreachable here. It is kept because the alternative is
+            # depending on that, and the failure it would let through is the worst kind: a
+            # zero-initialised GPA read as a valid mapping, feeding page 0's bytes into the
+            # identification.
+            self.failed_translations += 1
+            return None, f"unmapped for 0x{unmapped.value:X} bytes"
         return gpa.value, None
 
     def memory_chunks(self):
@@ -576,6 +585,20 @@ def walk(state, root_gpa):
                 break
 
     descend(root_gpa & PFN_MASK, 0, 0)
+    # `truncated` names a budget; an unreadable table is a different way to be short of the tree,
+    # and a reader checking one flag should not have to know about the other. Same vocabulary as
+    # the module list: `complete`, with a reason when it is false.
+    if stats["truncated"]:
+        stats["complete"] = False
+        stats["incomplete_reason"] = stats["truncated"]
+    elif stats["unreadable_tables"]:
+        stats["complete"] = False
+        stats["incomplete_reason"] = (
+            f"{stats['unreadable_tables']} page table(s) could not be read, so their subtrees "
+            "are not in this answer"
+        )
+    else:
+        stats["complete"] = True
     return leaves, stats
 
 
@@ -928,6 +951,14 @@ def walkable(vtl1):
         return False, "the provider reports VTL1 not enabled on this VP"
     if not vtl1.get("cr3"):
         return False, "no VTL1 CR3 came back from the capture"
+    mode = vtl1.get("paging_mode")
+    if mode is not None and mode != "Long":
+        # `walk` hard-codes four levels, 9-bit indices and a 48-bit canonical form. Any other
+        # shape would be traversed with the wrong strides and produce missing or invented leaves
+        # rather than an error, which is worse than refusing.
+        return False, f"paging mode {mode} is not the four-level long mode this walk decodes"
+    if vtl1.get("cr4") is not None and vtl1["cr4"] & (1 << 12):
+        return False, "CR4.LA57 is set: five-level paging is not decoded by this walk"
     return True, None
 
 

@@ -225,10 +225,20 @@ class FakeVp:
     def paging_mode(self, _vp):
         return "Long"
 
+    # Values measured off the bench rather than placeholders: a made-up CR4 of 0x1234 has bit 12
+    # set, which is CR4.LA57, and silently tripped the five-level refusal the moment it existed.
+    REGISTERS = {
+        "X64_RegisterCr0": 0x80010033,
+        "X64_RegisterCr3": 0x1201000,
+        "X64_RegisterCr4": 0x1506B8,
+        "X64_RegisterEfer": 0xD01,
+        "X64_RegisterRip": 0xFFFFF8021B480035,
+    }
+
     def register(self, _vp, name):
         if name == self.failing_register:
             raise probe.ProbeError(f"GetRegisterValue({name}) failed: 0x80004001")
-        return {"X64_RegisterCr3": 0x1201000}.get(name, 0x1234)
+        return self.REGISTERS[name]
 
 
 class VtlSwitch(unittest.TestCase):
@@ -500,6 +510,58 @@ class FailedReadsAreCounted(unittest.TestCase):
         _leaves, stats = probe.walk(source, ROOT)
         self.assertEqual(stats["unreadable_tables"], 1)
 
+    def test_an_unreadable_table_makes_the_walk_incomplete_not_merely_counted(self):
+        # `truncated` names a budget, and a reader checking that one flag would read a walk with
+        # an omitted subtree as whole. Both ways of being short of the tree answer `complete`.
+        source = four_level_tree(extra_pdpt_entries={1: entry(0x7000)})
+        source.unreadable.add(0x7000)
+        _leaves, stats = probe.walk(source, ROOT)
+        self.assertIsNone(stats["truncated"], "no budget was hit")
+        self.assertFalse(stats["complete"])
+        self.assertIn("could not be read", stats["incomplete_reason"])
+
+    def test_a_clean_walk_is_complete(self):
+        _leaves, stats = probe.walk(four_level_tree(), ROOT)
+        self.assertTrue(stats["complete"])
+        self.assertNotIn("incomplete_reason", stats)
+
+    def test_an_exhausted_budget_also_answers_complete(self):
+        with unittest.mock.patch.object(probe, "MAX_TABLE_READS", 2):
+            _leaves, stats = probe.walk(four_level_tree(), ROOT)
+        self.assertFalse(stats["complete"])
+        self.assertIn("budget", stats["incomplete_reason"])
+
+    def test_a_translation_reporting_an_unmapped_span_is_not_a_mapping(self):
+        # Measured on this provider an unmapped VA fails outright (0xC0370505), so this branch is
+        # unreachable against the real thing -- which is why it is pinned here instead. Without
+        # it, a success with a zero-initialised GPA would read page 0's bytes into the
+        # identification, and nothing downstream could tell.
+        class FakeTranslateLib:
+            def __init__(self, hr, gpa, unmapped):
+                self.hr, self.gpa, self.unmapped = hr, gpa, unmapped
+
+            def GuestVirtualAddressToPhysicalAddress(self, _h, _vp, _va, gpa_ref, unmapped_ref):
+                gpa_ref._obj.value = self.gpa
+                unmapped_ref._obj.value = self.unmapped
+                return self.hr
+
+        def state(lib):
+            st = probe.SavedState.__new__(probe.SavedState)
+            st.lib = lib
+            st.handle = None
+            st.failed_translations = 0
+            return st
+
+        good = state(FakeTranslateLib(0, 0xCD0000, 0))
+        self.assertEqual(good.va_to_gpa(0, BASE_VA), (0xCD0000, None))
+        self.assertEqual(good.failed_translations, 0)
+
+        lying = state(FakeTranslateLib(0, 0, 0x8000000000))
+        gpa, reason = lying.va_to_gpa(0, BASE_VA)
+        self.assertIsNone(gpa, "GPA 0 is real memory, so returning it would be believed")
+        self.assertIn("unmapped", reason)
+        self.assertEqual(lying.failed_translations, 1)
+
     def test_the_source_counts_failures_no_consumer_can_hide(self):
         class FakeReadLib:
             def __init__(self, results):
@@ -548,6 +610,34 @@ class WalkableGate(unittest.TestCase):
         proceed, why = probe.walkable({"forced": True, "enabled": True})
         self.assertFalse(proceed)
         self.assertIn("no VTL1 CR3", why)
+
+    def test_a_paging_mode_the_walker_cannot_decode_blocks_it(self):
+        # `walk` hard-codes four levels, 9-bit indices and a 48-bit canonical form. Another shape
+        # would be traversed with the wrong strides and yield missing or invented leaves, which
+        # is worse than refusing -- the walk cannot tell it is reading the wrong tables.
+        base = {"forced": True, "enabled": True, "cr3": 0x1201000, "cr4": 0x1506B8}
+        proceed, why = probe.walkable({**base, "paging_mode": "Pae"})
+        self.assertFalse(proceed)
+        self.assertIn("Pae", why)
+        self.assertTrue(probe.walkable({**base, "paging_mode": "Long"})[0])
+
+    def test_five_level_paging_blocks_the_walk(self):
+        proceed, why = probe.walkable(
+            {"forced": True, "enabled": True, "cr3": 0x1201000, "paging_mode": "Long",
+             "cr4": 0x1506B8 | (1 << 12)}
+        )
+        self.assertFalse(proceed)
+        self.assertIn("LA57", why)
+
+    def test_an_unreadable_paging_mode_does_not_block_the_walk(self):
+        # Unknown is not "wrong", the same way an unreadable `enabled` is not False: the walk's
+        # own output is the evidence, and the report says the question went unanswered.
+        proceed, why = probe.walkable(
+            {"forced": True, "enabled": True, "cr3": 0x1201000, "cr4": 0x1506B8,
+             "errors": {"paging_mode": "0x80004001"}}
+        )
+        self.assertTrue(proceed)
+        self.assertIsNone(why)
 
 
 class FakeChunkLib:
