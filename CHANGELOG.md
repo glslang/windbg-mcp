@@ -118,7 +118,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   were recorded, so the provenance described the input rather than the analysed bytes. That last
   one is also the round's own lesson about tests: the first attempt pinned `describe_file`, which
   was never where the defect was, and backing the re-stat out of `main` left it green -- so the
-  ordering moved into `capture_provenance`, a function a test can drive. No Rust and no MCP
+  ordering moved into `capture_provenance`, a function a test can drive. **A sixth round found
+  one more, caused by the fifth**: with confirmation now able to reject every hit, the branch
+  that handles "no candidate accepted" still wrote `hits: []`, so a run that found four `KDBG`
+  tags and refused all four reported none -- and threw away the `confirmed`/`rejected_by`
+  annotations that are the only thing distinguishing a coincidental tag from a stale module
+  list. The tags now travel inside each candidate's attempt record, one home whether or not a
+  candidate was accepted. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
