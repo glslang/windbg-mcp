@@ -257,6 +257,24 @@ Two mechanisms, cheapest first:
    path was never exercised, and cannot be without enumeration succeeding first. Treat "WinHv needs
    no driver" as untested rather than disproven.
 
+   **A driver of our own has no distribution story, and that reorders the backends rather than
+   just costing one.** Microsoft will not WHQL-sign a driver whose purpose is handing user mode a
+   read of memory it could not otherwise reach; a driver that got signed anyway would be a
+   candidate for the vulnerable-driver blocklist later. So any such driver is test-signed,
+   self-signed, or admitted by an enterprise code-integrity policy — each of which means the
+   operator reconfigures their machine, and none of which ships. **That makes it a research
+   capability and not a feature**, however well it works.
+
+   What survives that constraint is being a **client of drivers Microsoft already signs**:
+   `winhvr.sys` and `vid.sys`, or the documented user-mode **WHP** API. Those carry no signing
+   problem at all, because we ship no driver. The backend table in
+   [`exdi-stub-plan.md`](exdi-stub-plan.md) lists WHP with the caveat that it is "aimed at
+   partitions the caller creates, so applicability to an existing VM's VTL1 is doubtful and should
+   be checked before it is costed" — that check is now the highest-value unknown in this plan,
+   because it is the only candidate that could both work and ship. And it is exactly what
+   `ReadInterfaceWinHv` was going to exercise, which makes the untested status of that path the
+   thing to resolve first rather than a loose end.
+
    **So H2's cheap probe is spent, and the remaining options both require the same concession.**
    Disabling HVCI on the debugger host makes the oracle usable and becomes a recorded condition of
    every measurement taken afterwards. Writing our own driver — H2's stated fallback — needs either
