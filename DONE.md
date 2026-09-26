@@ -5173,6 +5173,16 @@ Three things about the shape of it are worth keeping.
   restore may have landed in whatever the engine now holds. `rollback_complete` asks both halves
   now, and the rendering has a line for a block where nought of the steps failed and the rollback
   is still not complete.
+- **Six review rounds asked one question — *how soon does the batch find out* — and the answer
+  is where the probe sits, not how many places it is repeated in.** It began after the loop, moved
+  to after each step, then to the detection point for the seal, and finally to between a step's
+  action and that step's own assertions: `Check::Eval` is engine calls, so a probe after them has
+  `? (…)` answered by the replacement and reports the result as this step's verdict, about a target
+  the caller never named. `run_step` takes the reading and the seal now and hands the reading back,
+  so there is one probe per step rather than two and no gap between them. What is left is inside a
+  single engine call, which nothing in this process can observe until it returns — the same
+  residual `refuse_a_break_for_a_replaced_target` documents, and the bound rather than the next
+  round's finding.
 - **And a moved selection is not a replacement, which the first version of that said it was.** A
   report keys the caller's next move off the difference: a replaced target retires this session's
   handle through the post-op fingerprint check, while a moved selection leaves it good — so

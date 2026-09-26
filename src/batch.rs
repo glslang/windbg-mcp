@@ -1475,14 +1475,15 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             ));
             continue;
         }
-        let done = run_step(d, step, position, steps_deadline, &mut bound, ended);
+        let (done, held) = run_step(d, step, position, steps_deadline, &mut bound, ended);
         ended |= done.target_gone;
-        // Asked after **every** step, including the last one, and that is the half that matters:
-        // a check only at the top of the loop would see every replacement except the one made by
-        // the final step, which is precisely the batch whose next act is its rollback. Mutually
-        // exclusive with the ending below rather than ranked against it — the host answers `None`
-        // for a target that has gone — so the order of these two branches is presentation.
-        let held = held(d);
+        // The step carries the reading, taken between its action and its own assertions — see
+        // `run_step`, which is also where the seal is taken. Answered for **every** step,
+        // including the last one, which is the half that matters: a check only at the top of the
+        // loop would see every replacement except the one made by the final step, which is
+        // precisely the batch whose next act is its rollback. Mutually exclusive with the ending
+        // below rather than ranked against it — the host answers `Same` for a target that has
+        // gone — so the order of these two branches is presentation.
         let identified = matches!(held, Held::Replaced(_));
         if let Held::Replaced(why) | Held::Uncertain(why) = held {
             // Outranks every other reading of this step, and for a reason none of them share:
@@ -1490,14 +1491,6 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
             // batch whose remaining work is *harmful*. A step that failed or was cut short still
             // ran against the target the caller meant; everything after this would not — and a
             // target nothing can identify is the same problem with less to say about it.
-            // **Sealed here rather than after the loop**, which is where the seal below would
-            // have got to it — after every remaining step had been rendered as skipped. That is
-            // in-process work, so the window is short, and it is a window all the same: the
-            // worker's latch is not published until the op ends, so an `interrupt` arriving in it
-            // reaches `SetInterrupt` and whatever the engine is holding. Raised by Codex on
-            // [#392](https://github.com/glslang/windbg-mcp/pull/392), twice — the first time
-            // against a path that was never sealed at all.
-            d.sealing(Sealed::TargetLost);
             unverified = Some(Unverified {
                 identified,
                 during_cleanup: false,
@@ -1609,19 +1602,15 @@ pub fn run(d: &mut impl Debuggee, op: &BatchOp, budget: Duration) -> BatchReport
         }
         // Cleanup continues past its own failures, deliberately: the steps are ordered, but a
         // patch that cannot be restored must not stop a breakpoint from being cleared.
-        let done = run_step(d, step, position, budget, &mut bound, ended);
+        let (done, held) = run_step(d, step, position, budget, &mut bound, ended);
         ended |= done.target_gone;
         // And stops outright at a replacement, which is the one thing a failure is not: the
         // remaining cleanup would land somewhere else. The outcome is left alone — a cleanup step
         // that swapped the target says nothing about whether the *steps* committed — so this is
         // reported by the block itself, and `rollback()` reads `Incomplete` because part of it
         // ran.
-        let held = held(d);
         let identified = matches!(held, Held::Replaced(_));
         if let Held::Replaced(why) | Held::Uncertain(why) = held {
-            // The same seal, for the same reason, one block later: from here the batch sends
-            // nothing more, and a break would reach the engine rather than this job.
-            d.sealing(Sealed::TargetLost);
             unverified = Some(Unverified {
                 identified,
                 during_cleanup: true,
@@ -1683,15 +1672,17 @@ fn run_step(
     // itself as the ending — each is running against a target that is not there, and asking the
     // engine afterwards cannot tell "it went during this step" from "it was gone before".
     already_gone: bool,
-) -> StepOutcome {
+) -> (StepOutcome, Held) {
     let budget_ms = step_budget_ms(d.elapsed(), deadline).max(MIN_STEP_BUDGET_MS);
     let mut resolve = |name: &str| bound.get(name).cloned();
 
     // Resolved before anything runs, so an unbound reference costs nothing. In `always` this is
     // the ordinary case, not an error in the batch: the step that would have bound it never ran.
     let action = match step.action.substituted(&mut resolve) {
+        // Nothing ran, so nothing can have changed: `Same` is a statement about this step rather
+        // than a reading, and the caller's own between-steps knowledge is untouched.
         Ok(action) => action,
-        Err(why) => return StepOutcome::skipped(position, step, why),
+        Err(why) => return (StepOutcome::skipped(position, step, why), Held::Same),
     };
     let checks: Result<Vec<Check>, String> = step
         .expect
@@ -1700,7 +1691,7 @@ fn run_step(
         .collect();
     let checks = match checks {
         Ok(checks) => checks,
-        Err(why) => return StepOutcome::skipped(position, step, why),
+        Err(why) => return (StepOutcome::skipped(position, step, why), Held::Same),
     };
 
     let rendered = action.rendered();
@@ -1743,6 +1734,26 @@ fn run_step(
         }
     });
 
+    // **Asked here, between the action and this step's own assertions, and that placement is the
+    // end of a run of six review rounds rather than a preference.** Everything a batch does after
+    // its target has changed is done to something else, and the question each round asked was
+    // *how soon does it find out*: after the loop, then after the step, and now after the one
+    // thing that can change it. An `eval` expectation is engine calls too — `? (…)` against the
+    // replacement — so a probe after them evaluates a verdict about somebody else's target and
+    // reports it as this step's, and leaves the interrupt window open across them.
+    //
+    // **What is left is inside a single engine call and cannot be closed from here**, which is
+    // the same residual `worker::refuse_a_break_for_a_replaced_target` documents: until the call
+    // that does the replacing returns, nothing in this process has observed anything. That is the
+    // bound; there is no seventh place to move this to.
+    let held = held(d);
+    if !matches!(held, Held::Same) {
+        // Sealed at the discovery, before the step is even finished being classified: from here a
+        // break would reach the engine rather than this job, and the worker's own latch is not
+        // published until the op ends. See [`Debuggee::sealing`].
+        d.sealing(Sealed::TargetLost);
+    }
+
     let (output, mut cut_short, target_gone) = match ran {
         // `already_gone` gates this half too, though nothing can reach it: dbgscope refuses a
         // command outright when the engine holds no debuggee, so a *successful* call cannot have
@@ -1755,24 +1766,27 @@ fn run_step(
             !already_gone && ran.target_gone,
         ),
         Err(why) => {
-            return StepOutcome {
-                position,
-                label: step.label(),
-                rendered,
-                changes,
-                result: StepResult::Failed(why),
-                output: String::new(),
-                cut_short: false,
-                // **A step can fail and still have ended the target**, and nothing it returns can
-                // say so: `raw_command`'s own contract is that a command failing part-way may
-                // already have run an earlier segment that resumed the target, and the pump that
-                // follows is where the process then exits. The failure comes back as an error
-                // string with the ending in appended prose, so the engine is what is asked. Left
-                // unread, `probe_state` reaches its "a step resumed and did not report a stop"
-                // arm and reports the session **running** — the most wrong of the answers
-                // available, on a session that has no target at all.
-                target_gone: !already_gone && d.has_target() == Some(false),
-            };
+            return (
+                StepOutcome {
+                    position,
+                    label: step.label(),
+                    rendered,
+                    changes,
+                    result: StepResult::Failed(why),
+                    output: String::new(),
+                    cut_short: false,
+                    // **A step can fail and still have ended the target**, and nothing it returns can
+                    // say so: `raw_command`'s own contract is that a command failing part-way may
+                    // already have run an earlier segment that resumed the target, and the pump that
+                    // follows is where the process then exits. The failure comes back as an error
+                    // string with the ending in appended prose, so the engine is what is asked. Left
+                    // unread, `probe_state` reaches its "a step resumed and did not report a stop"
+                    // arm and reports the session **running** — the most wrong of the answers
+                    // available, on a session that has no target at all.
+                    target_gone: !already_gone && d.has_target() == Some(false),
+                },
+                held,
+            );
         }
     };
 
@@ -1789,6 +1803,20 @@ fn run_step(
             result = StepResult::Failed(
                 "this step ended the target, so its assertions could not be checked — there is \
                  nothing left to ask"
+                    .to_string(),
+            );
+            break;
+        }
+        // And the other way of having nothing to ask: the engine is holding something, and not
+        // what this step was aimed at. An `eval` check sent now would be answered by the
+        // replacement and reported as this step's verdict — a claim about a target the caller
+        // never named. Same treatment as the ending above, and for its stated reason: nothing was
+        // learned about the target, so this is a failure rather than an assertion that did not
+        // hold.
+        if !matches!(held, Held::Same) && check.needs_the_engine() {
+            result = StepResult::Failed(
+                "the debug target changed while this step was running, so its assertions could \
+                 not be checked against the target the step was aimed at"
                     .to_string(),
             );
             break;
@@ -1850,16 +1878,19 @@ fn run_step(
     // count honest: a second clip in the renderer would count from the first one's remainder and
     // report a fraction of what was really left out.
     let cap = report_cap(&result);
-    StepOutcome {
-        position,
-        label: step.label(),
-        rendered,
-        changes,
-        result,
-        output: clip(&output, cap),
-        cut_short,
-        target_gone,
-    }
+    (
+        StepOutcome {
+            position,
+            label: step.label(),
+            rendered,
+            changes,
+            result,
+            output: clip(&output, cap),
+            cut_short,
+            target_gone,
+        },
+        held,
+    )
 }
 
 /// How much of a step's output survives into the report. The step that did not succeed is the one
@@ -3294,6 +3325,52 @@ mod tests {
                 .is_some_and(|why| why.contains(PANIC)),
             "the panic's own message reaches the report: {:?}",
             report.always[0]
+        );
+    }
+
+    /// An `eval` expectation is **not** sent to a target the step just replaced.
+    ///
+    /// The sixth and last of a run of review rounds on one question — *how soon does the batch
+    /// find out* — and the one that fixes where the probe belongs rather than moving it: after
+    /// the action, before this step's own assertions. `Check::Eval` is engine calls, so a probe
+    /// after them evaluates `? (…)` against the replacement and reports the answer as this step's
+    /// verdict, about a target the caller never named; and it leaves the interrupt window open
+    /// across those calls, where the seal is what closes it.
+    ///
+    /// What is left after this is inside one engine call, which nothing in this process can
+    /// observe. That is the bound rather than the next round's finding.
+    #[test]
+    fn an_assertion_is_not_evaluated_against_the_target_its_step_replaced() {
+        let mut d = stopped()
+            .on(".opendump", Ok("Loading Dump File"))
+            .on("? (", Ok(EVAL_ONE))
+            .replaces_the_target_on(".opendump");
+
+        let mut swap = cmd(r".if (1) { .opendump C:\other.dmp }");
+        swap.expect = vec![Check::Eval {
+            expr: "poi(hevd!Guard)".to_string(),
+            equals: "1".to_string(),
+        }];
+
+        let report = run(&mut d, &op(vec![swap], vec![]), BUDGET);
+
+        assert!(
+            !d.ran("? ("),
+            "the assertion must not be answered by the replacement: {:?}",
+            d.calls
+        );
+        assert!(
+            matches!(&report.steps[0].result, StepResult::Failed(why)
+                if why.contains("changed while this step was running")),
+            "and the step says why it could not be checked rather than reporting a verdict it \
+             did not reach: {:?}",
+            report.steps[0].result
+        );
+        assert_eq!(report.outcome, BatchOutcome::TargetReplaced { at: 1 });
+        assert_eq!(
+            d.sealed,
+            Some(Sealed::TargetLost),
+            "and the job is sealed from the moment the action returned, not after the checks"
         );
     }
 
