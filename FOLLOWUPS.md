@@ -2026,14 +2026,17 @@ overstated the first two into blockers and got the third wrong.**
   repo distributes no driver and the operator supplies the transport. That is an install step and a
   security-posture note to write down, not a reason to build less. **Once it is in place, the rest
   is drivable from it.**
-- **Execution control is an open question, not a settled impossibility.** What is established is
-  narrower than "there is none": post-26100 `securekernel.exe` ships no KD transport **of its own**,
-  every `Kd`-prefixed symbol in it being data. But the **hypervisor** carries VTL1 debug machinery —
-  a root VTL1 debug context and an active port `0xC35C` (50012) were measured; it was configured,
-  did not activate, and the initialization failure was never named. The validation record declines
-  the stronger claim in terms: *"They do not establish that this Windows build lacks Secure Kernel
-  debugging support."* And `kdnet.exe` on this bench reports network debugging supported for the VM.
-  So stepping is **an item to settle** (S5), not a door to close.
+- **Execution control is an open question, and the hypervisor half of it already works.** What is
+  established is narrower than "there is none": post-26100 `securekernel.exe` ships no KD transport
+  **of its own**, every `Kd`-prefixed symbol in it being data. The **hypervisor's** VTL1 debug
+  machinery is a separate thing and is **initialised**: its activation failure was identified
+  (`0x1D`, debug free-page list exhausted), raising `hypervisordebugpages` resolved it, and active
+  port `0xC35C` (50012) with both buffers allocated proves the allocations completed. **What is
+  unresolved is Secure Kernel-side attachment** — a working port with nothing on the guest side
+  connecting to it, which sits uncomfortably beside SK shipping no KD transport and may be the same
+  wall. The validation record declines the stronger claim in terms: *"They do not establish that
+  this Windows build lacks Secure Kernel debugging support."* So stepping is **an item to settle**
+  (S5), starting at attachment rather than at activation.
 - **Writes: measured by S4 on 2026-09-26, and the answer differs per route.** An earlier draft of
   this item asserted VTL1 was patchable from the existence of a wrapper; the ABI argued otherwise
   (`HV_ACCESS_GPA_RESULT_CODE` defines `HvAccessGpaWriteIntercept` (3) beside the `ReadIntercept`
@@ -2242,7 +2245,8 @@ guest side to speak to it — rather than by re-running a completed experiment.
 1. **S0's saved-state source** — decides how much setup a user needs, not whether it ships.
    Cheapest, and first.
 2. **Image-only symbol resolution** — decides whether S2 is small or is a `dbgscope` change.
-3. **S5's activation failure** — decides inspector versus debugger, and is the one that would
+3. **S5's unresolved Secure Kernel *attachment*** — not its activation, which is done: the port is
+   up and SK does not connect to it. Decides inspector versus debugger, and is the one that would
    change the shape of S3's tool surface rather than its contents. Independent of the rest, so it
    can run in parallel or not at all.
 4. **Build stability of the offsets, and the derivation that replaces them.**
