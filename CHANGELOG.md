@@ -160,7 +160,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   measured rather than left as a worry -- `securekernel.exe` spans 373 pages with **one**
   physical discontinuity, and the debugger data block sits at page 307 offset `0x5E0`, inside a
   frame with an adjacent successor -- and the image-side search, which reads by VA through the
-  translator, has no such blind spot and is the authoritative one. No Rust and no MCP
+  translator, has no such blind spot and is the authoritative one. **An eleventh round found the
+  successor pairing reset at every chunk boundary**, so two chunks the provider reports
+  separately but which are physically adjacent would have the last page of one flushed before
+  the first page of the next could join it -- a split record missed at a boundary the stated
+  limitation does not cover, those frames being adjacent. `pending` now lives across the chunk
+  loop and the GPA-adjacency check, which was already there, is the only thing deciding
+  join-or-flush. Measured on this bench the case does not arise -- the two chunks are
+  `0x0..0xF8000000` and `0x100000000..0x108000000`, the PCI hole between them -- so no reported
+  number moves; the structure no longer depends on that. No Rust and no MCP
   transport changed. The full record, both arms and what it does not establish, is the **S0 result**
   section of [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
