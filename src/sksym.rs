@@ -223,6 +223,11 @@ pub(crate) enum SymbolFailure {
 }
 
 /// Why a loaded PDB could not be vouched for.
+///
+/// **Three arms, and they are the whole set**: an identity that says the wrong thing, one the engine
+/// would not give, and one it does not have. Every way the check can fail to happen is one of those,
+/// which is the answer to four review rounds each finding another — stated here so a fifth has
+/// somewhere to land rather than something to add.
 #[derive(Debug)]
 pub(crate) enum Unvouched {
     /// The engine reports the PDB it matched does not belong to this image.
@@ -231,6 +236,10 @@ pub(crate) enum Unvouched {
     /// as having a symbol provider, so there is one — what is missing is the answer that would let it
     /// be checked.
     NotAsked(String),
+    /// The engine answered, and has no signature for a module it reports as PDB-backed. Carries the
+    /// kind, because that is the half that makes it a contradiction rather than an ordinary absence —
+    /// `CodeView` and `Sym` have no signature and are accepted.
+    NoIdentity(SymbolKind),
 }
 
 impl SymbolFailure {
@@ -295,6 +304,11 @@ impl std::fmt::Display for SymbolFailure {
                     f,
                     "the engine would not say which PDB it loaded, so nothing checked that the \
                      symbols belong to this image: {detail}"
+                ),
+                Unvouched::NoIdentity(kind) => write!(
+                    f,
+                    "the engine reports the module's symbols as {kind:?} and has no PDB signature \
+                     for them, so nothing could check that they belong to this image"
                 ),
             },
         }
@@ -470,7 +484,6 @@ impl Symbols {
         // **Not `.ok().flatten()`**, which is what this was: it made *the engine could not be asked*
         // indistinguishable from *the module has no PDB signature*, and the mismatch check below is
         // skipped in both cases — so an unanswered query published provenance nothing had validated.
-        // `Ok(None)` still means there is nothing to check and is not a refusal.
         let pdb = match engine.module_pdb(module.base) {
             Ok(pdb) => pdb,
             Err(e) => {
@@ -480,6 +493,24 @@ impl Symbols {
                 });
             }
         };
+        // **A PDB-backed provider must have an identity, and this is the arm that closes the set.**
+        // Four review rounds on #399 landed on this one seam, each on another way the identity could
+        // fail to vouch for the symbols, so it is worth saying what the set *is* rather than adding a
+        // fourth later: the engine says the wrong thing ([`Unvouched::Mismatch`]), will not say
+        // ([`Unvouched::NotAsked`]), or says nothing (here). Those are every way a check can fail to
+        // happen, which is why this is a **requirement on the kind** rather than another enumerated
+        // failure — any future shape of "no identity" lands in this arm without a new one.
+        //
+        // `CodeView` and `Sym` keep `None`, because those providers genuinely have no PDB signature to
+        // report and refusing them would be refusing what they are. Unmeasured, like the other
+        // refusals: this bench has only produced `Pdb` with an identity, which is what the gated test
+        // asserts.
+        if matches!(module.symbols, SymbolKind::Pdb | SymbolKind::Dia) && pdb.is_none() {
+            return Err(SymbolFailure::PdbUnvouched {
+                why: Unvouched::NoIdentity(module.symbols),
+                symbol_file,
+            });
+        }
         if let Some(identity) = &pdb
             && identity.unmatched
         {
@@ -1088,7 +1119,9 @@ mod tests {
         // this cannot fail while that refusal stands, and that is the point: it fails if the refusal
         // is ever narrowed again, which is what rounds 1 to 3 of #399 did once already. The PDB half
         // is the same claim from the other side: a provider that loaded and a PDB the engine can name
-        // are the state the cached provenance is only safe in.
+        // are the state the cached provenance is only safe in — and since round 7 that half is a
+        // ratchet too, `Unvouched::NoIdentity` having made a PDB-backed module with no signature a
+        // refusal. Both assertions now fail only if a refusal is narrowed, which is what they are for.
         assert_ne!(
             symbols.kind(),
             SymbolKind::Deferred,

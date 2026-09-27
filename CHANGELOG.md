@@ -76,7 +76,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   protection was incidental and the guard is what turns a sharing violation into *you named an
   input*. **And a PDB nothing vouched for is a refusal either way round**, whether the engine reports
   it does not belong to this image or cannot be asked which one it loaded: `.ok().flatten()` had made
-  the second read as "there is no signature", publishing provenance nothing had checked. The engine
+  the second read as "there is no signature", publishing provenance nothing had checked — and a module
+  the engine calls PDB-backed while having no signature for it is the third and closing way that check
+  can fail to happen, so it is a requirement on the kind rather than a fourth enumerated failure. The
+  engine
   ratchet likewise fails on a *rename* of the type, since `use … DebugEngine as E; E::new()` would
   otherwise walk past a check that reads the name. And **a flag where a value belongs is refused** on
   all twelve flags that take one, not just the reported `--sympath`: `--symbols --sympath
