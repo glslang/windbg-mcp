@@ -348,61 +348,63 @@ tell is not the findings.** [#393](https://github.com/glslang/windbg-mcp/pull/39
 rounds and 33 findings** on one probe whose *answer* never moved: the S0 verdict, the VTL1 `CR3`
 `0x1201000` and all three landmark offsets are identical in the first commit and in the merge, and
 the documentation around them took **115 insertions against 10 deletions** — additive qualification,
-not a correction. What moved was the size of the thing. The files those findings were filed against
-went **1,322 to 3,153 lines, +139%**.
+not a correction. What moved was the size of the thing: the first commit inserted **1,478** lines
+and the sixteen rounds added **2,367** more on top of it, **+160%**.
 
-**The first draft of this section got the diagnosis wrong, and the measurement is what caught it.**
-It said the review was re-reviewing its own output. Blame the line each comment is anchored to, at
-the commit it was filed against, and only **12 of 33** findings were on lines an earlier remediation
-commit had written — 17 if you also count the commit under review. The reviewer was mostly reading
-the **original** 1,322 lines and finding real defects in them. What circled was the *remedies*: **11
-of 17** remediation commits modified lines an earlier remediation commit had introduced. The review
-was not eating its own output; the remedies were, and the surface they added is what every later
-round had to read.
-
-So the predicate is **growth**, not attribution. The artifact is the set of files findings are being
-filed against, which the findings name themselves:
+So the predicate is **growth**, and it is measured on the PR's own diff so that there is no file set
+to choose:
 
 ```console
-for p in $(gh api --paginate repos/<o>/<r>/pulls/<n>/comments --jq '.[].path' | sort -u); do
-  printf '%s %s %s\n' "$(git show <first-commit>:"$p" 2>/dev/null | wc -l)" "$(wc -l < "$p")" "$p"
-done | awk '{b+=$1; a+=$2} END {
-  if (b == 0) print a, "lines, all of it added after the first commit: B is yes"
-  else printf "%d -> %d  B %s (%+.1f%%)\n", b, a, (2*a > 3*b ? "yes" : "no"), (a-b)*100/b }'
+git diff --shortstat <first-commit>^ <first-commit>   # insertions: what was submitted
+git diff --shortstat <first-commit> HEAD             # insertions: what review has added since
 ```
 
-A path the first commit does not have counts as **zero** there, which is the whole point: a file a
-remediation commit added is review-added surface, and skipping it would understate B by exactly the
-thing B is for. The `2>/dev/null` is what makes that happen rather than failing the loop, and the `b
-== 0` arm is for the review whose entire artifact arrived after the first commit — all baselines
-zero, which is B yes and a division by zero if you let it reach the percentage. The verdict is
-printed rather than inferred from the percentage because `1000 -> 1501` prints as `+50%` at zero
-decimals and B is **yes** there: `2*a > 3*b` is the test, and exactly +50% is no. A **rename**
-inflates B, because the old path goes to zero and the new one appears at full size — resolve it with
-`git log --follow` on the new path, or accept the inflation and say so in the number.
-
-**Compute the predicate once the PR has five remediation commits, then after every round, and write
-it down.** Two terms, and they are the only things in this section that decide anything:
+**Compute the predicate after every round and write it down.** Two terms, and they are the only
+things in this section that decide anything:
 
 - **A** — has the deliverable's answer moved since the first commit?
-- **B** — have those files grown by more than half since the first commit?
+- **B** — are the insertions since the first commit more than half the insertions in it?
+
+Neither term is latched. B is a cumulative diff against the first commit, so a round that deletes
+more than it adds genuinely lowers it, and that is the freeze lifting for the right reason rather
+than flickering. A is re-read every round too: if a fix to an existing defect changes the answer,
+new surface is legitimate again and the freeze must lift, because otherwise the machinery the
+corrected answer needs would be declined by a rule whose own first sentence says a moving answer
+earns it. If the first commit inserted nothing, B is yes as soon as anything is added.
 
 **Freeze the surface when A is no and B is yes, and not before.** Either term alone is ordinary
 review: a still-moving answer means the artifact has not converged and new surface is legitimate,
 and growth while the answer is still moving is just the work being done. On #393 the pair first
-holds at the **fifth** remediation commit (+68%) and holds to the end; this PR, at +19% with an
-answer that moved three times, never reaches it. Measure B against the **first** commit rather than
-the previous one so a round that only deletes cannot reset it, and latch it for the same reason a
-freeze that flickers is worse than either state.
+holds at the **third** remediation commit (+52%, ending at +160%) — earlier than it felt at the
+time, and before the rounds that produced the real defects. This PR is far past B — a 52-line first
+commit against which review has since added more than twice that — with an answer that moved every
+round, so the pair never holds here.
 
-**Why growth rather than blame**, which took three review rounds to arrive at: an attribution metric
-needs a file scope, and the scope changes the answer. On #393, blaming every changed file gives 16
-of 17 commits and a first majority at commit **3**; the two instrument files give 11 of 17 and
-commit **5**; and one changelog bullet extended each round is enough to swing it, because an
-append-only log guarantees a hit and so carries no information at all. Growth needs no scope beyond
-the paths the findings name. It also survives the merge: a squash or rebase rewrites every SHA, so a
-blame-based retrospective must run against the **pre-merge branch tip**, and doing that wrong here
-returned a confident **0 of 33** that looked exactly like a clean result.
+**Why the PR's diff and not a list of files**, which took four review rounds to arrive at: every
+file set is a scope, and the scope decides the answer. Measured on #393: the files that attracted
+findings give +139% and a first yes at commit 5; **every** file the PR touched gives +23% and
+**never** fires, because `FOLLOWUPS.md` contributes two thousand barely-touched lines to the
+denominator; dropping the append-only logs gives +65% and a first yes at commit 14, too late to act
+on. A reviewer's suggestion to derive the set from the remediation changes is the second of those,
+and it would have disabled the rule on the PR it came from. The diff has no denominator to game: a
+file a remedy adds without ever attracting a comment counts, because it is insertions, and a large
+file nobody touched cannot dilute, because it is in nobody's diff.
+
+**Blame was the first attempt and it was worse.** An attribution metric needs the same file scope
+*and* a SHA namespace: on #393, blaming every changed file gives 16 of 17 commits with a first
+majority at commit 3, the two instrument files give 11 of 17 and commit 5, and one changelog bullet
+extended each round is enough to swing it, because an append-only log guarantees a hit and so
+carries no information. It also does not survive the merge — a squash or rebase rewrites every SHA,
+so a blame-based retrospective must run against the **pre-merge branch tip**, and doing that wrong
+here returned a confident **0 of 33** that looked exactly like a clean result.
+
+**The first draft of this section also got the diagnosis wrong, and only measuring caught it.** It
+said the review was re-reviewing its own output. Blame the line each comment is anchored to, at the
+commit it was filed against, and only **12 of 33** findings were on lines an earlier remediation
+commit had written — 17 if you also count the commit under review. The reviewer was mostly reading
+the **original** submission and finding real defects in it. What circled was the *remedies*: **11 of
+17** remediation commits modified lines an earlier one had introduced. The review was not eating its
+own output; the remedies were, and the surface they added is what every later round had to read.
 
 **What the trigger does not license is waving findings through, and this PR is the proof.** By round
 ten the answer had not moved for ten rounds and the loop looked spent. **Round 15 then found that
