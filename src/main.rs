@@ -28,10 +28,13 @@ mod logbridge;
 mod progress;
 mod proto;
 mod record;
+mod savedstate;
 mod schema;
 mod sd;
 mod server;
 mod service;
+mod sk;
+mod skinspect;
 mod structured;
 mod surface;
 mod target;
@@ -113,6 +116,11 @@ fn main() -> Result<()> {
     if let Some(at) = args.iter().position(|arg| arg == cast::RENDER_FLAG) {
         // Before the runtime: this reads a file and writes a file, and neither wants one.
         return render_cast(&args[at + 1..]);
+    }
+    if let Some(at) = args.iter().position(|arg| arg == skinspect::INSPECT_FLAG) {
+        // The same shape and the same reason: it reads a Hyper-V capture and writes a report,
+        // touching neither DbgEng nor MCP (`FOLLOWUPS.md` item 103, gate S1).
+        return skinspect::run(&args[at + 1..]);
     }
 
     // Also before the runtime, and for a sharper reason than the renderer's. Installing touches the

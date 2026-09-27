@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+
+- **A guest's Secure Kernel can now be decoded by this server, from a Hyper-V capture, through a
+  command-line role rather than a tool.** `FOLLOWUPS.md` item 103's gate S1. `src/sk.rs` is
+  everything gates H0–H4 and S0 measured, expressed so the byte source is a parameter: a guarded
+  four-level page-table walk, PE identification against an on-disk image, the `KdDebuggerDataBlock`
+  decode and the `SkLoadedModuleList` walk. `src/savedstate.rs` is the one source it ships with — a
+  Hyper-V saved state read through the Windows SDK's `vmsavedstatedumpprovider.dll` — and
+  `windbg-mcp --sk-inspect` drives the two and prints a report, a fourth non-server role beside
+  `--render-cast` that touches neither DbgEng nor MCP. **No MCP tool and no `tools/list` change**:
+  the surface is gate S3 and its shape is an open question, and a capture is a fixed snapshot with
+  no debuggee, which fits this server's one-worker-per-target session model awkwardly enough to
+  deserve its own decision. **The seam is the design.** A source answers `root()` as well as
+  `read(gpa, len)`, because the decode starts from the VTL1 page-table root and three captures of
+  one guest carry three different ones — an implementation hard-coding the first would have walked
+  from the wrong root on the third and not been told. Every read answers *whole or not at all*, so a
+  16-byte-wide source cannot make a decode judge a 4096-byte page on its first sixteen bytes; every
+  failure says **why**, because `HvCallReadGpa` refuses with `HV_STATUS_SUCCESS`, a per-access
+  `ReadIntercept` and zeros, and a seam carrying bytes-or-nothing turns protected memory into
+  plausible data; and the failure **count lives inside the read primitive**, where no consumer can
+  bypass it, after four review rounds on S0's probe each found another `if reason { continue }`
+  reporting a clean negative. Acceptance is two independent structures agreeing — `KernBase` inside
+  the block, *and* the first `DllBase` of the list that block points at — enforced in the one
+  function that can accept a candidate rather than left to whoever remembers to check, since a
+  duplicate mapping of one image matches every header field and a stale `PsLoadedModuleList` yields
+  plausible names rather than an error. Measured against the VBS guest's checkpoint on 2026-09-27
+  and reproducing S0's Python probe landmark for landmark on that capture — `CR3` `0x107593000`,
+  self-map index 309, `securekernel.exe` at GPA `0xCD0000`, the block at `+0x1335E0` with `Size`
+  `0x3A0`, the module list at `+0x127770`, the same six VTL1 modules, 179 table reads and 215
+  decodes — plus two checks the probe did not run: a structural route to the list head that agrees
+  with the block, and the provider's own address translator agreeing with the walk on 373 of 373
+  pages of the image. The VBS-off twin refuses the VTL switch by name (`0xC0370509`), reported as a
+  refused **switch** rather than as a guest with no Secure Kernel. 34 tests, all fixtures rather
+  than captured pages, six of them mutation-verified — one of which caught a test asserting against
+  the same constant the code fills with, so changing the poison to zero had moved both sides of the
+  assertion. `docs/secure-kernel/` carries the record.
+
 ### Changed
 
 - **The debugger tier's ARM64 half is one entry again, and it names an image rather than a moving label.** It was a pair -- `windows-11-arm` beside `windows-11-vs2026-arm` -- run side by side through the window GitHub announced for migrating the older label onto the Visual Studio 2026 ARM64 image, so that a break arriving with the new image would be attributable to the image rather than to the change under review. Nothing broke and the two converged: this workflow's own runs report `Image: windows-11-arm64` at 2026-09-23T06:22Z and `windows-11-vs2026-arm64` at 12:57Z the same day, then the new image on every run since -- eleven sampled over the following 47 hours, ending with both entries reporting `windows-11-vs2026-arm64`, `Version: 20260920.164.1` on the same run. Same image, same version, same inbox `dbgeng.dll`, which is the one thing that job exists to load, so the pair had stopped buying attribution and started buying a duplicate twenty-minute run on every PR. What survives is `windows-11-vs2026-arm` under the suffix `, arm64`: the **label pins the image and the name says which tier it is**, since carrying `vs2026` in a job name would rot one image later exactly as `windows-11-arm` did. The convention the pair established is now written where the next migration will be read -- add the new image as a second entry naming it in its suffix, keep both while they differ, drop the older when they do not. Checked rather than assumed: the repository ruleset requires `Build & test`, `Documentation lint` and `Smoke test (debugger tier)` and **neither ARM64 name**, so renaming one could not strand a required context on a job that will never report again. And the migration invalidated a measurement, which is the part worth carrying forward: issue #153's finding that `windows-11-arm`'s System32 ships no `symsrv.dll` is now about an image that label no longer names, and nobody has probed the new one. It cost nothing only because the symbol-half copy step was deliberately written to be independent of that answer -- a prediction made at the time, tested by this migration, and held. `docs/smoke-test.md` and `.claude/skills/live-kernel/SKILL.md` now say which image the probe was taken on rather than which label. `FOLLOWUPS.md` item 32, now in `DONE.md`.

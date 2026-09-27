@@ -2124,7 +2124,57 @@ to walk *from*, and hard-coding the one measured `0x1201000` is not an answer.
   setup. What changes is the install instructions and who can follow them, so write that down
   rather than treating a driver-only answer as a failure of the item.
 
-### S1 — the decode layer, source-agnostic. The bulk of the work, and offline-testable
+### S1 — the decode layer, source-agnostic — **BUILT AND RUN 2026-09-27**
+
+**Built in Rust, in this server, and measured against a real capture.** `src/sk.rs` is the decode
+layer over a `RawSource` seam (`root()` beside `read(gpa, len)`, both carrying *why* a read failed),
+`src/savedstate.rs` is the Hyper-V saved-state source bound through the SDK's
+`vmsavedstatedumpprovider.dll`, and `--sk-inspect` is a fourth non-server role beside
+`--render-cast` that drives the two and prints a report. **Not a tool surface** — that is S3, whose
+design question is still open, and a CLI role is what lets the decode be exercised without
+prejudging it.
+
+**It reproduces S0's probe on the capture it was run against, landmark for landmark**, which is what
+makes it measured rather than merely self-consistent. Run against the `Lab Guest Hyper-V` checkpoint
+(`H1 pinned 26200.9457 VBS+HVCI`, the **third-boot** capture) with
+`--image C:\Windows\System32\securekernel.exe`: VTL1 `CR3` **`0x107593000`** read out of the capture,
+root page **29 present entries** with the **self-map at index 309** and 139 non-zero bytes,
+`securekernel.exe` at GPA **`0xCD0000`** and base VA **`0xFFFFF8070EDA9000`**,
+`KdDebuggerDataBlock` at **`+0x1335E0`** with `Size` **`0x3A0`**, `SkLoadedModuleList` at
+**`+0x127770`**, the same **six** VTL1 modules with the same sizes, and **4** `KDBG` tags of which
+three are refused on `KernBase` and one accepted. Every one of those figures is S0's for this
+capture, including the `215` decodes from `179` table reads. What it adds: **16,437** leaf mappings
+over **4,545** distinct pages with **7,803** alias prefixes counted as unexpanded, 0 malformed
+entries, 0 unreadable tables, **18,253** reads of which **0** failed, and two checks S0 did not run —
+the **structural cross-check** (find the loader entry whose `DllBase` is the base, follow its
+`Blink`) found head `0xFFFFF8070EED0770`, **the same address the block names**, and the
+**provider's own translator** agreed with the walk on **373 of 373** pages of the image, with zero
+pages mapped by one and not the other.
+
+**The control arm refuses by name.** The same command against `Lab Guest Control`
+(`H1 control 26200.9457 VBS off`) reports partition VTLs `0x1` against the VBS guest's `0x3` and
+`ForceActiveVirtualTrustLevel(vp0, vtl1)` refused with `0xC0370509`
+(`VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED`) — reported as the **switch** being refused rather than
+as a guest with no Secure Kernel, which is the distinction `NotWalkable` exists to keep.
+
+**34 tests, all synthetic** — 26 in `sk`, 4 in `savedstate`, 4 in `skinspect` — inside the default
+`cargo test` (1,059 unit tests now, from 1,025). Six guards were **mutation-verified**: the self-map
+cut, the list-confirms-the-block rule, the poison fill, whole-or-nothing reads, the large-page frame
+mask, and unknown-is-not-wrong in the shape gate. The poison one **failed its mutation** and that is
+the finding worth keeping: the assertion compared against the `POISON` constant the code fills with,
+so changing the fill to zero moved both sides and the test passed on exactly the bug it exists for.
+It asserts the literal `0xAA` now.
+
+**What this does not establish.** The decode has been run against **one** capture, of one build, on
+one host — the `0x1201000` capture S0 also used is no longer on this bench, so the reboot-moved root
+is pinned by S0's record rather than re-measured here. The `.bin`/`.vsv` pair path is selected by
+code and **called by nothing**, this bench never having produced a capture of that form. Nothing
+here reads a *live* guest: `ReadFailure::Refused` is constructed by the fixtures alone, because a
+capture has nothing to refuse with and the hypercall source that answers
+`HV_STATUS_SUCCESS`-with-`ReadIntercept` is not built. And no symbol is resolved — that is S2, which
+the base this now produces is the input to.
+
+#### S1 as specified — the bulk of the work, and offline-testable
 
 Everything H4 did, expressed over a source seam so the byte source is a parameter: the guarded
 four-level page-table walk, PE identification against an on-disk image, the `KdDebuggerDataBlock`
