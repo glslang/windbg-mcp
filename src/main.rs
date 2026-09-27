@@ -12,9 +12,12 @@
 //! drift out of step with the writer is a reader that will. [`cast::RENDER_FLAG`] turns a recorded
 //! transcript into a terminal recording and exits, touching neither DbgEng nor MCP.
 //! [`skinspect::INSPECT_FLAG`] reads a Hyper-V saved state's VTL1 and reports what is in it
-//! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — as an
-//! image target with no debuggee, which is why the one-session-per-process rule that makes workers
-//! necessary does not reach it.
+//! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — **one**
+//! target, and that target is a **file**: an image opened for its symbols, with no process behind it
+//! to resume, detach or kill. So it satisfies the one-session-per-process rule that makes workers
+//! necessary rather than escaping it, which is what lets a report writer hold an engine where the
+//! supervisor may not. [`sksym`]'s module docs carry the argument, and a test there is what stops a
+//! third engine appearing somewhere that does not meet it.
 
 mod batch;
 mod cast;
