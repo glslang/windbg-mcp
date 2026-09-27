@@ -2417,6 +2417,29 @@ the capture had no VTL1 must not read like a run where neither half worked.
   binary carries its own `dbghelp.dll`, and whichever of DbgEng and the SDK provider loads first is
   the one the other inherits by name. The engine opens first, because it needs its own; the run
   above is what says the provider still reads a capture afterwards.
+- **Narrowing that refusal opened a hole, which round 2 of the review found.** Accepting `Deferred`
+  left the engine free to load the PDB on the first *landmark* query — after the only `unmatched`
+  check had run, so another build's names could have been printed as this build's, and the reported
+  provenance would have said `kind Deferred` and "no PDB signature" above addresses a PDB had just
+  resolved. That is the `.claude/skills/review-round` rule about what a deleted check was *also*
+  load-bearing for, and the whole suite stayed green through it. Fixed by **collapsing** the state
+  rather than reporting it: `Symbols::open` now issues one deliberately-failing lookup to make the
+  engine look before the provenance is read. Measured, twice: a module reading `symbols: deferred`
+  straight after the open moves to `symbols: pdb` with its PDB key on a single failing
+  `? securekernel!ThisSymbolDoesNotExistAnywhere`; and with `reload_symbols` not issued at all the
+  probe alone still gets `Pdb` and resolves both landmarks, so the two halves are independent and the
+  reload stays because it is the one that yields a *named* error. With **neither** issued, the gated
+  test fails on exactly the reported state (`symbols Deferred, pdb None, file securekernel.exe`),
+  which is what says its two new assertions are not vacuous.
+- **The loaded PDB is now an input, and the mutation says the finding's stronger form is wrong.**
+  Review also found that `symbol_file()` — a file this run read, discovered only once the engine had
+  loaded it — never reached `Inputs`, so `--json` could name it. Taken: it is added where it is first
+  known and the alias check re-runs, exactly as the capture paths are. But backing the guard out does
+  **not** truncate the PDB on this bench: the write fails with `os error 32`, *being used by another
+  process*, because DbgEng still holds it. The guard stays because that protection is incidental —
+  it would vanish if symbols were released or `symbol_file` named something the engine had closed —
+  and because a sharing violation reported as a failed report-write is the wrong answer to *you named
+  an input*. Verified both ways with the cache file hashed before and after.
 - **It is a third process in this crate that loads DbgEng, and that was a P1 on the review.** Review
   on [#399](https://github.com/glslang/windbg-mcp/pull/399) asked for image resolution to be routed
   through an engine worker, citing `AGENTS.md`. The fact is right and the remedy is declined: the
