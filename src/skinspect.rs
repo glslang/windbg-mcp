@@ -26,6 +26,7 @@ use anyhow::{Context, Result, bail};
 
 use crate::savedstate::{Capture, CaptureFiles, Kit, Provider, TranslateFailure};
 use crate::sk::{self, Gva, Landmarks, NotWalkable, PAGE, Reader};
+use crate::sksym::{self, Agreement, SymbolFailure, Symbols};
 
 pub(crate) const INSPECT_FLAG: &str = "--sk-inspect";
 
@@ -59,6 +60,14 @@ struct Request {
     vp: u32,
     vtl: u8,
     cross_check: bool,
+    /// Whether to open the image in DbgEng and name what the decode found (gate S2).
+    ///
+    /// Opt-in, because it is the only part of this role that loads an engine: it needs the debugger
+    /// bundle beside the binary and a symbol path that reaches a store with this build's PDB, and
+    /// without the flag the run stays engine-free the way gate S1's decode is.
+    symbols: bool,
+    /// A symbol path for that engine, where the default is not what the operator wants.
+    sympath: Option<String>,
     json: Option<PathBuf>,
 }
 
@@ -200,7 +209,7 @@ fn usage() -> String {
         "usage: windbg-mcp {INSPECT_FLAG} --image <securekernel.exe> \
          (--vm <name> [--snapshot <name>] | --vmrs <path> | --bin <path> --vsv <path>) \
          [--vp <n>] [--vtl <n>] [--kit <root>] [--kit-version <ver>] [--cross-check] \
-         [--json <path>]"
+         [--symbols] [--sympath <spec>] [--json <path>]"
     )
 }
 
@@ -214,6 +223,8 @@ fn parse(args: &[String]) -> Result<Request> {
         vp: 0,
         vtl: 1,
         cross_check: false,
+        symbols: false,
+        sympath: None,
         json: None,
     };
     let mut at = 0;
@@ -238,12 +249,18 @@ fn parse(args: &[String]) -> Result<Request> {
             "--kit-version" => request.kit_version = Some(value()?),
             "--vp" => request.vp = value()?.parse().context("--vp")?,
             "--vtl" => request.vtl = value()?.parse().context("--vtl")?,
+            "--sympath" => request.sympath = Some(value()?),
             "--json" => request.json = Some(PathBuf::from(value()?)),
-            "--cross-check" => {}
+            "--cross-check" | "--symbols" => {}
             other => bail!("unknown argument `{other}`\n{}", usage()),
         }
-        if flag == "--cross-check" {
-            request.cross_check = true;
+        // The valueless flags, set after the match because the value-taking arms hold the borrow
+        // that advances `at`. One arm each rather than a chain of `if`s, so adding a third cannot
+        // land in the wrong place.
+        match flag {
+            "--cross-check" => request.cross_check = true,
+            "--symbols" => request.symbols = true,
+            _ => {}
         }
         at += 1;
     }
@@ -297,6 +314,15 @@ fn parse(args: &[String]) -> Result<Request> {
             usage()
         );
     }
+    // Same rule as `--snapshot`, for the same reason: a symbol path with no engine to configure is
+    // a caller who means something this run is not doing, and accepting it silently would report a
+    // decode they would read as having used their store.
+    if request.sympath.is_some() && !request.symbols {
+        bail!(
+            "--sympath configures the engine --symbols opens, and --symbols was not given\n{}",
+            usage()
+        );
+    }
     Ok(request)
 }
 
@@ -338,6 +364,11 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     if let Some(json) = &request.json {
         inputs.refuse_if_output_is_an_input(json)?;
     }
+    // First line of every report, and not decoration: a figure from this role is a reading of the
+    // binary that answered, and the tree beside it moves independently. `BUILD_VERSION` carries the
+    // commit and, on a dirty tree, a digest of the diff — so a number quoted from this output can be
+    // re-derived, which `.claude/rules/measurement-provenance.md` exists because one could not.
+    println!("build      {}", crate::BUILD_VERSION);
     println!("kit        {} ({})", kit.version, kit.dll.display());
     println!(
         "image      {} ({} bytes, {} sections, timestamp {:#010X}, SizeOfImage {:#X})",
@@ -347,6 +378,25 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         disk.identity.timestamp,
         disk.identity.size_of_image
     );
+    // Before the provider and **not** fatal. Opening the engine is the only part of this role that
+    // needs a debugger bundle and a reachable symbol store, so a run that will have no symbols says
+    // so before it spends minutes reading a capture — and the decode is gate S1's and stands without
+    // them, so the failure travels as a value and is reported in its place rather than ending the
+    // run. It is after `Kit::find` so a host with no SDK fails before a PDB is downloaded for it,
+    // and that costs nothing: finding the kit is a filesystem search and *loading* the provider is
+    // the next line.
+    //
+    // Which is the order that matters, and it is a hazard rather than a preference: the debugger
+    // bundle beside this binary carries its own `dbghelp.dll`, and whichever of the two libraries
+    // loads first is the one the other inherits by name. The engine needs its own
+    // (`docs/install.md`), so it loads first — and that the provider still reads a capture
+    // afterwards is measured rather than assumed.
+    let symbols = request
+        .symbols
+        .then(|| Symbols::open(&request.image, &disk, request.sympath.as_deref()));
+    if let Some(opened) = &symbols {
+        report_symbols(opened);
+    }
     let provider = Provider::load(&kit).map_err(|e| anyhow::anyhow!(e))?;
     let files = match &request.capture {
         CaptureSpec::Vm { name, snapshot } => provider
@@ -379,9 +429,15 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
                 inputs.write_report(
                     path,
                     &serde_json::to_vec_pretty(&serde_json::json!({
+                        "build": crate::BUILD_VERSION,
                         "capture": files.paths(),
                         "walkable": false,
                         "reason": refusal(&why),
+                        // Carried on this path too: the control arm's report is where "the engine
+                        // had symbols and the capture had no VTL1" has to be distinguishable from
+                        // "neither half of this run worked".
+                        "symbols": symbols_json(symbols.as_ref()),
+                        "landmark_symbols": serde_json::Value::Null,
                     }))?,
                 )?;
                 println!("json       {}", path.display());
@@ -416,8 +472,24 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             println!("           the oracle first failed at {va:#X}: {why}");
         }
     }
+    // Gate S2's own measurement: the two landmarks the decode found in the capture, asked for again
+    // of a PDB that has never seen the capture. The image on disk is the join — the decode
+    // identified the mapping against it and the engine resolved symbols out of the same file.
+    let landmark_symbols = match (&symbols, &landmarks.identified) {
+        (Some(Ok(symbols)), Some(found)) => Some(compare_landmarks(symbols, found)),
+        _ => None,
+    };
+    if let Some(compared) = &landmark_symbols {
+        report_landmark_symbols(compared);
+    }
     if let Some(path) = &request.json {
-        let json = as_json(&files, &landmarks, differential.as_ref());
+        let json = as_json(
+            &files,
+            &landmarks,
+            differential.as_ref(),
+            symbols.as_ref(),
+            landmark_symbols.as_ref(),
+        );
         inputs.write_report(path, &serde_json::to_vec_pretty(&json)?)?;
         println!("json       {}", path.display());
     }
@@ -630,6 +702,135 @@ fn report_landmarks(landmarks: &Landmarks) {
     }
 }
 
+/// What the engine has for the image, and where it came from.
+///
+/// **Provenance first and always.** A symbol-derived figure is a reading of one PDB, and a page of
+/// them with no PDB key beside it cannot be re-derived or aged. The kind is printed as the engine
+/// reports it rather than interpreted: `pdb` is what a stripped public PDB and a private one both
+/// read as, which is why the type probes are a separate line and not an inference from this one.
+fn report_symbols(opened: &Result<Symbols, SymbolFailure>) {
+    match opened {
+        Err(why) => println!("symbols    unavailable: {why}"),
+        Ok(symbols) => {
+            println!(
+                "symbols    {} at {:#X}, SizeOfImage {:#X}, kind {:?}",
+                symbols.qualifier(),
+                symbols.preferred_base(),
+                symbols.size_of_image(),
+                symbols.kind()
+            );
+            match symbols.pdb() {
+                Some(pdb) => println!(
+                    "           pdb {}{:X}{}",
+                    pdb.guid,
+                    pdb.age,
+                    if symbols.symbol_file().is_empty() {
+                        String::new()
+                    } else {
+                        format!(" ({})", symbols.symbol_file())
+                    }
+                ),
+                // Not folded into the kind: symbols that loaded from something the engine has no
+                // PDB signature for are still symbols, and they are not re-derivable from a key.
+                None => println!("           the engine reports no PDB signature for this module"),
+            }
+            // Only a failing forced load has one, and only where the kind was still worth keeping —
+            // so this line is the answer to "the kind is not what I expected and nothing said why".
+            if let Some(why) = symbols.reload_error() {
+                println!("           the forced symbol load failed: {why}");
+            }
+            let probes = symbols.type_probes();
+            let found: Vec<&str> = probes
+                .iter()
+                .filter(|(_, found)| *found)
+                .map(|(name, _)| *name)
+                .collect();
+            if found.is_empty() {
+                println!(
+                    "           no type answered for any of {:?} — this PDB carries names and, as \
+                     far as {} probes can say, no type records",
+                    sksym::TYPE_PROBES,
+                    probes.len()
+                );
+            } else {
+                println!("           types answered for {found:?}");
+            }
+        }
+    }
+}
+
+/// Ask the PDB for the landmarks the decode found, at the base the decode found.
+fn compare_landmarks(
+    symbols: &Symbols,
+    found: &sk::Identified,
+) -> Result<Vec<Agreement>, sksym::RebaseRefused> {
+    let resolver = symbols.at(found.candidate.va)?;
+    Ok(vec![
+        sksym::compare(&resolver, "KdDebuggerDataBlock", found.block.va),
+        sksym::compare(&resolver, "SkLoadedModuleList", found.modules.head),
+    ])
+}
+
+fn report_landmark_symbols(compared: &Result<Vec<Agreement>, sksym::RebaseRefused>) {
+    let compared = match compared {
+        Err(why) => {
+            println!("\nlandmarks  cannot be rebased onto the identified base: {why:?}");
+            return;
+        }
+        Ok(compared) => compared,
+    };
+    println!();
+    for agreement in compared {
+        match &agreement.from_symbols {
+            // A symbol the PDB does not have is **unknown, not a disagreement**: a host that cannot
+            // reach a symbol store would otherwise read as a decode that is wrong.
+            Err(why) => println!(
+                "landmark   {} unresolved ({}); the decode found {:#X}",
+                agreement.name, why, agreement.from_decode.0
+            ),
+            Ok(resolved) => println!(
+                "landmark   {} rva {:#X} -> {:#X}: {} the decode's {:#X}{}",
+                agreement.name,
+                resolved.rva,
+                resolved.guest.0,
+                match agreement.agrees() {
+                    Some(true) => "agrees with",
+                    _ => "DISAGREES with",
+                },
+                agreement.from_decode.0,
+                match &agreement.decode_rva {
+                    Ok(rva) => format!(" (rva {rva:#X})"),
+                    Err(why) => format!(" (outside the image: {why:?})"),
+                }
+            ),
+        }
+        // The same question from the other end, and a separate engine call: the name at the
+        // *decode's* address. Displacement is the whole of what it adds — the engine answers with
+        // the nearest preceding symbol at any address in the module, so anything but zero is a
+        // near miss being reported as a hit.
+        match &agreement.named_by_decode {
+            Ok(Some(named)) if named.displacement == 0 => {
+                println!(
+                    "           the engine names {:#X} {}",
+                    agreement.from_decode.0, named.symbol
+                )
+            }
+            Ok(Some(named)) => println!(
+                "           the engine names {:#X} {}+{:#X}, so it is not that symbol",
+                agreement.from_decode.0, named.symbol, named.displacement
+            ),
+            Ok(None) => println!(
+                "           the engine has no name at {:#X}",
+                agreement.from_decode.0
+            ),
+            Err(why) => println!(
+                "           {:#X} is not in the image at all: {why:?}",
+                agreement.from_decode.0
+            ),
+        }
+    }
+}
+
 /// The walk against the provider's own translator, sampled from the image's range.
 struct Differential {
     offered: u64,
@@ -729,10 +930,78 @@ fn differential(
     Some(result)
 }
 
+/// The engine's side of the report, as data.
+///
+/// `null` when `--symbols` was not given — which is a different thing from `available: false`, and
+/// a consumer must be able to tell "nobody asked" from "it was asked and refused".
+fn symbols_json(opened: Option<&Result<Symbols, SymbolFailure>>) -> serde_json::Value {
+    match opened {
+        None => serde_json::Value::Null,
+        Some(Err(why)) => serde_json::json!({
+            "available": false,
+            "reason": why.to_string(),
+        }),
+        Some(Ok(symbols)) => serde_json::json!({
+            "available": true,
+            "module": symbols.qualifier(),
+            "preferred_base": format!("{:#X}", symbols.preferred_base()),
+            "size_of_image": format!("{:#X}", symbols.size_of_image()),
+            "kind": format!("{:?}", symbols.kind()),
+            "pdb": symbols.pdb().map(|pdb| serde_json::json!({
+                "guid": pdb.guid,
+                "age": pdb.age,
+                "key": format!("{}{:X}", pdb.guid, pdb.age),
+            })),
+            "symbol_file": symbols.symbol_file(),
+            "reload_error": symbols.reload_error(),
+            // The probes as asked and answered, not a verdict: a finite list cannot prove a PDB
+            // carries no types, and a consumer reading `types: false` would think it had.
+            "type_probes": symbols.type_probes().iter()
+                .map(|(name, found)| serde_json::json!({ "name": name, "found": found }))
+                .collect::<Vec<_>>(),
+        }),
+    }
+}
+
+fn landmark_symbols_json(
+    compared: Option<&Result<Vec<Agreement>, sksym::RebaseRefused>>,
+) -> serde_json::Value {
+    match compared {
+        None => serde_json::Value::Null,
+        Some(Err(why)) => serde_json::json!({ "rebased": false, "reason": format!("{why:?}") }),
+        Some(Ok(compared)) => serde_json::json!({
+            "rebased": true,
+            "landmarks": compared.iter().map(|agreement| serde_json::json!({
+                "name": agreement.name,
+                "decode_va": format!("{:#X}", agreement.from_decode.0),
+                "decode_rva": agreement.decode_rva.as_ref().ok().map(|rva| format!("{rva:#X}")),
+                "symbol_rva": agreement.from_symbols.as_ref().ok()
+                    .map(|resolved| format!("{:#X}", resolved.rva)),
+                "symbol_va": agreement.from_symbols.as_ref().ok()
+                    .map(|resolved| format!("{:#X}", resolved.guest.0)),
+                "unresolved": agreement.from_symbols.as_ref().err().map(|why| why.to_string()),
+                // Tri-state on purpose: `null` is the PDB having nothing to say, which is not the
+                // two routes disagreeing.
+                "agrees": agreement.agrees(),
+                "named_at_decode": match &agreement.named_by_decode {
+                    Ok(Some(named)) => serde_json::json!({
+                        "symbol": named.symbol,
+                        "displacement": format!("{:#X}", named.displacement),
+                    }),
+                    Ok(None) => serde_json::Value::Null,
+                    Err(why) => serde_json::json!({ "outside_image": format!("{why:?}") }),
+                },
+            })).collect::<Vec<_>>(),
+        }),
+    }
+}
+
 fn as_json(
     files: &CaptureFiles,
     landmarks: &Landmarks,
     differential: Option<&Differential>,
+    symbols: Option<&Result<Symbols, SymbolFailure>>,
+    landmark_symbols: Option<&Result<Vec<Agreement>, sksym::RebaseRefused>>,
 ) -> serde_json::Value {
     let identified = landmarks.identified.as_ref().map(|found| {
         let base = found.candidate.va.0;
@@ -761,6 +1030,7 @@ fn as_json(
         })
     });
     serde_json::json!({
+        "build": crate::BUILD_VERSION,
         "capture": files.paths(),
         "walkable": true,
         "root": format!("{:#X}", landmarks.root.0),
@@ -827,6 +1097,8 @@ fn as_json(
             "refused": landmarks.reads.refused,
             "bytes": landmarks.reads.bytes,
         },
+        "symbols": symbols_json(symbols),
+        "landmark_symbols": landmark_symbols_json(landmark_symbols),
     })
 }
 

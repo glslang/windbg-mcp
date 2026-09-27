@@ -1,6 +1,6 @@
 ---
 name: tiers
-description: Run and interpret this repo's test tiers - what `cargo test` covers, which gates are off by default, and how to turn on the dump, bounded, live-kernel, TTD and 32-bit tiers. Use before claiming a change is covered by a green run, when a tier needs enabling, or when a pass count or SKIPPED line has to be read correctly.
+description: Run and interpret this repo's test tiers - what `cargo test` covers, which gates are off by default, and how to turn on the dump, bounded, live-kernel, TTD, 32-bit and image-symbol gates. Use before claiming a change is covered by a green run, when a tier needs enabling, or when a pass count or SKIPPED line has to be read correctly.
 ---
 
 # Running the test tiers
@@ -171,4 +171,31 @@ a `net:` one. Three assertions gate themselves on what the target actually is ra
 tier: the KD endpoint being owned by the worker is a UDP claim, the key-redaction claim needs a key
 to look for, and the two **pool** tests need an x64 target because the walker decodes x64 pool
 descriptors. Each says so when it stands down; none of them passes quietly.
+
+## A gate that is not in `mcp_smoke` at all
+
+`sksym::tests::an_image_resolves_its_own_symbols_with_no_debuggee` is a **unit** test in
+`src/sksym.rs`, so it rides `cargo test --bins` rather than the smoke harness — the module is
+`pub(crate)` and an integration test cannot reach it. It opens `securekernel.exe` as a DbgEng image
+target, loads its PDB and resolves both directions across a rebase (`FOLLOWUPS.md` item 103, gate
+S2). The gate **is** the input, so a stale variable cannot point it at a file that is not there:
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_SKSYM = "C:\Windows\System32\securekernel.exe"
+cargo test --bins sksym -- --nocapture
+```
+
+Three things about it. **The engine has to be beside the *test* binary**, which is
+`target\debug\deps\` and not `target\debug` — so the bundle `docs/install.md` lists has to be copied
+one directory further down than the memory of doing it for `target\debug` suggests, and without
+`msdia140.dll` and `symsrv.dll` there the PDB does not load and the test fails rather than standing
+down. **It asserts nothing about the type probes**, deliberately: whether a Microsoft public PDB
+carries type records is Microsoft's to change, and pinning today's answer (none) would fail on
+exactly the build this gate would most want to hear about — so the probes print and the reader reads
+them. And the *other five* tests in that module need no engine at all and cover the arithmetic, so a
+green `cargo test` with the gate off is a real claim about the rebase and no claim at all about
+DbgEng.
+
+Running `--sk-inspect --symbols` by hand is the end-to-end version and needs a capture as well; it
+is the `windbg-mcp.exe` in `target\debug`, where the bundle already is.
 

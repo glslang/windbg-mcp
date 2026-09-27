@@ -1122,6 +1122,13 @@ symbol resolution against the *image* needs no live target, so the engine can st
 `securekernel.exe` statically and have the base applied from H4's walk. The part genuinely given up
 is DbgEng driving a live SK session, which E1 says it would not have driven knowledgeably anyway.
 
+**Measured as gate S2, 2026-09-27, and the recoverable half is smaller than this paragraph promised.**
+The *names* recover completely: DbgEng opens the image as a target of its own, loads
+`securekernel.pdb` from the public store, and resolves in both directions at whatever base the walk
+supplies. **The types do not recover at all** — that public PDB carries no type records, so "PDB type
+resolution" and "structure formatting" were never available to be given up or kept, by this route or
+by H5a's. The result is below; what stands in this paragraph is the first half of its last sentence.
+
 **Consequence for the sibling plan, recorded but not yet applied.**
 [`exdi-stub-plan.md`](exdi-stub-plan.md) is written around the H5a route and its hypercall section
 predates H4. It is **not** superseded wholesale — E0's activation problem and E4's integration work
@@ -1582,11 +1589,80 @@ provider that cannot return one register must not read as a guest with no Secure
 - **Nothing was read from a running guest.** A capture cannot refuse a read, so the refusal path
   through the seam is exercised by synthetic fixtures alone; the hypercall route that answers
   `HV_STATUS_SUCCESS` with a per-access `ReadIntercept` is not built.
-- **No symbol was resolved.** S2 is untouched, and the base this produces is its input.
+- **No symbol was resolved.** That was S2's, and the base this produces is its input; S2 has since
+  run, below.
 - **34 synthetic tests are not a second capture.** They pin the rules — the self-map, the large-page
   frame mask, a tag straddling a page boundary, a stale list under a matching `KernBase`, poison
   against zeros — and six of them were mutation-verified. That is a guard against regression, not
   more evidence about Windows.
+
+### S2 result, 2026-09-27: the PDB agrees with the scan, and there are no types to have
+
+S1 found the landmarks by searching the capture. S2 asks a `securekernel.pdb` that has never seen
+that capture where the same landmarks are, and the two agree to the byte. It is `src/sksym.rs`, and
+`windbg-mcp --sk-inspect --symbols` drives it. `FOLLOWUPS.md` item 103 carries the full record;
+what belongs here is the measurement, the mechanism, and the half that is not available.
+
+**Image-only symbol resolution needs no live target and no new primitive.** DbgEng accepts a PE
+image as a target in its own right — `OpenDumpFileWide` on `C:\Windows\System32\securekernel.exe`
+gives a session with exactly **one** module, at the image's own `ImageBase` `0x140000000`, and
+`.reload /f` against it fetches the PDB from the public store. So this uses `dbgscope` methods that
+already existed and touches neither the `execute` text hatch nor a new engine call. Its own work is
+the rebase from `0x140000000` onto the base the walk found.
+
+**The agreement, against the same `H1 pinned 26200.9457 VBS+HVCI` capture S1 ran on.** Image
+10.0.26100.9457, PDB key `C2C0D1A62E3269F40C69EA44FDB230C41`, `symbols: pdb`:
+
+| landmark | found by searching the capture (S0, S1) | read out of the PDB (S2) |
+|---|---|---|
+| `KdDebuggerDataBlock` RVA | `+0x1335E0` | `+0x1335E0` |
+| `SkLoadedModuleList` RVA | `+0x127770` | `+0x127770` |
+| `KdDebuggerDataBlock` in the guest | `0xFFFFF8070EEDC5E0` | `0xFFFFF8070EEDC5E0` |
+| `SkLoadedModuleList` in the guest | `0xFFFFF8070EED0770` | `0xFFFFF8070EED0770` |
+
+Asked the other way round as well, which is a separate engine call and can fail differently: the
+engine names each of those two guest addresses with displacement **0**. That matters because
+`GetNameByOffset` answers with the nearest *preceding* symbol at any address in the module, so a
+non-zero displacement is a miss dressed as a hit. Every S1 figure in the sections above reproduced
+unchanged in the same run.
+
+**So the module list now has a third route, and it is the only one that needs no debugger data
+block.** The tag scan cannot find `SkLoadedModuleList` — it is a bare `LIST_ENTRY` with no signature
+— which is why H4 read it out of the block and why the structural `Blink` walk exists as a
+cross-check. A PDB names it directly. The scan stays primary: a host with no symbol store, or a build
+whose PDB is not served, has only that route.
+
+**The control arm keeps the two halves apart.** Same command against the VBS-off twin: the symbols
+load and report normally while the capture refuses the VTL switch with `0xC0370509`. A run where the
+engine had symbols and the capture had no VTL1 must not read like a run where neither half worked, so
+the text report and the JSON carry them as separate answers.
+
+#### What S2 does not establish
+
+- **The public `securekernel.pdb` carries no type information.** `dt securekernel!_LIST_ENTRY` is
+  *not found*, `dt securekernel!*` lists symbols rather than types, every data symbol prints
+  `= <no type information>` under `x /t`, and four `GetTypeId` probes in the shipped code all answer
+  nothing. Structure walks over VTL1 therefore stay hand-decoded the way `src/sk.rs` does them. A
+  finite set of name probes cannot *prove* a PDB has no types, which is why the report prints what
+  was asked and what came back rather than a verdict.
+- **`SymbolKind::has_type_info` says otherwise and is wrong here.** It reads `DEBUG_SYMTYPE_PDB` as
+  private type information, and this module is `symbols: pdb` with no types: the engine does not
+  distinguish a stripped public PDB from a private one. Ask for a type; do not ask the kind.
+- **Rebasing inside the engine is available and is a trap.** `.reload /i
+  securekernel.exe=fffff8070eda9000,175000` with `.exepath` set does load the image a second time at
+  the guest's base and does resolve the same PDB there — but the name collides, so the second module
+  is `securekernel_exe` and **both** answer to `securekernel!`. With the pair loaded,
+  `? securekernel!KdDebuggerDataBlock` answers `0x1401335E0`: the *preferred* base. Measured on this
+  bench; it is why the rebase is arithmetic outside the engine.
+- **Two symbols, one PDB, one build, one host.** The gate resolves the landmarks S1 already found. It
+  does not enumerate the PDB, and it cannot name the other five VTL1 modules — their symbols are in
+  their own images, which nothing here opens.
+- **The no-symbols paths are unmeasured, and are deliberately not all refusals.** A missing engine is
+  a refusal, as is a module the engine has no symbols for at all; a module whose symbols merely did
+  not *load* is not, because `Deferred` means "nothing has looked yet" rather than "there are none"
+  and refusing it would turn away a host where names would have resolved. Such a run reports the kind
+  on its first line, before the capture is read, and each landmark carries the engine's own reason.
+  Only the working path has been run here.
 
 ## Explicitly out of scope
 
