@@ -1428,6 +1428,67 @@ a broken one.
   is the sessionless shape — so the awkward fit with this server's session model is now the common
   case rather than a hypothetical, and S5 remains the thing that could bring execution state back.
 
+#### Is a capture carrying VTL1 a boundary crossing?
+
+Asked directly, 2026-09-27, because the reasonable reaction to "a checkpoint hands over Secure
+Kernel" is to wonder whether Microsoft should hear about it. **The evidence says this is documented
+behaviour inside the boundary VBS claims, so there is nothing here to report** — and the three cases
+that *would* be reportable are named below, none of them measured yet.
+
+Three readings, the first two measured on this host:
+
+1. **The SDK documents the capability in terms.**
+   `C:\Program Files (x86)\Windows Kits\10\Include\10.0.26100.0\um\vmsavedstatedump.h`, at
+   `ForceActiveVirtualTrustLevel`: *"Forces the current Virtual Trust Level of a given virtual
+   processor. This is useful to force register state to and virtual address translation to come from
+   a different VTL."* Beside it `GetGuestEnabledVirtualTrustLevels`, `GetEnabledVirtualTrustLevels`,
+   `GetActiveVirtualTrustLevel`, and a `GetGuestOsInfo` that takes a VTL parameter. Reading a
+   capture's VTL1 register state and translating its VTL1 addresses is an API surface Microsoft
+   shipped, commented and versioned — which is what S0 used, as documented.
+2. **The mitigation for the at-rest half exists and is switched off here.** `Get-VMSecurity` on both
+   lab guests: `TpmEnabled True`, **`EncryptStateAndVmMigrationTraffic False`**, `Shielded False`.
+   The knob whose job is to encrypt saved state is available and unset; a mitigation being offered
+   is design intent stated out loud. Whether it actually covers VTL1 in a capture is **unmeasured**
+   and is arm 4 below.
+3. **The boundary VBS claims is VTL0 → VTL1 *inside the guest*.** For a guest that is not
+   hardware-isolated the host partition is inside the TCB, which this document's own H3 and H4
+   demonstrate from the other direction: the same pages were read from a *running* guest with a
+   driver in the root partition. Every route here needs Hyper-V Administrator on the host, which can
+   already read a running guest's RAM and attach a kernel debugger to it. A capture therefore lowers
+   the **setup cost** for a principal already inside the boundary rather than crossing one — which
+   is precisely what S0 was run to measure.
+
+**What the Secure Kernel *base* is worth, separately**, since that is the landmark that prompted the
+question: against the host it was never a secret, and it does not reach VTL0 by this route — a guest
+kernel cannot read the host's checkpoint file. The content that would matter is VTL1 **data**: IUM
+trustlet and LSA Isolated memory. **Whether those pages are in the capture is unmeasured here**;
+nothing in S0 or S1 looked, and neither should be read as saying they are or are not.
+
+**Three things that would be reportable, and the state of each:**
+
+- **VTL1 out of a capture taken with `EncryptStateAndVmMigrationTraffic = $true`**, or from a
+  Shielded VM. That would be encryption not covering what it claims. **Unmeasured — specified as
+  arm 4 below.**
+- **A principal below Hyper-V Administrator.** Reading a checkpoint needs read access to a *file*,
+  not the Hyper-V role — so the file's ACL is the boundary, and **on this bench it is wide open**:
+  `D:\Hyper-V\Virtual Machines\Snapshots\<id>.vmrs` (1,984,630,784 bytes) grants
+  `BUILTIN\Users: ReadAndExecute` and `NT AUTHORITY\Authenticated Users: Modify`. Measured
+  2026-09-27, and **inherited rather than set by Hyper-V**: both ACEs carry the `ID` flag in the
+  SDDL and match `D:\`'s root ACL, which is the Windows default for a non-system volume, while the
+  two ACEs Hyper-V *does* add (the VM's own SID and a capability SID) are the non-inherited ones. So
+  Hyper-V adds what it needs and does not strip what it inherited, and a VM whose storage sits on a
+  default-ACL'd data volume has its guest RAM readable by any authenticated local user. That is a
+  **configuration hazard rather than a product defect** — the storage path is the administrator's
+  choice — but it is the one of these three that is true here today, and it is worth fixing on any
+  bench that keeps VM files off the system volume.
+- **A hardware-isolated guest** (SEV-SNP / TDX), where the host is outside the TCB by construction.
+  Out of scope by this document's own "Explicitly out of scope", and nothing here reaches one.
+
+**One measured fact about arm 4's cost**, since it decides how the arm is run:
+`Set-VMSecurity -EncryptStateAndVmMigrationTraffic $true` on a running VM is refused —
+*"The SecuritySettingData property cannot be modified because the virtual machine is running"* — so
+the arm needs the guest powered off and is a scheduled lab mutation, not a probe.
+
 ### S1 result, 2026-09-27: the decode layer is Rust in this server, and it reproduces the probe
 
 S0 answered *whether* a driver-free source carries VTL1. S1 is the decode over that source expressed
