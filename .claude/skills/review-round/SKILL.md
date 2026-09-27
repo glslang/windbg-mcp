@@ -342,7 +342,7 @@ git diff -U0 <fix>^ <fix> -- <file>                     # the - side ranges this
 git blame --porcelain -L<start>,<end> <fix>^ -- <file>   # which commit introduced those lines
 ```
 
-**Compute both numbers at round five and at every round after, and write them down**: has the
+**Compute both numbers from the fifth remediation commit on, and write them down**: has the
 deliverable's answer moved since the first commit, and how many rounds have gone on surface the
 review itself added. They are not kept as diagnostics: they are the predicate the freeze below is
 gated on, and nothing else in this section decides. Until they are on the page, *"this is past the
@@ -362,14 +362,19 @@ and a guard handed a subset of the inputs it promised. So a rule that stops on r
 
 **Freeze the surface when the two numbers say so, and not before.** The predicate is both halves at
 once: the deliverable's answer has not moved since the first commit, **and** more than half the
-rounds so far have modified lines an earlier round introduced. Either half alone is ordinary review
-— a still-moving answer means the artifact has not converged and new surface is legitimate, while
-churn with no repeat-modification is a review finding real defects in the original, which is it
-working. On #393 the pair first holds at round **five** (3 of 5) and holds at every round after (11
-of 17); a two-round PR never reaches it. **Latch it** — the ratio can fall back under half after a
-run of rounds that touch nothing earlier, and a freeze that flickers is worse than either state, so
-once it holds it holds for the rest of the PR. The majority is a reading off one PR and not a
-derived constant: move it if a second PR says otherwise, but move it with the count that made you.
+**remediation commits** so far have modified lines an earlier one introduced. The unit is commits
+rather than rounds for three reasons: the commands above classify a commit, a round that needed two
+commits added surface twice, and a round boundary is not always crisp — #393 carries a catch-up
+commit for findings a broken watcher had missed, which is neither a round nor not one. It has to be
+one unit or the other to be computable, and on that PR the choice does not change the verdict: 11 of
+17 commits or 10 of 16 rounds, with the majority first holding at the fifth either way. Either half
+of the predicate alone is ordinary review — a still-moving answer means the artifact has not
+converged and new surface is legitimate, while churn with no repeat-modification is a review finding
+real defects in the original, which is it working. A two-commit PR never reaches it. **Latch it** —
+the ratio can fall back under half after a run of commits that touch nothing earlier, and a freeze
+that flickers is worse than either state, so once it holds it holds for the rest of the PR. The
+majority is a reading off one PR and not a derived constant: move it if a second PR says otherwise,
+but move it with the count that made you.
 
 Once the predicate holds, the instrument's scope is closed: a finding that names a defect in what is
 there is fixed, and a finding asking for a **new** mechanism — one more counter, one more reason
@@ -399,7 +404,7 @@ window, and the rule exists so the decision belongs to the two numbers rather th
 out of patience first.
 
 **What it buys, replayed over the PR that produced it: not a shorter review.** The trigger fires at
-round five — the answer had not moved and three of the first five commits were already modifying
+the fifth commit — the answer had not moved and three of the first five were already modifying
 their predecessors' lines — and the terminal condition is never reached, because every round from
 five to sixteen named a defect in surface that existed. Two remedies would have been smaller and ten
 would have been unchanged: **sixteen rounds either way.** What the rule actually moves is earlier
