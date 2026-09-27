@@ -326,9 +326,10 @@ git blame --porcelain -L<start>,<end> <fix>^ -- <file>   # which commit introduc
 
 **Compute both numbers at round five and at every round after, and write them down**: has the
 deliverable's answer moved since the first commit, and how many rounds have gone on surface the
-review itself added. Until they are on the page, *"this is past the point of positive return"* is a
-feeling and escalating it asks the user to arbitrate a hunch. Once they are on the page it is not a
-judgement call at all, and does not need escalating.
+review itself added. They are not kept as diagnostics: they are the predicate the freeze below is
+gated on, and nothing else in this section decides. Until they are on the page, *"this is past the
+point of positive return"* is a feeling and escalating it asks the user to arbitrate a hunch. Once
+they are on the page it is not a judgement call at all, and does not need escalating.
 
 **What the trigger does not license is waving findings through, and this PR is the proof.** By round
 ten the answer had not moved for ten rounds and the loop looked spent. **Round 15 then found that
@@ -341,13 +342,24 @@ and a guard handed a subset of the inputs it promised. So a rule that stops on r
 *"the result stopped moving"*, ships a tool that overwrites its input. The stop is never on
 **reading** findings, and never on fixing a defect in code that already exists.
 
-**Freeze the surface instead.** Once an instrument has answered the question it was built to answer,
-its scope is closed: a finding that names a defect in what is there is fixed, and a finding asking
-for a **new** mechanism — one more counter, one more reason field, one more paragraph stating one
-more limitation — is declined **by scope**, with the reason in that round's commit if one is being
-made and said out loud if not. That converges on the number that matters, because new surface is
-exactly what those eleven commits were re-reviewing. It applies to an instrument built to answer a
-question; on shipped server code, new surface may be the deliverable and this is the wrong rule.
+**Freeze the surface when the two numbers say so, and not before.** The predicate is both halves at
+once: the deliverable's answer has not moved since the first commit, **and** more than half the
+rounds so far have modified lines an earlier round introduced. Either half alone is ordinary review
+— a still-moving answer means the artifact has not converged and new surface is legitimate, while
+churn with no repeat-modification is a review finding real defects in the original, which is it
+working. On #393 the pair first holds at round **five** (3 of 5) and holds at every round after (11
+of 17); a two-round PR never reaches it. **Latch it** — the ratio can fall back under half after a
+run of rounds that touch nothing earlier, and a freeze that flickers is worse than either state, so
+once it holds it holds for the rest of the PR. The majority is a reading off one PR and not a
+derived constant: move it if a second PR says otherwise, but move it with the count that made you.
+
+Once the predicate holds, the instrument's scope is closed: a finding that names a defect in what is
+there is fixed, and a finding asking for a **new** mechanism — one more counter, one more reason
+field, one more paragraph stating one more limitation — is declined **by scope**, with the reason in
+that round's commit if one is being made and said out loud if not. That converges on the number that
+matters, because new surface is exactly what those eleven commits were re-reviewing. It applies to
+an instrument built to answer a question; on shipped server code, new surface may be the deliverable
+and this is the wrong rule.
 
 **A finding can be both, and then the remedy is to retract the claim rather than build machinery to
 earn it.** Rounds 9 and 10 of that PR each named a real defect in existing behaviour — a
