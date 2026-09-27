@@ -85,6 +85,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was left as found: both settings reverted, the two pinned checkpoints intact, the three this work
   created removed, and the pinned VBS capture re-read afterwards to the same landmarks.
 
+- **The provider crash that arm 4 turned up is now a report that can be sent as it stands**, in
+  `docs/secure-kernel/vmsavedstatedumpprovider-crash.md`, with
+  `tools/vmsavedstate_load_probe.py` as a twelve-line repro that calls one export and names no VM.
+  Writing it up moved three things the arm had left open. The repro crashes at the **same fault
+  offset** `0xD569` from CPython as from this server's Rust binary — two hosts sharing nothing but the
+  DLL, which is what makes the fault the provider's and deterministic rather than a property of
+  either caller. The trigger is **specific**, and a control matrix is what says so: the same call
+  *refuses* 4 MiB of random bytes, a truncated real capture, and one with its first 512 bytes zeroed,
+  all three with a clean `0x80070570` (`ERROR_FILE_CORRUPT`) — so the parser has a rejection path and
+  the encrypted case is simply not on it. And **"encrypted" is now a measurement** rather than
+  Hyper-V's claim, which the arm's own caveat admitted it was not: the encrypted and plaintext
+  captures share the container magic `14 20 28 01` and the field at `+0x08`, while payload entropy is
+  **8.000** bits/byte against **7.246** — a well-formed container whose contents the provider has no
+  key for, which is the case that should have produced a refusal. Reported as a crash and not as a
+  memory-safety vulnerability: `0xC0000409` is the corruption check firing, and nothing here fed it a
+  crafted capture. What remains untested is written down too — no crafted input, one SDK version and
+  architecture, Shielded VMs and the `.bin`/`.vsv` pair untried, and `Apply-VMSnapshot` never run
+  against the encrypted capture.
+
 - **A guest's Secure Kernel is readable from a Hyper-V checkpoint, with no driver and nothing
   signed.** `FOLLOWUPS.md` item 103's first gate, S0, asked whether a driver-free memory source
   contains VTL1 pages -- a question about *how much setup a user needs*, since the live route H0-H4
