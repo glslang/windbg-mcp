@@ -53,6 +53,24 @@ use windows_sys::core::{PCSTR, PCWSTR, PWSTR};
 
 use crate::sk::{Gpa, GuestShape, PAGE, PagingMode, RawSource, ReadFailure};
 
+/// `VM_SAVED_STATE_DUMP_E_VA_NOT_MAPPED`, the provider's answer for an address nothing maps.
+///
+/// Recognised by value so that *"nothing maps that"* stays distinguishable from *"the call
+/// failed"* — see [`TranslateFailure`].
+const VA_NOT_MAPPED: i32 = 0xC037_0505u32 as i32;
+
+/// Why the provider would not translate an address.
+///
+/// Two answers, kept apart for the same reason every other failure in this module is: the first is
+/// the oracle **answering**, the second is the oracle being **unavailable**. Folding the second into
+/// the first turns a provider error into a disagreement with our own walk — evidence produced by a
+/// call that produced none.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum TranslateFailure {
+    NotMapped,
+    Failed(String),
+}
+
 /// The provider's opaque instance handle. **Never fabricated**: an S0 experiment that passed one it
 /// had not been given hung inside the DLL and had to be killed.
 type Handle = *mut c_void;
@@ -557,23 +575,26 @@ impl Capture<'_> {
         }
     }
 
-    /// The provider's **own** virtual-to-physical translation for the VTL it was forced to.
+    /// The provider's own virtual-to-physical translation for the VTL it was forced to.
     ///
     /// Not used by the decode: it is the free differential oracle S0 found, and it is not our code.
     /// A walk that agrees with it on an address has been checked against something independent.
-    pub(crate) fn translate(&self, va: u64) -> Result<Gpa, String> {
+    pub(crate) fn translate(&self, va: u64) -> Result<Gpa, TranslateFailure> {
         let mut gpa = 0u64;
         let mut unmapped = 0u64;
         let hr = unsafe { (self.api.translate)(self.handle, self.vp, va, &mut gpa, &mut unmapped) };
+        if hr == VA_NOT_MAPPED {
+            return Err(TranslateFailure::NotMapped);
+        }
         if hr < 0 {
-            return Err(hresult(hr));
+            return Err(TranslateFailure::Failed(hresult(hr)));
         }
         if unmapped != 0 {
             // Measured on this provider, an unmapped VA fails outright with 0xC0370505 and a mapped
             // one reports an unmapped span of zero, so this is unreachable here. Kept because the
             // alternative is depending on that, and what it would let through is the worst kind: a
             // zero-initialised GPA read as a valid mapping, feeding page 0's bytes into a decode.
-            return Err(format!("unmapped for {unmapped:#X} bytes"));
+            return Err(TranslateFailure::NotMapped);
         }
         Ok(Gpa(gpa))
     }

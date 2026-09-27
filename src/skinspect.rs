@@ -19,23 +19,39 @@
 //! page of `securekernel.exe` is offered to both, and a page the provider maps that the walk does
 //! not is counted as a miss on our side.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::savedstate::{Capture, CaptureFiles, Kit, Provider};
+use crate::savedstate::{Capture, CaptureFiles, Kit, Provider, TranslateFailure};
 use crate::sk::{self, Gva, Landmarks, NotWalkable, PAGE, Reader};
 
 pub(crate) const INSPECT_FLAG: &str = "--sk-inspect";
 
+/// Which capture to read, as **one** value.
+///
+/// Three independent `Option`s were the shape that let `--vm` and `--vmrs` both be given and one of
+/// them silently win, which is what the two matches on them disagreeing would eventually have cost:
+/// a report about a different capture than the caller named. Parsing resolves the choice once, and
+/// nothing downstream has a preference to get wrong.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CaptureSpec {
+    Vm {
+        name: String,
+        snapshot: Option<String>,
+    },
+    Vmrs(PathBuf),
+    /// The older pair, which is selected here and — on this bench — called by nothing.
+    Pair {
+        bin: PathBuf,
+        vsv: PathBuf,
+    },
+}
+
 /// What to read, and what to compare it against.
 #[derive(Debug)]
 struct Request {
-    vm: Option<String>,
-    snapshot: Option<String>,
-    vmrs: Option<PathBuf>,
-    bin: Option<PathBuf>,
-    vsv: Option<PathBuf>,
+    capture: CaptureSpec,
     image: PathBuf,
     kit: Option<PathBuf>,
     kit_version: Option<String>,
@@ -43,6 +59,73 @@ struct Request {
     vtl: u8,
     cross_check: bool,
     json: Option<PathBuf>,
+}
+
+/// Every file this run reads, and the only way to write the report.
+///
+/// **The write goes through the thing that holds the inputs**, so a report cannot be written without
+/// the check having been made — the half-version is not expressible. That shape is the lesson from
+/// S0's probe rather than caution: `--json` naming the capture truncated it and wrote the report
+/// over it (round 15 there), and the guard added for it was then found to have been handed four of
+/// the six input paths (round 16). Here a path becomes an input by being *added*, and additions
+/// happen where the path is first known.
+struct Inputs {
+    paths: Vec<PathBuf>,
+}
+
+impl Inputs {
+    fn new() -> Inputs {
+        Inputs { paths: Vec::new() }
+    }
+
+    fn add(&mut self, path: &Path) {
+        self.paths.push(path.to_path_buf());
+    }
+
+    /// Refuse an output that names any input, before anything is written.
+    ///
+    /// Compared by *identity* rather than by spelling: a relative path, a different case and a
+    /// trailing `.\` all name the same file on Windows and would each pass a string comparison.
+    fn refuse_if_output_is_an_input(&self, output: &Path) -> Result<()> {
+        let target = identity(output);
+        for input in &self.paths {
+            if identity(input) == target {
+                bail!(
+                    "--json {} names an input this run reads ({}); writing the report there would \
+                     destroy it",
+                    output.display(),
+                    input.display()
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Write the report, having refused every aliasing output first.
+    fn write_report(&self, output: &Path, bytes: &[u8]) -> Result<()> {
+        self.refuse_if_output_is_an_input(output)?;
+        std::fs::write(output, bytes).with_context(|| format!("writing {}", output.display()))
+    }
+}
+
+/// A path reduced to something two spellings of one file agree on.
+///
+/// `canonicalize` for a file that exists; for one that does not — which the output usually is — the
+/// parent is canonicalized and the file name appended, so a not-yet-created report in the same
+/// directory as an input still compares equal to it. Falls back to the path as given, lowercased,
+/// when even the parent cannot be resolved: a comparison that cannot be made must not silently
+/// answer "different".
+fn identity(path: &Path) -> String {
+    let resolved = std::fs::canonicalize(path).ok().or_else(|| {
+        let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
+        let name = path.file_name()?;
+        Some(std::fs::canonicalize(parent).ok()?.join(name))
+    });
+    resolved
+        .unwrap_or_else(|| path.to_path_buf())
+        .display()
+        .to_string()
+        .to_lowercase()
 }
 
 fn usage() -> String {
@@ -55,12 +138,9 @@ fn usage() -> String {
 }
 
 fn parse(args: &[String]) -> Result<Request> {
+    let (mut vm, mut snapshot, mut vmrs, mut bin, mut vsv) = (None, None, None, None, None);
     let mut request = Request {
-        vm: None,
-        snapshot: None,
-        vmrs: None,
-        bin: None,
-        vsv: None,
+        capture: CaptureSpec::Vmrs(PathBuf::new()),
         image: PathBuf::new(),
         kit: None,
         kit_version: None,
@@ -81,11 +161,11 @@ fn parse(args: &[String]) -> Result<Request> {
                 .ok_or_else(|| anyhow::anyhow!("{flag} needs a value\n{}", usage()))
         };
         match flag {
-            "--vm" => request.vm = Some(value()?),
-            "--snapshot" => request.snapshot = Some(value()?),
-            "--vmrs" => request.vmrs = Some(PathBuf::from(value()?)),
-            "--bin" => request.bin = Some(PathBuf::from(value()?)),
-            "--vsv" => request.vsv = Some(PathBuf::from(value()?)),
+            "--vm" => vm = Some(value()?),
+            "--snapshot" => snapshot = Some(value()?),
+            "--vmrs" => vmrs = Some(PathBuf::from(value()?)),
+            "--bin" => bin = Some(PathBuf::from(value()?)),
+            "--vsv" => vsv = Some(PathBuf::from(value()?)),
             "--image" => request.image = PathBuf::from(value()?),
             "--kit" => request.kit = Some(PathBuf::from(value()?)),
             "--kit-version" => request.kit_version = Some(value()?),
@@ -106,25 +186,91 @@ fn parse(args: &[String]) -> Result<Request> {
             usage()
         );
     }
-    if request.vm.is_none()
-        && request.vmrs.is_none()
-        && (request.bin.is_none() || request.vsv.is_none())
-    {
-        bail!(
+    // **Exactly one** capture form, named as a set rather than resolved by precedence: giving two
+    // is a caller who means something this cannot do, and picking one of them would analyse a
+    // capture they did not ask for.
+    let mut forms: Vec<&str> = Vec::new();
+    if vm.is_some() {
+        forms.push("--vm");
+    }
+    if vmrs.is_some() {
+        forms.push("--vmrs");
+    }
+    if bin.is_some() || vsv.is_some() {
+        forms.push("--bin/--vsv");
+    }
+    match forms.as_slice() {
+        [] => bail!(
             "name a capture: --vm, --vmrs, or --bin with --vsv\n{}",
+            usage()
+        ),
+        [_] => {}
+        several => bail!(
+            "name one capture, not {}: {}\n{}",
+            several.len(),
+            several.join(" and "),
+            usage()
+        ),
+    }
+    request.capture = match (vm, vmrs, bin, vsv) {
+        (Some(name), _, _, _) => CaptureSpec::Vm { name, snapshot },
+        (None, Some(path), _, _) => CaptureSpec::Vmrs(path),
+        (None, None, Some(bin), Some(vsv)) => CaptureSpec::Pair { bin, vsv },
+        // The pair is two files and one of them alone is a usage error, not a capture that fails to
+        // load inside the provider.
+        (None, None, bin, _) => bail!(
+            "--bin and --vsv go together; {} was given without the other\n{}",
+            if bin.is_some() { "--bin" } else { "--vsv" },
+            usage()
+        ),
+    };
+    if !matches!(request.capture, CaptureSpec::Vm { .. }) && request.snapshot_was_given(args) {
+        bail!(
+            "--snapshot names a checkpoint of a --vm, and no --vm was given\n{}",
             usage()
         );
     }
     Ok(request)
 }
 
+impl Request {
+    /// Whether `--snapshot` appeared, which only means something beside `--vm`.
+    ///
+    /// Read off the arguments rather than kept in a field: once the capture is one value, a snapshot
+    /// belonging to no VM has nowhere to live, and silently ignoring it would be the same class of
+    /// defect as preferring one selector over another.
+    fn snapshot_was_given(&self, args: &[String]) -> bool {
+        args.iter().any(|arg| arg == "--snapshot")
+    }
+}
+
 pub(crate) fn run(args: &[String]) -> Result<()> {
     let request = parse(args)?;
+    let mut inputs = Inputs::new();
+    inputs.add(&request.image);
+    // Named before they are read, so a `--json` aliasing one is refused before the analysis rather
+    // than after it — the file a `--vmrs` names is the caller's capture, and it is irreplaceable.
+    match &request.capture {
+        CaptureSpec::Vm { .. } => {}
+        CaptureSpec::Vmrs(path) => inputs.add(path),
+        CaptureSpec::Pair { bin, vsv } => {
+            inputs.add(bin);
+            inputs.add(vsv);
+        }
+    }
+    if let Some(json) = &request.json {
+        inputs.refuse_if_output_is_an_input(json)?;
+    }
     // Before the provider is touched: a typo in `--image` must be a refusal rather than a failure
     // three minutes into a decode that has already read a capture.
     let disk = sk::DiskImage::open(&request.image).map_err(|e| anyhow::anyhow!(e))?;
     let kit = Kit::find(request.kit.as_deref(), request.kit_version.as_deref())
         .map_err(|e| anyhow::anyhow!(e))?;
+    inputs.add(&kit.dll);
+    inputs.add(&kit.header);
+    if let Some(json) = &request.json {
+        inputs.refuse_if_output_is_an_input(json)?;
+    }
     println!("kit        {} ({})", kit.version, kit.dll.display());
     println!(
         "image      {} ({} bytes, {} sections, timestamp {:#010X}, SizeOfImage {:#X})",
@@ -135,16 +281,21 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         disk.identity.size_of_image
     );
     let provider = Provider::load(&kit).map_err(|e| anyhow::anyhow!(e))?;
-    let files = match (&request.vm, &request.vmrs, &request.bin, &request.vsv) {
-        (Some(vm), _, _, _) => provider
-            .locate(vm, request.snapshot.as_deref())
+    let files = match &request.capture {
+        CaptureSpec::Vm { name, snapshot } => provider
+            .locate(name, snapshot.as_deref())
             .map_err(|e| anyhow::anyhow!(e))?,
-        (None, Some(vmrs), _, _) => CaptureFiles::vmrs(vmrs),
-        (None, None, Some(bin), Some(vsv)) => CaptureFiles::pair(bin, vsv),
-        _ => bail!("no capture files"),
+        CaptureSpec::Vmrs(vmrs) => CaptureFiles::vmrs(vmrs),
+        CaptureSpec::Pair { bin, vsv } => CaptureFiles::pair(bin, vsv),
     };
     for path in files.paths() {
         println!("capture    {path}");
+        // Hyper-V answered with these, so they were not in the list above. A `--json` naming one is
+        // still a report written over a capture.
+        inputs.add(Path::new(path));
+    }
+    if let Some(json) = &request.json {
+        inputs.refuse_if_output_is_an_input(json)?;
     }
     let capture = provider
         .open(&files, request.vp, request.vtl)
@@ -158,9 +309,9 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
             // one rather than as an error with a backtrace.
             println!("\nnot walkable: {}", refusal(&why));
             if let Some(path) = &request.json {
-                std::fs::write(
+                inputs.write_report(
                     path,
-                    serde_json::to_vec_pretty(&serde_json::json!({
+                    &serde_json::to_vec_pretty(&serde_json::json!({
                         "capture": files.paths(),
                         "walkable": false,
                         "reason": refusal(&why),
@@ -172,7 +323,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         }
     };
     report_landmarks(&landmarks);
-    let differential = differential(&capture, &landmarks);
+    let differential = differential(|va| capture.translate(va), &landmarks);
     if let Some(sampled) = &differential {
         println!(
             "\noracle     {} page(s) of the image offered to both: {} agree, {} the provider maps \
@@ -187,8 +338,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     }
     if let Some(path) = &request.json {
         let json = as_json(&files, &landmarks, differential.as_ref());
-        std::fs::write(path, serde_json::to_vec_pretty(&json)?)
-            .with_context(|| format!("writing {}", path.display()))?;
+        inputs.write_report(path, &serde_json::to_vec_pretty(&json)?)?;
         println!("json       {}", path.display());
     }
     Ok(())
@@ -388,20 +538,70 @@ fn report_landmarks(landmarks: &Landmarks) {
 struct Differential {
     offered: u64,
     agree: u64,
+    disagree: u64,
     provider_only: u64,
     walk_only: u64,
+    /// Addresses the oracle could not answer for **at all**, which is not a mapping difference and
+    /// must never be counted as one: an unavailable oracle produces no evidence about the walk.
+    provider_failed: u64,
+    first_provider_error: Option<(u64, String)>,
     disagreement: Option<(u64, u64, u64)>,
 }
 
-fn differential(capture: &Capture, landmarks: &Landmarks) -> Option<Differential> {
+/// What one address says about the walk and the oracle together.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Outcome {
+    Agree,
+    Disagree {
+        ours: u64,
+        theirs: u64,
+    },
+    ProviderOnly,
+    WalkOnly,
+    /// The oracle could not answer. **Its own outcome**, because an oracle that failed is not a
+    /// walk that was wrong — this arm is what the two `None`s used to be folded into.
+    ProviderFailed(String),
+    NeitherMaps,
+}
+
+/// Classify one address. The **only** place the two answers are compared.
+///
+/// Extracted so the rule is testable on its own line: the defect this replaced was in the
+/// comparison itself, and a test that drove a whole capture could not reach it.
+fn classify(ours: Option<u64>, theirs: Result<sk::Gpa, TranslateFailure>) -> Outcome {
+    match (ours, theirs) {
+        (_, Err(TranslateFailure::Failed(why))) => Outcome::ProviderFailed(why),
+        (Some(ours), Ok(theirs)) if ours == theirs.0 => Outcome::Agree,
+        (Some(ours), Ok(theirs)) => Outcome::Disagree {
+            ours,
+            theirs: theirs.0,
+        },
+        (None, Ok(_)) => Outcome::ProviderOnly,
+        (Some(_), Err(TranslateFailure::NotMapped)) => Outcome::WalkOnly,
+        (None, Err(TranslateFailure::NotMapped)) => Outcome::NeitherMaps,
+    }
+}
+
+/// The walk against a translator, page by page over the identified image's own range.
+///
+/// Takes the translator as a parameter rather than a [`Capture`] so the accounting can be tested
+/// with no capture, no provider and no VM — including the case that matters most here, an oracle
+/// that fails.
+fn differential(
+    translate: impl Fn(u64) -> Result<sk::Gpa, TranslateFailure>,
+    landmarks: &Landmarks,
+) -> Option<Differential> {
     let found = landmarks.identified.as_ref()?;
     let base = found.candidate.va.0;
     let size = found.candidate.identity.size_of_image as u64;
     let mut result = Differential {
         offered: 0,
         agree: 0,
+        disagree: 0,
         provider_only: 0,
         walk_only: 0,
+        provider_failed: 0,
+        first_provider_error: None,
         disagreement: None,
     };
     let mut offset = 0u64;
@@ -409,16 +609,22 @@ fn differential(capture: &Capture, landmarks: &Landmarks) -> Option<Differential
         let va = base + offset;
         offset += PAGE;
         result.offered += 1;
-        let theirs = capture.translate(va).ok().map(|gpa| gpa.0);
         let ours = landmarks.space.translate(Gva(va)).map(|gpa| gpa.0);
-        match (ours, theirs) {
-            (Some(ours), Some(theirs)) if ours == theirs => result.agree += 1,
-            (Some(ours), Some(theirs)) => {
+        // One classification site, so the counting below cannot disagree with the rule above.
+        match classify(ours, translate(va)) {
+            Outcome::Agree => result.agree += 1,
+            Outcome::Disagree { ours, theirs } => {
+                result.disagree += 1;
                 result.disagreement = result.disagreement.or(Some((va, ours, theirs)));
             }
-            (None, Some(_)) => result.provider_only += 1,
-            (Some(_), None) => result.walk_only += 1,
-            (None, None) => {}
+            Outcome::ProviderOnly => result.provider_only += 1,
+            Outcome::WalkOnly => result.walk_only += 1,
+            Outcome::ProviderFailed(why) => {
+                result.provider_failed += 1;
+                result.first_provider_error =
+                    result.first_provider_error.take().or(Some((va, why)));
+            }
+            Outcome::NeitherMaps => {}
         }
     }
     Some(result)
@@ -494,8 +700,13 @@ fn as_json(
         "oracle": differential.map(|d| serde_json::json!({
             "offered": d.offered,
             "agree": d.agree,
+            "disagree": d.disagree,
             "provider_only": d.provider_only,
             "walk_only": d.walk_only,
+            "provider_failed": d.provider_failed,
+            "first_provider_error": d.first_provider_error.as_ref().map(|(va, why)| {
+                serde_json::json!({ "va": format!("{va:#X}"), "reason": why })
+            }),
             "first_disagreement": d.disagreement.map(|(va, ours, theirs)| serde_json::json!({
                 "va": format!("{va:#X}"),
                 "walk": format!("{ours:#X}"),
@@ -553,6 +764,123 @@ mod tests {
     }
 
     #[test]
+    fn two_capture_selectors_are_a_usage_error_rather_than_one_of_them_winning() {
+        // `--vm` and `--vmrs` together used to resolve by the order of a match arm, so the caller
+        // got a report about a capture they had not named.
+        let args: Vec<String> = ["--image", "sk.exe", "--vm", "Lab", "--vmrs", "c.vmrs"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let error = parse(&args).expect_err("two forms");
+        assert!(
+            error.to_string().contains("name one capture, not 2"),
+            "{error}"
+        );
+        assert!(error.to_string().contains("--vm and --vmrs"), "{error}");
+    }
+
+    #[test]
+    fn a_snapshot_with_no_vm_is_refused_rather_than_ignored() {
+        let args: Vec<String> = ["--image", "sk.exe", "--vmrs", "c.vmrs", "--snapshot", "S0"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let error = parse(&args).expect_err("a snapshot belongs to a vm");
+        assert!(
+            error.to_string().contains("--snapshot names a checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_report_refuses_to_be_written_over_an_input_however_the_path_is_spelled() {
+        // S0's probe truncated a capture this way and wrote the report over it, and the guard added
+        // for it was then found to have been given four of the six input paths.
+        let dir = std::env::temp_dir().join("windbg-mcp-sk-inspect-alias");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let capture = dir.join("capture.vmrs");
+        std::fs::write(&capture, b"not really a capture").expect("write input");
+        let mut inputs = Inputs::new();
+        inputs.add(&capture);
+
+        assert!(
+            inputs.refuse_if_output_is_an_input(&capture).is_err(),
+            "the same path"
+        );
+        // The same file under a different spelling: case, and a `.\` hop through the directory.
+        let shouty = dir.join("CAPTURE.VMRS");
+        assert!(
+            inputs.refuse_if_output_is_an_input(&shouty).is_err(),
+            "case"
+        );
+        let hopped = dir.join(".").join("capture.vmrs");
+        assert!(
+            inputs.refuse_if_output_is_an_input(&hopped).is_err(),
+            "a . component"
+        );
+        // And the **write** refuses it too, which is the line the shipped defect was on: a guard
+        // that exists and is not called is the same file destroyed.
+        assert!(
+            inputs.write_report(&capture, b"{}").is_err(),
+            "the write must refuse it"
+        );
+        assert_eq!(
+            std::fs::read(&capture).expect("input survives the refused write"),
+            b"not really a capture"
+        );
+        // And a report beside it is fine, including one that does not exist yet.
+        let report = dir.join("report.json");
+        inputs
+            .refuse_if_output_is_an_input(&report)
+            .expect("a new file beside the input");
+        inputs.write_report(&report, b"{}").expect("write");
+        assert_eq!(
+            std::fs::read(&capture).expect("input survives"),
+            b"not really a capture",
+            "the input was modified"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn an_oracle_that_could_not_answer_is_not_a_mapping_disagreement() {
+        // The defect: `.ok()` turned a failed `GuestVirtualAddressToPhysicalAddress` into "no
+        // mapping", so a page the walk *did* map was counted as the walk and the provider
+        // disagreeing — evidence manufactured out of a call that produced none.
+        let failed = classify(
+            Some(0x1000),
+            Err(TranslateFailure::Failed("hresult 0x80070057".into())),
+        );
+        assert_eq!(failed, Outcome::ProviderFailed("hresult 0x80070057".into()));
+        // And it must not become one when the walk has no mapping either.
+        assert!(matches!(
+            classify(
+                None,
+                Err(TranslateFailure::Failed("hresult 0x80004005".into()))
+            ),
+            Outcome::ProviderFailed(_)
+        ));
+        // The oracle answering "nothing maps that" is a different outcome and stays one.
+        assert_eq!(
+            classify(Some(0x1000), Err(TranslateFailure::NotMapped)),
+            Outcome::WalkOnly
+        );
+        assert_eq!(
+            classify(None, Err(TranslateFailure::NotMapped)),
+            Outcome::NeitherMaps
+        );
+        assert_eq!(classify(Some(0x2000), Ok(sk::Gpa(0x2000))), Outcome::Agree);
+        assert_eq!(
+            classify(Some(0x2000), Ok(sk::Gpa(0x3000))),
+            Outcome::Disagree {
+                ours: 0x2000,
+                theirs: 0x3000
+            }
+        );
+        assert_eq!(classify(None, Ok(sk::Gpa(0x4000))), Outcome::ProviderOnly);
+    }
+
+    #[test]
     fn a_bin_without_a_vsv_is_not_a_capture() {
         // The older pair is two files, and one of them alone is a usage error rather than a load
         // that fails inside the provider.
@@ -566,6 +894,19 @@ mod tests {
             .map(|s| (*s).to_string())
             .collect();
         let error = parse(&args).expect_err("--vsv missing");
-        assert!(error.to_string().contains("name a capture"), "{error}");
+        // It names the missing half rather than the generic "name a capture" it used to: with the
+        // capture resolved to one value, half a pair is a distinguishable mistake.
+        assert!(
+            error.to_string().contains("--bin and --vsv go together")
+                && error.to_string().contains("--bin was given"),
+            "{error}"
+        );
+        // And the same the other way round.
+        let args: Vec<String> = ["--image", "sk.exe", "--vsv", "a.vsv"]
+            .iter()
+            .map(|s| (*s).to_string())
+            .collect();
+        let error = parse(&args).expect_err("--bin missing");
+        assert!(error.to_string().contains("--vsv was given"), "{error}");
     }
 }
