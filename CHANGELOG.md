@@ -75,9 +75,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attributes the failure to the setting rather than to the capture being new, and is the whole rigour
   of the arm. So the mitigation holds and the verdict stands, **and the arm turned up a different
   defect worth reporting**: a documented SDK API crashing on an input Hyper-V itself wrote, which is
-  a robustness and availability bug rather than a boundary bypass. Reported as nothing more than
-  that: a `__fastfail` is a deliberate kill so it shows no corruption, and the `FAST_FAIL_*` subcode
-  that would say which check fired is the first exception parameter and was not captured. Limits
+  a robustness and availability bug rather than a boundary bypass. Reported with a named cause, measured
+  under this server's own debugger: subcode **`0x7 FAST_FAIL_FATAL_APP_EXIT`** — the CRT's `abort` —
+  reached from `gsl::details::terminate` under
+  `PartitionStateParser::GetPartitionStateVirtualProcessors`, so it is a Guidelines Support Library
+  contract violation while parsing the partition state rather than a corruption check. Limits
   stated rather than glossed: the capture is unreadable *by this provider*, which is not the same as measured
   ciphertext, and the encrypted checkpoint was never applied, so Hyper-V reading what it wrote is an
   inference. Shielded VMs are untested. The third reportable case needs nobody's involvement and is

@@ -2150,12 +2150,15 @@ measurement rather than an assumption. Shielded VMs are untested.
 
 **And the arm found something it was not looking for, which is the part worth reporting.** A
 **documented SDK API fast-fails on an input Microsoft's own hypervisor produced** — not a refusal,
-not an `HRESULT`, a crash. It is reported as a robustness and availability defect and nothing more:
-a `__fastfail` is a *deliberate* kill, so it shows no memory corruption — and without the
-`FAST_FAIL_*` subcode, which is the first exception parameter and was not captured, it does not rule
-one out either. This entry said "the corruption was *detected*" for one commit, reading
-`0xC0000409`'s name as its meaning; `src/fault.rs`'s own `STATUS_STACK_BUFFER_OVERRUN` comment exists
-to stop exactly that, and review caught it by citing it. Nothing here fed it a *crafted* capture. That is the `vmsavedstatedumpprovider.dll` bug to raise, and it is a different
+not an `HRESULT`, a crash. **Measured under this server's own debugger**: subcode
+**`0x7 FAST_FAIL_FATAL_APP_EXIT`**, the CRT's `abort`, reached from
+`gsl::details::terminate` under `PartitionStateParser::GetPartitionStateVirtualProcessors` inside
+`LoadSavedStateFile` — a **Guidelines Support Library contract violation** while parsing the
+partition state, not a corruption check. So it is a robustness defect with a named cause: a parser
+asserted on input it has no key for instead of returning an error. This entry said "the corruption
+was *detected*" for one commit, reading `0xC0000409`'s name as its meaning; `src/fault.rs`'s own
+`STATUS_STACK_BUFFER_OVERRUN` comment exists to stop exactly that, review caught it by citing it, and
+the measurement then settled it. That is the `vmsavedstatedumpprovider.dll` bug to raise, and it is a different
 thing from the VBS-boundary question the arm was run to answer — which came back negative, as the
 verdict says.
 
