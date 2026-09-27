@@ -99,6 +99,14 @@ use crate::sk::{DiskImage, Gva};
 /// separate roles with separate budgets, and nothing here needs them to agree.
 const LOAD_WAIT_MS: u32 = 60_000;
 
+/// A symbol name no image has, asked for once to make the engine load symbols.
+///
+/// The *answer* is discarded — what the call is for is the side effect, since a deferred module
+/// resolves on first use and a lookup that finds nothing is a first use like any other. Deliberately
+/// not a plausible name: one that happened to exist would still force the load, but it would make
+/// this read like a query whose result mattered.
+const FORCE_LOAD_PROBE: &str = "__windbg_mcp_force_symbol_load__";
+
 /// Type names asked for, to report whether this PDB answers with a type at all.
 ///
 /// **A finite list cannot prove a PDB carries no types**, and this one is not offered as proof: it
@@ -275,7 +283,29 @@ impl Symbols {
             .reload_symbols(&format!("/f {}", module.image_name))
             .err()
             .map(|e| e.to_string());
-        // Re-read: the kind before the reload is `deferred`, which says nothing.
+        // **And then make the engine look, whatever the reload said.** A *resolving query* is what
+        // settles a deferred module, and one that finds nothing settles it just as well: measured
+        // 2026-09-27, a module reading `symbols: deferred` straight after the open moved to
+        // `symbols: pdb` with its PDB key on a single failing lookup
+        // (`? securekernel!ThisSymbolDoesNotExistAnywhere`, itself `0x80040205`).
+        //
+        // Which is load-bearing rather than tidy, and review found it: narrowing the refusal below
+        // to `None` — round 1 of #399 — left `Deferred` free to load its PDB on the first *landmark*
+        // query, which is after the only `unmatched` check has run. `unmatched` is the one failure
+        // where symbols did load and reading them is worse than having none, so bypassing it would
+        // print another build's names as this build's. And the same window made the reported
+        // provenance a lie in the ordinary case: `kind Deferred` and "no PDB signature" printed
+        // above landmarks that a PDB had just resolved. Forcing the look **collapses** that state
+        // instead of reporting it, which needs no second read and no field saying which one is
+        // current.
+        //
+        // **And the probe is not riding on the reload**, which is the half worth measuring rather
+        // than assuming: with `reload_symbols` not issued at all, the gated test below still reports
+        // `symbols Pdb` with the PDB key and resolves both landmarks. So either alone suffices on
+        // this bench and the pair is what covers a host where one of them does not — the reload
+        // staying because it is the half that yields a *named* error for [`Symbols::reload_error`].
+        let _ = engine.symbol_offset(&format!("{}!{FORCE_LOAD_PROBE}", module.name));
+        // Re-read: the kind before the reload and the probe is `deferred`, which says nothing.
         let module = engine
             .module(&module.name)
             .map_err(|e| SymbolFailure::Open(e.to_string()))?;
@@ -873,6 +903,21 @@ mod tests {
             symbols.symbol_file()
         );
         println!("type probes: {:?}", symbols.type_probes());
+        // **The provenance has to be settled by `open`, not by whatever is asked next.** This is the
+        // inconsistency review found on #399: a `Deferred` module loading its PDB on the first
+        // landmark query would print resolved addresses under a `Deferred` kind and "no PDB
+        // signature", and would skip the `unmatched` check entirely. Asserted as both halves —
+        // nobody-has-looked is gone, and a PDB the engine selected is named — because either alone
+        // could be true while the state was still moving.
+        assert_ne!(
+            symbols.kind(),
+            SymbolKind::Deferred,
+            "open left the module deferred, so the provenance it reports is not yet a fact"
+        );
+        assert!(
+            symbols.pdb().is_some(),
+            "symbols loaded and the engine named no PDB for them"
+        );
 
         // A base the image was certainly not built for, so a resolution that ignored the rebase
         // could not accidentally agree with one that applied it.

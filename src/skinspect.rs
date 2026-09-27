@@ -394,6 +394,33 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let symbols = request
         .symbols
         .then(|| Symbols::open(&request.image, &disk, request.sympath.as_deref()));
+    // The PDB the engine selected is a file this run **read**, discovered only once it had loaded —
+    // so it becomes an input the same way Hyper-V's capture paths do, by being added where it is
+    // first known. Raised by review on #399 as the same defect round 15 of #393 found for the
+    // capture, on a path that did not exist yet when that guard was built.
+    //
+    // **Backing this out does not destroy the PDB on this bench, and the reason is not our code.**
+    // Measured: with the `add` removed, `--json <the loaded PDB>` fails with
+    // `os error 32`, *the process cannot access the file because it is being used by another
+    // process* — DbgEng still holds it. So the finding's stronger form, that the report would
+    // truncate it, is not what happens here. The guard stays anyway, for reasons that do not depend
+    // on an engine's handle: the protection is incidental and would vanish the moment symbols were
+    // released or `symbol_file` named something the engine had closed, and a sharing violation
+    // reported as a failed report-write is the wrong answer to *you named an input* — which this
+    // says before anything is opened for writing.
+    //
+    // A `symbol_file` that is the image path rather than a PDB is possible (an export-only module
+    // names the image), and adding it twice costs nothing: `Inputs` is a list of things not to
+    // write over, not a set of distinct files.
+    if let Some(Ok(opened)) = &symbols {
+        let symbol_file = opened.symbol_file();
+        if !symbol_file.is_empty() {
+            inputs.add(Path::new(symbol_file));
+            if let Some(json) = &request.json {
+                inputs.refuse_if_output_is_an_input(json)?;
+            }
+        }
+    }
     if let Some(opened) = &symbols {
         report_symbols(opened);
     }

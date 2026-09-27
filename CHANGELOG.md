@@ -56,7 +56,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because the two would otherwise fight over whose `dbghelp.dll` the process has, and a failure is
   reported in place rather than ending the run — the control arm is what that is for: against the
   VBS-off twin the symbols load and report normally while the capture refuses the VTL switch with
-  `0xC0370509`, and the report and the JSON keep those apart. `--sk-inspect` also **names the build
+  `0xC0370509`, and the report and the JSON keep those apart. **Symbols are made to load before the
+  provenance is read**, with one deliberately-failing lookup after the forced `.reload /f`: a module
+  left `Deferred` would otherwise load its PDB on the first *landmark* query, after the only
+  `unmatched` check had run — printing another build's names as this build's — and would report `kind
+  Deferred` and "no PDB signature" above addresses that PDB had just resolved. Measured: a deferred
+  module moves to `pdb` with its key on a single failing lookup, and with the reload not issued at all
+  the probe alone still loads it, so the two are independent and the reload stays for its *named*
+  error. **And the PDB the engine selected is an input**, added where it is first known so `--json`
+  cannot name it; the mutation is what says why it is worth having rather than what the finding
+  claimed — backing it out fails with `os error 32` because DbgEng still holds the file, so the
+  protection was incidental and the guard is what turns a sharing violation into *you named an
+  input*. `--sk-inspect` also **names the build
   that produced its report** now, as its first line and in the JSON, because a figure taken from this
   role is a reading of the binary that answered and the tree beside it moves independently; the runs
   above were taken from this change's own working tree, a `-dirty` build over `3552d867`, and
