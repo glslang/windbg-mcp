@@ -2482,6 +2482,15 @@ the capture had no VTL1 must not read like a run where neither half worked.
   a value, so the fix is central and the assertion is a table over every one of them; `--json` is the
   worst of the twelve, since it would have written the report to a file named `--cross-check`.
   Mutation-verified: backing the guard out fails the new test on `--vm` and leaves the old one green.
+- **Round 7 was the fourth on the vouching seam, so the set is now closed rather than extended.** A
+  module the engine reports as `Pdb`/`Dia` while having **no** signature for it was still accepted, so
+  `symbol_offset` results were trusted with nothing having checked which build they came from. Taken —
+  and written as a *requirement on the kind* rather than as a fourth enumerated failure, because the
+  three arms of `Unvouched` are the whole set: the identity says the wrong thing, the engine will not
+  say, or it has none. Any future shape of "no identity" lands in the third without a new arm.
+  `CodeView` and `Sym` keep `None`, those providers genuinely having no signature. Unmeasured like the
+  other refusal arms — this bench only produces `Pdb` with an identity, which is what the gated test
+  asserts, and that assertion is now a ratchet on the refusal rather than a discovery.
 - **The loaded PDB is now an input, and the mutation says the finding's stronger form is wrong.**
   Review also found that `symbol_file()` — a file this run read, discovered only once the engine had
   loaded it — never reached `Inputs`, so `--json` could name it. Taken: it is added where it is first
