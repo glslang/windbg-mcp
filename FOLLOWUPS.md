@@ -2130,7 +2130,8 @@ to walk *from*, and hard-coding the one measured `0x1201000` is not an answer.
 `EncryptStateAndVmMigrationTraffic = $true`, **no VTL1 comes out** — and not because the walk found
 nothing: `LoadSavedStateFile` never returns. The provider **fast-fails**, and the OS names it:
 `windbg-mcp.exe 0.20.0.0`, faulting module **`vmsavedstatedumpprovider.dll 10.0.26100.7705`**,
-exception **`0xC0000409`** (`STATUS_STACK_BUFFER_OVERRUN`), WER event name `BEX64`, fault offset
+exception **`0xC0000409`** — the status every `__fastfail` raises, whose legacy name
+`STATUS_STACK_BUFFER_OVERRUN` is **not** a diagnosis — WER event name `BEX64`, fault offset
 `0xD569`. Measured on **both** guests: the VBS-off control (arm 4a) and the VBS guest (arm 4b),
 the second being the one that has a VTL1 to withhold.
 
@@ -2149,9 +2150,12 @@ measurement rather than an assumption. Shielded VMs are untested.
 
 **And the arm found something it was not looking for, which is the part worth reporting.** A
 **documented SDK API fast-fails on an input Microsoft's own hypervisor produced** — not a refusal,
-not an `HRESULT`, a crash. `0xC0000409` means the corruption was *detected*, so this is a robustness
-and availability defect rather than a demonstrated memory-safety exploit, and nothing here fed it a
-*crafted* capture. That is the `vmsavedstatedumpprovider.dll` bug to raise, and it is a different
+not an `HRESULT`, a crash. It is reported as a robustness and availability defect and nothing more:
+a `__fastfail` is a *deliberate* kill, so it shows no memory corruption — and without the
+`FAST_FAIL_*` subcode, which is the first exception parameter and was not captured, it does not rule
+one out either. This entry said "the corruption was *detected*" for one commit, reading
+`0xC0000409`'s name as its meaning; `src/fault.rs`'s own `STATUS_STACK_BUFFER_OVERRUN` comment exists
+to stop exactly that, and review caught it by citing it. Nothing here fed it a *crafted* capture. That is the `vmsavedstatedumpprovider.dll` bug to raise, and it is a different
 thing from the VBS-boundary question the arm was run to answer — which came back negative, as the
 verdict says.
 
@@ -2194,8 +2198,10 @@ asserting: **turn the knob on and see whether VTL1 still comes out.**
 has to put it back. `Set-VMSecurity -EncryptStateAndVmMigrationTraffic $true` is **refused while the
 VM runs** (measured: *"The SecuritySettingData property cannot be modified because the virtual
 machine is running"*), so the sequence is: graceful shutdown, set the knob, start, take a
-`CheckpointType = Standard` checkpoint, run `windbg-mcp --sk-inspect` against it, then revert the
-knob and restart. A key protector already exists on both guests (5,207 bytes, measured 2026-09-27),
+`CheckpointType = Standard` checkpoint, run `windbg-mcp --sk-inspect` against it, then **shut down a
+second time** to revert the knob, and start again. The revert hits the same running-VM refusal as the
+set, which an earlier draft of this method missed — it is **two** stop/start transitions per guest,
+not one. A key protector already exists on both guests (5,207 bytes, measured 2026-09-27),
 so the knob has one to use and this should need no new key material.
 
 - **Expected pass — the boundary holds:** the provider cannot read the capture at all, and **the
@@ -2204,15 +2210,23 @@ so the knob has one to use and this should need no new key material.
   produce the same "no VTL1" as encryption working, and the first three say nothing. So the file's
   existence and plausible size are checked, and the failure has to come from `LoadSavedStateFile` or
   from the reads — not from the file not being there.
-- **Finding — worth reporting:** the provider loads it and VTL1 is still reachable, meaning the
-  setting does not cover saved state the way its name claims.
-- **The control is already in hand**, and it is what makes either outcome mean something: the *same
-  guest's unencrypted* checkpoint reads end to end (S1's run below). So a capture that will not load
-  after the knob is attributable to the knob.
+- **Finding — worth reporting, and weaker than it looks:** the provider loads it and VTL1 is still
+  reachable. **That alone would not have been the finding**, because this arm runs on the owning host
+  with the VM's key protector available, where a successful read is authorized decryption and says
+  nothing about how the bytes are stored. What would settle *that* is the file: a payload entropy
+  reading, or the same capture read on a host lacking the guardian key. Review raised this against
+  the run, and the run had in fact taken the entropy reading — 8.000 bits/byte against a plaintext
+  capture's 7.246 — so the conclusion stands on the file rather than on the provider.
+- **The control has to be a *fresh* capture of the same workflow**, not the pinned one. An older
+  checkpoint reading fine leaves "this capture is malformed or capture-specific" confounded with
+  "encryption did it", and a named load error does not separate them. The run therefore took a fresh
+  **plaintext** checkpoint of the same guest after reverting the knob and read it with the identical
+  command; this bullet asked only for the pinned one, which review correctly called insufficient.
 - **The arms differ by a boot as well as by the setting**, unavoidably, since the knob needs a power
   cycle. That is why the comparison is *whether it reads at all* rather than a value-for-value one —
   S0 already measured that the `CR3` moves across a boot while the image-relative offsets do not.
-- **Cost:** one power cycle of a lab guest and one ~2 GB checkpoint. The guest must be one whose
+- **Cost:** **two** power cycles of a lab guest — one to set the knob, one to revert it — plus a
+  checkpoint per arm, each a good fraction of the guest's RAM. The guest must be one whose
   in-guest state is expendable, which is a question for whoever owns the bench rather than an
   implementation detail.
 

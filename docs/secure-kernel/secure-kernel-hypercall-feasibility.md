@@ -1432,8 +1432,11 @@ a broken one.
 
 Asked directly, 2026-09-27, because the reasonable reaction to "a checkpoint hands over Secure
 Kernel" is to wonder whether Microsoft should hear about it. **The evidence says this is documented
-behaviour inside the boundary VBS claims, so there is nothing here to report** — and the three cases
-that *would* be reportable are named below, none of them measured yet.
+behaviour inside the boundary VBS claims, so there is nothing here to report about VTL1 reachability
+itself.** Three cases that *would* be reportable are named below, and two of them have since been
+measured: the encryption one came back negative (S0 arm 4), and the **file-ACL one is true on this
+bench** — which is a configuration matter rather than a product defect, but it is also the reason the
+third reading below no longer claims what it used to.
 
 Three readings, the first two measured on this host:
 
@@ -1448,15 +1451,23 @@ Three readings, the first two measured on this host:
 2. **The mitigation for the at-rest half exists and is switched off here.** `Get-VMSecurity` on both
    lab guests: `TpmEnabled True`, **`EncryptStateAndVmMigrationTraffic False`**, `Shielded False`.
    The knob whose job is to encrypt saved state is available and unset; a mitigation being offered
-   is design intent stated out loud. Whether it actually covers VTL1 in a capture is **unmeasured**
-   and is arm 4 below.
+   is design intent stated out loud. **Whether it covers VTL1 in a capture was then measured — arm 4
+   below — and it does.**
 3. **The boundary VBS claims is VTL0 → VTL1 *inside the guest*.** For a guest that is not
    hardware-isolated the host partition is inside the TCB, which this document's own H3 and H4
    demonstrate from the other direction: the same pages were read from a *running* guest with a
-   driver in the root partition. Every route here needs Hyper-V Administrator on the host, which can
-   already read a running guest's RAM and attach a kernel debugger to it. A capture therefore lowers
-   the **setup cost** for a principal already inside the boundary rather than crossing one — which
-   is precisely what S0 was run to measure.
+   driver in the root partition. So a guest's VTL1 is **the host's to protect**, and reading it from
+   the host is not a boundary being crossed — which is what makes the *setup cost* the thing S0 was
+   run to measure.
+
+   **This reading used to say "every route here needs Hyper-V Administrator", and that is false.**
+   The live routes do — H3 and H4 need a driver loaded and the Hyper-V APIs need the role. A
+   **capture is a file**, and the `--vmrs` route needs nothing but read access to it, so the file's
+   ACL is the gate rather than the Hyper-V role. On this bench that ACL is inherited and permissive,
+   which is measured below and is the second reportable case — so the sentence contradicted a
+   measurement three paragraphs later in its own document. What survives is the claim above: the
+   host's TCB contains the guest's VTL1 either way, and who on the host can reach a capture is the
+   operator's ACL to set.
 
 **What the Secure Kernel *base* is worth, separately**, since that is the landmark that prompted the
 question: against the host it was never a secret, and it does not reach VTL0 by this route — a guest
@@ -1476,11 +1487,23 @@ nothing in S0 or S1 looked, and neither should be read as saying they are or are
   attributes the failure to the setting rather than to the capture being new. So the mitigation
   holds and this verdict stands — **and the arm turned up a different defect worth reporting**: a
   documented SDK API crashing on an input Hyper-V itself wrote, which is a robustness and
-  availability bug rather than a boundary bypass (the `0xC0000409` is the corruption being
-  *detected*, and nothing here fed it a crafted capture). Two things it does not establish: the
-  capture is unreadable **by this provider**, which is not the same as measured ciphertext — no
-  entropy reading was taken — and the encrypted checkpoint was never `Apply-VMSnapshot`ed, so
-  Hyper-V's ability to read what it wrote is an inference. Shielded VMs remain untested.
+  availability bug rather than a boundary bypass. It is written up in
+  [`vmsavedstatedumpprovider-crash.md`](vmsavedstatedumpprovider-crash.md), and note what
+  `0xC0000409` does **not** say: it is the status every `__fastfail` raises, so its legacy name
+  (`STATUS_STACK_BUFFER_OVERRUN`) is not a diagnosis and the `FAST_FAIL_*` subcode that would be one
+  was not captured. This file said "the corruption being detected" for one commit, which is the trap
+  `src/fault.rs` exists to stop.
+
+  **What the arm does and does not establish about the file.** The payload *was* measured, which an
+  earlier version of this paragraph denied: the encrypted and plaintext captures share the container
+  magic `14 20 28 01` and the field at `+0x08`, while payload entropy is **8.000** bits/byte against
+  **7.246** — a well-formed container whose body is at maximal entropy. That reading matters more
+  than the provider's behaviour, because the arm ran **on the owning host with the VM's key protector
+  available**: in that context a *successful* read would have been authorized decryption and would
+  have said nothing about how the bytes are stored, so provider-level reachability could never have
+  been the evidence. Still unestablished: the encrypted checkpoint was never `Apply-VMSnapshot`ed, so
+  Hyper-V reading what it wrote is an inference, and Shielded VMs and a capture read from a host
+  *without* the guardian key are both untested.
 - **A principal below Hyper-V Administrator.** Reading a checkpoint needs read access to a *file*,
   not the Hyper-V role — so the file's ACL is the boundary, and **on this bench it is wide open**:
   `D:\Hyper-V\Virtual Machines\Snapshots\<id>.vmrs` (1,984,630,784 bytes) grants

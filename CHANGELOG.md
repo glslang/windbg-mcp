@@ -68,15 +68,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reportable and none is asserted away. **S0 arm 4 ran the interesting one**: with
   `EncryptStateAndVmMigrationTraffic` on, no VTL1 comes out, on the VBS guest as well as on the
   VBS-off control — and it does not come out because `LoadSavedStateFile` never returns. The provider
-  **fast-fails**: `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`), WER `BEX64`, faulting module
+  **fast-fails**: `0xC0000409` — the status every `__fastfail` raises, whose legacy name
+  `STATUS_STACK_BUFFER_OVERRUN` is not a diagnosis — WER `BEX64`, faulting module
   `vmsavedstatedumpprovider.dll 10.0.26100.7705` at offset `0xD569`. A *fresh plaintext* capture of
   the same guest, read minutes later with the identical command, loads normally — which is what
   attributes the failure to the setting rather than to the capture being new, and is the whole rigour
   of the arm. So the mitigation holds and the verdict stands, **and the arm turned up a different
   defect worth reporting**: a documented SDK API crashing on an input Hyper-V itself wrote, which is
-  a robustness and availability bug rather than a boundary bypass — the `0xC0000409` is the
-  corruption being *detected*, and nothing here fed it a crafted capture. Two limits stated rather
-  than glossed: the capture is unreadable *by this provider*, which is not the same as measured
+  a robustness and availability bug rather than a boundary bypass. Reported as nothing more than
+  that: a `__fastfail` is a deliberate kill so it shows no corruption, and the `FAST_FAIL_*` subcode
+  that would say which check fired is the first exception parameter and was not captured. Limits
+  stated rather than glossed: the capture is unreadable *by this provider*, which is not the same as measured
   ciphertext, and the encrypted checkpoint was never applied, so Hyper-V reading what it wrote is an
   inference. Shielded VMs are untested. The third reportable case needs nobody's involvement and is
   true on this bench now: the checkpoint files inherit the data volume's ACL — `BUILTIN\Users:
@@ -89,9 +91,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `docs/secure-kernel/vmsavedstatedumpprovider-crash.md`, with
   `tools/vmsavedstate_load_probe.py` as a twelve-line repro that calls one export and names no VM.
   Writing it up moved three things the arm had left open. The repro crashes at the **same fault
-  offset** `0xD569` from CPython as from this server's Rust binary — two hosts sharing nothing but the
-  DLL, which is what makes the fault the provider's and deterministic rather than a property of
-  either caller. The trigger is **specific**, and a control matrix is what says so: the same call
+  offset** `0xD569` from CPython as from this server's Rust binary — two processes on this host sharing
+  nothing but the DLL, which is what makes the fault the provider's and deterministic rather than a
+  property of either caller, and says nothing about other machines. The trigger is **specific**, and a control matrix is what says so: the same call
   *refuses* 4 MiB of random bytes, a truncated real capture, and one with its first 512 bytes zeroed,
   all three with a clean `0x80070570` (`ERROR_FILE_CORRUPT`) — so the parser has a rejection path and
   the encrypted case is simply not on it. And **"encrypted" is now a measurement** rather than
