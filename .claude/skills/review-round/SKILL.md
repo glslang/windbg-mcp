@@ -52,6 +52,10 @@ against the count you actually worked. Both misses above were invisible in every
 and obvious the moment the totals disagreed — 25 comments against 21 worked. It costs one command
 at the end.
 
+**And reconciling is not the same as continuing.** *The stopping rule* at the end of this file is
+when to stop working rounds at all — a pair of numbers you compute, not a judgement call to hand
+upward.
+
 **Codex is the bot to watch, and CodeRabbit's green is not evidence.** Its check reports `pass` with
 *"Review rate limited"* beside it when it has not reviewed at all. Measured on
 [#349](https://github.com/glslang/windbg-mcp/pull/349): across the PR's eight commits it filed **no
@@ -302,3 +306,51 @@ valid thunk: **a new defect, shipped on a true finding.** The test now sets a ge
 
 The first attempt used their example and failed, which is how it was caught — so write the test from
 the rule, run it, and read a failure as a question about which of the two is wrong.
+
+## The stopping rule: freeze the surface, then stop
+
+**A review loop can feed on its own output, and the tell is not that the findings stopped being
+real.** [#393](https://github.com/glslang/windbg-mcp/pull/393) ran **sixteen rounds and 33
+findings** on one probe whose *answer* never moved: the S0 verdict, the VTL1 `CR3` `0x1201000` and
+all three landmark offsets are identical in the first commit and in the merge, and the documentation
+around them took **115 insertions against 10 deletions** — additive qualification, not a correction.
+What grew was the instrument: **895 → 1,537** lines of probe, **288 → 1,474** lines of test, and 180
+lines of changelog. And of the seventeen remediation commits, **eleven modified lines that an
+earlier commit in the same series had introduced.** That last number is the loop, and it is a
+measurement rather than a mood:
+
+```console
+git diff -U0 <fix>^ <fix> -- <file>                     # the - side ranges this fix touched
+git blame --porcelain -L<start>,<end> <fix>^ -- <file>   # which commit introduced those lines
+```
+
+**Compute both numbers at round five and at every round after, and write them down**: has the
+deliverable's answer moved since the first commit, and how many rounds have gone on surface the
+review itself added. Until they are on the page, *"this is past the point of positive return"* is a
+feeling and escalating it asks the user to arbitrate a hunch. Once they are on the page it is not a
+judgement call at all, and does not need escalating.
+
+**What the trigger does not license is waving findings through, and this PR is the proof.** By round
+ten the answer had not moved for ten rounds and the loop looked spent. **Round 15 then found that
+`--json` could destroy the capture it had just read**, and round 16 found a real defect in round
+15's own guard. Of the last seven rounds, four went on code the review had added *and* two found
+genuine defects, one destructive — so a rule that stops on round count, or on *"the result stopped
+moving"*, ships a tool that overwrites its input. The stop is never on **reading** findings, and
+never on fixing a defect in code that already exists.
+
+**Freeze the surface instead.** Once an instrument has answered the question it was built to answer,
+its scope is closed: a finding that names a defect in what is there is fixed, and a finding asking
+for a **new** mechanism — one more counter, one more reason field, one more paragraph stating one
+more limitation — is declined **by scope**, with the reason in that round's commit if one is being
+made and said out loud if not. That converges on the number that matters, because new surface is
+exactly what those eleven commits were re-reviewing. It applies to an instrument built to answer a
+question; on shipped server code, new surface may be the deliverable and this is the wrong rule.
+
+**Then stop, and do not ask.** The terminal round is the one whose findings are all new-mechanism
+requests and prose preference with no defect in existing surface. Do not request another review
+after it. Report once to whoever is driving the work: rounds worked, findings taken against
+declined, both numbers above, and every finding left unworked with where to find it — so they can
+triage it themselves rather than take your word that nothing is left. **Continuing past that point
+is what needs a reason; stopping does not.** Each further round costs a CI cycle and a context
+window, and the rule exists so the decision belongs to the two numbers rather than to whoever runs
+out of patience first.
