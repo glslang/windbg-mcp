@@ -31,7 +31,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   store or a build whose PDB is not served has only that route. **Three things this settles in the
   negative.** The public `securekernel.pdb` carries **no type information** — `dt securekernel!*`
   lists symbols rather than types, every global prints `= <no type information>`, and four
-  `GetTypeId` probes in the shipped code all answer nothing — so the plan's "symbols **and** types"
+  `GetTypeId` probes in the shipped code all answer `E_NOINTERFACE`, *no such interface supported*,
+  which is the engine declining type queries for this module rather than four names being absent — so the plan's "symbols **and** types"
   is one of the two, and structure walks over VTL1 stay hand-decoded. `SymbolKind::has_type_info`
   must not be the test for that, reading `DEBUG_SYMTYPE_PDB` as private type information where this
   module is `symbols: pdb` with none: the engine does not distinguish a stripped public PDB from a

@@ -76,10 +76,39 @@
 //! structure walks over VTL1 stay hand-decoded the way [`crate::sk`] already does them, and this
 //! module reports what a small [`TYPE_PROBES`] set answered rather than claiming either way.
 //!
+//! **And what the engine says when asked is more specific than "absent", which only showed once the
+//! answer stopped being a `bool`:** every one of the four comes back `E_NOINTERFACE`
+//! (`0x80004002`), *no such interface supported* — the engine declining to service type queries for
+//! this module at all, rather than four names it looked for and did not find. That is a better
+//! corroboration of the claim than a sample of four could be, and it was what the collapsed boolean
+//! was hiding.
+//!
 //! **And `SymbolKind::has_type_info` must not be used to decide it.** That helper reads
 //! `DEBUG_SYMTYPE_PDB` as "exposes private type information", and this image is `symbols: pdb`
 //! with no types at all — the engine does not distinguish a stripped public PDB from a private
 //! one. Asking for a type and seeing what comes back is the only answer.
+//!
+//! # Every engine answer this module turns into a value, and what each does with a failure
+//!
+//! **An engine call that failed is not a negative answer**, and three review rounds on #399 each
+//! found one place that treated it as one — `module_pdb`'s `.ok().flatten()`, `type_id`'s
+//! `is_ok_and`, and `module_symbol_file`'s `unwrap_or_default`. Two were reported and the third came
+//! out of counting, so the list is here rather than the discipline:
+//!
+//! | call | a failure becomes |
+//! |---|---|
+//! | `DebugEngine::new` (panics) | [`SymbolFailure::EngineUnavailable`] |
+//! | `set_symbol_path`, `open_dump`, `modules`, `module`, `module_symbol_file` | [`SymbolFailure::Engine`], naming the step |
+//! | `wait_for_event` | [`SymbolFailure::LoadWait`], or [`SymbolFailure::LoadIncomplete`] for a wait that ended without a stop |
+//! | `module_pdb` | [`SymbolFailure::PdbUnvouched`] with [`Unvouched::NotAsked`] — never "no signature" |
+//! | `reload_symbols` | kept as [`Symbols::reload_error`] and reported; it is not fatal because the probe below may still load symbols |
+//! | `symbol_offset` for [`FORCE_LOAD_PROBE`] | discarded **deliberately**: the call is made for its side effect and no answer is wanted |
+//! | `type_id` | the engine's own message, per probe ([`Symbols::type_probes`]) — never `false` |
+//! | `symbol_offset` for a caller's name | [`ResolveFailure::Unknown`], carrying the engine's message; the name says *did not resolve* rather than *does not exist*, because the two are one failed call to DbgEng |
+//! | `symbol_for` | `None`, which is `dbgscope`'s own contract: an address with no name is the ordinary case and is not a failure |
+//!
+//! Two of those are answers rather than omissions and are the ones to check against before adding a
+//! tenth row: the discarded probe, and `symbol_for`.
 
 use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::path::Path;
@@ -387,7 +416,17 @@ impl Symbols {
         // the success path is a path a `--json` can be pointed at. `unmatched` is the case review
         // named ([`SymbolFailure::file_read`]); enumerating rather than fixing the one arm found
         // `NoSymbols` in the same position.
-        let symbol_file = engine.module_symbol_file(module.base).unwrap_or_default();
+        // **Not `unwrap_or_default()`**, which is what this was, and the enumeration that followed
+        // review's `type_id` finding is what found it: an error became `""`, which reads as *the
+        // engine named no symbol file* — and an empty path silently disables the `--json` protection
+        // built on it, so the guard would have been off for the one reason nothing reported.
+        let symbol_file =
+            engine
+                .module_symbol_file(module.base)
+                .map_err(|e| SymbolFailure::Engine {
+                    step: "reading the symbol file the engine selected for the module",
+                    detail: e.to_string(),
+                })?;
         // **A symbol provider is required, and the probe above is what makes that honest.** Round 1
         // of #399's review narrowed this to [`SymbolKind::None`] alone, reasoning that dbgscope
         // documents `Deferred` as *not* a statement that symbols are missing — a deferred module
@@ -493,19 +532,29 @@ impl Symbols {
         &self.symbol_file
     }
 
-    /// Ask the engine for each of [`TYPE_PROBES`] and report what it had.
+    /// Ask the engine for each of [`TYPE_PROBES`]: the type id it answered, or **what it said
+    /// instead**.
     ///
     /// Reported as the list rather than as a verdict, because four names answering nothing is
     /// evidence that this PDB carries no types and is not a proof of it.
-    pub(crate) fn type_probes(&self) -> Vec<(&'static str, bool)> {
+    ///
+    /// **`Result` rather than `bool`, which is the third round of one class.** `is_ok_and` collapsed
+    /// every failure into *absent*, so a DIA that could not service the query produced the same four
+    /// negatives as a stripped PDB — and those four negatives are what this gate offers as evidence
+    /// for its headline finding. DbgEng signals *no such type* as a failed call too, so the two
+    /// cannot be told apart from the `Result` alone; what this does is stop **claiming** the
+    /// distinction and hand the engine's own reason to the reader, who can see whether it says the
+    /// type was not found or something operational. Review on #399 raised it for this call after
+    /// raising it for `module_pdb`, which is why the module docs now enumerate every site.
+    pub(crate) fn type_probes(&self) -> Vec<(&'static str, Result<u32, String>)> {
         TYPE_PROBES
             .iter()
             .map(|name| {
-                let found = self
+                let answer = self
                     .engine
                     .type_id(self.preferred_base, name)
-                    .is_ok_and(|id| id != 0);
-                (*name, found)
+                    .map_err(|e| e.to_string());
+                (*name, answer)
             })
             .collect()
     }

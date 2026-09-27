@@ -2371,10 +2371,14 @@ the capture had no VTL1 must not read like a run where neither half worked.
 
 - **The public `securekernel.pdb` carries no type information.** `dt securekernel!_LIST_ENTRY` is
   *not found*, `dt securekernel!*` lists symbols rather than types, every data symbol prints
-  `= <no type information>` under `x /t`, and four `GetTypeId` probes in the shipped code all answer
-  nothing. The plan asked for "symbols **and types**"; the types half is not available to ask for,
-  so structure walks over VTL1 stay hand-decoded the way `src/sk.rs` already does them. A finite
-  probe cannot prove a PDB has none, which is why the code reports the probes rather than a verdict.
+  `= <no type information>` under `x /t`, and four `GetTypeId` probes in the shipped code answer
+  **`E_NOINTERFACE` (`0x80004002`), *no such interface supported*, every one of them** — the engine
+  declining to service type queries for this module rather than four names it looked for and missed,
+  which is a better corroboration than a sample of four could be. That detail only appeared once the
+  probes stopped being booleans (round 5). The plan asked for "symbols **and types**"; the types half
+  is not available to ask for, so structure walks over VTL1 stay hand-decoded the way `src/sk.rs`
+  already does them. A finite probe cannot prove a PDB has none, which is why the code reports the
+  engine's reason per probe rather than a verdict.
 - **`SymbolKind::has_type_info` is wrong about this image, and must not be the test.** It reads
   `DEBUG_SYMTYPE_PDB` as private type information; this module is `symbols: pdb` with no types at
   all, because the engine does not distinguish a stripped public PDB from a private one. Asking for
@@ -2460,6 +2464,15 @@ the capture had no VTL1 must not read like a run where neither half worked.
   test, so instead the **rename** fails the check — a name that cannot be renamed cannot be
   constructed through a rename, and both forms are mutation-verified. What it covers is stated as an
   inclusion: a literal construction and the two rename forms, not a macro-generated call.
+- **Round 5 found the third of that class, so the class is now enumerated in the module.** `type_id`'s
+  `is_ok_and` collapsed every failure into *absent*, and those negatives are what this gate offers as
+  evidence that the PDB has no types — so a DIA that could not answer would have read as a stripped
+  PDB. The probes carry the engine's own message now, and counting the rest of the module found a
+  third site review had not named: `module_symbol_file`'s `unwrap_or_default`, where an error became
+  `""` and an empty path **silently disables** the `--json` guard built on it. That one is a refusal.
+  `src/sksym.rs` carries a table of every engine call and what a failure becomes, including the two
+  that are answers rather than omissions — the discarded forcing probe, and `symbol_for`, whose `None`
+  is `dbgscope`'s own contract.
 - **The loaded PDB is now an input, and the mutation says the finding's stronger form is wrong.**
   Review also found that `symbol_file()` — a file this run read, discovered only once the engine had
   loaded it — never reached `Inputs`, so `--json` could name it. Taken: it is added where it is first

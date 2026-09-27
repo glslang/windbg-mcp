@@ -1641,10 +1641,13 @@ the text report and the JSON carry them as separate answers.
 
 - **The public `securekernel.pdb` carries no type information.** `dt securekernel!_LIST_ENTRY` is
   *not found*, `dt securekernel!*` lists symbols rather than types, every data symbol prints
-  `= <no type information>` under `x /t`, and four `GetTypeId` probes in the shipped code all answer
-  nothing. Structure walks over VTL1 therefore stay hand-decoded the way `src/sk.rs` does them. A
-  finite set of name probes cannot *prove* a PDB has no types, which is why the report prints what
-  was asked and what came back rather than a verdict.
+  `= <no type information>` under `x /t`, and four `GetTypeId` probes in the shipped code all come
+  back **`E_NOINTERFACE` (`0x80004002`)** — *no such interface supported*, which is the engine
+  declining to service type queries for this module at all rather than four names it searched for and
+  did not find. Structure walks over VTL1 therefore stay hand-decoded the way `src/sk.rs` does them. A
+  finite set of name probes cannot *prove* a PDB has no types, which is why the report prints the
+  engine's own reason for each rather than a verdict — and that reason is what makes the four
+  negatives worth more than a sample of four.
 - **`SymbolKind::has_type_info` says otherwise and is wrong here.** It reads `DEBUG_SYMTYPE_PDB` as
   private type information, and this module is `symbols: pdb` with no types: the engine does not
   distinguish a stripped public PDB from a private one. Ask for a type; do not ask the kind.
