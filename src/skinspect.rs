@@ -777,16 +777,26 @@ fn report_symbols(opened: &Result<Symbols, SymbolFailure>) {
             let probes = symbols.type_probes();
             let found: Vec<&str> = probes
                 .iter()
-                .filter(|(_, found)| *found)
+                .filter(|(_, answer)| answer.is_ok())
                 .map(|(name, _)| *name)
                 .collect();
             if found.is_empty() {
+                // **The engine's own reason per probe, not a verdict.** DbgEng reports *no such type*
+                // as a failed call, so nothing here can separate a stripped PDB from a type query
+                // that could not run — and this gate offers these negatives as evidence for exactly
+                // that claim. So the reasons are printed and the reader judges: one that does not say
+                // the type was not found is a broken query rather than a PDB without types.
                 println!(
-                    "           no type answered for any of {:?} — this PDB carries names and, as \
-                     far as {} probes can say, no type records",
-                    sksym::TYPE_PROBES,
+                    "           no type answered for any of {} probe(s); the engine's reason for \
+                     each follows, and one that is not 'type not found' is a query that could not \
+                     run rather than a PDB without type records",
                     probes.len()
                 );
+                for (name, answer) in &probes {
+                    if let Err(why) = answer {
+                        println!("           {name}: {why}");
+                    }
+                }
             } else {
                 println!("           types answered for {found:?}");
             }
@@ -990,9 +1000,16 @@ fn symbols_json(opened: Option<&Result<Symbols, SymbolFailure>>) -> serde_json::
             "symbol_file": symbols.symbol_file(),
             "reload_error": symbols.reload_error(),
             // The probes as asked and answered, not a verdict: a finite list cannot prove a PDB
-            // carries no types, and a consumer reading `types: false` would think it had.
+            // carries no types, and a consumer reading `found: false` would think it had — which is
+            // why the engine's reason travels instead of a boolean. `type_id` present means the
+            // engine answered with one; `error` means it did not answer, for a reason that may or may
+            // not be the type being absent.
             "type_probes": symbols.type_probes().iter()
-                .map(|(name, found)| serde_json::json!({ "name": name, "found": found }))
+                .map(|(name, answer)| serde_json::json!({
+                    "name": name,
+                    "type_id": answer.as_ref().ok(),
+                    "error": answer.as_ref().err(),
+                }))
                 .collect::<Vec<_>>(),
         }),
     }
