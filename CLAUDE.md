@@ -172,9 +172,10 @@ $remote = 8765                                                          # from t
 ```
 
 A mismatch means the endpoint you are talking to is *not* that service, and stopping it releases
-somebody else's targets while changing nothing about yours. On this bench the two ports happen to
-be equal and the pids match, so it is the second column — and the equal ports are a coincidence of
-this setup, not something to build the check on.
+somebody else's targets while changing nothing about yours. On the bench those numbers were taken
+from, the two ports happened to be equal and the pids matched, so it was the second column — and the
+equal ports are a coincidence of that setup, not something to build the check on. Read your own,
+rather than expecting these.
 
 ### The stdio shape
 
@@ -205,11 +206,13 @@ renamed `.stale` file spawns workers from it too — old code stays consistently
 you want. It also means `.stale` can be held by more than one process: reconnecting ends the
 supervisor, and its workers exit with it, so step 4 is still just "after the reconnect".
 
-### The service shape (this repo's ARM64 bench)
+### The service shape (as measured on an ARM64 guest, 2026-09-18)
 
-Measured 2026-09-18. The registered server is **not** a child of Claude Code: it is a Windows
-service on the debugger guest, and the client reaches it over HTTP through an ssh port-forward from
-the Mac. Ask the host rather than reading the wiring from here — it is per machine, and this is a
+**Where this shape applies**, the registered server is **not** a child of Claude Code: it is a
+Windows service on the debugger guest, and the client reaches it over HTTP — on that bench through an
+ssh port-forward from a Mac. Whether it applies to *your* session is what `claude mcp list` answers,
+not this heading: the same repository is also driven from a stdio registration on the Windows host
+itself. Ask the host rather than reading the wiring from here — it is per machine, and this is a
 public repository, so the shapes are given with placeholders:
 
 ```console
@@ -364,16 +367,24 @@ does not say, and how to turn each tier on.
 This project is also installable as a user-scope Claude Code plugin (`windbg-mcp@windbg-mcp`), which
 is a snapshot of the last *published* release and does **not** track working-tree edits.
 
-**What is registered here is neither that plugin nor a local build** (checked 2026-09-18, and this
-paragraph used to say otherwise): this project has a single MCP server, and it is an **HTTP**
-transport on a forwarded loopback port — the guest's service, which is the second column of the
-table above. Its name and endpoint are machine-specific and deliberately not written down here; ask
-the host, as that table says. There is no `.claude/settings.local.json` disabling anything; the
-`.claude/` directory holds `rules/` and `skills/` and nothing else. So a change is live once the
-**service** has been restarted, and never because a build finished on this Mac — which cannot
-produce a Windows binary anyway.
+**Which server your session is talking to is a property of the setup, so this file does not say —
+`claude mcp list` does.** It has now been wrong twice by asserting one: it claimed a local build,
+then an HTTP service on a forwarded loopback port, and on the bench that wrote this sentence it is a
+**stdio** command. All three are ordinary. The plugin's own manifest
+([`.claude-plugin/plugin.json`](.claude-plugin/plugin.json)) declares **stdio**, running
+`${CLAUDE_PLUGIN_ROOT}/target/release/windbg-mcp.exe` — but the same binary serves HTTP under
+`--listen`, as a foreground listener or a service, reached directly or through a forward, and a host
+may register it that way instead of or beside the plugin. Read the registration, match it to the
+column in the table above, and only then decide what makes a change live: a `/mcp` reconnect, or a
+service restart.
+
+What is durable, and worth knowing before you look: the **plugin is a snapshot of the last published
+release**, so a plugin-provided server never runs your working tree however many times you rebuild.
+A plugin is enabled per machine through `enabledPlugins` in `.claude/settings.local.json`, which
+`.gitignore` excludes along with the rest of `.claude/*` bar `rules/` and `skills/` — so anything
+about that file's contents is a statement about one working copy and does not belong here.
 
 Keep machine-specific server wiring out of version control. The registration lives in
-`~/.claude.json` under this project, and it carries a **bearer token** for the listener, so treat
-that file the way `.claude/rules/powershell-scripts.md` says to treat a token: do not print it, and
-verify it by hash if you must check it at all.
+`~/.claude.json` under this project, and an **HTTP** one carries a **bearer token** for the listener,
+so treat that file the way `.claude/rules/powershell-scripts.md` says to treat a token: do not print
+it, and verify it by hash if you must check it at all.
