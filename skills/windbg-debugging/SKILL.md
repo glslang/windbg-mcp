@@ -64,7 +64,7 @@ it reached.
 Three edges to keep in mind. If a step overruns far enough to consume the reserve too, cleanup is
 skipped and the result says `rollback: INCOMPLETE` — believe it rather than the intent. If a step
 leaves the debugger holding something other than the target the batch started against — a
-`.opendump` or `.attach` reached through a wrapper, an engine that stops saying what it holds or
+`.create` or `.attach` reached through a wrapper, an engine that stops saying what it holds or
 which process it is in, or a session left pointed at a different process — the batch stops there
 and the cleanup is dropped on
 purpose, reported as `BATCH: TARGET REPLACED` or `TARGET UNCERTAIN` with `rollback: NOT ATTEMPTED`:
