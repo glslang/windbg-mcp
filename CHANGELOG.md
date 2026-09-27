@@ -41,7 +41,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base and resolve the same PDB there, but the module name collides, so it comes up
   `securekernel_exe` and *both* answer to `securekernel!`: with the pair loaded,
   `? securekernel!KdDebuggerDataBlock` answers the **preferred** base. One module plus arithmetic has
-  no such ambiguity and is testable with no engine, which six of the seven new tests are (1,087 unit
+  no such ambiguity and is testable with no engine, which seven of the eight new tests are (1,088 unit
   tests now, from 1,080). Five
   pin the rebase against literals — the two landmark offsets, the half-open end of the image, an
   address below the base refused rather than wrapped, both bases checked for overflow, and an
@@ -78,7 +78,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it does not belong to this image or cannot be asked which one it loaded: `.ok().flatten()` had made
   the second read as "there is no signature", publishing provenance nothing had checked. The engine
   ratchet likewise fails on a *rename* of the type, since `use … DebugEngine as E; E::new()` would
-  otherwise walk past a check that reads the name. `--sk-inspect` also **names the build
+  otherwise walk past a check that reads the name. And **a flag where a value belongs is refused** on
+  all twelve flags that take one, not just the reported `--sympath`: `--symbols --sympath
+  --cross-check` had taken `--cross-check` as the symbol path and left cross-checking silently off,
+  and `--json` would have written the report to a file named `--cross-check`. The test that should
+  have caught it was named for exactly that property and put the flag last, where there is no next
+  flag to eat. `--sk-inspect` also **names the build
   that produced its report** now, as its first line and in the JSON, because a figure taken from this
   role is a reading of the binary that answered and the tree beside it moves independently; the runs
   above were taken from this change's own working tree, a `-dirty` build over `3552d867`, and

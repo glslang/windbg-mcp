@@ -234,9 +234,22 @@ fn parse(args: &[String]) -> Result<Request> {
         // rather than the next flag being swallowed as a filename.
         let mut value = || -> Result<String> {
             at += 1;
-            args.get(at)
-                .cloned()
-                .ok_or_else(|| anyhow::anyhow!("{flag} needs a value\n{}", usage()))
+            match args.get(at) {
+                // **A flag is not a value, and this helper is shared by every flag that takes one.**
+                // Review on #399 reported it for `--sympath` — `--symbols --sympath --cross-check`
+                // took `--cross-check` as the symbol path and left cross-checking silently off, so a
+                // run could report neither thing it was asked for. The same hole was on all eleven,
+                // and `--json` is the sharper one: it would have written the report to a file
+                // literally named `--cross-check`. Refused by shape rather than against a list of
+                // flag names, because a second list of them is a second thing to keep in step —
+                // nothing this parser accepts as a *value* can begin with `--`.
+                Some(next) if next.starts_with("--") => Err(anyhow::anyhow!(
+                    "{flag} needs a value and was followed by `{next}`, which is a flag\n{}",
+                    usage()
+                )),
+                Some(value) => Ok(value.clone()),
+                None => Err(anyhow::anyhow!("{flag} needs a value\n{}", usage())),
+            }
         };
         match flag {
             "--vm" => vm = Some(value()?),
@@ -1176,6 +1189,53 @@ mod tests {
             .collect();
         let error = parse(&args).expect_err("--vm has no value");
         assert!(error.to_string().contains("--vm needs a value"), "{error}");
+    }
+
+    /// The half this test's neighbour promises in its **name** and never reached.
+    ///
+    /// `a_flag_with_no_value_is_a_usage_error_rather_than_eating_the_next_flag` puts the flag last,
+    /// so `args.get(at)` is `None` and the next flag is not there to be eaten — which is why review
+    /// on #399 found `--symbols --sympath --cross-check` taking `--cross-check` as a symbol path and
+    /// turning cross-checking off with nothing saying so. Every flag that takes a value shares the
+    /// helper, so the table is the assertion: `--json` is here because writing the report to a file
+    /// named `--cross-check` is the worst of them, and `--vp` because a parse error would have hidden
+    /// the swallow behind a different complaint.
+    #[test]
+    fn a_flag_where_a_value_belongs_is_refused_by_every_flag_that_takes_one() {
+        for flag in [
+            "--vm",
+            "--snapshot",
+            "--vmrs",
+            "--bin",
+            "--vsv",
+            "--image",
+            "--kit",
+            "--kit-version",
+            "--vp",
+            "--vtl",
+            "--sympath",
+            "--json",
+        ] {
+            // The flag under test comes first so it is reached before anything else can complain,
+            // and the trailing image keeps a *passing* parse from failing for an unrelated reason —
+            // which is what would make a swallow look like a refusal.
+            let args: Vec<String> = [flag, "--cross-check", "--image", "sk.exe"]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect();
+            let text = parse(&args)
+                .err()
+                .unwrap_or_else(|| panic!("{flag} swallowed --cross-check as its value"))
+                .to_string();
+            assert!(
+                text.contains(&format!("{flag} needs a value")),
+                "{flag} refused for the wrong reason: {text}"
+            );
+            assert!(
+                text.contains("--cross-check"),
+                "{flag}'s refusal does not name the token it would have eaten: {text}"
+            );
+        }
     }
 
     #[test]
