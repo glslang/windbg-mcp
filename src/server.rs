@@ -3668,7 +3668,7 @@ impl WindbgServer {
         // it is where the read happens — but a refusal from there travels as a `debugger` failure,
         // which tells a caller to look at the capture for a number they chose. Checked here, it is
         // `invalid_argument` and it costs no session routing at all.
-        if let Err(why) = crate::sksession::readable(args.size) {
+        if let Err(why) = crate::sksession::readable(address, args.size) {
             return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
         }
         let out = self

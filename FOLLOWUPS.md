@@ -2696,6 +2696,27 @@ establish* below.
   support it. This is the same class as round 1's four: a sentence asserting more than was
   established, one level up from a value doing it.
 
+#### Review round 3: one finding, and the third time the rule already existed next door
+
+**A read whose last byte is past the top of the address space was not refused.** `Gva::offset` wraps
+— deliberately, since a loader record starts `0x30` *before* its `DllBase` and the subtraction is
+done the same way — so two bytes at `0xFFFF_FFFF_FFFF_FFFF` continued at zero: the answer stitched
+from both ends of the space where something is mapped low, and a refusal naming a page the caller
+never asked about where nothing is. Codex.
+
+Refused in **`sk::Space::read_span`**, which is the reader every part of the decode goes through, so
+`gather_image` and the module walk are covered rather than the one call site that was in mind — with
+its own `VaFailure::Wraps`, because reporting it as the low page it wrapped onto is the reason the
+finding was worth filing. The caller's own range is checked in the supervisor too, as an argument and
+before any routing, for round 2's reason.
+
+**And `sksym::Rebase` has refused exactly this since gate S2** — `RangeOverflows`, with a test named
+`a_range_that_runs_off_the_top_is_refused`. That makes three findings in three rounds where the rule
+was already established in a sibling and the new code was the outlier: `attach_kernel`'s
+`open_failure`, `--sk-inspect`'s cross-check comparison, and now this. The lesson is cheaper than the
+rounds were: when adding a path beside an existing one, read what the existing one *refuses*, not
+only what it does.
+
 #### What this does **not** establish
 
 - **One capture, one build, one host.** The same limitation S1 and S2 carry, and the tier is written

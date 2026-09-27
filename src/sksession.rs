@@ -391,7 +391,7 @@ impl Session {
         address: u64,
         size: u32,
     ) -> Result<structured::SecureKernelRead, String> {
-        readable(size)?;
+        readable(address, size)?;
         let landmarks = self.walkable()?;
         let at = Gva(address);
         // The physical address the range starts at, which is the coordinate the source was actually
@@ -553,7 +553,7 @@ impl Session {
 /// [#401](https://github.com/glslang/windbg-mcp/pull/401): it came back `debugger`). This side keeps
 /// it because a bound enforced only by whoever remembers to call it is half a bound, and the worker
 /// is where the read actually happens.
-pub(crate) fn readable(size: u32) -> Result<(), String> {
+pub(crate) fn readable(address: u64, size: u32) -> Result<(), String> {
     if size == 0 {
         return Err("size must be at least one byte".into());
     }
@@ -561,6 +561,17 @@ pub(crate) fn readable(size: u32) -> Result<(), String> {
         return Err(format!(
             "{size} bytes is more than this tool will read at once ({MAX_READ}); ask for a \
              narrower range"
+        ));
+    }
+    // **The range, not just its length.** `sk::Space::read_span` refuses a span that leaves the
+    // address space and so cannot answer with bytes from both ends of it — this says the same thing
+    // to the caller, as an argument, before a session is routed to. Both exist for the reason the
+    // size bound does: the reader's guard covers every caller of the decode, and this one is the
+    // only place that can say *which argument* was wrong.
+    if address.checked_add(u64::from(size) - 1).is_none() {
+        return Err(format!(
+            "{size} bytes from {address:#x} runs off the top of the address space; the last byte of \
+             a range has to be in it"
         ));
     }
     Ok(())
@@ -781,6 +792,10 @@ fn outside(why: &OutsideImage) -> String {
 fn va_failure(why: &VaFailure) -> String {
     match why {
         VaFailure::Unmapped(va) => format!("nothing in this capture's VTL1 maps {:#x}", va.0),
+        VaFailure::Wraps { va, len } => format!(
+            "{len} bytes from {:#x} runs off the top of the address space",
+            va.0
+        ),
         VaFailure::Read { va, gpa, failure } => format!(
             "reading {:#x} (physical {:#x}) failed: {}",
             va.0,
@@ -1491,15 +1506,34 @@ mod tests {
 
     /// The read bound, which is about the **answer** rather than the read: a capture is a file and
     /// the bytes are cheap, where the hex a caller pays for is twice the size again.
+    ///
+    /// And the **range**, which is a different question from its length: a span whose last byte is
+    /// past the top of the address space continues at zero, because `Gva::offset` wraps
+    /// deliberately, so the answer would be stitched from both ends of the space or refused naming a
+    /// low page nobody asked about (Codex, #401).
     #[test]
-    fn a_read_is_bounded_and_says_so() {
-        assert!(readable(1).is_ok());
-        assert!(readable(MAX_READ).is_ok());
-        let refused = readable(MAX_READ + 1).expect_err("a read past the cap is refused");
+    fn a_read_is_bounded_by_its_length_and_by_where_it_ends() {
+        let base = 0xFFFF_F807_0EDA_9000;
+        assert!(readable(base, 1).is_ok());
+        assert!(readable(base, MAX_READ).is_ok());
+        let refused = readable(base, MAX_READ + 1).expect_err("a read past the cap is refused");
         assert!(refused.contains(&MAX_READ.to_string()), "{refused}");
         assert!(
-            readable(0).is_err(),
+            readable(base, 0).is_err(),
             "a zero-byte read is a caller who meant something else"
+        );
+
+        // The last byte of the space is a legitimate one-byte read, and the boundary is where a
+        // `<=`/`<` confusion would live.
+        assert!(readable(u64::MAX, 1).is_ok());
+        let wraps = readable(u64::MAX, 2).expect_err("a span that leaves the space is refused");
+        assert!(
+            wraps.contains("off the top of the address space"),
+            "the refusal has to say which of the two bounds it is: {wraps}"
+        );
+        assert!(
+            readable(u64::MAX - 0x10, 0x40).is_err(),
+            "a span that starts inside the space and ends past it is the same refusal"
         );
     }
 

@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider refusing the VTL switch by name (`0xC0370509`), and the session **opens** carrying that as
   its reason and refuses every read with the same sentence — while its symbols load normally, which
   is the pair that had to stay distinguishable. Eleven new tests (1,099 unit tests now, from 1,088)
-  and five in the smoke harness (130, from 126), all fifteen guards **mutation-verified**: the
+  and five in the smoke harness (130, from 126), all eighteen guards **mutation-verified**: the
   kind gate three ways — accept every debugger op on a capture, accept every capture op elsewhere, and replace
   the allow-list with a deny-list, where the row that then goes through is the one that was not
   thought of — and five renderers, including a landmark that disagrees rendering as agreement and a
@@ -63,14 +63,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   first time that ceiling has caught one: holding the report in `TargetSummary` inlined its schema
   into all seven openers' `$defs` and measured 341,057 B, and moving it into an outcome of its own
   took **50,844 B** back off the wire for a change no client can observe. Two review rounds found
-  eight defects, seven of them taken: four were a **value asserting something nothing had compared** —
+  nine defects, eight of them taken: four were a **value asserting something nothing had compared** —
   the structural cross-check reporting agreement it never checked, an interrupt marking a job it could
   not stop, an opener's refusal answering in the wrong shape, a tier's prose claiming a tool its body
   never called — and two more were the same thing in a **sentence**: a `limitation` giving the VBS-off
   reading for all six reasons a capture can have no VTL1, and a page's headline byte figure left
   behind by its own table. The eighth is declined with its fact recorded: an open that exceeds the
   call timeout loses its decode, and both remedies would put another copy of a ten-kilobyte schema on
-  the wire for every caller.
+  the wire for every caller. Round 3's single finding is the one worth carrying forward: a read
+  whose last byte was past the top of the address space wrapped to zero, because `Gva::offset` wraps
+  deliberately — refused in the reader every part of the decode goes through rather than at the one
+  call site, and with its own failure, since reporting it as the low page it wrapped onto is what made
+  it worth filing. `sksym::Rebase` has refused the same thing since gate S2, which makes three
+  findings in three rounds where the rule already existed in a sibling and this code was the outlier.
 - **`securekernel.exe`'s symbols now resolve against the base gate S1 found in a capture, with no
   debuggee anywhere — and the PDB agrees with the capture scan to the byte.** `FOLLOWUPS.md` item
   103's gate S2, `src/sksym.rs`, driven by `windbg-mcp --sk-inspect --symbols`. The unknown the gate
