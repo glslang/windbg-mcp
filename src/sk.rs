@@ -805,6 +805,16 @@ pub(crate) enum VaFailure {
     /// The walk found no mapping for this page. Distinct from a read that failed: an address
     /// nothing maps and an address whose bytes were refused are different facts.
     Unmapped(Gva),
+    /// The span runs off the top of the address space.
+    ///
+    /// **Its own answer because the alternative is bytes from two unrelated ends of it.**
+    /// [`Gva::offset`] wraps — deliberately, since a loader record starts `0x30` *before* its
+    /// `DllBase` and the subtraction is done the same way — so a read of two bytes at
+    /// `0xFFFF_FFFF_FFFF_FFFF` continues at zero and either stitches the answer from both ends or
+    /// refuses naming a low page the caller never asked about. Raised by Codex on
+    /// [#401](https://github.com/glslang/windbg-mcp/pull/401); refused in the reader rather than at
+    /// one caller, so `gather_image` and the module walk get it too.
+    Wraps { va: Gva, len: usize },
     Read {
         va: Gva,
         gpa: Gpa,
@@ -845,6 +855,12 @@ impl<'a, 'b> Space<'a, 'b> {
     /// a boundary is the ordinary case here, not the exception: the debugger data block sits
     /// wherever it sits.
     pub(crate) fn read_span(&self, va: Gva, len: usize) -> Result<Vec<u8>, VaFailure> {
+        // **The whole span, before the first page.** The loop below walks `va.offset(n)`, which
+        // wraps, so a span whose last byte is past the top of the space reads from the bottom of it
+        // instead — see [`VaFailure::Wraps`].
+        if len > 0 && va.0.checked_add(len as u64 - 1).is_none() {
+            return Err(VaFailure::Wraps { va, len });
+        }
         let mut out = Vec::with_capacity(len);
         while out.len() < len {
             let at = va.offset(out.len() as u64);
@@ -2283,6 +2299,37 @@ mod tests {
             },
         ]);
         assert_eq!(space.distinct_pages(), 512 + 1);
+    }
+
+    /// **A span that leaves the address space is refused in the reader**, so every caller of the
+    /// decode gets it rather than the one that was remembered.
+    ///
+    /// `Gva::offset` wraps on purpose — a loader record starts `0x30` before its `DllBase` and the
+    /// subtraction is done the same way — so the loop inside `read_span` would carry on at zero. The
+    /// fixture maps a page at the very top of the space, which is what makes the first page of the
+    /// span readable and the refusal about the *span* rather than about the mapping (Codex, #401).
+    #[test]
+    fn a_span_that_runs_off_the_top_of_the_address_space_is_refused_as_that() {
+        let mut fixture = Fixture::new();
+        fixture.image(0x2_0000_0000, 0x40000, PAGE as u32, 7, &[".text"]);
+        let reader = Reader::new(&fixture);
+        let (leaves, _) = walk(&reader, Gpa(fixture.root));
+        let space = AddressSpace::new(leaves);
+        let reads = Space::new(&reader, &space);
+        // One byte at the top of the space is a range; two is not.
+        assert!(matches!(
+            reads.read_span(Gva(u64::MAX), 2),
+            Err(VaFailure::Wraps { len: 2, .. })
+        ));
+        // And it is refused as *that* rather than as an unmapped low page, which is what the loop
+        // would have reached: a caller told "nothing maps 0x0" would go and look at the guest.
+        assert!(
+            !matches!(
+                reads.read_span(Gva(u64::MAX), 2),
+                Err(VaFailure::Unmapped(_))
+            ),
+            "a wrapped span must not be reported as the low page it wrapped onto"
+        );
     }
 
     #[test]
