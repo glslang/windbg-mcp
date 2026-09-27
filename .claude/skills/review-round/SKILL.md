@@ -25,17 +25,52 @@ itself, in two places:**
   gh api --paginate repos/<owner>/<repo>/issues/<n>/comments \
     --jq '.[] | select(.body | contains("codex-pull-request-review-summary")) | .body'
   ```
-- **A reaction on the PR**: 👀 while a review is running, **👍 once every review has finished with
-  no findings** — which is the signal that a round is genuinely closed rather than pending.
+- **A reaction on the PR**: 👀 while a review is running, and a `+1` from
+  `chatgpt-codex-connector[bot]` — the 👍 — when Codex's own reviews finished with no findings.
   ```console
-  gh api repos/<owner>/<repo>/issues/<n>/reactions --jq '.[] | "\(.user.login): \(.content)"'
+  gh api repos/<owner>/<repo>/issues/<n>/reactions \
+    --jq '.[] | "\(.user.login): \(.content) \(.created_at)"'
   ```
-  A `+1` from `chatgpt-codex-connector[bot]` is that 👍. Reactions on the *comments* are a different
-  thing and are usually empty — the completion signal is on the pull request.
+  Read that `created_at`: the reaction carries no commit, is created once, and never retracts.
+  Reactions on the *comments* are a different thing and are usually empty.
 
-So the order is: findings at the head (act on them), else the summary comment's `Commit` (is the
-head even reviewed?), else the 👍 (did it finish clean?). Reviews re-trigger on new commits, and
-`@codex review` / `@codex security review` in a comment asks for one.
+So the order is: findings at the head (act on them), then the summary comment's `Commit` and
+`Status` — is the head reviewed, and did that review finish? The 👍 corroborates and never decides.
+Reviews re-trigger on new commits, and `@codex review` / `@codex security review` in a comment asks
+for one.
+
+**The 👍 is confirmatory at best and never a thing to wait for, and its absence is never a reason to
+ask for another review.** Measured across the fourteen most recent PRs here: **eight carry no Codex
+summary comment at all** — all of them merged, and #388 and #389 were opened the same day, so it is
+not an enablement cutoff — meaning no status row and no reaction will ever arrive on them. Of the
+six that were reviewed, [#392](https://github.com/glslang/windbg-mcp/pull/392) has a 👍 created at
+20:59:15 and **CodeRabbit filed two findings against that same head at 21:22:15**, twenty-three
+minutes later; the reaction is still sitting there. Its presence is not evidence about the head, and
+its absence is not evidence about anything.
+
+**Asking for a review to settle the question is the move that compounds.** `@codex review` starts a
+*fresh* round on the same head, whose findings need remedies, whose surface the next review then
+reads — and the remedies it produces are what the growth reading measures in *When to stop working
+rounds*. A review you triggered to resolve your own uncertainty is not evidence of closure; it
+manufactures a round. If no row exists at all, the PR was never reviewed — a fact to report, not a
+gap to fill with a trigger.
+
+**A `Completed` row closes Codex's review, not the round, and the other reviewer's state is
+observable rather than a waiting game.** CodeRabbit publishes one check per head whose *description*
+is the state: `Review completed` once its findings are in, `Review rate limited` when it did not
+review that head and never will. Both sit in a `success` bucket, which is why the rule above is to
+read the reason text.
+
+```console
+gh api repos/<o>/<r>/commits/<head>/status \
+  --jq '.statuses[] | select(.context=="CodeRabbit") | .description'
+```
+
+Wait for one of those two before closing, because a duration is a guess: CodeRabbit trailed Codex by
+**1 minute** on this PR, **3 minutes** on #393 and **23 minutes** on #392, so a five-minute settle
+catches the first two and misses the third. Whether the description flips before or after its
+comments land is not measured here, so allow a short settle after the flip rather than closing on
+the flip itself.
 
 **A round is not a moment, and reading it as one loses findings.** Codex posts a round's comments
 over a minute or two, so a watcher that fires on the *first* comment reads a partial round. On
@@ -52,12 +87,20 @@ against the count you actually worked. Both misses above were invisible in every
 and obvious the moment the totals disagreed — 25 comments against 21 worked. It costs one command
 at the end.
 
+**And reconciling is not the same as continuing.** *When to stop working rounds* at the end of this
+file is when to stop working them at all — a reading you record, not a judgement call to hand
+upward.
+
 **Codex is the bot to watch, and CodeRabbit's green is not evidence.** Its check reports `pass` with
 *"Review rate limited"* beside it when it has not reviewed at all. Measured on
 [#349](https://github.com/glslang/windbg-mcp/pull/349): across the PR's eight commits it filed **no
 reviews and no findings** — `pulls/<n>/reviews` has not one CodeRabbit entry — while its check read
 `pass` the whole way. All six findings there came from Codex. So read that check's reason text
-rather than its bucket, and do not wait on it or offer to re-trigger it.
+rather than its bucket. **That measurement stands and its conclusion no longer does**: since #349 it
+has filed real findings on four heads across three PRs, so treat it as a reviewer that is often
+absent rather than one that never runs, and wait on its *description* as the settle above says — a
+bounded wait, because `Review rate limited` is itself a terminal answer. Still do not offer to
+re-trigger it.
 
 **They also circle the same topic, and contradict each other and themselves across rounds.** A bot
 reviews *this diff* without the argument that produced it, so the same seam comes back round after
@@ -302,3 +345,40 @@ valid thunk: **a new defect, shipped on a true finding.** The test now sets a ge
 
 The first attempt used their example and failed, which is how it was caught — so write the test from
 the rule, run it, and read a failure as a question about which of the two is wrong.
+
+## When to stop working rounds
+
+**A review can keep finding real defects long after the work has stopped being worth it.**
+[#393](https://github.com/glslang/windbg-mcp/pull/393) ran **sixteen rounds and 33 findings** on one
+probe. The answer never moved — the S0 verdict, the VTL1 `CR3` `0x1201000` and all three landmark
+offsets are identical in the first commit and in the merge — while the artifact more than doubled:
+**1,478** insertions submitted, **2,367** added on top of them.
+
+**That pair is the signal, and it is a reading rather than a formula.** The answer has stopped
+moving, and your remedies keep adding surface. Write both down in a line each round; what matters is
+that they are on the page and not in your head, because a judgement you have recorded does not need
+escalating to whoever is driving the work. **Resist turning them into a threshold.** This section
+was rewritten eight times under review, three of those redefining how the growth term was computed,
+and each of those rounds was a reviewer correctly arguing about a number in a diff — a stale freeze
+point, a rounding that hid the boundary, a division by zero, four defensible file scopes giving four
+different answers. None of it made the rule better at stopping anything. State the rule as a
+judgement you record, not as an instrument, or the instrument becomes the work.
+
+**When it holds, stop adding surface — not stop reading findings.** Fix defects in what is there.
+Decline a finding that asks for new machinery, another counter, another reason field, another
+paragraph stating another limitation, and say why. When a real defect's only remedy would be new
+machinery, **retract the claim instead**: a weaker claim costs a sentence and leaves nothing for the
+next round to read, while a new counter leaves surface that later rounds will land on.
+
+**Then stop at the first round whose findings are all new-mechanism requests and prose preference,
+and do not ask.** Report once: rounds worked, taken against declined, and anything left unworked
+with where to find it, so it can be triaged rather than taken on trust. Continuing past that point
+needs a reason; stopping does not. Do not trigger a review to confirm it — that manufactures a
+round, as the note on the 👍 above says.
+
+**It will not shorten the PR, and pretending it would is the trap.** Every round of #393 found
+something real, including round 15 finding that `--json` could destroy the capture it had just read
+and round 16 finding a defect in round 15's own guard. Stopping on round count, or on "the answer
+stopped moving", would have shipped a tool that overwrote its input. The lever is the size of each
+remedy rather than the decision to stop: three remedies had already added 763 lines against the
+1,478 submitted, and the rounds that found the worst defects were reading that addition.
