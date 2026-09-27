@@ -4691,7 +4691,13 @@ pub struct SkRejection {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct SkCrossCheck {
     /// Whether the two routes name the same head.
-    pub agrees: bool,
+    ///
+    /// **`None` is not a disagreement**, for [`SkLandmark::agrees`]'s reason: it is the structural
+    /// route having found nothing to compare, or no identified image for it to be about. A `false`
+    /// is the two routes naming different heads, which says the decode's own two witnesses are not
+    /// about one structure.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agrees: Option<bool>,
     /// The loader entry whose `DllBase` is the identified base.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub entry: Option<String>,

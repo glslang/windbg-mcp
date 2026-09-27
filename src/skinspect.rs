@@ -644,7 +644,7 @@ fn report_landmarks(landmarks: &Landmarks) {
             }
             match &landmarks.cross_check {
                 Some(Ok(cross)) => {
-                    let agrees = cross.head.0 == found.block.ps_loaded_module_list;
+                    let agrees = cross.agrees_with(&found.block);
                     println!(
                         "crosscheck entry {:#X} -> head {:#X}: {} the block ({} page(s) scanned, {} \
                          unreadable)",

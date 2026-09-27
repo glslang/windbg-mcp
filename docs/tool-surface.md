@@ -6,8 +6,8 @@ how much of that surface a run serves, and three behaviours the table has no roo
 ## Serving fewer tools (`--tools`)
 
 All sixty-seven tools are served unless you say otherwise, and their definitions cost the model
-**95,792 bytes — about 24k tokens — before it has asked anything**, once per conversation. Every
-figure on this page is a measurement of 2026-09-26 rather than an invariant: any edit to a tool's
+**103,293 bytes — about 26k tokens — before it has asked anything**, once per conversation. Every
+figure on this page is a measurement of 2026-09-27 rather than an invariant: any edit to a tool's
 description moves it, so re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
 **not**, which is how it came to say 94,921 while the table beside it said 94,957. Seven

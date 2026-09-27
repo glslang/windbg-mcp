@@ -627,7 +627,13 @@ fn decoded(landmarks: &Landmarks) -> structured::SkDecode {
             .collect(),
         cross_check: landmarks.cross_check.as_ref().map(|result| match result {
             Ok(found) => structured::SkCrossCheck {
-                agrees: true,
+                // **Compared, not assumed.** Finding the entry and reading its `Blink` is what this
+                // route *does*; whether that head is the one the block names is the question it was
+                // run to answer, and reporting `Ok` as agreement answers it without asking.
+                agrees: landmarks
+                    .identified
+                    .as_ref()
+                    .map(|found_image| found.agrees_with(&found_image.block)),
                 entry: Some(addr(found.entry.0)),
                 head: Some(addr(found.head.0)),
                 pages_scanned: found.pages_scanned,
@@ -635,7 +641,9 @@ fn decoded(landmarks: &Landmarks) -> structured::SkDecode {
                 detail: None,
             },
             Err(miss) => structured::SkCrossCheck {
-                agrees: false,
+                // A miss is not a disagreement: nothing was found to compare, which is what the
+                // detail below says and what `None` means here.
+                agrees: None,
                 entry: None,
                 head: None,
                 pages_scanned: miss.pages_scanned,
@@ -910,8 +918,16 @@ pub(crate) fn render(report: &structured::SecureKernelReport) -> String {
             out.push_str(&format!(
                 "crosscheck {} ({} page(s) scanned, {} unreadable)\n",
                 match (cross.agrees, &cross.entry, &cross.head) {
-                    (true, Some(entry), Some(head)) => format!(
+                    (Some(true), Some(entry), Some(head)) => format!(
                         "entry {entry} -> head {head}: the structural route agrees with the block"
+                    ),
+                    // **Loud, because this is the one line that says the decode's two independent
+                    // witnesses are about the same structure.** A disagreement here means one of
+                    // them is reading something else, and a reader who skims must not read it as
+                    // the agreeing case with different numbers in it.
+                    (Some(false), Some(entry), Some(head)) => format!(
+                        "entry {entry} -> head {head}: DISAGREES with the block, which names a \
+                         different list head"
                     ),
                     _ => cross
                         .detail
@@ -1353,6 +1369,55 @@ mod tests {
         assert!(render_symbol(&at).contains("is exactly that address"));
         assert!(render_symbol(&near).contains("0x18 byte(s) past"));
         assert!(!render_symbol(&near).contains("is exactly that address"));
+    }
+
+    /// **The cross-check has three answers and the report must not render two of them alike.**
+    ///
+    /// The one that matters is the middle: two routes naming different heads says the decode's own
+    /// witnesses are not about one structure, and until review it was rendered as agreement — the
+    /// value said `true` for any successful search (CodeRabbit, #401). `None` is neither: nothing
+    /// was found to compare.
+    #[test]
+    fn the_cross_check_renders_agreement_disagreement_and_neither_apart() {
+        let cross = |agrees| structured::SkCrossCheck {
+            agrees,
+            entry: Some(structured::addr(0xFFFF_B700_0220_20C0)),
+            head: Some(structured::addr(0xFFFF_F807_0EED_0770)),
+            pages_scanned: 1249,
+            pages_unreadable: 0,
+            detail: agrees
+                .is_none()
+                .then(|| "the structural route found no loader entry for this base".to_string()),
+        };
+        let rendered = |agrees| {
+            let mut decode = decode();
+            decode.cross_check = Some(cross(agrees));
+            let mut report = report();
+            report.decode = Some(decode);
+            render(&report)
+        };
+
+        let agrees = rendered(Some(true));
+        assert!(agrees.contains("agrees with the block"), "{agrees}");
+        assert!(!agrees.contains("DISAGREES"), "{agrees}");
+
+        let disagrees = rendered(Some(false));
+        assert!(
+            disagrees.contains("DISAGREES with the block"),
+            "a disagreement rendered as anything softer is the one reading this line exists to \
+             prevent:\n{disagrees}"
+        );
+        assert!(
+            !disagrees.contains("route agrees"),
+            "one line must not say both:\n{disagrees}"
+        );
+
+        let neither = rendered(None);
+        assert!(neither.contains("no loader entry"), "{neither}");
+        assert!(
+            !neither.contains("agrees with the block") && !neither.contains("DISAGREES"),
+            "a search that found nothing is not a verdict either way:\n{neither}"
+        );
     }
 
     /// The read bound, which is about the **answer** rather than the read: a capture is a file and
