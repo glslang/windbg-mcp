@@ -1,9 +1,16 @@
 # Secure Kernel research
 
 Can a debugger reach **VTL1** — the Secure Kernel — on a VBS-enabled Windows guest, and can
-`windbg-mcp` drive it? These documents are the record of finding out. They are a **research log,
-not a feature**: nothing here ships in the server today, and several sections record what did not
-work and why, which is most of the value.
+`windbg-mcp` drive it? These documents are the record of finding out. They are a **research log**
+first, and several sections record what did not work and why, which is most of the value.
+
+**One part of it is now code in this server**, and the rest is not. `src/sk.rs` decodes a guest's
+VTL1 — the page-table walk, the image identification, the debugger data block and the module list —
+over a source seam, `src/savedstate.rs` reads a Hyper-V capture through the Windows SDK's provider,
+and `windbg-mcp --sk-inspect` drives the two from the command line (`FOLLOWUPS.md` item 103, gate
+S1). There is **no MCP tool**: that is gate S3, and its shape is still an open question. So no
+`tools/list` changes, nothing a client can call, and everything below about the *live* route still
+needs the bench posture it describes.
 
 ## The answer so far
 
@@ -52,8 +59,12 @@ to be read, never remembered** — the third boot above is what a hard-coded `0x
 walked from.
 
 **What is still open:** turning those reads into tools (gate H5), which is scoped as `FOLLOWUPS.md`
-item 103 and has begun — its first gate, S0, is answered above, and what remains is the decode
-layer, symbols against the image, and the tool surface itself. Its route is decided, and the
+item 103 and is part-built — **S0** is answered above and **S1**, the decode layer, is now in
+`src/sk.rs` and reproduces every capture-derived landmark in the table below from a checkpoint, with
+two checks the probe did not run: a structural route to the module list that agrees with the block,
+and the provider's own address translator agreeing with the walk on every page of the image. What
+remains is symbols against the image (S2), the tool surface (S3), and whether VTL1 execution can be
+controlled at all (S5). Its route is decided, and the
 decision is the opposite of where this work began. Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
 and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even

@@ -1428,6 +1428,68 @@ a broken one.
   is the sessionless shape — so the awkward fit with this server's session model is now the common
   case rather than a hypothetical, and S5 remains the thing that could bring execution state back.
 
+### S1 result, 2026-09-27: the decode layer is Rust in this server, and it reproduces the probe
+
+S0 answered *whether* a driver-free source carries VTL1. S1 is the decode over that source expressed
+so the source is a parameter, and it is now `src/sk.rs` (the seam, the guarded walk, PE
+identification, the `KdDebuggerDataBlock` decode, the `SkLoadedModuleList` walk),
+`src/savedstate.rs` (the SDK provider bound from Rust) and `windbg-mcp --sk-inspect` (a
+command-line role, **not** an MCP tool — that is S3). `FOLLOWUPS.md` item 103 carries the full
+record; what belongs here is the measurement and what it does not cover.
+
+**The run, 2026-09-27, against the `H1 pinned 26200.9457 VBS+HVCI` checkpoint of the VBS guest** —
+the **third-boot** capture, the one whose root is not `0x1201000`. Every capture-derived landmark in
+this document reproduced, from an independent implementation in a different language:
+
+| landmark | S0's probe | `src/sk.rs` |
+|---|---|---|
+| VTL1 `CR3` | `0x107593000` | `0x107593000` |
+| root page: present entries / self-map index | 29 / 309 | 29 / 309 |
+| `securekernel.exe` GPA | `0x00CD0000` | `0xCD0000` |
+| `securekernel.exe` base VA | `0xFFFFF8070EDA9000` | `0xFFFFF8070EDA9000` |
+| `KdDebuggerDataBlock` | `+0x1335E0`, `Size` `0x3A0` | `+0x1335E0`, `Size` `0x3A0` |
+| `SkLoadedModuleList` | `+0x127770` | `+0x127770` |
+| VTL1 modules | the same six | the same six, same sizes |
+| `KDBG` tags found / accepted | 4 / 1 | 4 / 1 |
+| table reads / decodes | 179 / 215 | 179 / 215 |
+
+**Two checks the probe did not run, and both are the reason this is worth more than a second
+opinion.** The **structural route** — find a loader entry whose `DllBase` is the identified base with
+`SizeOfImage` sixteen bytes later, then follow its `Blink` — found the list head
+`0xFFFFF8070EED0770` at entry `0xFFFFB700022020C0`, which is **the same head the debugger data block
+names**, reached without reading the block at all. And the **provider's own translator**
+(`GuestVirtualAddressToPhysicalAddress`, which is Microsoft's code and not ours) agreed with the walk
+on **373 of 373** pages of the image, with **0** pages mapped by one and not the other. The sample is
+taken from the *image's* `SizeOfImage` rather than from the walk's own leaves, deliberately: comparing
+on the addresses the walk found would only ask whether we agree about what we found, and a page the
+walk missed would be invisible to it.
+
+Figures the probe has no equivalent for, recorded so a later build can be compared: **16,437** leaf
+mappings over **4,545** distinct pages, **7,803** alias prefixes counted as unexpanded, **0**
+malformed entries, **0** unreadable tables, **18,253** physical reads of which **0** failed,
+**74,764,288** bytes read.
+
+**The control arm, same command against the VBS-off twin** (`H1 control 26200.9457 VBS off`):
+partition VTLs `0x1` against the VBS guest's `0x3`, and `ForceActiveVirtualTrustLevel(vp0, vtl1)`
+refused with `0xC0370509` (`VM_SAVED_STATE_DUMP_E_VP_VTL_NOT_ENABLED`). Reported as the **switch**
+being refused, which is deliberately not the same answer as a register that did not come back — a
+provider that cannot return one register must not read as a guest with no Secure Kernel.
+
+#### What the S1 result does not establish
+
+- **One capture, one build, one host.** The `0x1201000` capture is no longer on this bench, so the
+  reboot-moved root remains pinned by S0's record rather than re-measured by this implementation.
+- **The `.bin`/`.vsv` pair is selected and never called.** Same gap S0 recorded, for the same
+  reason: no capture of that form has ever been produced here.
+- **Nothing was read from a running guest.** A capture cannot refuse a read, so the refusal path
+  through the seam is exercised by synthetic fixtures alone; the hypercall route that answers
+  `HV_STATUS_SUCCESS` with a per-access `ReadIntercept` is not built.
+- **No symbol was resolved.** S2 is untouched, and the base this produces is its input.
+- **34 synthetic tests are not a second capture.** They pin the rules — the self-map, the large-page
+  frame mask, a tag straddling a page boundary, a stale list under a matching `KernBase`, poison
+  against zeros — and six of them were mutation-verified. That is a guard against regression, not
+  more evidence about Windows.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility
