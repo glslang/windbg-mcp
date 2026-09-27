@@ -42,6 +42,7 @@ mod server;
 mod service;
 mod sk;
 mod skinspect;
+mod sksession;
 mod sksym;
 mod structured;
 mod surface;

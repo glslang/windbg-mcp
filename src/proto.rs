@@ -69,6 +69,36 @@ pub enum EngineOp {
     Launch {
         command_line: String,
     },
+    /// Open a Hyper-V capture and decode the Secure Kernel in its VTL1 — `FOLLOWUPS.md` item 103,
+    /// gate S3's opener.
+    ///
+    /// **The one opener whose target is not a debuggee.** What the worker ends up holding is a
+    /// file, read through the SDK's saved-state provider, and the engine beside it has at most the
+    /// *image* open so symbols can be resolved against it ([`crate::sksession`]). Everything the
+    /// session can answer is decoded here, at the open, because a capture is a fixed snapshot: no
+    /// later call re-reads it, and the whole decode travels back on this op's summary.
+    ///
+    /// Boxed for `clippy::large_enum_variant`: the request carries five paths and every
+    /// [`WorkerRequest`] would otherwise pay for the largest thing any op can hold.
+    OpenSecureKernel(Box<crate::sksession::Request>),
+    /// The VTL1 loader list this session's decode walked.
+    SkModules,
+    /// `size` bytes of VTL1 at a guest virtual address, through the address space the walk found.
+    ///
+    /// Its own op rather than a flag on [`Self::ReadMemory`], and the reason is the whole of S3's
+    /// refusal rule: `ReadMemory` reaches the **engine**, whose target in this session is the image
+    /// on disk, so routing a VTL1 address through it would read a file and answer as though it had
+    /// read the guest.
+    SkRead {
+        address: u64,
+        size: u32,
+    },
+    /// A name resolved against the image, or the name of an address — both in the guest's
+    /// coordinates, which is the rebase gate S2 exists for.
+    SkSymbol {
+        name: Option<String>,
+        address: Option<u64>,
+    },
 
     // ---- ordinary work ----
     /// A raw command run with **no watchdog at all** — `index_trace`'s, and nothing else's.
@@ -650,6 +680,7 @@ impl EngineOp {
                 | Self::AttachKernel { .. }
                 | Self::AttachProcess { .. }
                 | Self::Launch { .. }
+                | Self::OpenSecureKernel(_)
         )
     }
 
@@ -679,6 +710,10 @@ impl EngineOp {
             Self::Launch { .. } | Self::AttachProcess { .. } => Some(TargetOrigin::LocalProcess),
             Self::OpenDump { .. } | Self::OpenTrace { .. } => Some(TargetOrigin::Recorded),
             Self::AttachKernel { .. } | Self::AttachKernelLocal => Some(TargetOrigin::Kernel),
+            // A guest's kernel: the process ids in it are the captured machine's and were never
+            // this host's, which is exactly what this variant means and what keeps
+            // `may_ask_the_os` from asking Windows about one.
+            Self::OpenSecureKernel(_) => Some(TargetOrigin::Kernel),
             _ => None,
         }
     }
@@ -1507,6 +1542,16 @@ pub struct Output {
     /// from this one, and the two would drift.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub target_left_running: Option<bool>,
+    /// What a Secure Kernel capture opener decoded, for that one op.
+    ///
+    /// [`Self::summary`]'s shape and reason — the answer is keyed by a session handle this process
+    /// has never heard of, so the worker sends the value and the supervisor folds it in — but
+    /// **beside** the summary rather than inside it. `TargetSummary` is the engine's answer about a
+    /// debuggee and this session has none; the tool surface's own reason is
+    /// [`crate::structured::SkOpenOutcome`]'s, where holding it in `TargetSummary` was measured
+    /// inlining its schema into seven openers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sk: Option<Box<crate::structured::SecureKernelReport>>,
 }
 
 impl Output {
@@ -1519,6 +1564,7 @@ impl Output {
             stop: None,
             target_left_running: None,
             raised: None,
+            sk: None,
         }
     }
 
@@ -1541,6 +1587,7 @@ impl Output {
             stop: None,
             target_left_running: None,
             raised: None,
+            sk: None,
         }
     }
 
@@ -1554,6 +1601,7 @@ impl Output {
             stop: Some(Box::new(stop)),
             target_left_running: None,
             raised: None,
+            sk: None,
         }
     }
 
@@ -1566,6 +1614,20 @@ impl Output {
             stop: None,
             target_left_running: None,
             raised: None,
+            sk: None,
+        }
+    }
+
+    /// A Secure Kernel capture opener's reply: the report, the session's one limitation, and the
+    /// decode the supervisor folds into [`crate::structured::SkOpenedSession`].
+    pub fn opened_capture(
+        text: impl Into<String>,
+        summary: crate::structured::TargetSummary,
+        capture: crate::structured::SecureKernelReport,
+    ) -> Self {
+        Self {
+            sk: Some(Box::new(capture)),
+            ..Self::opened(text, summary)
         }
     }
 
@@ -1578,6 +1640,7 @@ impl Output {
             stop: None,
             target_left_running,
             raised: None,
+            sk: None,
         }
     }
     /// An [`EngineOp::Interrupt`]'s reply: what the worker did about the job it was for. See

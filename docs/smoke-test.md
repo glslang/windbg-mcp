@@ -11,6 +11,7 @@ crate compiles against stays identical — so the unit tests keep passing and cl
 cargo test --test mcp_smoke              # protocol tier (default)
 $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke   # + the debugger tier
 $env:WINDBG_MCP_SMOKE_TTD  = "1"; cargo test --test mcp_smoke   # + the TTD tier (elevated)
+$env:WINDBG_MCP_SMOKE_SK_CAPTURE = "<a .vmrs>"; cargo test --test mcp_smoke   # + the capture tier
 ```
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
@@ -136,6 +137,15 @@ down on a host where they are perfectly testable.
 The worry that a symbol condition silences assertions passing today is settled rather than assumed:
 the x64 entry reads `mm_exploit_v5.exe` out of `SeAuditProcessCreationInfo`, a walk through `nt`'s
 types that cannot happen without its PDB, and its run shows all four *running* rather than skipping.
+
+**The Secure Kernel capture tier's gate is a file, not a machine.** `WINDBG_MCP_SMOKE_SK_CAPTURE`
+names a Hyper-V standard checkpoint (`.vmrs`) and `WINDBG_MCP_SMOKE_SK_IMAGE` optionally names the
+`securekernel.exe` the guest was running; the tier then drives the four `securekernel` tools against
+it. It needs the Windows SDK's `vmsavedstatedumpprovider.dll` on the host and **the Hyper-V role on
+nothing** — a checkpoint reads the same copied off the host as on it, which is what gate S0 of
+`FOLLOWUPS.md` item 103 measured. What it asserts is the *shape* of the answer — a decode, or the
+reason there is none, never neither — because whether the capture has VTL1 in it is a property of
+somebody's guest rather than of this server. The figures are in that item.
 
 **The sample they open follows the host.** Four dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so

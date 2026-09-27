@@ -1244,6 +1244,11 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
     let _ = LIMITATION.set(limitation);
     // Published before `Ready`, so the request reader can never be handed work it cannot interrupt.
     let _ = INTERRUPT.set(engine.interrupt_handle());
+    // The Secure Kernel capture this worker holds, if its session is one — `FOLLOWUPS.md` item 103
+    // gate S3. A local of this thread rather than a `static`, which is what keeps it out of the
+    // `Send`/`Sync` question entirely: the provider's handles are raw pointers, every call on them
+    // is made from here, and there is nowhere else in this process that could reach them.
+    let mut sk: Option<crate::sksession::Session> = None;
     emit(&WorkerMessage::Ready {
         build: crate::BUILD_VERSION.to_string(),
     });
@@ -1327,7 +1332,14 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                 }
                 apply_symbol_path(&engine, &setting).map_err(Failed::from)?;
             }
-            execute(&engine, id, request.op, queued, request.handle_bound)
+            execute(
+                &engine,
+                id,
+                request.op,
+                queued,
+                request.handle_bound,
+                &mut sk,
+            )
         }));
         let panicked = result.is_err();
         let result = result.unwrap_or_else(|_| Err(Failed::from("debugger operation panicked")));
@@ -1699,17 +1711,26 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
 /// An unreadable status is not a refusal — the same rule dbgscope's own guard follows. Refusing on
 /// a guess costs a caller a session that was working, which is the worse of the two mistakes.
 fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Failed> {
-    if matches!(
-        op,
-        EngineOp::OpenDump { .. }
-            | EngineOp::OpenTrace { .. }
-            | EngineOp::AttachKernelLocal
-            | EngineOp::AttachKernel { .. }
-            | EngineOp::AttachProcess { .. }
-            | EngineOp::Launch { .. }
-            | EngineOp::EndSession
+    // **Every opener, by the predicate rather than by a list of six.** The list was the six there
+    // were, and the seventh — the Secure Kernel capture opener — was refused by this on its way to
+    // creating anything: an engine with no target reads the same before an open as after one, which
+    // is what the exemption is for, and enumerating them put the next one outside it. Measured, as
+    // the capture opener answering *this session has no target left* on the first run that reached
+    // a real capture.
+    if op.is_opener()
+        || matches!(
+            op,
+            EngineOp::EndSession
             | EngineOp::Interrupt { .. }
-    ) {
+            // A Secure Kernel session reads a **file**, and its engine holds either nothing or the
+            // image the symbols came from. Refusing these because there is no debuggee would refuse
+            // the ordinary case: a session opened without `symbols` has no target and never needed
+            // one.
+            | EngineOp::SkModules
+            | EngineOp::SkRead { .. }
+            | EngineOp::SkSymbol { .. }
+        )
+    {
         return None;
     }
     match e.has_target() {
@@ -2046,6 +2067,11 @@ fn watch_for(op: &EngineOp) -> Watch {
     match op {
         _ if op.is_opener() => Watch::Baseline,
         EngineOp::EndSession | EngineOp::Interrupt { .. } => Watch::Ignore,
+        // For the reason [`refuse_when_the_target_is_gone`] exempts them: these read a capture, and
+        // the engine's target — the image, when there is one — is not what they answer about. It
+        // also cannot move under them, since a Secure Kernel session accepts no op that can run a
+        // command (`crate::engine::refuse_op_on_kind`).
+        EngineOp::SkModules | EngineOp::SkRead { .. } | EngineOp::SkSymbol { .. } => Watch::Ignore,
         _ => Watch::Compare,
     }
 }
@@ -2427,6 +2453,7 @@ fn execute(
     op: EngineOp,
     queued: Duration,
     handle_bound: bool,
+    sk: &mut Option<crate::sksession::Session>,
 ) -> Result<Output, Failed> {
     // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
     // *plus* whatever this op has already spent getting to the point of arming one. Every budget
@@ -2612,6 +2639,33 @@ fn execute(
             },
             || e.execute_command("r").map_err(es),
         ),
+
+        EngineOp::OpenSecureKernel(request) => open_secure_kernel(e, id, &request, sk),
+
+        EngineOp::SkModules => {
+            let modules = held_capture(sk)?.modules().map_err(Failed::from)?;
+            Ok(Output::typed(
+                crate::sksession::render_modules(&modules),
+                modules,
+            ))
+        }
+
+        EngineOp::SkRead { address, size } => {
+            let read = held_capture(sk)?
+                .read(e, address, size)
+                .map_err(Failed::from)?;
+            Ok(Output::typed(crate::sksession::render_read(&read), read))
+        }
+
+        EngineOp::SkSymbol { name, address } => {
+            let symbol = held_capture(sk)?
+                .symbol(e, name.as_deref(), address)
+                .map_err(Failed::from)?;
+            Ok(Output::typed(
+                crate::sksession::render_symbol(&symbol),
+                symbol,
+            ))
+        }
 
         EngineOp::Launch { command_line } => open(
             e,
@@ -7680,6 +7734,72 @@ where
         summary.limitation.clone(),
     );
     Ok(Output::opened(text, summary))
+}
+
+/// `open_sk_capture`'s opener: decode a Hyper-V capture's VTL1 and keep it for the session.
+///
+/// **Not [`open`], and the difference is the summary rather than the milestones.** That helper
+/// finishes with [`target_summary`], which asks the engine what it is holding — and here the engine
+/// is holding `securekernel.exe` as a *file*, or nothing at all. Reporting its module table would
+/// tell the caller that a Secure Kernel capture has one module, named `securekernel`, based where
+/// the engine put the image: three facts, all about the wrong thing. So every debuggee field is
+/// left absent, which is what it is, and the summary carries the decode instead.
+fn open_secure_kernel(
+    e: &DebugEngine,
+    id: u64,
+    request: &crate::sksession::Request,
+    slot: &mut Option<crate::sksession::Session>,
+) -> Result<Output, Failed> {
+    if slot.is_some() {
+        return Err(Failed::from(
+            "this session already holds a capture; a worker holds one target for its life",
+        ));
+    }
+    let session = crate::sksession::Session::open(request, e).map_err(Failed::from)?;
+    // **Both milestones at one instant, and that is honest rather than lazy.** A failure inside
+    // `Session::open` leaves nothing behind — the capture handle is released as its value is
+    // dropped, and no process was started and no connection taken — so every one of them is a
+    // pre-commit failure, which is the supervisor's *open again* advice and the correct one. What
+    // the pair says is that from here the session holds an open capture, and re-opening would load
+    // a second copy of a file that is a good fraction of a guest's RAM.
+    emit(&WorkerMessage::Committed { id });
+    emit(&WorkerMessage::Opened { id });
+    let mut report = session.report();
+    // The two engine-backed halves, read here because this is where the engine is. Both are
+    // reported whatever they answer: a probe the engine refused and a landmark the PDB could not
+    // name are findings, and a report that dropped them would present a run with no symbols and a
+    // run whose symbols said nothing as the same thing.
+    let (probes, landmarks) = session.symbol_evidence(e);
+    report.symbols.type_probes = probes;
+    report.symbols.landmarks = landmarks;
+    let limitation = session.limitation();
+    let text = appended(crate::sksession::render(&report), limitation.clone());
+    // Both halves, for `FOLLOWUPS.md` item 43's reason: a structured-aware client forwards
+    // `structuredContent` and drops the text, so a limitation stated only in the report is one
+    // those clients never see. Every other field of the summary stays absent, which is what it is:
+    // there is no debuggee here for the engine to have answers about.
+    let summary = structured::TargetSummary {
+        limitation,
+        ..Default::default()
+    };
+    *slot = Some(session);
+    Ok(Output::opened_capture(text, summary, report))
+}
+
+/// The capture this worker holds, for the three ops that read one.
+///
+/// The supervisor refuses these against any other kind of session, so reaching this with an empty
+/// slot means the two gates disagree — which is worth an answer rather than a panic, for the reason
+/// `FOLLOWUPS.md` item 55 gives about a rule enforced in two places.
+fn held_capture(
+    slot: &Option<crate::sksession::Session>,
+) -> Result<&crate::sksession::Session, Failed> {
+    slot.as_ref().ok_or_else(|| {
+        Failed::categorised(
+            structured::ErrorCategory::StaleSession,
+            "this session holds no Secure Kernel capture".to_string(),
+        )
+    })
 }
 
 /// The post-attach diagnostic shared by both kernel openers.

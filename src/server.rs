@@ -6,6 +6,7 @@
 //! returning full text); session-management tools drive the typed `dbgscope` openers.
 
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::time::Duration;
 
 use rmcp::ErrorData;
@@ -1006,6 +1007,87 @@ fn guarded_location(
         (None, Some(_)) => Err("coordinate requires an explicit session_id".into()),
         _ => Err("provide exactly one location: address/expression or coordinate".into()),
     }
+}
+
+/// `open_sk_capture`'s arguments.
+///
+/// The three ways of naming a capture are three fields here and **one value** by the time anything
+/// acts on them ([`crate::savedstate::CaptureSpec::one_of`]): the tool resolves them, refuses
+/// anything but exactly one, and the worker is handed the choice already made.
+#[derive(Deserialize, JsonSchema)]
+pub struct SkCaptureArgs {
+    /// The Hyper-V virtual machine whose checkpoint to read. Needs Hyper-V on this host.
+    #[serde(default)]
+    pub vm: Option<String>,
+    /// Which checkpoint of that VM. Omit for its most recent one. Only with `vm`.
+    #[serde(default)]
+    pub snapshot: Option<String>,
+    /// A `.vmrs` file, named directly. A checkpoint copied off the Hyper-V host reads the same
+    /// way here as on it.
+    #[serde(default)]
+    pub vmrs: Option<String>,
+    /// The older capture pair's memory file. Give `vsv` with it.
+    #[serde(default)]
+    pub bin: Option<String>,
+    /// The older capture pair's device-state file. Give `bin` with it.
+    #[serde(default)]
+    pub vsv: Option<String>,
+    /// The `securekernel.exe` the captured guest was running, on this host's disk — usually
+    /// `C:\Windows\System32\securekernel.exe` when the builds match.
+    pub image: String,
+    /// A Windows SDK root to take `vmsavedstatedumpprovider.dll` from. Omit to search the
+    /// installed kits.
+    #[serde(default)]
+    pub kit: Option<String>,
+    /// A particular SDK version, e.g. "10.0.26100.0". Omit for the newest one that has the
+    /// provider.
+    #[serde(default)]
+    pub kit_version: Option<String>,
+    /// Which virtual processor's saved registers the VTL1 page-table root comes from. Default 0.
+    #[serde(default)]
+    pub vp: Option<u32>,
+    /// Which VTL to read. Default 1, which is where the Secure Kernel is.
+    #[serde(default)]
+    pub vtl: Option<u8>,
+    /// Also reach the loader list *structurally* — the entry whose base is the identified
+    /// image's, followed by its `Blink` — and report whether it agrees with the debugger data
+    /// block. A second route to one answer, costing a scan of the mapped pages.
+    #[serde(default)]
+    pub cross_check: bool,
+    /// Open the image in the debugger and load its PDB, so addresses here have names. Needs a
+    /// reachable symbol store; the decode is the same either way.
+    #[serde(default)]
+    pub symbols: bool,
+    /// A symbol path for that engine, replacing the default rather than adding to it. Only with
+    /// `symbols`.
+    #[serde(default)]
+    pub symbol_path: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SkReadArgs {
+    /// Guest virtual address in the captured VTL1 (decimal, or "0x"-hex).
+    pub address: String,
+    /// How many bytes. Whole or nothing: a range reaching a page the capture does not carry is
+    /// refused rather than answered short.
+    pub size: u32,
+    /// Which session to act on. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+pub struct SkSymbolArgs {
+    /// A symbol in the Secure Kernel image, unqualified — the module name is the engine's and is
+    /// applied here.
+    #[serde(default)]
+    pub name: Option<String>,
+    /// A guest virtual address to name instead (decimal, or "0x"-hex).
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Which session to act on. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
 }
 
 #[derive(Deserialize, JsonSchema)]
@@ -2232,6 +2314,19 @@ pub(crate) fn changes_debug_target(command: &str) -> bool {
     })
 }
 
+/// Which typed answer a successful open produces.
+///
+/// A parameter rather than two functions, because everything else about an open is shared: the
+/// milestones, the phases, the withdrawal of a profile claim, and every failure branch with its
+/// own recovery advice. Only the success payload differs — see [`structured::SkOpenOutcome`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum OpenShape {
+    /// A target DbgEng holds: what [`structured::OpenOutcome`] describes.
+    Debuggee,
+    /// A Hyper-V capture read for its Secure Kernel.
+    Capture,
+}
+
 impl WindbgServer {
     /// Routes a call to the session the caller named — or to the current one — and runs it.
     ///
@@ -2264,7 +2359,29 @@ impl WindbgServer {
         what: String,
         op: EngineOp,
     ) -> Result<CallToolResult, ErrorData> {
-        self.opened_as(kind, what, None, op).await
+        self.opened_as(kind, what, None, op, OpenShape::Debuggee)
+            .await
+    }
+
+    /// [`Self::opened`] for the one opener whose target is not a debuggee.
+    ///
+    /// Everything about the open is the same — the milestones, the phases, every failure branch and
+    /// its advice — and only the **success** payload differs, because a capture's answer is a decode
+    /// rather than an engine's view of a target. See [`structured::SkOpenOutcome`] for why that is a
+    /// second type rather than a field on the first.
+    async fn opened_capture(
+        &self,
+        what: String,
+        op: EngineOp,
+    ) -> Result<CallToolResult, ErrorData> {
+        self.opened_as(
+            SessionKind::SecureKernel,
+            what,
+            None,
+            op,
+            OpenShape::Capture,
+        )
+        .await
     }
 
     /// [`Self::opened`] for an opener that was given a *connection profile*, which is only
@@ -2281,6 +2398,7 @@ impl WindbgServer {
         what: String,
         profile: Option<structured::ProfileFacts>,
         op: EngineOp,
+        shape: OpenShape,
     ) -> Result<CallToolResult, ErrorData> {
         // Kept for the typed answer, which describes what was asked for rather than re-deriving
         // it from the report the debugger printed.
@@ -2303,6 +2421,7 @@ impl WindbgServer {
                 id,
                 mut report,
                 summary,
+                sk,
             }) => {
                 let mut profile = profile;
                 // **Withdrawn from the session, and reported from there** — one home rather than
@@ -2341,21 +2460,53 @@ impl WindbgServer {
                 // a pointer half the clients never see, and a pointer *removed* from only one is
                 // the leak still open on the other.
                 let report = self.annotated_report(report, &summary);
-                outcome_result(
-                    format!(
-                        "{report}\n\nsession_id: {id}\nPass this as `session_id` on later \
-                         calls to route them to this session and to fail loudly rather than act \
-                         on a different target."
+                let text = format!(
+                    "{report}\n\nsession_id: {id}\nPass this as `session_id` on later calls to \
+                     route them to this session and to fail loudly rather than act on a different \
+                     target."
+                );
+                // **One shape per kind of target, and the failure branches above are shared.** A
+                // capture opener that answered with `OpenOutcome` would have to put its decode in
+                // `TargetSummary`, which is the arrangement `structured::SkOpenOutcome` records
+                // the cost of: 73 KB of schema inlined into seven openers for one tool's answer.
+                match (shape, sk) {
+                    (OpenShape::Capture, Some(capture)) => outcome_result(
+                        text,
+                        structured::SkOpenOutcome::Ok(structured::SkOpenedSession {
+                            session_id: id,
+                            kind: kind.into(),
+                            target,
+                            report,
+                            limitation: summary.limitation,
+                            capture,
+                        }),
                     ),
-                    structured::OpenOutcome::Ok(structured::OpenedSession {
-                        session_id: id,
-                        kind: kind.into(),
-                        target,
-                        report,
-                        summary,
-                        profile: profile.map(Box::new),
-                    }),
-                )
+                    // A capture opener whose worker sent no decode, which nothing produces: the
+                    // op that answers this shape builds the report before it answers at all. It is
+                    // an answer rather than an `expect` because the alternative is losing a session
+                    // that is open and usable over a field, and the handle is in the text either
+                    // way.
+                    (OpenShape::Capture, None) => open_failure(
+                        ErrorCategory::Debugger,
+                        format!(
+                            "the capture opened and its worker sent no decode with the \
+                             report\n\n{text}"
+                        ),
+                        Some(id),
+                        TargetCreated::Yes,
+                    ),
+                    (OpenShape::Debuggee, _) => outcome_result(
+                        text,
+                        structured::OpenOutcome::Ok(structured::OpenedSession {
+                            session_id: id,
+                            kind: kind.into(),
+                            target,
+                            report,
+                            summary,
+                            profile: profile.map(Box::new),
+                        }),
+                    ),
+                }
             }
             // No worker, so no session — and no argument the model can change fixes that.
             Err(OpenError::Unavailable(m)) => Err(ErrorData::internal_error(m, None)),
@@ -2720,6 +2871,7 @@ impl WindbgServer {
                 connection: selected.connection,
                 experimental_break_on_connect: args.experimental_break_on_connect,
             },
+            OpenShape::Debuggee,
         )
         .await
     }
@@ -3357,6 +3509,211 @@ impl WindbgServer {
         .await
     }
 
+    /// Open a Hyper-V saved state (a **standard checkpoint**) and decode the Secure Kernel in the
+    /// guest's VTL1 — memory a running Windows cannot read about itself.
+    /// Name the capture exactly one way: `vm` (with an optional `snapshot`), `vmrs`, or `bin` with
+    /// `vsv` (the older pair). `image` is required: a mapping in VTL1 is identified by comparing it
+    /// with that file, so there is nothing to identify against without one.
+    /// Needs the Windows SDK's `vmsavedstatedumpprovider.dll` on this host.
+    /// The answer is the whole decode — the page-table root read out of the capture, the walk, the
+    /// image's base, `KdDebuggerDataBlock`, `SkLoadedModuleList`, and every count the decode made
+    /// including failed reads. A capture is a fixed snapshot, so nothing it says changes while the
+    /// session is held, and one opened on a guest with VBS switched off reports that it carries no
+    /// VTL1 — which is the answer to asking, not a failure.
+    /// `symbols` (opt-in) also opens that image in the debugger and loads its PDB, which is what
+    /// lets addresses here have names; it needs a reachable symbol store, and the decode is the
+    /// same either way.
+    /// Opens a new session in its own engine process — sessions already open are left alone — and
+    /// returns a `session_id` that routes later calls to it. End it with `end_session`.
+    /// A capture holds no debuggee: nothing executes, and the debugger tools are refused on this
+    /// session rather than answering about the image file the engine has open.
+    #[rmcp::tool(
+        annotations(
+            title = "Open a Secure Kernel capture",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<structured::SkOpenOutcome>()
+    )]
+    async fn open_sk_capture(
+        &self,
+        Parameters(args): Parameters<SkCaptureArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        // **The three ways of naming a capture are resolved here, into one value.** The same rule
+        // the command-line role applies (`savedstate::CaptureSpec::one_of`) and the same reason:
+        // two selectors with one silently winning is a session about a capture the caller did not
+        // name.
+        let capture = match crate::savedstate::CaptureSpec::one_of(
+            args.vm.clone(),
+            args.snapshot.clone(),
+            args.vmrs.clone().map(PathBuf::from),
+            args.bin.clone().map(PathBuf::from),
+            args.vsv.clone().map(PathBuf::from),
+        ) {
+            Ok(capture) => capture,
+            // Spelled the way this caller's arguments are — `vm`, not `--vm`. The rule is shared
+            // with the command-line role and the dialect is not.
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why.explain(""), None);
+            }
+        };
+        // Same shape as the role's `--snapshot` check, for the same reason: a snapshot belonging
+        // to no VM is a caller who means something this cannot do, and ignoring it silently would
+        // read whichever checkpoint Hyper-V happened to answer with.
+        if args.snapshot.is_some() && args.vm.is_none() {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                "`snapshot` names a checkpoint of a `vm`, and no `vm` was given".to_string(),
+                None,
+            );
+        }
+        if args.symbol_path.is_some() && !args.symbols {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                "`symbol_path` configures the engine `symbols` opens, and `symbols` was not given"
+                    .to_string(),
+                None,
+            );
+        }
+        let what = capture.describe();
+        self.opened_capture(
+            what,
+            EngineOp::OpenSecureKernel(Box::new(crate::sksession::Request {
+                capture,
+                image: PathBuf::from(args.image),
+                kit: args.kit.map(PathBuf::from),
+                kit_version: args.kit_version,
+                vp: args.vp.unwrap_or(0),
+                vtl: args.vtl.unwrap_or(1),
+                cross_check: args.cross_check,
+                symbols: args.symbols,
+                symbol_path: args.symbol_path,
+            })),
+        )
+        .await
+    }
+
+    /// List the modules the Secure Kernel had loaded in the captured guest's VTL1, walked from
+    /// `SkLoadedModuleList`. Six on a stock Windows guest, `securekernel.exe` first.
+    /// Each entry carries the base the guest loaded it at and its `SizeOfImage`; one whose name
+    /// could not be read says so rather than coming back unnamed. A walk that did not close back
+    /// on its own head is reported incomplete with the reason, because a truncated list of modules
+    /// looks exactly like a short one.
+    #[rmcp::tool(
+        annotations(
+            title = "List Secure Kernel modules",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = false
+        ),
+        output_schema = constraints_of::<Outcome<structured::SecureKernelModules>>()
+    )]
+    async fn sk_modules(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(args.session_id.as_deref(), EngineOp::SkModules)
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Read bytes out of the captured guest's VTL1, by **guest virtual address**, translated
+    /// through the page-table walk this session made at the open. The physical address it landed on
+    /// comes back with the bytes, so a reading here can be compared with one taken another way,
+    /// and — where the session has symbols — what the image calls that address.
+    /// Whole or nothing: a range reaching a page the capture does not carry is refused naming that
+    /// page rather than answered short, which would look like the end of a structure.
+    /// This is the only read that answers about the guest; the debugger tools are refused on a
+    /// capture session, whose engine target is the image on disk.
+    #[rmcp::tool(
+        annotations(
+            title = "Read Secure Kernel memory",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::SecureKernelRead>>()
+    )]
+    async fn sk_read_memory(
+        &self,
+        Parameters(args): Parameters<SkReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let address = match parse_u64(&args.address) {
+            Ok(address) => address,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkRead {
+                    address,
+                    size: args.size,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Name an address in the captured Secure Kernel, or find where a name is — both in the
+    /// guest's own coordinates. Pass exactly one of `name` (unqualified, e.g.
+    /// `SkLoadedModuleList`) or `address`.
+    /// The symbols come from the image's PDB loaded with **no debuggee**, at the image's own
+    /// preferred base, rebased onto the base the decode found; the answer carries the guest
+    /// address, the RVA and the engine's own address, so a figure from here joins a disassembler
+    /// loaded at either base.
+    /// A lookup by address answers with the nearest preceding name and how far past it the address
+    /// is — a displacement of zero is the only answer that says the address *is* the symbol.
+    /// Needs a session opened with `symbols`. There are no **types**: the public
+    /// `securekernel.pdb` carries no type records, so there is no structure formatting over VTL1,
+    /// and the open's report says what the engine answered when asked.
+    #[rmcp::tool(
+        annotations(
+            title = "Resolve a Secure Kernel symbol",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<structured::SecureKernelSymbol>>()
+    )]
+    async fn sk_symbol(
+        &self,
+        Parameters(args): Parameters<SkSymbolArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let address = match args.address.as_deref().map(parse_u64).transpose() {
+            Ok(address) => address,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        // Refused here as well as in the worker, because this is the half that can say it in the
+        // caller's own terms — and because "exactly one" is an argument rule rather than a
+        // property of the capture.
+        if args.name.is_some() == address.is_some() {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                "give exactly one of `name` or `address`".to_string(),
+                args.session_id,
+            );
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkSymbol {
+                    name: args.name,
+                    address,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
     /// List the debug sessions this server holds — what each one is, how long it has been in
     /// its current state, and which one a call that names no session is routed to. Pass a
     /// `session_id` to ask about one in particular.
@@ -6305,7 +6662,12 @@ mod tests {
 
     /// Only a tool that structurally cannot reach the network may say so. Everything that
     /// touches a target can trigger a PDB download, and over KDNET the target itself is
-    /// remote — leaving the three that never reach the engine at all.
+    /// remote — leaving the ones that never reach the engine at all.
+    ///
+    /// `sk_modules` is the fourth, and its two siblings are deliberately **not**: a Secure Kernel
+    /// session's module list was walked at the open and is rendered from the value it produced,
+    /// where `sk_read_memory` and `sk_symbol` both ask the engine for a name — and an engine asked
+    /// for a name is an engine that may go and fetch a PDB.
     #[test]
     fn only_the_tools_that_cannot_reach_the_network_are_closed_world() {
         let closed: Vec<String> = WindbgServer::tool_router()
@@ -6325,7 +6687,8 @@ mod tests {
                 "decode_error_reporting",
                 "decode_ioctl",
                 "server_log",
-                "session_status"
+                "session_status",
+                "sk_modules"
             ]
         );
     }

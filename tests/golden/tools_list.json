@@ -3,7 +3,7 @@
     "(none)",
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 63,
+  "toolCount": 67,
   "tools": [
     {
       "hints": {
@@ -1210,6 +1210,54 @@
     },
     {
       "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "open_sk_capture",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SkOpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "bin: string|null",
+        "cross_check: boolean",
+        "image: string",
+        "kit: string|null",
+        "kit_version: string|null",
+        "snapshot: string|null",
+        "symbol_path: string|null",
+        "symbols: boolean",
+        "vm: string|null",
+        "vmrs: string|null",
+        "vp: integer|null/uint32",
+        "vsv: string|null",
+        "vtl: integer|null/uint8"
+      ],
+      "required": [
+        "image"
+      ],
+      "title": "Open a Secure Kernel capture"
+    },
+    {
+      "hints": {
         "destructive": true,
         "idempotent": false,
         "openWorld": true,
@@ -1736,6 +1784,115 @@
         "path"
       ],
       "title": "Set symbol search path"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": false,
+        "readOnly": true
+      },
+      "name": "sk_modules",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SecureKernelModules",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "List Secure Kernel modules"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "sk_read_memory",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SecureKernelRead",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "address: string",
+        "session_id: string|null",
+        "size: integer/uint32"
+      ],
+      "required": [
+        "address",
+        "size"
+      ],
+      "title": "Read Secure Kernel memory"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "sk_symbol",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/SecureKernelSymbol",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "address: string|null",
+        "name: string|null",
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Resolve a Secure Kernel symbol"
     },
     {
       "hints": {

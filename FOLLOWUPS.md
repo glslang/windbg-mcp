@@ -2536,7 +2536,143 @@ available, and if it needs an engine call it is a **typed `dbgscope` method**, p
 that a new DbgEng primitive belongs there rather than behind the `execute` text hatch. Size that
 before promising symbols.
 
-### S3 — the tool surface
+### S3 — the tool surface — **BUILT AND RUN 2026-09-27**
+
+**Four tools, one session per capture, and the whole decode on the open.** `open_sk_capture`,
+`sk_modules`, `sk_read_memory` and `sk_symbol` are a `--tools` group of their own
+(`securekernel`); `src/sksession.rs` is the session they open, `EngineOp::OpenSecureKernel` and
+three siblings carry them to a worker, and `crate::engine::refuse_op_on_kind` is what keeps every
+other tool off a capture. The three questions this gate was deferred to answer are answered below,
+and two of the three answers are forced rather than chosen.
+
+**1. Where does the engine live? In a worker — and the half of that which is *measured* is the half
+about the engine-free code.** The rule (`AGENTS.md`) already keeps DbgEng out of the process serving
+MCP, which settles the symbol half and nothing else: the decode needs no engine at all, so nothing
+in the rule stopped it living in the supervisor beside the session registry. What stops it is
+**S0 arm 4**: `vmsavedstatedumpprovider.dll` `__fastfail`s on a capture it has no key for —
+`0xC0000409`, subcode `FAST_FAIL_FATAL_APP_EXIT`, reached from a GSL contract violation inside
+`LoadSavedStateFile`, measured from two different hosts and reported to Microsoft
+(`docs/secure-kernel/vmsavedstatedumpprovider-crash.md`). A vendor DLL that aborts the process on a
+path a *caller* supplies cannot be loaded into the supervisor, where it would take every other
+client's session with it; in a worker it costs the one session that named the capture, which is what
+process-per-session is for. So the arm that was run to answer a question about the VBS boundary
+turned out to decide this one.
+
+**2. One session handle or two? One, with symbols opt-in on it.** The symbols are the capture's only
+because the mapping was identified against the same `securekernel.exe` on disk, and the rebase needs
+the base the decode found — so a symbol handle without a capture handle can answer nothing in guest
+coordinates, and two handles would be two halves of a join nothing checks. `symbols: true` stays
+opt-in because it is the only part that needs a debugger bundle and a reachable symbol store, and
+the decode stands without it: the control arm below has symbols loaded and no VTL1, which is exactly
+the pair a caller must be able to tell from a run where neither worked.
+
+**3. What is a "structure walk" with no types? The decoders `src/sk.rs` already has.** The public
+`securekernel.pdb` carries no type information, so there is no `dt` over VTL1 to offer and none is
+offered. What the surface exposes is what was hand-decoded — the root page, the walk, the identified
+image, the debugger data block and the loader list — plus `sk_read_memory` for anything else, and
+the four type probes travel with the session so a caller is **told** why there is no type-driven
+walk rather than finding out one failed call at a time.
+
+**And a fourth question nobody asked, which the first answer creates.** A worker holding a capture
+has at most one DbgEng target and it is the *image*, at its own preferred base. `read_memory` there
+would read a file and answer as though it had read the guest; `registers` would answer about no
+thread. Neither *fails*. So the supervisor refuses every op that is not one of this session's own,
+in `submit_gated` — the one funnel every non-opener passes — and it is an **allow-list in both
+directions**: a tool added to `EngineOp` later is refused on a capture until somebody decides what it
+means for one, where a deny-list's cost for forgetting is a wrong answer rather than a refusal. The
+refusal names what the engine is actually holding, because "this tool is not available here" sends a
+reader looking for a missing feature.
+
+That rule is also what makes the session's answers stable: nothing in a capture session can execute a
+command, so the engine's target cannot be replaced under the symbols, and the capture is a file that
+does not change. Every figure the open reports is as true at the end of the session as at the
+beginning — which is why the **whole decode travels with the opener** rather than being re-read by a
+later call, and why a structured-aware client (which drops the text block) gets the read counters
+that say whether a negative was earned.
+
+#### What it was run against, and what reproduced
+
+Driven over MCP against the same `H1 pinned 26200.9457 VBS+HVCI` checkpoint gates S0, S1 and S2 were
+run on, with `--tools` defaulted, on build `0.20.0+g7606eac3` plus this change's own tree. **Every
+S1 and S2 figure came back unchanged through the tool surface**: root `0x107593000` read out of the
+capture, root page 29 present entries with the self-map at 309 and 139 non-zero bytes, 16,437 leaf
+mappings over 4,545 distinct pages from 179 table reads and 215 decodes with 7,803 alias prefixes
+unexpanded, 0 malformed entries and 0 unreadable tables, 16,437 pages scanned with 7 PE headers of
+which 1 matches the image, `securekernel.exe` at `0xFFFFF8070EDA9000` (GPA `0xCD0000`),
+`KdDebuggerDataBlock` at `+0x1335E0` with `Size` `0x3A0`, `SkLoadedModuleList` at `+0x127770`, the
+same six VTL1 modules with the same sizes, three `KDBG` tags rejected on `KernBase` and one accepted,
+the structural cross-check reaching head `0xFFFFF8070EED0770` — the address the block names — and
+18,253 reads of which **0** failed. Symbols: PDB key `C2C0D1A62E3269F40C69EA44FDB230C41`, both
+landmarks agreeing in both directions, and all four type probes answering `E_NOINTERFACE`.
+
+**And one thing the CLI role could not show, which is the point of a read tool.** `sk_read_memory` at
+the block's own address returns `C0C5ED0E07F8FFFF C0C5ED0E07F8FFFF 4B444247 A0030000 0090DA0E07F8FFFF`
+— a `LIST_ENTRY` pointing at itself, then **`KDBG`** as the owner tag, then `0x3A0` as the `Size`,
+then `0xFFFFF8070EDA9000` as `KernBase`. Three of the decode's own conclusions, read back as bytes
+through a different code path, and the engine names that address `securekernel!KdDebuggerDataBlock`
+beside them. A read across a page boundary (`0xFFFFF8070EDA9FF0`, 64 bytes) comes back whole and
+stitched.
+
+**The control arm is the other half.** The same command against the VBS-off twin's capture
+(`H1 control 26200.9457 VBS off`) reports partition VTLs `0x1` against the VBS guest's `0x3`, the
+provider refusing the VTL switch by name (`0xC0370509`), and the session **opens** carrying that as
+its `not_walkable` reason and its `limitation` — after which `sk_modules` and `sk_read_memory` are
+refused with the same sentence rather than answering zeroes. Symbols loaded normally on it, which is
+the pair that had to stay distinguishable.
+
+The four refusals were exercised in the same run: `read_memory`, `registers`, `modules` and `execute`
+against the capture session, each answered with what the engine is holding instead.
+
+#### What it cost, stated because a reader will ask whether it should have been paid
+
+**The surface grew by 7,501 B of model-visible context**, from 95,792 to 103,293 across 63 to 67
+tools: `open_sk_capture` 3,918, `sk_symbol` 1,466, `sk_read_memory` 1,277, `sk_modules` 840. That is
+paid at the start of **every** conversation, by every caller, because the default surface is every
+tool — and the overwhelming majority of callers have no Hyper-V checkpoint, no Windows SDK and no VBS
+guest. `--tools` is the lever that exists for it and it is opt-*out*. Whether a group should be able
+to be *outside* the default surface is a real question and is left as one (item 106 below), because
+it is a change to what `--tools` means rather than something this gate should decide. The four
+descriptions were trimmed from 8,340 B first, which took out sentences that explained rather than
+told.
+
+**And the wire payload found a multiplication, which is the first time that ceiling has caught one.**
+`SecureKernelReport` was first held in `structured::TargetSummary`, whose schema is reached by all
+seven openers — so `schemars` inlined the whole report into seven `$defs` closures and `tools/list`
+measured **341,057 B**. Moving it into an outcome of its own (`SkOpenOutcome`, declared by one tool)
+took **50,844 B** back off the wire for a change no client can observe; the payload settled at
+290,213 B, of which the four tools' own output schemas are 14,257 and **378 is `SessionKindName`
+gaining a `secure_kernel` variant** — one enum variant paid eight times over, which the per-tool
+golden keyed by *name* is what made visible. Both ceilings were raised with the arithmetic recorded
+beside them (96,500 → 105,000 and 268,000 → 295,000).
+
+#### What this does **not** establish
+
+- **One capture, one build, one host.** The same limitation S1 and S2 carry, and the tier is written
+  so it does not pretend otherwise: `WINDBG_MCP_SMOKE_SK_CAPTURE` names a `.vmrs` and the test
+  asserts the *shape* of the answer — a decode, or the reason there is none, never neither — because
+  whether a given capture has VTL1 in it is a property of somebody's guest. Both arms have been run
+  here; nothing in the suite pins a figure, deliberately.
+- **No live source.** Every tool reads a capture. The operator-supplied transport that reads a
+  *running* guest is unbuilt, and so is `ReadFailure::Refused`'s only real producer — a capture has
+  nothing to refuse with, so the refusal path is still fixture-only. Two things follow if a live
+  source is ever added behind these tools: the session stops being a fixed snapshot, which is the
+  premise the decode-on-open rests on, and `sk_read_memory` acquires a target that can change
+  between two reads.
+- **No writes.** S4 settled that the direct route writes VTL1, and nothing here exposes it. That
+  stays out for the reason the plan's *Out of scope* section gives.
+- **The capture ops are not interruptible.** `interrupt` reaches DbgEng, and a page-table walk is
+  this server's own code: a break raised during an open does not stop it. What bounds it is the
+  walk's own budgets (20,000 table reads, 200,000 leaves) and the read counters that report them, not
+  a caller's clock. The measured open is ~16s on a 4 GiB guest's checkpoint; a caller whose call
+  timeout is shorter abandons the wait while the worker finishes, exactly as a slow dump open does.
+- **`sk_read_memory`'s 64 KiB cap is a policy, not a measurement.** A capture is a file and the bytes
+  are cheap; what is not cheap is the hex in a result a model pays for.
+- **The `.bin`/`.vsv` pair is still called by nothing.** It is selected by code in both roles and
+  this bench has never produced a capture of that form.
+- **Nothing was measured about a second client.** A capture session is owned like any other and the
+  four-session cap is shared with debugger sessions, but no run here had two credentials open one.
+
+#### S3 as specified
 
 Shape it after S0 and S2 answer, not now — **both have answered**, so this is the next gate. What
 the plan asked for is SK base and size, structure walks, and symbol resolution against the image.
@@ -2676,8 +2812,10 @@ guest side to speak to it — rather than by re-running a completed experiment.
    the public PDB carries **no types**, so "symbols and types" is one of the two.
 3. **S5's unresolved Secure Kernel *attachment*** — not its activation, which is done: the port is
    up and SK does not connect to it. Decides inspector versus debugger, and is the one that would
-   change the shape of S3's tool surface rather than its contents. Independent of the rest, so it
-   can run in parallel or not at all.
+   change the shape of S3's tool surface rather than its contents. **That surface now exists**, so
+   the change is to something built rather than to a design: a capture session is a fixed snapshot
+   whose whole decode travels with the open, and execution state would make it neither. Independent
+   of the rest, so it can run in parallel or not at all.
 4. **Build stability of the offsets, and the derivation that replaces them.** **Half-answered
    2026-09-27 by S2**: the PDB derives both offsets per build and agrees with the scan on this one,
    and it reaches `SkLoadedModuleList` directly where the scan cannot. What is *not* answered is the
@@ -2823,3 +2961,51 @@ a second one"*.
   commentary, which use it as the canonical example. The measurement needs the debugger tier plus a
   live kernel target (`.claude/skills/live-kernel/SKILL.md`), and it should be taken on a build
   named in the write-up, since this is a per-engine-version answer.
+
+## 106. [windbg-mcp] A tool group every caller pays for and few can use
+
+**Repo:** `windbg-mcp`. **Origin:** item 103's gate S3, 2026-09-27 — raised by the change that
+created the cost rather than by a reviewer, because the arithmetic is unarguable and the remedy is
+not.
+
+**The four `securekernel` tools are 7,501 B of model-visible surface** (`open_sk_capture` 3,918,
+`sk_symbol` 1,466, `sk_read_memory` 1,277, `sk_modules` 840, measured 2026-09-27 against a
+103,293 B surface), and they are paid **once per conversation by every caller**, because the default
+surface is every tool. What they need to be usable is a Hyper-V standard checkpoint of a VBS guest,
+the Windows SDK's saved-state provider, and the `securekernel.exe` that guest was running. Almost
+nobody driving a crash dump has any of the three.
+
+`--tools` is the lever that exists for exactly this, and its shape is the problem: it is opt-**out**,
+so a caller who wants no capture tools has to name every group it *does* want, and the default a
+client gets when it says nothing is the widest one. That was the right default while every group was
+something most callers might reach for; a research capability behind a three-part setup is the first
+group for which it is not.
+
+**What *not* to do, and it is the obvious thing.** Dropping the group from the default surface makes
+`--tools` mean two things — a selection, and an exception list — and breaks the property
+`mcp_smoke::every_tool_belongs_to_exactly_one_group` exists for: that the groups **add up** to the
+surface, in both directions, so a tool added and forgotten is still served. A surface where some
+groups are in the default and some are not needs that test rewritten around a second concept, and it
+needs a story for the client that asks for `all`.
+
+**Three shapes worth weighing, and the measurement to take first.**
+
+- **An `extra` marker on a group**, so the default is *every group that is not marked*, and `all`
+  means all. Smallest change, one new concept, and the join test becomes "the marked groups plus the
+  default ones are the surface".
+- **A spec that subtracts** (`--tools all,-securekernel`). No change to what a group is, and it
+  leaves the default surface as it is — which is the thing being complained about, so it helps the
+  operator who already knows and nobody else.
+- **Nothing, and say so in the docs.** The honest option if the measurement below says the cost is
+  noise. 7.3% of the surface is not obviously noise, but the surface is 26k tokens against context
+  windows that are now much larger than they were when item 24 measured it, and *that* is the
+  comparison nobody here has re-taken.
+
+**The measurement to take first** is not about bytes: it is whether a model served the wider surface
+is measurably worse at the tasks it *is* for. `tools/local_model_eval.py` is the bench that could say
+so (`.claude/skills/eval-bench`), and the grid already varies the surface. Until that has run, this
+item is a cost with no demonstrated harm, which is why it is an item rather than a change.
+
+**Where it picks up:** `GROUPS` and `Toolset::parse` in `src/toolset.rs`, the join test in
+`tests/mcp_smoke.rs`, `docs/tool-surface.md`'s table, and the two ceilings in `tests/mcp_smoke.rs`
+whose doc comments record what each raise bought.

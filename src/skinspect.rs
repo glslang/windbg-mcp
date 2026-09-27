@@ -24,31 +24,11 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
-use crate::savedstate::{Capture, CaptureFiles, Kit, Provider, TranslateFailure};
+use crate::savedstate::{Capture, CaptureFiles, CaptureSpec, Kit, Provider, TranslateFailure};
 use crate::sk::{self, Gva, Landmarks, NotWalkable, PAGE, Reader};
 use crate::sksym::{self, Agreement, SymbolFailure, Symbols};
 
 pub(crate) const INSPECT_FLAG: &str = "--sk-inspect";
-
-/// Which capture to read, as **one** value.
-///
-/// Three independent `Option`s were the shape that let `--vm` and `--vmrs` both be given and one of
-/// them silently win, which is what the two matches on them disagreeing would eventually have cost:
-/// a report about a different capture than the caller named. Parsing resolves the choice once, and
-/// nothing downstream has a preference to get wrong.
-#[derive(Debug, Clone, PartialEq, Eq)]
-enum CaptureSpec {
-    Vm {
-        name: String,
-        snapshot: Option<String>,
-    },
-    Vmrs(PathBuf),
-    /// The older pair, which is selected here and — on this bench — called by nothing.
-    Pair {
-        bin: PathBuf,
-        vsv: PathBuf,
-    },
-}
 
 /// What to read, and what to compare it against.
 #[derive(Debug)]
@@ -283,44 +263,12 @@ fn parse(args: &[String]) -> Result<Request> {
             usage()
         );
     }
-    // **Exactly one** capture form, named as a set rather than resolved by precedence: giving two
-    // is a caller who means something this cannot do, and picking one of them would analyse a
-    // capture they did not ask for.
-    let mut forms: Vec<&str> = Vec::new();
-    if vm.is_some() {
-        forms.push("--vm");
-    }
-    if vmrs.is_some() {
-        forms.push("--vmrs");
-    }
-    if bin.is_some() || vsv.is_some() {
-        forms.push("--bin/--vsv");
-    }
-    match forms.as_slice() {
-        [] => bail!(
-            "name a capture: --vm, --vmrs, or --bin with --vsv\n{}",
-            usage()
-        ),
-        [_] => {}
-        several => bail!(
-            "name one capture, not {}: {}\n{}",
-            several.len(),
-            several.join(" and "),
-            usage()
-        ),
-    }
-    request.capture = match (vm, vmrs, bin, vsv) {
-        (Some(name), _, _, _) => CaptureSpec::Vm { name, snapshot },
-        (None, Some(path), _, _) => CaptureSpec::Vmrs(path),
-        (None, None, Some(bin), Some(vsv)) => CaptureSpec::Pair { bin, vsv },
-        // The pair is two files and one of them alone is a usage error, not a capture that fails to
-        // load inside the provider.
-        (None, None, bin, _) => bail!(
-            "--bin and --vsv go together; {} was given without the other\n{}",
-            if bin.is_some() { "--bin" } else { "--vsv" },
-            usage()
-        ),
-    };
+    // **Exactly one** capture form, and the rule is [`CaptureSpec::one_of`]'s rather than this
+    // parser's: the tool surface resolves the same three ways of naming a capture, and a rule with
+    // two copies is a rule the next form gets added to one of. The usage line is appended here
+    // because only this caller has one.
+    request.capture = CaptureSpec::one_of(vm, snapshot, vmrs, bin, vsv)
+        .map_err(|why| anyhow::anyhow!("{}\n{}", why.explain("--"), usage()))?;
     if !matches!(request.capture, CaptureSpec::Vm { .. }) && request.snapshot_was_given(args) {
         bail!(
             "--snapshot names a checkpoint of a --vm, and no --vm was given\n{}",
@@ -356,13 +304,8 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     inputs.add(&request.image);
     // Named before they are read, so a `--json` aliasing one is refused before the analysis rather
     // than after it — the file a `--vmrs` names is the caller's capture, and it is irreplaceable.
-    match &request.capture {
-        CaptureSpec::Vm { .. } => {}
-        CaptureSpec::Vmrs(path) => inputs.add(path),
-        CaptureSpec::Pair { bin, vsv } => {
-            inputs.add(bin);
-            inputs.add(vsv);
-        }
+    for path in request.capture.given_paths() {
+        inputs.add(path);
     }
     if let Some(json) = &request.json {
         inputs.refuse_if_output_is_an_input(json)?;
@@ -446,13 +389,10 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
         report_symbols(opened);
     }
     let provider = Provider::load(&kit).map_err(|e| anyhow::anyhow!(e))?;
-    let files = match &request.capture {
-        CaptureSpec::Vm { name, snapshot } => provider
-            .locate(name, snapshot.as_deref())
-            .map_err(|e| anyhow::anyhow!(e))?,
-        CaptureSpec::Vmrs(vmrs) => CaptureFiles::vmrs(vmrs),
-        CaptureSpec::Pair { bin, vsv } => CaptureFiles::pair(bin, vsv),
-    };
+    let files = request
+        .capture
+        .files(&provider)
+        .map_err(|e| anyhow::anyhow!(e))?;
     for path in files.paths() {
         println!("capture    {path}");
         // Hyper-V answered with these, so they were not in the list above. A `--json` naming one is

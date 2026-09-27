@@ -1983,8 +1983,35 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// `set_breakpoint` in `exec`, so a client served `session,exec` could arm a breakpoint on a live
 /// kernel and had no typed way to list or remove one. `bl` and `bc` through the raw hatch were the
 /// whole answer, and a surface that narrow does not have it.
+/// **96,500 -> 105,000 for the Secure Kernel capture surface** (2026-09-27), which is four tools
+/// and the largest single raise here — so the arithmetic is a term each: the model-visible surface
+/// went 95,792 -> 103,293 across 63 -> 67 tools, and of those 7,501 B, `open_sk_capture` is 3,918,
+/// `sk_symbol` 1,466, `sk_read_memory` 1,277 and `sk_modules` 840. The four sum to the whole
+/// difference exactly, which is the thing to check rather than assume: none of them carries a
+/// `TOOL_NOTES` cross-reference, so unlike the three raises above this one has no second term, and
+/// the per-tool golden — diffed by tool *name* — is what says no existing tool moved a byte.
+///
+/// `open_sk_capture` is the second-largest tool on the surface after `debug_batch`, and it is
+/// **eleven arguments** rather than a long description: three ways of naming a capture, the image
+/// the decode identifies against, two for the SDK, two for the processor and VTL, and three for
+/// the symbol half. It was 4,256 B as first written and the trim that brought it to 3,918 took out
+/// sentences that explained rather than told.
+///
+/// The new figure leaves 1,707 B, 1.6% — the same headroom the last two raises left, and for the
+/// same reason: a ceiling with no room in it fails the next reworded description rather than the
+/// next tool.
+///
+/// **What this raise is really buying is worth naming, because a reader of this line will
+/// eventually ask whether it should have been paid at all.** These four tools are a research
+/// capability: reading a Secure Kernel out of a Hyper-V capture needs a checkpoint, the Windows
+/// SDK and a VBS guest, and the overwhelming majority of callers have none of those. They pay
+/// 7,501 B for it at the start of every conversation, because the default surface is every tool.
+/// `--tools` is the lever that exists for exactly this and it is opt-*out*: a caller who does not
+/// want them asks for the groups it does want. A group that could be left out of the default
+/// surface is a change to what `--tools` means, and `FOLLOWUPS.md` records it rather than this
+/// raise deciding it.
 // 2026-09-19: the opt-in attach field adds 329 B; retain its experimental safety qualifiers.
-const MODEL_VISIBLE_CEILING: usize = 96_500;
+const MODEL_VISIBLE_CEILING: usize = 105_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2092,9 +2119,37 @@ const MODEL_VISIBLE_CEILING: usize = 96_500;
 /// the 40 B between that and its first recording being the `still_set` a review round added to
 /// each failed row, which is what this ceiling's headroom is for.
 /// The new figure leaves 5,083 B, 1.9%, which is the headroom every raise here has left.
+/// **268,000 -> 295,000 for the Secure Kernel capture surface** (2026-09-27), four tools and the
+/// largest raise here. The payload went 267,441 -> 290,213, a difference of **22,772**, and it has
+/// a second term: the four new tools are 22,390 B of wire between them (`open_sk_capture` 13,787,
+/// `sk_symbol` 3,001, `sk_read_memory` 2,866, `sk_modules` 2,736), **seven existing tools grew 54 B
+/// each** — 378 in all — and the last 4 bytes are the array's own commas.
+///
+/// Those 54 B are `SessionKindName` gaining a `secure_kernel` variant, and they are the shape of
+/// finding to expect from this ceiling rather than an oversight: that enum is inlined in every
+/// opener's `OpenOutcome` closure and in `session_status`'s, so one variant is paid eight times.
+/// The per-tool golden keyed by **name** is what makes it visible — a positional diff would have
+/// blamed whichever tools sit where the four new ones were inserted, which is
+/// `positional-diffs-misattribute` on a surface that just grew.
+///
+/// **The sharing question answered *yes* here, and that is why this raise is 27,000 rather than
+/// 95,000.** `SecureKernelReport` was first held in [`crate::structured::TargetSummary`], which is
+/// reached by the output schema of all seven openers — so `schemars` inlined the whole report into
+/// seven `$defs` closures and the payload measured **341,057 B**. Moving it into an outcome of its
+/// own (`SkOpenOutcome`, which only this tool declares) took 50,844 B back off the wire for a
+/// change no client can observe. That is the first time this ceiling has caught a multiplication
+/// rather than confirming there was none, which is what it is for.
+///
+/// `open_sk_capture`'s remaining 9,709 B is the report's own twenty-odd nested types — a page-table
+/// walk, a scan, an identified image, a cross-check, the read counters and the symbol provenance —
+/// inlined once. It is second only to `driver_surface` and, like it, is a decision: the decode's
+/// counters are the evidence for its negatives, and a client that has to go back for them is a
+/// client that will not.
+///
+/// The new figure leaves 4,787 B, 1.6%.
 // 2026-09-20: unresolved-kernel state, one error enum variant per output closure, and the
 // explicit handoff field make the measured payload 254,925 B. No schema descriptions added.
-const WIRE_CEILING: usize = 268_000;
+const WIRE_CEILING: usize = 295_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,842
 /// bytes (2026-09-26), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -2382,9 +2437,9 @@ fn output_schemas_are_object_rooted() {
 /// default surface, which is what a run with no `--tools` serves, would still have carried it.
 #[test]
 fn every_tool_belongs_to_exactly_one_group() {
-    // Every group there is. A ninth added to `src/toolset.rs` and not to this line fails the same
+    // Every group there is. A tenth added to `src/toolset.rs` and not to this line fails the same
     // way a missing tool does, because its tools are then absent from the union too.
-    const GROUPS: &str = "session,inspect,exec,ttd,ioctl,allocator,crash,batch";
+    const GROUPS: &str = "session,inspect,exec,ttd,ioctl,allocator,crash,batch,securekernel";
 
     let listed = |server: &mut Server| -> Vec<String> {
         let response = server.request("tools/list", json!({}), STEP);
@@ -2906,6 +2961,14 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             "error",
         ),
         ("attach_kernel", json!({}), "error"),
+        // The Secure Kernel opener, failing on the image rather than on the capture: the decode
+        // identifies a mapping against that file and reads it before the provider is touched, so
+        // this reaches its refusal without a capture, an SDK or Hyper-V anywhere.
+        (
+            "open_sk_capture",
+            json!({ "vmrs": "Z:\\no\\such.vmrs", "image": "Z:\\no\\such.exe" }),
+            "error",
+        ),
         // Both are answered from this server's own bookkeeping, so they succeed with nothing
         // open — and `server_log` has records to answer with whatever else has happened, this
         // server having logged its own startup.
@@ -2974,6 +3037,20 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             "error",
         ),
         ("break_in", json!({ "execution": "exec-nothing" }), "error"),
+        // The three capture tools, each well formed, so each takes the session refusal rather
+        // than its own argument one — `sk_symbol` given both `name` and `address` is refused
+        // before a session is looked for, which is its own unit test.
+        ("sk_modules", json!({}), "error"),
+        (
+            "sk_read_memory",
+            json!({ "address": "0xfffff80000000000", "size": 16 }),
+            "error",
+        ),
+        (
+            "sk_symbol",
+            json!({ "name": "SkLoadedModuleList" }),
+            "error",
+        ),
         ("pool_find_tag", json!({ "tag": "Tgsm" }), "error"),
         (
             "pool_chunk",
@@ -4033,7 +4110,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 63 tools (session, crash)"),
+        log.contains("serving 13 of 67 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4065,7 +4142,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 63 tools (session, inspect) — except bench serves 13 of 63 tools \
+            "serving 20 of 67 tools (session, inspect) — except bench serves 13 of 67 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -18621,4 +18698,209 @@ fn a_kdnet_endpoint_another_process_holds_is_refused_rather_than_parked() {
             .is_empty(),
         "a refused attach left a session behind"
     );
+}
+
+// ---- tier 7: a Secure Kernel capture -------------------------------------------
+
+/// The capture the Secure Kernel tier reads, or `None` with a `SKIPPED` line.
+///
+/// **A file rather than a VM name**, which is gate S0's own finding one level up: a Hyper-V
+/// checkpoint carries the guest's VTL1 and reads the same copied off the host as on it, so this
+/// tier needs Hyper-V on **no** host — only the `.vmrs` and the SDK's provider. A VM name would
+/// have made the gate "this machine runs the guest", which is the setup cost S0 measured away.
+fn secure_kernel_tier() -> Option<(String, String)> {
+    let Some(capture) = std::env::var_os("WINDBG_MCP_SMOKE_SK_CAPTURE") else {
+        skip(
+            "set WINDBG_MCP_SMOKE_SK_CAPTURE=<path to a .vmrs> to run the Secure Kernel capture \
+             tier (a Hyper-V standard checkpoint; a VBS guest's has VTL1 in it and a VBS-off \
+             guest's does not, and this tier asserts whichever it is told)",
+        );
+        return None;
+    };
+    let capture = capture.to_string_lossy().to_string();
+    if !std::path::Path::new(&capture).exists() {
+        skip(&format!("no capture at {capture}"));
+        return None;
+    }
+    // The image the decode identifies against, defaulted to this host's because a capture of the
+    // same build is the ordinary case. Overridable, since the guest's build and the host's need not
+    // match — and when they do not, nothing in the capture matches and the tier would be asserting
+    // the negative rather than the decode.
+    let image = std::env::var("WINDBG_MCP_SMOKE_SK_IMAGE")
+        .unwrap_or_else(|_| r"C:\Windows\System32\securekernel.exe".to_string());
+    if !std::path::Path::new(&image).exists() {
+        skip(&format!("no Secure Kernel image at {image}"));
+        return None;
+    }
+    Some((capture, image))
+}
+
+/// **A capture opens as a session, and answers about the guest rather than about the image.**
+///
+/// The end-to-end half of `FOLLOWUPS.md` item 103 gate S3. What it asserts is the *shape* of the
+/// answer rather than any figure in it, because the capture is the operator's: a VBS guest's
+/// carries VTL1 and a VBS-off guest's does not, and both are results. The invariant that holds
+/// either way is the one this pins — a report says which of the two it is, and never neither.
+///
+/// The figures are measured in `FOLLOWUPS.md` against the bench's own pinned checkpoint, where they
+/// can be compared with gate S1's and S2's for the same capture. A test cannot hold them: they are
+/// a property of somebody's guest.
+#[test]
+fn a_secure_kernel_capture_opens_as_a_session_and_answers_about_its_vtl1() {
+    let Some((capture, image)) = secure_kernel_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let opened = server.tool_data(
+        "open_sk_capture",
+        json!({ "vmrs": capture, "image": image, "cross_check": true }),
+        TARGET_STEP,
+    );
+    let session = opened["session_id"]
+        .as_str()
+        .expect("a capture opener mints a handle")
+        .to_string();
+    let report = &opened["capture"];
+
+    // Provenance first: which provider read the capture, and which file the decode compared it
+    // with. A figure out of this session can only be re-derived by somebody who knows both.
+    assert!(
+        !report["provider"]["kit_version"]
+            .as_str()
+            .unwrap_or_default()
+            .is_empty(),
+        "the report does not name the SDK provider that read the capture: {report}"
+    );
+    assert_eq!(
+        report["identified_against"]["path"], image,
+        "the report names an image the caller did not give: {report}"
+    );
+
+    // **The invariant: a decode or a reason, never neither and never both.** A capture with no VTL1
+    // is the answer on a VBS-off guest, so the session opens and says so — and a caller must not
+    // have to tell that apart from a decode that found nothing.
+    let walkable = !report["decode"].is_null();
+    let refused = !report["not_walkable"].is_null();
+    assert!(
+        walkable != refused,
+        "a capture report must carry a decode or the reason there is none: {report}"
+    );
+
+    if walkable {
+        let decode = &report["decode"];
+        assert!(
+            decode["reads"]["attempted"].as_u64().unwrap_or(0) > 0,
+            "a decode that read nothing is not a decode: {decode}"
+        );
+        assert!(
+            !decode["root"].as_str().unwrap_or_default().is_empty(),
+            "the page-table root is read out of the capture and reported: {decode}"
+        );
+        if !decode["image"].is_null() {
+            let base = decode["image"]["base"]
+                .as_str()
+                .unwrap_or_default()
+                .to_string();
+            let modules =
+                server.tool_data("sk_modules", json!({ "session_id": session }), TARGET_STEP);
+            let listed: Vec<&Value> = modules["modules"]
+                .as_array()
+                .map(Vec::as_slice)
+                .unwrap_or(&[])
+                .iter()
+                .collect();
+            assert!(
+                !listed.is_empty(),
+                "an identified image means a loader list the block pointed at: {modules}"
+            );
+            // The list vouches for the block by naming the same base back — which is what
+            // `identify` accepted the candidate on, asked for again through the tool surface.
+            assert!(
+                listed.iter().any(|module| module["base"] == json!(base)),
+                "no entry in the loader list names the identified base {base}: {modules}"
+            );
+            // A read at the base is the image's own PE header, and a capture is a file: `MZ`.
+            let read = server.tool_data(
+                "sk_read_memory",
+                json!({ "session_id": session, "address": base, "size": 2 }),
+                TARGET_STEP,
+            );
+            assert_eq!(
+                read["data"], "4D5A",
+                "the identified base is a PE image's first two bytes: {read}"
+            );
+            assert!(
+                !read["gpa"].as_str().unwrap_or_default().is_empty(),
+                "a read reports the physical address it was served from: {read}"
+            );
+        }
+    } else {
+        // Every read is refused with the same sentence the open reported, rather than answering
+        // zeroes about a VTL1 that is not there.
+        let refusal =
+            server.tool_failure("sk_modules", json!({ "session_id": session }), TARGET_STEP);
+        assert!(
+            refusal["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("no VTL1 address space"),
+            "a capture with no VTL1 refuses a read saying so: {refusal}"
+        );
+    }
+
+    // **The gate, in the direction only a capture can test**: the engine in this session's worker
+    // holds the image on disk, so a debugger tool would answer about the wrong thing. The unit
+    // test over `refuse_op_on_kind` pins the rule; this is what says it is wired into the one
+    // funnel every call passes.
+    let refused = server.tool_failure(
+        "read_memory",
+        json!({ "session_id": session, "address": "0x1000", "size": 16 }),
+        TARGET_STEP,
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Secure Kernel image on disk"),
+        "a debugger tool on a capture session must be refused with what the engine is holding: \
+         {refused}"
+    );
+
+    let ended = server.tool_data("end_session", json!({ "session_id": session }), TARGET_STEP);
+    assert_eq!(ended["released"], json!(true), "{ended}");
+}
+
+/// **And the mirror direction, which needs no capture at all.**
+///
+/// The capture tools on a debugger session: the worker behind one holds no capture and could only
+/// answer that it has none, so the refusal happens in the supervisor and names what those tools
+/// read. This runs in the debugger tier because the session has to be real — the rule is a unit
+/// test's, and what this covers is that `Sessions::submit_gated` is where it is applied.
+#[test]
+fn the_capture_tools_are_refused_on_a_debugger_session() {
+    let Some(dump) = target_tier() else {
+        return;
+    };
+    let mut server = Server::started();
+    let session = server.open_session("open_dump", json!({ "path": dump }), TARGET_STEP);
+    for (tool, args) in [
+        ("sk_modules", json!({ "session_id": session })),
+        (
+            "sk_read_memory",
+            json!({ "session_id": session, "address": "0x1000", "size": 16 }),
+        ),
+        (
+            "sk_symbol",
+            json!({ "session_id": session, "name": "SkLoadedModuleList" }),
+        ),
+    ] {
+        let refused = server.tool_failure(tool, args, TARGET_STEP);
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Hyper-V saved state"),
+            "`{tool}` on a dump session must be refused saying what it reads: {refused}"
+        );
+    }
 }
