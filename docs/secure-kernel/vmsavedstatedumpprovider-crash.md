@@ -13,15 +13,38 @@ it can be sent as it stands.
 inside the call with `0xC0000409`, which is a **`__fastfail`** and therefore uncatchable — no
 `try`/`except`, no SEH handler and no `catch_unwind` in the caller sees it.
 
-**That status is not a diagnosis, and its legacy name invites one.** `0xC0000409` is
-`STATUS_STACK_BUFFER_OVERRUN` by name and is the status Windows raises for **every** `__fastfail`,
-so on any build since Windows 8 it almost never means a stack buffer overrun. What says *why* is the
-**`FAST_FAIL_*` subcode**, which travels as the first exception parameter — and this measurement
-**did not capture it**: WER's event carries the status and the fault offset, not the parameter. So
-the fault is a deliberate termination raised by the provider, of an unstated kind; `abort` from an
-unhandled C++ exception (`FAST_FAIL_FATAL_APP_EXIT`) and a real corruption check are both consistent
-with what was observed, and this report claims neither. A dump, or the same repro under a debugger,
-would name the subcode; see *What was not tested*.
+**It is a contract violation, not a corruption check.** `0xC0000409` is `STATUS_STACK_BUFFER_OVERRUN`
+by name and is the status Windows raises for **every** `__fastfail`, so the name says nothing on its
+own; what says why is the subcode in the first exception parameter. Measured under a debugger:
+
+```text
+Subcode: 0x7 FAST_FAIL_FATAL_APP_EXIT        (the CRT's abort())
+```
+
+and the stack says which `abort` it is:
+
+```text
+vmsavedstatedumpprovider!abort                                                   +0xD569
+vmsavedstatedumpprovider!terminate                                               +0x19716
+vmsavedstatedumpprovider!gsl::details::terminate                                 +0x40235
+vmsavedstatedumpprovider!PartitionStateParser::GetPartitionStateVirtualProcessors +0x3F294
+vmsavedstatedumpprovider!VmSavedStateDumpContentProvider::VmSavedStateDumpContentProvider +0x3AFCC
+vmsavedstatedumpprovider!std::_Ref_count_obj2<VmSavedStateDumpContentProvider>…  +0x2A59B
+vmsavedstatedumpprovider!LoadSavedStateFile                                      +0x35FFA
+  … the caller's frames (libffi → _ctypes → python313) …
+```
+
+So: `LoadSavedStateFile` constructs the content provider, which parses the partition state, and
+**`PartitionStateParser::GetPartitionStateVirtualProcessors` trips a Guidelines Support Library
+contract**. GSL's contract-violation handler calls `std::terminate`, which calls `abort`, which
+`__fastfail`s — and the process is gone. The frame at `+0xD569` is the `abort` itself, which is why
+WER reports that offset.
+
+That makes this an ordinary robustness defect with an ordinary fix: a parser reached a precondition
+it could not satisfy on input it does not have the key for, and asserted instead of returning an
+error. **No memory corruption is involved**, and the report claims none: subcode 7 is a deliberate
+exit, and the `gsl::details::terminate` frame identifies the mechanism as a contract check rather
+than a security mitigation.
 
 The same function **refuses corrupt, truncated and random input cleanly**, with
 `0x80070570` (`ERROR_FILE_CORRUPT`). So this is not a parser that gives up loudly on anything it
@@ -37,10 +60,10 @@ Availability and robustness, in a component whose whole job is parsing files:
   which file did it.
 - **The input is ordinary and legitimate.** Nothing crafted it. Hyper-V wrote it, from a supported
   configuration, using the setting Microsoft documents for protecting saved state.
-- **Not demonstrated to be more than that, and deliberately not characterised further.** A
-  `__fastfail` is a *deliberate* kill, so nothing here shows memory corruption at all — and equally,
-  without the subcode nothing here rules out a corruption check having been the thing that fired. No
-  crafted input was tried and no exploitability claim is made. This is reported as a crash.
+- **Not a memory-safety issue, and now measured rather than hedged.** Subcode 7 is a deliberate
+  exit and the failing frame is a GSL contract check, so no corruption is involved and none is
+  claimed. No crafted input was tried and no exploitability claim is made. This is reported as a
+  crash with a named cause.
 
 Worth one factual note on who can supply the input, without a claim attached: a `.vmrs` is a file, so
 its ACL is the boundary. On the bench this was found on, the checkpoint files inherited the data
@@ -113,6 +136,10 @@ Fault offset:              0x000000000000d569
 WER event name:            BEX64
 ```
 
+WER carries the status and the offset but **not** the subcode, which is why the measurement above was
+taken under a debugger instead. The two agree: the debugger stopped at `0x7FFCEFBDD569` against a
+module base of `0x7FFCEFBD0000`, which is the `+0xD569` WER reports.
+
 **The same fault offset appears from an unrelated process** — a Rust binary calling the same export
 through its own FFI produced `0xC0000409` at `0xD569` as well. Two processes with nothing in common
 but this DLL, one offset: the fault is in the provider and is deterministic rather than a property of
@@ -155,14 +182,23 @@ in `VmSavedStateDumpDefs.h`, of which this work has seen `0xC0370509`
 `ERROR_FILE_CORRUPT` is already returned for input it cannot parse. Anything in that shape lets a
 caller say *"this capture is encrypted and I cannot read it"* and carry on to the next file.
 
+The narrow version of that, given the stack: a **contract check on parsed input is the wrong
+instrument** in a library whose input is a file. Whatever precondition
+`GetPartitionStateVirtualProcessors` asserts, an encrypted payload is a legitimate way for it not to
+hold, so that path wants a validation returning an error rather than a `terminate`. The same argument
+covers input that is merely malformed — where this parser **already** does the right thing and answers
+`ERROR_FILE_CORRUPT`, which is what makes this look like one path that was missed rather than a
+design choice.
+
 ## What was not tested
 
 Stated so the report is not read as broader than it is:
 
-- **The `FAST_FAIL_*` subcode.** The one measurement most worth adding before this is sent: it names
-  which check fired, and `0xC0000409` alone does not. It is the first exception parameter, so a
-  local dump (`HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps`) or running the
-  repro under a debugger produces it; neither was done.
+- **Which contract, and on what value.** The failing frame is named
+  (`PartitionStateParser::GetPartitionStateVirtualProcessors`) but the precondition it checks is not,
+  and there are no private symbols to say. A `gsl::span` bound, a `gsl::not_null`, a `narrow_cast` —
+  any of them ends here, and which one it is needs the source or a closer look at the disassembly
+  than this took.
 - **No crafted input.** Nothing here fabricated or mutated an encrypted capture to probe the fault
   further, and no attempt was made to determine whether any check can be avoided.
 - **One SDK version, one architecture.** 10.0.26100.7705, x64 provider in an x64 process. The ARM64

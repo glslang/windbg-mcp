@@ -1488,11 +1488,13 @@ nothing in S0 or S1 looked, and neither should be read as saying they are or are
   holds and this verdict stands — **and the arm turned up a different defect worth reporting**: a
   documented SDK API crashing on an input Hyper-V itself wrote, which is a robustness and
   availability bug rather than a boundary bypass. It is written up in
-  [`vmsavedstatedumpprovider-crash.md`](vmsavedstatedumpprovider-crash.md), and note what
-  `0xC0000409` does **not** say: it is the status every `__fastfail` raises, so its legacy name
-  (`STATUS_STACK_BUFFER_OVERRUN`) is not a diagnosis and the `FAST_FAIL_*` subcode that would be one
-  was not captured. This file said "the corruption being detected" for one commit, which is the trap
-  `src/fault.rs` exists to stop.
+  [`vmsavedstatedumpprovider-crash.md`](vmsavedstatedumpprovider-crash.md). `0xC0000409` is the
+  status every `__fastfail` raises, so its legacy name (`STATUS_STACK_BUFFER_OVERRUN`) is not a
+  diagnosis — this file said "the corruption being detected" for one commit, which is the trap
+  `src/fault.rs` exists to stop. The subcode was then measured: **`0x7 FAST_FAIL_FATAL_APP_EXIT`**,
+  from `gsl::details::terminate` under
+  `PartitionStateParser::GetPartitionStateVirtualProcessors` — a GSL contract violation while
+  parsing the partition state, which is a robustness bug and not a mitigation firing.
 
   **What the arm does and does not establish about the file.** The payload *was* measured, which an
   earlier version of this paragraph denied: the encrypted and plaintext captures share the container
