@@ -2491,6 +2491,14 @@ the capture had no VTL1 must not read like a run where neither half worked.
   `CodeView` and `Sym` keep `None`, those providers genuinely having no signature. Unmeasured like the
   other refusal arms — this bench only produces `Pdb` with an identity, which is what the gated test
   asserts, and that assertion is now a ratchet on the refusal rather than a discovery.
+- **Round 8: the same swallow, surviving in the one branch this bench cannot reach.** The text report
+  printed a failed probe's reason only when *every* probe failed, so a mixed result — one type
+  answered, another query broken — showed the successes and dropped the error. Every probe fails
+  against this PDB, so that branch never runs here and round 5's fix looked complete. The loop is
+  outside the branch now. Not unit-tested, stated rather than hidden: `report_symbols` takes the
+  engine-holding `Symbols`, so splitting a printable provenance out to test a `println!` is more
+  structure than the fix is worth. Codex filed nothing at that head, so round 7's closure of the
+  vouching set held from its side.
 - **The loaded PDB is now an input, and the mutation says the finding's stronger form is wrong.**
   Review also found that `symbol_file()` — a file this run read, discovered only once the engine had
   loaded it — never reached `Inputs`, so `--json` could name it. Taken: it is added where it is first
