@@ -213,7 +213,8 @@ way was mine.
 `docs/**/*.md` and `skills/**/*.md` (`.github/workflows/ci.yml`), so `CLAUDE.md`, `FOLLOWUPS.md`,
 `DONE.md` and everything under **`.claude/`** are absent from all four — and note `skills/**` is
 the *shipped* plugin skill, not `.claude/skills/`, which is this repo's own working guidance and is
-unlinted like the rest. Point the linter at them anyway and it reports ten pre-existing errors —
+unlinted like the rest. Point the linter at them anyway and it reports pre-existing errors —
+**fourteen in `CLAUDE.md` alone, measured 2026-09-27**, where this line said ten —
 fence and list spacing, nothing that renders wrongly — so neither a clean run nor a dirty one tells
 you anything about an edit you just made here.
 
