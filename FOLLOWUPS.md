@@ -2519,11 +2519,25 @@ Two consequences, and they point in opposite directions:
   others are even asked for — so a reading without it has a *shape* chosen by a guess, and the
   next reading differs because the guess changed rather than because the target did. That is one
   field and needs no table; the rest of this entry is the fields whose absence is legitimate.
+
+  **And the *selection* is closed outright, which is the worked example of what this asks for.**
+  A batch measures the current process beside the fingerprint (`worker::BatchTarget`), and that
+  field had the same `.ok()` and the same double meaning until Codex raised it on
+  [#392](https://github.com/glslang/windbg-mcp/pull/392) as well. It is now `worker::Selection`,
+  three-valued — `NotAsked` / `Process` / `Refused` — so a refused reading is not a process and
+  not an agreement with the next refusal: `usable_baseline` will not start a batch against one and
+  `BatchTarget::moved` answers `Held::Uncertain` when one arrives mid-batch, with a sentence saying
+  the engine would not say rather than claiming the selection moved. **What made that one closable
+  is exactly what the four below are missing**: whether it applies is a *gate in the code*
+  (`fingerprints_the_process`, on the target's kind) rather than an inference from an error, and
+  the refusal is narrowed by a second rule that costs nothing — a session holding one process has
+  nowhere for the selection to be, so a write lands there or fails and the refusal is accepted.
+  Neither trick is available inside `TargetFingerprint`, which is why this entry stands.
 - **What would close it:** a reading that records, per field, whether the query was *not asked*,
   *answered*, or *refused* — the first two from the gates that already exist
   (`fingerprints_the_process`, and a second one for the connection query, which is the one that
   needs the per-kind judgement) — and a comparison in which a `refused` on either side answers
-  *cannot tell* rather than *same*. `batch::Held::Unknown` is already that answer on the batch
+  *cannot tell* rather than *same*. `batch::Held::Uncertain` is already that answer on the batch
   side and already withholds cleanup.
 
   **Most of it needs no table, and that is the part to build first.** `kind` and `dumps` are asked
@@ -2533,7 +2547,7 @@ Two consequences, and they point in opposite directions:
   absence is legitimate on every target but a live kernel. And a field whose **readability flips**
   between the two readings can answer *cannot tell* for any of the four, table or no table.
 
-  **The handle's half is what makes it a redesign rather than a patch.** `Held::Unknown` would
+  **The handle's half is what makes it a redesign rather than a patch.** `Held::Uncertain` would
   have to say *why*: a flip is the case `worker::replacement` retires on today (a field that stops
   answering has changed what the engine says), while an unreadable `has_target` is the case it
   deliberately does **not** retire on — so one value cannot serve both, and the variant needs a

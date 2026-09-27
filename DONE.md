@@ -5228,7 +5228,7 @@ Three things about the shape of it are worth keeping.
   identity probe was the one call into the host outside `guarded`, so a panic in any of its four
   engine queries would have unwound past the `always` block and the seal — the rollback loss
   `guarded` exists to prevent, arriving through the check added to prevent a worse one; it answers
-  `Held::Unknown` now, which withholds and reports rather than vanishing. And the *fingerprint* is
+  `Held::Uncertain` now, which withholds and reports rather than vanishing. And the *fingerprint* is
   the wrong granularity for this caller: it carries the process **set** and deliberately not the
   selection, which is right for a handle and not for a batch, since `eb <addr>` writes into
   DbgEng's current process — so on a session holding two user-mode processes a step that moves the
@@ -5255,7 +5255,7 @@ Three things about the shape of it are worth keeping.
   length. dbgscope says the same thing from the other end, on `has_target` itself: *"an unreadable
   status is not an answer, and this does not collapse one into `true`: what to do when the engine
   cannot be asked differs by caller, and each one below decides."* So `Held` has three values,
-  `Held::Unknown` withholds the cleanup under its own outcome (`BatchOutcome::TargetUncertain`,
+  `Held::Uncertain` withholds the cleanup under its own outcome (`BatchOutcome::TargetUncertain`,
   which claims no second target because none was identified), and a batch that cannot read a
   baseline **before its first step is refused outright** — nothing run, nothing changed,
   resubmitting safe, which is the one answer that costs the caller a retry rather than a write.
@@ -5264,7 +5264,7 @@ Three things about the shape of it are worth keeping.
   handle half retires nothing on an engine that will not answer (`worker::replacement_now`), and
   the batch withholds. Same predicate, different price: a wrong retirement costs a caller one
   re-open, a wrong restore costs whatever that address means in somebody else's target. And the
-  argument that makes `Unknown` rare is the same one that makes withholding cheap — an engine that
+  argument that makes `Uncertain` rare is the same one that makes withholding cheap — an engine that
   cannot answer `GetExecutionStatus`, an engine-local call that never reaches the wire, was
   unlikely to execute the restore either.
 
@@ -5280,6 +5280,28 @@ so it needs a per-target-kind table of required fields, which is the claim `Targ
 doc records as having been wrong three review rounds running, and a decision per caller besides.
 Filing it was the proportionate move for the same reason this item was not folded into item 81: it
 is a change to a type both halves share and deserves its own review.
+
+**But the third round on that seam was about the field *this* item added, and that one is closed
+rather than filed.** A batch measures the current process beside the fingerprint
+(`worker::BatchTarget`, added two rounds earlier because `eb <addr>` writes into DbgEng's *current*
+process), and it was read with the same `.ok()` — so a refused query and a question that does not
+apply were again one `None`, two refusals compared equal, and a step that moved the selection
+between two held processes while that query was failing read as nothing having happened. The hazard
+the field was added for, reintroduced by how the field was read; raised by Codex on the rebased
+head. It is `worker::Selection` now — `NotAsked` / `Process` / `Refused` — with `usable_baseline`
+refusing a baseline whose selection was refused and `BatchTarget::moved` answering
+`Held::Uncertain` on one that arrives mid-batch, worded as *"would not say which process"* rather
+than as a selection that moved, which is a claim about the target there is no evidence for.
+**Why this one did not have to go to item 104:** both things that make the fingerprint's four
+fields undecidable are absent here. Whether the question applies is a **gate in the code**
+(`fingerprints_the_process`, on the kind) rather than an inference from an `E_UNEXPECTED` that
+spells two things; and the refusal is narrowed to the only shape in which a selection can
+misdirect a write — a session holding **more than one** process — since one holding a single
+process has nowhere else for a write to land, so the refusal is accepted there and costs nothing.
+That narrowing is also what makes the refusal affordable on kinds this bench cannot measure: a TTD
+trace holds one process and takes the accepted arm, which matters because replay does not run here
+at all (issue #132). Measured with the gate in place: 1,080 unit and 126 smoke tests, dump tier on,
+nothing refused that used to run.
 
 **What measuring it disproved — the item's own example.** Every draft of this entry, and the
 paragraph in `CLAUDE.md`-adjacent prose that came with item 81, illustrated a replacement with

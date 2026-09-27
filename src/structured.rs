@@ -4015,8 +4015,9 @@ pub enum BatchOutcomeName {
     /// original target, which this session can no longer reach: open one on it to put it back.
     TargetReplaced,
     /// Nothing could certify that the debugger is still holding the target the batch's steps ran
-    /// against — it would not say what it holds, or the session is left pointed at a different
-    /// process, where a write lands in another address space. The steps after that point were not
+    /// against, or the process their writes landed in — it would not say what it holds or which
+    /// process it is pointed at, or the session is left pointed at a different one, where a write
+    /// lands in another address space. The steps after that point were not
     /// attempted and the `always` block was deliberately not run — `rollback` says
     /// `not_attempted`. Kept apart from [`Self::TargetReplaced`] because nothing identified a
     /// second target and **this session's handle is not retired**: it may be perfectly usable,
@@ -4038,8 +4039,8 @@ pub enum RollbackDisposition {
     Incomplete,
     /// The block was dropped on purpose: the batch could no longer certify that the debugger
     /// holds the target its steps ran against — replaced, a debugger that would not say what it
-    /// holds, or a session left pointed at another process. Nothing was tried and nothing was
-    /// undone, which is not the same news as a rollback that failed.
+    /// holds or which process it is in, or a session left pointed at another one. Nothing was
+    /// tried and nothing was undone, which is not the same news as a rollback that failed.
     NotAttempted,
 }
 

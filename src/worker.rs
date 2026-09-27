@@ -2146,15 +2146,68 @@ struct BatchTarget {
     /// DbgEng's current process, for a user-mode target only — the same gate
     /// [`fingerprints_the_process`] applies to the set, for its reason: on a kernel target this
     /// is whatever the machine was running at the last break and moves across every `g`.
-    current_process: Option<u32>,
+    current_process: Selection,
+}
+
+/// Which process a batch's writes would land in, with **asked and refused** kept apart from **not
+/// asked**.
+///
+/// `Option<u32>` could not hold that, which is the third finding on this seam from Codex on
+/// [#392](https://github.com/glslang/windbg-mcp/pull/392) and the first against a field the round
+/// before it added: `None` meant both *"this kind of target has no selection to compare"* and
+/// *"the engine would not say which process it is pointed at"*, so two refusals compared **equal**
+/// and a step that moved the selection between two held processes while that query was failing
+/// read as nothing having happened — with the `always` restore then written into the process the
+/// step moved to.
+///
+/// **The fingerprint's own four fields have the same shape and are deliberately not fixed here**
+/// (`FOLLOWUPS.md` item 104). What makes this one decidable is that whether it applies is a
+/// **gate in the code** — [`fingerprints_the_process`], reading the target's kind — rather than
+/// something that would have to be inferred from an error DbgEng spells the same way for a
+/// question that does not apply and one asked at the wrong time.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Selection {
+    /// The gate says this kind of target has no selection worth comparing: on a kernel target the
+    /// current process is whatever the machine was running at the last break, which moves across
+    /// every `g`.
+    NotAsked,
+    /// The process a write would land in.
+    Process(u32),
+    /// Asked, and the engine would not say. Not a process, and not an agreement with the next
+    /// reading that also could not be taken.
+    Refused(String),
+}
+
+/// The selection from the engine's answer, with the one refusal that costs nothing to accept.
+///
+/// **A session holding exactly one process has nowhere for the selection to be.** A write lands in
+/// that process or it fails, whatever the engine will say about which one is current — so a
+/// refusal is only news on a session holding **more than one** user-mode process, which is also
+/// the only shape in which a moved selection can misdirect a restore. That scoping is what keeps
+/// [`usable_baseline`]'s refusal from costing every batch on a target whose selection query never
+/// answers: for the kinds the debugger tier covers, a refusal here is measured not to happen; for
+/// a TTD trace it cannot be measured on this bench at all (replay does not run here, issue #132),
+/// and a trace holds one process, so it takes this arm rather than the refusal.
+///
+/// Its own function because the arm that matters is a refusal, and an engine cannot be made to
+/// refuse from a test.
+fn selection(answer: Result<u32, String>, held: Option<&[u32]>) -> Selection {
+    match (answer, held) {
+        (Ok(pid), _) => Selection::Process(pid),
+        (Err(_), Some([sole])) => Selection::Process(*sole),
+        (Err(why), _) => Selection::Refused(why),
+    }
 }
 
 impl BatchTarget {
     /// Reads the selection beside a fingerprint already taken.
     fn read(e: &DebugEngine, fingerprint: TargetFingerprint) -> Self {
         let current_process = match fingerprints_the_process(fingerprint.kind) {
-            true => e.current_process_system_id().ok(),
-            false => None,
+            true => selection(
+                e.current_process_system_id().map_err(es),
+                fingerprint.processes.as_deref(),
+            ),
+            false => Selection::NotAsked,
         };
         Self {
             fingerprint,
@@ -2172,6 +2225,13 @@ impl BatchTarget {
     /// handle stays good, and a report claiming a retirement would be describing one that is not
     /// going to happen. Both withhold the cleanup; only one of them ends the session.
     ///
+    /// **And a selection nobody could read is a third answer, ahead of both.** It is not a
+    /// process that agrees with the next reading's refusal, and it is not a selection that
+    /// *moved*: reporting it as the latter would make a claim about the target out of a reading
+    /// that was never taken. What cannot arrive is a mismatch of *shape* —
+    /// [`Selection::NotAsked`] against [`Selection::Process`] — because that needs the kind to
+    /// have changed, which is a replacement and is answered first.
+    ///
     /// Its own function so the rule is testable without an engine, and so both questions are
     /// asked in one place. The target is asked first, because a session whose target was swapped
     /// has a new selection as well and the swap is the news.
@@ -2179,17 +2239,27 @@ impl BatchTarget {
         if let Some(why) = replacement(&self.fingerprint, &now.fingerprint, Some(true)) {
             return Held::Replaced(why);
         }
-        if self.current_process != now.current_process {
-            return Held::Uncertain(
+        match (&self.current_process, &now.current_process) {
+            // **A refusal is not a reading that can agree with another refusal**, and it is
+            // answered ahead of the comparison below because that one would report it as a
+            // selection that *moved* — a claim about the target, made from a reading nobody got.
+            (Selection::Refused(why), _) | (_, Selection::Refused(why)) => {
+                Held::Uncertain(format!(
+                    "the debugger would not say which process in this session it is pointed at, \
+                     so this batch cannot certify that a restore would be written in the address \
+                     space its steps ran in: {why}"
+                ))
+            }
+            (here, there) if here != there => Held::Uncertain(
                 "the debugger is pointed at a different process in this session than the one \
                  this batch's steps ran against. Nothing replaced the session's target — the set \
                  of processes it holds is unchanged — but memory and register writes land in \
                  whichever process is current, so a restore taken in one and applied in another \
                  would be written at an address that means something else there"
                     .to_string(),
-            );
+            ),
+            _ => Held::Same,
         }
-        Held::Same
     }
 }
 
@@ -2205,8 +2275,8 @@ fn batch_baseline(e: &DebugEngine) -> Option<BatchTarget> {
     if !matches!(e.has_target(), Ok(true)) {
         return None;
     }
-    let reading = TargetFingerprint::read(e);
-    usable_baseline(&reading).then(|| BatchTarget::read(e, reading))
+    let baseline = BatchTarget::read(e, TargetFingerprint::read(e));
+    usable_baseline(&baseline).then_some(baseline)
 }
 
 /// Whether a reading is one a batch can measure its steps against.
@@ -2231,9 +2301,17 @@ fn batch_baseline(e: &DebugEngine) -> Option<BatchTarget> {
 /// rounds running, and a change to a type both halves of this mechanism share. Raised by Codex on
 /// [#392](https://github.com/glslang/windbg-mcp/pull/392).
 ///
+/// **The selection is the second field this asks about, and for the same reason narrowed to the
+/// case that can misdirect a write.** [`Selection::Refused`] is an unreadable current process on a
+/// session holding more than one — see [`selection`], which accepts the refusal outright where
+/// there is only one process for a write to land in. Two such readings would compare equal, so a
+/// batch that started against one would run its cleanup certified by a field neither reading had:
+/// refusing costs a retry, and running costs a restore written wherever the selection has since
+/// moved to.
+///
 /// Its own function so the rule is testable without an engine, which the reading itself is not.
-fn usable_baseline(reading: &TargetFingerprint) -> bool {
-    reading.kind.is_some()
+fn usable_baseline(reading: &BatchTarget) -> bool {
+    reading.fingerprint.kind.is_some() && !matches!(reading.current_process, Selection::Refused(_))
 }
 
 /// Takes the baseline after an opener, and after every other op checks that the engine is still
@@ -10498,7 +10576,7 @@ mod tests {
                 processes: Some(vec![1000, 2368]),
                 connection: None,
             },
-            current_process: Some(pid),
+            current_process: super::Selection::Process(pid),
         };
         let Held::Uncertain(moved) = with_selection(2368).moved(&with_selection(1000)) else {
             panic!(
@@ -10529,7 +10607,7 @@ mod tests {
                 processes: None,
                 connection: Some(0x1234),
             },
-            current_process: None,
+            current_process: super::Selection::NotAsked,
         };
         assert_eq!(kernel(vec![]).moved(&kernel(vec![])), Held::Same);
         assert!(
@@ -10556,6 +10634,10 @@ mod tests {
     /// assertion here and no other test.
     #[test]
     fn a_batch_baseline_needs_the_field_that_decides_the_others() {
+        let baseline = |fingerprint, current_process| super::BatchTarget {
+            fingerprint,
+            current_process,
+        };
         let unreadable = TargetFingerprint {
             kind: None,
             dumps: Some(vec![]),
@@ -10563,21 +10645,121 @@ mod tests {
             connection: None,
         };
         assert!(
-            !super::usable_baseline(&unreadable),
+            // The gate reads `None` as "it might be a kernel target", so the selection is never
+            // asked for — which is the guess this refuses, not a second reason to.
+            !super::usable_baseline(&baseline(unreadable, super::Selection::NotAsked)),
             "a reading whose shape was chosen by a guess cannot be compared against"
         );
         assert!(
-            super::usable_baseline(&of_a_process(2368)),
+            super::usable_baseline(&baseline(
+                of_a_process(2368),
+                super::Selection::Process(2368)
+            )),
             "an ordinary reading is usable, `connection` being absent on every user target"
         );
         // And a kernel one, where the *process set* is the field that is legitimately absent —
         // so "usable" cannot be "every field answered", which is the wider hole item 104 keeps.
-        assert!(super::usable_baseline(&TargetFingerprint {
-            kind: kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_CONNECTION),
+        assert!(super::usable_baseline(&baseline(
+            TargetFingerprint {
+                kind: kind(DEBUG_CLASS_KERNEL, DEBUG_KERNEL_CONNECTION),
+                dumps: Some(vec![]),
+                processes: None,
+                connection: Some(0x1234),
+            },
+            super::Selection::NotAsked
+        )));
+    }
+
+    /// **A current process the engine refused is not a baseline a batch may start against.**
+    ///
+    /// Raised by Codex on [#392](https://github.com/glslang/windbg-mcp/pull/392), against the
+    /// field the round before it added: `.ok()` made a refused query and a question that does not
+    /// apply the same `None`, so two refusals compared equal and a step that moved the selection
+    /// under a failing query read as nothing having happened. Refused before a step runs rather
+    /// than reported after, which is what the `kind` half above already does and for the same
+    /// price — a retry against a restore written in whichever process the selection has moved to.
+    ///
+    /// **Both halves of the narrowing are asserted here, because the refusal is only sound with
+    /// them**: a session holding one process has nowhere for the selection to be, so its refusal
+    /// is accepted and the batch runs.
+    ///
+    /// Mutation-verified, each against the mutation it is for and each failing this test alone
+    /// out of 1,080: dropping the [`super::Selection::Refused`] clause from `usable_baseline`
+    /// fails the first assertion, and deleting the sole-process arm of [`super::selection`] fails
+    /// the third with `Refused("would not say")` where `Process(2368)` was expected. The test
+    /// below is *not* moved by either, which is the point of the two being separate: it compares
+    /// readings and never builds one.
+    #[test]
+    fn a_current_process_the_engine_refused_is_not_a_baseline() {
+        let held = |pids: Vec<u32>| TargetFingerprint {
+            kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_PROCESS),
             dumps: Some(vec![]),
-            processes: None,
-            connection: Some(0x1234),
-        }));
+            processes: Some(pids),
+            connection: None,
+        };
+        assert!(
+            !super::usable_baseline(&super::BatchTarget {
+                fingerprint: held(vec![1000, 2368]),
+                current_process: super::Selection::Refused("would not say".to_string()),
+            }),
+            "a batch cannot certify where a restore lands from a reading nobody got"
+        );
+        assert_eq!(
+            super::selection(Err("would not say".to_string()), Some(&[1000, 2368])),
+            super::Selection::Refused("would not say".to_string()),
+            "and on a session holding two processes that refusal is what the reading is"
+        );
+        assert_eq!(
+            super::selection(Err("would not say".to_string()), Some(&[2368])),
+            super::Selection::Process(2368),
+            "but a session holding one process has nowhere else for a write to land, so the \
+             refusal is accepted rather than costing the batch"
+        );
+        assert_eq!(
+            super::selection(Ok(1000), Some(&[1000, 2368])),
+            super::Selection::Process(1000),
+            "and an answer is the answer"
+        );
+    }
+
+    /// **A selection that stopped being readable is reported as that, not as one that moved.**
+    ///
+    /// The half of the same finding that lands *during* a batch, the baseline gate above having
+    /// closed the other: the reading a step is measured against was good, and the one after it
+    /// could not be taken. Both withhold the cleanup, so the outcome is the same and the
+    /// *sentence* is not — "pointed at a different process" is a claim about the target, and
+    /// there is no evidence for it here.
+    ///
+    /// Mutation-verified, and the failure is legible as the defect rather than as a mismatch:
+    /// restoring the `Option` comparison this replaced fails the **first** assertion, and what it
+    /// prints is the wrong sentence in full — *"pointed at a different process … the set of
+    /// processes it holds is unchanged"*, about a reading nobody took. Spelling two refusals as
+    /// equal fails the **second**. Neither moves the baseline test above, and neither moves any
+    /// of the other 1,079.
+    #[test]
+    fn a_selection_that_stopped_being_readable_is_not_one_that_moved() {
+        let with = |current_process| super::BatchTarget {
+            fingerprint: TargetFingerprint {
+                kind: kind(DEBUG_CLASS_USER_WINDOWS, DEBUG_USER_WINDOWS_PROCESS),
+                dumps: Some(vec![]),
+                processes: Some(vec![1000, 2368]),
+                connection: None,
+            },
+            current_process,
+        };
+        let refused = || super::Selection::Refused("asked at the wrong time".to_string());
+        let Held::Uncertain(why) = with(super::Selection::Process(2368)).moved(&with(refused()))
+        else {
+            panic!("a reading that could not be taken withholds the cleanup")
+        };
+        assert!(
+            why.contains("would not say which process") && !why.contains("different process"),
+            "and says which of the two it is, having no evidence for the other: {why}"
+        );
+        assert!(
+            matches!(with(refused()).moved(&with(refused())), Held::Uncertain(_)),
+            "and two refusals are not two readings that agree"
+        );
     }
 
     /// **A kernel target's fingerprint must not carry a process id**, and that is the one field
