@@ -25,17 +25,35 @@ itself, in two places:**
   gh api --paginate repos/<owner>/<repo>/issues/<n>/comments \
     --jq '.[] | select(.body | contains("codex-pull-request-review-summary")) | .body'
   ```
-- **A reaction on the PR**: 👀 while a review is running, **👍 once every review has finished with
-  no findings** — which is the signal that a round is genuinely closed rather than pending.
+- **A reaction on the PR**: 👀 while a review is running, and a `+1` from
+  `chatgpt-codex-connector[bot]` — the 👍 — when Codex's own reviews finished with no findings.
   ```console
-  gh api repos/<owner>/<repo>/issues/<n>/reactions --jq '.[] | "\(.user.login): \(.content)"'
+  gh api repos/<owner>/<repo>/issues/<n>/reactions \
+    --jq '.[] | "\(.user.login): \(.content) \(.created_at)"'
   ```
-  A `+1` from `chatgpt-codex-connector[bot]` is that 👍. Reactions on the *comments* are a different
-  thing and are usually empty — the completion signal is on the pull request.
+  Read that `created_at`: the reaction carries no commit, is created once, and never retracts.
+  Reactions on the *comments* are a different thing and are usually empty.
 
-So the order is: findings at the head (act on them), else the summary comment's `Commit` (is the
-head even reviewed?), else the 👍 (did it finish clean?). Reviews re-trigger on new commits, and
-`@codex review` / `@codex security review` in a comment asks for one.
+So the order is: findings at the head (act on them), then the summary comment's `Commit` and
+`Status` — is the head reviewed, and did that review finish? The 👍 corroborates and never decides.
+Reviews re-trigger on new commits, and `@codex review` / `@codex security review` in a comment asks
+for one.
+
+**The 👍 is confirmatory at best and never a thing to wait for, and its absence is never a reason to
+ask for another review.** Measured across the fourteen most recent PRs here: **eight carry no Codex
+summary comment at all** — all of them merged, and #388 and #389 were opened the same day, so it is
+not an enablement cutoff — meaning no status row and no reaction will ever arrive on them. Of the
+six that were reviewed, [#392](https://github.com/glslang/windbg-mcp/pull/392) has a 👍 created at
+20:59:15 and **CodeRabbit filed two findings against that same head at 21:22:15**, twenty-three
+minutes later; the reaction is still sitting there. Its presence is not evidence about the head, and
+its absence is not evidence about anything.
+
+**Asking for a review to settle the question is the move that compounds.** `@codex review` starts a
+*fresh* round on the same head, whose findings need remedies, whose surface the next review then
+reads — the churn half of the predicate in *The stopping rule* is fed by exactly this. A review you
+triggered to resolve your own uncertainty is not evidence of closure; it manufactures a round. If
+the row says `Completed` at the head and nothing is anchored there, the round is closed. If no row
+exists at all, the PR was never reviewed — a fact to report, not a gap to fill with a trigger.
 
 **A round is not a moment, and reading it as one loses findings.** Codex posts a round's comments
 over a minute or two, so a watcher that fires on the *first* comment reads a partial round. On
