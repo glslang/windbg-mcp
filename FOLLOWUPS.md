@@ -2155,6 +2155,26 @@ and availability defect rather than a demonstrated memory-safety exploit, and no
 thing from the VBS-boundary question the arm was run to answer — which came back negative, as the
 verdict says.
 
+**It is written up as a sendable report**, in
+[`docs/secure-kernel/vmsavedstatedumpprovider-crash.md`](docs/secure-kernel/vmsavedstatedumpprovider-crash.md),
+and writing it moved three things the arm itself had left open:
+
+- **The repro is twelve lines and calls one export**
+  ([`tools/vmsavedstate_load_probe.py`](tools/vmsavedstate_load_probe.py)), so the defect is no
+  longer stated through this server. It crashes at the **same fault offset** `0xD569` from CPython as
+  from the Rust binary — two hosts sharing nothing but the DLL, which is what says the fault is the
+  provider's and deterministic.
+- **The trigger is specific, and a control matrix says so.** The same call **refuses** 4 MiB of
+  random bytes, a truncated real capture and one with its first 512 bytes zeroed — all three
+  `0x80070570` (`ERROR_FILE_CORRUPT`), no crash. So this is not a parser that dies on anything it
+  dislikes; the encrypted path is the unhandled one.
+- **"Encrypted" is now measured rather than Hyper-V's claim**, which the arm's own caveat said it was
+  not: the two captures share the container magic `14 20 28 01` and the field at `+0x08`, while the
+  payload entropy is **8.000** bits/byte against the plaintext capture's **7.246**. A well-formed
+  container whose contents the provider has no key for — the case that should have been a clean
+  refusal. The `Apply-VMSnapshot` check remains unrun, so Hyper-V reading what it wrote is still an
+  inference.
+
 **The bench was left as found**: both knobs back to `False`, the two pinned checkpoints intact and
 the three this arm created removed, both guests running, and the pinned VBS capture re-read
 afterwards to the same landmarks.

@@ -83,7 +83,11 @@ three cases that *would* be reportable are named there. The interesting one has 
 capture at all — so the mitigation holds. That arm did surface a **different** defect, and it is the
 one to raise with Microsoft: the SDK's provider **fast-fails** (`0xC0000409`) on an encrypted capture
 that Hyper-V itself wrote, rather than refusing it, which is a robustness bug and not a boundary
-bypass. The remaining case needs no Microsoft involvement and is true today: these `.vmrs` files
+bypass. It is written up as a report in
+[`vmsavedstatedumpprovider-crash.md`](vmsavedstatedumpprovider-crash.md), with a twelve-line repro,
+the control matrix that makes the trigger specific — corrupt, truncated and random input are all
+refused cleanly with `ERROR_FILE_CORRUPT` — and the container-header and entropy readings that show
+the input is a well-formed file with an encrypted payload. The remaining case needs no Microsoft involvement and is true today: these `.vmrs` files
 inherit `D:\`'s ACL, so any authenticated local user can read a guest's whole RAM.
 
 **Two things are open beneath that.** Whether VTL1 *execution* can be controlled at all is
@@ -109,6 +113,7 @@ Two older side-investigations, kept because they are about the same binary:
 |---|---|
 | [Securekernel ARM64 export follow-up](securekernel-export-followup.md) | Why eight matches went unresolved in an ARM64 `securekernel.exe` comparison — undecoded instructions in Binary Ninja, not missing inputs or failed matching. |
 | [Read-only Secure Kernel handoff](securekernel-handoff-acceptance.md) | The handoff probe and its refusal/preservation tests. Live acceptance is **not run**; the record says so rather than implying coverage. |
+| [`vmsavedstatedumpprovider.dll` fast-fails on an encrypted saved state](vmsavedstatedumpprovider-crash.md) | A defect in a Microsoft SDK component, found by gate S0 arm 4 and written as a report that can be sent as it stands: a twelve-line repro, the control matrix that makes the trigger specific, what the OS records, and what was deliberately not tested. Not a VBS boundary bypass — that question is answered in document 4. |
 
 Supporting captures live in
 [`docs/samples/secure-kernel-debugger-investigation/`](../samples/secure-kernel-debugger-investigation/README.md),
