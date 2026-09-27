@@ -2351,9 +2351,11 @@ cross-check agreeing with the block, the oracle 373 of 373, 18,253 reads and 0 f
 **And the report now names the build that produced it**, which it did not under S1: `--sk-inspect`
 prints `BUILD_VERSION` as its first line and carries it in the JSON, so a figure quoted out of this
 role can be re-derived. The runs above were taken from **this change's own working tree** — a
-`0.20.0+g2466abc2-dirty.<digest>` build, and the digest is deliberately not written here: it covers
-the uncommitted diff, so it moved twice while these paragraphs were being edited. The committed
-equivalent is the commit that adds this.
+`0.20.0+g3552d867-dirty.<digest>` build, and the digest is deliberately not written here: it covers
+the uncommitted diff, so it moved four times while these paragraphs were being edited. The committed
+equivalent is the commit that adds this. **Re-measured after rebasing onto `44428f5`** — every figure
+above is identical on both parents, which is the one thing a rebase of a measurement has to be
+checked for rather than assumed.
 
 **So the module list is now reachable three ways, and one of them needs no block.** Unknown 4 asked
 for a derivation to replace two remembered offsets; the PDB *is* that derivation, per build, and it
@@ -2396,14 +2398,18 @@ the capture had no VTL1 must not read like a run where neither half worked.
   beside it and each landmark carrying the engine's reason for itself. That is a decision taken to
   avoid guessing a direction on values this bench has never produced — the working path is the only
   one that has been run.
-- **Six tests, five of them with no engine at all** (1,071 unit tests now, from 1,065). The pure
+- **Seven tests, six of them with no engine at all** (1,087 unit tests now, from 1,080 — re-derived
+  after rebasing onto `44428f5`, which moved both figures from the 1,071-from-1,065 this said when
+  it was branched off `2466abc2`). The five pure
   ones pin the rebase: the two landmark offsets against literals, the half-open end of the image,
   an address below the base refused rather than wrapped, both bases checked for overflow, and an
   unresolved symbol reading as *unknown* rather than as a disagreement. All four guards were
   mutation-verified — widen the end to `>`, swap `checked_sub` for `wrapping_sub`, drop the
   preferred base from the overflow loop, make `agrees()` answer `Some(false)` — and each failed the
-  one test it belongs to and no other. The sixth needs an engine, a symbol store and a real image,
-  and is gated on the image path so the gate and the input are one thing:
+  one test it belongs to and no other. A sixth is about neither the rebase nor the engine and reads
+  the crate's own source: exactly two files may **construct** a `DebugEngine`, which is the review
+  finding below turned into a ratchet. Only the seventh needs an engine, a symbol store and a real
+  image, and it is gated on the image path so the gate and the input are one thing:
   `WINDBG_MCP_SMOKE_SKSYM=<path to securekernel.exe>`. **It asserts nothing about the type probes**:
   whether a Microsoft public PDB carries type records is Microsoft's to change, and pinning today's
   answer would fail on the build this gate would most want to hear about.
@@ -2411,6 +2417,18 @@ the capture had no VTL1 must not read like a run where neither half worked.
   binary carries its own `dbghelp.dll`, and whichever of DbgEng and the SDK provider loads first is
   the one the other inherits by name. The engine opens first, because it needs its own; the run
   above is what says the provider still reads a capture afterwards.
+- **It is a third process in this crate that loads DbgEng, and that was a P1 on the review.** Review
+  on [#399](https://github.com/glslang/windbg-mcp/pull/399) asked for image resolution to be routed
+  through an engine worker, citing `AGENTS.md`. The fact is right and the remedy is declined: the
+  rule's constraint is one debuggee session per process, every call on the thread that made it, and
+  no engine in the process that serves MCP — and `--sk-inspect` meets all three, opening **one**
+  target which is a *file*, on a single thread, in a role that speaks no MCP and returns from `main`
+  before a runtime exists. Routing would mean building a session registry and a `proto` channel
+  inside a report writer, and would **pre-decide S3's own open question** for a research CLI. So
+  `AGENTS.md` now states the constraint rather than the shape, and
+  `sksym::tests::only_the_worker_and_this_module_build_an_engine` fails if a third file constructs an
+  engine — mutation-verified both ways: a construction in `engine.rs` fails it, a prose mention of
+  the same name does not.
 
 #### S2 as specified
 
@@ -2448,7 +2466,10 @@ thing a caller opens; whether it lives in the supervisor (which has never loaded
 `dbgeng.dll` in-process would be a new property of that role) or in a worker of its own; and what
 `structure walks` means now that types are **not** available, since the plan's wording assumed a PDB
 that would format them. Two of the three are about where an engine lives, which is this repo's
-oldest architectural line — decide them before writing a tool, not after.
+oldest architectural line — decide them before writing a tool, not after. And that is now enforced
+rather than remembered: `sksym::tests::only_the_worker_and_this_module_build_an_engine` fails on a
+third file constructing an engine, so a tool surface that puts one in the supervisor fails
+`cargo test` with the reason rather than reaching a review round.
 
 ### S4 — settle the write routes — **RUN 2026-09-26, settled; do not repeat as written**
 

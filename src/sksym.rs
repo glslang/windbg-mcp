@@ -1,14 +1,44 @@
-//! Symbols for a Secure Kernel image, resolved with **no debuggee**.
+//! Symbols for a Secure Kernel image, resolved with **no process to debug**.
 //!
 //! `FOLLOWUPS.md` item 103 gate **S2**. Gate S1 ([`crate::sk`]) finds `securekernel.exe` in a
 //! guest's VTL1 and says where its base is; this names what is at an address in it, and says where
 //! a name is. It is the one place in H5b that DbgEng earns its keep — the reads are already
-//! [`crate::sk`]'s, and routing those through an engine with no target would buy nothing.
+//! [`crate::sk`]'s, and routing those through an engine that could not read the guest anyway would
+//! buy nothing.
+//!
+//! # This is the third process in this crate that loads DbgEng, and why that is allowed
+//!
+//! `AGENTS.md`'s rule is *keep DbgEng access inside the worker process and on its engine thread*,
+//! and **the supervisor must never touch a `DebugEngine`**. Raised against this module by review on
+//! [#399](https://github.com/glslang/windbg-mcp/pull/399) as a P1, asking for image resolution to be
+//! routed through a worker. The fact is right — an engine here is a new thing — and the remedy is
+//! declined, because the rule's *purpose* is met by construction and its letter is about a role this
+//! is not:
+//!
+//! - **It is not the supervisor.** [`crate::skinspect`] speaks no MCP, holds no session registry, has
+//!   no clients and routes nothing, and `main` returns into it *before* a tokio runtime is built.
+//!   There is no server for a wedged engine to take down and no other session to protect — which is
+//!   what the worker boundary exists to buy.
+//! - **One target per process, which is the rule's actual constraint.** dbgeng.dll holds one debuggee
+//!   session per process; this opens exactly one, and the thing it opens is a **file**. There is no
+//!   live process behind it, nothing to resume, detach or kill, and no second opener in this role.
+//! - **One thread.** This process spawns none — not [`crate::sk`], [`crate::savedstate`],
+//!   [`crate::skinspect`] or this module — so every engine call is on the thread that made it, which
+//!   is the other half of the rule.
+//!
+//! **What the remedy would cost is the thing S3 is deferred to decide.** There is no worker to route
+//! to here: a worker is spawned by `crate::engine::Sessions`, which lives in the supervisor. Routing
+//! would mean building a session registry and a `crate::proto` channel inside a command-line report
+//! writer — and it would pre-decide, for a research CLI, where the *tool surface*'s engine lives,
+//! which item 103's S3 lists as one of its three open questions. So the decision is recorded as a
+//! test instead of as prose:
+//! [`tests::only_the_worker_and_this_module_build_an_engine`] fails if a third file constructs one,
+//! which is where a future `DebugEngine` in the supervisor stops rather than in a review round.
 //!
 //! # The unknown this gate was written to settle, and the answer
 //!
 //! The plan recorded it as an open question: `dbgscope`'s symbol methods all assume a session with
-//! a target, so *image-only* resolution — load `securekernel.exe` at a base with no debuggee and
+//! a target, so *image-only* resolution — load `securekernel.exe` at a base with nothing running and
 //! resolve against it — was "not obviously available", and if it needed an engine call it would be
 //! a new typed `dbgscope` method rather than an `execute` of text.
 //!
@@ -588,9 +618,71 @@ mod tests {
     //!
     //! Everything here is the arithmetic, which is this module's own work — the resolution itself
     //! is `dbgscope`'s and is exercised by the gated test at the bottom, which needs an engine, a
-    //! symbol server and a real `securekernel.exe`.
+    //! symbol server and a real `securekernel.exe`. Plus one that is about neither, and reads the
+    //! crate's own source: where an engine may be built.
 
     use super::*;
+
+    /// **Exactly two files in this crate may construct a `DebugEngine`**, and this is the ratchet.
+    ///
+    /// `AGENTS.md` says the supervisor must never touch one, and until this module there was nothing
+    /// to state that against but prose — which is how the P1 on
+    /// [#399](https://github.com/glslang/windbg-mcp/pull/399) came to be a review finding rather than
+    /// a failing test. The rule is a **construction** rule and not a mention rule: half the worker's
+    /// analysis modules take a `&DebugEngine` quite properly, and it is *building* one that decides
+    /// which process owns a debuggee session.
+    ///
+    /// A third entry is a design change and has to argue for itself — the argument this module's own
+    /// entry rests on is in its module docs, and none of it (no MCP, no registry, one file-backed
+    /// target, one thread) is true of `engine.rs`, `server.rs`, `listen.rs` or `service.rs`.
+    ///
+    /// Comment lines are stripped before matching, so naming `DebugEngine::new` in prose elsewhere
+    /// does not trip it; a block comment would, and this crate writes none.
+    #[test]
+    fn only_the_worker_and_this_module_build_an_engine() {
+        let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
+        let mut builders: Vec<String> = Vec::new();
+        let mut walked = 0usize;
+        let mut pending = vec![src.clone()];
+        while let Some(dir) = pending.pop() {
+            for entry in std::fs::read_dir(&dir).expect("src/ is readable") {
+                let path = entry.expect("a readable directory entry").path();
+                if path.is_dir() {
+                    pending.push(path);
+                    continue;
+                }
+                if path.extension().is_none_or(|e| e != "rs") {
+                    continue;
+                }
+                walked += 1;
+                let text = std::fs::read_to_string(&path).expect("a readable Rust file");
+                let builds = text.lines().any(|line| {
+                    !line.trim_start().starts_with("//") && line.contains("DebugEngine::new")
+                });
+                if builds {
+                    builders.push(
+                        path.strip_prefix(&src)
+                            .unwrap_or(&path)
+                            .display()
+                            .to_string()
+                            .replace('\\', "/"),
+                    );
+                }
+            }
+        }
+        // A walk that read nothing would agree with an empty expectation, which is the one way this
+        // test could pass by doing nothing at all.
+        assert!(walked > 20, "only {walked} Rust files were walked");
+        builders.sort();
+        assert_eq!(
+            builders,
+            vec!["sksym.rs".to_string(), "worker.rs".to_string()],
+            "a `DebugEngine` is constructed outside the engine worker and `sksym`. That decides \
+             which process owns a debuggee session, so it is a design change rather than a local \
+             one: see `AGENTS.md`, this module's docs, and `FOLLOWUPS.md` item 103 gate S3, which \
+             is where the tool surface's engine is still to be placed."
+        );
+    }
 
     /// The three figures the bench measured, as literals.
     ///

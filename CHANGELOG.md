@@ -40,12 +40,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   base and resolve the same PDB there, but the module name collides, so it comes up
   `securekernel_exe` and *both* answer to `securekernel!`: with the pair loaded,
   `? securekernel!KdDebuggerDataBlock` answers the **preferred** base. One module plus arithmetic has
-  no such ambiguity and is testable with no engine, which five of the six new tests are. Those five
+  no such ambiguity and is testable with no engine, which six of the seven new tests are (1,087 unit
+  tests now, from 1,080). Five
   pin the rebase against literals — the two landmark offsets, the half-open end of the image, an
   address below the base refused rather than wrapped, both bases checked for overflow, and an
   unresolved symbol reading as *unknown* rather than as a disagreement, because a host that cannot
   reach a symbol server must not read as a decode that is wrong — and all four guards were
-  mutation-verified, each failing the one test it belongs to and no other. The sixth needs an engine,
+  mutation-verified, each failing the one test it belongs to and no other. The sixth reads the
+  crate's own source and pins which files may construct an engine. Only the seventh needs an engine,
   a symbol store and a real image, and is gated on the image path so the gate and the input are one
   thing (`WINDBG_MCP_SMOKE_SKSYM`); it deliberately asserts **nothing** about the type probes, since
   whether a Microsoft public PDB carries type records is Microsoft's to change and pinning today's
@@ -57,7 +59,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `0xC0370509`, and the report and the JSON keep those apart. `--sk-inspect` also **names the build
   that produced its report** now, as its first line and in the JSON, because a figure taken from this
   role is a reading of the binary that answered and the tree beside it moves independently; the runs
-  above were taken from this change's own working tree, a `-dirty` build over `2466abc2`. Still **no MCP tool and no
+  above were taken from this change's own working tree, a `-dirty` build over `3552d867`, and
+  re-measured unchanged after the rebase onto `44428f5`. **It is a
+  third process in this crate that loads DbgEng**, which review raised as a P1 against `AGENTS.md`'s
+  *worker or nothing* wording: the rule's constraint is one debuggee session per process, every call
+  on the thread that made it, and no engine in the process that serves MCP, and this role meets all
+  three — one target, and that target is a *file*, on a single thread, speaking no MCP and returning
+  from `main` before a runtime exists. `AGENTS.md` now states the constraint rather than the shape,
+  and a test fails if a **third** file constructs an engine, so the next one is a decision rather
+  than a review finding. Still **no MCP tool and no
   `tools/list` change**; the surface is gate S3, which this moves rather than answers, since the
   decode is engine-free and the symbols are not.
 
