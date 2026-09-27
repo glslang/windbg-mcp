@@ -105,7 +105,7 @@ native analysis of it works and always has — and says so in the opener's `limi
 
 ## Tools
 
-Sixty-three tools in eight `--tools` groups; the rows below split some of those groups by theme. The
+Sixty-seven tools in nine `--tools` groups; the rows below split some of those groups by theme. The
 `--tools` column is the name that selects one — see
 [Serving fewer tools](docs/tool-surface.md#serving-fewer-tools---tools).
 
@@ -125,9 +125,10 @@ Sixty-three tools in eight `--tools` groups; the rows below split some of those 
 | User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
+| Secure Kernel | `securekernel` | `open_sk_capture` — open a Hyper-V checkpoint and decode the Secure Kernel in the guest's VTL1: the page-table root read out of the capture, `securekernel.exe`'s base, `KdDebuggerDataBlock`, `SkLoadedModuleList`, and every count the decode made; `sk_modules` — the VTL1 loader list; `sk_read_memory` — VTL1 by guest virtual address; `sk_symbol` — a name or an address, rebased onto the base the decode found. Needs the Windows SDK's saved-state provider; **no driver, no test-signing, and no Hyper-V on the machine reading the file** |
 
-All of them are served unless you say otherwise, and the definitions cost the model **95,792 bytes —
-about 24k tokens — before it has asked anything** (measured 2026-09-26). `--tools
+All of them are served unless you say otherwise, and the definitions cost the model **103,293 bytes —
+about 26k tokens — before it has asked anything** (measured 2026-09-27). `--tools
 session,inspect,crash` cuts that to 33,187 B for twenty-three tools, and a `--listen` client can be
 given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
 is always included, and what a typed operand may not contain.

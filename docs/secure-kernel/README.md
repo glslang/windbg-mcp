@@ -9,9 +9,15 @@ VTL1 — the page-table walk, the image identification, the debugger data block 
 over a source seam, `src/savedstate.rs` reads a Hyper-V capture through the Windows SDK's provider,
 `src/sksym.rs` resolves `securekernel.exe`'s symbols against that decode with no debuggee at all,
 and `windbg-mcp --sk-inspect` drives them from the command line (`FOLLOWUPS.md` item 103, gates S1
-and S2). There is **no MCP tool**: that is gate S3, and its shape is still an open question. So no
-`tools/list` changes, nothing a client can call, and everything below about the *live* route still
-needs the bench posture it describes.
+and S2).
+
+**And since gate S3 there are four MCP tools** (`open_sk_capture`, `sk_modules`, `sk_read_memory`,
+`sk_symbol`, the `--tools securekernel` group): a capture opens as a **session of its own** whose
+worker holds the file rather than a debuggee, and the debugger tools are refused on it because the
+engine beside it has at most `securekernel.exe` open for symbols —
+[`docs/sessions.md`](../sessions.md#secure-kernel-captures) is the caller's half. What that reaches
+is a **capture**. Everything below about the *live* route still needs the bench posture it describes,
+and no tool here drives one: a session reads a file, and a file does not execute.
 
 ## The answer so far
 
@@ -73,8 +79,12 @@ and the provider's own address translator agreeing with the walk on every page o
 with no debuggee, and the PDB puts both offsets in the table below exactly where searching the
 capture put them — a third route to the module list, and the only one that needs no debugger data
 block. It also settles what symbols *cannot* give: the public `securekernel.pdb` carries **no type
-information**, so structure walks stay hand-decoded. What
-remains is the tool surface (S3) and whether VTL1 execution can be
+information**, so structure walks stay hand-decoded. **S3**, the tool surface, is now four tools in
+the `securekernel` group: a capture is a session whose worker holds a file, the decode travels with
+the open, and the debugger tools are refused on it — the three questions that gate was deferred to
+answer (where the engine lives, one handle or two, and what a structure walk means with no types) are
+answered in `src/sksession.rs` and in `FOLLOWUPS.md`. What
+remains is whether VTL1 execution can be
 controlled at all (S5). Its route is decided, and the
 decision is the opposite of where this work began. Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench

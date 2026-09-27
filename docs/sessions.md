@@ -5,6 +5,12 @@ The six Session tools that open a target (`open_dump`, `open_trace`, `attach_ker
 holding one target — and return a **`session_id`**. Every tool that touches a target accepts that id
 as an optional argument, and it is what **routes** the call to the right worker.
 
+`open_sk_capture` is a seventh, and the one whose session holds **no debuggee**: it reads a Hyper-V
+checkpoint for the Secure Kernel in the guest's VTL1, which is a file rather than a target, and the
+debugger tools are **refused** on it rather than answering about the `securekernel.exe` the engine
+beside it has open for symbols. It counts against the same limit, ends the same way, and appears in
+`session_status` as `secure_kernel`. See [Secure Kernel captures](#secure-kernel-captures) below.
+
 Sessions are independent. Opening a second target does not disturb the first, a call against one
 does not queue behind work in another, and ending one leaves the rest alone. Up to `4` at once; at
 the limit a new open reclaims the oldest **idle** session, and if every session has a call in flight
@@ -68,6 +74,41 @@ says so and sends nothing, as does one repeated while a batch is still stopping.
 **lost** its target is closed to breaks for the opposite reason: it runs nothing further, so there
 is nothing left to cut short, and what a break would reach instead is the engine — which is holding
 something this session cannot name, and on a live kernel would be a machine nobody asked about.
+
+## Secure Kernel captures
+
+`open_sk_capture` opens a **Hyper-V saved state** — a standard checkpoint — and decodes the Secure
+Kernel in the guest's VTL1: the page-table root read out of the capture, `securekernel.exe`'s base,
+`KdDebuggerDataBlock`, `SkLoadedModuleList` and the loader list it points at. The whole decode comes
+back with the open, because a capture is a fixed snapshot: nothing in it changes while the session is
+held, so there is nothing for a later call to re-read.
+
+Three things about such a session differ from every other one here, and each is a consequence of the
+target being a file:
+
+- **Only its own tools work on it.** `sk_modules`, `sk_read_memory` and `sk_symbol` read the capture;
+  every other debugger tool is refused by name. That is not a limitation being enforced for
+  tidiness — the engine in that worker holds the Secure Kernel **image on disk** (or nothing at all,
+  when the session was opened without `symbols`), so `read_memory` there would read the file and
+  report it as the guest's memory, and `registers` would answer about no thread. A tool added to this
+  server later is refused on a capture until somebody decides what it would mean for one.
+- **Nothing executes**, so there is nothing to resume, step, or break into, and `end_session` closes
+  a file. The capture is opened read-only and is never written.
+- **A capture with no VTL1 opens and says so.** On a guest with VBS switched off the provider refuses
+  the VTL switch by name, and that is the answer to asking rather than a failure: the session opens,
+  reports the refusal and the partition's VTLs, and refuses every read against it with the same
+  sentence.
+
+`symbols: true` also opens that image in the debugger and loads its PDB, which is what gives
+addresses in the session names — in both directions, and rebased onto the base the decode found.
+There are no **types**: Microsoft's public `securekernel.pdb` carries no type records, so a structure
+in VTL1 is read with `sk_read_memory` and decoded by hand rather than formatted.
+
+What it needs on the host: the Windows SDK's `vmsavedstatedumpprovider.dll`, and the
+`securekernel.exe` the guest was running. **No driver, no test-signing, and no Hyper-V role on the
+machine reading the file** — a checkpoint copied off the host reads the same anywhere.
+[`secure-kernel/README.md`](secure-kernel/README.md) is the background, and the capabilities and
+limits are recorded there rather than here.
 
 ## Running a target asynchronously
 

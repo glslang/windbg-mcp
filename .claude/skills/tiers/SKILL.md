@@ -1,6 +1,6 @@
 ---
 name: tiers
-description: Run and interpret this repo's test tiers - what `cargo test` covers, which gates are off by default, and how to turn on the dump, bounded, live-kernel, TTD, 32-bit and image-symbol gates. Use before claiming a change is covered by a green run, when a tier needs enabling, or when a pass count or SKIPPED line has to be read correctly.
+description: Run and interpret this repo's test tiers - what `cargo test` covers, which gates are off by default, and how to turn on the dump, bounded, live-kernel, TTD, 32-bit, image-symbol and Secure Kernel capture gates. Use before claiming a change is covered by a green run, when a tier needs enabling, or when a pass count or SKIPPED line has to be read correctly.
 ---
 
 # Running the test tiers
@@ -198,4 +198,37 @@ DbgEng.
 
 Running `--sk-inspect --symbols` by hand is the end-to-end version and needs a capture as well; it
 is the `windbg-mcp.exe` in `target\debug`, where the bundle already is.
+
+## The Secure Kernel capture tier
+
+`a_secure_kernel_capture_opens_as_a_session_and_answers_about_its_vtl1` drives the four
+`securekernel` tools against a real checkpoint (`FOLLOWUPS.md` item 103, gate S3), and its gate is a
+**file**:
+
+```pwsh
+$env:WINDBG_MCP_SMOKE_SK_CAPTURE = "D:\Hyper-V\Virtual Machines\Snapshots\<id>.vmrs"
+cargo test --test mcp_smoke a_secure_kernel_capture -- --nocapture
+```
+
+`WINDBG_MCP_SMOKE_SK_IMAGE` overrides the image the decode identifies against, which defaults to
+this host's `C:\Windows\System32\securekernel.exe`; give it the guest's build when the two differ,
+or nothing in the capture matches and the tier asserts the negative instead of the decode.
+
+**A file rather than a VM name, and that is gate S0's finding rather than a convenience**: a
+checkpoint carries the guest's VTL1 and reads the same copied off the Hyper-V host as on it, so this
+tier needs the Hyper-V role on no machine — only the `.vmrs` and the SDK's
+`vmsavedstatedumpprovider.dll`.
+
+**It asserts the shape of the answer, not the figures in it**, because the capture is the operator's:
+a VBS guest's has VTL1 and a VBS-off guest's does not, and both are results. What holds either way is
+that the report carries a decode **or** the reason there is none, never neither — and on this bench
+both arms have been run, the pinned VBS checkpoint and the VBS-off control. The figures are in
+`FOLLOWUPS.md` item 103's S3 section, where they can be compared with gates S1's and S2's for the
+same capture.
+
+**The mirror direction needs no capture** and rides the debugger tier instead:
+`the_capture_tools_are_refused_on_a_debugger_session` opens the sample dump and asserts the three
+capture tools are refused on it. The rule itself is a unit test
+(`engine::tests::a_capture_session_accepts_its_own_ops_and_refuses_the_debugger_ones`); those two are
+what say it is wired into the funnel every call passes.
 

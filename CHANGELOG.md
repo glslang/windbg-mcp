@@ -9,6 +9,60 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A Hyper-V checkpoint now opens as a debug session, and four tools read the Secure Kernel out of
+  it.** `FOLLOWUPS.md` item 103's gate S3: `open_sk_capture`, `sk_modules`, `sk_read_memory` and
+  `sk_symbol`, in a `--tools securekernel` group, over `src/sksession.rs`. Gates S1 and S2 were
+  reachable only from `windbg-mcp --sk-inspect`; this is the same two halves behind the tool surface,
+  and the three questions the gate was deferred to answer are answered by where it puts things.
+  **The engine lives in a worker, and the decisive argument is measured rather than architectural.**
+  `AGENTS.md` already keeps DbgEng out of the process serving MCP, which settles the symbol half and
+  says nothing about the decode, which needs no engine at all — what settles *that* is S0 arm 4:
+  `vmsavedstatedumpprovider.dll` `__fastfail`s (`0xC0000409`, `FAST_FAIL_FATAL_APP_EXIT`, from a GSL
+  contract violation inside `LoadSavedStateFile`) on a capture it has no key for, so a vendor DLL
+  that aborts the process on an input a caller supplies cannot be loaded beside the session registry.
+  In a worker it costs the one session that named the capture. **One session handle carries both
+  halves**, `symbols` opt-in on it, because the symbols are the capture's only through the image the
+  mapping was identified against and the rebase needs the base the decode found — two handles would
+  be two halves of a join nothing checks. **And a "structure walk" is the decoders `src/sk.rs`
+  already has**: the public `securekernel.pdb` carries no type records, so there is no `dt` over VTL1
+  on offer and the four type probes travel with the session, which tells a caller *why* rather than
+  letting them find out one failed call at a time. What follows from a capture being a file is that
+  **the debugger tools are refused on such a session** — by an allow-list, in both directions, in the
+  one funnel every call passes — because the engine in that worker holds `securekernel.exe` **as an
+  image** and `read_memory` there would read the file and answer as though it had read the guest,
+  which does not fail. The refusal names what the engine is holding. That refusal is also what keeps
+  the answers stable: nothing in the session can run a command, so the target cannot be replaced
+  under the symbols, and the capture does not change — which is why the **whole decode travels with
+  the open** rather than being re-read, counters included, for the structured-aware client that drops
+  the text. Measured over MCP against the same `H1 pinned 26200.9457 VBS+HVCI` checkpoint gates S0,
+  S1 and S2 ran on: **every one of their figures came back unchanged** — root `0x107593000`, 29
+  present entries with the self-map at 309, 16,437 leaves over 4,545 pages from 179 table reads and
+  215 decodes, `securekernel.exe` at `0xFFFFF8070EDA9000`, `KdDebuggerDataBlock` at `+0x1335E0` with
+  `Size` `0x3A0`, `SkLoadedModuleList` at `+0x127770`, the same six modules, the structural
+  cross-check agreeing with the block, 18,253 reads and **0** failed, both landmarks agreeing in both
+  directions, all four type probes `E_NOINTERFACE`. And one thing the command-line role could not
+  show: `sk_read_memory` at the block's own address returns the self-pointing `LIST_ENTRY`, then
+  **`KDBG`**, then `0x3A0`, then `0xFFFFF8070EDA9000` — three of the decode's conclusions read back
+  as bytes through a different path, with the engine naming that address beside them. The control arm
+  is the other half: the VBS-off twin's capture reports partition VTLs `0x1` against `0x3`, the
+  provider refusing the VTL switch by name (`0xC0370509`), and the session **opens** carrying that as
+  its reason and refuses every read with the same sentence — while its symbols load normally, which
+  is the pair that had to stay distinguishable. Nine new tests (1,097 unit tests now, from 1,088) and
+  two in the smoke harness (128, from 126), all eight guards **mutation-verified**: the kind gate
+  three ways — accept every debugger op on a capture, accept every capture op elsewhere, and replace
+  the allow-list with a deny-list, where the row that then goes through is the one that was not
+  thought of — and five renderers, including a landmark that disagrees rendering as agreement and a
+  failed type probe being dropped beside one that answered, which is review round 8 of #399's finding
+  one level up. The capture tier's gate is a **file** (`WINDBG_MCP_SMOKE_SK_CAPTURE`), so it needs the
+  Hyper-V role on no machine, and it asserts the *shape* of the answer — a decode, or the reason there
+  is none, never neither — because whether a capture has VTL1 in it is a property of somebody's guest.
+  **What it costs is recorded rather than absorbed**: the surface grew 7,501 B of model-visible
+  context across 63 → 67 tools, paid by every caller because the default surface is every tool, and
+  whether a group should be able to sit outside that default is now item 106 rather than a decision
+  this made quietly. The `tools/list` payload found a **multiplication** on the way, which is the
+  first time that ceiling has caught one: holding the report in `TargetSummary` inlined its schema
+  into all seven openers' `$defs` and measured 341,057 B, and moving it into an outcome of its own
+  took **50,844 B** back off the wire for a change no client can observe.
 - **`securekernel.exe`'s symbols now resolve against the base gate S1 found in a capture, with no
   debuggee anywhere — and the PDB agrees with the capture scan to the byte.** `FOLLOWUPS.md` item
   103's gate S2, `src/sksym.rs`, driven by `windbg-mcp --sk-inspect --symbols`. The unknown the gate

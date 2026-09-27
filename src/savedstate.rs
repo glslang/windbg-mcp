@@ -419,6 +419,189 @@ impl Drop for Provider {
     }
 }
 
+/// Which capture to read, as **one** value.
+///
+/// Three independent `Option`s were the shape that let `--vm` and `--vmrs` both be given and one of
+/// them silently win, which is what the two matches on them disagreeing would eventually have cost:
+/// a report about a different capture than the caller named. Resolving the choice once means
+/// nothing downstream has a preference to get wrong.
+///
+/// **Shared by the command-line role and the tool surface**, which is the reason it lives here
+/// rather than in either of them: the rule that exactly one form may be given has a history
+/// (`FOLLOWUPS.md` item 103), and two copies of it are two places for the next form to be added to
+/// one of. It crosses the supervisor→worker wire as this type, already resolved, so the worker has
+/// no choice left to make.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) enum CaptureSpec {
+    Vm {
+        name: String,
+        snapshot: Option<String>,
+    },
+    Vmrs(PathBuf),
+    /// The older pair, which is selected here and — on this bench — called by nothing.
+    Pair {
+        bin: PathBuf,
+        vsv: PathBuf,
+    },
+}
+
+/// One way of naming a capture, for a refusal that has to spell it the way its caller does.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Selector {
+    Vm,
+    Vmrs,
+    Pair,
+}
+
+impl Selector {
+    /// The argument names this form is given by, unprefixed.
+    fn names(self) -> &'static [&'static str] {
+        match self {
+            Selector::Vm => &["vm"],
+            Selector::Vmrs => &["vmrs"],
+            Selector::Pair => &["bin", "vsv"],
+        }
+    }
+
+    /// How it is written in `prefix`'s dialect: `--bin/--vsv` on a command line, `bin/vsv` in a
+    /// tool's arguments.
+    fn spell(self, prefix: &str) -> String {
+        self.names()
+            .iter()
+            .map(|name| format!("{prefix}{name}"))
+            .collect::<Vec<_>>()
+            .join("/")
+    }
+}
+
+/// Why the capture is not exactly one thing.
+///
+/// **A value rather than a sentence, because the rule is shared and the spelling is not.** The
+/// command line names these forms `--vm` and `--vmrs`; the tool surface names them `vm` and `vmrs`,
+/// and a refusal that sent a model looking for a flag it cannot pass would be the shared rule
+/// leaking its first caller's dialect. Measured: the tool answered *name one capture, not 2: --vm
+/// and --vmrs* on the first run that reached it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum NotOneCapture {
+    NoneGiven,
+    Several(Vec<Selector>),
+    /// The older pair is two files, and one of them alone is a usage error rather than a capture
+    /// that fails to load inside the provider.
+    HalfAPair {
+        given: &'static str,
+        missing: &'static str,
+    },
+}
+
+impl NotOneCapture {
+    /// The refusal, in the dialect `prefix` spells: `"--"` for a command line, `""` for a tool.
+    pub(crate) fn explain(&self, prefix: &str) -> String {
+        match self {
+            NotOneCapture::NoneGiven => format!(
+                "name a capture: {}, {}, or {}bin with {}vsv",
+                Selector::Vm.spell(prefix),
+                Selector::Vmrs.spell(prefix),
+                prefix,
+                prefix
+            ),
+            NotOneCapture::Several(forms) => format!(
+                "name one capture, not {}: {}",
+                forms.len(),
+                forms
+                    .iter()
+                    .map(|form| form.spell(prefix))
+                    .collect::<Vec<_>>()
+                    .join(" and ")
+            ),
+            NotOneCapture::HalfAPair { given, missing } => format!(
+                "{prefix}bin and {prefix}vsv go together; {prefix}{given} was given without \
+                 {prefix}{missing}"
+            ),
+        }
+    }
+}
+
+impl CaptureSpec {
+    /// Resolve the three ways of naming a capture into one, refusing anything but exactly one.
+    ///
+    /// **Named as a set rather than resolved by precedence**: giving two is a caller who means
+    /// something this cannot do, and picking one of them would read a capture they did not ask for.
+    pub(crate) fn one_of(
+        vm: Option<String>,
+        snapshot: Option<String>,
+        vmrs: Option<PathBuf>,
+        bin: Option<PathBuf>,
+        vsv: Option<PathBuf>,
+    ) -> Result<CaptureSpec, NotOneCapture> {
+        let mut forms: Vec<Selector> = Vec::new();
+        if vm.is_some() {
+            forms.push(Selector::Vm);
+        }
+        if vmrs.is_some() {
+            forms.push(Selector::Vmrs);
+        }
+        if bin.is_some() || vsv.is_some() {
+            forms.push(Selector::Pair);
+        }
+        match forms.as_slice() {
+            [] => return Err(NotOneCapture::NoneGiven),
+            [_] => {}
+            _ => return Err(NotOneCapture::Several(forms)),
+        }
+        match (vm, vmrs, bin, vsv) {
+            (Some(name), _, _, _) => Ok(CaptureSpec::Vm { name, snapshot }),
+            (None, Some(path), _, _) => Ok(CaptureSpec::Vmrs(path)),
+            (None, None, Some(bin), Some(vsv)) => Ok(CaptureSpec::Pair { bin, vsv }),
+            (None, None, bin, _) => Err(if bin.is_some() {
+                NotOneCapture::HalfAPair {
+                    given: "bin",
+                    missing: "vsv",
+                }
+            } else {
+                NotOneCapture::HalfAPair {
+                    given: "vsv",
+                    missing: "bin",
+                }
+            }),
+        }
+    }
+
+    /// The files this names, asking Hyper-V where a checkpoint lives when it is named by VM.
+    pub(crate) fn files(&self, provider: &Provider) -> Result<CaptureFiles, String> {
+        match self {
+            CaptureSpec::Vm { name, snapshot } => provider.locate(name, snapshot.as_deref()),
+            CaptureSpec::Vmrs(vmrs) => Ok(CaptureFiles::vmrs(vmrs)),
+            CaptureSpec::Pair { bin, vsv } => Ok(CaptureFiles::pair(bin, vsv)),
+        }
+    }
+
+    /// The paths this names *before* the provider is asked, which is every file a caller supplied.
+    ///
+    /// A VM has none: Hyper-V answers with them, and until it does there is nothing to protect.
+    pub(crate) fn given_paths(&self) -> Vec<&Path> {
+        match self {
+            CaptureSpec::Vm { .. } => Vec::new(),
+            CaptureSpec::Vmrs(vmrs) => vec![vmrs.as_path()],
+            CaptureSpec::Pair { bin, vsv } => vec![bin.as_path(), vsv.as_path()],
+        }
+    }
+
+    /// How this reads in a report, and what a session is named after.
+    pub(crate) fn describe(&self) -> String {
+        match self {
+            CaptureSpec::Vm {
+                name,
+                snapshot: Some(snapshot),
+            } => format!("{name} ({snapshot})"),
+            CaptureSpec::Vm {
+                name,
+                snapshot: None,
+            } => name.clone(),
+            CaptureSpec::Vmrs(vmrs) => vmrs.display().to_string(),
+            CaptureSpec::Pair { bin, .. } => bin.display().to_string(),
+        }
+    }
+}
 /// The files one capture is made of. Any subset may be present.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct CaptureFiles {

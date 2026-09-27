@@ -374,6 +374,49 @@ pub struct OpenedSession {
     pub profile: Option<Box<ProfileFacts>>,
 }
 
+/// What `open_sk_capture` produced.
+///
+/// **Its own outcome rather than a field on [`OpenOutcome`], and the reason is a measurement.**
+/// [`TargetSummary`] is reached by the output schema of all seven openers, and `schemars` inlines
+/// every type a schema can reach into that schema's own `$defs` — so a [`SecureKernelReport`] held
+/// there is inlined seven times over. Measured while it was: the `tools/list` payload went from
+/// 268 KB to **341 KB**, 73 KB of schema no model reads, for one tool's answer. Here it appears
+/// once.
+///
+/// The **failure** branch is deliberately the same [`OpenFailure`] every other opener answers with:
+/// the two enums serialize their error branch identically, so the supervisor's one failure path
+/// produces content that validates against both schemas and a client switching on `status` reads
+/// one shape.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum SkOpenOutcome {
+    Ok(SkOpenedSession),
+    Error(OpenFailure),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkOpenedSession {
+    /// The handle to pass as `session_id` on later calls.
+    pub session_id: String,
+    pub kind: SessionKindName,
+    /// The capture this session reads, as the caller named it.
+    pub target: String,
+    /// The decode as a report, with [`Self::capture`] rendered from the same values.
+    pub report: String,
+    /// What this session **cannot** do that a caller would otherwise assume it can: a capture with
+    /// no VTL1 in it, a walk that identified no Secure Kernel, symbols that were asked for and did
+    /// not load. Absent when there is nothing to say.
+    ///
+    /// Carried as a field for [`TargetSummary::limitation`]'s reason: a structured-aware client
+    /// forwards `structuredContent` and drops the text, so a limitation stated only in the report
+    /// is one half the clients never see.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limitation: Option<String>,
+    /// Boxed — which JSON never sees — because this struct is one variant of an enum whose other
+    /// is a fraction of its size, the same reason [`TargetSummary::primary_module`] is.
+    pub capture: Box<SecureKernelReport>,
+}
+
 /// What a caller reads off an open every single time: which build, where the kernel is, and —
 /// for a crash dump — which bug check.
 ///
@@ -534,6 +577,9 @@ pub enum SessionKindName {
     KernelLocal,
     Process,
     Launch,
+    /// A Hyper-V capture read for its Secure Kernel (VTL1), which is a file and has no
+    /// debuggee: nothing executes, and the debugger tools are refused on it.
+    SecureKernel,
 }
 
 impl From<SessionKind> for SessionKindName {
@@ -545,6 +591,7 @@ impl From<SessionKind> for SessionKindName {
             SessionKind::KernelLocal => Self::KernelLocal,
             SessionKind::Process => Self::Process,
             SessionKind::Launch => Self::Launch,
+            SessionKind::SecureKernel => Self::SecureKernel,
         }
     }
 }
@@ -4404,6 +4451,437 @@ fn ms(d: std::time::Duration) -> u64 {
     d.as_millis().min(u128::from(u64::MAX)) as u64
 }
 
+// ---- Secure Kernel: `FOLLOWUPS.md` item 103, gate S3 ----
+//
+// **The `Sk` prefix is this subsystem's own spelling**, not an abbreviation invented here:
+// `src/sk.rs` decodes it, `--sk-inspect` reports it, and the landmark these types are mostly about
+// is called `SkLoadedModuleList` by Microsoft. The tools are `sk_`-prefixed for the same reason.
+//
+// # Why the decode's counters are in the typed half rather than in the report
+//
+// A structured-aware client forwards `structuredContent` and drops the text block, and the one
+// thing a reader of this must not have to take on trust is whether a negative was earned: a decode
+// that identified nothing with a non-zero [`SkReads::failed`] has read a capture it could not read
+// and found nothing in it. Gate S1 put that counter inside the read primitive so no consumer could
+// bypass it; putting it only in the rendered report would hand it back to whichever half of the
+// result the client happens to read.
+
+/// What one Secure Kernel capture session decoded, as values.
+///
+/// The whole of it travels with the **opener**, because a capture is a fixed snapshot: nothing it
+/// says can change while the session is held, so there is nothing for a later call to re-read. A
+/// caller that lost the text still has every figure the decode produced.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecureKernelReport {
+    /// The files the capture is made of, as Hyper-V or the caller named them.
+    pub capture: Vec<String>,
+    /// Which SDK provider read them, and the image on disk the decode identified against.
+    ///
+    /// **Provenance rather than decoration.** Every address in this report is relative to a base
+    /// that was accepted because the bytes in the guest matched *this* file, and the capture was
+    /// parsed by *that* DLL — a figure quoted out of here can only be re-derived by somebody who
+    /// knows both (`.claude/rules/measurement-provenance.md`).
+    pub provider: SkProvider,
+    pub identified_against: SkImageOnDisk,
+    pub form: SkCaptureForm,
+    /// Which virtual processor's registers the page-table root was read from, and which VTL it was
+    /// read at. Both are the caller's, defaulted to VP 0 and VTL 1.
+    pub vp: u32,
+    pub vtl: u8,
+    pub guest: SkGuest,
+    /// Why this session has no VTL1 address space to read, when it has none — a VBS-off guest's
+    /// capture, a provider that refused the VTL switch, or a paging mode this decode does not walk.
+    ///
+    /// **An answer rather than a failed open.** On a guest with Secure Kernel switched off this is
+    /// *the* result of asking, so the session opens and says so; every read against it is then
+    /// refused with this same sentence rather than answering zeroes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub not_walkable: Option<String>,
+    /// Absent exactly when [`Self::not_walkable`] is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub decode: Option<SkDecode>,
+    pub symbols: SkSymbolHalf,
+}
+
+/// The SDK's saved-state provider that read the capture.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkProvider {
+    /// The Windows Kits version the DLL was taken from.
+    pub kit_version: String,
+    pub dll: String,
+}
+
+/// The image on disk a mapping in the capture was identified against, as this run read it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkImageOnDisk {
+    pub path: String,
+    pub file_size: u64,
+    pub sections: u16,
+    /// The PE `TimeDateStamp` and `SizeOfImage`, which with the section names are what say a
+    /// mapping in the guest *is* this image.
+    pub timestamp: u32,
+    pub size_of_image: u32,
+}
+
+/// Which shape of capture was read. The pair is the older form and is selected by code this bench
+/// has never produced one for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SkCaptureForm {
+    Vmrs,
+    BinVsv,
+}
+
+/// What the capture says about the guest it was taken from, before anything is decoded.
+///
+/// **This is the half that separates "no Secure Kernel here" from "this did not work"**, and it is
+/// reported whether or not the decode ran: a partition with VTLs `0x1` is a guest that had no VTL1
+/// to capture, where `0x3` and a refused read is a capture whose VTL1 was not reachable.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkGuest {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vp_count: Option<u32>,
+    /// The VTLs the **partition** had enabled, as a bitmask the provider reports: `0x3` is VTL0 and
+    /// VTL1, `0x1` is a guest with no Secure Kernel.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub partition_vtls: Option<String>,
+    /// The same question for the virtual processor this session reads.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vp_vtls: Option<String>,
+    /// Which VTL that processor was executing in when the capture was written.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub active_vtl: Option<u8>,
+    /// The provider's own architecture code for the processor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub architecture: Option<i32>,
+    /// Questions the provider would not answer, by name. A capture with nothing to say and a
+    /// provider that would not say are different facts, and a report that dropped the second would
+    /// present it as the first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub unanswered: Vec<SkUnanswered>,
+}
+
+/// One question the provider refused, and what it said.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkUnanswered {
+    pub question: String,
+    pub detail: String,
+}
+
+/// The decode itself: what was walked, what was found in it, and what it cost.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkDecode {
+    /// The VTL1 page-table root, **read out of this capture**. Not reboot-stable: the same guest
+    /// carries a different root on the next boot, which is why it is reported rather than assumed.
+    pub root: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_page: Option<SkRootPage>,
+    /// Why the root page itself could not be read, which is a different failure from a walk that
+    /// found nothing.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub root_page_unreadable: Option<String>,
+    pub walk: SkWalk,
+    pub scan: SkScan,
+    /// The mapping two independent structures agreed was `securekernel.exe`'s base, when one was
+    /// found.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image: Option<SkImage>,
+    /// Every `KDBG` tag that was refused, and why. **A run where every tag was found and every one
+    /// was refused is what these exist for**: without them it reads as a capture with no tags in it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<SkRejection>,
+    /// The structural route to the list head, when it was asked for: find the loader entry whose
+    /// `DllBase` is the base and follow its `Blink`, with no debugger data block involved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cross_check: Option<SkCrossCheck>,
+    pub reads: SkReads,
+}
+
+/// What the root page holds, judged on all 4096 bytes.
+///
+/// Secure Kernel maps nothing in the low half, so its first entries are legitimately zero — judging
+/// the page on its first sixteen bytes is what read it as empty for most of a session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkRootPage {
+    pub present_entries: usize,
+    pub non_zero_bytes: usize,
+    /// Indexes whose entry points back at this very page. Two builds measured here self-map at 388
+    /// and at 309, and an unguarded descent through one of those re-enters the table 512× per level.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub self_map_indexes: Vec<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub first_present_index: Option<usize>,
+    pub upper_half_present: usize,
+}
+
+/// How the four-level descent went, in counts.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkWalk {
+    pub leaf_mappings: usize,
+    /// Distinct 4 KiB frames those mappings cover, which is far smaller than the leaf count on a
+    /// self-mapped tree.
+    pub mapped_pages: u64,
+    pub table_reads: u64,
+    /// Tables whose entries were decoded, which is **higher** than the reads: one page serves at
+    /// more than one level.
+    pub tables_decoded: u64,
+    /// Prefixes left unexpanded because the table was already expanded at this level. Counted
+    /// rather than silent, and deliberately not a failure: complete virtual enumeration of a
+    /// recursively self-mapped tree is combinatorial, and a `complete` that counted these would
+    /// never be true.
+    pub alias_prefixes_skipped: u64,
+    /// Entries the processor would fault on rather than follow. Skipped, and counted.
+    pub malformed_entries: u64,
+    pub unreadable_tables: u64,
+    pub complete: bool,
+    /// Why it is not the whole tree, when it is not: a budget this walk imposes, or tables the
+    /// source would not answer for. Two different things, and a reader checking one should not
+    /// have to know about the other.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
+}
+
+/// How the scan for PE headers went.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub struct SkScan {
+    pub pages_scanned: u64,
+    /// Pages a read did not answer for. **A page that could not be read is not a page without an
+    /// image**: collapsing the two lets a refused read arrive as a clean negative.
+    pub pages_unreadable: u64,
+    pub pe_headers_found: usize,
+    /// How many of those carry the image on disk this session was opened with.
+    pub matching_the_image: usize,
+    /// Whether the scan stopped at its own budget rather than at the end of the leaves.
+    pub capped: bool,
+}
+
+/// The identified image, and the two landmarks inside it.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkImage {
+    /// Where the guest loaded it — the base every address in this session is relative to.
+    pub base: String,
+    /// The physical address that base maps to.
+    pub gpa: String,
+    pub size_of_image: u32,
+    pub timestamp: u32,
+    /// Bytes of the image the walk could gather, and pages of it that would not read.
+    pub gathered_bytes: usize,
+    pub pages_unreadable: usize,
+    /// `KdDebuggerDataBlock`, found by its `KDBG` owner tag and vouched for by `KernBase`.
+    pub block: String,
+    /// The block's own `Size`. **Reported, never matched**: a needle built from a remembered value
+    /// is what made an earlier scan report zero occurrences with the block three pages away, and
+    /// the live reading disagrees with the same build's on-disk one.
+    pub block_size: u32,
+    /// `SkLoadedModuleList`, read out of the block's `PsLoadedModuleList` field rather than located
+    /// independently — it is a bare `LIST_ENTRY` with no signature to search for.
+    pub module_list: String,
+    /// How many loader entries the list yielded at the open.
+    pub modules: usize,
+}
+
+/// One `KDBG` hit that was refused, and why.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkRejection {
+    pub at: String,
+    pub why: String,
+}
+
+/// The structural cross-check: the same list head reached without reading a debugger data block.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkCrossCheck {
+    /// Whether the two routes name the same head.
+    pub agrees: bool,
+    /// The loader entry whose `DllBase` is the identified base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub entry: Option<String>,
+    /// The head its `Blink` points at.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub head: Option<String>,
+    pub pages_scanned: u64,
+    pub pages_unreadable: u64,
+    /// Why the structural route found nothing, and whether its budget is the reason.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// Every physical read the decode made.
+///
+/// **Counted inside the read primitive**, so no consumer can bypass it: a run that found nothing
+/// with a non-zero `failed` is a run whose negative has not been earned.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema)]
+pub struct SkReads {
+    pub attempted: u64,
+    pub failed: u64,
+    /// Of those failures, the ones the source **refused** rather than could not perform — a read
+    /// that answered success-with-`ReadIntercept` and zeros is protected memory, not a broken
+    /// source.
+    pub refused: u64,
+    pub bytes: u64,
+}
+
+/// What became of the symbol half of this session.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkSymbolHalf {
+    pub state: SkSymbolState,
+    /// Why symbols are not loaded, when they were asked for and are not. The engine's own reason,
+    /// naming the step that failed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refusal: Option<String>,
+    /// The name symbols are qualified by, **as the engine named it** — never derived from the file
+    /// name, which the engine mangles on collision.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub qualifier: Option<String>,
+    /// Where the engine has the image, which is its own `ImageBase` and not the guest's base. The
+    /// rebase between the two is this session's arithmetic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub preferred_base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kind: Option<SymbolState>,
+    /// The PDB the engine actually selected — the provenance any name out of this session travels
+    /// with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pdb: Option<CoordinatePdb>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol_file: Option<String>,
+    /// What the forced load said where it failed and the symbols were still worth keeping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reload_error: Option<String>,
+    /// **No types, and what the engine said instead.** The public `securekernel.pdb` carries no
+    /// type information, so there is no type-driven structure walk over VTL1 in this session: the
+    /// structures `src/sk.rs` decodes by hand are the ones there are. Each probe carries the
+    /// engine's own reason, because a query that could not run and a PDB with no type records are
+    /// one failed call from here and must not be reported as the same finding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub type_probes: Vec<SkTypeProbe>,
+    /// The landmarks the decode found, asked for again of a PDB that has never seen the capture.
+    /// Two independent routes to one address, which is this session's strongest self-check.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub landmarks: Vec<SkLandmark>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SkSymbolState {
+    /// The session was opened without `symbols`, so no engine was pointed at the image.
+    NotRequested,
+    Loaded,
+    /// They were asked for and are not available; `refusal` says why, and the decode stands without
+    /// them.
+    Refused,
+}
+
+/// One type the engine was asked for, and what it answered.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkTypeProbe {
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub type_id: Option<u32>,
+    /// The engine's message where the probe did not answer. `No such interface supported` is the
+    /// engine declining to service type queries for this module at all, which is a stronger reading
+    /// than four names having been looked for and missed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refused: Option<String>,
+}
+
+/// One address the decode and the PDB both have an answer for.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkLandmark {
+    pub name: String,
+    /// Where the decode found it in the guest.
+    pub from_decode: String,
+    /// Where the PDB puts it, rebased onto the guest's base.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from_symbols: Option<String>,
+    /// Its offset into the image, which is the coordinate that survives a reboot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rva: Option<String>,
+    /// Whether the two routes name the same address. **`None` is not a disagreement**: a PDB with
+    /// nothing to say about a name is a host without symbols for this build, not a broken decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agrees: Option<bool>,
+    /// What the engine calls the decode's own address — the same question asked in the other
+    /// direction, which can fail differently.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub named_by_decode: Option<String>,
+    /// Why one of the two directions had no answer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub detail: Option<String>,
+}
+
+/// The VTL1 loader list, walked from the head the block named.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecureKernelModules {
+    /// `SkLoadedModuleList` itself.
+    pub head: String,
+    pub modules: Vec<SkModule>,
+    /// Whether the enumeration closed back on its head.
+    pub complete: bool,
+    /// Why it did not, when it did not — an unreadable entry, the entry limit, a null link, or a
+    /// walk that left the list somewhere that is neither the head nor null.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub incomplete: Option<String>,
+    /// Entries whose name could not be read. **Not the same as an entry with no name**, which the
+    /// loader list legitimately has: reporting both as an empty string would let an enumeration be
+    /// called complete while quietly omitting names.
+    pub names_unreadable: u64,
+}
+
+/// One loader entry.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SkModule {
+    /// The loader entry's own address.
+    pub entry: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Why this entry's name could not be read, when it could not.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name_unreadable: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub size_of_image: Option<u32>,
+    /// Why the record itself could not be read — which is not the same as an entry whose *name*
+    /// could not be read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub unreadable: Option<String>,
+}
+
+/// Bytes read out of the guest's VTL1, by virtual address.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecureKernelRead {
+    pub address: String,
+    /// The physical address the first page of the range maps to, through the walk this session
+    /// holds. Carried because it is the coordinate the source was actually asked for.
+    pub gpa: String,
+    pub requested_size: u32,
+    pub read_size: u32,
+    /// Uppercase hex, no separators — the same spelling `read_memory` uses.
+    pub data: String,
+    /// What the PDB calls the address, when this session has symbols and the address is inside the
+    /// identified image.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub symbol: Option<String>,
+}
+
+/// One symbol, in the three coordinates a reader needs.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SecureKernelSymbol {
+    /// As the engine spells it, qualifier included.
+    pub symbol: String,
+    /// Where it is in the guest.
+    pub address: String,
+    /// Its offset into the image — the coordinate that survives a reboot and joins a disassembler.
+    pub rva: String,
+    /// Where the engine has it, at the image's own preferred base. Present so a figure taken from
+    /// this session can be checked against a disassembler loaded at either base.
+    pub engine_address: String,
+    /// Bytes past the symbol, for a lookup by address. **Zero is the only value that says the
+    /// address *is* the symbol** — the engine answers with the nearest preceding name at any
+    /// address in the module.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub displacement: Option<u64>,
+}
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -372,6 +372,10 @@ pub enum SessionKind {
     Kernel,
     Process,
     Launch,
+    /// A Hyper-V capture, read for the Secure Kernel in its VTL1. The only kind whose worker
+    /// holds no debuggee: what it holds is a file, opened through the saved-state provider, and
+    /// the engine beside it has at most the *image* open for symbols.
+    SecureKernel,
 }
 
 impl SessionKind {
@@ -383,6 +387,7 @@ impl SessionKind {
             Self::Kernel => "kernel target",
             Self::Process => "attached process",
             Self::Launch => "launched process",
+            Self::SecureKernel => "Secure Kernel capture",
         }
     }
 
@@ -551,6 +556,54 @@ impl SessionState {
             Self::Opening | Self::Attaching | Self::Open => None,
             Self::Failed(why) | Self::Retired(why) | Self::Closed(why) => Some(why),
         }
+    }
+}
+
+/// Whether this op may run against a session of this kind, and what to say when it may not.
+///
+/// **An allow-list, in both directions, and that is the whole of the design.** A Secure Kernel
+/// session (`FOLLOWUPS.md` item 103, gate S3) holds a *file* read through the Hyper-V saved-state
+/// provider; the DbgEng engine in its worker holds either nothing or `securekernel.exe` as an
+/// image, so `read_memory` there would read the file rather than the guest and `registers` would
+/// answer about no thread at all. Neither fails: they answer, about the wrong thing.
+///
+/// So the rule is *which ops this kind accepts* rather than *which ops it refuses*. A tool added
+/// later is refused on a capture until somebody decides what it means for one — the cost of
+/// forgetting is a refusal, where a deny-list's is a wrong answer. And the three capture ops are
+/// refused everywhere else for the mirror reason: the worker behind an ordinary session holds no
+/// capture and could only answer that it has none.
+///
+/// `EndSession` and `Interrupt` are in neither list: a teardown is the answer every refusal gives
+/// and must not be refused by one, and an interrupt is answered ahead of the worker's queue.
+/// `PreserveKernel` is reader-side control and never reaches a capture.
+fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
+    let capture_op = matches!(
+        op,
+        EngineOp::OpenSecureKernel(_)
+            | EngineOp::SkModules
+            | EngineOp::SkRead { .. }
+            | EngineOp::SkSymbol { .. }
+    );
+    let always = matches!(
+        op,
+        EngineOp::EndSession | EngineOp::Interrupt { .. } | EngineOp::PreserveKernel
+    );
+    match (kind, capture_op, always) {
+        (_, _, true) => None,
+        (SessionKind::SecureKernel, true, _) => None,
+        (SessionKind::SecureKernel, false, _) => Some(
+            "The debugger tools answer about the engine's target, which in this session is \
+             the Secure Kernel image on disk — not the guest's VTL1 — so they would answer about \
+             the wrong thing rather than fail. Use this session's own capture tools, or end it \
+             and open the target you meant."
+                .to_string(),
+        ),
+        (_, true, _) => Some(
+            "The Secure Kernel capture tools read a Hyper-V saved state, and this session \
+             holds a debugger target instead. Open a capture in a session of its own."
+                .to_string(),
+        ),
+        _ => None,
     }
 }
 
@@ -1443,6 +1496,9 @@ pub struct OpenReport {
     /// The target's own facts, as the worker read them off the engine. Defaulted — every field
     /// absent — only for a reply that carried none, which the openers do not produce.
     pub summary: crate::structured::TargetSummary,
+    /// What a Secure Kernel capture opener decoded, and `None` for every other opener. Beside the
+    /// summary rather than in it, for [`crate::proto::Output::sk`]'s reason.
+    pub sk: Option<Box<crate::structured::SecureKernelReport>>,
 }
 
 /// How an open failed. The variants exist because they need different recovery advice, and
@@ -1926,6 +1982,15 @@ impl Sessions {
                 &session.state(),
             )));
         }
+        // An op that does not belong to this kind of session, which for a Secure Kernel capture
+        // is almost all of them — see [`refuse_op_on_kind`].
+        if let Some(why) = refuse_op_on_kind(session.kind, &call.op) {
+            return Err(EngineError::Debugger(format!(
+                "Session `{}` holds a {}. {why}",
+                session.id,
+                session.kind.label()
+            )));
+        }
         // Refused rather than queued while the target is moving — see
         // [`Sessions::refuse_while_running`]. Under the gate above, so the answer cannot go stale
         // between here and the enqueue below.
@@ -2203,6 +2268,7 @@ impl Sessions {
                     id,
                     report: report.text,
                     summary: report.summary.unwrap_or_default(),
+                    sk: report.sk,
                 })
             }
             Err(EngineError::Timeout(message)) => Err(OpenError::Timeout { id, message }),
@@ -4688,6 +4754,86 @@ async fn reader(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- which ops a kind of session accepts ---------------------------------------
+
+    /// The allow-list, from both sides, and the property is *which way it is written* rather than
+    /// which ops are on it today.
+    ///
+    /// A deny-list answers the next tool added to `EngineOp` about the wrong target, because a
+    /// capture session's engine holds the Secure Kernel **image** and `read_memory` against it
+    /// reads a file. So the second block below is not a list of ops that happen to be refused: it
+    /// is there to be *incomplete*, and a rule written the other way up fails it. Mutation-verified
+    /// three ways — accept every debugger op on a capture, accept every capture op elsewhere, and
+    /// replace the allow-list with a deny-list naming `read_memory`, `current_location` and
+    /// `modules`, where `breakpoints` is the row that then goes through.
+    #[test]
+    fn a_capture_session_accepts_its_own_ops_and_refuses_the_debugger_ones() {
+        let capture_ops = [
+            EngineOp::SkModules,
+            EngineOp::SkRead {
+                address: 0xfffff80000000000,
+                size: 16,
+            },
+            EngineOp::SkSymbol {
+                name: Some("SkLoadedModuleList".into()),
+                address: None,
+            },
+        ];
+        for op in &capture_ops {
+            assert!(
+                refuse_op_on_kind(SessionKind::SecureKernel, op).is_none(),
+                "a capture session refused one of its own ops: {op:?}"
+            );
+            let refused = refuse_op_on_kind(SessionKind::Dump, op)
+                .unwrap_or_else(|| panic!("a dump session accepted a capture op: {op:?}"));
+            assert!(
+                refused.contains("Hyper-V saved state"),
+                "the refusal does not say what a capture tool reads: {refused}"
+            );
+        }
+
+        // Every op a caller can reach that is not one of the three above, including the ones this
+        // test would never think to list: refused, with the reason a caller can act on.
+        for op in [
+            EngineOp::CurrentLocation,
+            EngineOp::ReadMemory {
+                address: "0x0".into(),
+                coordinate: None,
+                size: 16,
+                patience_ms: 0,
+            },
+            EngineOp::Modules {
+                filter: None,
+                limit: 16,
+                refresh: false,
+            },
+            EngineOp::Breakpoints,
+        ] {
+            let refused = refuse_op_on_kind(SessionKind::SecureKernel, &op)
+                .unwrap_or_else(|| panic!("a capture session accepted a debugger op: {op:?}"));
+            assert!(
+                refused.contains("Secure Kernel image on disk"),
+                "the refusal does not say what the engine is actually holding: {refused}"
+            );
+        }
+
+        // The three that are neither, and must never be refused by a kind: a teardown is the
+        // answer every refusal gives, an interrupt is answered ahead of the worker's queue, and
+        // preservation is reader-side control.
+        for kind in [SessionKind::SecureKernel, SessionKind::Kernel] {
+            for op in [
+                EngineOp::EndSession,
+                EngineOp::Interrupt { job: None },
+                EngineOp::PreserveKernel,
+            ] {
+                assert!(
+                    refuse_op_on_kind(kind, &op).is_none(),
+                    "{op:?} must reach every kind of session"
+                );
+            }
+        }
+    }
 
     // ---- the worker's protocol channel --------------------------------------------
 

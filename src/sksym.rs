@@ -315,10 +315,33 @@ impl std::fmt::Display for SymbolFailure {
     }
 }
 
-/// One image, opened as a target, with symbols loaded and nothing else in the session.
+/// One image, opened as a target of **this process's own engine**, with symbols loaded and
+/// nothing else in the session.
+///
+/// **Two hosts, one loader, and the split is what keeps the one-session rule true.** [`Loaded`] is
+/// what the engine answered, with no engine in it; this is the pair held by a host that had to
+/// create one — [`crate::skinspect`], the command-line role, where the engine is built here and
+/// dropped with the report. The other host is [`crate::worker`], whose engine belongs to the
+/// session and exists before this module is reached: it builds a [`Loaded`] against that engine and
+/// constructs none of its own, because `dbgeng.dll` holds **one debuggee session per process** and
+/// a second `DebugEngine` there would be a second session in a process that already has one.
+///
+/// That is gate S3's answer to *where does the tool surface's engine live*, and it is the reason
+/// this type stopped owning the load: a session's image target is the worker's, held for the life
+/// of the session, and the supervisor — which serves MCP — still constructs nothing
+/// ([`tests::only_the_worker_and_this_module_build_an_engine`]).
 pub(crate) struct Symbols {
     /// Held for the life of the resolver: dropping it ends the session.
     engine: DebugEngine,
+    loaded: Loaded,
+}
+
+/// What the engine said about the image it loaded: the provenance, with no engine in it.
+///
+/// Read once, at the load, and **nothing downstream can move it** — which is what the forcing probe
+/// in [`Loaded::on`] buys, and why a reader of these values does not have to ask when they were
+/// true. The residual assumption is stated rather than hidden: no further `.reload` is issued.
+pub(crate) struct Loaded {
     /// The name symbols are qualified by, as the engine named it — never derived from the file
     /// name, because the engine is what decides and it mangles on collision.
     qualifier: String,
@@ -336,12 +359,11 @@ pub(crate) struct Symbols {
 }
 
 impl Symbols {
-    /// Open `image` as a target and load its symbols, or say why not.
+    /// Create an engine, open `image` as its target, and load its symbols — or say why not.
     ///
-    /// `disk` is gate S1's own reading of the same file, and the two are compared: the symbols are
-    /// the capture's only because the mapping was identified against *this* image, so an engine
-    /// that read something else out of it breaks the chain and has to be a refusal rather than a
-    /// footnote.
+    /// The engine-owning half of [`Loaded::on`], for the one role that has no engine yet. Every
+    /// rule about what is loaded and what is refused is in that function; this adds a `DebugEngine`
+    /// and nothing else.
     pub(crate) fn open(
         image: &Path,
         disk: &DiskImage,
@@ -351,6 +373,66 @@ impl Symbols {
         // same way `crate::worker` has to handle it.
         let engine = catch_unwind(AssertUnwindSafe(DebugEngine::new))
             .map_err(|_| SymbolFailure::EngineUnavailable)?;
+        let loaded = Loaded::on(&engine, image, disk, symbol_path)?;
+        Ok(Symbols { engine, loaded })
+    }
+
+    pub(crate) fn qualifier(&self) -> &str {
+        self.loaded.qualifier()
+    }
+
+    /// What the forced symbol load said, where it failed and the kind was still worth keeping.
+    pub(crate) fn reload_error(&self) -> Option<&str> {
+        self.loaded.reload_error()
+    }
+
+    pub(crate) fn preferred_base(&self) -> u64 {
+        self.loaded.preferred_base()
+    }
+
+    pub(crate) fn size_of_image(&self) -> u32 {
+        self.loaded.size_of_image()
+    }
+
+    pub(crate) fn kind(&self) -> SymbolKind {
+        self.loaded.kind()
+    }
+
+    pub(crate) fn pdb(&self) -> Option<&PdbIdentity> {
+        self.loaded.pdb()
+    }
+
+    pub(crate) fn symbol_file(&self) -> &str {
+        self.loaded.symbol_file()
+    }
+
+    pub(crate) fn type_probes(&self) -> Vec<(&'static str, Result<u32, String>)> {
+        self.loaded.type_probes(&self.engine)
+    }
+
+    /// A resolver for this image as the guest loaded it, at `guest_base`.
+    pub(crate) fn at(&self, guest_base: Gva) -> Result<Resolver<'_>, RebaseRefused> {
+        self.loaded.at(&self.engine, guest_base)
+    }
+}
+
+impl Loaded {
+    /// Open `image` as `engine`'s target and load its symbols, or say why not.
+    ///
+    /// `disk` is gate S1's own reading of the same file, and the two are compared: the symbols are
+    /// the capture's only because the mapping was identified against *this* image, so an engine
+    /// that read something else out of it breaks the chain and has to be a refusal rather than a
+    /// footnote.
+    ///
+    /// The engine is **borrowed**, so this says nothing about whose it is or how long it lives:
+    /// [`Symbols::open`] hands it one it just created and drops it with the report, and
+    /// [`crate::worker`] hands it the session's, which outlives every call made through it.
+    pub(crate) fn on(
+        engine: &DebugEngine,
+        image: &Path,
+        disk: &DiskImage,
+        symbol_path: Option<&str>,
+    ) -> Result<Loaded, SymbolFailure> {
         if let Some(path) = symbol_path {
             // A path the caller gave replaces the engine's default rather than appending to it: an
             // operator naming a store means that store, and silently keeping `srv*` beside it is
@@ -522,8 +604,7 @@ impl Symbols {
                 symbol_file,
             });
         }
-        Ok(Symbols {
-            engine,
+        Ok(Loaded {
             qualifier: module.name.clone(),
             preferred_base: module.base,
             size_of_image: module.size,
@@ -563,7 +644,7 @@ impl Symbols {
         &self.symbol_file
     }
 
-    /// Ask the engine for each of [`TYPE_PROBES`]: the type id it answered, or **what it said
+    /// Ask `engine` for each of [`TYPE_PROBES`]: the type id it answered, or **what it said
     /// instead**.
     ///
     /// Reported as the list rather than as a verdict, because four names answering nothing is
@@ -577,12 +658,14 @@ impl Symbols {
     /// distinction and hand the engine's own reason to the reader, who can see whether it says the
     /// type was not found or something operational. Review on #399 raised it for this call after
     /// raising it for `module_pdb`, which is why the module docs now enumerate every site.
-    pub(crate) fn type_probes(&self) -> Vec<(&'static str, Result<u32, String>)> {
+    pub(crate) fn type_probes(
+        &self,
+        engine: &DebugEngine,
+    ) -> Vec<(&'static str, Result<u32, String>)> {
         TYPE_PROBES
             .iter()
             .map(|name| {
-                let answer = self
-                    .engine
+                let answer = engine
                     .type_id(self.preferred_base, name)
                     .map_err(|e| e.to_string());
                 (*name, answer)
@@ -591,9 +674,19 @@ impl Symbols {
     }
 
     /// A resolver for this image as the guest loaded it, at `guest_base`.
-    pub(crate) fn at(&self, guest_base: Gva) -> Result<Resolver<'_>, RebaseRefused> {
+    ///
+    /// `engine` is the one these symbols were loaded into, and passing a different one would
+    /// resolve names in another session's target — which is why it is an argument here rather than
+    /// a field: the two hosts hold their engine in different places, and neither can supply the
+    /// wrong one without saying so at the call site.
+    pub(crate) fn at<'a>(
+        &'a self,
+        engine: &'a DebugEngine,
+        guest_base: Gva,
+    ) -> Result<Resolver<'a>, RebaseRefused> {
         Ok(Resolver {
-            symbols: self,
+            engine,
+            loaded: self,
             rebase: Rebase::new(self.preferred_base, guest_base.0, self.size_of_image)?,
         })
     }
@@ -748,7 +841,10 @@ impl std::fmt::Display for ResolveFailure {
 
 /// One image's symbols, read in the guest's coordinates.
 pub(crate) struct Resolver<'a> {
-    symbols: &'a Symbols,
+    /// The engine these symbols were loaded into, which is the session's in a worker and the
+    /// report's own in [`crate::skinspect`].
+    engine: &'a DebugEngine,
+    loaded: &'a Loaded,
     rebase: Rebase,
 }
 
@@ -757,13 +853,21 @@ impl Resolver<'_> {
         self.rebase
     }
 
+    /// The module name the engine qualifies these symbols by.
+    ///
+    /// Exposed so a caller quoting a symbol quotes **the engine's** spelling rather than one derived
+    /// beside it: the engine mangles on collision, so a name assembled from the file would be a
+    /// second answer that can disagree with the one the lookup used.
+    pub(crate) fn qualifier(&self) -> &str {
+        &self.loaded.qualifier
+    }
+
     /// Where `name` is. Unqualified — the module the engine named is applied here, so a caller
     /// cannot accidentally qualify it with a name this session does not have.
     pub(crate) fn resolve(&self, name: &str) -> Result<Resolved, ResolveFailure> {
-        let qualified = format!("{}!{}", self.symbols.qualifier, name);
+        let qualified = format!("{}!{}", self.loaded.qualifier, name);
         let engine =
-            self.symbols
-                .engine
+            self.engine
                 .symbol_offset(&qualified)
                 .map_err(|e| ResolveFailure::Unknown {
                     name: qualified.clone(),
@@ -784,7 +888,6 @@ impl Resolver<'_> {
     pub(crate) fn describe(&self, at: Gva) -> Result<Option<Named>, OutsideImage> {
         let engine = self.rebase.to_engine(at)?;
         Ok(self
-            .symbols
             .engine
             .symbol_for(engine)
             .map(|(symbol, displacement)| Named {

@@ -6,8 +6,8 @@
       "inputSchema": 1233,
       "modelVisible": 2602,
       "name": "attach_kernel",
-      "outputSchema": 4513,
-      "wire": 7269
+      "outputSchema": 4567,
+      "wire": 7323
     },
     {
       "annotations": 122,
@@ -15,8 +15,8 @@
       "inputSchema": 33,
       "modelVisible": 330,
       "name": "attach_kernel_local",
-      "outputSchema": 4513,
-      "wire": 4996
+      "outputSchema": 4567,
+      "wire": 5050
     },
     {
       "annotations": 117,
@@ -24,8 +24,8 @@
       "inputSchema": 204,
       "modelVisible": 547,
       "name": "attach_process",
-      "outputSchema": 4513,
-      "wire": 5208
+      "outputSchema": 4567,
+      "wire": 5262
     },
     {
       "annotations": 68,
@@ -321,8 +321,8 @@
       "inputSchema": 229,
       "modelVisible": 586,
       "name": "launch",
-      "outputSchema": 4513,
-      "wire": 5259
+      "outputSchema": 4567,
+      "wire": 5313
     },
     {
       "annotations": 65,
@@ -339,8 +339,17 @@
       "inputSchema": 211,
       "modelVisible": 718,
       "name": "open_dump",
-      "outputSchema": 4513,
-      "wire": 5390
+      "outputSchema": 4567,
+      "wire": 5444
+    },
+    {
+      "annotations": 129,
+      "description": 1458,
+      "inputSchema": 2404,
+      "modelVisible": 3918,
+      "name": "open_sk_capture",
+      "outputSchema": 9709,
+      "wire": 13787
     },
     {
       "annotations": 114,
@@ -348,8 +357,8 @@
       "inputSchema": 211,
       "modelVisible": 534,
       "name": "open_trace",
-      "outputSchema": 4513,
-      "wire": 5192
+      "outputSchema": 4567,
+      "wire": 5246
     },
     {
       "annotations": 123,
@@ -456,8 +465,8 @@
       "inputSchema": 314,
       "modelVisible": 1387,
       "name": "session_status",
-      "outputSchema": 3797,
-      "wire": 5288
+      "outputSchema": 3851,
+      "wire": 5342
     },
     {
       "annotations": 114,
@@ -476,6 +485,33 @@
       "name": "set_symbol_path",
       "outputSchema": 0,
       "wire": 2355
+    },
+    {
+      "annotations": 126,
+      "description": 475,
+      "inputSchema": 314,
+      "modelVisible": 840,
+      "name": "sk_modules",
+      "outputSchema": 1739,
+      "wire": 2736
+    },
+    {
+      "annotations": 124,
+      "description": 671,
+      "inputSchema": 551,
+      "modelVisible": 1277,
+      "name": "sk_read_memory",
+      "outputSchema": 1434,
+      "wire": 2866
+    },
+    {
+      "annotations": 129,
+      "description": 899,
+      "inputSchema": 517,
+      "modelVisible": 1466,
+      "name": "sk_symbol",
+      "outputSchema": 1375,
+      "wire": 3001
     },
     {
       "annotations": 116,
@@ -569,15 +605,15 @@
     }
   ],
   "totals": {
-    "annotations": 6672,
-    "description": 37150,
-    "inputSchema": 55324,
+    "annotations": 7180,
+    "description": 40653,
+    "inputSchema": 59110,
     "instructions": 2022,
-    "modelVisible": 95792,
-    "outputSchema": 163190,
-    "payload": 267441,
-    "tools": 63,
-    "wire": 267367,
+    "modelVisible": 103293,
+    "outputSchema": 177825,
+    "payload": 290213,
+    "tools": 67,
+    "wire": 290135,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }
