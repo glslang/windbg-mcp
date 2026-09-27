@@ -50,10 +50,12 @@ its absence is not evidence about anything.
 
 **Asking for a review to settle the question is the move that compounds.** `@codex review` starts a
 *fresh* round on the same head, whose findings need remedies, whose surface the next review then
-reads — the churn half of the predicate in *The stopping rule* is fed by exactly this. A review you
-triggered to resolve your own uncertainty is not evidence of closure; it manufactures a round. If
-the row says `Completed` at the head and nothing is anchored there, the round is closed. If no row
-exists at all, the PR was never reviewed — a fact to report, not a gap to fill with a trigger.
+reads — and the remedies it produces are what B measures in *The stopping rule*. A review you
+triggered to resolve your own uncertainty is not evidence of closure; it manufactures a round. A
+`Completed` row closes **Codex's** review and not the round: on this repo CodeRabbit has twice filed
+findings minutes after it, so the round is closed when the row reads `Completed` at the head **and**
+a settle has passed with nothing new anchored there from either reviewer. If no row exists at all,
+the PR was never reviewed — a fact to report, not a gap to fill with a trigger.
 
 **A round is not a moment, and reading it as one loses findings.** Codex posts a round's comments
 over a minute or two, so a watcher that fires on the *first* comment reads a partial round. On
@@ -348,9 +350,17 @@ So the predicate is **growth**, not attribution. The artifact is the set of file
 filed against, which the findings name themselves:
 
 ```console
-gh api --paginate repos/<o>/<r>/pulls/<n>/comments --jq '.[].path' | sort -u
-git show <first-commit>:<path> | wc -l        # against the same file in the working tree
+for p in $(gh api --paginate repos/<o>/<r>/pulls/<n>/comments --jq '.[].path' | sort -u); do
+  printf '%s %s %s\n' "$(git show <first-commit>:"$p" 2>/dev/null | wc -l)" "$(wc -l < "$p")" "$p"
+done | awk '{b+=$1; a+=$2} END {printf "%d -> %d  %+.0f%%\n", b, a, (a-b)*100/b}'
 ```
+
+A path the first commit does not have counts as **zero** there, which is the whole point: a file a
+remediation commit added is review-added surface, and skipping it would understate B by exactly the
+thing B is for. The `2>/dev/null` is what makes that happen rather than failing the loop. A
+**rename** inflates B, because the old path goes to zero and the new one appears at full size —
+resolve it with `git log --follow` on the new path, or accept the inflation and say so in the
+number.
 
 **Compute the predicate once the PR has five remediation commits, then after every round, and write
 it down.** Two terms, and they are the only things in this section that decide anything:
