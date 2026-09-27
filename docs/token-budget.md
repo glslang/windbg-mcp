@@ -349,13 +349,13 @@ None of these is a bug. They are recorded because they were invisible, and
    | `inspect` | 10 | 13,152 | 12.7% |
    | `ioctl` | 10 | 12,435 | 12.0% |
    | `batch` | 1 | 10,842 | 10.5% |
-   | `securekernel` | 4 | 7,501 | 7.3% |
+   | `securekernel` | 4 | 7,529 | 7.3% |
    | `crash` | 3 | 7,427 | 7.2% |
    | `ttd` | 9 | 6,829 | 6.6% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 67 | 103,293 |
+   | *(absent)* | 67 | 103,321 |
    | `session,inspect,exec,crash` | 33 | 48,216 |
    | `session,inspect,crash` | 23 | 33,187 |
    | `crash` | 13 | 19,943 |

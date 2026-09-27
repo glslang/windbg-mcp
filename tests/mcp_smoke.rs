@@ -1985,11 +1985,16 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// whole answer, and a surface that narrow does not have it.
 /// **96,500 -> 105,000 for the Secure Kernel capture surface** (2026-09-27), which is four tools
 /// and the largest single raise here — so the arithmetic is a term each: the model-visible surface
-/// went 95,792 -> 103,293 across 63 -> 67 tools, and of those 7,501 B, `open_sk_capture` is 3,918,
-/// `sk_symbol` 1,466, `sk_read_memory` 1,277 and `sk_modules` 840. The four sum to the whole
+/// went 95,792 -> 103,321 across 63 -> 67 tools, and of those 7,529 B, `open_sk_capture` is 3,918,
+/// `sk_symbol` 1,466, `sk_read_memory` 1,305 and `sk_modules` 840. The four sum to the whole
 /// difference exactly, which is the thing to check rather than assume: none of them carries a
 /// `TOOL_NOTES` cross-reference, so unlike the three raises above this one has no second term, and
 /// the per-tool golden — diffed by tool *name* — is what says no existing tool moved a byte.
+///
+/// **28 B of `sk_read_memory` is its own bound, in the schema**: review round 1 found the size cap
+/// enforced in the worker and reported as a debugger failure, and putting the refusal where the
+/// argument is read is only half of it — `minimum`/`maximum` on the field is what makes the bound
+/// discoverable rather than a runtime surprise. It is the only `schemars(range)` on this surface.
 ///
 /// `open_sk_capture` is the second-largest tool on the surface after `debug_batch`, and it is
 /// **eleven arguments** rather than a long description: three ways of naming a capture, the image
@@ -2120,9 +2125,9 @@ const MODEL_VISIBLE_CEILING: usize = 105_000;
 /// each failed row, which is what this ceiling's headroom is for.
 /// The new figure leaves 5,083 B, 1.9%, which is the headroom every raise here has left.
 /// **268,000 -> 295,000 for the Secure Kernel capture surface** (2026-09-27), four tools and the
-/// largest raise here. The payload went 267,441 -> 290,213, a difference of **22,772**, and it has
-/// a second term: the four new tools are 22,390 B of wire between them (`open_sk_capture` 13,787,
-/// `sk_symbol` 3,001, `sk_read_memory` 2,866, `sk_modules` 2,736), **seven existing tools grew 54 B
+/// largest raise here. The payload went 267,441 -> 290,241, a difference of **22,800**, and it has
+/// a second term: the four new tools are 22,418 B of wire between them (`open_sk_capture` 13,787,
+/// `sk_symbol` 3,001, `sk_read_memory` 2,894, `sk_modules` 2,736), **seven existing tools grew 54 B
 /// each** — 378 in all — and the last 4 bytes are the array's own commas.
 ///
 /// Those 54 B are `SessionKindName` gaining a `secure_kernel` variant, and they are the shape of
@@ -18757,6 +18762,47 @@ fn an_openers_argument_refusal_says_whether_a_target_was_created() {
             "`{tool}` refused for the wrong reason: {data}"
         );
     }
+}
+
+/// **A read size this tool will not serve is the caller's argument, not the target's failure.**
+///
+/// Both halves are asserted, and the second is what the first is worth: the category is
+/// `invalid_argument`, and the refusal arrives with **no session open at all** — which is only
+/// possible because it is checked before routing. The worker enforces the same bound (a bound only
+/// the supervisor held would be one the worker's own callers could walk past), and a refusal from
+/// there travels as `debugger`, which tells a caller to go and look at the capture for a number they
+/// chose. Codex, [#401](https://github.com/glslang/windbg-mcp/pull/401).
+///
+/// In the protocol tier, for that reason: a well-formed `sk_read_memory` with nothing open takes the
+/// *session* refusal instead, and the two categories are what tell the checks apart.
+#[test]
+fn a_read_size_this_tool_will_not_serve_is_refused_as_an_argument() {
+    let mut server = Server::started();
+    for size in [json!(0), json!(70000)] {
+        let refused = server.tool_failure(
+            "sk_read_memory",
+            json!({ "address": "0xfffff80000000000", "size": size }),
+            STEP,
+        );
+        assert_eq!(
+            refused["error"]["category"],
+            json!("invalid_argument"),
+            "a size of {size} is the caller's to fix, and it was refused before any session was \
+             looked for: {refused}"
+        );
+    }
+    // The same tool, a size it will serve, and nothing open: the session refusal, which is the
+    // other category and the thing that says the check above ran first.
+    let no_session = server.tool_failure(
+        "sk_read_memory",
+        json!({ "address": "0xfffff80000000000", "size": 16 }),
+        STEP,
+    );
+    assert_eq!(
+        no_session["error"]["category"],
+        json!("stale_session"),
+        "with no session open a well-formed read takes the session refusal: {no_session}"
+    );
 }
 
 // ---- tier 7: a Secure Kernel capture -------------------------------------------

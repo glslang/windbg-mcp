@@ -1068,8 +1068,9 @@ pub struct SkCaptureArgs {
 pub struct SkReadArgs {
     /// Guest virtual address in the captured VTL1 (decimal, or "0x"-hex).
     pub address: String,
-    /// How many bytes. Whole or nothing: a range reaching a page the capture does not carry is
-    /// refused rather than answered short.
+    /// How many bytes, 1 to 65536. Whole or nothing: a range reaching a page the capture does not
+    /// carry is refused rather than answered short.
+    #[schemars(range(min = 1, max = 65536))]
     pub size: u32,
     /// Which session to act on. Omit for the current one.
     #[serde(default)]
@@ -3663,6 +3664,13 @@ impl WindbgServer {
                 return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
             }
         };
+        // **The size bound is the caller's mistake, not the target's.** The worker enforces it too —
+        // it is where the read happens — but a refusal from there travels as a `debugger` failure,
+        // which tells a caller to look at the capture for a number they chose. Checked here, it is
+        // `invalid_argument` and it costs no session routing at all.
+        if let Err(why) = crate::sksession::readable(args.size) {
+            return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+        }
         let out = self
             .run(
                 args.session_id.as_deref(),

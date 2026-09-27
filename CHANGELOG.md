@@ -48,7 +48,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   provider refusing the VTL switch by name (`0xC0370509`), and the session **opens** carrying that as
   its reason and refuses every read with the same sentence — while its symbols load normally, which
   is the pair that had to stay distinguishable. Eleven new tests (1,099 unit tests now, from 1,088)
-  and three in the smoke harness (129, from 126), all thirteen guards **mutation-verified**: the
+  and five in the smoke harness (130, from 126), all fifteen guards **mutation-verified**: the
   kind gate three ways — accept every debugger op on a capture, accept every capture op elsewhere, and replace
   the allow-list with a deny-list, where the row that then goes through is the one that was not
   thought of — and five renderers, including a landmark that disagrees rendering as agreement and a
@@ -62,7 +62,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   this made quietly. The `tools/list` payload found a **multiplication** on the way, which is the
   first time that ceiling has caught one: holding the report in `TargetSummary` inlined its schema
   into all seven openers' `$defs` and measured 341,057 B, and moving it into an outcome of its own
-  took **50,844 B** back off the wire for a change no client can observe.
+  took **50,844 B** back off the wire for a change no client can observe. Two review rounds found
+  eight defects, seven of them taken: four were a **value asserting something nothing had compared** —
+  the structural cross-check reporting agreement it never checked, an interrupt marking a job it could
+  not stop, an opener's refusal answering in the wrong shape, a tier's prose claiming a tool its body
+  never called — and two more were the same thing in a **sentence**: a `limitation` giving the VBS-off
+  reading for all six reasons a capture can have no VTL1, and a page's headline byte figure left
+  behind by its own table. The eighth is declined with its fact recorded: an open that exceeds the
+  call timeout loses its decode, and both remedies would put another copy of a ten-kilobyte schema on
+  the wire for every caller.
 - **`securekernel.exe`'s symbols now resolve against the base gate S1 found in a capture, with no
   debuggee anywhere — and the PDB agrees with the capture scan to the byte.** `FOLLOWUPS.md` item
   103's gate S2, `src/sksym.rs`, driven by `windbg-mcp --sk-inspect --symbols`. The unknown the gate

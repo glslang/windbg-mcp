@@ -498,11 +498,11 @@
     {
       "annotations": 124,
       "description": 671,
-      "inputSchema": 551,
-      "modelVisible": 1277,
+      "inputSchema": 579,
+      "modelVisible": 1305,
       "name": "sk_read_memory",
       "outputSchema": 1434,
-      "wire": 2866
+      "wire": 2894
     },
     {
       "annotations": 129,
@@ -607,13 +607,13 @@
   "totals": {
     "annotations": 7180,
     "description": 40653,
-    "inputSchema": 59110,
+    "inputSchema": 59138,
     "instructions": 2022,
-    "modelVisible": 103293,
+    "modelVisible": 103321,
     "outputSchema": 177825,
-    "payload": 290213,
+    "payload": 290241,
     "tools": 67,
-    "wire": 290135,
+    "wire": 290163,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }

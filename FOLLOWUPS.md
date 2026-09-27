@@ -2679,6 +2679,23 @@ Worth recording as a set, because four of the five are the same shape — **a cl
 The sixth is declined with its fact taken, and is the timeout bullet in *What this does not
 establish* below.
 
+#### Review round 2: two findings, both taken, both about a claim being wrong for most of its cases
+
+- **`sk_read_memory`'s size bound was the worker's, and arrived as a debugger failure.** A size this
+  tool will not serve is the *caller's* argument, and a refusal categorised `debugger` sends them to
+  look at the capture for a number they chose. It is checked in the supervisor now — before any
+  session is routed to, which is what makes it reachable with nothing open — and the worker keeps its
+  own, because a bound only one side holds is one the other side's callers walk past. The bound is
+  also **in the schema** now (`minimum: 1`, `maximum: 65536`, the only `schemars(range)` on this
+  surface, 28 B): a cap a caller can only discover by exceeding it is a cap they will exceed.
+- **The session's `limitation` gave the VBS-off reading for all six `NotWalkable` variants**, and it
+  is true of two. A guest whose paging shape this walk does not decode **has** a VTL1, and a register
+  the provider would not answer for is the provider's failure rather than a fact about the guest —
+  three readings that send a reader to three different places. `what_no_vtl1_means` is the per-cause
+  sentence, and the test asserts the VBS-off wording appears for exactly the two variants that
+  support it. This is the same class as round 1's four: a sentence asserting more than was
+  established, one level up from a value doing it.
+
 #### What this does **not** establish
 
 - **One capture, one build, one host.** The same limitation S1 and S2 carry, and the tier is written
