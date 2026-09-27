@@ -86,7 +86,9 @@ calls free and the heap tools call allocated. That run filed two more, both now 
 [`DONE.md`](./DONE.md) — item 96, the pool walker's LFH reading, which it showed is not `nt`'s,
 and the ARM64 pool gate behind it; and item 98, the uncommitted memory that kept every live walk
 measured at `Partial` once the diagnostics were gone, which turned out to want the memory
-manager's answer rather than the allocator's. And item 104 from closing item 102 (2026-09-26): the target fingerprint spells
+manager's answer rather than the allocator's. And item 105 from review on that item's PR after it had merged (2026-09-27): the
+measurement item 102 took to correct its own example contradicts a claim this server's design is
+introduced with, in about a dozen places that were never swept. And item 104 from closing item 102 (2026-09-26): the target fingerprint spells
 *"this field does not apply"* and *"this field could not be read"* the same way, so two failures
 compare equal and a recovery reads as a replacement — which a handle survives and a batch's
 rollback does not.
@@ -2785,3 +2787,39 @@ Two consequences, and they point in opposite directions:
   for the batch's half of the decision. The measurement to take first is whether any of the three
   always-required queries can actually fail on an engine that answers `GetExecutionStatus` — none
   of this is reachable if they cannot, and nothing here has been able to make one do it.
+
+## 105. [windbg-mcp] `.opendump` is documented as replacing the target, and the one measurement of it says it adds one
+
+**Repo:** `windbg-mcp`. **Origin:** two prose sites raised by CodeRabbit on
+[#392](https://github.com/glslang/windbg-mcp/pull/392) after it merged, and fixed there. The wider
+version is this repo contradicting itself: item 102 measured the command it had used as its own
+example of a replacement and found it is not one — driven live over stdio against the dev build
+(dbgeng 10.0.26100.1742, ARM64, 2026-09-26), `.if (1) { .opendump C:\other.dmp }` on a dump session
+left `||` listing **two systems** with the original still current, and `? @$ip`, `version` and `lm`
+all still answering from it. That reading is recorded in `DONE.md`; the *claim* it contradicts is
+still in about a dozen places, including the sentence this server's whole shape is introduced with
+(`docs/architecture.md`'s opening and `src/engine.rs`'s module doc): *"dbgeng.dll holds one
+debuggee session per process … which is why `.opendump` **replaces** the target rather than opening
+a second one"*.
+
+- **Why deferred:** one command, one target kind, one engine build, and a rewrite of that sentence
+  would trade a claim that is wrong on one kind for one that is unmeasured on three. What it wants
+  first is the matrix: `.opendump` on a **dump** session (measured: adds a system), on a **live
+  user-mode** target, on a **live kernel** one, and `.opendump` of the *same* file; and then which
+  command actually switches, which this server has never observed at all — `||1s` through
+  `ExecuteWide` failed here with `0x80040205`, so "the switch is what replaces a target" is
+  currently an inference rather than a reading.
+- **What does not change whatever the matrix says, and is worth writing down before anyone starts.**
+  `server::changes_debug_target` keeps `.opendump` on its list and `batch::retires_handle` keeps
+  pre-retiring for it: over-matching there costs a caller one re-open, the scan cannot see a
+  wrapper anyway, and since item 81 the *actual* retirement is decided by comparing what the engine
+  holds rather than by the command's name. The batch's own reading is likewise unaffected — it
+  compares holdings, so a `.opendump` that adds a system and leaves the current one alone correctly
+  reads as **nothing changed**, which is what the live run showed. So this is a documentation
+  defect with a measurement behind it, not a behaviour one.
+- **Where it picks up:** `docs/architecture.md`'s opening paragraph and `src/engine.rs`'s module
+  doc, which state it as the reason for one worker per session; `docs/sessions.md` (three places),
+  `docs/tool-surface.md`, `src/server.rs`'s `changes_debug_target` and `src/proto.rs`'s op
+  commentary, which use it as the canonical example. The measurement needs the debugger tier plus a
+  live kernel target (`.claude/skills/live-kernel/SKILL.md`), and it should be taken on a build
+  named in the write-up, since this is a per-engine-version answer.

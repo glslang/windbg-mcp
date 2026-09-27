@@ -4020,9 +4020,11 @@ pub enum BatchOutcomeName {
     /// lands in another address space. The steps after that point were not
     /// attempted and the `always` block was deliberately not run — `rollback` says
     /// `not_attempted`. Kept apart from [`Self::TargetReplaced`] because nothing identified a
-    /// second target and **this session's handle is not retired**: it may be perfectly usable,
-    /// and what the steps changed is likely still in place on a target that is likely still
-    /// there.
+    /// second target: what the steps changed is likely still in place on a target that is likely
+    /// still there. **Whether this session's handle still answers is a separate question this
+    /// outcome does not settle** — a batch that *names* a command which retires handles retires
+    /// this one before its first step runs, reached or not — so ask `session_status` rather than
+    /// reading this as a promise about the handle.
     TargetUncertain,
 }
 

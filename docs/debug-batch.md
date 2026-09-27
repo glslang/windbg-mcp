@@ -79,9 +79,9 @@ Five honest limits, none of them hidden in the report:
   the reserve as well leaves cleanup with no budget; the block is then skipped and the result says
   `rollback: INCOMPLETE`, naming each step that did not run.
 - **A step that *replaces* the debug target stops the batch and the rollback is deliberately not
-  run.** A wrapper hides the command that does it — `.if (1) { .opendump … }`, a `.foreach`, an
-  alias resolved at execution time, a breakpoint command run at a hit — so neither the by-name scan
-  that retires a handle nor `validate` can see one, and the engine process compares what it is
+  run.** A wrapper hides the command that does it — `.if (1) { .create … }` and the `g` that arms
+  it, a `.foreach`, an alias resolved at execution time, a breakpoint command run at a hit — so
+  neither the by-name scan that retires a handle nor `validate` can see one, and the engine process compares what it is
   holding against what the batch started against instead — after every step's *action*, before
   that step's own assertions, so an `eval` expectation is never answered by the replacement and
   reported as the step's verdict. What cannot be caught is a change made *inside* one engine call,

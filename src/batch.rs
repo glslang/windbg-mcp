@@ -2295,11 +2295,13 @@ pub fn render(report: &BatchReport) -> String {
             "BATCH: TARGET UNCERTAIN at step {at} of {total} — after that step nothing could \
              certify that the debugger is still holding the target the steps ran against, so the \
              steps after it were not attempted{}. {} Nothing identified a *second* target, which \
-             is what separates this from TARGET REPLACED: this session's handle is not being \
-             retired, and what the steps changed is very likely still in place on a target that \
-             is very likely still there. Read `mutations` above for what that is, and ask what \
-             this session holds before deciding whether to put it back from here or from a new \
-             one.\n",
+             is what separates this from TARGET REPLACED: what the steps changed is very likely \
+             still in place on a target that is very likely still there. Read `mutations` above \
+             for what that is, and ask `session_status` whether this session's handle still \
+             answers before deciding whether to put it back from here or from a new one — this \
+             report cannot say, because a batch that *names* a command which retires handles \
+             retires this one before its first step runs, whether that step was reached or \
+             not.\n",
             withheld(report),
             why_unverified(report, "Nothing said what the debugger is holding now.")
         ),
@@ -3226,16 +3228,27 @@ mod tests {
         assert!(text.contains("TARGET UNCERTAIN at step 2"), "{text}");
         assert!(text.contains("rollback: NOT ATTEMPTED"), "{text}");
         // The headline names the other outcome to say what this one is *not*, so the check is on
-        // the verdict rather than on the word — and on the one claim that would be false: nothing
-        // here retires the session's handle, because the fingerprint did not move.
+        // the verdict rather than on the word.
         let headline = text.lines().next().unwrap_or_default();
         assert!(
             !headline.starts_with("BATCH: TARGET REPLACED"),
             "nothing may claim a replacement here: {headline}"
         );
+        // **And it may claim nothing either way about the handle**, which is the second thing
+        // Codex found in this sentence ([#392](https://github.com/glslang/windbg-mcp/pull/392),
+        // after the merge): `server::debug_batch` reads `retires_handle` over *every* step
+        // including `always` and marks the whole call retiring, and the supervisor's pump retires
+        // the session before the worker starts — so a batch that stops at step 2 with a
+        // `.opendump` waiting at step 4 has a retired handle and an unreached command. This
+        // report is written in the worker, which cannot see that, so the fix is to stop claiming
+        // and to name what can answer.
         assert!(
-            !text.contains("DETACHED/REPLACED") && text.contains("handle is not being retired"),
-            "and the report must not say this session is finished when it is not: {text}"
+            !text.contains("DETACHED/REPLACED") && !text.contains("handle is not"),
+            "the report may neither say this session is finished nor promise it is not: {text}"
+        );
+        assert!(
+            text.contains("`session_status`"),
+            "and must send the caller to the one thing that answers it: {text}"
         );
     }
 
