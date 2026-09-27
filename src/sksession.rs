@@ -521,10 +521,10 @@ impl Session {
     pub(crate) fn limitation(&self) -> Option<String> {
         match &self.landmarks {
             Err(why) => Some(format!(
-                "This capture carries no VTL1 to read ({}), so every read against this session is \
-                 refused. The guest it was taken from had Secure Kernel switched off, or the \
-                 provider would not switch the virtual processor to VTL1.",
-                refusal(why)
+                "This capture has no VTL1 address space this decode can walk ({}), so every read \
+                 against this session is refused.{}",
+                refusal(why),
+                what_no_vtl1_means(why)
             )),
             Ok(landmarks) if landmarks.identified.is_none() => Some(
                 "The walk found no mapping of this image in the capture's VTL1, so nothing here \
@@ -546,7 +546,14 @@ impl Session {
 ///
 /// A free function rather than two lines inside the read, so the bound is testable without a
 /// capture, a provider or an SDK — which is the only way it gets tested at all.
-fn readable(size: u32) -> Result<(), String> {
+///
+/// **Called on both sides of the pipe, and that is deliberate.** The supervisor calls it to refuse a
+/// caller's argument *as* an argument — `invalid_argument`, before a session is routed to, because a
+/// size this tool will not read is not a failure of the target (Codex,
+/// [#401](https://github.com/glslang/windbg-mcp/pull/401): it came back `debugger`). This side keeps
+/// it because a bound enforced only by whoever remembers to call it is half a bound, and the worker
+/// is where the read actually happens.
+pub(crate) fn readable(size: u32) -> Result<(), String> {
     if size == 0 {
         return Err("size must be at least one byte".into());
     }
@@ -718,6 +725,32 @@ fn walk_incomplete(why: sk::Incomplete) -> String {
             "{count} page table(s) could not be read, so the subtrees below them are missing \
              rather than empty"
         ),
+    }
+}
+
+/// What a refusal means for the *session*, which is a different question from what happened.
+///
+/// **One sentence for all six variants was wrong for four of them** (CodeRabbit,
+/// [#401](https://github.com/glslang/windbg-mcp/pull/401)): it said the guest had Secure Kernel
+/// switched off, which is the VBS-off reading and true of two. A guest whose paging shape this walk
+/// does not decode **has** a VTL1, and a register the provider would not answer for is the
+/// provider's failure rather than a fact about the guest — and a caller acting on the wrong one of
+/// those three goes and looks at the wrong thing.
+fn what_no_vtl1_means(why: &NotWalkable) -> &'static str {
+    match why {
+        NotWalkable::SwitchRefused(_) | NotWalkable::VtlNotEnabled => {
+            " The guest it was taken from had Secure Kernel switched off, or the provider would not \
+             switch the virtual processor to VTL1."
+        }
+        NotWalkable::NoRoot { .. } => {
+            " That is the provider not answering for the register this walk starts from, rather than \
+             a statement about the guest: another capture of the same guest may well carry it."
+        }
+        NotWalkable::PagingMode(_) | NotWalkable::FiveLevel | NotWalkable::NotLongMode => {
+            " The guest's VTL1 is there and this decode does not walk that paging shape — a \
+             four-level walk of tables that are not four-level would yield invented leaves rather \
+             than an error, so it refuses instead."
+        }
     }
 }
 
@@ -1418,6 +1451,42 @@ mod tests {
             !neither.contains("agrees with the block") && !neither.contains("DISAGREES"),
             "a search that found nothing is not a verdict either way:\n{neither}"
         );
+    }
+
+    /// **A session with no VTL1 says which of three things happened, not one of them six times.**
+    ///
+    /// The VBS-off reading — the guest had Secure Kernel switched off — is true of two variants and
+    /// was printed for all of them (CodeRabbit, #401). The other two readings send a caller somewhere
+    /// else entirely: a paging mode this walk does not decode is a guest that *has* a VTL1, and a
+    /// register the provider would not answer for is the provider's failure.
+    #[test]
+    fn a_capture_with_no_vtl1_says_which_of_the_three_causes_it_was() {
+        let vbs_off = " had Secure Kernel switched off";
+        for why in [
+            NotWalkable::SwitchRefused("hresult 0xC0370509".into()),
+            NotWalkable::VtlNotEnabled,
+        ] {
+            assert!(
+                what_no_vtl1_means(&why).contains(vbs_off),
+                "{why:?} is the VBS-off reading and must say so"
+            );
+        }
+        for why in [
+            NotWalkable::NoRoot {
+                unreadable: vec![("cr3", "hresult 0x80070057".to_string())],
+            },
+            NotWalkable::PagingMode(sk::PagingMode::Pae),
+            NotWalkable::FiveLevel,
+            NotWalkable::NotLongMode,
+        ] {
+            let means = what_no_vtl1_means(&why);
+            assert!(
+                !means.contains(vbs_off),
+                "{why:?} is not a guest with Secure Kernel switched off, and saying so sends a \
+                 reader to look at the wrong thing: {means}"
+            );
+            assert!(!means.is_empty(), "{why:?} has no reading at all");
+        }
     }
 
     /// The read bound, which is about the **answer** rather than the read: a capture is a file and
