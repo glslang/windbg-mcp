@@ -20,11 +20,28 @@ assertion, and because the same script is how a later SDK gets re-tested.
 import ctypes
 import glob
 import os
+import platform
 import sys
 from ctypes import wintypes
 
 KIT = r"C:\Program Files (x86)\Windows Kits\10\bin"
-ARCH = "arm64" if os.environ.get("PROCESSOR_ARCHITECTURE", "").upper() == "ARM64" else "x64"
+
+
+def provider_arch():
+    """The SDK subdirectory whose DLL this *process* can load.
+
+    Derived from the pointer width and the machine family, **not** from
+    `PROCESSOR_ARCHITECTURE`: that names the machine, so a 32-bit Python on an x64 host would
+    select the x64 provider, and `ctypes.WinDLL` would then refuse the image before
+    `LoadSavedStateFile` was ever called -- an unrelated loader error wearing the shape of this
+    report's repro.
+    """
+    if sys.maxsize <= 2**32:
+        return "x86"
+    return "arm64" if platform.machine().lower() in ("arm64", "aarch64") else "x64"
+
+
+ARCH = provider_arch()
 
 
 def newest_provider():

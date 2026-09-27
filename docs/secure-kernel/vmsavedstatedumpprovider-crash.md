@@ -10,8 +10,18 @@ it can be sent as it stands.
 
 `LoadSavedStateFile` terminates the calling process when handed a saved state captured from a VM with
 `EncryptStateAndVmMigrationTraffic` enabled. It does not return a failure `HRESULT`: the process dies
-inside the call with `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`), which is a **fast-fail** and
-therefore uncatchable — no `try`/`except`, no SEH handler and no `catch_unwind` in the caller sees it.
+inside the call with `0xC0000409`, which is a **`__fastfail`** and therefore uncatchable — no
+`try`/`except`, no SEH handler and no `catch_unwind` in the caller sees it.
+
+**That status is not a diagnosis, and its legacy name invites one.** `0xC0000409` is
+`STATUS_STACK_BUFFER_OVERRUN` by name and is the status Windows raises for **every** `__fastfail`,
+so on any build since Windows 8 it almost never means a stack buffer overrun. What says *why* is the
+**`FAST_FAIL_*` subcode**, which travels as the first exception parameter — and this measurement
+**did not capture it**: WER's event carries the status and the fault offset, not the parameter. So
+the fault is a deliberate termination raised by the provider, of an unstated kind; `abort` from an
+unhandled C++ exception (`FAST_FAIL_FATAL_APP_EXIT`) and a real corruption check are both consistent
+with what was observed, and this report claims neither. A dump, or the same repro under a debugger,
+would name the subcode; see *What was not tested*.
 
 The same function **refuses corrupt, truncated and random input cleanly**, with
 `0x80070570` (`ERROR_FILE_CORRUPT`). So this is not a parser that gives up loudly on anything it
@@ -27,9 +37,10 @@ Availability and robustness, in a component whose whole job is parsing files:
   which file did it.
 - **The input is ordinary and legitimate.** Nothing crafted it. Hyper-V wrote it, from a supported
   configuration, using the setting Microsoft documents for protecting saved state.
-- **Not demonstrated to be more than that.** `0xC0000409` means a corruption check *fired*, so the
-  mitigation did its job; nothing here shows memory corruption that escaped it, and no crafted input
-  was tried. This is reported as a crash, not as a memory-safety vulnerability.
+- **Not demonstrated to be more than that, and deliberately not characterised further.** A
+  `__fastfail` is a *deliberate* kill, so nothing here shows memory corruption at all — and equally,
+  without the subcode nothing here rules out a corruption check having been the thing that fired. No
+  crafted input was tried and no exploitability claim is made. This is reported as a crash.
 
 Worth one factual note on who can supply the input, without a claim attached: a `.vmrs` is a file, so
 its ACL is the boundary. On the bench this was found on, the checkpoint files inherited the data
@@ -65,9 +76,13 @@ file in front of this parser.
    modified because the virtual machine is running"* — which is why this needs a power cycle.
 
 2. Take a **standard** checkpoint of the running VM, which is what writes a `.vmrs` containing saved
-   memory and register state:
+   memory and register state. `Checkpoint-VM` honours the VM's **configured** checkpoint type, and
+   the default on current Hyper-V is *Production*, which uses VSS inside the guest and does **not**
+   save memory — so a reader following these steps on a default VM gets a `.vmrs` without the state
+   that triggers this, and reproduces nothing. Set the type explicitly:
 
    ```powershell
+   Set-VM -Name 'Some VM' -CheckpointType Standard
    Checkpoint-VM -Name 'Some VM' -SnapshotName 'repro'
    ```
 
@@ -98,10 +113,11 @@ Fault offset:              0x000000000000d569
 WER event name:            BEX64
 ```
 
-**The same fault offset appears from an unrelated host process** — a Rust binary calling the same
-export through its own FFI produced `0xC0000409` at `0xD569` as well. Two hosts with nothing in
-common but this DLL, one offset: the fault is in the provider and is deterministic, not a property of
-either caller.
+**The same fault offset appears from an unrelated process** — a Rust binary calling the same export
+through its own FFI produced `0xC0000409` at `0xD569` as well. Two processes with nothing in common
+but this DLL, one offset: the fault is in the provider and is deterministic rather than a property of
+either caller. Both ran on the one host in the table above, so this says nothing about
+reproducibility across machines.
 
 ## The control matrix, which is what makes the trigger specific
 
@@ -143,8 +159,12 @@ caller say *"this capture is encrypted and I cannot read it"* and carry on to th
 
 Stated so the report is not read as broader than it is:
 
+- **The `FAST_FAIL_*` subcode.** The one measurement most worth adding before this is sent: it names
+  which check fired, and `0xC0000409` alone does not. It is the first exception parameter, so a
+  local dump (`HKLM\SOFTWARE\Microsoft\Windows\Windows Error Reporting\LocalDumps`) or running the
+  repro under a debugger produces it; neither was done.
 - **No crafted input.** Nothing here fabricated or mutated an encrypted capture to probe the fault
-  further, and no attempt was made to determine whether the corruption check can be avoided.
+  further, and no attempt was made to determine whether any check can be avoided.
 - **One SDK version, one architecture.** 10.0.26100.7705, x64 provider in an x64 process. The ARM64
   provider ships beside it and was not exercised; no other kit version is installed on this host.
 - **Shielded VMs and `Save-VM`.** Only the checkpoint form was produced. A shielded VM, and the
