@@ -1467,8 +1467,20 @@ nothing in S0 or S1 looked, and neither should be read as saying they are or are
 **Three things that would be reportable, and the state of each:**
 
 - **VTL1 out of a capture taken with `EncryptStateAndVmMigrationTraffic = $true`**, or from a
-  Shielded VM. That would be encryption not covering what it claims. **Unmeasured — specified as
-  arm 4 below.**
+  Shielded VM. That would be encryption not covering what it claims. **Measured 2026-09-27 as S0 arm
+  4, and it does not happen**: with the setting on, no VTL1 comes out, on the VBS guest as well as
+  on the control. It does not come out because `LoadSavedStateFile` **never returns** — the provider
+  fast-fails, `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`), WER `BEX64`, faulting module
+  `vmsavedstatedumpprovider.dll 10.0.26100.7705` at offset `0xD569`. A *fresh plaintext* capture of
+  the same guest taken minutes later reads normally with the identical command, which is what
+  attributes the failure to the setting rather than to the capture being new. So the mitigation
+  holds and this verdict stands — **and the arm turned up a different defect worth reporting**: a
+  documented SDK API crashing on an input Hyper-V itself wrote, which is a robustness and
+  availability bug rather than a boundary bypass (the `0xC0000409` is the corruption being
+  *detected*, and nothing here fed it a crafted capture). Two things it does not establish: the
+  capture is unreadable **by this provider**, which is not the same as measured ciphertext — no
+  entropy reading was taken — and the encrypted checkpoint was never `Apply-VMSnapshot`ed, so
+  Hyper-V's ability to read what it wrote is an inference. Shielded VMs remain untested.
 - **A principal below Hyper-V Administrator.** Reading a checkpoint needs read access to a *file*,
   not the Hyper-V role — so the file's ACL is the boundary, and **on this bench it is wide open**:
   `D:\Hyper-V\Virtual Machines\Snapshots\<id>.vmrs` (1,984,630,784 bytes) grants

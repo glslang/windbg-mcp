@@ -56,6 +56,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Documentation
 
+- **A Hyper-V checkpoint handing over a guest's Secure Kernel is expected, and the one case that
+  could have overturned that was measured rather than argued.** `FOLLOWUPS.md` item 103. The verdict
+  rests on three things: the Windows SDK documents VTL selection in a capture as a feature
+  (`ForceActiveVirtualTrustLevel` is commented *"useful to force register state to and virtual
+  address translation to come from a different VTL"*), VBS claims a VTL0-to-VTL1 boundary **inside**
+  the guest rather than one against the host — which gates H3 and H4 already demonstrated from the
+  other side, reading the same pages out of a *running* guest — and every route needs Hyper-V
+  Administrator, which can already read a live guest's RAM and attach a kernel debugger to it. So a
+  capture lowers the setup cost for a principal already inside the boundary. Three cases would be
+  reportable and none is asserted away. **S0 arm 4 ran the interesting one**: with
+  `EncryptStateAndVmMigrationTraffic` on, no VTL1 comes out, on the VBS guest as well as on the
+  VBS-off control — and it does not come out because `LoadSavedStateFile` never returns. The provider
+  **fast-fails**: `0xC0000409` (`STATUS_STACK_BUFFER_OVERRUN`), WER `BEX64`, faulting module
+  `vmsavedstatedumpprovider.dll 10.0.26100.7705` at offset `0xD569`. A *fresh plaintext* capture of
+  the same guest, read minutes later with the identical command, loads normally — which is what
+  attributes the failure to the setting rather than to the capture being new, and is the whole rigour
+  of the arm. So the mitigation holds and the verdict stands, **and the arm turned up a different
+  defect worth reporting**: a documented SDK API crashing on an input Hyper-V itself wrote, which is
+  a robustness and availability bug rather than a boundary bypass — the `0xC0000409` is the
+  corruption being *detected*, and nothing here fed it a crafted capture. Two limits stated rather
+  than glossed: the capture is unreadable *by this provider*, which is not the same as measured
+  ciphertext, and the encrypted checkpoint was never applied, so Hyper-V reading what it wrote is an
+  inference. Shielded VMs are untested. The third reportable case needs nobody's involvement and is
+  true on this bench now: the checkpoint files inherit the data volume's ACL — `BUILTIN\Users:
+  ReadAndExecute`, `Authenticated Users: Modify` — so any authenticated local user can read a file
+  holding a guest's whole RAM, which is a storage-path hazard rather than a product defect. The lab
+  was left as found: both settings reverted, the two pinned checkpoints intact, the three this work
+  created removed, and the pinned VBS capture re-read afterwards to the same landmarks.
+
 - **A guest's Secure Kernel is readable from a Hyper-V checkpoint, with no driver and nothing
   signed.** `FOLLOWUPS.md` item 103's first gate, S0, asked whether a driver-free memory source
   contains VTL1 pages -- a question about *how much setup a user needs*, since the live route H0-H4

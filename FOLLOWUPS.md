@@ -2124,7 +2124,42 @@ to walk *from*, and hard-coding the one measured `0x1201000` is not an answer.
   setup. What changes is the install instructions and who can follow them, so write that down
   rather than treating a driver-only answer as a failure of the item.
 
-#### S0 arm 4 — does the encryption knob cover the capture? — **SPECIFIED 2026-09-27, NOT RUN**
+#### S0 arm 4 — does the encryption knob cover the capture? — **RUN 2026-09-27: it does, and the provider crashes rather than refusing**
+
+**The mitigation holds, so the verdict below stands.** With
+`EncryptStateAndVmMigrationTraffic = $true`, **no VTL1 comes out** — and not because the walk found
+nothing: `LoadSavedStateFile` never returns. The provider **fast-fails**, and the OS names it:
+`windbg-mcp.exe 0.20.0.0`, faulting module **`vmsavedstatedumpprovider.dll 10.0.26100.7705`**,
+exception **`0xC0000409`** (`STATUS_STACK_BUFFER_OVERRUN`), WER event name `BEX64`, fault offset
+`0xD569`. Measured on **both** guests: the VBS-off control (arm 4a) and the VBS guest (arm 4b),
+the second being the one that has a VTL1 to withhold.
+
+**The control is what makes that attributable to the knob**, and it is the arm's whole rigour. A
+*fresh plaintext* checkpoint of the same guest, taken minutes later on the next boot and read with
+the identical command, **loads normally**: partition VTLs `0x1`, and the VTL1 switch refused with
+`0xC0370509` as every plaintext control has been, exit 0. So the failure is not "a fresh capture",
+not "this boot" and not the command — the one thing that differs is the setting.
+
+**What this does not establish, and the distinction matters.** The capture is unreadable **by this
+provider**; nothing here inspected its bytes, so "encrypted" is Hyper-V's claim about what it wrote
+rather than something measured — an entropy reading would have been cheap and was not taken. Nor was
+the encrypted checkpoint *applied*: Hyper-V presumably reads what it writes, but that is an
+inference, and `Apply-VMSnapshot` is the check that would have made the capture's well-formedness a
+measurement rather than an assumption. Shielded VMs are untested.
+
+**And the arm found something it was not looking for, which is the part worth reporting.** A
+**documented SDK API fast-fails on an input Microsoft's own hypervisor produced** — not a refusal,
+not an `HRESULT`, a crash. `0xC0000409` means the corruption was *detected*, so this is a robustness
+and availability defect rather than a demonstrated memory-safety exploit, and nothing here fed it a
+*crafted* capture. That is the `vmsavedstatedumpprovider.dll` bug to raise, and it is a different
+thing from the VBS-boundary question the arm was run to answer — which came back negative, as the
+verdict says.
+
+**The bench was left as found**: both knobs back to `False`, the two pinned checkpoints intact and
+the three this arm created removed, both guests running, and the pinned VBS capture re-read
+afterwards to the same landmarks.
+
+#### S0 arm 4 as specified, before it ran
 
 **Why this arm exists.** S0's result invites the question whether a checkpoint carrying VTL1 is a
 defect worth reporting to Microsoft, and the answer recorded in
