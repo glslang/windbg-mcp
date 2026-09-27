@@ -30,6 +30,18 @@
   the `\Driver\mountmgr` dispatch switch, `decode_ioctl` for the access tiers, the device DACL parsed
   from memory, and an `ioctl_trace` sweep — ending with a reachability report (which codes a standard
   user can reach vs. what the I/O manager blocks).
+- [`provider-crash-walkthrough.md`](provider-crash-walkthrough.md) — the one where the bug is
+  **somebody else's code**: a crash inside the Windows SDK's `vmsavedstatedumpprovider.dll`, turned
+  into a report Microsoft can act on. It deliberately does *not* re-teach the `__fastfail` decode the
+  explorer walkthrough owns; what it adds is the evidence a **report** needs and a diagnosis does
+  not — a twelve-line checked-in repro, a control matrix isolating the trigger (random, truncated
+  and header-corrupted input are all refused cleanly with `ERROR_FILE_CORRUPT`, so the parser has a
+  rejection path and the encrypted case is not on it), a container-magic and entropy reading
+  establishing the input is well-formed ciphertext rather than garbage, the subcode and stack from
+  `launch`/`go`/`exception_triage` naming a **GSL contract violation** in
+  `PartitionStateParser::GetPartitionStateVirtualProcessors`, and an enumerated list of what the
+  report refuses to claim. Includes the correction that a first draft read `0xC0000409`'s legacy
+  name as its meaning — in a repo that ships a decoder for exactly that.
 - [`explorer-crash-walkthrough.md`](explorer-crash-walkthrough.md) — the server debugging **its own
   host**: a Windows 11 shell that would not start, traced through three consecutive faults to a
   malformed AppModel State Repository. A user-mode counterpart to the kernel walkthroughs, and the

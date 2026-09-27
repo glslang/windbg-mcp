@@ -152,6 +152,9 @@ Worked sessions with the real outputs and the gotchas — the long form is in
   KDNET kernel and deciding user-mode reachability.
 - [Explorer won't start](docs/explorer-crash-walkthrough.md) — the server debugging its own host:
   a dead Windows shell traced through three faults to a malformed State Repository.
+- [A crash in somebody else's component](docs/provider-crash-walkthrough.md) — a Windows SDK DLL
+  killed by a GSL contract violation, worked up into a report: a twelve-line repro, a control matrix
+  isolating the trigger, and what the report refuses to claim.
 - [Disassembler coordinates](docs/coordinates.md) — joining a `crash_triage` frame to a function in
   an image fetched on another machine.
 

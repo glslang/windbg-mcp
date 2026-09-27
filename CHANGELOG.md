@@ -89,6 +89,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was left as found: both settings reverted, the two pinned checkpoints intact, the three this work
   created removed, and the pinned VBS capture re-read afterwards to the same landmarks.
 
+- **A walkthrough where the bug is somebody else's code**,
+  `docs/provider-crash-walkthrough.md`. The other walkthroughs here debug a target and end in an
+  answer; this one ends in a **report**, which needs different evidence — so it is about the evidence
+  rather than about the crash. It deliberately does not re-teach the `__fastfail` decode
+  `explorer-crash-walkthrough.md` already owns, and cites it instead. What it adds: a twelve-line
+  checked-in repro; a control matrix that isolates the trigger by showing what does *not* crash
+  (random, truncated and header-corrupted input all refused with `ERROR_FILE_CORRUPT`, so the parser
+  has a rejection path and the encrypted case is not on it); a container-magic and entropy reading
+  establishing the input is well-formed ciphertext rather than garbage — and the note that this is
+  also what rescues the gate it came from, since a *successful* read on the owning host would have
+  been authorized decryption and evidence of nothing; the subcode and stack from
+  `launch`/`go`/`exception_triage`, naming a GSL contract violation; and an enumerated list of what
+  the report refuses to claim. It records its own correction too: a first draft read `0xC0000409`'s
+  legacy name as its meaning, in a repository that ships a decoder for that exact trap, and review
+  caught it by citing `src/fault.rs` back at it.
+
 - **The provider crash that arm 4 turned up is now a report that can be sent as it stands**, in
   `docs/secure-kernel/vmsavedstatedumpprovider-crash.md`, with
   `tools/vmsavedstate_load_probe.py` as a twelve-line repro that calls one export and names no VM.
