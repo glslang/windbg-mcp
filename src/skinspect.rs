@@ -19,6 +19,7 @@
 //! page of `securekernel.exe` is offered to both, and a page the provider maps that the walk does
 //! not is counted as a miss on our side.
 
+use std::os::windows::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
@@ -89,7 +90,10 @@ impl Inputs {
     fn refuse_if_output_is_an_input(&self, output: &Path) -> Result<()> {
         let target = identity(output);
         for input in &self.paths {
-            if identity(input) == target {
+            // File identity first, for the hard link a path comparison cannot see; the name
+            // comparison second, because the output usually does not exist yet and has no identity
+            // to read. Either saying "the same file" is a refusal.
+            if same_file(input, output) == Some(true) || identity(input) == target {
                 bail!(
                     "--json {} names an input this run reads ({}); writing the report there would \
                      destroy it",
@@ -108,6 +112,66 @@ impl Inputs {
     }
 }
 
+/// The file two paths share, when they both exist: NTFS's own identity for it.
+///
+/// **A hard link is one file under two names**, and `canonicalize` keeps both — so a `--json` naming
+/// a link to the capture compares unequal to it by every path-shaped test and the write truncates
+/// the shared file record. `volume_serial_number` and `file_index` are what NTFS uses to answer
+/// *same file*, and `std::fs::metadata` on Windows fills both.
+///
+/// `None` when either path does not exist, or the platform did not supply the pair — in which case
+/// [`identity`] below is the answer instead. The output usually does not exist yet, which is why
+/// this cannot be the only comparison.
+fn same_file(left: &Path, right: &Path) -> Option<bool> {
+    Some(file_identity(left)? == file_identity(right)?)
+}
+
+/// `(volume serial, file index)` for a path that exists, which is NTFS's answer to *which file*.
+///
+/// Opened with no access rights at all — `CreateFileW(0, …)` is a query-only open, so this needs no
+/// read permission on the file and cannot disturb whoever else has it open. `std` exposes these same
+/// two numbers behind the unstable `windows_by_handle` feature, which is the only reason this is
+/// FFI rather than four lines of safe code.
+fn file_identity(path: &Path) -> Option<(u32, u64)> {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, CreateFileW, FILE_FLAG_BACKUP_SEMANTICS, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE, GetFileInformationByHandle, OPEN_EXISTING,
+    };
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let handle = unsafe {
+        CreateFileW(
+            wide.as_ptr(),
+            0,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+            std::ptr::null(),
+            OPEN_EXISTING,
+            // So a directory can be opened too: a `--json` naming one fails later anyway, but it
+            // must not fail *here* and leave the comparison unanswered.
+            FILE_FLAG_BACKUP_SEMANTICS,
+            std::ptr::null_mut(),
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE || handle.is_null() {
+        return None;
+    }
+    let mut info = BY_HANDLE_FILE_INFORMATION::default();
+    let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+    unsafe { CloseHandle(handle) };
+    if ok == 0 {
+        return None;
+    }
+    Some((
+        info.dwVolumeSerialNumber,
+        (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
+    ))
+}
+
 /// A path reduced to something two spellings of one file agree on.
 ///
 /// `canonicalize` for a file that exists; for one that does not — which the output usually is — the
@@ -115,6 +179,9 @@ impl Inputs {
 /// directory as an input still compares equal to it. Falls back to the path as given, lowercased,
 /// when even the parent cannot be resolved: a comparison that cannot be made must not silently
 /// answer "different".
+///
+/// This is the **weaker** of the two tests and runs when [`same_file`] cannot answer. It compares
+/// names, so it cannot see a hard link.
 fn identity(path: &Path) -> String {
     let resolved = std::fs::canonicalize(path).ok().or_else(|| {
         let parent = path.parent().filter(|p| !p.as_os_str().is_empty())?;
@@ -326,14 +393,27 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     let differential = differential(|va| capture.translate(va), &landmarks);
     if let Some(sampled) = &differential {
         println!(
-            "\noracle     {} page(s) of the image offered to both: {} agree, {} the provider maps \
-             and the walk does not, {} the walk maps and the provider does not",
-            sampled.offered, sampled.agree, sampled.provider_only, sampled.walk_only
+            "\noracle     {} page(s) of the image offered to both: {} agree, {} disagree, {} the \
+             provider maps and the walk does not, {} the walk maps and the provider says nothing \
+             maps, {} the provider could not answer for",
+            sampled.offered,
+            sampled.agree,
+            sampled.disagree,
+            sampled.provider_only,
+            sampled.walk_only,
+            sampled.provider_failed
         );
+        // Every outcome, so the categories add up to `offered`. A text report that recorded a failed
+        // oracle and did not print it would leave the reader subtracting — and this line shipped
+        // that way once, because the edit that was supposed to add these fields silently did not
+        // apply and the check was of the script's own report rather than of the file.
         if let Some((va, ours, theirs)) = sampled.disagreement {
             println!(
                 "           first disagreement at {va:#X}: walk {ours:#X}, provider {theirs:#X}"
             );
+        }
+        if let Some((va, why)) = &sampled.first_provider_error {
+            println!("           the oracle first failed at {va:#X}: {why}");
         }
     }
     if let Some(path) = &request.json {
@@ -502,21 +582,37 @@ fn report_landmarks(landmarks: &Landmarks) {
                     ),
                 }
             }
-            if let Some(cross) = &landmarks.cross_check {
-                let agrees = cross.head.0 == found.block.ps_loaded_module_list;
-                println!(
-                    "crosscheck entry {:#X} -> head {:#X}: {} the block ({} page(s) scanned, {} \
-                     unreadable)",
-                    cross.entry.0,
-                    cross.head.0,
-                    if agrees {
-                        "agrees with"
+            match &landmarks.cross_check {
+                Some(Ok(cross)) => {
+                    let agrees = cross.head.0 == found.block.ps_loaded_module_list;
+                    println!(
+                        "crosscheck entry {:#X} -> head {:#X}: {} the block ({} page(s) scanned, {} \
+                         unreadable)",
+                        cross.entry.0,
+                        cross.head.0,
+                        if agrees {
+                            "agrees with"
+                        } else {
+                            "DISAGREES with"
+                        },
+                        cross.pages_scanned,
+                        cross.pages_unreadable
+                    );
+                }
+                // A miss is not a disagreement, and a **capped** miss is not even a search: saying
+                // which is why the budget is reported rather than absorbed.
+                Some(Err(miss)) => println!(
+                    "crosscheck found no loader entry naming the base ({} page(s) scanned, {} \
+                     unreadable{})",
+                    miss.pages_scanned,
+                    miss.pages_unreadable,
+                    if miss.capped {
+                        ", stopped at the page budget — this is not a search that looked everywhere"
                     } else {
-                        "DISAGREES with"
-                    },
-                    cross.pages_scanned,
-                    cross.pages_unreadable
-                );
+                        ""
+                    }
+                ),
+                None => {}
             }
         }
     }
@@ -606,7 +702,10 @@ fn differential(
     };
     let mut offset = 0u64;
     while offset < size {
-        let va = base + offset;
+        // `wrapping_add`, like `Gva::offset` and for the same reason: `base` is an upper-half
+        // canonical address and `size` is a `SizeOfImage` read out of the guest, so a crafted header
+        // puts this over the top of the address space and panics a debug build.
+        let va = base.wrapping_add(offset);
         offset += PAGE;
         result.offered += 1;
         let ours = landmarks.space.translate(Gva(va)).map(|gpa| gpa.0);
@@ -691,12 +790,21 @@ fn as_json(
             "matching_disk": landmarks.candidates.iter().filter(|c| c.matches_disk).count(),
         },
         "identified": identified,
-        "cross_check": landmarks.cross_check.as_ref().map(|cross| serde_json::json!({
-            "entry_va": format!("{:#X}", cross.entry.0),
-            "head_va": format!("{:#X}", cross.head.0),
-            "pages_scanned": cross.pages_scanned,
-            "pages_unreadable": cross.pages_unreadable,
-        })),
+        "cross_check": landmarks.cross_check.as_ref().map(|cross| match cross {
+            Ok(cross) => serde_json::json!({
+                "found": true,
+                "entry_va": format!("{:#X}", cross.entry.0),
+                "head_va": format!("{:#X}", cross.head.0),
+                "pages_scanned": cross.pages_scanned,
+                "pages_unreadable": cross.pages_unreadable,
+            }),
+            Err(miss) => serde_json::json!({
+                "found": false,
+                "pages_scanned": miss.pages_scanned,
+                "pages_unreadable": miss.pages_unreadable,
+                "capped": miss.capped,
+            }),
+        }),
         "oracle": differential.map(|d| serde_json::json!({
             "offered": d.offered,
             "agree": d.agree,
@@ -838,6 +946,42 @@ mod tests {
             std::fs::read(&capture).expect("input survives"),
             b"not really a capture",
             "the input was modified"
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_hard_link_to_an_input_is_the_input() {
+        // `canonicalize` keeps both names of one file, so every path-shaped comparison says
+        // "different" and the write truncates the shared file record. NTFS's own identity —
+        // volume serial plus file index — is what answers this.
+        let dir = std::env::temp_dir().join("windbg-mcp-sk-inspect-hardlink");
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let capture = dir.join("capture.vmrs");
+        let link = dir.join("report.json");
+        std::fs::write(&capture, b"not really a capture").expect("write input");
+        let _ = std::fs::remove_file(&link);
+        if std::fs::hard_link(&capture, &link).is_err() {
+            // A volume without hard links, or a sandbox that refuses one. Skipped rather than
+            // passed: a test that silently proves nothing is worse than one that says so.
+            eprintln!("SKIPPED: this filesystem would not make a hard link");
+            std::fs::remove_dir_all(&dir).ok();
+            return;
+        }
+        assert_eq!(
+            same_file(&capture, &link),
+            Some(true),
+            "the two names are one file"
+        );
+        let mut inputs = Inputs::new();
+        inputs.add(&capture);
+        assert!(
+            inputs.write_report(&link, b"{}").is_err(),
+            "a hard link to the capture is the capture"
+        );
+        assert_eq!(
+            std::fs::read(&capture).expect("input survives"),
+            b"not really a capture"
         );
         std::fs::remove_dir_all(&dir).ok();
     }

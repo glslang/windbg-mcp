@@ -70,6 +70,13 @@ windows-sys = { version = "0.61", features = [
     # (`0x80670015`, `0x80073d54`), which is what makes that decoder a typed host call rather than
     # a scrape of an extension's output.
     "Win32_System_Diagnostics_Debug",
+    # `CreateFileW` + `GetFileInformationByHandle`, which is how `src/skinspect.rs` answers whether
+    # two paths are the same file before it writes a report over one of them. A **hard link** is one
+    # file under two names and `canonicalize` keeps both, so every path-shaped comparison says
+    # "different" and the write truncates the shared file record — which for a Hyper-V capture is
+    # irreplaceable. `std`'s `volume_serial_number`/`file_index` are the same two numbers and are
+    # still unstable (`windows_by_handle`, rust#63010), which is the only reason this is FFI.
+    "Win32_Storage_FileSystem",
     # `GetModuleHandleW`, for the other half of the same decode: an `NTSTATUS` is in `ntdll`'s
     # message table and in no other, so `0xc0000409` resolves there or nowhere. A handle lookup and
     # never a load — ntdll is mapped into every process that exists.

@@ -1489,6 +1489,7 @@ pub(crate) fn identify(
 }
 
 /// The list head found structurally, without reading any debugger data block.
+#[derive(Debug)]
 pub(crate) struct CrossCheck {
     /// The loader entry whose `DllBase` is the identified base.
     pub(crate) entry: Gva,
@@ -1499,6 +1500,25 @@ pub(crate) struct CrossCheck {
     pub(crate) pages_unreadable: u64,
 }
 
+/// How a structural search ended when it found nothing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct CrossCheckMiss {
+    pub(crate) pages_scanned: u64,
+    pub(crate) pages_unreadable: u64,
+    /// Whether the budget stopped it. **"Scanned everything and found nothing" and "ran out of
+    /// budget" are different answers**, and a cross-check that reports the second as the first would
+    /// contradict the block for no reason.
+    pub(crate) capped: bool,
+}
+
+/// Pages the structural cross-check will read before giving up.
+///
+/// It needs a ceiling for the same reason the primary walk does, and the measured run hides that: it
+/// found its entry after 1,249 pages, which is luck rather than a bound. A single 1 GiB leaf is
+/// 262,144 pages on its own, and a walk can return many — so without this an optional cross-check
+/// can outlast everything it is checking.
+const MAX_CROSS_CHECK_PAGES: u64 = 200_000;
+
 /// Find the loader list a second way: by its entry for the image, not by the block that names it.
 ///
 /// Search for a word equal to the identified base with the image's `SizeOfImage` sixteen bytes
@@ -1507,17 +1527,41 @@ pub(crate) struct CrossCheck {
 /// two agreeing is what made either believable**. Kept as the cross-check rather than the primary,
 /// because `SkLoadedModuleList` is a bare `LIST_ENTRY` with no signature to search for: only the
 /// block has one.
+///
+/// **Budgeted like every other scan here**, and the answer says which way it ended: `Err` carries
+/// whether [`MAX_CROSS_CHECK_PAGES`] stopped it, because a search that ran out and a search that
+/// looked everywhere are different statements about the block it is checking.
 pub(crate) fn cross_check_module_list(
     space: &Space<'_, '_>,
     leaves: &[Leaf],
     base: u64,
     size_of_image: u32,
-) -> Option<CrossCheck> {
+) -> Result<CrossCheck, CrossCheckMiss> {
+    cross_check_within(space, leaves, base, size_of_image, MAX_CROSS_CHECK_PAGES)
+}
+
+/// [`cross_check_module_list`] with the budget as a parameter, for the same reason
+/// [`walk_within`] exists: the rule worth pinning is that the budget *reports*, and a fixture big
+/// enough to spend 200,000 pages is not a test anyone runs.
+pub(crate) fn cross_check_within(
+    space: &Space<'_, '_>,
+    leaves: &[Leaf],
+    base: u64,
+    size_of_image: u32,
+    budget: u64,
+) -> Result<CrossCheck, CrossCheckMiss> {
     let mut pages_scanned = 0u64;
     let mut pages_unreadable = 0u64;
     for leaf in leaves {
         let mut offset = 0u64;
         while offset < leaf.size {
+            if pages_scanned + pages_unreadable >= budget {
+                return Err(CrossCheckMiss {
+                    pages_scanned,
+                    pages_unreadable,
+                    capped: true,
+                });
+            }
             let va = leaf.va.offset(offset);
             offset += PAGE;
             let page = match space.page(va) {
@@ -1558,7 +1602,7 @@ pub(crate) fn cross_check_module_list(
                 let head = Gva(u64::from_le_bytes(
                     links[..8].try_into().expect("read_span answered 8 bytes"),
                 ));
-                return Some(CrossCheck {
+                return Ok(CrossCheck {
                     entry,
                     head,
                     pages_scanned,
@@ -1567,7 +1611,11 @@ pub(crate) fn cross_check_module_list(
             }
         }
     }
-    None
+    Err(CrossCheckMiss {
+        pages_scanned,
+        pages_unreadable,
+        capped: false,
+    })
 }
 
 /// Everything this gate decodes about one source, in the order the decodes depend on each other.
@@ -1588,8 +1636,9 @@ pub(crate) struct Landmarks {
     pub(crate) candidates: Vec<Candidate>,
     pub(crate) attempts: Vec<Attempt>,
     pub(crate) identified: Option<Identified>,
-    /// Present only when asked for, and `None` inside that when the structural route found nothing.
-    pub(crate) cross_check: Option<CrossCheck>,
+    /// Present only when asked for; the inner `Err` says the structural route found nothing and
+    /// whether its budget is why.
+    pub(crate) cross_check: Option<Result<CrossCheck, CrossCheckMiss>>,
     /// Every physical read the whole decode made. **A run that identified nothing with a non-zero
     /// [`ReadStats::failed`] is a run whose negative has not been earned** — which is the one thing
     /// a caller must not have to remember to check, so it travels with the result.
@@ -1625,12 +1674,12 @@ pub(crate) fn locate(
         let reads = Space::new(reader, &space);
         let (identified, attempts) = identify(&reads, &matching);
         let cross = match (&identified, cross_check) {
-            (Some(found), true) => cross_check_module_list(
+            (Some(found), true) => Some(cross_check_module_list(
                 &reads,
                 &leaves,
                 found.candidate.va.0,
                 found.candidate.identity.size_of_image,
-            ),
+            )),
             _ => None,
         };
         (identified, attempts, cross)
@@ -2255,7 +2304,36 @@ mod tests {
         assert!(!landmarks.attempts[0].accepted);
         // And the structural route found the same head without reading the block.
         let cross = landmarks.cross_check.expect("the entry names the base");
+        let cross = cross.expect("the structural route finds the entry");
         assert_eq!(cross.head, Gva(found.block.ps_loaded_module_list));
+    }
+
+    #[test]
+    fn the_cross_check_says_whether_its_budget_stopped_it() {
+        // The measured run found its entry after 1,249 pages, which is luck rather than a bound: a
+        // single 1 GiB leaf is 262,144 pages, and a capture can return many.
+        let mut fixture = Fixture::new();
+        fixture.map_range(SLOT, 0x40000, 4 * PAGE);
+        let reader = Reader::new(&fixture);
+        let (leaves, _) = walk(&reader, Gpa(fixture.root));
+        let space = AddressSpace::new(leaves.clone());
+        let reads = Space::new(&reader, &space);
+
+        // A base nothing names, with room to look everywhere: a miss that is a real search.
+        let miss = cross_check_within(&reads, &leaves, 0xDEAD_0000, 0x1000, 100)
+            .expect_err("nothing names that base");
+        assert!(!miss.capped, "{miss:?}");
+        assert_eq!(miss.pages_scanned, 4);
+
+        // The same search with a budget below the work: refused, and it says so rather than
+        // reporting the same clean miss.
+        let capped = cross_check_within(&reads, &leaves, 0xDEAD_0000, 0x1000, 2)
+            .expect_err("the budget stops it");
+        assert!(
+            capped.capped,
+            "a budget that stops a search must not read as a search"
+        );
+        assert_eq!(capped.pages_scanned, 2);
     }
 
     #[test]
