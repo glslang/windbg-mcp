@@ -2158,7 +2158,9 @@ partition state, not a corruption check. So it is a robustness defect with a nam
 asserted on input it has no key for instead of returning an error. This entry said "the corruption
 was *detected*" for one commit, reading `0xC0000409`'s name as its meaning; `src/fault.rs`'s own
 `STATUS_STACK_BUFFER_OVERRUN` comment exists to stop exactly that, review caught it by citing it, and
-the measurement then settled it. That is the `vmsavedstatedumpprovider.dll` bug to raise, and it is a different
+the measurement then settled it. That `vmsavedstatedumpprovider.dll` bug was **reported to Microsoft via Feedback
+Hub on 2026-09-27** and needs raising again by nobody; what remains is re-testing a later SDK against
+the checked-in repro. It is a different
 thing from the VBS-boundary question the arm was run to answer — which came back negative, as the
 verdict says.
 

@@ -6,6 +6,13 @@ about, and it is not a VBS boundary bypass — that question was asked separatel
 [the feasibility record](secure-kernel-hypercall-feasibility.md). This file is the report, written so
 it can be sent as it stands.
 
+> **Status: reported to Microsoft via Feedback Hub, 2026-09-27.** So this is a record rather than a
+> to-do — do not raise it again. What it is still useful for is **re-testing**: the repro is checked
+> in and takes one command, so a later SDK can be checked against the version below, and the two
+> facts to compare are that `LoadSavedStateFile` returns at all and, if it fails, that it does so
+> with an `HRESULT` rather than by terminating the caller. The version measured here is
+> **10.0.26100.7705**.
+
 ## Summary
 
 `LoadSavedStateFile` terminates the calling process when handed a saved state captured from a VM with
