@@ -63,14 +63,15 @@ it reached.
 
 Three edges to keep in mind. If a step overruns far enough to consume the reserve too, cleanup is
 skipped and the result says `rollback: INCOMPLETE` — believe it rather than the intent. If a step
-leaves the debugger holding something other than the target the batch started against — a
-`.create` or `.attach` reached through a wrapper, an engine that stops saying what it holds or
-which process it is in, or a session left pointed at a different process — the batch stops there
-and the cleanup is dropped on
-purpose, reported as `BATCH: TARGET REPLACED` or `TARGET UNCERTAIN` with `rollback: NOT ATTEMPTED`:
-a restore that cannot be aimed is worse than one that is missing, so whatever the steps changed is
-still in place and putting it back is yours. And a teardown while the batch runs — `end_session`, or a client disconnect — stops it at its **next**
-step and rolls it back first, reported as `BATCH: ABANDONED`; it cannot cut short a step already
+leaves the debugger holding something other than the target the batch started against — an
+`.attach` reached through a wrapper, or a wrapped `.create`, whose change lands at the `g` after it
+because the command only arms the creation; an engine that stops saying what it holds or which
+process it is in; a session left pointed at a different process — the batch stops at **that** step
+and the cleanup is dropped on purpose, reported as `BATCH: TARGET REPLACED` or `TARGET UNCERTAIN`
+with `rollback: NOT ATTEMPTED`: a restore that cannot be aimed is worse than one that is missing, so
+whatever the steps changed is still in place and putting it back is yours. And a teardown while the
+batch runs — `end_session`, or a client disconnect — stops it at its **next** step and rolls it back
+first, reported as `BATCH: ABANDONED`; it cannot cut short a step already
 inside the debugger, so a batch built from long steps waits out the one it is in before it unwinds
 (the teardown waits with it).
 
