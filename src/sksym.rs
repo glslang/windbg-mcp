@@ -130,8 +130,16 @@ pub(crate) const TYPE_PROBES: [&str; 4] = [
 pub(crate) enum SymbolFailure {
     /// `DebugEngine::new` panicked — on this bench that means `dbgeng.dll` was not discoverable.
     EngineUnavailable,
-    /// The engine refused the image as a target.
-    Open(String),
+    /// An engine call failed, naming **which** one.
+    ///
+    /// One variant with a step rather than one per call, and the step is the whole point. This was
+    /// `Open(String)` whose message said *the engine refused the image as a target*, which was true
+    /// of one of its four uses: review on #399 caught it for `--sympath`, where the sentence sends an
+    /// operator to look at their image for a symbol-path problem and `open_dump` has not run yet.
+    /// Enumerating rather than fixing that one found the same wrong sentence on the module listing and
+    /// on the re-read. A symbol failure is non-fatal here, so this text is the operator's only
+    /// account of why a report has no symbols in it.
+    Engine { step: &'static str, detail: String },
     /// The load wait itself failed.
     LoadWait(String),
     /// The wait returned without the target having stopped, so nothing is loaded.
@@ -152,19 +160,46 @@ pub(crate) enum SymbolFailure {
         engine: (u32, u32),
         disk: (u32, u32),
     },
-    /// The engine has **no** symbols for the module at all — [`SymbolKind::None`] and nothing
-    /// weaker, since `Deferred` and `Export` both mean *some*, and refusing either would turn away
-    /// a host where names would have resolved. `reload` carries the `.reload /f` error where there
-    /// was one, because "no PDB was served for this build" and "the symbol path is unreachable" look
-    /// identical from the [`SymbolKind`] alone.
+    /// The module has no symbol **provider** after a resolving query has been made — `Deferred` and
+    /// `Export` included, since after that query neither means "nobody has looked yet".
+    ///
+    /// `reload` carries the `.reload /f` error where there was one, because "no PDB was served for
+    /// this build" and "the symbol path is unreachable" look identical from the [`SymbolKind`] alone.
     NoSymbols {
         kind: SymbolKind,
         reload: Option<String>,
+        /// Whatever the engine named as this module's symbol file — the image's own name, usually.
+        /// Carried so a failure can still say what it read; see [`SymbolFailure::file_read`].
+        symbol_file: String,
     },
     /// The engine matched a PDB and then found it did not belong to this image. Its own variant
     /// because it is the one failure where symbols *did* load and reading them is worse than
     /// having none.
-    PdbUnmatched { guid: String, age: u32 },
+    PdbUnmatched {
+        guid: String,
+        age: u32,
+        /// The candidate PDB's path. **A file this run read**, and the reason this field exists:
+        /// without it the only route to the path was the success arm, so a run refused here left a
+        /// PDB a `--json` could be pointed at once the engine let go of it. Review on #399.
+        symbol_file: String,
+    },
+}
+
+impl SymbolFailure {
+    /// A file this failure **read**, where it read one.
+    ///
+    /// The single place that question is answered, so a new variant that reads a file has one
+    /// function to come to rather than a caller to remember. `Identity` and the image-opening step
+    /// read the image, which is already an input by the time this is asked, so they answer `None`
+    /// rather than repeating it.
+    pub(crate) fn file_read(&self) -> Option<&str> {
+        let file = match self {
+            SymbolFailure::NoSymbols { symbol_file, .. }
+            | SymbolFailure::PdbUnmatched { symbol_file, .. } => symbol_file.as_str(),
+            _ => return None,
+        };
+        (!file.is_empty()).then_some(file)
+    }
 }
 
 impl std::fmt::Display for SymbolFailure {
@@ -174,9 +209,7 @@ impl std::fmt::Display for SymbolFailure {
                 f,
                 "DbgEng could not be initialised (is dbgeng.dll on the search path?)"
             ),
-            SymbolFailure::Open(why) => {
-                write!(f, "the engine refused the image as a target: {why}")
-            }
+            SymbolFailure::Engine { step, detail } => write!(f, "{step}: {detail}"),
             SymbolFailure::LoadWait(why) => write!(f, "waiting for the image to load: {why}"),
             SymbolFailure::LoadIncomplete(outcome) => write!(
                 f,
@@ -192,15 +225,19 @@ impl std::fmt::Display for SymbolFailure {
                  decode identified against timestamp {:#010X} and SizeOfImage {:#X}",
                 engine.0, engine.1, disk.0, disk.1
             ),
-            SymbolFailure::NoSymbols { kind, reload } => match reload {
-                Some(why) => write!(f, "no symbols loaded (the module reads {kind:?}): {why}"),
+            SymbolFailure::NoSymbols { kind, reload, .. } => match reload {
+                Some(why) => write!(
+                    f,
+                    "no symbols loaded (the module still reads {kind:?} after a resolving query): \
+                     {why}"
+                ),
                 None => write!(
                     f,
-                    "no symbols loaded (the module reads {kind:?}); check the symbol path and \
-                     that a PDB is served for this build"
+                    "no symbols loaded (the module still reads {kind:?} after a resolving query); \
+                     check the symbol path and that a PDB is served for this build"
                 ),
             },
-            SymbolFailure::PdbUnmatched { guid, age } => write!(
+            SymbolFailure::PdbUnmatched { guid, age, .. } => write!(
                 f,
                 "the engine loaded {guid}{age:X}, which it reports does not match this image — its \
                  names would be another build's"
@@ -251,19 +288,26 @@ impl Symbols {
             // how a run downloads from the internet when it was told not to.
             engine
                 .set_symbol_path(path)
-                .map_err(|e| SymbolFailure::Open(e.to_string()))?;
+                .map_err(|e| SymbolFailure::Engine {
+                    step: "configuring the symbol path given with --sympath",
+                    detail: e.to_string(),
+                })?;
         }
         engine
             .open_dump(&image.display().to_string())
-            .map_err(|e| SymbolFailure::Open(e.to_string()))?;
+            .map_err(|e| SymbolFailure::Engine {
+                step: "opening the image as a target",
+                detail: e.to_string(),
+            })?;
         match engine.wait_for_event(LOAD_WAIT_MS) {
             Ok(WaitOutcome::Stopped { .. }) => {}
             Ok(other) => return Err(SymbolFailure::LoadIncomplete(other)),
             Err(e) => return Err(SymbolFailure::LoadWait(e.to_string())),
         }
-        let modules = engine
-            .modules()
-            .map_err(|e| SymbolFailure::Open(e.to_string()))?;
+        let modules = engine.modules().map_err(|e| SymbolFailure::Engine {
+            step: "listing the target's modules",
+            detail: e.to_string(),
+        })?;
         let [module] = modules.as_slice() else {
             return Err(SymbolFailure::NotOneModule(modules.len()));
         };
@@ -308,26 +352,55 @@ impl Symbols {
         // Re-read: the kind before the reload and the probe is `deferred`, which says nothing.
         let module = engine
             .module(&module.name)
-            .map_err(|e| SymbolFailure::Open(e.to_string()))?;
-        // **Only `None` is refused, and the narrowness is the point.** The tempting version demands
-        // a provider that carries names — anything but `Pdb`/`Dia`/`CodeView`/`Sym` is a refusal —
-        // and it is wrong about `Deferred` in the one direction that costs a working host: dbgscope
-        // documents that value as *not* a statement that symbols are missing, a deferred module
-        // usually resolving on first use, and this bench has only ever measured the succeeding path.
-        // Guessing which way to be wrong about a value never seen here is what
-        // `.claude/rules/measurement-provenance.md` is about, so the kind is **reported** on the
-        // report's own first line — as fast as a refusal, and before any capture is read — and each
-        // landmark then answers with the engine's reason for itself. `Export` stays for the same
-        // reason: export-only names are fewer, not none.
-        if matches!(module.symbols, SymbolKind::None) {
+            .map_err(|e| SymbolFailure::Engine {
+                step: "re-reading the module after its symbols were made to load",
+                detail: e.to_string(),
+            })?;
+        // Read **before** any refusal, so a failure that read a PDB can still name it: gate S1's
+        // `Inputs` learns what a run read from wherever it is first known, and a path known only on
+        // the success path is a path a `--json` can be pointed at. `unmatched` is the case review
+        // named ([`SymbolFailure::file_read`]); enumerating rather than fixing the one arm found
+        // `NoSymbols` in the same position.
+        let symbol_file = engine.module_symbol_file(module.base).unwrap_or_default();
+        // **A symbol provider is required, and the probe above is what makes that honest.** Round 1
+        // of #399's review narrowed this to [`SymbolKind::None`] alone, reasoning that dbgscope
+        // documents `Deferred` as *not* a statement that symbols are missing — a deferred module
+        // usually resolves on first use — so refusing it would turn away a host where names would
+        // have resolved.
+        //
+        // **That argument died the moment the probe was added, and rounds 2 and 3 of the same review
+        // are what it cost.** The probe *is* a first use, so a module still `Deferred` after one is
+        // not "nobody has looked": it is the engine having looked and not resolved them. Accepting it
+        // left the PDB free to load on the first *landmark* query — after the `unmatched` check
+        // below, which is the one failure where symbols did load and reading them is worse than
+        // having none — and left the reported provenance able to say `Deferred` and "no PDB
+        // signature" above addresses a PDB had just resolved. Round 2 answered that with the probe;
+        // round 3 pointed out the probe can *fail* to settle it, and the same hole is back.
+        //
+        // So the generating choice goes rather than the symptom: after a resolving query the kind is
+        // a fact, a refusal here is justified by measurement instead of by a guess, and **nothing
+        // downstream can move it** — which is what lets the provenance below be read once and kept.
+        //
+        // Both halves are measured rather than reasoned. A symbol path reaching no store
+        // (`--sympath C:\nonexistent-symbol-store`) leaves this module reading **`Export`**, not
+        // `Deferred` — the engine falls back to the image's export table — so that is the value this
+        // refusal actually fires on. And `Export` costs the gate nothing: with symbols failing to
+        // load, `x securekernel!KdDebuggerDataBlock` and `x securekernel!SkLoadedModuleList` both
+        // answer **nothing** against roughly 280 exported names, neither landmark being exported. The
+        // residual assumption is stated rather than hidden: a provider does not change without
+        // another `.reload`, and this issues none after this point.
+        if !matches!(
+            module.symbols,
+            SymbolKind::Pdb | SymbolKind::Dia | SymbolKind::CodeView | SymbolKind::Sym
+        ) {
             return Err(SymbolFailure::NoSymbols {
                 kind: module.symbols,
                 reload,
+                symbol_file,
             });
         }
         // Kept rather than dropped once the refusal above has not fired: a forced load that errored
-        // and left a kind the report accepts is exactly the case the reader needs told, and it is
-        // the half that would have gone silent when the refusal narrowed.
+        // while the probe succeeded is exactly the case the reader needs told.
         let reload_error = reload;
         let pdb = engine.module_pdb(module.base).ok().flatten();
         if let Some(identity) = &pdb
@@ -336,9 +409,9 @@ impl Symbols {
             return Err(SymbolFailure::PdbUnmatched {
                 guid: identity.guid.clone(),
                 age: identity.age,
+                symbol_file,
             });
         }
-        let symbol_file = engine.module_symbol_file(module.base).unwrap_or_default();
         Ok(Symbols {
             engine,
             qualifier: module.name.clone(),
@@ -903,12 +976,12 @@ mod tests {
             symbols.symbol_file()
         );
         println!("type probes: {:?}", symbols.type_probes());
-        // **The provenance has to be settled by `open`, not by whatever is asked next.** This is the
-        // inconsistency review found on #399: a `Deferred` module loading its PDB on the first
-        // landmark query would print resolved addresses under a `Deferred` kind and "no PDB
-        // signature", and would skip the `unmatched` check entirely. Asserted as both halves —
-        // nobody-has-looked is gone, and a PDB the engine selected is named — because either alone
-        // could be true while the state was still moving.
+        // **`open`'s post-condition, and it is a ratchet rather than a discovery.** Since round 3 the
+        // refusal makes a `Deferred` kind unreachable here — `open` would have returned `Err` — so
+        // this cannot fail while that refusal stands, and that is the point: it fails if the refusal
+        // is ever narrowed again, which is what rounds 1 to 3 of #399 did once already. The PDB half
+        // is the same claim from the other side: a provider that loaded and a PDB the engine can name
+        // are the state the cached provenance is only safe in.
         assert_ne!(
             symbols.kind(),
             SymbolKind::Deferred,

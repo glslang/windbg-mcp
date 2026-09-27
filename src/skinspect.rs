@@ -412,13 +412,21 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     // A `symbol_file` that is the image path rather than a PDB is possible (an export-only module
     // names the image), and adding it twice costs nothing: `Inputs` is a list of things not to
     // write over, not a set of distinct files.
-    if let Some(Ok(opened)) = &symbols {
-        let symbol_file = opened.symbol_file();
-        if !symbol_file.is_empty() {
-            inputs.add(Path::new(symbol_file));
-            if let Some(json) = &request.json {
-                inputs.refuse_if_output_is_an_input(json)?;
-            }
+    // **From either arm.** A refusal reads a file too — the candidate PDB behind an `unmatched`, or
+    // whatever the engine named for a module whose symbols would not load — and taking the path off
+    // the success arm alone left exactly those runs unprotected, since a symbol failure here is
+    // non-fatal and the report is still written. Review on #399 named the `unmatched` case;
+    // `SymbolFailure::file_read` is where the question is answered for every variant, so a new one
+    // has a function to come to rather than this call site to be remembered at.
+    let symbol_file = match &symbols {
+        Some(Ok(opened)) => Some(opened.symbol_file()).filter(|file| !file.is_empty()),
+        Some(Err(why)) => why.file_read(),
+        None => None,
+    };
+    if let Some(file) = symbol_file {
+        inputs.add(Path::new(file));
+        if let Some(json) = &request.json {
+            inputs.refuse_if_output_is_an_input(json)?;
         }
     }
     if let Some(opened) = &symbols {

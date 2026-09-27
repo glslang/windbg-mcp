@@ -56,14 +56,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   because the two would otherwise fight over whose `dbghelp.dll` the process has, and a failure is
   reported in place rather than ending the run — the control arm is what that is for: against the
   VBS-off twin the symbols load and report normally while the capture refuses the VTL switch with
-  `0xC0370509`, and the report and the JSON keep those apart. **Symbols are made to load before the
-  provenance is read**, with one deliberately-failing lookup after the forced `.reload /f`: a module
-  left `Deferred` would otherwise load its PDB on the first *landmark* query, after the only
-  `unmatched` check had run — printing another build's names as this build's — and would report `kind
-  Deferred` and "no PDB signature" above addresses that PDB had just resolved. Measured: a deferred
-  module moves to `pdb` with its key on a single failing lookup, and with the reload not issued at all
-  the probe alone still loads it, so the two are independent and the reload stays for its *named*
-  error. **And the PDB the engine selected is an input**, added where it is first known so `--json`
+  `0xC0370509`, and the report and the JSON keep those apart. **Symbols are made to load and then
+  required**, with one deliberately-failing lookup after the forced `.reload /f`: a module left
+  `Deferred` would otherwise load its PDB on the first *landmark* query, after the only `unmatched`
+  check had run — printing another build's names as this build's — and would report `kind Deferred`
+  and "no PDB signature" above addresses that PDB had just resolved. A probe alone only narrows that
+  window, so after it a module without a symbol provider is refused, which is honest in a way it was
+  not before: a probe *is* a first use, so `Deferred` after one is the engine having looked and not
+  resolved them. Measured throughout — a deferred module moves to `pdb` with its key on a single
+  failing lookup; the probe alone loads it with the reload not issued at all, so the two are
+  independent and the reload stays for its *named* error; a symbol path reaching no store leaves the
+  module reading `Export`, which is what the refusal actually fires on; and neither landmark is among
+  that module's ~280 exports, so refusing `Export` costs the gate nothing. **And the PDB the engine
+  selected is an input** — on the failure arms too, since a refusal can have read one — added where it
+  is first known so `--json`
   cannot name it; the mutation is what says why it is worth having rather than what the finding
   claimed — backing it out fails with `os error 32` because DbgEng still holds the file, so the
   protection was incidental and the guard is what turns a sharing violation into *you named an
