@@ -342,12 +342,21 @@ git diff -U0 <fix>^ <fix> -- <file>                     # the - side ranges this
 git blame --porcelain -L<start>,<end> <fix>^ -- <file>   # which commit introduced those lines
 ```
 
-**Compute both numbers from the fifth remediation commit on, and write them down**: has the
-deliverable's answer moved since the first commit, and how many rounds have gone on surface the
-review itself added. They are not kept as diagnostics: they are the predicate the freeze below is
-gated on, and nothing else in this section decides. Until they are on the page, *"this is past the
-point of positive return"* is a feeling and escalating it asks the user to arbitrate a hunch. Once
-they are on the page it is not a judgement call at all, and does not need escalating.
+**Compute the predicate from the fifth remediation commit on, and write it down.** It has two terms,
+and they are the only things in this section that decide anything:
+
+- **A** — has the deliverable's answer moved since the first commit?
+- **B** — of the remediation commits so far, how many modified lines that an earlier remediation
+  commit introduced? **The unit is commits, not rounds**, because the two commands above classify a
+  commit, a round needing two commits added surface twice, and a round boundary is not always crisp:
+  #393 carries a catch-up commit for findings a broken watcher had missed, which is neither a round
+  nor not one. On that PR the unit does not change the verdict — 11 of 17 commits or 10 of 16
+  rounds, majority first holding at the fifth either way — but it has to be one or the other to be
+  computable.
+
+Until both are on the page, *"this is past the point of positive return"* is a feeling and
+escalating it asks the user to arbitrate a hunch. Once they are, it is not a judgement call at all
+and does not need escalating.
 
 **What the trigger does not license is waving findings through, and this PR is the proof.** By round
 ten the answer had not moved for ten rounds and the loop looked spent. **Round 15 then found that
@@ -360,21 +369,15 @@ and a guard handed a subset of the inputs it promised. So a rule that stops on r
 *"the result stopped moving"*, ships a tool that overwrites its input. The stop is never on
 **reading** findings, and never on fixing a defect in code that already exists.
 
-**Freeze the surface when the two numbers say so, and not before.** The predicate is both halves at
-once: the deliverable's answer has not moved since the first commit, **and** more than half the
-**remediation commits** so far have modified lines an earlier one introduced. The unit is commits
-rather than rounds for three reasons: the commands above classify a commit, a round that needed two
-commits added surface twice, and a round boundary is not always crisp — #393 carries a catch-up
-commit for findings a broken watcher had missed, which is neither a round nor not one. It has to be
-one unit or the other to be computable, and on that PR the choice does not change the verdict: 11 of
-17 commits or 10 of 16 rounds, with the majority first holding at the fifth either way. Either half
-of the predicate alone is ordinary review — a still-moving answer means the artifact has not
-converged and new surface is legitimate, while churn with no repeat-modification is a review finding
-real defects in the original, which is it working. A two-commit PR never reaches it. **Latch it** —
-the ratio can fall back under half after a run of commits that touch nothing earlier, and a freeze
-that flickers is worse than either state, so once it holds it holds for the rest of the PR. The
-majority is a reading off one PR and not a derived constant: move it if a second PR says otherwise,
-but move it with the count that made you.
+**Freeze the surface when A is no and B is a majority, and not before.** Either term alone is
+ordinary review — a still-moving answer means the artifact has not converged and new surface is
+legitimate, while churn with no repeat-modification is a review finding real defects in the
+original, which is it working. On #393 the pair first holds at the fifth commit (3 of 5) and holds
+at every commit after (11 of 17); a two-commit PR never reaches it. **Latch it** — B can fall back
+under half after a run of commits that touch nothing earlier, and a freeze that flickers is worse
+than either state, so once the pair holds it holds for the rest of the PR. The majority is a reading
+off one PR and not a derived constant: move it if a second PR says otherwise, but move it with the
+count that made you.
 
 Once the predicate holds, the instrument's scope is closed: a finding that names a defect in what is
 there is fixed, and a finding asking for a **new** mechanism — one more counter, one more reason
@@ -397,19 +400,18 @@ deliverable.
 **Then stop, and do not ask.** The terminal round is the one whose findings are all new-mechanism
 requests and prose preference with no defect in existing surface. Do not request another review
 after it. Report once to whoever is driving the work: rounds worked, findings taken against
-declined, both numbers above, and every finding left unworked with where to find it — so they can
+declined, **A** and **B**, and every finding left unworked with where to find it — so they can
 triage it themselves rather than take your word that nothing is left. **Continuing past that point
 is what needs a reason; stopping does not.** Each further round costs a CI cycle and a context
-window, and the rule exists so the decision belongs to the two numbers rather than to whoever runs
+window, and the rule exists so the decision belongs to **A** and **B** rather than to whoever runs
 out of patience first.
 
-**What it buys, replayed over the PR that produced it: not a shorter review.** The trigger fires at
-the fifth commit — the answer had not moved and three of the first five were already modifying
-their predecessors' lines — and the terminal condition is never reached, because every round from
-five to sixteen named a defect in surface that existed. Two remedies would have been smaller and ten
-would have been unchanged: **sixteen rounds either way.** What the rule actually moves is earlier
-than the stop. Rounds one to five changed or added **1,119** lines across probe and test against the
-**1,183** they were reviewing — they nearly doubled the artifact, and rounds 11, 12, 13 and 16 then
-found defects in what those rounds had added. **The lever is the size of each remedy, not the
-decision to stop.** What the stopping half buys is narrower and still worth having: the decision
-stops being escalated as a judgement call, and the loop stops being invisible.
+**What it buys, replayed over the PR that produced it: not a shorter review.** The predicate first
+holds at the fifth commit (**A** no, **B** 3 of 5) and the terminal condition is never reached,
+because every round from five to sixteen named a defect in surface that existed. Two remedies would
+have been smaller and ten unchanged: **sixteen rounds either way.** What the rule actually moves is
+earlier than the stop. The first five remediation commits changed or added **1,119** lines across
+probe and test against the **1,183** they were reviewing — they nearly doubled the artifact, and
+commits 11, 12, 13 and 16 then found defects in what those five had added. **The lever is the size
+of each remedy, not the decision to stop.** What the stopping half buys is narrower and still worth
+having: the decision stops being escalated as a judgement call, and the loop stops being invisible.
