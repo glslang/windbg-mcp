@@ -73,7 +73,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cannot name it; the mutation is what says why it is worth having rather than what the finding
   claimed — backing it out fails with `os error 32` because DbgEng still holds the file, so the
   protection was incidental and the guard is what turns a sharing violation into *you named an
-  input*. `--sk-inspect` also **names the build
+  input*. **And a PDB nothing vouched for is a refusal either way round**, whether the engine reports
+  it does not belong to this image or cannot be asked which one it loaded: `.ok().flatten()` had made
+  the second read as "there is no signature", publishing provenance nothing had checked. The engine
+  ratchet likewise fails on a *rename* of the type, since `use … DebugEngine as E; E::new()` would
+  otherwise walk past a check that reads the name. `--sk-inspect` also **names the build
   that produced its report** now, as its first line and in the JSON, because a figure taken from this
   role is a reading of the binary that answered and the tree beside it moves independently; the runs
   above were taken from this change's own working tree, a `-dirty` build over `3552d867`, and

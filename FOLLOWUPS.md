@@ -2450,6 +2450,16 @@ the capture had no VTL1 must not read like a run where neither half worked.
   success arm, so a refusal that had *read* a PDB left it unprotected — `SymbolFailure::file_read` is
   now the one place that answers what a failure read, and `NoSymbols` was in the same position as the
   `unmatched` case review named.
+- **Round 4, two findings, both taken and one remedy declined.** Asking the engine *which* PDB it
+  loaded can fail, and `.ok().flatten()` turned that into "there is no signature" — so *could not ask*
+  was published as a fact and the mismatch check was skipped with nothing saying so, which is
+  `sk::ReadFailure`'s own lesson committed one level up. `PdbUnmatched` is now `PdbUnvouched` carrying
+  *why*: both halves are "this PDB is not vouched for", so they are one refusal rather than two cases
+  a fifth round can find a third of. And the engine ratchet was bypassable by renaming the type
+  (`use … DebugEngine as E; E::new()`); CodeRabbit asked for alias-tracking, which is a parser in a
+  test, so instead the **rename** fails the check — a name that cannot be renamed cannot be
+  constructed through a rename, and both forms are mutation-verified. What it covers is stated as an
+  inclusion: a literal construction and the two rename forms, not a macro-generated call.
 - **The loaded PDB is now an input, and the mutation says the finding's stronger form is wrong.**
   Review also found that `symbol_file()` — a file this run read, discovered only once the engine had
   loaded it — never reached `Inputs`, so `--json` could name it. Taken: it is added where it is first

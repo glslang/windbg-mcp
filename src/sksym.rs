@@ -172,17 +172,36 @@ pub(crate) enum SymbolFailure {
         /// Carried so a failure can still say what it read; see [`SymbolFailure::file_read`].
         symbol_file: String,
     },
-    /// The engine matched a PDB and then found it did not belong to this image. Its own variant
-    /// because it is the one failure where symbols *did* load and reading them is worse than
-    /// having none.
-    PdbUnmatched {
-        guid: String,
-        age: u32,
-        /// The candidate PDB's path. **A file this run read**, and the reason this field exists:
-        /// without it the only route to the path was the success arm, so a run refused here left a
-        /// PDB a `--json` could be pointed at once the engine let go of it. Review on #399.
+    /// Symbols loaded and nothing vouched for the PDB they came from.
+    ///
+    /// **One refusal for one rule, either way round.** A *mismatch* — the engine having matched a PDB
+    /// it then found does not belong to this image — was its own refusal from the start, because it is
+    /// the one failure where symbols did load and reading them is worse than having none. Review on
+    /// #399 found the other half: asking the engine *which* PDB it has could fail, and
+    /// `.ok().flatten()` turned that into "there is no signature" — so *could not ask* was reported as
+    /// a fact, and the mismatch check was skipped with nothing saying so. That is exactly the
+    /// conflation [`crate::sk::ReadFailure`] exists to prevent one level down, committed one level up.
+    ///
+    /// Both are *this PDB is not vouched for*, so they are one variant rather than two cases a later
+    /// round can find a third of.
+    PdbUnvouched {
+        why: Unvouched,
+        /// The PDB's path. **A file this run read**, and the reason this field exists: without it the
+        /// only route to the path was the success arm, so a run refused here left a PDB a `--json`
+        /// could be pointed at once the engine let go of it. Review on #399.
         symbol_file: String,
     },
+}
+
+/// Why a loaded PDB could not be vouched for.
+#[derive(Debug)]
+pub(crate) enum Unvouched {
+    /// The engine reports the PDB it matched does not belong to this image.
+    Mismatch { guid: String, age: u32 },
+    /// The engine could not be asked which PDB it loaded. **Not "there is none"**: the module reads
+    /// as having a symbol provider, so there is one — what is missing is the answer that would let it
+    /// be checked.
+    NotAsked(String),
 }
 
 impl SymbolFailure {
@@ -195,7 +214,7 @@ impl SymbolFailure {
     pub(crate) fn file_read(&self) -> Option<&str> {
         let file = match self {
             SymbolFailure::NoSymbols { symbol_file, .. }
-            | SymbolFailure::PdbUnmatched { symbol_file, .. } => symbol_file.as_str(),
+            | SymbolFailure::PdbUnvouched { symbol_file, .. } => symbol_file.as_str(),
             _ => return None,
         };
         (!file.is_empty()).then_some(file)
@@ -237,11 +256,18 @@ impl std::fmt::Display for SymbolFailure {
                      check the symbol path and that a PDB is served for this build"
                 ),
             },
-            SymbolFailure::PdbUnmatched { guid, age, .. } => write!(
-                f,
-                "the engine loaded {guid}{age:X}, which it reports does not match this image — its \
-                 names would be another build's"
-            ),
+            SymbolFailure::PdbUnvouched { why, .. } => match why {
+                Unvouched::Mismatch { guid, age } => write!(
+                    f,
+                    "the engine loaded {guid}{age:X}, which it reports does not match this image — \
+                     its names would be another build's"
+                ),
+                Unvouched::NotAsked(detail) => write!(
+                    f,
+                    "the engine would not say which PDB it loaded, so nothing checked that the \
+                     symbols belong to this image: {detail}"
+                ),
+            },
         }
     }
 }
@@ -402,13 +428,27 @@ impl Symbols {
         // Kept rather than dropped once the refusal above has not fired: a forced load that errored
         // while the probe succeeded is exactly the case the reader needs told.
         let reload_error = reload;
-        let pdb = engine.module_pdb(module.base).ok().flatten();
+        // **Not `.ok().flatten()`**, which is what this was: it made *the engine could not be asked*
+        // indistinguishable from *the module has no PDB signature*, and the mismatch check below is
+        // skipped in both cases — so an unanswered query published provenance nothing had validated.
+        // `Ok(None)` still means there is nothing to check and is not a refusal.
+        let pdb = match engine.module_pdb(module.base) {
+            Ok(pdb) => pdb,
+            Err(e) => {
+                return Err(SymbolFailure::PdbUnvouched {
+                    why: Unvouched::NotAsked(e.to_string()),
+                    symbol_file,
+                });
+            }
+        };
         if let Some(identity) = &pdb
             && identity.unmatched
         {
-            return Err(SymbolFailure::PdbUnmatched {
-                guid: identity.guid.clone(),
-                age: identity.age,
+            return Err(SymbolFailure::PdbUnvouched {
+                why: Unvouched::Mismatch {
+                    guid: identity.guid.clone(),
+                    age: identity.age,
+                },
                 symbol_file,
             });
         }
@@ -741,6 +781,10 @@ mod tests {
     ///
     /// Comment lines are stripped before matching, so naming `DebugEngine::new` in prose elsewhere
     /// does not trip it; a block comment would, and this crate writes none.
+    ///
+    /// **What it covers**, stated as the inclusion rather than as a boast: a literal construction, a
+    /// `use … DebugEngine as …` rename, and a `type … = … DebugEngine` rename. A call generated inside
+    /// a macro body is not covered, and neither is a rename split across lines.
     #[test]
     fn only_the_worker_and_this_module_build_an_engine() {
         let src = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src");
@@ -760,7 +804,21 @@ mod tests {
                 walked += 1;
                 let text = std::fs::read_to_string(&path).expect("a readable Rust file");
                 let builds = text.lines().any(|line| {
-                    !line.trim_start().starts_with("//") && line.contains("DebugEngine::new")
+                    let line = line.trim_start();
+                    if line.starts_with("//") {
+                        return false;
+                    }
+                    // The construction itself, however the path to the type is spelled...
+                    line.contains("DebugEngine::new")
+                        // ...and either way of **renaming** the type, which is how `E::new()` would
+                        // walk past the line above. Raised by review on #399, which proposed tracking
+                        // aliases and matching calls through them: a parser in a test is more
+                        // machinery than this rule is worth, and a name that cannot be renamed cannot
+                        // be constructed through a rename. Failing on the *rename* is also what keeps
+                        // this from flagging a `&DebugEngine` parameter — only these two forms
+                        // introduce one, and no file in the crate has either today.
+                        || line.contains("DebugEngine as ")
+                        || (line.starts_with("type ") && line.contains("DebugEngine"))
                 });
                 if builds {
                     builders.push(
