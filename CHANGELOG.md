@@ -47,8 +47,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   is the other half: the VBS-off twin's capture reports partition VTLs `0x1` against `0x3`, the
   provider refusing the VTL switch by name (`0xC0370509`), and the session **opens** carrying that as
   its reason and refuses every read with the same sentence — while its symbols load normally, which
-  is the pair that had to stay distinguishable. Eleven new tests (1,099 unit tests now, from 1,088)
-  and five in the smoke harness (130, from 126), all eighteen guards **mutation-verified**: the
+  is the pair that had to stay distinguishable. Thirteen new unit tests (1,101 now, from 1,088) and
+  four in the smoke harness (130, from 126), all eighteen guards **mutation-verified**: the
   kind gate three ways — accept every debugger op on a capture, accept every capture op elsewhere, and replace
   the allow-list with a deny-list, where the row that then goes through is the one that was not
   thought of — and five renderers, including a landmark that disagrees rendering as agreement and a
