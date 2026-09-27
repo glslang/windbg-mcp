@@ -79,13 +79,16 @@ Five honest limits, none of them hidden in the report:
   the reserve as well leaves cleanup with no budget; the block is then skipped and the result says
   `rollback: INCOMPLETE`, naming each step that did not run.
 - **A step that *replaces* the debug target stops the batch and the rollback is deliberately not
-  run.** A wrapper hides the command that does it — `.if (1) { .create … }` and the `g` that arms
-  it, a `.foreach`, an alias resolved at execution time, a breakpoint command run at a hit — so
-  neither the by-name scan that retires a handle nor `validate` can see one, and the engine process compares what it is
+  run.** A wrapper hides the command that does it — `.if (1) { .create … }`, a `.foreach`, an
+  alias resolved at execution time, a breakpoint command run at a hit — so neither the by-name scan
+  that retires a handle nor `validate` can see one, and the engine process compares what it is
   holding against what the batch started against instead — after every step's *action*, before
   that step's own assertions, so an `eval` expectation is never answered by the replacement and
   reported as the step's verdict. What cannot be caught is a change made *inside* one engine call,
-  which nothing in the server has observed until that call returns.
+  which nothing in the server has observed until that call returns. **The step the report names is
+  the one the change happened at, which need not be the one carrying the command**: measured, a
+  wrapped `.create` only *arms* the creation (*"Create will proceed with next execution"*), so the
+  batch stops at the `g` after it and names that step.
   What it protects is the cleanup: a target that has *gone* refuses a restore, while a target that
   has been *replaced* accepts it, at an address that means something else there. The outcome is
   `BATCH: TARGET REPLACED`, the disposition is `rollback: NOT ATTEMPTED` rather than `INCOMPLETE`,
