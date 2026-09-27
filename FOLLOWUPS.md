@@ -2406,9 +2406,9 @@ the capture had no VTL1 must not read like a run where neither half worked.
   `x securekernel!KdDebuggerDataBlock` and `x securekernel!SkLoadedModuleList` both answer nothing
   against roughly 280 exported names. What is still unmeasured is a build whose PDB is *served but
   wrong* — the `unmatched` arm.
-- **Seven tests, six of them with no engine at all** (1,087 unit tests now, from 1,080 — re-derived
+- **Eight tests, seven of them with no engine at all** (1,088 unit tests now, from 1,080 — re-derived
   after rebasing onto `44428f5`, which moved both figures from the 1,071-from-1,065 this said when
-  it was branched off `2466abc2`). The five pure
+  it was branched off `2466abc2`, and again when review round 6 added one). The five pure
   ones pin the rebase: the two landmark offsets against literals, the half-open end of the image,
   an address below the base refused rather than wrapped, both bases checked for overflow, and an
   unresolved symbol reading as *unknown* rather than as a disagreement. All four guards were
@@ -2473,6 +2473,15 @@ the capture had no VTL1 must not read like a run where neither half worked.
   `src/sksym.rs` carries a table of every engine call and what a failure becomes, including the two
   that are answers rather than omissions — the discarded forcing probe, and `symbol_for`, whose `None`
   is `dbgscope`'s own contract.
+- **Round 6 found a flag being eaten as a value, and the test that should have caught it was named
+  for exactly that.** `--symbols --sympath --cross-check` took `--cross-check` as the symbol path and
+  left cross-checking silently off. `a_flag_with_no_value_is_a_usage_error_rather_than_eating_the_next_flag`
+  — S1's — puts the flag **last**, so there is no next flag to eat: the name claimed the general
+  property and the body covered the trivial half, which is `.claude/skills/review-round`'s "a test can
+  pass on a neighbouring rule" from the other side. The helper is shared by all twelve flags that take
+  a value, so the fix is central and the assertion is a table over every one of them; `--json` is the
+  worst of the twelve, since it would have written the report to a file named `--cross-check`.
+  Mutation-verified: backing the guard out fails the new test on `--vm` and leaves the old one green.
 - **The loaded PDB is now an input, and the mutation says the finding's stronger form is wrong.**
   Review also found that `symbol_file()` — a file this run read, discovered only once the engine had
   loaded it — never reached `Inputs`, so `--json` could name it. Taken: it is added where it is first
