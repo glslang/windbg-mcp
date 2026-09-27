@@ -1657,12 +1657,20 @@ the text report and the JSON carry them as separate answers.
 - **Two symbols, one PDB, one build, one host.** The gate resolves the landmarks S1 already found. It
   does not enumerate the PDB, and it cannot name the other five VTL1 modules — their symbols are in
   their own images, which nothing here opens.
-- **The no-symbols paths are unmeasured, and are deliberately not all refusals.** A missing engine is
-  a refusal, as is a module the engine has no symbols for at all; a module whose symbols merely did
-  not *load* is not, because `Deferred` means "nothing has looked yet" rather than "there are none"
-  and refusing it would turn away a host where names would have resolved. Such a run reports the kind
-  on its first line, before the capture is read, and each landmark carries the engine's own reason.
-  Only the working path has been run here.
+- **A host with no symbols is refused, and what that refusal reads is measured.** `Symbols::open`
+  makes the engine issue a resolving query — one deliberately-failing lookup, which is what settles a
+  deferred module — and then **requires** a symbol provider, naming the kind and the forced reload's
+  own error when there is none, before the capture is read. Pointed at a symbol path that reaches no
+  store, the module comes back **`Export`** rather than `Deferred`: DbgEng falls back to the image's
+  export table, and the run reports *no symbols loaded (the module still reads Export after a
+  resolving query)* while the decode carries on. Refusing that costs nothing here — with symbols
+  failing to load, `x securekernel!KdDebuggerDataBlock` and `x securekernel!SkLoadedModuleList` both
+  answer nothing against roughly 280 exported names, so neither landmark is reachable from exports.
+  The first draft of this gate accepted a still-deferred module on the grounds that `Deferred` means
+  "nothing has looked yet"; after the probe it does not, and three review rounds on
+  [#399](https://github.com/glslang/windbg-mcp/pull/399) were the cost of that distinction — a module
+  left deferred could load its PDB on the first *landmark* query, after the only check that the PDB
+  belongs to this image. What is still unmeasured is a PDB that is served and **wrong**.
 
 ## Explicitly out of scope
 

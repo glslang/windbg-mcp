@@ -2389,15 +2389,19 @@ the capture had no VTL1 must not read like a run where neither half worked.
 - **Only two symbols are asked for.** The gate resolves the landmarks S1 already found, in both
   directions; it does not enumerate the PDB, name the other five VTL1 modules (their symbols are in
   *their* images, which nothing here opens), or resolve anything S1 did not locate.
-- **It has read one PDB, for one build, on one host, and the no-symbols paths are unmeasured.** A
-  missing engine is a refusal and so is a module the engine has **no** symbols for at all; a module
-  whose symbols merely did not *load* is **not** — `Deferred` and `Export` both mean *some*, and
-  dbgscope documents `Deferred` as explicitly not a statement that symbols are missing, so refusing
-  it would turn away a host where names would have resolved on first use. The kind is reported
-  instead, on the report's first line and before any capture is read, with `.reload /f`'s own error
-  beside it and each landmark carrying the engine's reason for itself. That is a decision taken to
-  avoid guessing a direction on values this bench has never produced — the working path is the only
-  one that has been run.
+- **It has read one PDB, for one build, on one host.** A module with no symbol **provider** after
+  `Symbols::open` has made a resolving query is refused — `Deferred` and `Export` included — with the
+  kind and `.reload /f`'s own error named, before any capture is read. Round 1 of the review narrowed
+  that to `None` alone, reasoning that `Deferred` means nobody has looked; **that reasoning died the
+  moment the forcing probe was added, and rounds 2 and 3 are what it cost** (see below).
+  **And the refusal is now measured rather than reasoned about**, which it was not when this bullet
+  first said "unmeasured": `--sympath C:\nonexistent-symbol-store` leaves the module reading
+  **`Export`** and not `Deferred` — the engine falls back to the image's export table — and the run
+  reports *no symbols loaded (the module still reads Export after a resolving query)* while the decode
+  proceeds. Refusing `Export` costs the gate nothing, also measured: with symbols failing to load,
+  `x securekernel!KdDebuggerDataBlock` and `x securekernel!SkLoadedModuleList` both answer nothing
+  against roughly 280 exported names. What is still unmeasured is a build whose PDB is *served but
+  wrong* — the `unmatched` arm.
 - **Seven tests, six of them with no engine at all** (1,087 unit tests now, from 1,080 — re-derived
   after rebasing onto `44428f5`, which moved both figures from the 1,071-from-1,065 this said when
   it was branched off `2466abc2`). The five pure
@@ -2431,6 +2435,21 @@ the capture had no VTL1 must not read like a run where neither half worked.
   reload stays because it is the one that yields a *named* error. With **neither** issued, the gated
   test fails on exactly the reported state (`symbols Deferred, pdb None, file securekernel.exe`),
   which is what says its two new assertions are not vacuous.
+- **Round 3 then found the probe can fail to settle it, and that is when the choice went rather than
+  the symptom.** Accepting `Deferred` *after* a resolving query was the thing generating both
+  rounds — the probe made the argument for accepting it false, since a module still deferred once the
+  engine has looked is one whose symbols did not load. So the refusal is back to requiring a
+  provider, now justified by a measurement instead of a guess, and nothing downstream can move the
+  kind: that is what makes reading the provenance once and keeping it safe, with the residual
+  assumption stated (no further `.reload` is issued) rather than hidden. `Export` goes with it and
+  costs nothing this gate wants — neither landmark is an export of `securekernel.exe`. The same round
+  found two more, both enumerated rather than patched one at a time: `SymbolFailure::Open`'s message
+  said *the engine refused the image as a target* for **four** different engine calls, of which it was
+  true for one (review named `--sympath`, where `open_dump` has not run yet), so it is now
+  `Engine { step, detail }` and each site names its step; and the symbol file was captured only on the
+  success arm, so a refusal that had *read* a PDB left it unprotected — `SymbolFailure::file_read` is
+  now the one place that answers what a failure read, and `NoSymbols` was in the same position as the
+  `unmatched` case review named.
 - **The loaded PDB is now an input, and the mutation says the finding's stronger form is wrong.**
   Review also found that `symbol_file()` — a file this run read, discovered only once the engine had
   loaded it — never reached `Inputs`, so `--json` could name it. Taken: it is added where it is first
