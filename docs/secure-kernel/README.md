@@ -72,6 +72,17 @@ a working EXDI would supply a generic memory target rather than any SK awareness
 now exist, that is a trade with nothing on one side. What it costs is DbgEng's symbol handling, most
 of which is recoverable against the *image* without a live target.
 
+**Is a checkpoint carrying Secure Kernel a defect to report?** Asked and answered **no**, 2026-09-27,
+with the evidence in gate 4's document: the SDK documents VTL selection in a capture as a feature
+(`ForceActiveVirtualTrustLevel` is commented *"useful to force register state … from a different
+VTL"*), VBS claims a VTL0→VTL1 boundary *inside* the guest rather than one against the host, and
+every route here needs Hyper-V Administrator, which can already read a running guest's memory. The
+three cases that *would* be reportable are named there, and two of them are unmeasured — the
+interesting one being whether `EncryptStateAndVmMigrationTraffic`, which is **off** on both lab
+guests, actually covers VTL1 in a capture. The third needs no Microsoft involvement and is true
+today: these `.vmrs` files inherit `D:\`'s ACL, so any authenticated local user can read a guest's
+whole RAM.
+
 **Two things are open beneath that.** Whether VTL1 *execution* can be controlled at all is
 unresolved and decides inspector versus debugger: the hypervisor's VTL1 debug port is up and Secure
 Kernel does not connect to it. And whether VTL1 can be *written* is settled per route —

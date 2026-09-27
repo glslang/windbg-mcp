@@ -2124,6 +2124,51 @@ to walk *from*, and hard-coding the one measured `0x1201000` is not an answer.
   setup. What changes is the install instructions and who can follow them, so write that down
   rather than treating a driver-only answer as a failure of the item.
 
+#### S0 arm 4 — does the encryption knob cover the capture? — **SPECIFIED 2026-09-27, NOT RUN**
+
+**Why this arm exists.** S0's result invites the question whether a checkpoint carrying VTL1 is a
+defect worth reporting to Microsoft, and the answer recorded in
+[`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md)
+is **no** — the SDK documents the capability, and the host is inside the TCB for a guest that is not
+hardware-isolated. Part of that answer is that **Microsoft ships a mitigation for the at-rest half
+and it is off on this bench**: `EncryptStateAndVmMigrationTraffic` is `False` on both lab guests. Arm
+4 is the one case in that verdict that could overturn it, so it is worth running rather than
+asserting: **turn the knob on and see whether VTL1 still comes out.**
+
+**Method.** Record the guest's current `Get-VMSecurity` first — the arm changes VM configuration and
+has to put it back. `Set-VMSecurity -EncryptStateAndVmMigrationTraffic $true` is **refused while the
+VM runs** (measured: *"The SecuritySettingData property cannot be modified because the virtual
+machine is running"*), so the sequence is: graceful shutdown, set the knob, start, take a
+`CheckpointType = Standard` checkpoint, run `windbg-mcp --sk-inspect` against it, then revert the
+knob and restart. A key protector already exists on both guests (5,207 bytes, measured 2026-09-27),
+so the knob has one to use and this should need no new key material.
+
+- **Expected pass — the boundary holds:** the provider cannot read the capture at all, and **the
+  refusal names a reason at load or read**. That last clause is the whole rigour of this arm: a
+  `LocateSavedStateFiles` that found nothing, a path typo or a checkpoint that was never written
+  produce the same "no VTL1" as encryption working, and the first three say nothing. So the file's
+  existence and plausible size are checked, and the failure has to come from `LoadSavedStateFile` or
+  from the reads — not from the file not being there.
+- **Finding — worth reporting:** the provider loads it and VTL1 is still reachable, meaning the
+  setting does not cover saved state the way its name claims.
+- **The control is already in hand**, and it is what makes either outcome mean something: the *same
+  guest's unencrypted* checkpoint reads end to end (S1's run below). So a capture that will not load
+  after the knob is attributable to the knob.
+- **The arms differ by a boot as well as by the setting**, unavoidably, since the knob needs a power
+  cycle. That is why the comparison is *whether it reads at all* rather than a value-for-value one —
+  S0 already measured that the `CR3` moves across a boot while the image-relative offsets do not.
+- **Cost:** one power cycle of a lab guest and one ~2 GB checkpoint. The guest must be one whose
+  in-guest state is expendable, which is a question for whoever owns the bench rather than an
+  implementation detail.
+
+**And one case in that verdict is already true here, which is not about Microsoft.** Reading a
+checkpoint needs read access to a *file*, not the Hyper-V role — and this bench's
+`D:\Hyper-V\Virtual Machines\Snapshots\<id>.vmrs` grants `BUILTIN\Users: ReadAndExecute` and
+`Authenticated Users: Modify`, **inherited from `D:\`** rather than set by Hyper-V. So any
+authenticated local user can read a file holding the guest's whole RAM, VTL1 included. It is a
+storage-path configuration hazard rather than a product defect, it is not part of arm 4, and it
+wants fixing on its own.
+
 ### S1 — the decode layer, source-agnostic — **BUILT AND RUN 2026-09-27**
 
 **Built in Rust, in this server, and measured against a real capture.** `src/sk.rs` is the decode
