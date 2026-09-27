@@ -7,10 +7,14 @@
 //! is what dbgeng.dll's one-session-per-process rule makes the natural unit, and what lets a
 //! session that cannot be unwound be killed without taking the server with it.
 //!
-//! There is also a third, which is not a server at all: [`cast::RENDER_FLAG`] turns a recorded
-//! transcript into a terminal recording and exits. It touches neither DbgEng nor MCP, and it is
-//! here rather than in a second binary because it reads a format this crate defines — a renderer
-//! that could drift out of step with the writer is a renderer that will.
+//! There are also two that are not servers at all, and they are here rather than in a second
+//! binary for the same reason: each reads a format this crate defines, and a reader that could
+//! drift out of step with the writer is a reader that will. [`cast::RENDER_FLAG`] turns a recorded
+//! transcript into a terminal recording and exits, touching neither DbgEng nor MCP.
+//! [`skinspect::INSPECT_FLAG`] reads a Hyper-V saved state's VTL1 and reports what is in it
+//! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — as an
+//! image target with no debuggee, which is why the one-session-per-process rule that makes workers
+//! necessary does not reach it.
 
 mod batch;
 mod cast;
@@ -35,6 +39,7 @@ mod server;
 mod service;
 mod sk;
 mod skinspect;
+mod sksym;
 mod structured;
 mod surface;
 mod target;
@@ -119,7 +124,9 @@ fn main() -> Result<()> {
     }
     if let Some(at) = args.iter().position(|arg| arg == skinspect::INSPECT_FLAG) {
         // The same shape and the same reason: it reads a Hyper-V capture and writes a report,
-        // touching neither DbgEng nor MCP (`FOLLOWUPS.md` item 103, gate S1).
+        // speaking no MCP (`FOLLOWUPS.md` item 103, gates S1 and S2). It does load DbgEng, but
+        // only when asked for symbols with `--symbols`, and then as an *image* target with no
+        // debuggee — which is why it is not a worker: there is no debuggee session to own.
         return skinspect::run(&args[at + 1..]);
     }
 

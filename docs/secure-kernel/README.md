@@ -4,11 +4,12 @@ Can a debugger reach **VTL1** — the Secure Kernel — on a VBS-enabled Windows
 `windbg-mcp` drive it? These documents are the record of finding out. They are a **research log**
 first, and several sections record what did not work and why, which is most of the value.
 
-**One part of it is now code in this server**, and the rest is not. `src/sk.rs` decodes a guest's
+**Part of it is now code in this server**, and the rest is not. `src/sk.rs` decodes a guest's
 VTL1 — the page-table walk, the image identification, the debugger data block and the module list —
 over a source seam, `src/savedstate.rs` reads a Hyper-V capture through the Windows SDK's provider,
-and `windbg-mcp --sk-inspect` drives the two from the command line (`FOLLOWUPS.md` item 103, gate
-S1). There is **no MCP tool**: that is gate S3, and its shape is still an open question. So no
+`src/sksym.rs` resolves `securekernel.exe`'s symbols against that decode with no debuggee at all,
+and `windbg-mcp --sk-inspect` drives them from the command line (`FOLLOWUPS.md` item 103, gates S1
+and S2). There is **no MCP tool**: that is gate S3, and its shape is still an open question. So no
 `tools/list` changes, nothing a client can call, and everything below about the *live* route still
 needs the bench posture it describes.
 
@@ -58,19 +59,30 @@ the coordinates to carry forward; the VAs beside them depend on the load base, a
 to be read, never remembered** — the third boot above is what a hard-coded `0x1201000` would have
 walked from.
 
+That the offsets are the build's is now checkable rather than inferred: gate S2 reads both out of
+this build's `securekernel.pdb` and gets `+0x1335E0` and `+0x127770`, the same two values searching
+the capture produced. The PDB is therefore where a *different* build's offsets come from — but only
+where one is served, which is why the tag scan stays the primary route and not the fallback.
+
 **What is still open:** turning those reads into tools (gate H5), which is scoped as `FOLLOWUPS.md`
 item 103 and is part-built — **S0** is answered above and **S1**, the decode layer, is now in
 `src/sk.rs` and reproduces every capture-derived landmark in the table below from a checkpoint, with
 two checks the probe did not run: a structural route to the module list that agrees with the block,
-and the provider's own address translator agreeing with the walk on every page of the image. What
-remains is symbols against the image (S2), the tool surface (S3), and whether VTL1 execution can be
+and the provider's own address translator agreeing with the walk on every page of the image.
+**S2**, symbols, is now `src/sksym.rs`: DbgEng opens `securekernel.exe` as a target in its own right
+with no debuggee, and the PDB puts both offsets in the table below exactly where searching the
+capture put them — a third route to the module list, and the only one that needs no debugger data
+block. It also settles what symbols *cannot* give: the public `securekernel.pdb` carries **no type
+information**, so structure walks stay hand-decoded. What
+remains is the tool surface (S3) and whether VTL1 execution can be
 controlled at all (S5). Its route is decided, and the
 decision is the opposite of where this work began. Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
 and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even
 a working EXDI would supply a generic memory target rather than any SK awareness. Since the reads
-now exist, that is a trade with nothing on one side. What it costs is DbgEng's symbol handling, most
-of which is recoverable against the *image* without a live target.
+now exist, that is a trade with nothing on one side. What it costs is DbgEng's symbol handling —
+and S2 has since measured how much of that comes back against the *image* without a live target:
+the **names** completely, the **types** not at all.
 
 **Is a checkpoint carrying Secure Kernel a defect to report?** Asked and answered **no**, 2026-09-27,
 with the evidence in gate 4's document: the SDK documents VTL selection in a capture as a feature
@@ -105,7 +117,7 @@ Read them in this order; each assumes the one before it.
 | 1 | [Secure Kernel debugging plan](secure-kernel-debugging-plan.md) | The original plan: validate software-only SK debugging, then integrate whichever route works. Carries the handoff status and the `Kd=` option set read out of `dbgeng.dll` — six kernel-discovery modes, of which `Kd=VerAddr:<addr>` is the one a Secure Kernel bind would use. |
 | 2 | [Secure Kernel debugging validation](secure-kernel-debugging-validation.md) | The measurement record behind everything else. NT and hypervisor debugging pass; **native SK attachment does not**. Why post-26100 `securekernel.exe` ships no KD transport, and what `SkdInitDebuggerDataBlock` does instead. The longest document here and the one to cite. |
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
-| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, and **S0**, which finds a driver-free source that carries VTL1 and its page-table root. |
+| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, **S0**, which finds a driver-free source that carries VTL1 and its page-table root, **S1**, the decode layer over that source, and **S2**, symbols against the image with no debuggee — which also settles that the public PDB has no types. |
 
 Two older side-investigations, kept because they are about the same binary:
 

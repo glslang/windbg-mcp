@@ -2320,7 +2320,99 @@ Three things must be pinned by tests rather than discovered again:
   `ReadIntercept` and zeros. A source that collapses the two produces silent zeros exactly where
   the protected memory is; the seam must carry *why* a read failed, not just bytes-or-not.
 
-### S2 — symbols, which is the one place DbgEng earns its keep
+### S2 — symbols, which is the one place DbgEng earns its keep — **BUILT AND RUN 2026-09-27**
+
+**Names yes, types no, and no new `dbgscope` primitive.** `src/sksym.rs` opens
+`securekernel.exe` as a DbgEng target in its own right, loads `securekernel.pdb` from the public
+symbol server, and rebases it onto the base gate S1 found — so a VTL1 address has a name and a name
+has a VTL1 address, with no debuggee anywhere. `--sk-inspect --symbols` is the opt-in that drives
+it, and it is opt-in because it is the only part of that role that loads an engine.
+
+**The unknown is settled, and the answer was the cheapest of the three it could have been.** DbgEng
+accepts a PE image as a target: `OpenDumpFileWide` on `C:\Windows\System32\securekernel.exe`
+produces a session with exactly **one** module, at the image's own `ImageBase` `0x140000000`, and
+`.reload /f` against it downloads the PDB. Everything the gate needs is `dbgscope` methods that
+already existed — `open_dump`, `wait_for_event`, `modules`, `module`, `reload_symbols`,
+`module_pdb`, `module_symbol_file`, `symbol_offset`, `symbol_for`, `type_id` — so there is no stacked
+`dbgscope` PR, and the `execute` hatch is not used either. The whole of this module's own work is
+the **rebase**.
+
+**The measurement, and it is the strongest cross-check this item has produced.** Against the image
+on this bench (10.0.26100.9457, PDB key `C2C0D1A62E3269F40C69EA44FDB230C41`, `symbols: pdb`), the
+PDB puts `KdDebuggerDataBlock` at RVA **`0x1335E0`** and `SkLoadedModuleList` at **`0x127770`** —
+**the same two offsets S0's tag scan and S1's decode found inside the capture**, derived from a file
+that has never seen it. Run end to end against the `H1 pinned 26200.9457 VBS+HVCI` checkpoint, both
+rebase onto the decode's own addresses (`0xFFFFF8070EEDC5E0` and `0xFFFFF8070EED0770`) and the
+engine names each of those addresses with displacement **0**, asked in the other direction. Every S1
+figure reproduced unchanged in the same run — root `0x107593000`, 29 present entries, self-map 309,
+16,437 leaves over 4,545 pages, 179 table reads, 215 decodes, six modules, the structural
+cross-check agreeing with the block, the oracle 373 of 373, 18,253 reads and 0 failed.
+
+**And the report now names the build that produced it**, which it did not under S1: `--sk-inspect`
+prints `BUILD_VERSION` as its first line and carries it in the JSON, so a figure quoted out of this
+role can be re-derived. The runs above were taken from **this change's own working tree** — a
+`0.20.0+g2466abc2-dirty.<digest>` build, and the digest is deliberately not written here: it covers
+the uncommitted diff, so it moved twice while these paragraphs were being edited. The committed
+equivalent is the commit that adds this.
+
+**So the module list is now reachable three ways, and one of them needs no block.** Unknown 4 asked
+for a derivation to replace two remembered offsets; the PDB *is* that derivation, per build, and it
+reaches `SkLoadedModuleList` directly — which the tag scan cannot, the list being a bare `LIST_ENTRY`
+with no signature to search for. The block route stays: it is what works with no symbol server.
+
+**The control arm is the other half of what makes the two halves independent.** Same command against
+the VBS-off twin: symbols load and report normally, and the capture refuses the VTL switch by name
+(`0xC0370509`). The report and the JSON keep those apart — a run where the engine had symbols and
+the capture had no VTL1 must not read like a run where neither half worked.
+
+#### What S2 does **not** deliver, measured rather than assumed
+
+- **The public `securekernel.pdb` carries no type information.** `dt securekernel!_LIST_ENTRY` is
+  *not found*, `dt securekernel!*` lists symbols rather than types, every data symbol prints
+  `= <no type information>` under `x /t`, and four `GetTypeId` probes in the shipped code all answer
+  nothing. The plan asked for "symbols **and types**"; the types half is not available to ask for,
+  so structure walks over VTL1 stay hand-decoded the way `src/sk.rs` already does them. A finite
+  probe cannot prove a PDB has none, which is why the code reports the probes rather than a verdict.
+- **`SymbolKind::has_type_info` is wrong about this image, and must not be the test.** It reads
+  `DEBUG_SYMTYPE_PDB` as private type information; this module is `symbols: pdb` with no types at
+  all, because the engine does not distinguish a stripped public PDB from a private one. Asking for
+  a type is the only answer. Worth a `dbgscope` doc fix on its own, and not a blocker here.
+- **Rebasing inside the engine is a trap, and it was measured being one.** DbgEng will load the
+  image a second time at the guest's base — `.reload /i securekernel.exe=fffff8070eda9000,175000`
+  with `.exepath` set — and resolves the same PDB there. But it cannot reuse the module name, so the
+  second module comes up `securekernel_exe`, and **both answer to `securekernel!`**: with the pair
+  loaded, `? securekernel!KdDebuggerDataBlock` answers `0x1401335E0`, the *preferred* base. A
+  name-based lookup would silently return an address in the wrong space. One module plus arithmetic
+  has no such ambiguity and is testable with no engine.
+- **Only two symbols are asked for.** The gate resolves the landmarks S1 already found, in both
+  directions; it does not enumerate the PDB, name the other five VTL1 modules (their symbols are in
+  *their* images, which nothing here opens), or resolve anything S1 did not locate.
+- **It has read one PDB, for one build, on one host, and the no-symbols paths are unmeasured.** A
+  missing engine is a refusal and so is a module the engine has **no** symbols for at all; a module
+  whose symbols merely did not *load* is **not** — `Deferred` and `Export` both mean *some*, and
+  dbgscope documents `Deferred` as explicitly not a statement that symbols are missing, so refusing
+  it would turn away a host where names would have resolved on first use. The kind is reported
+  instead, on the report's first line and before any capture is read, with `.reload /f`'s own error
+  beside it and each landmark carrying the engine's reason for itself. That is a decision taken to
+  avoid guessing a direction on values this bench has never produced — the working path is the only
+  one that has been run.
+- **Six tests, five of them with no engine at all** (1,071 unit tests now, from 1,065). The pure
+  ones pin the rebase: the two landmark offsets against literals, the half-open end of the image,
+  an address below the base refused rather than wrapped, both bases checked for overflow, and an
+  unresolved symbol reading as *unknown* rather than as a disagreement. All four guards were
+  mutation-verified — widen the end to `>`, swap `checked_sub` for `wrapping_sub`, drop the
+  preferred base from the overflow loop, make `agrees()` answer `Some(false)` — and each failed the
+  one test it belongs to and no other. The sixth needs an engine, a symbol store and a real image,
+  and is gated on the image path so the gate and the input are one thing:
+  `WINDBG_MCP_SMOKE_SKSYM=<path to securekernel.exe>`. **It asserts nothing about the type probes**:
+  whether a Microsoft public PDB carries type records is Microsoft's to change, and pinning today's
+  answer would fail on the build this gate would most want to hear about.
+- **The `dbghelp` load order was a hazard and is now a measurement.** The engine bundle beside this
+  binary carries its own `dbghelp.dll`, and whichever of DbgEng and the SDK provider loads first is
+  the one the other inherits by name. The engine opens first, because it needs its own; the run
+  above is what says the provider still reads a capture afterwards.
+
+#### S2 as specified
 
 Resolve `securekernel.exe`'s symbols and types against a base supplied by S1. This is the part
 worth keeping DbgEng for, and **the only part**: the remaining primitives are reads this server
@@ -2335,14 +2427,28 @@ before promising symbols.
 
 ### S3 — the tool surface
 
-Shape it after S0 and S2 answer, not now. What the plan asked for is SK base and size, structure
-walks, and symbol resolution against the image. Note that a reader with no debuggee fits this
+Shape it after S0 and S2 answer, not now — **both have answered**, so this is the next gate. What
+the plan asked for is SK base and size, structure walks, and symbol resolution against the image.
+Note that a reader with no debuggee fits this
 server's existing session model awkwardly — the one-worker-per-debuggee reason for the worker
 process does not apply — so whether this is a session kind, a sessionless tool group or a separate
 surface is a real design question, and **S0 and S5 both move it**: a live driver-backed source is
 not a fixed snapshot, and an S5 pass would bring execution state back into a surface shaped on the
 assumption that there is none. **S0 has moved it**: the source most users will have is a capture, so
 the sessionless shape is the case to design for and the live one is the variant.
+
+**And S2 has moved it in the other direction, which is the part to design around rather than
+discover.** The decode is engine-free and the symbols are not: `src/sksym.rs` holds a DbgEng session
+on an image file, which is a debuggee-less target and so needs no worker by the
+one-session-per-process rule — but it is still an engine in *some* process, and `--sk-inspect` is a
+short-lived one. A tool surface is not: it would hold that engine for the life of a session, beside
+whatever engine the caller's other sessions hold. **Three things follow, and none of them is
+answered.** Whether the symbol half is part of the same session handle as the capture or a separate
+thing a caller opens; whether it lives in the supervisor (which has never loaded DbgEng, and where
+`dbgeng.dll` in-process would be a new property of that role) or in a worker of its own; and what
+`structure walks` means now that types are **not** available, since the plan's wording assumed a PDB
+that would format them. Two of the three are about where an engine lives, which is this repo's
+oldest architectural line — decide them before writing a tool, not after.
 
 ### S4 — settle the write routes — **RUN 2026-09-26, settled; do not repeat as written**
 
@@ -2449,12 +2555,22 @@ guest side to speak to it — rather than by re-running a completed experiment.
    VTL1 and its `CR3`, read driver-free through the SDK's `vmsavedstatedumpprovider.dll`. The
    remaining setup is Hyper-V administrator on the host plus the SDK, and the live driver route is
    now what a *running* target costs rather than what access costs.
-2. **Image-only symbol resolution** — decides whether S2 is small or is a `dbgscope` change.
+2. ~~**Image-only symbol resolution**~~ — **answered 2026-09-27**: small, and no `dbgscope` change.
+   DbgEng opens a PE image as a target of its own and loads its PDB there, so `symbol_offset` and
+   `symbol_for` work against `securekernel.exe` with no debuggee and the rebase onto S1's base is
+   arithmetic in `src/sksym.rs`. What the answer *cost* is the half the question did not ask about:
+   the public PDB carries **no types**, so "symbols and types" is one of the two.
 3. **S5's unresolved Secure Kernel *attachment*** — not its activation, which is done: the port is
    up and SK does not connect to it. Decides inspector versus debugger, and is the one that would
    change the shape of S3's tool surface rather than its contents. Independent of the rest, so it
    can run in parallel or not at all.
-4. **Build stability of the offsets, and the derivation that replaces them.**
+4. **Build stability of the offsets, and the derivation that replaces them.** **Half-answered
+   2026-09-27 by S2**: the PDB derives both offsets per build and agrees with the scan on this one,
+   and it reaches `SkLoadedModuleList` directly where the scan cannot. What is *not* answered is the
+   no-symbols case, which is the one the recipe below is for — a host with no symbol store, or a
+   build whose PDB is not served, still has only the tag scan. So both routes stay, and the scan is
+   still the primary rather than the fallback.
+
    `KdDebuggerDataBlock` at `+0x1335E0` and `SkLoadedModuleList` at `+0x127770` are **one build**,
    and the block's `Size` already disagreed with an earlier static reading (`0x3A0` live against
    `0x3A8` from the image). So the offsets are a fast path to *verify*, never the lookup — but

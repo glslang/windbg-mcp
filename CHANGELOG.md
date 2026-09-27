@@ -9,6 +9,58 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **`securekernel.exe`'s symbols now resolve against the base gate S1 found in a capture, with no
+  debuggee anywhere — and the PDB agrees with the capture scan to the byte.** `FOLLOWUPS.md` item
+  103's gate S2, `src/sksym.rs`, driven by `windbg-mcp --sk-inspect --symbols`. The unknown the gate
+  was written to settle was whether image-only resolution is available at all, since every
+  `dbgscope` symbol method assumes a session with a target; the answer is that **DbgEng opens a PE
+  image as a target in its own right**. `OpenDumpFileWide` on
+  `C:\Windows\System32\securekernel.exe` gives a session with exactly one module at the image's own
+  `ImageBase` `0x140000000`, and `.reload /f` fetches `securekernel.pdb` from the public store — so
+  this needed **no new typed `dbgscope` primitive** and no `execute` text hatch, and the whole of its
+  own work is the rebase from that base onto the guest's. Measured 2026-09-27 against the same
+  `H1 pinned 26200.9457 VBS+HVCI` checkpoint S1 ran on: the PDB puts `KdDebuggerDataBlock` at RVA
+  `0x1335E0` and `SkLoadedModuleList` at `0x127770`, **the same two offsets S0's tag scan and S1's
+  decode found inside the capture**, rebasing onto the decode's own `0xFFFFF8070EEDC5E0` and
+  `0xFFFFF8070EED0770` — and asked the other way round, a separate engine call, the engine names both
+  of those guest addresses with displacement **0**, which is the only value that says an address *is*
+  a symbol rather than being somewhere after one. Every S1 figure reproduced unchanged in the same
+  run. So the module list is now reachable **three** ways and one of them needs no debugger data
+  block at all: the tag scan cannot find `SkLoadedModuleList`, a bare `LIST_ENTRY` with no signature
+  to search for, and a PDB names it directly. The scan stays primary, because a host with no symbol
+  store or a build whose PDB is not served has only that route. **Three things this settles in the
+  negative.** The public `securekernel.pdb` carries **no type information** — `dt securekernel!*`
+  lists symbols rather than types, every global prints `= <no type information>`, and four
+  `GetTypeId` probes in the shipped code all answer nothing — so the plan's "symbols **and** types"
+  is one of the two, and structure walks over VTL1 stay hand-decoded. `SymbolKind::has_type_info`
+  must not be the test for that, reading `DEBUG_SYMTYPE_PDB` as private type information where this
+  module is `symbols: pdb` with none: the engine does not distinguish a stripped public PDB from a
+  private one. And **rebasing inside the engine is a trap that was measured being one** — a second
+  `.reload /i securekernel.exe=<base>,<size>` with `.exepath` set does load the image at the guest's
+  base and resolve the same PDB there, but the module name collides, so it comes up
+  `securekernel_exe` and *both* answer to `securekernel!`: with the pair loaded,
+  `? securekernel!KdDebuggerDataBlock` answers the **preferred** base. One module plus arithmetic has
+  no such ambiguity and is testable with no engine, which five of the six new tests are. Those five
+  pin the rebase against literals — the two landmark offsets, the half-open end of the image, an
+  address below the base refused rather than wrapped, both bases checked for overflow, and an
+  unresolved symbol reading as *unknown* rather than as a disagreement, because a host that cannot
+  reach a symbol server must not read as a decode that is wrong — and all four guards were
+  mutation-verified, each failing the one test it belongs to and no other. The sixth needs an engine,
+  a symbol store and a real image, and is gated on the image path so the gate and the input are one
+  thing (`WINDBG_MCP_SMOKE_SKSYM`); it deliberately asserts **nothing** about the type probes, since
+  whether a Microsoft public PDB carries type records is Microsoft's to change and pinning today's
+  answer would fail on exactly the build worth hearing about. The symbol half is **opt-in** because
+  it is the only part of `--sk-inspect` that loads an engine, it opens before the SDK provider
+  because the two would otherwise fight over whose `dbghelp.dll` the process has, and a failure is
+  reported in place rather than ending the run — the control arm is what that is for: against the
+  VBS-off twin the symbols load and report normally while the capture refuses the VTL switch with
+  `0xC0370509`, and the report and the JSON keep those apart. `--sk-inspect` also **names the build
+  that produced its report** now, as its first line and in the JSON, because a figure taken from this
+  role is a reading of the binary that answered and the tree beside it moves independently; the runs
+  above were taken from this change's own working tree, a `-dirty` build over `2466abc2`. Still **no MCP tool and no
+  `tools/list` change**; the surface is gate S3, which this moves rather than answers, since the
+  decode is engine-free and the symbols are not.
+
 - **A guest's Secure Kernel can now be decoded by this server, from a Hyper-V capture, through a
   command-line role rather than a tool.** `FOLLOWUPS.md` item 103's gate S1. `src/sk.rs` is
   everything gates H0–H4 and S0 measured, expressed so the byte source is a parameter: a guarded
