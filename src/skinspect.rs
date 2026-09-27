@@ -793,25 +793,36 @@ fn report_symbols(opened: &Result<Symbols, SymbolFailure>) {
                 .filter(|(_, answer)| answer.is_ok())
                 .map(|(name, _)| *name)
                 .collect();
+            // **The engine's own reason per probe, not a verdict.** DbgEng reports *no such type* as a
+            // failed call, so nothing here can separate a stripped PDB from a type query that could
+            // not run — and this gate offers these negatives as evidence for exactly that claim. So
+            // the reasons are printed and the reader judges.
             if found.is_empty() {
-                // **The engine's own reason per probe, not a verdict.** DbgEng reports *no such type*
-                // as a failed call, so nothing here can separate a stripped PDB from a type query
-                // that could not run — and this gate offers these negatives as evidence for exactly
-                // that claim. So the reasons are printed and the reader judges: one that does not say
-                // the type was not found is a broken query rather than a PDB without types.
                 println!(
                     "           no type answered for any of {} probe(s); the engine's reason for \
                      each follows, and one that is not 'type not found' is a query that could not \
                      run rather than a PDB without type records",
                     probes.len()
                 );
-                for (name, answer) in &probes {
-                    if let Err(why) = answer {
-                        println!("           {name}: {why}");
-                    }
-                }
             } else {
-                println!("           types answered for {found:?}");
+                println!(
+                    "           types answered for {found:?}; any probe that failed is below, and a \
+                     failure beside a success is a query that could not run rather than an absent \
+                     type — the provider demonstrably works"
+                );
+            }
+            // **Outside the branch**, because an engine failure must not disappear from the report
+            // because a *different* probe succeeded. That is the same swallow round 5 took out of
+            // `type_probes` surviving in the one branch this bench cannot reach: every probe fails
+            // against this PDB, so `found` is never non-empty here and the mixed case went unseen
+            // until review read it. Not unit-tested, and the reason is worth stating rather than
+            // hiding — `report_symbols` takes the engine-holding `Symbols`, so exercising it needs an
+            // engine, and splitting a printable provenance out to test a `println!` is more structure
+            // than this fix is worth.
+            for (name, answer) in &probes {
+                if let Err(why) = answer {
+                    println!("           {name}: {why}");
+                }
             }
         }
     }
