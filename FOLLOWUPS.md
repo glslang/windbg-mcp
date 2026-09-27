@@ -3083,16 +3083,46 @@ needs a story for the client that asks for `all`.
 - **A spec that subtracts** (`--tools all,-securekernel`). No change to what a group is, and it
   leaves the default surface as it is — which is the thing being complained about, so it helps the
   operator who already knows and nobody else.
-- **Nothing, and say so in the docs.** The honest option if the measurement below says the cost is
-  noise. 7.3% of the surface is not obviously noise, but the surface is 26k tokens against context
-  windows that are now much larger than they were when item 24 measured it, and *that* is the
-  comparison nobody here has re-taken.
+- **Nothing, and say so in the docs.** Still on the table, and it does not need the measurement
+  below: 7.3% of the surface is not obviously noise, but the surface is 26k tokens against context
+  windows that are now much larger than they were when item 24 measured it — and *that* comparison is
+  one nobody here has re-taken, needs no model and no bench, and would settle whether this item is
+  about anything at all.
 
-**The measurement to take first** is not about bytes: it is whether a model served the wider surface
-is measurably worse at the tasks it *is* for. `tools/local_model_eval.py` is the bench that could say
-so (`.claude/skills/eval-bench`), and the grid already varies the surface. Until that has run, this
-item is a cost with no demonstrated harm, which is why it is an item rather than a change.
+**The measurement that would settle it is not available here, and saying which of two reasons that
+is matters.** The question is whether a model served the wider surface is measurably worse at the
+tasks it *is* for — `tools/local_model_eval.py` is the only thing in this repo that can answer it
+(`.claude/skills/eval-bench`). Two things stand between the item and that answer:
+
+- **The grid has no arm for this question.** Its surfaces are `full`, `lean`
+  (`session,inspect,crash`) and `min` (`crash`), narrowed **toward** `crash` — so what it measures is
+  what a *small* surface costs, and three of its six tasks cannot be answered on the 11-tool one at
+  all. This item asks the opposite: what the extra 7,529 B on the **full** surface costs. That needs a
+  new arm — every tool *except* `securekernel` — which is a plan change and a fourth credential rather
+  than a run. An earlier draft of this item said "the grid already varies the surface", which is true
+  and beside the point.
+- **And the model side is not on this bench.** The ollama arms need the weights somewhere with the
+  compute for them, which for this project is a **Mac**, with the listener here behind an ssh forward
+  (`docs/local-model.md`'s second row — the arrangement every published figure came from). The
+  checked-in plan says so itself rather than this paragraph asserting it: all three models on its
+  **ollama** rows are `-mlx` builds, and MLX runs on Apple silicon. (Its third row is
+  `backend: claude-code`, which is hosted and names no local weights — so the constraint is on the
+  ollama arms, which are the ones this question needs.) The Windows debugging
+  host has no compute for local models at all, so *row one of that table is not an option here*,
+  whatever the product supports. A grid run is hours, so this is a two-machine arrangement to
+  schedule rather than an afternoon.
+
+**So the honest status is blocked, and deciding it without the measurement is a legitimate outcome
+rather than a lesser one.** The case for an `extra` marker does not rest on the eval: the setup this
+group needs is three-part (a checkpoint, the SDK, a VBS guest), which is a stronger statement about
+the audience than any accuracy delta would be, and the cost is arithmetic that is already taken. What
+the eval would add is the *size* of the harm, which decides how much machinery the remedy is worth —
+so if it runs, run it **after** deciding the shape, to price the change rather than to authorise it.
 
 **Where it picks up:** `GROUPS` and `Toolset::parse` in `src/toolset.rs`, the join test in
 `tests/mcp_smoke.rs`, `docs/tool-surface.md`'s table, and the two ceilings in `tests/mcp_smoke.rs`
-whose doc comments record what each raise bought.
+whose doc comments record what each raise bought. If the eval arm is ever added it is a surface in
+`tools/eval_plan.json` plus a credential in whatever `EVAL_TOKENS` names — and note that plan's
+`"tools": 51` label for `full`, which was the count when it was written and is 67 now: the records
+carry the served surface, so the label is a reader's hint rather than a measurement, and a new arm is
+the moment to re-derive it.
