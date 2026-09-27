@@ -333,10 +333,13 @@ judgement call at all, and does not need escalating.
 **What the trigger does not license is waving findings through, and this PR is the proof.** By round
 ten the answer had not moved for ten rounds and the loop looked spent. **Round 15 then found that
 `--json` could destroy the capture it had just read**, and round 16 found a real defect in round
-15's own guard. Of the last seven rounds, four went on code the review had added *and* two found
-genuine defects, one destructive — so a rule that stops on round count, or on *"the result stopped
-moving"*, ships a tool that overwrites its input. The stop is never on **reading** findings, and
-never on fixing a defect in code that already exists.
+15's own guard. Of the last seven rounds, four went on code the review had added — and **every one
+of the seven named something real**: a false negative reported as a clean result, records missed at
+chunk boundaries, a counter that read nothing-found as nothing-there, an unreadable module name
+indistinguishable from an empty one, an overclaim in checked-in prose, a destructive output path,
+and a guard handed a subset of the inputs it promised. So a rule that stops on round count, or on
+*"the result stopped moving"*, ships a tool that overwrites its input. The stop is never on
+**reading** findings, and never on fixing a defect in code that already exists.
 
 **Freeze the surface instead.** Once an instrument has answered the question it was built to answer,
 its scope is closed: a finding that names a defect in what is there is fixed, and a finding asking
@@ -346,6 +349,16 @@ made and said out loud if not. That converges on the number that matters, becaus
 exactly what those eleven commits were re-reviewing. It applies to an instrument built to answer a
 question; on shipped server code, new surface may be the deliverable and this is the wrong rule.
 
+**A finding can be both, and then the remedy is to retract the claim rather than build machinery to
+earn it.** Rounds 9 and 10 of that PR each named a real defect in existing behaviour — a
+completeness flag that conflated two answers, and a physical scan reporting no tag with every
+failure counter at zero — and each remedy added surface without touching one existing line. That is
+the case the paragraph above splits badly: the finding is not a new-mechanism request and declining
+it would be wrong. Weakening what the instrument claims costs a sentence and leaves nothing for the
+next round to review; another counter to make the strong claim true leaves surface that four later
+rounds went on. Prefer the retraction, and reach for the mechanism only when the claim is the
+deliverable.
+
 **Then stop, and do not ask.** The terminal round is the one whose findings are all new-mechanism
 requests and prose preference with no defect in existing surface. Do not request another review
 after it. Report once to whoever is driving the work: rounds worked, findings taken against
@@ -354,3 +367,14 @@ triage it themselves rather than take your word that nothing is left. **Continui
 is what needs a reason; stopping does not.** Each further round costs a CI cycle and a context
 window, and the rule exists so the decision belongs to the two numbers rather than to whoever runs
 out of patience first.
+
+**What it buys, replayed over the PR that produced it: not a shorter review.** The trigger fires at
+round five — the answer had not moved and three of the first five commits were already modifying
+their predecessors' lines — and the terminal condition is never reached, because every round from
+five to sixteen named a defect in surface that existed. Two remedies would have been smaller and ten
+would have been unchanged: **sixteen rounds either way.** What the rule actually moves is earlier
+than the stop. Rounds one to five changed or added **1,119** lines across probe and test against the
+**1,183** they were reviewing — they nearly doubled the artifact, and rounds 11, 12, 13 and 16 then
+found defects in what those rounds had added. **The lever is the size of each remedy, not the
+decision to stop.** What the stopping half buys is narrower and still worth having: the decision
+stops being escalated as a judgement call, and the loop stops being invisible.
