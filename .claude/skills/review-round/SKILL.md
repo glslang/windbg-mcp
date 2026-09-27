@@ -51,11 +51,25 @@ its absence is not evidence about anything.
 **Asking for a review to settle the question is the move that compounds.** `@codex review` starts a
 *fresh* round on the same head, whose findings need remedies, whose surface the next review then
 reads — and the remedies it produces are what B measures in *The stopping rule*. A review you
-triggered to resolve your own uncertainty is not evidence of closure; it manufactures a round. A
-`Completed` row closes **Codex's** review and not the round: on this repo CodeRabbit has twice filed
-findings minutes after it, so the round is closed when the row reads `Completed` at the head **and**
-a settle has passed with nothing new anchored there from either reviewer. If no row exists at all,
-the PR was never reviewed — a fact to report, not a gap to fill with a trigger.
+triggered to resolve your own uncertainty is not evidence of closure; it manufactures a round. If no
+row exists at all, the PR was never reviewed — a fact to report, not a gap to fill with a trigger.
+
+**A `Completed` row closes Codex's review, not the round, and the other reviewer's state is
+observable rather than a waiting game.** CodeRabbit publishes one check per head whose *description*
+is the state: `Review completed` once its findings are in, `Review rate limited` when it did not
+review that head and never will. Both sit in a `success` bucket, which is why the rule above is to
+read the reason text.
+
+```console
+gh api repos/<o>/<r>/commits/<head>/status \
+  --jq '.statuses[] | select(.context=="CodeRabbit") | .description'
+```
+
+Wait for one of those two before closing, because a duration is a guess: CodeRabbit trailed Codex by
+**1 minute** on this PR, **3 minutes** on #393 and **23 minutes** on #392, so a five-minute settle
+catches the first two and misses the third. Whether the description flips before or after its
+comments land is not measured here, so allow a short settle after the flip rather than closing on
+the flip itself.
 
 **A round is not a moment, and reading it as one loses findings.** Codex posts a round's comments
 over a minute or two, so a watcher that fires on the *first* comment reads a partial round. On
@@ -352,15 +366,20 @@ filed against, which the findings name themselves:
 ```console
 for p in $(gh api --paginate repos/<o>/<r>/pulls/<n>/comments --jq '.[].path' | sort -u); do
   printf '%s %s %s\n' "$(git show <first-commit>:"$p" 2>/dev/null | wc -l)" "$(wc -l < "$p")" "$p"
-done | awk '{b+=$1; a+=$2} END {printf "%d -> %d  %+.0f%%\n", b, a, (a-b)*100/b}'
+done | awk '{b+=$1; a+=$2} END {
+  if (b == 0) print a, "lines, all of it added after the first commit: B is yes"
+  else printf "%d -> %d  B %s (%+.1f%%)\n", b, a, (2*a > 3*b ? "yes" : "no"), (a-b)*100/b }'
 ```
 
 A path the first commit does not have counts as **zero** there, which is the whole point: a file a
 remediation commit added is review-added surface, and skipping it would understate B by exactly the
-thing B is for. The `2>/dev/null` is what makes that happen rather than failing the loop. A
-**rename** inflates B, because the old path goes to zero and the new one appears at full size —
-resolve it with `git log --follow` on the new path, or accept the inflation and say so in the
-number.
+thing B is for. The `2>/dev/null` is what makes that happen rather than failing the loop, and the `b
+== 0` arm is for the review whose entire artifact arrived after the first commit — all baselines
+zero, which is B yes and a division by zero if you let it reach the percentage. The verdict is
+printed rather than inferred from the percentage because `1000 -> 1501` prints as `+50%` at zero
+decimals and B is **yes** there: `2*a > 3*b` is the test, and exactly +50% is no. A **rename**
+inflates B, because the old path goes to zero and the new one appears at full size — resolve it with
+`git log --follow` on the new path, or accept the inflation and say so in the number.
 
 **Compute the predicate once the PR has five remediation commits, then after every round, and write
 it down.** Two terms, and they are the only things in this section that decide anything:
