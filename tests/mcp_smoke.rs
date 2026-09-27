@@ -18700,6 +18700,65 @@ fn a_kdnet_endpoint_another_process_holds_is_refused_rather_than_parked() {
     );
 }
 
+/// **An opener's refusal answers in the opener's own shape, `target` and all.**
+///
+/// Every opener declares an outcome whose error branch is `OpenFailure`, and `target` — did this
+/// open create or claim anything — is the field that decides whether opening again is a recovery or
+/// a second attach. An argument refusal that answered with the ordinary `Outcome` shape would be
+/// missing it, so a schema-validating client rejects the very message telling it what was wrong.
+/// `open_sk_capture` shipped three such refusals until review caught them (CodeRabbit,
+/// [#401](https://github.com/glslang/windbg-mcp/pull/401)).
+///
+/// In the protocol tier: every refusal here is answered before a worker is spawned, so no engine is
+/// involved. Which is also what makes it a **general** claim rather than one tool's — the two
+/// openers with argument checks reachable without a debugger are asserted together, and a third
+/// added later that uses the wrong helper fails here.
+#[test]
+fn an_openers_argument_refusal_says_whether_a_target_was_created() {
+    let mut server = Server::started();
+    for (tool, args, expect) in [
+        // Two ways of naming a capture, which is a caller meaning something this cannot do.
+        (
+            "open_sk_capture",
+            json!({ "vm": "Lab", "vmrs": "Z:\\no\\such.vmrs", "image": "Z:\\no\\such.exe" }),
+            "name one capture",
+        ),
+        // A snapshot belongs to a VM, and silently ignoring it would read whichever checkpoint
+        // Hyper-V answered with.
+        (
+            "open_sk_capture",
+            json!({ "snapshot": "H1", "vmrs": "Z:\\no\\such.vmrs", "image": "Z:\\no\\such.exe" }),
+            "names a checkpoint of a `vm`",
+        ),
+        // `attach_kernel` with neither selector: the same rule, and the one this shape came from.
+        ("attach_kernel", json!({}), "profile"),
+    ] {
+        let response = server.call_tool(tool, args, STEP);
+        assert_no_error(&response, tool);
+        assert!(is_tool_error(&response), "`{tool}` was expected to refuse");
+        let data = &response["result"]["structuredContent"];
+        assert_eq!(data["status"], "error", "{data}");
+        assert_eq!(
+            data["target"],
+            json!("no"),
+            "`{tool}`'s argument refusal must carry `target`, and `no` is the honest value — \
+             nothing is opened before the arguments are read: {data}"
+        );
+        assert_eq!(
+            data["error"]["category"],
+            json!("invalid_argument"),
+            "{data}"
+        );
+        assert!(
+            data["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(expect),
+            "`{tool}` refused for the wrong reason: {data}"
+        );
+    }
+}
+
 // ---- tier 7: a Secure Kernel capture -------------------------------------------
 
 /// The capture the Secure Kernel tier reads, or `None` with a `SKIPPED` line.
@@ -18847,6 +18906,24 @@ fn a_secure_kernel_capture_opens_as_a_session_and_answers_about_its_vtl1() {
             "a capture with no VTL1 refuses a read saying so: {refusal}"
         );
     }
+
+    // **`sk_symbol` against a session opened without symbols**, which is the fourth tool and the
+    // reason this test's prose could claim four. It is a refusal rather than an absence of names:
+    // the session says which of the three symbol states it is in, so a caller learns the remedy
+    // (open it again with `symbols`) rather than an empty answer. The tier does not ask for symbols
+    // because they need a reachable store, and what is asserted here holds either way.
+    let without = server.tool_failure(
+        "sk_symbol",
+        json!({ "session_id": session, "name": "SkLoadedModuleList" }),
+        TARGET_STEP,
+    );
+    assert!(
+        without["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("without symbols"),
+        "a capture session with no symbols must say so rather than answering nothing: {without}"
+    );
 
     // **The gate, in the direction only a capture can test**: the engine in this session's worker
     // holds the image on disk, so a debugger tool would answer about the wrong thing. The unit

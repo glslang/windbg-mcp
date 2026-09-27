@@ -1183,6 +1183,18 @@ pub(crate) enum ListIncomplete {
     LeftTheList(Gva),
 }
 
+impl CrossCheck {
+    /// Whether this route and `block` name the same list head.
+    ///
+    /// The two are independent: this one found a loader entry whose `DllBase` is the identified base
+    /// and followed its `Blink`, where the block's `PsLoadedModuleList` is a field read out of a
+    /// structure located by its tag. Them agreeing is what makes either believable, and it is a
+    /// comparison rather than a property of having found something.
+    pub(crate) fn agrees_with(&self, block: &KdbgHit) -> bool {
+        self.head.0 == block.ps_loaded_module_list
+    }
+}
+
 /// Why a list does not vouch for the block that pointed at it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum ListInvalid {
@@ -1489,6 +1501,11 @@ pub(crate) fn identify(
 }
 
 /// The list head found structurally, without reading any debugger data block.
+///
+/// **It is not an agreement until something compares it**, which is the whole of what this route is
+/// for: [`CrossCheck::agrees_with`] is that comparison, and it lives here rather than in a renderer
+/// because there are now two of them and one of them got it wrong. `--sk-inspect` compared; the tool
+/// surface reported `agrees: true` for any `Ok` (CodeRabbit, [#401](https://github.com/glslang/windbg-mcp/pull/401)).
 #[derive(Debug)]
 pub(crate) struct CrossCheck {
     /// The loader entry whose `DllBase` is the identified base.
@@ -1717,6 +1734,40 @@ mod tests {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     use super::*;
+
+    /// **The structural route agrees with the block only when the two heads are the same address.**
+    ///
+    /// Pinned here rather than in either renderer because there are two of them, and the tool
+    /// surface reported agreement for any successful search until review caught it — the search
+    /// finding a loader entry and following its `Blink` is what it *does*, and whether that head is
+    /// the one the block names is the question it exists to answer.
+    #[test]
+    fn a_cross_check_agrees_only_with_the_head_the_block_names() {
+        let head = 0xFFFF_F807_0EED_0770;
+        let found = super::CrossCheck {
+            entry: super::Gva(0xFFFF_B700_0220_20C0),
+            head: super::Gva(head),
+            pages_scanned: 1249,
+            pages_unreadable: 0,
+        };
+        let block = |names: u64| super::KdbgHit {
+            va: super::Gva(0xFFFF_F807_0EED_C5E0),
+            image_offset: 0x1335E0,
+            size: 0x3A0,
+            kern_base: 0xFFFF_F807_0EDA_9000,
+            kern_base_matches: true,
+            ps_loaded_module_list: names,
+        };
+        assert!(
+            found.agrees_with(&block(head)),
+            "two routes naming one head is the agreement this check exists to report"
+        );
+        assert!(
+            !found.agrees_with(&block(head + 0x10)),
+            "a block naming a different head is a disagreement, and the decode's two witnesses are \
+             then not about one structure"
+        );
+    }
 
     /// A physical address space built by hand, with per-page refusals.
     struct Fixture {

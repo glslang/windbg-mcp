@@ -623,6 +623,22 @@ enum Cleanup {
     /// publishing it. Raised by Codex on
     /// [#392](https://github.com/glslang/windbg-mcp/pull/392).
     TargetLost,
+    /// A Secure Kernel capture op — the opener's decode, a read, a module list, a symbol lookup.
+    ///
+    /// **Sealed because a break cannot reach it, which is the opposite of the three above**: those
+    /// are sealed to protect work that must not stop half way, and this is sealed because there is
+    /// nothing there to stop. A capture op runs this server's own Rust and the SDK provider's code;
+    /// it makes no DbgEng call that polls for a Ctrl+Break, so `SetInterrupt` files against an
+    /// engine that is holding an image and idle.
+    ///
+    /// What sealing buys is the *answer*. Unsealed, [`interrupt_running`] marked the job and
+    /// [`release`] then routed a complete result through [`cut_short`] — so a decode that ran to the
+    /// end came back labelled as truncated, and the interrupt's own caller was told an operation was
+    /// stopping that was not. Raised by Codex on
+    /// [#401](https://github.com/glslang/windbg-mcp/pull/401). Sealed at the door by [`claim`],
+    /// like a teardown and for the same structural reason: there is no phase to enter, the whole op
+    /// is uninterruptible from its first instruction.
+    NotInterruptible,
 }
 
 static RUNNING: Mutex<Running> = Mutex::new(Running {
@@ -782,6 +798,14 @@ fn claim(e: &DebugEngine, id: u64, cleanup: Option<Cleanup>) {
 fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
     match op {
         EngineOp::EndSession => Some(Cleanup::Teardown),
+        // Every capture op, including the opener, whose decode is the long one. See
+        // [`Cleanup::NotInterruptible`]: none of them can be reached by a break, so an interrupt
+        // aimed at one is refused with the reason rather than marking a job whose result then
+        // reports itself cut short.
+        EngineOp::OpenSecureKernel(_)
+        | EngineOp::SkModules
+        | EngineOp::SkRead { .. }
+        | EngineOp::SkSymbol { .. } => Some(Cleanup::NotInterruptible),
         _ => None,
     }
 }
@@ -1619,6 +1643,19 @@ fn interrupt_running(bound: Option<u64>) -> Result<(Interrupted, String), String
                      would act on whatever the engine is holding instead. Its reply is on its way \
                      and says what the batch changed, what it could not undo, and whether this \
                      session's handle survives it."
+                ),
+                // **Says what it cannot do rather than what it is protecting**, which is the
+                // difference between this and the three above: there is no work here a break would
+                // damage, there is simply nothing for a break to reach. Offering `end_session` as
+                // the way out is honest — it ends the session and the read with it — and is
+                // deliberately named as costing the session rather than stopping the read.
+                Cleanup::NotInterruptible => format!(
+                    "Not interrupted. The operation on this session (job {job}) reads a Secure \
+                     Kernel capture, which runs no debugger command: a Ctrl+Break has nothing in \
+                     it to land on, so nothing was sent and this call's result will not be \
+                     reported as cut short. Its own bounds are the decode's — the walk's read and \
+                     leaf budgets, which its report carries — and `end_session` ends the session \
+                     outright if it has to be stopped, at the cost of re-reading the capture."
                 ),
                 // Deliberately not offering `end_session` as the way out, which is the advice
                 // above and is void here: this *is* that teardown.
@@ -14475,24 +14512,63 @@ mod tests {
         assert_eq!(running.sealed(8), None, "the next job starts interruptible");
     }
 
-    /// **A teardown is sealed at the door and nothing else is.**
+    /// **What is sealed at the door, and the two different reasons for it.**
     ///
-    /// Sealing it inside its own arm left a window — the claim, then a statement or two, then the
-    /// seal — in which an interrupt still found an interruptible job: the break it raised was
-    /// consumed by the seal that followed, so the target was protected, while its caller had been
-    /// told the teardown was stopping and `Running::interrupted` still named a teardown that went
-    /// on to succeed, which `release` turns into a completed result reported as cut short.
+    /// A **teardown** is sealed because sealing it inside its own arm left a window — the claim,
+    /// then a statement or two, then the seal — in which an interrupt still found an interruptible
+    /// job: the break it raised was consumed by the seal that followed, so the target was protected,
+    /// while its caller had been told the teardown was stopping and `Running::interrupted` still
+    /// named a teardown that went on to succeed, which `release` turns into a completed result
+    /// reported as cut short.
     ///
-    /// A batch is deliberately not here. Its rollback is a phase it enters partway through, so
-    /// sealing it at the claim would make its steps uninterruptible — which is the whole of what
-    /// `interrupt` on a batch is for.
+    /// A **capture op** is sealed for the other reason: not to protect the work but because a break
+    /// cannot reach it at all. It runs this server's own Rust and the SDK provider's, polls no
+    /// DbgEng call, and unsealed it produced exactly the outcome above from the other direction — a
+    /// decode that ran to the end, reported cut short, and an interrupt caller told an operation was
+    /// stopping (Codex, [#401](https://github.com/glslang/windbg-mcp/pull/401)).
+    ///
+    /// **This test's name used to say the teardown was the only one**, which is the shape review
+    /// round 6 of [#399](https://github.com/glslang/windbg-mcp/pull/399) is about: a name claiming a
+    /// general property over a body that checked one case. The name now states the rule, and the
+    /// body enumerates both halves — including a batch, which is deliberately **not** sealed here
+    /// because its rollback is a phase it enters partway through and sealing it at the claim would
+    /// make its steps uninterruptible, which is the whole of what `interrupt` on a batch is for.
     #[test]
-    fn a_teardown_is_the_only_op_sealed_before_it_starts() {
+    fn every_op_sealed_before_it_starts_is_one_a_break_must_not_or_cannot_reach() {
         assert_eq!(
             sealed_as(&EngineOp::EndSession),
             Some(Cleanup::Teardown),
             "a teardown that is not sealed by its claim has a window where it is not sealed at all"
         );
+        for op in [
+            EngineOp::OpenSecureKernel(Box::new(crate::sksession::Request {
+                capture: crate::savedstate::CaptureSpec::Vmrs(std::path::PathBuf::from("c.vmrs")),
+                image: std::path::PathBuf::from("securekernel.exe"),
+                kit: None,
+                kit_version: None,
+                vp: 0,
+                vtl: 1,
+                cross_check: false,
+                symbols: false,
+                symbol_path: None,
+            })),
+            EngineOp::SkModules,
+            EngineOp::SkRead {
+                address: 0xfffff80000000000,
+                size: 16,
+            },
+            EngineOp::SkSymbol {
+                name: Some("SkLoadedModuleList".into()),
+                address: None,
+            },
+        ] {
+            assert_eq!(
+                sealed_as(&op),
+                Some(Cleanup::NotInterruptible),
+                "a capture op that is not sealed has its complete result reported as cut short: \
+                 {op:?}"
+            );
+        }
         assert_eq!(
             sealed_as(&EngineOp::Batch(BatchOp {
                 steps: Vec::new(),

@@ -3556,25 +3556,39 @@ impl WindbgServer {
             // Spelled the way this caller's arguments are — `vm`, not `--vm`. The rule is shared
             // with the command-line role and the dialect is not.
             Err(why) => {
-                return typed_error(ErrorCategory::InvalidArgument, why.explain(""), None);
+                return open_failure(
+                    ErrorCategory::InvalidArgument,
+                    why.explain(""),
+                    None,
+                    TargetCreated::No,
+                );
             }
         };
         // Same shape as the role's `--snapshot` check, for the same reason: a snapshot belonging
         // to no VM is a caller who means something this cannot do, and ignoring it silently would
         // read whichever checkpoint Hyper-V happened to answer with.
         if args.snapshot.is_some() && args.vm.is_none() {
-            return typed_error(
+            return open_failure(
                 ErrorCategory::InvalidArgument,
                 "`snapshot` names a checkpoint of a `vm`, and no `vm` was given".to_string(),
                 None,
+                TargetCreated::No,
             );
         }
+        // **`open_failure`, not `typed_error`, for all three of these.** This tool declares
+        // `SkOpenOutcome`, whose error branch is the `OpenFailure` every opener answers with — and
+        // that carries `target`, which `Outcome<()>`'s does not. A schema-validating client would
+        // reject the refusal rather than read it (CodeRabbit,
+        // [#401](https://github.com/glslang/windbg-mcp/pull/401)); `attach_kernel`'s own argument
+        // refusals have always been this shape. `No` is the honest value: nothing is opened before
+        // these.
         if args.symbol_path.is_some() && !args.symbols {
-            return typed_error(
+            return open_failure(
                 ErrorCategory::InvalidArgument,
                 "`symbol_path` configures the engine `symbols` opens, and `symbols` was not given"
                     .to_string(),
                 None,
+                TargetCreated::No,
             );
         }
         let what = capture.describe();

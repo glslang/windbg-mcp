@@ -2645,6 +2645,40 @@ gaining a `secure_kernel` variant** — one enum variant paid eight times over, 
 golden keyed by *name* is what made visible. Both ceilings were raised with the arithmetic recorded
 beside them (96,500 → 105,000 and 268,000 → 295,000).
 
+#### Review round 1 on [#401](https://github.com/glslang/windbg-mcp/pull/401): six findings, five taken
+
+Worth recording as a set, because four of the five are the same shape — **a claim nothing compared**:
+
+- **The cross-check reported agreement for any successful search.** `cross_check_within` finds a
+  loader entry whose `DllBase` is the identified base and follows its `Blink`; whether that head is
+  the one the block names is the *question*, and `decoded` answered `agrees: true` without asking it.
+  `--sk-inspect` compared and the tool surface did not, which is why the comparison is now a method
+  on `CrossCheck` used by both — a rule with two renderers is a rule one of them gets wrong. The
+  field is `Option<bool>` now, for `SkLandmark::agrees`'s reason: a search that found nothing is not
+  a disagreement.
+- **An interrupt during a capture op marked the job**, so a complete decode was reported cut short
+  and its caller was told the operation was stopping. Sealed at the door now, with a `Cleanup`
+  variant whose doc says why it belongs in an enum named for cleanup: the other three are sealed to
+  protect work that must not stop halfway, and this one because there is nothing there to stop. The
+  test that pinned "a teardown is the only op sealed at the door" had a **name claiming a general
+  property** over a body that checked one case, which is review round 6 of #399's shape; it now
+  states the rule and enumerates both halves.
+- **`open_sk_capture`'s three argument refusals answered in the wrong shape.** The tool declares
+  `SkOpenOutcome`, whose error branch carries `target`; `typed_error` serialises `Outcome<()>`, which
+  does not — so a schema-validating client would reject the message telling it what was wrong.
+  `attach_kernel`'s argument refusals have always used `open_failure`, so this was the outlier rather
+  than a new rule, and the test now asserts it of **both** openers.
+- **The tier's prose claimed four tools and its body reached three.** `sk_symbol` was never called
+  against a capture. Rather than narrow the sentence, the test now calls it and asserts the refusal a
+  session opened *without* symbols gives — which pins a state that had no test at all, and makes the
+  sentence true.
+- **`docs/tool-surface.md`'s headline still said 95,792 B** while its own table said 103,293. The
+  `.claude/rules/tool-surface.md` trap exactly as written: the tables are checked against a running
+  server and a figure in a *sentence* is not.
+
+The sixth is declined with its fact taken, and is the timeout bullet in *What this does not
+establish* below.
+
 #### What this does **not** establish
 
 - **One capture, one build, one host.** The same limitation S1 and S2 carry, and the tier is written
@@ -2660,11 +2694,26 @@ beside them (96,500 → 105,000 and 268,000 → 295,000).
   between two reads.
 - **No writes.** S4 settled that the direct route writes VTL1, and nothing here exposes it. That
   stays out for the reason the plan's *Out of scope* section gives.
-- **The capture ops are not interruptible.** `interrupt` reaches DbgEng, and a page-table walk is
-  this server's own code: a break raised during an open does not stop it. What bounds it is the
-  walk's own budgets (20,000 table reads, 200,000 leaves) and the read counters that report them, not
-  a caller's clock. The measured open is ~16s on a 4 GiB guest's checkpoint; a caller whose call
-  timeout is shorter abandons the wait while the worker finishes, exactly as a slow dump open does.
+- **The capture ops are not interruptible, and they say so.** `interrupt` reaches DbgEng, and a
+  page-table walk is this server's own code: a break raised during one has nothing to land on. Round
+  1 of review found what that cost before it was said out loud — the interrupt marked the job, so a
+  decode that ran to the end came back through `cut_short` labelled as truncated, and the interrupt's
+  caller was told an operation was stopping that was not. The ops are sealed at the door now
+  (`worker::Cleanup::NotInterruptible`) and the refusal names what it cannot do. What bounds them is
+  the walk's own budgets (20,000 table reads, 200,000 leaves) and the read counters that report them,
+  not a caller's clock.
+- **An open that times out loses its decode, and the recovery is to open again.** The measured open
+  is ~16s against a 300s default call timeout, so the window is wide — but the decode travels on the
+  opener's reply *only*, and a caller who abandoned that wait cannot get it back: `sk_modules` still
+  answers, `session_status` reports state, and the root, the walk, the candidate rejections and the
+  read counters are gone until the capture is read again. Raised by Codex on
+  [#401](https://github.com/glslang/windbg-mcp/pull/401), **taken as a fact and declined as a
+  change**: the remedies are a fifth tool or a field on `session_status`, and both put another copy
+  of the report's ten-kilobyte schema on the wire for every caller — which is what item 106 is about,
+  arriving in the same review as the item. An earlier draft of this bullet said a timeout costs what
+  it costs "exactly as a slow dump open does", and that analogy is the part that was wrong: a dump's
+  summary is re-derivable from `modules` and `crash_triage`, and a capture's decode is not. The
+  recovery is `end_session` and a second open, which is the 16s again.
 - **`sk_read_memory`'s 64 KiB cap is a policy, not a measurement.** A capture is a file and the bytes
   are cheap; what is not cheap is the hex in a result a model pays for.
 - **The `.bin`/`.vsv` pair is still called by nothing.** It is selected by code in both roles and
