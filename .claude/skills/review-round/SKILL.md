@@ -50,9 +50,10 @@ its absence is not evidence about anything.
 
 **Asking for a review to settle the question is the move that compounds.** `@codex review` starts a
 *fresh* round on the same head, whose findings need remedies, whose surface the next review then
-reads — and the remedies it produces are what B measures in *The stopping rule*. A review you
-triggered to resolve your own uncertainty is not evidence of closure; it manufactures a round. If no
-row exists at all, the PR was never reviewed — a fact to report, not a gap to fill with a trigger.
+reads — and the remedies it produces are what the growth reading measures in *When to stop working
+rounds*. A review you triggered to resolve your own uncertainty is not evidence of closure; it
+manufactures a round. If no row exists at all, the PR was never reviewed — a fact to report, not a
+gap to fill with a trigger.
 
 **A `Completed` row closes Codex's review, not the round, and the other reviewer's state is
 observable rather than a waiting game.** CodeRabbit publishes one check per head whose *description*
@@ -86,8 +87,8 @@ against the count you actually worked. Both misses above were invisible in every
 and obvious the moment the totals disagreed — 25 comments against 21 worked. It costs one command
 at the end.
 
-**And reconciling is not the same as continuing.** *The stopping rule* at the end of this file is
-when to stop working rounds at all — a pair of numbers you compute, not a judgement call to hand
+**And reconciling is not the same as continuing.** *When to stop working rounds* at the end of this
+file is when to stop working them at all — a reading you record, not a judgement call to hand
 upward.
 
 **Codex is the bot to watch, and CodeRabbit's green is not evidence.** Its check reports `pass` with
@@ -95,7 +96,11 @@ upward.
 [#349](https://github.com/glslang/windbg-mcp/pull/349): across the PR's eight commits it filed **no
 reviews and no findings** — `pulls/<n>/reviews` has not one CodeRabbit entry — while its check read
 `pass` the whole way. All six findings there came from Codex. So read that check's reason text
-rather than its bucket, and do not wait on it or offer to re-trigger it.
+rather than its bucket. **That measurement stands and its conclusion no longer does**: since #349 it
+has filed real findings on four heads across three PRs, so treat it as a reviewer that is often
+absent rather than one that never runs, and wait on its *description* as the settle above says — a
+bounded wait, because `Review rate limited` is itself a terminal answer. Still do not offer to
+re-trigger it.
 
 **They also circle the same topic, and contradict each other and themselves across rounds.** A bot
 reviews *this diff* without the argument that produced it, so the same seam comes back round after
@@ -341,109 +346,39 @@ valid thunk: **a new defect, shipped on a true finding.** The test now sets a ge
 The first attempt used their example and failed, which is how it was caught — so write the test from
 the rule, run it, and read a failure as a question about which of the two is wrong.
 
-## The stopping rule: freeze the surface, then stop
+## When to stop working rounds
 
-**A review can go on finding real defects long after the work has stopped being worth it, and the
-tell is not the findings.** [#393](https://github.com/glslang/windbg-mcp/pull/393) ran **sixteen
-rounds and 33 findings** on one probe whose *answer* never moved: the S0 verdict, the VTL1 `CR3`
-`0x1201000` and all three landmark offsets are identical in the first commit and in the merge, and
-the documentation around them took **115 insertions against 10 deletions** — additive qualification,
-not a correction. What moved was the size of the thing: the first commit inserted **1,478** lines
-and the sixteen rounds added **2,367** more on top of it, **+160%**.
+**A review can keep finding real defects long after the work has stopped being worth it.**
+[#393](https://github.com/glslang/windbg-mcp/pull/393) ran **sixteen rounds and 33 findings** on one
+probe. The answer never moved — the S0 verdict, the VTL1 `CR3` `0x1201000` and all three landmark
+offsets are identical in the first commit and in the merge — while the artifact more than doubled:
+**1,478** insertions submitted, **2,367** added on top of them.
 
-So the predicate is **growth**, and it is measured on the PR's own diff so that there is no file set
-to choose:
+**That pair is the signal, and it is a reading rather than a formula.** The answer has stopped
+moving, and your remedies keep adding surface. Write both down in a line each round; what matters is
+that they are on the page and not in your head, because a judgement you have recorded does not need
+escalating to whoever is driving the work. **Resist turning them into a threshold.** This section
+was rewritten eight times under review, three of those redefining how the growth term was computed,
+and each of those rounds was a reviewer correctly arguing about a number in a diff — a stale freeze
+point, a rounding that hid the boundary, a division by zero, four defensible file scopes giving four
+different answers. None of it made the rule better at stopping anything. State the rule as a
+judgement you record, not as an instrument, or the instrument becomes the work.
 
-```console
-git diff --shortstat <first-commit>^ <first-commit>   # insertions: what was submitted
-git diff --shortstat <first-commit> HEAD             # insertions: what review has added since
-```
+**When it holds, stop adding surface — not stop reading findings.** Fix defects in what is there.
+Decline a finding that asks for new machinery, another counter, another reason field, another
+paragraph stating another limitation, and say why. When a real defect's only remedy would be new
+machinery, **retract the claim instead**: a weaker claim costs a sentence and leaves nothing for the
+next round to read, while a new counter leaves surface that later rounds will land on.
 
-**Compute the predicate after every round and write it down.** Two terms, and they are the only
-things in this section that decide anything:
+**Then stop at the first round whose findings are all new-mechanism requests and prose preference,
+and do not ask.** Report once: rounds worked, taken against declined, and anything left unworked
+with where to find it, so it can be triaged rather than taken on trust. Continuing past that point
+needs a reason; stopping does not. Do not trigger a review to confirm it — that manufactures a
+round, as the note on the 👍 above says.
 
-- **A** — has the deliverable's answer moved since the first commit?
-- **B** — are the insertions since the first commit more than half the insertions in it?
-
-Neither term is latched. B is a cumulative diff against the first commit, so a round that deletes
-more than it adds genuinely lowers it, and that is the freeze lifting for the right reason rather
-than flickering. A is re-read every round too: if a fix to an existing defect changes the answer,
-new surface is legitimate again and the freeze must lift, because otherwise the machinery the
-corrected answer needs would be declined by a rule whose own first sentence says a moving answer
-earns it. If the first commit inserted nothing, B is yes as soon as anything is added.
-
-**Freeze the surface when A is no and B is yes, and not before.** Either term alone is ordinary
-review: a still-moving answer means the artifact has not converged and new surface is legitimate,
-and growth while the answer is still moving is just the work being done. On #393 the pair first
-holds at the **third** remediation commit (+52%, ending at +160%) — earlier than it felt at the
-time, and before the rounds that produced the real defects. This PR is far past B — a 52-line first
-commit against which review has since added more than twice that — with an answer that moved every
-round, so the pair never holds here.
-
-**Why the PR's diff and not a list of files**, which took four review rounds to arrive at: every
-file set is a scope, and the scope decides the answer. Measured on #393: the files that attracted
-findings give +139% and a first yes at commit 5; **every** file the PR touched gives +23% and
-**never** fires, because `FOLLOWUPS.md` contributes two thousand barely-touched lines to the
-denominator; dropping the append-only logs gives +65% and a first yes at commit 14, too late to act
-on. A reviewer's suggestion to derive the set from the remediation changes is the second of those,
-and it would have disabled the rule on the PR it came from. The diff has no denominator to game: a
-file a remedy adds without ever attracting a comment counts, because it is insertions, and a large
-file nobody touched cannot dilute, because it is in nobody's diff.
-
-**Blame was the first attempt and it was worse.** An attribution metric needs the same file scope
-*and* a SHA namespace: on #393, blaming every changed file gives 16 of 17 commits with a first
-majority at commit 3, the two instrument files give 11 of 17 and commit 5, and one changelog bullet
-extended each round is enough to swing it, because an append-only log guarantees a hit and so
-carries no information. It also does not survive the merge — a squash or rebase rewrites every SHA,
-so a blame-based retrospective must run against the **pre-merge branch tip**, and doing that wrong
-here returned a confident **0 of 33** that looked exactly like a clean result.
-
-**The first draft of this section also got the diagnosis wrong, and only measuring caught it.** It
-said the review was re-reviewing its own output. Blame the line each comment is anchored to, at the
-commit it was filed against, and only **12 of 33** findings were on lines an earlier remediation
-commit had written — 17 if you also count the commit under review. The reviewer was mostly reading
-the **original** submission and finding real defects in it. What circled was the *remedies*: **11 of
-17** remediation commits modified lines an earlier one had introduced. The review was not eating its
-own output; the remedies were, and the surface they added is what every later round had to read.
-
-**What the trigger does not license is waving findings through, and this PR is the proof.** By round
-ten the answer had not moved for ten rounds and the loop looked spent. **Round 15 then found that
-`--json` could destroy the capture it had just read**, and round 16 found a real defect in round
-15's own guard. **Every one of the last seven rounds named something real**: a false negative
-reported as a clean result, records missed at chunk boundaries, a counter that read nothing-found as
-nothing-there, an unreadable module name indistinguishable from an empty one, an overclaim in
-checked-in prose, a destructive output path, and a guard handed a subset of the inputs it promised.
-So a rule that stops on round count, or on *"the result stopped moving"*, ships a tool that
-overwrites its input. The stop is never on **reading** findings, and never on fixing a defect in
-code that already exists.
-
-Once the predicate holds, the instrument's scope is closed: a finding that names a defect in what is
-there is fixed, and a finding asking for a **new** mechanism — one more counter, one more reason
-field, one more paragraph stating one more limitation — is declined **by scope**, with the reason in
-that round's commit if one is being made and said out loud if not. That is what keeps B from
-climbing further. It applies to an instrument built to answer a question; on shipped server code,
-new surface may be the deliverable and this is the wrong rule.
-
-**A finding can be both, and then the remedy is to retract the claim rather than build machinery to
-earn it.** Rounds 9 and 10 of that PR each named a real defect in existing behaviour — a
-completeness flag that conflated two answers, and a physical scan reporting no tag with every
-failure counter at zero — and each remedy added surface without touching one existing line.
-Declining them would have been wrong. Weakening what the instrument claims costs a sentence and adds
-nothing to B; another counter to make the strong claim true does.
-
-**Then stop, and do not ask.** The terminal round is the one whose findings are all new-mechanism
-requests and prose preference with no defect in existing surface. Do not request another review
-after it — see above on what triggering one costs. Report once to whoever is driving the work:
-rounds worked, findings taken against declined, **A** and **B**, and every finding left unworked
-with where to find it, so they can triage it themselves rather than take your word that nothing is
-left. **Continuing past that point is what needs a reason; stopping does not.**
-
-**What it buys, replayed over the PR that produced it: not a shorter review.** The predicate first
-holds at the fifth remediation commit and the terminal condition is never reached, because every
-round from five to sixteen named a defect in surface that existed — **sixteen rounds either way**,
-with two remedies smaller. What the rule actually moves is earlier than the stop, and B is a lever
-rather than a thermometer: the first five remediation commits changed or added **1,119** lines
-across probe and test against the **1,183** they were reviewing, nearly doubling the artifact before
-the predicate could even be computed. **The size of each remedy is the decision that matters, not
-the decision to stop.** What the stopping half buys is narrower and still worth having: the decision
-stops being escalated as a judgement call, and the growth stops being invisible.
+**It will not shorten the PR, and pretending it would is the trap.** Every round of #393 found
+something real, including round 15 finding that `--json` could destroy the capture it had just read
+and round 16 finding a defect in round 15's own guard. Stopping on round count, or on "the answer
+stopped moving", would have shipped a tool that overwrote its input. The lever is the size of each
+remedy rather than the decision to stop: three remedies had already added 763 lines against the
+1,478 submitted, and the rounds that found the worst defects were reading that addition.
