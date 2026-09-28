@@ -3048,10 +3048,18 @@ validated. The full record is the
   HVCI check. This guest has one, `LsaIso`, and it is inert: **0.3593750 s of CPU in 27.6 hours**,
   unchanged to the tick across a logon burst, because Credential Guard is not configured
   (`LsaCfgFlags` unset, `RequiredSecurityProperties = 0`). At that duty cycle 832,560 samples expect
-  ~3 hits and most of that CPU was spent at boot, so **zero is the predicted result**.
-- **S5g, 2026-09-28: three routes to VTL1 occupancy, all closed on this bench.** Run with the
-  operator's authorisation to reconfigure and reboot the VBS guest. **Credential Guard** is closed
-  by **edition** — `LsaCfgFlags`, the DeviceGuard scenario key and `EnableVirtualizationBasedSecurity`
+  about **1.5** hits if that time were spread evenly across two VPs -- 832,560 is the combined
+  total, which an earlier draft divided as though it were per-VP and called ~3 -- and under uniform
+  sampling zero still has roughly a **22%** probability. So this is *compatibility with rare
+  `LsaIso` activity*, *not* validation of the sampler; S5g's known VTL1 workloads later produced
+  zero hits too, which points at `ActiveVtl` not reporting rather than at the sampler missing.
+- **S5g, 2026-09-28: two routes to VTL1 occupancy closed, the enclave route OPEN and measured.**
+  Run with the
+  operator's authorisation to reconfigure and reboot the VBS guest. **Credential Guard** is **unresolved**, and an earlier
+  draft wrongly closed it *by edition* — Microsoft's table says Windows Pro: No, but the operator's
+  Pro machine reports Credential Guard protecting it and this bench's own Pro host runs `LsaIso`,
+  so Pro does run it; worse, that host reads `SecurityServicesRunning = 0` while its UI says CG is
+  on, so the field the guest was judged by is not a sound test. What was seen: `LsaCfgFlags`, the DeviceGuard scenario key and `EnableVirtualizationBasedSecurity`
   all set, **Secure Boot `On` for both reboots** (a documented CG prerequisite, disabled only later
   for the enclave route, so not a confounder), `SecurityServicesRunning` still `2` and no DeviceGuard
   events — because Microsoft's edition table reads *Windows Pro: **No***. `LsaCfgFlags = 1` is
@@ -3098,7 +3106,8 @@ validated. The full record is the
   (VBS/HVCI verified still running after both), a self-signed `CN=VTL1 Enclave Test` cert in
   `LocalMachine\Root`, Credential Guard keys set and inert, `C:\encl\` staged, and **four reboots**
   — so the `CR3`, self-map index and SK base have all moved again from the figures in S5c–S5f.
-- **Bench note:** eleven inbox driver images started in the VBS guest to provoke VTL1 will not stop
+- **Bench note (historical, S5f only — the S5g reboots cleared them; verified none running).**
+  Eleven inbox driver images started in the VBS guest to provoke VTL1 would not stop
   and stay loaded until it reboots. Harmless — drivers for hardware the VM lacks — but a later gate
   reading its module list should know why they are there.
 - **The debugger half is back to S5b's leftover**: whether a partition-scoped intercept fires for

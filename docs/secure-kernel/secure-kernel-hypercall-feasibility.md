@@ -2524,9 +2524,12 @@ was trying to show, and it is four orders of magnitude rather than one and a hal
   tick** across a burst of loopback logons. It is inert because Credential Guard is not configured
   — `LsaCfgFlags` unset, `RequiredSecurityProperties = 0`, `SecurityServicesRunning` listing HVCI
   alone — so `LsaIso` is loaded and does no work. At 0.36 s of VTL1 user-mode execution in 27 hours,
-  832,560 samples would expect **~3** hits if that time were spread evenly, and most of it was
-  spent at boot. **Zero is what the numbers predict**; the sampler was not missing VTL1, there was
-  almost none to miss.
+  832,560 samples would expect about **1.5** hits if that time were spread evenly -- that total is
+  the *combined* figure across two VPs, which an earlier draft divided as though it were per-VP and
+  called ~3 -- and under uniform sampling zero still carries roughly a **22%** probability. So the
+  arithmetic shows this result is **compatible with rare `LsaIso` activity**, which is weaker than
+  the validation of the sampler it was first written as: S5g's known VTL1 workloads produced zero
+  hits too, and that points at `ActiveVtl` not reporting rather than at a sampler missing windows.
 - **So the experiment that would settle it is to give the guest a trustlet that works.** That was
   then attempted, with the operator's authorisation, and is the S5g result below: both routes to a
   working trustlet are closed on this bench, one by edition and one by signing policy.
@@ -2546,7 +2549,7 @@ inbox drivers for hardware the VM does not have, they failed to find devices, an
 them — but the guest is not byte-for-byte as it was found, and a later gate reading its module list
 should know why there is a FireWire controller in it.
 
-### S5g result, 2026-09-28: two routes to VTL1 occupancy closed, the third open and measured
+### S5g result, 2026-09-28: the enclave route is open and measured; one route closed, one unresolved
 
 **Two doors are shut and the third is open: our own code now runs in VTL1, and a halt taken
 while it runs is the condition every earlier gate was qualified on.** The value is in both halves —
@@ -2555,7 +2558,7 @@ too rarely to catch" into a number; this turns "we could make it run" into two s
 and one success. Run with the operator's authorisation to reconfigure and reboot the VBS guest; see
 *What it cost the bench* at the end, because this one changed the guest materially.
 
-#### Route 1 — Credential Guard: closed by edition
+#### Route 1 — Credential Guard: unresolved, and the edition was the wrong answer
 
 The cheapest workload is the trustlet already present. `LsaCfgFlags = 1` did nothing, so
 `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard\Enabled = 1` and
@@ -2563,14 +2566,27 @@ The cheapest workload is the trustlet already present. `LsaCfgFlags = 1` did not
 `SecurityServicesRunning` stayed `2`** — HVCI alone, no Credential Guard, and not one event in
 `Microsoft-Windows-DeviceGuard/Operational` to explain it.
 
-**The explanation is the edition, and it is cited rather than asserted.** Microsoft's Credential
-Guard documentation carries an edition table — *Windows Pro: **No**, Windows Enterprise: Yes,
-Windows Pro Education/SE: No, Windows Education: Yes* — and this guest is `Windows 11 Pro`
-(`EditionID` `Professional`, build 26200). Not a configuration problem, so no configuration fixes
-it. **Review proposed that current Pro releases do support it; the table is why that is declined.**
-The nearest true statement in the same document is that a Pro device *previously* running
-Credential Guard — downgraded from Enterprise — can retain it, which is a legacy state rather than
-support, and this guest shows none of it.
+**The explanation is NOT the edition, and an earlier version of this section said it was.**
+Microsoft's Credential Guard documentation carries an edition table reading *Windows Pro: **No***,
+and that table was used here to decline a review finding which said the edition could not be the
+cause. **The finding was right and the citation was wrong.** The operator produced a Windows 11 Pro
+machine whose Security UI reports *"Credential Guard is protecting your account log-in from
+attacks"*, and this bench's own host — `Windows 11 Pro`, build 26200 — is running `LsaIso` with
+`VirtualizationBasedSecurityStatus = 2`. **Pro runs Credential Guard in practice**, whatever the
+table says.
+
+**Worse for the original reading, the test itself is suspect.** That host reports
+`SecurityServicesConfigured = 0` and `SecurityServicesRunning = 0` while its own UI says Credential
+Guard is protecting it — so `SecurityServicesRunning` staying `2` on the guest does not establish
+that Credential Guard failed to start, which is the entire evidential basis the conclusion rested
+on.
+
+**So this route is recorded as unresolved rather than closed.** Why the guest did not report
+Credential Guard after both documented switches and two reboots is unknown: candidates include the
+in-VM requirements the same documentation lists (a Hyper-V host with an IOMMU, a generation 2 VM),
+licensing entitlement, and the reporting field being unreliable. **It no longer blocks anything** —
+route 3 below produced the VTL1 workload this gate wanted — but the reasoning that retired it was
+unsound and is retracted here rather than left standing.
 
 **Secure Boot was `On` for both of those reboots**, which matters because Secure Boot is a
 documented Credential Guard prerequisite and this record later turns it **off** for the enclave
@@ -2738,9 +2754,12 @@ The VBS guest is **not** as it was found, and a later gate reading it needs to k
 - A self-signed **`CN=VTL1 Enclave Test`** certificate sits in the guest's `LocalMachine\Root`.
 - `LsaCfgFlags` and the DeviceGuard Credential Guard scenario keys are set and inert.
 - `C:\encl\` holds the enclave, its host and the certificate.
-- **Four reboots**, so every boot-specific landmark has moved again — the `CR3`, the self-map index
-  and Secure Kernel's base are all different from the figures in S5c through S5f, which is exactly
-  the trap the H4 correction above documents.
+- **Four reboots, and the new landmarks are *measured* rather than inferred from that count.**
+  Inferring movement from a reboot is the same error in reverse as inferring sameness from an equal
+  `CR3`, which this record corrects above — the value has repeated across boots before. As read
+  after S5g: VTL1 `CR3` **`0x3BEF2000`** (it was `0x1201000` for S5c–S5f) and Secure Kernel parked at
+  **`0xFFFFF80679FB0035`**. The self-map index was not re-read and is unknown rather than assumed to
+  have moved.
 
 ## Explicitly out of scope
 
