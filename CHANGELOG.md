@@ -37,6 +37,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read side. Halting both VPs of the VBS guest was measured: `SUCCESS` on each, both runtimes
   frozen (995 and 299 per 2000 ms against 45,005 and 23,046 before, and 229,059 and 30,687 after,
   the first a catch-up burst from a guest that really had stopped), both released clean.
+- **And the inspector has now run as one thing rather than as two halves joined by an inference.**
+  "End to end" originally composed S5c (halt the VPs, read *registers*) with H4 (read VTL1 *memory*
+  on a guest nobody stopped), measured in different runs — which review caught. One process now
+  drives both drivers, with the LiveCloudKd SDK's own freeze and pause **off** so the only stop is
+  the measured one: both VPs halted (runtimes 11,149 → 379 and 32,119 → 188), **3 of 3** VTL1 GPAs
+  returning content while halted, each read **twice inside the halt** and agreeing 3/3, two of them
+  byte-identical to H4's recorded values. What it does **not** show is that the halt was necessary:
+  the same double reads while running were stable too, since an idle guest changes nothing and
+  neither lab guest can be loaded from this host.
 - **S5 still does not pass, and the gap is stated rather than rounded off.** Its condition is *a
   VTL1 execution stop delivered to a debugger*: this is the **whole VP**, at an arbitrary point,
   found by polling. Set by naming VTL1, `HvRegisterExplicitSuspend` reads `1` at VTL0 too, and the

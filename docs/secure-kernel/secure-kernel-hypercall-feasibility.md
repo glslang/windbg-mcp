@@ -2227,11 +2227,33 @@ VTL0's.
 
 #### What it changes downstream
 
-- **A live VTL1 *inspector* is feasible end to end, and it has to halt every VP rather than one.**
+- **A live VTL1 *inspector* works end to end, and it has to halt every VP rather than one.**
   Stop the guest (S5c), read VTL1 registers (H3) and VTL1 memory by the direct route (H4), resume —
   on a running guest, with no capture. S3's tool surface was shaped for a fixed snapshot because S0
   said most users would have one; this says a *live* source can be given the same shape, with the
   stop bracketing the reads.
+
+  **That sentence was a composition of two halves measured in different runs until review said
+  so**, which is a fair thing to be caught by: S5c halted VPs and read *registers*, H4 read VTL1
+  *memory* on a guest nobody had stopped, and "end to end" was an inference joining them. It is now
+  one run. `s5d.py` drives both drivers in a single process — `h3probe.sys` for the halt,
+  LiveCloudKd's `hvmm.sys` for the direct route, with the SDK's `ForceFreezeCPU` and
+  `PausePartition` **off** so the only stop in the experiment is the measured one:
+
+  - both VPs of partition `0x7` halted, `SUCCESS` each, and both runtimes froze — **11,149 → 379**
+    and **32,119 → 188** over the same window, 2/2;
+  - **3 of 3** VTL1 GPAs that H4 established the direct route reaches returned content *while both
+    VPs were halted* — `0x0C00000`, `0x3E00000`, `0x4800000` — and `0x3E00000`'s
+    `ff01000000010000` and `0x4800000`'s `0000000000000060` are byte-identical to what H4 recorded
+    for them;
+  - each address was read **twice inside the halt** and agreed both times, 3/3, which is what
+    "fixed source" has to mean.
+
+  **What the run does not show is that the halt was necessary**, and the instrument says so itself:
+  the same double reads while the guest was *running* were stable too, 0 of 3 changing. An idle
+  guest is not a demanding test of consistency, and this bench has no way to load these guests —
+  neither answers ICMP or WinRM. So the composition is demonstrated and its *value* on a busy guest
+  is still an argument from what a second VP can do rather than a measurement of it.
 
   **The "every VP" part is a correction from review, and it is the difference between a stop and a
   snapshot.** S5c's other arms halt VP 0 alone, and on a two-VP guest the second processor goes on
