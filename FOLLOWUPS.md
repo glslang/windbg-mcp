@@ -3139,9 +3139,13 @@ validated. The full record is the
   the count first moves at sample 121/121 and 219/219. **Read where a count first moved, not what it
   ended at**; the last sample is on the wrong side of the release.
 - **S5 still does not pass, and what is missing is now one specific thing.** Its condition wants a
-  stop *delivered to a debugger*; this is a stop with nobody listening, because the parent holds no
-  port. So the remaining work is `HvCallCreatePort`/`HvCallConnectPort` and a SynIC message page in
-  `h3probe.sys` — driver work, with the catch half already measured — rather than another question
+  stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
+  port. That is not the same as nothing receiving it: the root's own stack owns a port for each
+  child (S5b found eleven `Vid.sys` sites installing intercepts on children), and an exception
+  intercept it never asked for landing there, never completed, would produce exactly this hold. So
+  the next gate starts by establishing **where the message goes today**, from `Vid.sys` and
+  `winhvr.sys`, and only then builds `HvCallCreatePort`/`HvCallConnectPort` and a SynIC message page
+  into `h3probe.sys`. Driver work with the catch half already measured, rather than another question
   about whether any route exists.
 - **The scope limit is the part to carry forward.** The enclave is VTL1 **user** mode; Secure Kernel
   is VTL1 **kernel** mode. A partition-scoped intercept whose ABI has no VTL field covering the first

@@ -2788,8 +2788,11 @@ in nothing else — `spin_host.exe BP0` runs the loop in VTL0, `BP1` runs the id
 the enclave through a new `RaiseBp` export, and each catches its own exception with `__try` /
 `__except` and counts what came back. The count is the detector: an intercept that fires takes the
 trap **before the guest dispatches it**, so `handled` tracking `rounds` says the guest saw every
-exception and `handled` frozen says something else took them. This parent holds no intercept port,
-so nothing here receives a message, and it does not need to.
+exception and `handled` frozen says something else took them. **This probe holds no port of its
+own**, so it receives nothing — and it does not need to in order to see the effect at the guest's
+end. That is not the same as saying nothing received the message: the root's own virtualization
+stack owns a port for every child it runs, and an exception intercept it never asked for arriving
+there is the likeliest mechanism of the hold. Unmeasured either way; see the bullets at the end.
 
 Beside it, from the parent: `HvRegisterVpRuntime` each second, a second PowerShell Direct
 connection four seconds into every intercept arm to ask whether the *guest* is still alive or only
@@ -2919,15 +2922,21 @@ nothing**, which is worth recording because S5g cost it four reboots.
   one is a reason to expect it covers the other, and expecting is not measuring. The plan forbids
   planting an `int 3` in Secure Kernel to check, and that prohibition stands — **so treat "a #BP in
   Secure Kernel would be held too" as an inference this record has not tested.**
-- **Nothing was delivered anywhere.** There is no port, no receiver and no intercept message was
-  read. S5's pass condition wants a stop *delivered to a debugger*, and this is a stop with nobody
-  listening. The gate does not pass.
-- **The mechanism of the hold is unmeasured.** Whether the hypervisor queues an undeliverable
-  intercept message and leaves the vCPU thread pending, or does something else, is not established
-  by anything here; what is established is the observable behaviour at the guest's exception
+- **Nothing was delivered to *us*.** This probe has no port and read no intercept message. S5's pass
+  condition wants a stop *delivered to a debugger*, and nothing here was. The gate does not pass.
+- **The mechanism of the hold is unmeasured, and the obvious candidate is not this probe's
+  absence.** Hyper-V's own stack owns a port for each child — S5b found eleven `Vid.sys` call sites
+  reaching `WinHvInstallIntercept`, so intercepts on children are ordinary there — and an exception
+  intercept nobody asked for arriving at that port, with `vmwp` never completing it, would produce
+  exactly this: the trap held, the thread pending, the rest of the partition untouched. Whether that
+  is what happens, or the hypervisor queues an undeliverable message some other way, is not
+  established by anything here. What is established is the behaviour at the guest's exception
   dispatch.
-- **`HvCallCreatePort` / `HvCallConnectPort` are untried.** Whether a parent can create a port of
-  its own and receive on it is the next question and is not answered here.
+- **`HvCallCreatePort` / `HvCallConnectPort` are untried**, and the bullet above is why the next
+  gate has to establish *where the message goes* before assuming a port of our own would receive
+  it. If intercepts are delivered to the partition's designated port, creating a second one is not
+  the answer and the question becomes which port the hypervisor uses and whether a parent may change
+  it.
 
 #### What to run next, and what not to repeat
 
@@ -2937,12 +2946,14 @@ nothing**, which is worth recording because S5g cost it four reboots.
   this gate's own retracted reading, and the script now refuses to make it.
 - **Do not** plant an `int 3` in Secure Kernel to extend the result from VTL1 user mode to VTL1
   kernel mode. S5a's prohibition is unchanged and the guest would bugcheck.
-- **The next experiment is the receiver**, and it is now a specific and bounded one: can the root
-  create a message port and connect it such that an exception intercept on a child is delivered to
-  it? That is `HvCallCreatePort`, `HvCallConnectPort` and a SynIC message page in `h3probe.sys` —
-  driver work rather than reversing, with the catch half already measured. If it can, S5's pass
-  condition is in reach for VTL1 *user* mode and the Secure Kernel question becomes the remaining
-  one.
+- **The next experiment is the receiver**, and it is now a specific and bounded one — but it starts
+  one step earlier than "create a port". First establish **where an exception intercept message on a
+  child is delivered today**, since the root's stack already owns a port for that child and is the
+  likeliest recipient; `Vid.sys` and `winhvr.sys` were both read for S5b and are the same two images
+  to read for this. Only then does `HvCallCreatePort` / `HvCallConnectPort` plus a SynIC message
+  page in `h3probe.sys` become the right build. That is driver work rather than reversing, with the
+  catch half already measured — and if it lands, S5's pass condition is in reach for VTL1 *user*
+  mode, with Secure Kernel's own code still the untested half.
 
 ## Explicitly out of scope
 

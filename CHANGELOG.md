@@ -28,8 +28,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   being the thing intercepted. Only the raising thread is held: the guest answered a second
   PowerShell Direct connection during every arm, and no guest needed a reboot.
   **S5 still does not pass**, and what is missing is now one specific thing rather than a question
-  about whether any route exists: the parent holds no port, so this is a stop with nobody listening,
-  and `HvCallCreatePort`/`HvCallConnectPort` in the probe driver is the next gate.
+  about whether any route exists: nothing was delivered to *us*, because this probe holds no port —
+  though the root's own stack owns one for each child, and an exception intercept it never asked for
+  landing there uncompleted is the likeliest mechanism of the hold. So the next gate establishes
+  where that message goes before building a receiver.
   **The scope limit is the part to carry forward**: the enclave is VTL1 *user* mode and Secure
   Kernel is VTL1 *kernel* mode, so that a partition-scoped intercept with no VTL field in its ABI
   covers the first is a reason to expect the second and not a measurement of it.
