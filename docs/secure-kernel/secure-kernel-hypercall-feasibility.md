@@ -1681,8 +1681,11 @@ the text report and the JSON carry them as separate answers.
 hypervisor's root VTL1 debug context is live — active port `0xC35C` (50012), both buffers allocated
 once `hypervisordebugpages` went 1000 → 2000 — and nothing ever connects to it; and post-26100
 `securekernel.exe` ships no KD transport. S5's specification says to start by asking whether those
-are the **same wall**. They are, on the route measured here: **Secure Kernel contains no code that
-could speak to that port.**
+are the **same wall**. They are, for the route this scan covers: **Secure Kernel has no hypercall
+or MSR route to that port.** Across ten builds it never writes a debug control code as an immediate
+anywhere in its executable bytes, contains no hypercall instruction of its own, and touches none of
+the synthetic-debugger MSRs. That is a statement about those three readings over those ten images,
+not a proof that no mechanism of any kind exists — the limits are named below, and S5 stays open.
 
 Entirely offline. No VM queried, attached, reconfigured or rebooted; no BCD change; no driver; no
 `int 3`; no reservation change; no re-capture of the activation return — the three "do not"s in the
@@ -1710,7 +1713,7 @@ call-graph reachability from each export: `KdInitialize` reaches `0x6B` **only**
 reaches only one code, and a send/receive pair that share it plus two others, is
 `HvResetDebugSession` with `HvPostDebugData`/`HvRetrieveDebugData` beside it.
 
-#### The subject: ten `securekernel.exe` builds, 19041.207 to 26100.9457
+#### The subject: ten `securekernel.exe` builds, 19041.207 to 29667.1000
 
 **No sample contains a `vmcall` or `vmmcall` instruction at all**, so every hypercall Secure Kernel
 makes goes through the hypercall code page, which lives in two globals. That makes the set of
@@ -1719,40 +1722,59 @@ which matters, because the name moved: the generic invoker is `HvcallpInitiateHy
 26100 and `HvcallInitiateHypercall` after, and a first pass that asked for the later spelling
 resolved nothing on nine of ten samples and reported "0 hypercall sites" for every one of them.
 
-| build | sha256[:16] | decode coverage | wrapper call sites | distinct control codes | debug codes | `0069/6A/6B` written | `vmcall` | SynDbg MSR |
-|---|---|---|---|---|---|---|---|---|
-| 19041.207 | `7F85188451EE4671` | 100.00% | 30 | 21 | **none** | 0 | 0 | 0 |
-| 19041.7725 † | `8C7135D0E37E2943` | 100.00% | 30 | 21 | **none** | 0 | 0 | 0 |
-| 22621.317 † | `49F6196295058CD4` | 100.00% | 29 | 19 | **none** | 0 | 0 | 0 |
-| 22621.7582 † | `4FBF5EAD32F49A12` | 100.00% | 30 | 20 | **none** | 0 | 0 | 0 |
-| 28000.2952 | `BA493451314B11A1` | 99.99% | 39 | 25 | **none** | 0 | 0 | 0 |
-| 29617.1000 | `BB29E5EFCFEE50FD` | 99.81% | 39 | 25 | **none** | 0 | 0 | 0 |
-| 29639.1000 | `28FAEB48277EE5F8` | 99.82% | 39 | 25 | **none** | 0 | 0 | 0 |
-| 29648.1000 | `77DA0F3187B73655` | 99.80% | 32 | 25 | **none** | 0 | 0 | 0 |
-| 29667.1000 † | `7CB598068319DAC7` | 99.81% | 32 | 25 | **none** | 0 | 0 | 0 |
-| 26100.9457 | `A9CDE82E39794FB2` | 100.00% | 63 | 38 | **none** | 0 | 0 | 0 |
+**The scan makes two readings and only the first decides anything**, which is the shape the first
+version of this gate got wrong by resting everything on one evaluator. **Reading A** — are the debug
+codes present as immediates, and are there privileged instructions — is taken over *every executable
+byte* by three overlapping passes: the functions the exception directory declares, a linear sweep of
+each executable section that restarts after every undecodable byte, and a raw opcode byte search
+that cannot desynchronise. **Reading B**, the hypercall repertoire, comes from an abstract evaluator
+that walks in address order without following control flow; it is a heuristic lower bound whose job
+is to be the negative control, and it is never allowed to produce the verdict.
+
+| build | sha256[:16] | executable bytes | `0069/6A/6B` written | `vmcall` | SynDbg MSR | wrapper call sites | codes resolved |
+|---|---|---|---|---|---|---|---|
+| 19041.207 | `7F85188451EE4671` | 653,715 | **0** | 0 | 0 | 30 | 21 |
+| 19041.7725 † | `8C7135D0E37E2943` | 660,803 | **0** | 0 | 0 | 30 | 21 |
+| 22621.317 † | `49F6196295058CD4` | 752,348 | **0** | 0 | 0 | 29 | 19 |
+| 22621.7582 † | `4FBF5EAD32F49A12` | 780,892 | **0** | 0 | 0 | 30 | 20 |
+| 28000.2952 | `BA493451314B11A1` | 1,065,757 | **0** | 0 | 0 | 39 | 25 |
+| 29617.1000 | `BB29E5EFCFEE50FD` | 1,083,601 | **0** | 0 | 0 | 39 | 25 |
+| 29639.1000 | `28FAEB48277EE5F8` | 1,103,817 | **0** | 0 | 0 | 39 | 25 |
+| 29648.1000 | `77DA0F3187B73655` | 1,017,801 | **0** | 0 | 0 | 32 | 25 |
+| 29667.1000 † | `7CB598068319DAC7` | 1,036,777 | **0** | 0 | 0 | 32 | 25 |
+| 26100.9457 | `A9CDE82E39794FB2` | 1,012,571 | **0** | 0 | 0 | 63 | 38 |
 
 † identity unverified — these are the four downloads whose bytes did not match the requested index
 record, flagged as such in
 [the build survey](secure-kernel-debugging-validation.md#offline-build-comparison-and-native-route-gate-2026-09-19).
 They agree with the six verified rows and are listed separately rather than counted with them.
 
-**Three independent readings, and the first is the airtight one:**
+**What the scan found, in the order the conclusion depends on it:**
 
-- **The values `0x0069`, `0x006A` and `0x006B` are never written.** Every occurrence of any of them
-  as an immediate in any of the ten images — 5 to 10 per build — is a `cmp`, in code unrelated to
-  debugging. Nothing in Secure Kernel ever materialises one of these numbers as a value, so nothing
-  can pass one to anything, whether or not the enumeration below reached every call site. Against
-  that, the control writes all three and compares none.
-- **The enumerated repertoire contains none of them.** 19 to 38 distinct control codes per build,
-  spanning `0x0002` to `0x0103`, growing as builds add capability — and never a debug code. This is
-  the negative control the scan needs: a Secure Kernel that issued *no* hypercall would be a broken
-  scan rather than a finding.
+- **No debug code is written as an immediate, anywhere in the executable bytes.** Every occurrence
+  of `0x0069`, `0x006A` or `0x006B` in any of the ten images — 5 to 10 per build — is a `cmp`, in
+  code unrelated to debugging. This is reading A, it covers 100% of each image's executable
+  sections, and it is what the conclusion rests on. Against it, the control writes all three
+  distinct values and compares none.
+- **The enumeration has no holes left to hide in.** The linear sweep leaves 14 to 30 bytes
+  undecoded per build, in 7 to 22 short runs, and on inspection every one is ASCII string data
+  embedded in `.text` — they contain `0x61`, which is invalid in long mode. The scan does not take
+  that on trust: it re-reads each run from *every possible instruction boundary*, with a 15-byte
+  lookback so an instruction overlapping a run is decoded too, and reports the runs and their bytes
+  so the reading can be checked. The raw opcode pass covers those same bytes for the privileged
+  instructions independently.
 - **The synthetic-debugger MSRs are untouched.** Zero accesses to `0x400000F0`–`0x400000FF` in any
-  build, against 20 to 27 *other* synthetic-MSR sites per build — so the MSR scan demonstrably works
-  on these images and simply finds no debug MSR.
+  build, against 22 to 30 *other* synthetic-MSR sites per build — so the MSR scan demonstrably works
+  on these images and simply finds no debug MSR. Its index is read from the evaluator's state
+  rather than from the nearest preceding load, so `mov ecx, 0x400000EF; inc ecx; rdmsr` is followed
+  and an intervening call invalidates it; 16 to 19 sites per build have an index this cannot
+  resolve, and they are reported rather than dropped.
+- **The repertoire is the negative control, and it is a lower bound.** 19 to 38 distinct control
+  codes per build across 29 to 63 wrapper call sites, spanning `0x0002` to `0x0103`, growing as
+  builds add capability — and never a debug code. A Secure Kernel that issued *no* hypercall would
+  be a broken scan rather than a finding, which is the whole reason this reading exists.
 
-#### Three traps, each of which produced a wrong reading first
+#### Four traps, each of which produced a wrong reading first
 
 - **A sample named after its version resolves no symbols, and the scan then reports the answer you
   were hoping for.** `cdb` names a module after its *file*, so
@@ -1766,6 +1788,15 @@ They agree with the six verified rows and are listed separately rather than coun
   extended-fast rep limit, because a 112-byte fast input is a 16-byte header plus twelve 8-byte
   elements. Read the `cmp` as the bound and the `mov` as the code and you are right; read either
   the other way and it still looks right.
+- **Resting the whole negative on one approximate component.** The first version of this scan had a
+  single straight-line evaluator carrying the conclusion, and review found **six independent ways
+  it could invent a code or miss one** — partial-register writes (`mov ecx, 0x100; mov cl, 0x69` is
+  `0x0169`, not `0x0069`), branch joins, `and reg, 0` against a tracked parameter, tail calls,
+  an MSR index mutated between its load and the `rdmsr`, and a function that both forwards a
+  parameter and calls with a literal. Each was individually fixable and fixing them one at a time
+  was the wrong response: what generated them was a *negative* resting on a component that can only
+  ever be approximately right. The split into a sound reading that decides and a heuristic reading
+  that corroborates is the fix, and the six defects were repaired underneath it.
 - **Treating every function that calls the hypercall page as a wrapper reads bug check codes as
   hypercall codes.** `SkeBugCheckEx` calls the page directly, so an earlier pass enumerated *its*
   callers and took each `KeBugCheckEx(code, …)` argument for a control code — 271 call sites and 72
@@ -1794,11 +1825,17 @@ They agree with the six verified rows and are listed separately rather than coun
   read was of this workspace's `10.0.26100.9444`, which is not the lab guest's build.
 - **It is static, and a computed code would evade the immediate scan.** The three values are never
   written as immediates; a value *arrived at* arithmetically (`mov ecx, 0x68` then `inc ecx`) would
-  not show in that reading. The enumerated repertoire covers the computed cases it can resolve, and
-  between them the two readings are what the claim rests on.
-- **Coverage is not quite total on four builds.** 99.80% to 99.82% on 29617, 29639, 29648 and
-  29667, where three or four declared functions decoded short — roughly 1,900 bytes of about a
-  megabyte. The other six decoded completely.
+  not show in that reading. This is the one residual gap in the conclusion, and it is not closed by
+  the repertoire, which is only a lower bound.
+- **The repertoire does not follow control flow, and is not sound on its own.** The evaluator walks
+  in address order, so a code built across a branch can be missed and a block after an
+  unconditional jump can contribute one no path reaches. Discarding state at every branch target
+  was tried and is sound, but it took 26100.9457 from 38 codes to **1** — which destroys the
+  negative control the repertoire exists to be. A CFG with a merge at each join is the real fix and
+  is more machinery than a corroborating reading justifies, so the repertoire is labelled a
+  heuristic lower bound and the verdict is taken from the immediate scan instead. The two compose:
+  since no debug value appears as an immediate anywhere, no arrangement of branches can route one
+  into a wrapper *as an immediate*.
 - **Nothing here is about a route with no guest-side code**, which is now the only live candidate:
   a stop driven entirely from the hypervisor or the root, needing no cooperation from Secure Kernel
   at all. S5 continues there.

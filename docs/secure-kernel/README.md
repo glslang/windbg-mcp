@@ -115,10 +115,12 @@ inherit `D:\`'s ACL, so any authenticated local user can read a guest's whole RA
 **Two things are open beneath that.** Whether VTL1 *execution* can be controlled at all is
 unresolved and decides inspector versus debugger — but it is now a narrower question than "the port
 is up and nothing connects to it". **Those were the same wall**, measured 2026-09-27 as gate S5a:
-Secure Kernel contains no code that could speak to that port. Across ten builds from 19041.207 to
-26100.9457 it never writes the three debug hypercall codes as values at all — every occurrence is a
-`cmp` — its whole enumerated hypercall repertoire (19–38 codes per build) holds none of them, it
-contains no `vmcall` instruction of its own, and it touches none of the synthetic-debugger MSRs.
+Secure Kernel has no hypercall or MSR route to that port. Across ten builds from 19041.207 to
+29667.1000 it never writes the three debug hypercall codes as immediates anywhere in its executable
+bytes — every occurrence is a `cmp` — it contains no `vmcall` instruction of its own, and it touches
+none of the synthetic-debugger MSRs. Its enumerated hypercall repertoire (19–38 codes per build)
+holds none of them either, and that reading is a lower bound serving as the negative control rather
+than the verdict.
 The control is Windows' own KD-over-hypervisor transport, `kdhvcom.dll`, which is nothing but those
 three hypercalls behind the five-function KD export contract. So the hypervisor's VTL1 debug port is
 a receiver with no sender, and what remains for S5 is the one route that needs no guest-side code:
