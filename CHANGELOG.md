@@ -9,6 +9,53 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The hypervisor's VTL1 debug port and Secure Kernel shipping no KD transport turn out to be one
+  fact, and `tools/sk_hypercall_scan.py` is how that was established.** `FOLLOWUPS.md` item 103's
+  gate S5a. The record held the two apart: the hypervisor's root VTL1 debug context is live — active
+  port `0xC35C`, both buffers allocated once `hypervisordebugpages` went 1000 → 2000 — and nothing
+  ever connects to it, while post-26100 `securekernel.exe` has every `Kd`-prefixed symbol as data.
+  Joining them needed the question *what would speak to that port*, and the answer is on the same
+  machine: `kdhvcom.dll` is Windows' own KD transport over the hypervisor, exporting the five-function
+  contract (`KdInitialize`, `KdPower`, `KdReceivePacket`, `KdSendPacket`, `KdSetHiberRange` — the same
+  five as `kdnet.dll`) over `vmcall`/`vmmcall` and exactly three control codes. Which code is which is
+  pinned by that binary's own call graph rather than by citing a table: `KdInitialize` reaches `0x6B`
+  alone, send and receive reach all three, `KdPower` and `KdSetHiberRange` reach none. **Across ten
+  `securekernel.exe` builds from 19041.207 to 29667.1000, none of the three appears as an immediate at
+  any instruction boundary the scan recognises** — every occurrence at one is a `cmp` in unrelated
+  code — **no sample materialises a synthetic-debugger MSR number `0x400000F0`–`0x400000FF` at all,
+  and no sample contains a `vmcall` or `vmmcall`**. So the port is a receiver with no sender. S5 itself
+  is *not* closed: its pass condition is a VTL1 execution stop delivered to a debugger, and what this
+  closes is one route, leaving the one needing no guest-side code — `HvCallInstallIntercept`
+  (`0x004D`), which SK itself issues at VTL0 through `ShvlInstallExceptionIntercept`, aimed instead at
+  a child's VTL1.
+- **That scan decides from a sound reading and corroborates with an unsound one, because the first
+  version rested everything on the unsound one.** Reading A — the immediates and the privileged
+  instructions — is taken over every executable byte from four seeds unioned (`.pdata`, a linear sweep,
+  a recursive descent from direct call and jump targets to a fixpoint, and the export table), plus a
+  raw opcode byte search and a search anchored on the constants' own little-endian bytes. Reading B,
+  the hypercall repertoire, walks in address order without following control flow and is a heuristic
+  lower bound — 19 to 38 control codes per build, `0x0002`–`0x0103` — whose job is to be the negative
+  control, a Secure Kernel issuing *no* hypercall being a broken scan rather than a finding. It never
+  produces the verdict. Five review rounds and 28 findings did not move the answer and did move that
+  structure. Four proposed remedies were declined, three of them because each would have deleted the
+  reading it defended: clearing state at branch joins takes 26100.9457 from 38 codes to **1**, and
+  invalidating on unresolved MSR indices or unresolved repertoire sites makes every build
+  inconclusive, all ten having some. The fourth was declined for a different reason — seeding the
+  Guard CF function table is not available at all, `securekernel.exe` having none (table 0, count 0,
+  against 8,756 entries in `ntoskrnl.exe`, 1,535 in `kernel32.dll` and 13 in `kdhvcom.dll`, which is
+  how that probe was validated before its negative was believed). **What the limits are is printed with the
+  result rather than left in a document**: 5 to 12 repertoire sites and 16 to 19 `rdmsr`/`wrmsr` sites
+  per build whose operand does not resolve, the scan reading *immediates* rather than values — a
+  constant in `.rdata` is neither — and a verdict that says "no debug hypercall route **visible to
+  this scan**". `--control` is not optional: a run without one prints UNVALIDATED and exits non-zero,
+  since the file's own claim is that a failing control voids every negative. Four traps are recorded
+  with it, each of which produced a wrong reading first — a sample whose *filename* silently defeats
+  `cdb` symbol resolution, so nine of ten images reported "0 hypercall sites" with the conclusion's
+  shape; `0x0C` being both a control code and the rep-count bound beside it; bug check codes read as
+  hypercall codes, `SkeBugCheckEx` reaching the hypercall page with a literal `0x0087` and bug check
+  `0x69` existing; and the linear sweep genuinely desynchronising, measured against `.pdata` as 2 or 3
+  of 2,617–3,221 checkpoints per build, which is why dismissing a candidate now rests only on seeds
+  that start at a known function entry.
 - **A Hyper-V checkpoint now opens as a debug session, and four tools read the Secure Kernel out of
   it.** `FOLLOWUPS.md` item 103's gate S3: `open_sk_capture`, `sk_modules`, `sk_read_memory` and
   `sk_symbol`, in a `--tools securekernel` group, over `src/sksession.rs`. Gates S1 and S2 were
