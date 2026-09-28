@@ -9,9 +9,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Three routes to making Secure Kernel execute were tried and all three are closed on this
-  bench**, which is what turns S5f's "VTL1 runs too rarely to catch" into a map rather than a
-  shrug. Gate S5g, run with the operator's authorisation to reconfigure and reboot the VBS guest.
+- **Three routes to making Secure Kernel execute were tried and the third one works: our own code
+  now runs in VTL1, and a halt taken while it runs is the condition every earlier gate was
+  qualified on.** One route is closed, one unresolved, one open. Gate S5g, run with the
+  operator's authorisation to reconfigure and reboot the VBS guest.
   **Credential Guard: unresolved, and the edition was the wrong answer** — an earlier version of this
   entry closed the route on Microsoft's edition table (*Windows Pro: No*) and used it to decline a
   review finding that said the edition could not be the cause. The finding was right: a Windows 11
@@ -54,8 +55,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **That gate changed the lab guest**, recorded because a later one will read it: Secure Boot
   **off**, test-signing **on** (VBS and HVCI verified still running after both), a self-signed
   `CN=VTL1 Enclave Test` certificate in `LocalMachine\Root`, Credential Guard keys set and inert,
-  and **four reboots** — so the `CR3`, self-map index and Secure Kernel base have all moved again
-  from the figures the S5c–S5f entries quote.
+  and **four reboots**. The post-S5g landmarks are *measured* rather than inferred from that
+  count — inferring movement from a reboot is the same error in reverse as inferring sameness
+  from an equal `CR3`, which this record documents happening: VTL1 `CR3` is **`0x3BEF2000`**
+  (it was `0x1201000` for S5c–S5f) and Secure Kernel is parked at **`0xFFFFF80679FB0035`**.
+  **The self-map index was not re-read and is unknown**, not assumed to have moved.
 - **The lab guests were reachable the whole time, which retires a limitation stated three times and
   turns the stop's evidence from 40× into 23,854×.** Gate S5f. *"Neither guest answers ICMP or
   WinRM, so there is no way to load them from outside"* equated **no network path** with **no guest
