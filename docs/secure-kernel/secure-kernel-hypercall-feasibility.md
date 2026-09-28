@@ -2768,14 +2768,25 @@ The VBS guest is **not** as it was found, and a later gate reading it needs to k
   **`0xFFFFF80679FB0035`**. The self-map index was not re-read and is unknown rather than assumed to
   have moved.
 
-### S5h result, 2026-09-28: the intercept fires, and it holds VTL1 exactly as it holds VTL0
+### S5h result, 2026-09-28: a VTL1-raised exception is held and handed back, and which VTL takes it is not settled
 
-**A parent-installed exception intercept stops a VTL1 exception from ever reaching the guest, and
-hands it back intact when the intercept comes down.** This is the catch half S5b could not test:
-that gate installed and removed an intercept without provoking anything, so it could not tell an
-implicitly-VTL0 intercept from an implicitly-every-VTL one, and recorded the route as *unresolved
-on scope*. It is now resolved in the second direction — **not implicitly VTL0** — with the scope
-limit in *What this does not establish* below, which is the part of this section that matters most.
+**A parent-installed exception intercept stops a `#BP` raised in VTL1 user mode from ever reaching
+the guest, and hands it back intact when the intercept comes down** — no guest-side cooperation, no
+port, no patched byte. That is the first time anything in this record has stopped VTL1 execution at
+a *chosen kind of event* rather than at an arbitrary polling point, which is what S5c's halt gives.
+
+**What it does not settle is S5b's actual question.** That gate installed and removed an intercept
+without provoking anything, so it could not tell an implicitly-VTL0 intercept from an
+implicitly-every-VTL one, and recorded the route as *unresolved on scope*. **It stays unresolved.**
+A first version of this section claimed the halt readings ruled out the alternative — that the
+enclave's exception dispatch makes a VTL0 excursion and a VTL0-scoped intercept catches *that* — and
+review showed they do not; see *Where the held thread sits* below, which now carries the retraction
+and what would settle it.
+
+So this section reports a **behaviour** that is measured and a **mechanism** that is not, and the
+two matter differently: the behaviour is what a debugger would use, and the mechanism is what decides
+whether it reaches Secure Kernel's own code. *What this does not establish*, at the end, is the part
+to read before building on any of it.
 
 **S5g is what made it runnable.** A VTL1 exception was needed that is not a planted `int 3` in
 Secure Kernel, which the plan excludes and which would bugcheck the guest. S5g's enclave supplies
@@ -2885,23 +2896,52 @@ not land on the raiser. The raiser was held throughout all six — the progress 
 independently. Which VP carried it moved between halts in both arms, so the table is per-arm rather
 than per-VP.
 
-**The VTL1 arm's thread is caught in VTL1**, at one address, every time. That is what rules out the
-alternative this gate was most exposed to: if the enclave's exception dispatch made a VTL0 excursion
-and a VTL0-scoped intercept were catching *that*, the stall would show as a VTL0 user-mode `RIP`, the
-way the VTL0 arm's does. It does not.
+**These halts do not settle which VTL the interception happens in, and an earlier version of this
+section claimed they did.** It argued that if the enclave's exception dispatch made a VTL0 excursion
+and the intercept were catching *that*, the stall would surface as a VTL0 **user-mode** `RIP` the way
+the VTL0 arm's does — and it does not, so the excursion was ruled out. Review was right that this
+does not follow. A VTL1 exception reflected into VTL0 would leave the VTL1 register set **saved at
+the faulting instruction**, which is `0x000001D1009E500D`, while VTL0 sits in *kernel* code
+handling the reflection — which is `0xFFFFF80679FB001C`. **That is exactly the pair this table
+shows**, so the reading is consistent with both hypotheses and discriminates neither.
 
-**And the VTL0-labelled read is not echoing VTL1 here**, which matters because S5c recorded exactly
-that failure — over eight halts its VTL0-labelled `RIP`/`RSP` came back as the VTL1 values 8/8. In
-this arm the two VTLs report different addresses *and* different stacks, so the two reads are
-distinguishable in a way S5c's were not. On halts where the VP was not running the raiser, both
-reads return Secure Kernel's parked address, which is the S5c shape and is why the table above says
-where the raiser was *caught* rather than what every read returned.
+**Two further things cut the same way**, and both were available before the claim was made:
+
+- The VTL0-labelled read is `0xFFFFF80679FB001C`, in the **same page** as the
+  `0xFFFFF80679FB0035` this record attributes to Secure Kernel. A "VTL0" `RIP` landing in Secure
+  Kernel's page is the S5c anomaly's signature — over eight halts S5c's VTL0-labelled `RIP`/`RSP`
+  came back as the VTL1 values 8/8 — so the earlier claim that *"the VTL0-labelled read is not
+  echoing VTL1 here"* rested on the two values merely differing. They do differ, including in
+  `RSP`; that is weaker than being a trustworthy VTL0 context and was written as though it were
+  stronger.
+- The **null costs argue the other way**: a VTL1 exception costs `~9.7 us` against VTL0's
+  `~0.85 us` on the same guest, and an 11x gap is what a VTL1 → VTL0 → VTL1 round trip would look
+  like. That is a reason to take the excursion seriously rather than to dismiss it.
+
+**What still stands is the behaviour, not the mechanism.** A `#BP` raised in VTL1 user mode is held
+and handed back; *where* the hypervisor takes it is unresolved. And this is not a separate worry
+from the scope limit below — it is the same one, because an excursion-mediated hold would not extend
+to Secure Kernel's own code, which handles its exceptions in VTL1 without one. **What would settle
+it** is the route S5b named and this gate skipped: a static read of `hvix64.exe`'s intercept dispatch
+for a check on the active VTL, two attempts having failed on that image before Ghidra was on this
+bench — or delivery metadata from an actual receiver, which is the other next gate.
+
+On halts where the VP was not running the raiser, both reads return Secure Kernel's parked address,
+which is why the table says where the raiser was *caught* rather than what every read returned.
 
 #### The blast radius, which is narrower than the first run suggested
 
-**Only the raising thread is held; the guest keeps serving.** A second PowerShell Direct connection
-opened four seconds into every intercept arm answered with the guest's computer name every time, on
-both guests — so a partition-wide `#BP` intercept does not wedge the partition.
+**The guest keeps serving while an intercept stands.** A second PowerShell Direct connection opened
+four seconds into every intercept arm answered with the guest's computer name every time, on both
+guests — so a partition-wide `#BP` intercept does not wedge the partition.
+
+**That is all it shows, and an earlier version of this section read it as "only the raising thread
+is held".** It does not follow: the intercept is partition-scoped, so any *other* thread raising
+`#BP` in that window would be held too, and no such thread was arranged as a control — the
+connection that answered is one that raises no `#BP` at all. The claim is continued guest service,
+not exclusive single-thread impact. **Treat a standing `#BP` intercept as freezing every thread in
+the partition that raises that vector**, which is also why an install must be paired with its
+removal in a `finally`.
 
 **And the first run's runtime figures were read as a livelock, which per-second rates say they are
 not.** Raw `HvRegisterVpRuntime` deltas across a 190 s arm came to 444 M and 664 M 100ns units —
@@ -2915,13 +2955,18 @@ Both guests came through every run: teardown reported **0 intercepts still stand
 straggler processes, VBS and HVCI still `2` on the VBS guest, no reboot. **This gate cost the bench
 nothing**, which is worth recording because S5g cost it four reboots.
 
-#### What this does not establish, and the scope limit is the important one
+#### What this does not establish, and the two scope limits are the important part
 
-- **It is VTL1 *user* mode, not Secure Kernel.** The enclave runs in VTL1 user mode (IUM); Secure
-  Kernel is VTL1 kernel mode. That a partition-scoped intercept with no VTL field in its ABI covers
-  one is a reason to expect it covers the other, and expecting is not measuring. The plan forbids
-  planting an `int 3` in Secure Kernel to check, and that prohibition stands — **so treat "a #BP in
-  Secure Kernel would be held too" as an inference this record has not tested.**
+- **Which VTL the interception happens in.** The hold is measured at the guest's exception
+  dispatch; whether the hypervisor takes the trap in VTL1, or takes a VTL0 event that dispatching
+  the VTL1 exception produces, is open — see the retraction under *Where the held thread sits*. So
+  S5b's "implicitly VTL0 or implicitly every VTL" is **not** answered here.
+- **It is VTL1 *user* mode, not Secure Kernel**, and this is the same limit wearing different
+  clothes. The enclave runs in VTL1 user mode (IUM); Secure Kernel is VTL1 kernel mode and handles
+  its own exceptions without returning to VTL0. So if the hold turns out to be excursion-mediated,
+  it would **not** extend to Secure Kernel — the mechanism question above governs this one rather
+  than sitting beside it. The plan forbids planting an `int 3` in Secure Kernel to check, and that
+  prohibition stands: treat *"a `#BP` in Secure Kernel would be held too"* as untested.
 - **Nothing was delivered to *us*.** This probe has no port and read no intercept message. S5's pass
   condition wants a stop *delivered to a debugger*, and nothing here was. The gate does not pass.
 - **The mechanism of the hold is unmeasured, and the obvious candidate is not this probe's
@@ -2946,14 +2991,19 @@ nothing**, which is worth recording because S5g cost it four reboots.
   this gate's own retracted reading, and the script now refuses to make it.
 - **Do not** plant an `int 3` in Secure Kernel to extend the result from VTL1 user mode to VTL1
   kernel mode. S5a's prohibition is unchanged and the guest would bugcheck.
-- **The next experiment is the receiver**, and it is now a specific and bounded one — but it starts
-  one step earlier than "create a port". First establish **where an exception intercept message on a
-  child is delivered today**, since the root's stack already owns a port for that child and is the
-  likeliest recipient; `Vid.sys` and `winhvr.sys` were both read for S5b and are the same two images
-  to read for this. Only then does `HvCallCreatePort` / `HvCallConnectPort` plus a SynIC message
-  page in `h3probe.sys` become the right build. That is driver work rather than reversing, with the
-  catch half already measured — and if it lands, S5's pass condition is in reach for VTL1 *user*
-  mode, with Secure Kernel's own code still the untested half.
+- **There are now two next experiments, and they are independent.**
+  - **The receiver**, which is what S5's pass condition needs — but it starts one step earlier than
+    "create a port": first establish **where an exception intercept message on a child is delivered
+    today**, since the root's stack already owns a port for that child and is the likeliest
+    recipient. `Vid.sys` and `winhvr.sys` were both read for S5b and are the same two images to read
+    for this. Only then does `HvCallCreatePort` / `HvCallConnectPort` plus a SynIC message page in
+    `h3probe.sys` become the right build. Driver work rather than reversing, with the catch half
+    already measured.
+  - **The dispatch read**, which is what decides whether any of this reaches Secure Kernel:
+    `hvix64.exe`'s exception-intercept path, for a check on the active VTL. S5b named it, two
+    attempts had failed on that image, and Ghidra is on this bench now. A receiver that works would
+    also answer it from the other side, through the delivery metadata — so either experiment can go
+    first, and neither makes the other unnecessary for the *other* question.
 
 ## Explicitly out of scope
 

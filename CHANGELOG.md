@@ -9,10 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **A parent-installed exception intercept fires, and it holds VTL1 exactly as it holds VTL0.**
-  Gate S5h, and the catch half S5b could not test: that gate installed and removed an intercept
-  without provoking anything, so it could not tell an implicitly-VTL0 intercept from an
-  implicitly-every-VTL one and recorded the route as *unresolved on scope*. S5g's enclave supplies
+- **A VTL1-raised exception is held by a parent-installed intercept and handed back intact — and
+  which VTL takes it is not settled.** Gate S5h. S5b installed and removed an intercept without
+  provoking anything, so it could not tell an implicitly-VTL0 intercept from an
+  implicitly-every-VTL one and recorded the route as *unresolved on scope*; this gate measures the
+  **behaviour** and leaves that scope question open. S5g's enclave supplies
   the missing piece — a VTL1 exception raised by code we wrote, rather than a planted `int 3` in
   Secure Kernel, which the plan excludes. One guest-side binary raises `#BP` in both VTLs and counts
   what its own `__except` catches, so the arms differ in the VTL and in nothing else, and the count
@@ -23,18 +24,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and handed back rather than discarded: a resumable stop, not a swallowed exception. Both controls
   hold — an intercept on `#BR` that nothing raises, and a `#DE` raised against a `#BP` intercept,
   each leave both VTLs at their null rates — and either one alone would have left "an intercept is
-  standing" and "this exception was taken" as the same observation. Six halts catch the VTL1 arm's
-  thread at one VTL1 user-mode address inside the enclave, which is what rules out a VTL0 excursion
-  being the thing intercepted. Only the raising thread is held: the guest answered a second
-  PowerShell Direct connection during every arm, and no guest needed a reboot.
-  **S5 still does not pass**, and what is missing is now one specific thing rather than a question
-  about whether any route exists: nothing was delivered to *us*, because this probe holds no port —
-  though the root's own stack owns one for each child, and an exception intercept it never asked for
-  landing there uncompleted is the likeliest mechanism of the hold. So the next gate establishes
-  where that message goes before building a receiver.
-  **The scope limit is the part to carry forward**: the enclave is VTL1 *user* mode and Secure
-  Kernel is VTL1 *kernel* mode, so that a partition-scoped intercept with no VTL field in its ABI
-  covers the first is a reason to expect the second and not a measurement of it.
+  standing" and "this exception was taken" as the same observation. The guest keeps serving while an
+  intercept stands, and no guest needed a reboot.
+  **Two claims in the first draft of this entry are retracted, both found by review.** *"Six halts
+  catch the VTL1 arm inside the enclave, which rules out a VTL0 excursion being what is
+  intercepted"* — it does not, because a VTL1 exception reflected into VTL0 leaves VTL1 saved at the
+  faulting instruction while VTL0 sits in kernel code, which is exactly the pair measured; the
+  VTL0-labelled read lands in Secure Kernel's own page, which is the S5c anomaly's signature, and
+  the 11x cost of a VTL1 exception over a VTL0 one is a reason to take the excursion seriously
+  rather than to dismiss it. And *"only the raising thread is held"* was inferred from a connection
+  that raises no `#BP` at all — the intercept is partition-scoped, so treat it as freezing every
+  thread that raises that vector.
+  **S5 still does not pass, and there are two next gates rather than one.** Nothing was delivered to
+  *us*, because this probe holds no port — though the root's own stack owns one for each child, and
+  an exception intercept it never asked for landing there uncompleted is the likeliest mechanism of
+  the hold, so **the receiver gate** establishes where that message goes before building one. **The
+  dispatch-read gate** — `hvix64.exe`'s intercept path, for a check on the active VTL — is
+  independent, and is what the mechanism turns on.
+  **A working receiver would not close the gate by itself**: the enclave is VTL1 *user* mode and
+  Secure Kernel is VTL1 *kernel* mode, dispatching its own exceptions without returning to VTL0, so
+  an excursion-mediated hold would not reach it at all. The mechanism question governs the scope
+  question rather than sitting beside it.
 - **The first four runs of that gate read the VTL1 arm as *advancing*, and it is retracted here.**
   The counts — 1,902, 6,396, 15,076, 18,486 — were all the monitor's final sample, written *after*
   teardown removed the intercept and the raiser finished, and one of them became a "405x slower but
