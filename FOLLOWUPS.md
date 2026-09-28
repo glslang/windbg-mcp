@@ -3039,6 +3039,16 @@ validated. The full record is the
   two-VP spin and **twelve freshly loaded HVCI-verified kernel images**, and the halt's necessity
   is still unshown (80,399 reads over a matched 3 s window, one distinct value per page — those
   pages are static and a user-mode spin does not mutate SK's memory).
+- **Why VTL1 cannot be caught here is now a number, and it names the next experiment.** What holds
+  a VP in VTL1 long enough to sample is a **trustlet** (an IUM process, VTL1 *user* mode), not an
+  HVCI check. This guest has one, `LsaIso`, and it is inert: **0.3593750 s of CPU in 27.6 hours**,
+  unchanged to the tick across a logon burst, because Credential Guard is not configured
+  (`LsaCfgFlags` unset, `RequiredSecurityProperties = 0`). At that duty cycle 832,560 samples expect
+  ~3 hits and most of that CPU was spent at boot, so **zero is the predicted result**. **The
+  experiment that would settle it**: `LsaCfgFlags = 1` plus a reboot turns Credential Guard on,
+  logons then drive `LsaIso` in VTL1, and a halt taken while `ActiveVtl = 1` is the unmeasured
+  condition every halted-register reading is conditional on. **Not run** — it reconfigures and
+  restarts a shared lab guest, which is the operator's call.
 - **Bench note:** eleven inbox driver images started in the VBS guest to provoke VTL1 will not stop
   and stay loaded until it reboots. Harmless — drivers for hardware the VM lacks — but a later gate
   reading its module list should know why they are there.
