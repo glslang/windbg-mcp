@@ -2247,8 +2247,9 @@ established is narrow and conditional:
 **And `ActiveVtl = 1` is not merely unobserved, it could not be reached from here.** A sampler
 took **4,000 reads per VP with no delay — 8,000 in ~214 ms of wall time — and every one returned
 `ActiveVtl = 0`.** On an idle guest VTL1 runs too rarely to catch, and this bench cannot make it
-run: neither lab guest answers ICMP or WinRM, so there is no way to trigger the secure calls that
-would enter VTL1.
+run by any means this gate found: **corrected by S5f below** -- PowerShell Direct does reach both
+guests, and driving twelve kernel image loads through it still caught `ActiveVtl = 1` zero times in
+832,560 samples.
 
 **A third attempt at telling a consumer what to do went the way of the first two, and there will
 not be a fourth.** It said to read `ActiveVtl` and check it is zero, which sounds cheap and does
@@ -2282,8 +2283,8 @@ document invented.
   is how a VM pauses. What is new here is only that it is reachable from this probe and that VTL1
   state is readable across it.
 - **One host, one pair of guests, idle.** A busy guest would sharpen the runtime evidence and was
-  not available: neither guest answers ICMP or WinRM from this host, so there is no way to load
-  them from outside. Every arm but the all-VP one halts **VP 0 alone**, which is enough for a
+  not available at the time: **corrected by S5f below** -- PowerShell Direct loads them over the
+  VMBus, and the busy-guest figure is 23,854x rather than this section's 40x. Every arm but the all-VP one halts **VP 0 alone**, which is enough for a
   register reading and is *not* enough for a memory walk — see the inspector note below.
 - **Why the VTL0-labelled `RIP`/`RSP` coincide with VTL1's while halted.** Measured as systematic
   over eight cycles; the mechanism behind it is not established.
@@ -2321,8 +2322,10 @@ document invented.
   **What the run does not show is that the halt was necessary**, and the instrument says so itself:
   the same double reads while the guest was *running* were stable too, 0 of 3 changing. An idle
   guest is not a demanding test of consistency, and this bench has no way to load these guests —
-  neither answers ICMP or WinRM. So the composition is demonstrated and its *value* on a busy guest
-  is still an argument from what a second VP can do rather than a measurement of it.
+  they were thought unreachable. **S5f corrects the reachability and not the conclusion**: with the
+  guest busy, 80,399 reads over a matched 3 s window return one distinct value per page, so these
+  pages are static and the halt's *value* is still an argument from what a second VP can do rather
+  than a measurement of it.
 
   **And those three GPAs were preselected from H4's table, which review pointed out is not the
   join**: reads of known-good addresses succeed whether or not the halted *register* context can
@@ -2450,6 +2453,80 @@ a sentence in a document.
 - **"End to end" still should not be used**, for a different reason than round four thought: the
   chain is measured on a single virtual address, the pass condition for S5 is untouched, and the
   step that would make it a debugger — a stop at a chosen point — remains missing.
+
+### S5f result, 2026-09-28: the guests can be driven after all, and what that changes
+
+**"Neither lab guest answers ICMP or WinRM, so there is no way to load them from outside" was
+wrong, and it is repeated three times in the sections above.** There is a way that needs no network
+at all: **PowerShell Direct**, over the VMBus, which wants only a running Windows guest, Hyper-V
+admin on the host, and guest credentials. `Invoke-Command -VMName` reaches both guests
+(`DESKTOP-PR0QOQF`, VBS on; `LAB-VBSOFF`, VBS off; both 26200, 2 VPs). The error was equating *no
+network path* with *no guest access* and never testing the second — the guests had been reachable
+for the whole gate.
+
+What that unlocks is measurement, so here is what it settled and what it did not.
+
+#### The register interface is live, which nothing had checked
+
+Every reading in S5c and S5e assumes a parent-side `HvCallGetVpRegisters` samples the *running*
+processor. That had never been tested; on an idle guest a stale interface and a parked VP look
+identical, and both would return the constant `0xFFFFF8067A8BF8BD` this record quotes. Under a
+sustained user-mode spin driven through PowerShell Direct:
+
+| | VP 0 | VP 1 |
+|---|---|---|
+| samples in ~6 s | 110,638 | 110,638 |
+| distinct VTL0 `RIP` values | **6,675** | **6,603** |
+| user-mode `RIP`s | **87.9%** | **88.2%** |
+
+A read that returns ring-3 addresses 88% of the time while the guest spins in ring 3, across
+thousands of distinct values, is sampling the processor and not a cached exit record. **The idle
+constant was the idle loop, not a stale read** — and S5c's readings rest on an instrument that has
+now been checked rather than assumed.
+
+#### The stop, measured against a guest that is actually doing something
+
+S5c's headline figure was taken on an idle guest, where the separation is 40× and the record had
+to say so. Repeated with both VPs spinning:
+
+| | per 2000 ms |
+|---|---|
+| before the suspend | **19,512,433** |
+| **while VTL1-suspended** | **818** |
+| after release | **19,447,557** |
+| symmetric arm, named VTL0 | 472 |
+
+**23,854×**, with before and after within 0.3% of each other — so the load was steady across the
+window and the drop is the suspend rather than the guest losing interest. On the all-VP arm both
+processors drop together, 7,290,238 → 319 and 7,300,560 → 269. This is what the idle measurement
+was trying to show, and it is four orders of magnitude rather than one and a half.
+
+#### What driving the guest did *not* settle
+
+- **`ActiveVtl = 1` was still never observed**, and the sample count is now **832,560+** across
+  three conditions: idle, a two-VP user-mode spin, and **twelve freshly loaded kernel driver
+  images** — every one of them verified by HVCI, which is enforced on this guest
+  (`SecurityServicesRunning = 2`, `CodeIntegrityPolicyEnforcement = 2`). Kernel image loads are the
+  textbook VTL1 entry and the sampler covers ~18,000 reads per second per VP, and none landed in
+  VTL1. So the negative is much stronger and it is still a negative: either those windows are far
+  shorter than the sampling interval, or the parent-side `ActiveVtl` does not report a VP that is
+  executing VTL1. **This gate cannot tell which**, and the halted-register readings stay conditional
+  on `ActiveVtl = 0` exactly as before.
+- **The halt's necessity is still not demonstrated.** S5d compared two back-to-back reads, which an
+  idle guest passes trivially; the sharper test samples the same pages across a **matched
+  wall-clock window** in both conditions. Over 3 s with the guest busy: **80,399 reads while
+  running, one distinct value per page**, and the same one value while halted. Those three VTL1
+  pages are simply static, which a user-mode spin would not change — nothing in that workload
+  mutates Secure Kernel's memory. Showing the halt matters needs pages SK is actively writing, and
+  finding those needs the VTL1 activity the point above could not catch.
+
+#### What it cost the bench
+
+Twelve inbox driver images were loaded in the VBS guest to try to provoke VTL1, of which eleven
+will not stop (`sc stop` is unsupported for them) and remain loaded until it reboots. They are
+inbox drivers for hardware the VM does not have, they failed to find devices, and a reboot clears
+them — but the guest is not byte-for-byte as it was found, and a later gate reading its module list
+should know why there is a FireWire controller in it.
 
 ## Explicitly out of scope
 
