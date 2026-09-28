@@ -2935,12 +2935,15 @@ outright, so there is no extended form either. The full record, with the arm tab
   was picked because no hardware raises it; the hypervisor refuses it as `INVALID_PARAMETER`, every
   arm including the baseline failed the same way, and that reads exactly like a clean negative about
   VTL1. The script now *discovers* an accepted vector on the VTL0-only guest before any VTL arm
-  runs — `0x05` (#BR): architectural, so the hypervisor takes it, and not raisable by these guests.
-  **That second half is measured on this bench and is not a property of long mode**: `BOUND` does
-  not decode in 64-bit mode but MPX's bound-check instructions raise #BR, and what makes the vector
-  inert here is that this host has no MPX (`CPUID.7.0:EBX` bit 14 = 0, and neither MPX state
-  component offered in `CPUID.D`). On MPX-capable hardware the arm needs a different vector or a
-  paused target.
+  runs — `0x05` (#BR), which the hypervisor takes.
+- **"The vector cannot fire" is retracted, and the lesson is about the search rather than the
+  vector.** Two rounds each named a way #BR reaches a running x64 guest — MPX's bound-check
+  instructions, and the legacy `BOUND` still decoding in **32-bit compatibility mode**, which is
+  every WOW64 process — and an `int 5` is a third without looking far. No CPUID reading settles a
+  claim about every instruction a guest might execute. What protected the run was the disposable
+  guests and the install paired with its removal microseconds later; the vector made a fire
+  unlikely, not impossible. **A re-run needing a genuinely inert arm pauses the target or uses one
+  it is willing to lose.**
 - **Do not** re-run S5b, and **do not** re-test the spare bytes: the same acceptance on a partition
   with no VTL1 is what settles them, and that control has been taken.
 - **Aiming is what is closed; scope is not, and the route stays open.** A draft of this block said
