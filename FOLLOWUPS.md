@@ -2867,17 +2867,19 @@ guest side to speak to it — rather than by re-running a completed experiment.
 
 #### S5a — **RUN 2026-09-27: they are the same wall. Do not repeat; S5 continues below it**
 
-**Secure Kernel contains no code that could speak to that port**, measured offline across ten
-builds from 19041.207 to 26100.9457 with `tools/sk_hypercall_scan.py`. The three debug hypercall
-codes are never written as values in any of them — every occurrence of `0x69`, `0x6A` or `0x6B` is
-a `cmp` in unrelated code — the enumerated hypercall repertoire (19–38 distinct codes per build,
-`0x0002`–`0x0103`) contains none of them, there is no `vmcall`/`vmmcall` instruction in any sample,
-and nothing touches the synthetic-debugger MSRs `0x400000F0`–`0x400000FF`. The positive control is
-`kdhvcom.dll`, Windows' own KD-over-hypervisor transport, which is those three hypercalls behind the
-five-function KD export contract and which the same scanner reads correctly. Full result, controls,
-and the three traps that each produced a wrong reading first — a sample whose *filename* silently
-defeats symbol resolution, a control code that is also the rep-count bound, and bug check codes
-being read as hypercall codes — are in
+**Secure Kernel has no hypercall or MSR route to that port**, measured offline across ten builds
+from 19041.207 to 29667.1000 with `tools/sk_hypercall_scan.py`. The three debug hypercall codes are
+never written as immediates anywhere in any sample's executable bytes — every occurrence of `0x69`,
+`0x6A` or `0x6B` is a `cmp` in unrelated code — there is no `vmcall`/`vmmcall` instruction in any
+sample, and nothing touches the synthetic-debugger MSRs `0x400000F0`–`0x400000FF`. The enumerated
+hypercall repertoire (19–38 distinct codes per build, `0x0002`–`0x0103`) contains none of them
+either; that reading is a heuristic lower bound acting as the negative control, and the verdict
+comes from the immediate scan, which covers 100% of each image's executable sections. The positive
+control is `kdhvcom.dll`, Windows' own KD-over-hypervisor transport, which is those three hypercalls
+behind the five-function KD export contract and which the same scanner reads correctly. Full result,
+limits, and the four traps that each produced a wrong reading first — a sample whose *filename*
+silently defeats symbol resolution, a control code that is also the rep-count bound, resting the
+negative on one approximate evaluator, and bug check codes being read as hypercall codes — are in
 [the feasibility record](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
 **What this closes is one route, not the gate.** S5's pass condition is untouched. The remaining
