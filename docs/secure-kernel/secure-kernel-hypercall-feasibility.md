@@ -1729,12 +1729,16 @@ codes and the SynDbg MSR numbers present as immediates, and are there hypercall 
 taken over *every executable byte*, by passes chosen so that no one of them has to be trusted about
 where instructions begin:
 
-- **instruction boundaries from three seeds**, unioned: the functions the exception directory
-  declares, a linear sweep of each executable section, and a **recursive descent from every direct
-  call and jump target**, iterated to a fixpoint. The third is what reaches **leaf functions**,
-  which need no unwind data and are therefore absent from `.pdata` entirely — and which a linear
-  sweep can stride straight past if it desynchronises on embedded data. A leaf is reached by being
-  called, so its entry is a call target even when nothing else names it.
+- **instruction boundaries from four seeds**, unioned: the functions the exception directory
+  declares, a linear sweep of each executable section, a **recursive descent from every direct call
+  and jump target** iterated to a fixpoint, and the **export table**. The last two are what reach
+  **leaf functions**, which need no unwind data and are therefore absent from `.pdata` entirely —
+  and which a linear sweep can stride straight past if it desynchronises on embedded data. A leaf
+  is reached by being called, so its entry is a call target; one reachable *only* through an export
+  is not, which is why the export table is seeded too. That last seed is measured as a **no-op on
+  these images** — every exported entry is already reached by another seed, delta zero on the
+  builds checked — so it closes a hole in the reasoning rather than in the result, and is recorded
+  that way rather than as a finding.
 - **a raw opcode byte search** for `vmcall`, `vmmcall`, `rdmsr` and `wrmsr`, which cannot
   desynchronise because it does not decode at all.
 - **a byte-anchored search for the constants themselves.** An immediate is encoded little-endian,
@@ -1773,12 +1777,26 @@ They agree with the six verified rows and are listed separately rather than coun
   `0x0069`, `0x006A` or `0x006B` at such a boundary, in any of the ten images — 5 to 10 per build —
   is a `cmp`, in code unrelated to debugging. Against it, the control writes all three distinct
   values and compares none.
-- **And the superset is reported rather than argued away.** The byte-anchored pass also finds 40 to
-  95 decodings per build at offsets *no* pass recognises as a boundary — forms like `in al, 0x6b`
-  and `enter -0x6e18, 0x6b`, and mostly one-byte-shifted shadows of the real `cmp` beside them.
-  They are listed rather than filtered out, because the honest claim is "none at a recognised
-  boundary, and here is everything else that carries these bytes at any alignment", not "none
-  anywhere". Some of them are write-forms, which is exactly why the count is printed.
+- **And the superset is decided rather than merely reported.** The byte-anchored pass also finds 40
+  to 96 decodings per build at offsets *no* pass recognises as a boundary — forms like `in al, 0x6b`
+  and `enter -0x6e18, 0x6b`. Listing them and acting on none was the previous shape and it left a
+  real gap, because a candidate sitting in bytes no instruction covers is not a misreading of
+  anything: it is unexamined code. So each is tested against a bitmap of bytes lying inside some
+  instruction a decoder placed at a boundary. **Every one of them, on all ten builds, is a shadow
+  of an instruction covering its bytes; none sits in unexamined code.** A candidate that did would
+  make the scan inconclusive. The same discriminator settles the raw opcode pass, which is kept
+  apart from the decoders for the same reason in reverse: `0F 01 C1` can sit inside an immediate,
+  so a raw match is sound evidence of *absence* and must never be counted as a `vmcall` — 1 to 3
+  raw-only matches per build, all shadowed.
+- **A control code does not have to be bare.** The ABI puts it in bits 0–15 of a hypercall input
+  value, with the fast flag at bit 16 — so `0x00010069` is `HvPostDebugData` and an exact-equality
+  test misses it, which this scan did while its repertoire reading masked with `& 0xFFFF`. Matching
+  the field instead needs a bound, or it catches branch targets: measured across the ten samples, a
+  bare mask adds 0 to 5 further immediates per build, nearly all of them addresses like
+  `jmp 0x140060069`. The ABI supplies the bound — bits 27–30, 44–47 and 60–63 are reserved and zero
+  in any real input value — and control-transfer operands are excluded outright. With both, the
+  count of matches stays zero on every build while `0x00010069` and `0x0001000000010069` are
+  caught.
 - **The synthetic-debugger MSR numbers are never materialised at all.** Zero occurrences of
   `0x400000F0`–`0x400000FF` as an immediate anywhere in any build, at any alignment — and here the
   byte-anchored pass is precise as well as sound, since those values need a four-byte encoding.
@@ -1855,11 +1873,13 @@ They agree with the six verified rows and are listed separately rather than coun
   not an immediate in a code section. This is the residual gap in the conclusion and the repertoire
   does not close it, being only a lower bound. Both were found by auditing the tool's own claims
   against the checks behind them rather than by a reviewer, which is the cheaper order.
-- **5 to 12 wrapper sites per build have a control code the scan cannot recover**, and any of them
-  could carry a value by one of the routes above. They do not block the verdict, which is a
-  decision rather than an oversight: every sampled build has some, so blocking on them would make
-  every run inconclusive and delete the reading instead of qualifying it. The count is printed with
-  the verdict so it is never out of sight.
+- **5 to 12 wrapper sites and 16 to 19 `rdmsr`/`wrmsr` sites per build have an operand the scan
+  cannot recover**, and any of them could carry a value by one of the routes above — a constant in
+  `.rdata` loaded into `ecx` is the concrete case a reviewer raised, and it is real. They do not
+  block the verdict, which is a decision rather than an oversight: every sampled build has some, so
+  blocking on them would make every run inconclusive and delete the reading instead of qualifying
+  it. Both counts are printed on the verdict line so the qualifier travels with the result rather
+  than living in this document.
 - **The repertoire does not follow control flow, and is not sound on its own.** The evaluator walks
   in address order, so a code built across a branch can be missed and a block after an
   unconditional jump can contribute one no path reaches. Discarding state at every branch target
