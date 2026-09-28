@@ -2104,6 +2104,111 @@ unnamed here for the same reason it was in H3.
   it runs rather than after. It is second because it is the more expensive of the two and because
   an intercept that already covers VTL1 would make it unnecessary.
 
+### S5c result, 2026-09-28: the root can stop a child VP and read its VTL1 while it is stopped
+
+**The stop works, it is not a VTL1 stop, and the distinction is measured rather than reasoned
+about.** `HvCallSetVpRegisters` (`0x0051`) writing `HvRegisterExplicitSuspend` halts a running
+child's virtual processor from the root partition — no guest-side code, no exception, no intercept,
+no port — and while it is halted the child's **VTL1 register context is readable and distinct**.
+What the run also shows is that the halt is **VP-wide**: naming VTL1 stops the whole processor, not
+VTL1's execution, so this is an inspector's stop rather than the debugger's stop S5 asks for.
+
+Instrument `s5c.py` on the same `h3probe.sys` IOCTL as S5b. Same bench and same children as that
+gate: partitions `0x7` (`EnabledVtlSet` `0x0003`) and `0xB` (`0x0001`), VP 0, a 2000 ms hold.
+
+#### A status is not a stop, so the stop is measured separately
+
+`HV_STATUS_SUCCESS` says a register write was accepted. **`HvRegisterVpRuntime` (`0x00090000`) is
+what says a processor stopped**: it counts executed time in 100ns units and is read-only, so a
+working suspend shows as a counter that stops advancing. That mattered here rather than in theory —
+a first run at a 60 ms window read `during` as 139 against a `before` of 105 and called it nothing,
+because **an idle guest's VP and a suspended one are indistinguishable at that scale**. The window
+went to 2000 ms and a **null model** went in beside it: three samples with no suspend at all, to
+show what idle looks like when nothing is being done to it.
+
+| arm | VP runtime over 2000 ms |
+|---|---|
+| null model, no suspend (three samples) | 84,075 / 53,293 / 60,149 |
+| control 1 — VTL0 suspend on the VTL0-only child, before | 45,434 |
+| control 1 — **while suspended** | **430** |
+| control 1 — after release | 43,907 |
+| test — VTL1 suspend on the VBS child, before | 41,291 |
+| test — **while suspended** | **1,032** |
+| test — after release | 61,453 |
+| symmetric arm — VTL0 suspend on the **VBS** child, while suspended | 495 |
+
+Two orders of magnitude below the idle floor, in every suspended arm. An earlier version of the
+guard looked for a **catch-up burst** on release instead and called a clean 100× drop "weak" — an
+idle guest has no queued work to catch up on, so the burst was never the discriminator. The
+`during` sample against the null model is.
+
+#### What the VTL parameter does, and what it does not
+
+- **It is validated.** The same write naming VTL1 on the child with no VTL1 is **refused with
+  `0x0015`** — the same code its VTL1 register *read* returns, which is the S5b recon result
+  arriving from the write side.
+- **It does not scope the stop.** With the suspend set by naming VTL1, `HvRegisterExplicitSuspend`
+  reads **`1` at VTL0 as well**; the symmetric arm — setting it by naming VTL0 on the same VBS
+  guest — reads `1` at VTL1 and stops the VP just as hard (495 against 1,032). So there is one
+  VP-wide suspend behind a VTL parameter that decides *who may ask*, exactly as S5b found for the
+  intercept block's missing selector, and not a per-VTL stop.
+
+#### What is readable while it is stopped
+
+|  | VTL0 | VTL1 |
+|---|---|---|
+| `CR3` | `0x00000000007D5000` | `0x0000000001201000` |
+| `RIP` before the stop | `0xFFFFF8067A8BF8BD` | `0xFFFFF80609990035` |
+| `RIP` **during** the stop | `0xFFFFF80609990035` | `0xFFFFF80609990035` |
+| `RSP` **during** the stop | `0xFFFFBF003EA2DEC8` | `0xFFFFBF003EA2DEC8` |
+| `RIP` after release | `0x00007FFFCDD94F2A` (user mode) | `0xFFFFF80609990003` |
+
+That VTL1 `CR3` is `0x1201000` — the landmark S0 recorded for this boot and H4 before it, arriving
+here from a third direction.
+
+**The VTL1 context is real, and that needed its own control.** During the stop the VP's *own*
+`RIP` and `RSP` become the VTL1 values, which on its own is equally consistent with the read being
+mislabelled — so a separate read-only probe sampled the pair on a *running* guest: **40 of 40
+samples on each of both VPs returned a VTL1 `RIP` distinct from the VTL0 one**, with the VTL1 `CR3`
+distinct in every sample too. The VTL1 context is Secure Kernel's own, and it **moves** —
+`0xFFFFF80609990035` to `0xFFFFF80609990003` across one suspend cycle — so it is live state rather
+than a stale copy. What the two readings together do *not* settle is whether the VP is parked at
+the VTL1 entry context during the stop or whether the register path returns VTL1's context under
+both labels while suspended; both fit, and nothing here distinguishes them.
+
+#### What S5c does not establish
+
+- **S5's pass condition is still not met**, and this is the honest reading rather than a modest
+  one. *A VTL1 execution stop delivered to a debugger* wants a stop **of VTL1**, at a chosen point,
+  **reported** as an event. This is a stop of the whole VP, at an arbitrary point, discovered by
+  polling. Two of the three are missing.
+- **Secure Kernel was never caught executing.** `VsmVpStatus.ActiveVtl` read `0` in every sample of
+  every arm — 80 read-only samples plus each suspended arm — so VTL1 was parked throughout. On an
+  idle guest VTL1 runs rarely, and nothing here made it run.
+- **Nothing is delivered.** There is no event, no message and no port: the stop is something the
+  root does and then observes. A debugger's stop arrives; this one is taken.
+- **The suspend bit is measured, not documented.** No TLFS page this run could find publishes
+  `HV_EXPLICIT_SUSPEND_REGISTER`'s layout, so the control *establishes* that writing `1` reads back
+  `1` and stops the VP, and the run refuses to read any later arm if it does not.
+- **This is Hyper-V's own pause primitive**, not a new capability: the root suspending a child's VP
+  is how a VM pauses. What is new here is only that it is reachable from this probe and that VTL1
+  state is readable across it.
+- **One host, one pair of guests, VP 0, idle.** A busy guest would sharpen the runtime evidence and
+  was not available: neither guest answers ICMP or WinRM from this host, so there is no way to load
+  them from outside.
+
+#### What it changes downstream
+
+- **A live VTL1 *inspector* is now feasible end to end**, which is the practically useful half.
+  Stop the VP (S5c), read VTL1 registers (H3) and VTL1 memory by the direct route (H4), resume —
+  on a running guest, with no capture. S3's tool surface was shaped for a fixed snapshot because S0
+  said most users would have one; this says a *live* source can be given the same shape, with the
+  stop bracketing the reads.
+- **The debugger half stays open**, and its remaining candidate is the one S5b left: whether a
+  partition-scoped intercept fires for VTL1 execution. That is still the only route that could
+  produce a stop *at a chosen point*, and it still needs a receiver.
+- **Breakpoints stay excluded**, unchanged.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility

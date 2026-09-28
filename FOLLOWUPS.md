@@ -2958,14 +2958,38 @@ outright, so there is no extended form either. The full record, with the arm tab
   Ghidra is on this bench now where it was not then — or a live test, which needs a port of its own
   to receive on and a VTL1 exception that is **not** a planted `int 3`. Cheaper than the second
   candidate, and it would make it unnecessary.
-- **The second is measured rather than guessed, and it is not an intercept.**
-  `HvRegisterExplicitSuspend`, `HvRegisterInterceptSuspend` and `HvRegisterDispatchSuspend` read
-  from the parent at **both VTL0 and VTL1** on the VBS guest and are refused at VTL1 on the twin
-  with no VTL1 — the `TargetVtl` field discriminating exactly as it does for `CR3` in H3. Its gate
-  is `HvCallSetVpRegisters` (`0x0051`) against a child's VTL1 suspend register, with the VTL0
-  control beside it. **Read S4 before running it**: read and write disagreed about VTL1 there,
-  so the read above is not the answer. And unlike every arm in S5b, it *stops a running guest's
-  VP* — write the recovery down before, not after.
+- **The second was measured as S5c on 2026-09-28** — `HvCallSetVpRegisters` (`0x0051`) writing
+  `HvRegisterExplicitSuspend` — and it **works, without being the stop S5 asks for**. See below.
+
+#### S5c — **RUN 2026-09-28: the VP stops, VTL1 is readable stopped, and S5 does not pass**
+
+**A parent can halt a running child's virtual processor and read its VTL1 while it is halted** —
+`HvCallSetVpRegisters` writing `HvRegisterExplicitSuspend`, with no guest-side code, no exception,
+no intercept and no port. VP runtime while suspended was **430** (control, VTL0) and **1,032**
+(test, VTL1) per 2000 ms against an idle band of **41,291–84,075**, with a no-suspend null model
+beside it. Refused with `0x0015` at VTL1 on the twin with no VTL1, so the `TargetVtl` field is
+validated. The full record is the
+[S5c result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+
+- **It is a VP stop, not a VTL1 stop.** Set by naming VTL1, `ExplicitSuspend` reads `1` at VTL0
+  too; the symmetric arm — naming VTL0 on the same VBS guest — reads `1` at VTL1 and stops the VP
+  just as hard. One VP-wide suspend behind a VTL parameter that decides who may ask, which is the
+  same shape S5b found on the intercept block.
+- **S5 still does not pass, and this is the reading rather than modesty.** Its condition wants a
+  stop *of VTL1*, at a *chosen point*, *delivered* as an event. This is the whole VP, at an
+  arbitrary point, found by polling. `ActiveVtl` read `0` in all 80 read-only samples and in every
+  arm, so Secure Kernel was never caught executing.
+- **What is genuinely new is the inspector.** Stop the VP (S5c), read VTL1 registers (H3) and VTL1
+  memory by the direct route (H4), resume. That is live-target VTL1 inspection with no capture, and
+  it means S3's snapshot-shaped surface has a live variant that is now measured rather than
+  hypothetical.
+- **Do not** re-run S5c's controls; the suspend bit, the refusal code and the VP-wide scope are
+  taken. **Do** re-read `docs/.../secure-kernel-hypercall-feasibility.md` before building on the
+  VTL1 context: the VP's own `RIP`/`RSP` become the VTL1 values during the stop, and whether that
+  is the VP parked at VTL1 entry or the read path relabelling is **not** settled.
+- **The debugger half is back to S5b's leftover**: whether a partition-scoped intercept fires for
+  VTL1 execution, which is still the only candidate that could stop at a *chosen* point, and still
+  needs a receiver.
 
 ### Out of scope, with the reason rather than as a list
 
@@ -2994,9 +3018,11 @@ outright, so there is no extended form either. The full record, with the arm tab
    ten builds. So the remaining unknown is narrower and differently shaped — whether a VTL1 stop can
    be driven from the hypervisor or the root *without* guest-side code. **S5b has now split the
    named candidate for that in two**: a parent can install an exception intercept on a child and has
-   no field to aim one at a VTL, which leaves *whether it covers VTL1 anyway* unresolved and first
-   in line, with `HvCallSetVpRegisters` against a child's VTL1 suspend registers — readable there,
-   writeability unmeasured — as the second. Still decides inspector
+   no field to aim one at a VTL, which leaves *whether it covers VTL1 anyway* unresolved and now the
+   only live candidate. The second was **answered by S5c**: the suspend register is writable from
+   the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
+   rather than VTL-selective — so it buys a live *inspector* and not the stop S5 asks for. Still
+   decides inspector
    versus debugger, and still the one that would change the shape of S3's tool surface rather than
    its contents. **That surface now exists**, so the change is to something built rather than to a
    design: a capture session is a fixed snapshot whose whole decode travels with the open, and
