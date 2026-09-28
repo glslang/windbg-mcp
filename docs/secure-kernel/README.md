@@ -113,10 +113,19 @@ the input is a well-formed file with an encrypted payload. The remaining case ne
 inherit `D:\`'s ACL, so any authenticated local user can read a guest's whole RAM.
 
 **Two things are open beneath that.** Whether VTL1 *execution* can be controlled at all is
-unresolved and decides inspector versus debugger: the hypervisor's VTL1 debug port is up and Secure
-Kernel does not connect to it. And whether VTL1 can be *written* is settled per route —
-`HvCallWriteGpa` refuses it symmetrically with the read, the direct driver route accepts it — so the
-patch half of a software breakpoint exists and the catch half does not.
+unresolved and decides inspector versus debugger — but it is now a narrower question than "the port
+is up and nothing connects to it". **Those were the same wall**, measured 2026-09-27 as gate S5a:
+Secure Kernel contains no code that could speak to that port. Across ten builds from 19041.207 to
+26100.9457 it never writes the three debug hypercall codes as values at all — every occurrence is a
+`cmp` — its whole enumerated hypercall repertoire (19–38 codes per build) holds none of them, it
+contains no `vmcall` instruction of its own, and it touches none of the synthetic-debugger MSRs.
+The control is Windows' own KD-over-hypervisor transport, `kdhvcom.dll`, which is nothing but those
+three hypercalls behind the five-function KD export contract. So the hypervisor's VTL1 debug port is
+a receiver with no sender, and what remains for S5 is the one route that needs no guest-side code:
+a stop driven entirely from the hypervisor or the root. And whether VTL1 can be *written* is settled
+per route — `HvCallWriteGpa` refuses it symmetrically with the read, the direct driver route accepts
+it — so the patch half of a software breakpoint exists and the catch half has now been shown to have
+no Secure Kernel-side transport to arrive on.
 
 ## The documents
 
@@ -127,7 +136,7 @@ Read them in this order; each assumes the one before it.
 | 1 | [Secure Kernel debugging plan](secure-kernel-debugging-plan.md) | The original plan: validate software-only SK debugging, then integrate whichever route works. Carries the handoff status and the `Kd=` option set read out of `dbgeng.dll` — six kernel-discovery modes, of which `Kd=VerAddr:<addr>` is the one a Secure Kernel bind would use. |
 | 2 | [Secure Kernel debugging validation](secure-kernel-debugging-validation.md) | The measurement record behind everything else. NT and hypervisor debugging pass; **native SK attachment does not**. Why post-26100 `securekernel.exe` ships no KD transport, and what `SkdInitDebuggerDataBlock` does instead. The longest document here and the one to cite. |
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
-| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, **S0**, which finds a driver-free source that carries VTL1 and its page-table root, **S1**, the decode layer over that source, and **S2**, symbols against the image with no debuggee — which also settles that the public PDB has no types. |
+| 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, **S0**, which finds a driver-free source that carries VTL1 and its page-table root, **S1**, the decode layer over that source, **S2**, symbols against the image with no debuggee — which also settles that the public PDB has no types — and **S5a**, which joins the hypervisor's live-but-unused VTL1 debug port to Secure Kernel shipping no KD transport, and finds them to be the same wall. |
 
 Two older side-investigations, kept because they are about the same binary:
 
@@ -190,5 +199,8 @@ housekeeping.
 administrator on the host, a standard checkpoint, and the Windows SDK's
 `vmsavedstatedumpprovider.dll`. Nothing is signed, nothing is loaded, and the capture is a file
 that can be read on another machine. The probe that does it is checked in as
-[`tools/sk_savedstate_probe.py`](../../tools/sk_savedstate_probe.py) — the one instrument from
-this investigation that can be, because it needs no driver to go with it.
+[`tools/sk_savedstate_probe.py`](../../tools/sk_savedstate_probe.py), one of the two instruments
+from this investigation that can be, because it needs no driver to go with it. The other is
+[`tools/sk_hypercall_scan.py`](../../tools/sk_hypercall_scan.py), gate S5a's scanner, which needs
+less still: it reads `securekernel.exe` as a file, with no debugger, no target and no VM. Everything
+else here stays out of the repository, because it needs the weakened bench above to mean anything.

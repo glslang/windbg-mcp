@@ -1675,6 +1675,144 @@ the text report and the JSON carry them as separate answers.
   left deferred could load its PDB on the first *landmark* query, after the only check that the PDB
   belongs to this image. What is still unmeasured is a PDB that is served and **wrong**.
 
+### S5a result, 2026-09-27: the hypervisor's VTL1 debug port has no sender in Secure Kernel
+
+**The two facts are one fact.** The record held them separately and never joined them: the
+hypervisor's root VTL1 debug context is live — active port `0xC35C` (50012), both buffers allocated
+once `hypervisordebugpages` went 1000 → 2000 — and nothing ever connects to it; and post-26100
+`securekernel.exe` ships no KD transport. S5's specification says to start by asking whether those
+are the **same wall**. They are, on the route measured here: **Secure Kernel contains no code that
+could speak to that port.**
+
+Entirely offline. No VM queried, attached, reconfigured or rebooted; no BCD change; no driver; no
+`int 3`; no reservation change; no re-capture of the activation return — the three "do not"s in the
+S5 specification are untouched. The instrument is
+[`tools/sk_hypercall_scan.py`](../../tools/sk_hypercall_scan.py), a pure PE parse plus capstone; it
+needs no debugger, and symbols are used only to *name* what the scan already found structurally.
+
+#### The mechanism, and the control that identifies it
+
+A VTL1 debuggee cannot own the NIC — the hypervisor does, which is the whole point of
+`hypervisordebug` multiplexing three ports on one wire — so a debuggee hands KD packets to the
+hypervisor. **`kdhvcom.dll` is Windows' own implementation of exactly that**, and it is the positive
+control: without it a negative on Secure Kernel would be indistinguishable from a broken scanner.
+
+| reading | `C:\Windows\System32\kdhvcom.dll`, sha256 `CD4BD901326BBF31…` |
+|---|---|
+| exports | `KdInitialize`, `KdPower`, `KdReceivePacket`, `KdSendPacket`, `KdSetHiberRange` — the five-function KD transport contract, the same five `kdnet.dll` exports |
+| imports | six `ntoskrnl.exe` symbols, none hypercall-related |
+| hypercall instructions | **2** — `vmcall` at `+001FE0`, `vmmcall` at `+001FF0` (Intel and AMD) |
+| control codes written | **3**, and only 3: `0x69` at `+001A6F`, `0x6B` at `+001B74`, `0x6A` at `+001C7F`, each `mov dword ptr [rsp+X], imm` |
+
+**The code-to-name mapping is pinned by this binary's structure rather than by a cited table.** By
+call-graph reachability from each export: `KdInitialize` reaches `0x6B` **only**, `KdSendPacket` and
+`KdReceivePacket` reach all three, `KdPower` and `KdSetHiberRange` reach none. An initialize that
+reaches only one code, and a send/receive pair that share it plus two others, is
+`HvResetDebugSession` with `HvPostDebugData`/`HvRetrieveDebugData` beside it.
+
+#### The subject: ten `securekernel.exe` builds, 19041.207 to 26100.9457
+
+**No sample contains a `vmcall` or `vmmcall` instruction at all**, so every hypercall Secure Kernel
+makes goes through the hypercall code page, which lives in two globals. That makes the set of
+functions that can reach the hypervisor *derivable* rather than a list of names to keep up to date —
+which matters, because the name moved: the generic invoker is `HvcallpInitiateHypercall` before
+26100 and `HvcallInitiateHypercall` after, and a first pass that asked for the later spelling
+resolved nothing on nine of ten samples and reported "0 hypercall sites" for every one of them.
+
+| build | sha256[:16] | decode coverage | wrapper call sites | distinct control codes | debug codes | `0069/6A/6B` written | `vmcall` | SynDbg MSR |
+|---|---|---|---|---|---|---|---|---|
+| 19041.207 | `7F85188451EE4671` | 100.00% | 30 | 21 | **none** | 0 | 0 | 0 |
+| 19041.7725 † | `8C7135D0E37E2943` | 100.00% | 30 | 21 | **none** | 0 | 0 | 0 |
+| 22621.317 † | `49F6196295058CD4` | 100.00% | 29 | 19 | **none** | 0 | 0 | 0 |
+| 22621.7582 † | `4FBF5EAD32F49A12` | 100.00% | 30 | 20 | **none** | 0 | 0 | 0 |
+| 28000.2952 | `BA493451314B11A1` | 99.99% | 39 | 25 | **none** | 0 | 0 | 0 |
+| 29617.1000 | `BB29E5EFCFEE50FD` | 99.81% | 39 | 25 | **none** | 0 | 0 | 0 |
+| 29639.1000 | `28FAEB48277EE5F8` | 99.82% | 39 | 25 | **none** | 0 | 0 | 0 |
+| 29648.1000 | `77DA0F3187B73655` | 99.80% | 32 | 25 | **none** | 0 | 0 | 0 |
+| 29667.1000 † | `7CB598068319DAC7` | 99.81% | 32 | 25 | **none** | 0 | 0 | 0 |
+| 26100.9457 | `A9CDE82E39794FB2` | 100.00% | 63 | 38 | **none** | 0 | 0 | 0 |
+
+† identity unverified — these are the four downloads whose bytes did not match the requested index
+record, flagged as such in
+[the build survey](secure-kernel-debugging-validation.md#offline-build-comparison-and-native-route-gate-2026-09-19).
+They agree with the six verified rows and are listed separately rather than counted with them.
+
+**Three independent readings, and the first is the airtight one:**
+
+- **The values `0x0069`, `0x006A` and `0x006B` are never written.** Every occurrence of any of them
+  as an immediate in any of the ten images — 5 to 10 per build — is a `cmp`, in code unrelated to
+  debugging. Nothing in Secure Kernel ever materialises one of these numbers as a value, so nothing
+  can pass one to anything, whether or not the enumeration below reached every call site. Against
+  that, the control writes all three and compares none.
+- **The enumerated repertoire contains none of them.** 19 to 38 distinct control codes per build,
+  spanning `0x0002` to `0x0103`, growing as builds add capability — and never a debug code. This is
+  the negative control the scan needs: a Secure Kernel that issued *no* hypercall would be a broken
+  scan rather than a finding.
+- **The synthetic-debugger MSRs are untouched.** Zero accesses to `0x400000F0`–`0x400000FF` in any
+  build, against 20 to 27 *other* synthetic-MSR sites per build — so the MSR scan demonstrably works
+  on these images and simply finds no debug MSR.
+
+#### Three traps, each of which produced a wrong reading first
+
+- **A sample named after its version resolves no symbols, and the scan then reports the answer you
+  were hoping for.** `cdb` names a module after its *file*, so
+  `securekernel-10.0.29648.1000.exe` answers to `securekernel_10_0_29648_1000!` and every
+  `x securekernel!...` silently returns nothing. Nine of ten samples reported *0 hypercall sites,
+  no debug control codes* — a broken scan wearing the conclusion's clothes, caught only because the
+  negative control says a Secure Kernel issuing no hypercalls is impossible. The instrument now
+  stages each image under the real module name before asking.
+- **The control code and the rep-count bound are the same number.** `mov ecx, 0xc` followed by
+  `cmp r14d, ecx` is one constant serving as both: `0x000C` is the control code, and 12 is the
+  extended-fast rep limit, because a 112-byte fast input is a 16-byte header plus twelve 8-byte
+  elements. Read the `cmp` as the bound and the `mov` as the code and you are right; read either
+  the other way and it still looks right.
+- **Treating every function that calls the hypercall page as a wrapper reads bug check codes as
+  hypercall codes.** `SkeBugCheckEx` calls the page directly, so an earlier pass enumerated *its*
+  callers and took each `KeBugCheckEx(code, …)` argument for a control code — 271 call sites and 72
+  "control codes" on 28000.2952, including `0x0000` and `0x01E6`. Bug check `0x69` exists
+  (`IO1_INITIALIZATION_FAILED`), so this was a live route to a **false positive on the exact
+  question being asked**. The fix is to evaluate rcx at the *page call*: `SkeBugCheckEx` reaches it
+  with a literal `0x0087`, which is its own answer, and only a function that reaches the page with
+  the code it was *handed* has callers worth enumerating.
+
+#### What S5a does not establish
+
+- **S5's pass condition is untouched.** *A VTL1 execution stop is delivered to a debugger* is not
+  met by any outcome here. What is closed is one route — the hypercall and MSR route from Secure
+  Kernel's side — and closing it is what makes the remaining candidate specific.
+- **The receiver was not re-derived statically, and two attempts to do it failed instructively.**
+  Confirming from `hvix64.exe` that the debug hypercalls reach the VTL1 debug context would have
+  closed the loop from both ends. A stride scan for a dispatch table indexed past `0x6B` found a
+  16-byte-record array at `.data+0x22000` whose entries *self-label* — each stub writes its own
+  index into a per-processor ring — which looks exactly like proof that the index is a control code.
+  It is the **IDT**: the stubs end in `iretq` and the second qword of each record is a gate
+  attribute (`0x8E` interrupt, `0x8F` trap) with selector `0x0010`, so the index is a **vector**. A
+  second attempt, looking for a bound check after a `movzx …, cx`, found one candidate and it was a
+  512-entry page-table walk. The receiver therefore rests on the live trace already in the
+  validation record — the session handler reached twice with VTL 0 and **zero** times with a
+  nonzero VTL — and on the control binary, not on a static read of this build. The `hvix64.exe`
+  read was of this workspace's `10.0.26100.9444`, which is not the lab guest's build.
+- **It is static, and a computed code would evade the immediate scan.** The three values are never
+  written as immediates; a value *arrived at* arithmetically (`mov ecx, 0x68` then `inc ecx`) would
+  not show in that reading. The enumerated repertoire covers the computed cases it can resolve, and
+  between them the two readings are what the claim rests on.
+- **Coverage is not quite total on four builds.** 99.80% to 99.82% on 29617, 29639, 29648 and
+  29667, where three or four declared functions decoded short — roughly 1,900 bytes of about a
+  megabyte. The other six decoded completely.
+- **Nothing here is about a route with no guest-side code**, which is now the only live candidate:
+  a stop driven entirely from the hypervisor or the root, needing no cooperation from Secure Kernel
+  at all. S5 continues there.
+
+#### What it changes downstream
+
+- **Breakpoints stay excluded, and now for a measured reason rather than an assumed one.** S4 solved
+  the patch half — an `int 3` can be written into VTL1 by the direct route. S5a shows the catch half
+  has no Secure Kernel-side transport to deliver it, which is why the S5 instruction *do not plant
+  one to test this* stands unchanged and is better founded than when it was written.
+- **The inspector-versus-debugger question narrows rather than closes.** A capture session is a
+  fixed snapshot and stays one. What would change that is a route this gate did not test, not the
+  one it closed.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility
