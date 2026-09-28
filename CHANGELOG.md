@@ -9,6 +9,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A parent-installed exception intercept fires, and it holds VTL1 exactly as it holds VTL0.**
+  Gate S5h, and the catch half S5b could not test: that gate installed and removed an intercept
+  without provoking anything, so it could not tell an implicitly-VTL0 intercept from an
+  implicitly-every-VTL one and recorded the route as *unresolved on scope*. S5g's enclave supplies
+  the missing piece — a VTL1 exception raised by code we wrote, rather than a planted `int 3` in
+  Secure Kernel, which the plan excludes. One guest-side binary raises `#BP` in both VTLs and counts
+  what its own `__except` catches, so the arms differ in the VTL and in nothing else, and the count
+  is the detector: an intercept that fires takes the trap before the guest dispatches it, which
+  needs no port to observe. **With the intercept standing the guest handled 0 of 20,000** in every
+  arm — 120 consecutive zero samples over 24.4 s in VTL0, in VTL1 inside the enclave, and on the
+  VTL0-only twin. **Removing it mid-arm lets all three finish 20,000/20,000**, so the traps are held
+  and handed back rather than discarded: a resumable stop, not a swallowed exception. Both controls
+  hold — an intercept on `#BR` that nothing raises, and a `#DE` raised against a `#BP` intercept,
+  each leave both VTLs at their null rates — and either one alone would have left "an intercept is
+  standing" and "this exception was taken" as the same observation. Six halts catch the VTL1 arm's
+  thread at one VTL1 user-mode address inside the enclave, which is what rules out a VTL0 excursion
+  being the thing intercepted. Only the raising thread is held: the guest answered a second
+  PowerShell Direct connection during every arm, and no guest needed a reboot.
+  **S5 still does not pass**, and what is missing is now one specific thing rather than a question
+  about whether any route exists: the parent holds no port, so this is a stop with nobody listening,
+  and `HvCallCreatePort`/`HvCallConnectPort` in the probe driver is the next gate.
+  **The scope limit is the part to carry forward**: the enclave is VTL1 *user* mode and Secure
+  Kernel is VTL1 *kernel* mode, so that a partition-scoped intercept with no VTL field in its ABI
+  covers the first is a reason to expect the second and not a measurement of it.
+- **The first four runs of that gate read the VTL1 arm as *advancing*, and it is retracted here.**
+  The counts — 1,902, 6,396, 15,076, 18,486 — were all the monitor's final sample, written *after*
+  teardown removed the intercept and the raiser finished, and one of them became a "405x slower but
+  advancing" rate supporting a reading in which the two VTLs were reached differently. The trace
+  says the count first moves at sample 121 of 121, and 219 of 219 in the runs with no release: 120
+  consecutive zeroes, then a post-release burst. The reading now comes from where a count first
+  moved rather than what it ended at.
 - **Three routes to making Secure Kernel execute were tried and the third one works: our own code
   now runs in VTL1, and a halt taken while it runs is the condition every earlier gate was
   qualified on.** One route is closed, one unresolved, one open. Gate S5g, run with the
@@ -21,9 +52,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   by is not a sound test either. What was actually seen: `LsaCfgFlags`, the DeviceGuard scenario key and
   `EnableVirtualizationBasedSecurity` all set, **Secure Boot `On` for both reboots** (it is a
   documented CG prerequisite, and this gate turns it off only later), `SecurityServicesRunning` still
-  `2` and no DeviceGuard events — because Microsoft's edition table reads *Windows Pro: **No***, and
-  this guest is `Windows 11 Pro`. Review proposed that current Pro releases support it; the table is
-  why that is declined. Note also that `LsaCfgFlags = 1`, which is what was set, is *enabled **with**
+  `2` and no DeviceGuard events — and **why** it never activated is unknown, the candidates being the
+  in-VM requirements the same documentation lists, licensing entitlement, and the reporting field
+  itself being unreliable. Note also that `LsaCfgFlags = 1`, which is what was set, is *enabled **with**
   UEFI lock* and `2` is without: a repeat on an eligible edition should use `2`, and a VM's CG is
   disableable from the host with `Set-VMSecurity -VirtualizationBasedSecurityOptOut $true`.
   **Writing a trustlet: closed by signing policy** — IUM wants a Microsoft certificate with the IUM

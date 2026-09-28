@@ -2768,6 +2768,168 @@ The VBS guest is **not** as it was found, and a later gate reading it needs to k
   **`0xFFFFF80679FB0035`**. The self-map index was not re-read and is unknown rather than assumed to
   have moved.
 
+### S5h result, 2026-09-28: the intercept fires, and it holds VTL1 exactly as it holds VTL0
+
+**A parent-installed exception intercept stops a VTL1 exception from ever reaching the guest, and
+hands it back intact when the intercept comes down.** This is the catch half S5b could not test:
+that gate installed and removed an intercept without provoking anything, so it could not tell an
+implicitly-VTL0 intercept from an implicitly-every-VTL one, and recorded the route as *unresolved
+on scope*. It is now resolved in the second direction — **not implicitly VTL0** — with the scope
+limit in *What this does not establish* below, which is the part of this section that matters most.
+
+**S5g is what made it runnable.** A VTL1 exception was needed that is not a planted `int 3` in
+Secure Kernel, which the plan excludes and which would bugcheck the guest. S5g's enclave supplies
+one: our own code, in VTL1 user mode, in a process we start and can lose.
+
+#### The instrument
+
+One guest-side binary raises the exception in **both** VTLs, so the two arms differ in the VTL and
+in nothing else — `spin_host.exe BP0` runs the loop in VTL0, `BP1` runs the identical loop inside
+the enclave through a new `RaiseBp` export, and each catches its own exception with `__try` /
+`__except` and counts what came back. The count is the detector: an intercept that fires takes the
+trap **before the guest dispatches it**, so `handled` tracking `rounds` says the guest saw every
+exception and `handled` frozen says something else took them. This parent holds no intercept port,
+so nothing here receives a message, and it does not need to.
+
+Beside it, from the parent: `HvRegisterVpRuntime` each second, a second PowerShell Direct
+connection four seconds into every intercept arm to ask whether the *guest* is still alive or only
+the raising thread is stuck, and S5c's halt to read `RIP` at both VTLs while the arm is stalled.
+The client is `s5h.py`, on the same `h3probe.sys` IOCTL as S5b and S5c.
+
+**Every arm is a null / intercept / null triple**, run back to back: a difference between readings
+taken minutes apart is drift, and interleaving is what makes it the intercept.
+
+#### What the guest did, arm by arm
+
+Twenty thousand raises per arm. The null rate is what every intercept arm is read against, and the
+two VTLs have different null rates — a VTL1 exception costs about eleven times a VTL0 one on this
+guest, which is itself a measurement this gate did not have before:
+
+| arm | null | with the intercept standing |
+|---|---|---|
+| **VTL0**, VTL0-only guest | 20,000/20,000, `0.86 us` each | **0 handled** in 120 samples over 24.4 s |
+| **VTL0**, VBS guest | 20,000/20,000, `0.82–0.96 us` each | **0 handled** in 120 samples over 24.4 s |
+| **VTL1**, VBS guest, in the enclave | 20,000/20,000, `9.47–9.97 us` each | **0 handled** in 120 samples over 24.4 s |
+
+Every arm reports code `0x80000003` (`STATUS_BREAKPOINT`) in its null, so what the handler caught
+is checkable as the exception that was raised rather than assumed.
+
+**Released mid-arm, all three complete.** Removing the intercept at 25 s while the raiser is still
+running lets every arm finish **20,000/20,000** — so the traps were **held, not discarded**, and
+the hold is resumable. That is the difference between a stop a debugger could use and a swallowed
+exception, and it is measured rather than inferred. Held for 24.4 s of a 24.6 s run, the arms
+average `1224–1235 us` per exception against nulls of `0.86` and `9.7`.
+
+Longer holds behave the same: without the release, arms were held at zero for 40.4 s, 44.5 s and
+59.5 s across separate runs — 198, 218 and 291 consecutive zero samples.
+
+#### The two controls, because either one alone leaves the finding unreadable
+
+An intercept that is standing and an exception that is being taken are the same observation unless
+both are varied. So both were:
+
+| control | VTL0 | VTL1 |
+|---|---|---|
+| **install `#BR` (`0x05`), raise `#BP`** — an intercept nothing triggers | `0.94 us` against a `0.84` null, 20,000/20,000 | `9.71 us` against a `9.88` null, 20,000/20,000 |
+| **install `#BP` (`0x03`), raise `#DE`** — an exception the intercept is not for | `1.23 us` against a `1.13` null, 20,000/20,000 | `9.36 us` against a `10.01` null, 20,000/20,000 |
+
+Neither control moves either arm. The effect needs the installed vector to **be** the raised one,
+which is what "this intercept fires for this exception" means. `#DE` is raised by an integer divide
+by zero and reports `0xC0000094`, at a null cost within 15% of `#BP`'s in both VTLs, so it is a
+matched substitute rather than a cheaper one.
+
+The negative control from S5b ran first in every run and refused every time: intercept type
+`0xFFFFFFFF` returns `0x0005 INVALID_PARAMETER`, so `SUCCESS` on the real installs means something.
+`#BP` acceptance was re-derived on the VTL0-only child in each run rather than recalled from S5b's
+table.
+
+#### The retraction this gate had to make about its own first reading
+
+**The first four runs reported the VTL1 arm as *advancing* under the intercept — 1,902 then 6,396
+then 15,076 then 18,486 handled — and all four readings were wrong.** The monitor writes the live
+count every 200 ms; the arm's teardown removes the intercept; the guest-side raiser then finishes
+its remaining raises in under a second, and the monitor gets one more write in before it exits. The
+figure being read was that write. Converted to a rate it looked like a credible partial effect —
+"405x slower but advancing" — and it supported a whole reading in which the intercept reached VTL0
+and VTL1 differently.
+
+What caught it was the release arm, where the removal is explicit and the samples before it are
+unambiguous. Re-reading the trace then settled it: **the count first moves at sample 121 of 121**,
+and in the runs with no release, at sample 219 of 219. One hundred and twenty consecutive zeroes,
+then a post-release burst.
+
+The reading now comes from **where the count first moved**, not from what it ended at, and the
+script says `ALL ZERO` or names the sample. *A prefix is not a page* has a sibling here: the last
+sample is on the wrong side of the release.
+
+#### Where the held thread sits, and what the halt says about which VTL
+
+Six halts, five seconds apart, with the intercept standing (S5c's `HvRegisterExplicitSuspend`,
+released in a `finally`; every halt reported `released: True`):
+
+| | VTL0 arm | VTL1 arm |
+|---|---|---|
+| where the raiser was caught | VTL0 `RIP` **`0x00007FF7D5AF748D`**, user mode | VTL1 `RIP` **`0x000001D1009E500D`**, user mode inside the enclave |
+| same address across halts | yes, with `RSP` `0x000000B3BF7DF968` | yes, with `RSP` `0x000001D0F0B0FEB8` |
+| the other VTL on that VP | VTL1 parked at Secure Kernel's `0xFFFFF80679FB0035` | VTL0 read `0xFFFFF80679FB001C`, `RSP` `0xFFFFB18F23D8A648` |
+
+**The VTL1 arm's thread is caught in VTL1**, at one address, every time. That is what rules out the
+alternative this gate was most exposed to: if the enclave's exception dispatch made a VTL0 excursion
+and a VTL0-scoped intercept were catching *that*, the stall would show as a VTL0 user-mode `RIP`, the
+way the VTL0 arm's does. It does not.
+
+**And the VTL0-labelled read is not echoing VTL1 here**, which matters because S5c recorded exactly
+that failure — over eight halts its VTL0-labelled `RIP`/`RSP` came back as the VTL1 values 8/8. In
+this arm the two VTLs report different addresses *and* different stacks, so the two reads are
+distinguishable in a way S5c's were not. On halts where the VP was not running the raiser, both
+reads return Secure Kernel's parked address, which is the S5c shape and is why the table above says
+where the raiser was *caught* rather than what every read returned.
+
+#### The blast radius, which is narrower than the first run suggested
+
+**Only the raising thread is held; the guest keeps serving.** A second PowerShell Direct connection
+opened four seconds into every intercept arm answered with the guest's computer name every time, on
+both guests — so a partition-wide `#BP` intercept does not wedge the partition. VP runtime while an
+intercept stood was `0.12–0.16` and `0.48–0.55` CPU-seconds per second against a null-arm baseline
+near `0.03`: elevated, not saturated, and nowhere near the livelock the first run's raw deltas were
+read as.
+
+Both guests came through every run: teardown reported **0 intercepts still standing** each time, no
+straggler processes, VBS and HVCI still `2` on the VBS guest, no reboot. **This gate cost the bench
+nothing**, which is worth recording because S5g cost it four reboots.
+
+#### What this does not establish, and the scope limit is the important one
+
+- **It is VTL1 *user* mode, not Secure Kernel.** The enclave runs in VTL1 user mode (IUM); Secure
+  Kernel is VTL1 kernel mode. That a partition-scoped intercept with no VTL field in its ABI covers
+  one is a reason to expect it covers the other, and expecting is not measuring. The plan forbids
+  planting an `int 3` in Secure Kernel to check, and that prohibition stands — **so treat "a #BP in
+  Secure Kernel would be held too" as an inference this record has not tested.**
+- **Nothing was delivered anywhere.** There is no port, no receiver and no intercept message was
+  read. S5's pass condition wants a stop *delivered to a debugger*, and this is a stop with nobody
+  listening. The gate does not pass.
+- **The mechanism of the hold is unmeasured.** Whether the hypervisor queues an undeliverable
+  intercept message and leaves the vCPU thread pending, or does something else, is not established
+  by anything here; what is established is the observable behaviour at the guest's exception
+  dispatch.
+- **`HvCallCreatePort` / `HvCallConnectPort` are untried.** Whether a parent can create a port of
+  its own and receive on it is the next question and is not answered here.
+
+#### What to run next, and what not to repeat
+
+- **Do not** re-run the controls. The `#BR`-installed and `#DE`-raised arms are taken on both VTLs,
+  and the negative control ran in every one of six runs.
+- **Do not** read a progress count without checking which side of the release it is on. That is
+  this gate's own retracted reading, and the script now refuses to make it.
+- **Do not** plant an `int 3` in Secure Kernel to extend the result from VTL1 user mode to VTL1
+  kernel mode. S5a's prohibition is unchanged and the guest would bugcheck.
+- **The next experiment is the receiver**, and it is now a specific and bounded one: can the root
+  create a message port and connect it such that an exception intercept on a child is delivered to
+  it? That is `HvCallCreatePort`, `HvCallConnectPort` and a SynIC message page in `h3probe.sys` —
+  driver work rather than reversing, with the catch half already measured. If it can, S5's pass
+  condition is in reach for VTL1 *user* mode and the Secure Kernel question becomes the remaining
+  one.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility
