@@ -55,13 +55,22 @@ image name before asking.
 
 Usage
 -----
-    python sk_hypercall_scan.py --symbols <path> securekernel.exe [more.exe ...]
-    python sk_hypercall_scan.py --control C:\\Windows\\System32\\kdhvcom.dll
-    python sk_hypercall_scan.py --coverage --symbols <path> securekernel.exe
+    python sk_hypercall_scan.py --control C:\\Windows\\System32\\kdhvcom.dll \
+        --symbols <path> securekernel.exe [more.exe ...]
 
-Exit status is 0 only when every image scanned reached a well-founded negative: complete
-code enumeration, no debug immediate, no privileged instruction, no SynDbg MSR, and a
-repertoire with no unresolved sites.
+`--control` is not optional for an image scan. This file says a failing control voids every
+negative; a run with no control is the same situation with less information, so scanning
+images without one prints UNVALIDATED and exits non-zero rather than handing back a clean
+result nothing checked. x64 images only - an ARM64 `securekernel.exe` is PE32+ too, and is
+refused rather than decoded as x86-64.
+
+Exit status is 0 only when a control was run and passed, and every image reached a
+well-founded negative: no debug immediate at a recognised boundary, no SynDbg MSR number at
+any alignment, no hypercall instruction, and nothing left unexamined. Note what that does
+*not* include: wrapper sites whose control code did not resolve do not block it. Every
+sampled build has some, so blocking on them would make every run inconclusive and delete
+the reading rather than qualify it -- instead the count is printed with the verdict, since
+such a site could carry a value by one of the routes the limits name.
 """
 from __future__ import annotations
 
@@ -116,6 +125,14 @@ class PE:
         opt = coff + 20
         if struct.unpack_from('<H', d, opt)[0] != 0x20B:
             raise ValueError('not PE32+: %s' % path)
+        # PE32+ is not the same as x64, and an ARM64 `securekernel.exe` is both. Every
+        # decode here is CS_ARCH_X86/CS_MODE_64 and the exception directory is read as
+        # 12-byte x64 RUNTIME_FUNCTIONs, so an ARM64 image would produce a confident and
+        # meaningless verdict rather than an error. One such image is already on this
+        # bench (docs/secure-kernel/securekernel-export-followup.md).
+        if self.machine != 0x8664:
+            raise ValueError('not an x64 image (machine %04X): %s -- this scan decodes '
+                             'x86-64 only' % (self.machine, path))
         self.image_base = struct.unpack_from('<Q', d, opt + 24)[0]
         self.size_of_image = struct.unpack_from('<I', d, opt + 56)[0]
         ndir = struct.unpack_from('<I', d, opt + 108)[0]
@@ -802,6 +819,7 @@ def scan_image(path, sympath, show_coverage=False):
     print('  sha256 %s' % pe.sha256)
     print('  timestamp %08X   declared functions %d' % (pe.timestamp, len(pe.runtime_functions())))
 
+    residual = {'repertoire': 0}
     cov = coverage(pe)
     if show_coverage:
         print('  declared-function bytes: %d decoded of %d (%.2f%%), %d truncated'
@@ -874,6 +892,7 @@ def scan_image(path, sympath, show_coverage=False):
                  len(roles['unresolved'])))
         print('  distinct control codes resolved: %d  (a heuristic lower bound, not the'
               ' verdict)' % len(codes))
+        residual['repertoire'] = unresolved + len(roles['unresolved'])
         line = ['%04X' % c for c in sorted(codes)]
         for i in range(0, len(line), 16):
             print('     %s' % ' '.join(line[i:i + 16]))
@@ -902,15 +921,21 @@ def scan_image(path, sympath, show_coverage=False):
         for why in inconclusive:
             print('     - %s' % why)
     else:
-        print('  DEBUG HYPERCALL ROUTE: none -- and the scan that says so is complete')
-        # Each clause here must match the check that produced it. "No debug code as an
-        # immediate" would be broader than the reading: the byte-anchored superset above
-        # is not empty, and saying otherwise is the same defect this scan keeps being
-        # corrected for, committed in its own summary line.
+        # Deliberately not "no debug hypercall is issued". Each clause below names the
+        # check that produced it, and the residual is printed with them rather than left
+        # for a reader to remember: a wrapper site whose rcx did not resolve could carry
+        # a code this scan cannot see, by the same data-loaded or computed routes the
+        # limits name. Making those sites invalidate the run was considered and declined
+        # -- every sampled build has some, so it would render every result inconclusive
+        # and delete the reading rather than qualify it.
+        print('  NO DEBUG HYPERCALL ROUTE VISIBLE TO THIS SCAN')
         print('     (across %d executable bytes: no debug code as an immediate at a'
               ' recognised instruction boundary -- %d unaligned candidate(s) listed above'
               ' -- no SynDbg MSR number as an immediate at any alignment, no vmcall/vmmcall)'
               % (cov['executable'], len(unaligned)))
+        print('     residual: %d repertoire site(s) whose control code did not resolve,'
+              ' any of which could carry a value this scan does not read'
+              % residual['repertoire'])
 
     return dict(path=path, codes=sorted(codes), debug=hits, written=len(written),
                 privileged=len(union), syndbg=len(syndbg_imm), found=found,
@@ -965,9 +990,23 @@ def main(argv=None):
         ap.error('give at least one image, or --control')
 
     ok = True
+    controlled = False
     if args.control:
         ok = scan_control(args.control)
+        controlled = True
     rows = [scan_image(p, args.symbols, args.coverage) for p in args.images]
+
+    if rows and not controlled:
+        # This file says a failing control voids every negative. A run with no control
+        # at all is the same situation with less information, so it cannot be allowed to
+        # exit 0 -- a scanner regression or a capstone change would otherwise show up as
+        # a clean result.
+        print()
+        print('UNVALIDATED: no positive control was run, so these negatives are not'
+              ' supported.')
+        print('  Re-run with --control <path to kdhvcom.dll> (Windows ships it in'
+              ' System32).')
+        ok = False
 
     if rows:
         print()

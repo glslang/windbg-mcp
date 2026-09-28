@@ -1855,6 +1855,11 @@ They agree with the six verified rows and are listed separately rather than coun
   not an immediate in a code section. This is the residual gap in the conclusion and the repertoire
   does not close it, being only a lower bound. Both were found by auditing the tool's own claims
   against the checks behind them rather than by a reviewer, which is the cheaper order.
+- **5 to 12 wrapper sites per build have a control code the scan cannot recover**, and any of them
+  could carry a value by one of the routes above. They do not block the verdict, which is a
+  decision rather than an oversight: every sampled build has some, so blocking on them would make
+  every run inconclusive and delete the reading instead of qualifying it. The count is printed with
+  the verdict so it is never out of sight.
 - **The repertoire does not follow control flow, and is not sound on its own.** The evaluator walks
   in address order, so a code built across a branch can be missed and a block after an
   unconditional jump can contribute one no path reaches. Discarding state at every branch target
