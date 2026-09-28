@@ -2869,9 +2869,10 @@ guest side to speak to it — rather than by re-running a completed experiment.
 
 **Secure Kernel has no hypercall or MSR route to that port**, measured offline across ten builds
 from 19041.207 to 29667.1000 with `tools/sk_hypercall_scan.py`. The three debug hypercall codes are
-never written as immediates anywhere in any sample's executable bytes — every occurrence of `0x69`,
-`0x6A` or `0x6B` is a `cmp` in unrelated code — there is no `vmcall`/`vmmcall` instruction in any
-sample, and nothing touches the synthetic-debugger MSRs `0x400000F0`–`0x400000FF`. The enumerated
+never written at any instruction boundary the scan recognises — every occurrence of `0x69`, `0x6A`
+or `0x6B` at one is a `cmp` in unrelated code — no sample materialises a synthetic-debugger MSR
+number `0x400000F0`–`0x400000FF` at all, and there is no `vmcall`/`vmmcall` instruction in any of
+them. The enumerated
 hypercall repertoire (19–38 distinct codes per build, `0x0002`–`0x0103`) contains none of them
 either; that reading is a heuristic lower bound acting as the negative control, and the verdict
 comes from the immediate scan, which covers 100% of each image's executable sections. The positive

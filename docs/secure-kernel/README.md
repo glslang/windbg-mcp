@@ -116,9 +116,9 @@ inherit `D:\`'s ACL, so any authenticated local user can read a guest's whole RA
 unresolved and decides inspector versus debugger — but it is now a narrower question than "the port
 is up and nothing connects to it". **Those were the same wall**, measured 2026-09-27 as gate S5a:
 Secure Kernel has no hypercall or MSR route to that port. Across ten builds from 19041.207 to
-29667.1000 it never writes the three debug hypercall codes as immediates anywhere in its executable
-bytes — every occurrence is a `cmp` — it contains no `vmcall` instruction of its own, and it touches
-none of the synthetic-debugger MSRs. Its enumerated hypercall repertoire (19–38 codes per build)
+29667.1000 it never writes the three debug hypercall codes at any instruction boundary the scan
+recognises — every occurrence at one is a `cmp` — it never materialises a synthetic-debugger MSR
+number at all, and it contains no `vmcall` instruction of its own. Its enumerated hypercall repertoire (19–38 codes per build)
 holds none of them either, and that reading is a lower bound serving as the negative control rather
 than the verdict.
 The control is Windows' own KD-over-hypervisor transport, `kdhvcom.dll`, which is nothing but those
