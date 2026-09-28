@@ -9,6 +9,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The root can halt a running guest's virtual processor and read that guest's VTL1 while it is
+  halted — so a live Secure Kernel inspector is feasible end to end, with no capture.**
+  `FOLLOWUPS.md` item 103's gate S5c: `HvCallSetVpRegisters` (`0x0051`) writing
+  `HvRegisterExplicitSuspend`, from the root partition, with no guest-side code, no exception, no
+  intercept and no port. Stop the VP (S5c), read VTL1 registers (H3) and VTL1 memory by the direct
+  route (H4), resume. **A status is not a stop, so the stop is measured separately**:
+  `HvRegisterVpRuntime` counts executed time and is read-only, and it reads **430** (VTL0 control)
+  and **1,032** (VTL1 test) per 2000 ms while suspended against an idle band of **41,291–84,075**,
+  with a three-sample no-suspend null model beside it — because a first attempt at a 60 ms window
+  could not tell a suspended VP from an idle one, and an earlier guard looked for a catch-up burst
+  on release that an idle guest never produces. While halted the VTL1 context is readable and
+  distinct: `CR3` `0x1201000` — the landmark S0 and H4 both recorded, arriving from a third
+  direction — with `RIP` `0xFFFFF80609990035`, and a separate read-only probe found the VTL1 `RIP`
+  distinct from VTL0's in **40 of 40 samples on each of both VPs**, moving across a suspend cycle,
+  so it is Secure Kernel's own live state rather than a mislabelled read.
+- **S5 still does not pass, and the gap is stated rather than rounded off.** Its condition is *a
+  VTL1 execution stop delivered to a debugger*: this is the **whole VP**, at an arbitrary point,
+  found by polling. Set by naming VTL1, `HvRegisterExplicitSuspend` reads `1` at VTL0 too, and the
+  symmetric arm — naming VTL0 on the same VBS guest — reads `1` at VTL1 and stops the VP just as
+  hard (495 against 1,032), so there is one VP-wide suspend behind a VTL parameter that decides who
+  may ask, the same shape S5b found on the intercept block. The parameter *is* validated: naming
+  VTL1 on the twin with no VTL1 is refused with `0x0015`, the code its VTL1 register read returns.
+  `VsmVpStatus.ActiveVtl` read `0` in all 80 read-only samples and every arm, so Secure Kernel was
+  never caught executing. The debugger half is back to S5b's leftover — whether a partition-scoped
+  intercept fires for VTL1 execution — which is the only remaining candidate that could stop at a
+  chosen point, and still needs a receiver.
 - **A parent may install an exception intercept on a child partition, and may not aim one at that
   child's VTL1.** `FOLLOWUPS.md` item 103's gate S5b, which is the candidate S5a left standing: a
   VTL1 stop driven from the root through `HvCallInstallIntercept` (`0x004D`), the primitive Secure
