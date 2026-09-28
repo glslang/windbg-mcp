@@ -49,8 +49,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (characteristics `0x160` → `0x1E0`) and chain trust (in-guest signature `UnknownError` →
   **`Valid`**). Two of those moved the failure and neither fixed it — test-signing took it from 577
   to 193, trust left it at 193 — so the signature path is satisfied and an unidentified image-shape
-  rule remains. The next step is a diff against a known-good enclave binary rather than another
-  hypothesis; an attempt to find one by scanning `System32` misread
+  rule remains. That diff against a known-good enclave binary is **done** and is what opened the route; an attempt to find one by scanning `System32` misread
   `IMAGE_LOAD_CONFIG_DIRECTORY64` and returned 62 false positives including `mfc140`.
 - **That gate changed the lab guest**, recorded because a later one will read it: Secure Boot
   **off**, test-signing **on** (VBS and HVCI verified still running after both), a self-signed

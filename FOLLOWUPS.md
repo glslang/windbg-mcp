@@ -3053,7 +3053,7 @@ validated. The full record is the
   sampling zero still has roughly a **22%** probability. So this is *compatibility with rare
   `LsaIso` activity*, *not* validation of the sampler; S5g's known VTL1 workloads later produced
   zero hits too, which points at `ActiveVtl` not reporting rather than at the sampler missing.
-- **S5g, 2026-09-28: two routes to VTL1 occupancy closed, the enclave route OPEN and measured.**
+- **S5g, 2026-09-28: one route closed, one unresolved, and the enclave route OPEN and measured.**
   Run with the
   operator's authorisation to reconfigure and reboot the VBS guest. **Credential Guard** is **unresolved**, and an earlier
   draft wrongly closed it *by edition* — Microsoft's table says Windows Pro: No, but the operator's
@@ -3077,8 +3077,8 @@ validated. The full record is the
   enclave CRT, `/INTEGRITYCHECK` (which moved characteristics `0x160` → `0x1E0`), and chain trust
   (in-guest status `UnknownError` → **`Valid`**). Test-signing moved the error 577 → 193 and trust
   left it at 193, so the signature path is satisfied and an unidentified **shape** rule remains.
-  **Next**: diff against a known-good enclave binary — the MS sample or the enclave SDK — rather
-  than hypothesise. Note `veclient.lib` does not exist in SDK 10.0.26100; `vertdll.lib` was used
+  **Done — that diff is what opened the route**: Microsoft's sample was used as the reference and
+  the differences are listed above, so do not repeat it. Note `veclient.lib` does not exist in SDK 10.0.26100; `vertdll.lib` was used
   instead and whether that substitution is the defect is unmeasured.
 - **The condition every halted-register reading was qualified on is now measured, and `ActiveVtl`
   is not the way to it.** With the enclave spinning and the VPs measurably busy (**25.8%** and

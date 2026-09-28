@@ -2487,8 +2487,9 @@ live VTL0 read is perfectly compatible with an inactive VTL1 query returning sav
 is what the next section's `ActiveVtl = 0` result would predict. The only VTL1 movement this record
 has seen is `RIP` going `…0035` → `…0003` across one suspend cycle, which fits both readings.
 **So S5c's and S5e's VTL1 readings rest on an instrument validated for VTL0 and not for VTL1**, and
-validating it there needs a workload that demonstrably moves VTL1 — the thing S5g could not
-produce. **The idle
+validating it there needs a workload that demonstrably moves VTL1. **Superseded by S5g below**,
+which produced exactly that: with a VBS enclave spinning, the VTL1 `RIP` moves across halts and
+lands inside code we wrote, so the VTL1 read is live as well. **The idle
 constant was the idle loop, not a stale read** — and S5c's readings rest on an instrument that has
 now been checked rather than assumed.
 
@@ -2551,7 +2552,7 @@ should know why there is a FireWire controller in it.
 
 ### S5g result, 2026-09-28: the enclave route is open and measured; one route closed, one unresolved
 
-**Two doors are shut and the third is open: our own code now runs in VTL1, and a halt taken
+**One door is shut, one is unresolved, and the third is open: our own code now runs in VTL1, and a halt taken
 while it runs is the condition every earlier gate was qualified on.** The value is in both halves —
 which routes are closed and why, and what the working one finally measured. S5f turned "VTL1 runs
 too rarely to catch" into a number; this turns "we could make it run" into two specific refusals
@@ -2598,7 +2599,11 @@ the activation still did not happen.
 Microsoft documents `LsaCfgFlags` `1` as *enabled with UEFI lock* and `2` as *enabled without
 lock*, with the locked form removable only through an `SecConfig.efi` boot-sequence procedure that
 requires physical presence. `1` is what went onto this guest. Credential Guard never activated, so
-no lock is expected to have been established — but **a repeat on an eligible edition must use `2`**,
+and an earlier draft concluded from that that no lock can have been established — **which the
+retraction above forbids**: the test that said it never activated is the one just discarded, so
+**the lock state is unknown** and a later cleanup of this guest should assume it may need the
+documented `SecConfig.efi` removal procedure until someone checks. **A repeat on an eligible
+edition must use `2`**,
 and the escape hatch for a VM is worth recording beside it: the same documentation says a virtual
 machine's Credential Guard can be disabled from the host with
 `Set-VMSecurity -VMName <n> -VirtualizationBasedSecurityOptOut $true`.
@@ -2618,7 +2623,7 @@ is its own gate, against a throwaway checkpoint, with the bugcheck as the expect
 
 #### Route 3 — a VBS enclave: **open**, once the official sample was used as the reference
 
-**This route works, and the eight failures below were all one mistake: building from first
+**This route works, and the nine failures below were all one mistake: building from first
 principles instead of from Microsoft's sample.** `windows-classic-samples/Samples/VbsEnclave` is
 the reference; against it the image loads, initialises and runs, and *our own code executes in VTL1
 user mode*:
@@ -2644,7 +2649,9 @@ the loader is entitled to refuse. Beside it: non-zero `FamilyID`/`ImageID` where
 An enclave is the documented way to run *your own* code in VTL1 user mode, and unlike a trustlet it
 is a developer facility. The guest supports it — `IsEnclaveTypeSupported(ENCLAVE_TYPE_VBS)` is
 true, `vertdll.dll` is present — and `CreateEnclave` with `ENCLAVE_VBS_FLAG_DEBUG` **succeeds every
-run**. `LoadEnclaveImage` does not, and eight suspects were eliminated one at a time:
+run**. `LoadEnclaveImage` did not, and nine suspects were eliminated one at a time — the ninth
+being signature trust, which is the row most easily miscounted because it was cleared by an
+operator action rather than a rebuild:
 
 | suspect | what was done | result |
 |---|---|---|
