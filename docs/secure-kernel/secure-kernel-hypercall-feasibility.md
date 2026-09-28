@@ -2595,6 +2595,28 @@ record has not identified. `veclient.lib`, named in the requirements this build 
 exist in SDK `10.0.26100`; `vertdll.lib` is its equivalent here, and whether that substitution is
 the defect is unmeasured.
 
+**What the refusal does *not* stop is enclave creation, and that produced one more reading and one
+more correction.** The guest's System log records a **`Secure Trustlet … started` / `stopped`** pair
+for a run, so `CreateEnclave` really does instantiate a container in VTL1 even though the image
+never loads — which looked like a usable VTL1 workload. A loop was built on it: **300
+create/terminate cycles in 15 ms**, then 400,000 cycles while the sampler ran, for **326,468
+further samples and still no `ActiveVtl = 1`**.
+
+**Then the trustlet events were counted, and there were ten in three minutes rather than 400,000.**
+So the creates after the first are not each instantiating a secure trustlet — at 50 µs a cycle they
+are mostly VTL0 bookkeeping — and "a sustained VTL1 workload" was a claim made from a plausible
+mechanism rather than from a count. It is recorded here as the fourth workload *with that
+qualification*, not as the strong one it was briefly described as.
+
+**Across four workloads — idle, a user-mode spin, twelve HVCI-verified kernel image loads, and the
+enclave loop — `ActiveVtl` has now read `0` in more than 1.15 million samples.** Two readings fit
+and this bench cannot separate them: VTL1 windows are consistently shorter than the ~55 µs sampling
+interval, or **the parent-side `HvRegisterVsmVpStatus.ActiveVtl` does not report a VP that is
+executing VTL1 at all**. The second has become the likelier of the two — a sampler at ~16,000 reads
+per second per VP that never once lands in VTL1, across workloads that certainly enter it, is
+easier to explain by the field than by the timing — but neither is established, and the
+halted-register readings stay conditional either way.
+
 **Where to start next, and what to avoid.** Diff the image against a *known-good* enclave binary —
 Microsoft's VBS enclave sample or the enclave SDK package — rather than forming another hypothesis.
 An attempt to find one by scanning `System32` for images carrying an enclave configuration read the

@@ -3061,6 +3061,14 @@ validated. The full record is the
   **Next**: diff against a known-good enclave binary — the MS sample or the enclave SDK — rather
   than hypothesise. Note `veclient.lib` does not exist in SDK 10.0.26100; `vertdll.lib` was used
   instead and whether that substitution is the defect is unmeasured.
+- **`ActiveVtl` has now read `0` in over 1.15 million samples across four workloads** — idle, a
+  user-mode spin, twelve HVCI-verified kernel image loads, and an enclave create/terminate loop.
+  **The fourth is weaker than it first looked**: `CreateEnclave` does log a `Secure Trustlet
+  started/stopped` pair, but counting them gave **ten in three minutes against 400,000 cycles**, so
+  the creates after the first are mostly VTL0 bookkeeping and "a sustained VTL1 workload" was a
+  claim from a mechanism rather than a count. Two readings still fit — VTL1 windows shorter than
+  the ~55 µs sampling interval, or **the parent-side `ActiveVtl` cannot report a VP executing
+  VTL1** — with the second now likelier and neither established.
 - **The VBS guest is changed and a later gate must know.** Secure Boot **off**, test-signing **on**
   (VBS/HVCI verified still running after both), a self-signed `CN=VTL1 Enclave Test` cert in
   `LocalMachine\Root`, Credential Guard keys set and inert, `C:\encl\` staged, and **four reboots**
