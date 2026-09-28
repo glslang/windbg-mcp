@@ -2506,12 +2506,27 @@ was trying to show, and it is four orders of magnitude rather than one and a hal
 - **`ActiveVtl = 1` was still never observed**, and the sample count is now **832,560+** across
   three conditions: idle, a two-VP user-mode spin, and **twelve freshly loaded kernel driver
   images** — every one of them verified by HVCI, which is enforced on this guest
-  (`SecurityServicesRunning = 2`, `CodeIntegrityPolicyEnforcement = 2`). Kernel image loads are the
-  textbook VTL1 entry and the sampler covers ~18,000 reads per second per VP, and none landed in
-  VTL1. So the negative is much stronger and it is still a negative: either those windows are far
-  shorter than the sampling interval, or the parent-side `ActiveVtl` does not report a VP that is
-  executing VTL1. **This gate cannot tell which**, and the halted-register readings stay conditional
-  on `ActiveVtl = 0` exactly as before.
+  (`SecurityServicesRunning = 2`, `CodeIntegrityPolicyEnforcement = 2`).
+
+  **And the reason is now quantitative rather than a shrug, which is the useful part.** The thing
+  that occupies a VP in VTL1 for a measurable span is a **trustlet** — an IUM process, which runs in
+  VTL1 *user* mode — not an HVCI verification, which is a brief excursion into VTL1 kernel mode.
+  This guest runs exactly one trustlet, `LsaIso`, and it is **inert**: `TotalProcessorTime`
+  **0.3593750 s across 27.6 hours** of uptime, a duty cycle near 0.0004%, and **unchanged to the
+  tick** across a burst of loopback logons. It is inert because Credential Guard is not configured
+  — `LsaCfgFlags` unset, `RequiredSecurityProperties = 0`, `SecurityServicesRunning` listing HVCI
+  alone — so `LsaIso` is loaded and does no work. At 0.36 s of VTL1 user-mode execution in 27 hours,
+  832,560 samples would expect **~3** hits if that time were spread evenly, and most of it was
+  spent at boot. **Zero is what the numbers predict**; the sampler was not missing VTL1, there was
+  almost none to miss.
+- **So the experiment that would settle it is identified and not run.** Give the guest a trustlet
+  that works — `LsaCfgFlags = 1` and a reboot turns Credential Guard on, after which every logon
+  drives `LsaIso` in VTL1 — then sample during a logon burst, and halt the VP if `ActiveVtl = 1` is
+  caught, which is the unmeasured condition every halted-register reading here is conditional on.
+  It costs a reboot of that guest (its boot-specific landmarks move, as this record now documents)
+  and is reversible. **Not attempted here**: changing a lab guest's security configuration and
+  restarting it is a change to a shared machine rather than a reading of it, and it is the
+  operator's call rather than this gate's.
 - **The halt's necessity is still not demonstrated.** S5d compared two back-to-back reads, which an
   idle guest passes trivially; the sharper test samples the same pages across a **matched
   wall-clock window** in both conditions. Over 3 s with the guest busy: **80,399 reads while
