@@ -218,47 +218,111 @@ class PE:
                 pos = (got[-1].address + got[-1].size) - (self.image_base + s['vaddr'])
             yield s, out
 
-    def sweep_gaps(self):
-        """Executable bytes no swept instruction covers, as (section, start_rva, bytes).
-
-        On every Secure Kernel sample these are short runs containing 0x61, which is
-        invalid in long mode - ASCII string data embedded in `.text`. They are reported
-        rather than assumed benign, and `exhaustive_decode` closes them.
-        """
-        out = []
-        for s, insns in self.sweep_code():
-            n = min(s['vsize'], s['rawsize'])
-            covered = bytearray(n)
-            for i in insns:
-                off = i.address - self.image_base - s['vaddr']
-                for k in range(max(off, 0), min(off + i.size, n)):
-                    covered[k] = 1
-            run = None
-            for k in range(n):
-                if not covered[k]:
-                    if run is None:
-                        run = k
-                elif run is not None:
-                    out.append((s['name'], s['vaddr'] + run, self.read(s['vaddr'] + run, k - run)))
-                    run = None
-            if run is not None:
-                out.append((s['name'], s['vaddr'] + run, self.read(s['vaddr'] + run, n - run)))
+    def call_targets(self, insns):
+        out = set()
+        for ins in insns:
+            if ins.mnemonic in ('call', 'jmp') and ins.operands \
+                    and ins.operands[0].type == CS_OP_IMM:
+                rva = ins.operands[0].imm - self.image_base
+                if any(s['vaddr'] <= rva < s['vaddr'] + min(s['vsize'], s['rawsize'])
+                       for s in self.code_sections()):
+                    out.add(rva)
         return out
 
-    def exhaustive_decode(self, rva, length, lookback=15):
-        """Decode from *every* offset across a region, so nothing can hide in it.
+    def aligned_instructions(self):
+        """Instructions at every boundary any pass recognises: {rva: (mnemonic, ops, [imms])}.
 
-        The linear sweep jumps to the end of each instruction it decodes, so it does not
-        try every possible boundary; over a short region an exhaustive pass does, and an
-        instruction overlapping the region can begin at most 15 bytes before it.
+        Three seeds, unioned. The exception directory gives declared function starts; a
+        linear sweep of each section gives everything between them; and a recursive descent
+        from every direct call and jump target, iterated to a fixpoint, gives the **leaf
+        functions** - which need no unwind data, are therefore absent from `.pdata`, and are
+        exactly what a linear sweep can stride past if it desynchronises on embedded data.
+        A leaf is reached by being called, so its entry is a call target even when nothing
+        else names it.
         """
-        start = max(rva - lookback, 0)
-        blob = self.read(start, length + (rva - start) + lookback) or b''
-        seen = {}
-        for off in range(len(blob)):
-            for ins in MD.disasm(blob[off:], self.image_base + start + off, count=2):
-                seen[(ins.address - self.image_base, ins.mnemonic, ins.op_str)] = ins
-        return list(seen.values())
+        found = {}
+
+        def absorb(insns):
+            for ins in insns:
+                rva = ins.address - self.image_base
+                if rva not in found:
+                    found[rva] = (ins.mnemonic, ins.op_str,
+                                  [op.imm for op in ins.operands if op.type == CS_OP_IMM],
+                                  ins.size)
+
+        for _b, _e, insns in self.functions():
+            absorb(insns)
+        for _s, insns in self.sweep_code():
+            absorb(insns)
+
+        seeds = set()
+        for _s, insns in self.sweep_code():
+            seeds |= self.call_targets(insns)
+        for _b, _e, insns in self.functions():
+            seeds |= self.call_targets(insns)
+
+        seen_seeds = set()
+        while seeds:
+            rva = seeds.pop()
+            if rva in seen_seeds:
+                continue
+            seen_seeds.add(rva)
+            if rva in found:
+                continue
+            blob = self.read(rva, 4096)
+            if not blob:
+                continue
+            insns = list(MD.disasm(blob, self.image_base + rva))
+            absorb(insns)
+            seeds |= (self.call_targets(insns) - seen_seeds)
+        return found
+
+    def immediate_sites(self, values, lookback=15, anchor_bytes=1):
+        """Every instruction anywhere in executable bytes carrying one of `values` as an
+        immediate - anchored on the constant's own bytes, so no decode alignment can hide it.
+
+        This is the pass the whole conclusion rests on, and it is anchored this way because
+        the two cheaper ideas both leak. A linear sweep only restarts after an *undecodable*
+        byte, so data that decodes successfully but desynchronised carries the cursor past a
+        real leaf-function boundary - and a leaf is absent from `.pdata` too, so a genuine
+        `mov ecx, 0x69` there is missed while every coverage figure still reads 100%.
+
+        What cannot leak is the constant itself. An immediate is encoded little-endian, so
+        the low byte of the value appears verbatim in the instruction whatever the operand
+        width. So: find every occurrence of that low byte, then decode from all 16 possible
+        instruction starts that could cover it, and keep any decoding whose immediate is the
+        value and whose extent actually spans the anchor byte. Sound by construction, and it
+        never needs to know where an instruction begins.
+        """
+        anchors = {}
+        for v in values:
+            token = (v & ((1 << (8 * anchor_bytes)) - 1)).to_bytes(anchor_bytes, 'little')
+            anchors.setdefault(token, []).append(v)
+        out = {}
+        for s in self.code_sections():
+            n = min(s['vsize'], s['rawsize'])
+            blob = self.read(s['vaddr'], n) or b''
+            for token, candidates in anchors.items():
+                start = 0
+                while True:
+                    i = blob.find(token, start)
+                    if i < 0:
+                        break
+                    start = i + 1
+                    lo_off = max(i - lookback, 0)
+                    window = blob[lo_off:i + lookback + 1]
+                    for off in range(len(window)):
+                        addr = self.image_base + s['vaddr'] + lo_off + off
+                        for ins in MD.disasm(window[off:], addr, count=2):
+                            rva = ins.address - self.image_base
+                            if not (rva <= s['vaddr'] + i < rva + ins.size):
+                                continue
+                            for op in ins.operands:
+                                if op.type == CS_OP_IMM and op.imm in candidates:
+                                    out[(rva, ins.mnemonic, ins.op_str)] = (
+                                        rva, ins.mnemonic, ins.op_str, op.imm)
+                                    break
+        return sorted(out.values())
 
     def raw_opcode_sites(self):
         """Byte-pattern search for the privileged opcodes, over executable sections.
@@ -496,30 +560,40 @@ def privileged_instructions(pe):
 
 
 def debug_immediates(pe):
-    """Debug-code immediates over declared functions *and* the linear sweep.
+    """Debug-code immediates, anchored on the constants' bytes over all executable sections.
 
     Split by whether the value is written or only compared: the control writes all three
     and compares none, and every occurrence in every Secure Kernel sample is a `cmp`.
     """
     written, compared = {}, {}
-    def note(ins):
-        for op in ins.operands:
-            if op.type == CS_OP_IMM and op.imm in DEBUG_CODES:
-                key = (ins.address - pe.image_base, '%s %s' % (ins.mnemonic, ins.op_str))
-                (compared if ins.mnemonic in ('cmp', 'test') else written)[key] = op.imm
-                return
-    for _b, _e, insns in pe.functions():
-        for ins in insns:
-            note(ins)
-    for _s, insns in pe.sweep_code():
-        for ins in insns:
-            note(ins)
-    # Third pass over exactly the bytes the sweep could not decode, from every possible
-    # instruction boundary, so a gap cannot hide one of these values.
-    for _sec, rva, blob in pe.sweep_gaps():
-        for ins in pe.exhaustive_decode(rva, len(blob)):
-            note(ins)
-    return written, compared
+    aligned = pe.aligned_instructions()
+    for rva, (mnem, ops, imms, _sz) in aligned.items():
+        for imm in imms:
+            if imm in DEBUG_CODES:
+                key = (rva, '%s %s' % (mnem, ops))
+                (compared if mnem in ('cmp', 'test') else written)[key] = imm
+                break
+    # The byte-anchored superset: every decoding at *any* offset, most of which are not
+    # instruction boundaries at all. Reported rather than used, because it cannot tell a
+    # real instruction from a misreading of the bytes before one - on 26100.9457 it turns
+    # 0 written into 61, all of them forms like `in al, 0x6b` and `enter -0x6e18, 0x6b`.
+    # What it is good for is bounding the claim: if it is empty, no alignment anywhere
+    # carries one of these values, and no argument about boundaries can be needed.
+    unaligned = [t for t in pe.immediate_sites(DEBUG_CODES)
+                 if t[0] not in aligned]
+    return written, compared, unaligned
+
+
+def syndbg_immediates(pe):
+    """Any synthetic-debugger MSR number materialised as an immediate, anywhere.
+
+    The `rdmsr`/`wrmsr` reading below resolves an index where it can and leaves 16-19 sites
+    per build unresolved, so on its own it cannot support "no SynDbg MSR access": an index
+    it could not follow might be in the range. This reading can, and needs no control flow
+    - reaching one of these MSRs means putting its number in ecx, and every encoding of
+    that number contains its low byte.
+    """
+    return pe.immediate_sites(range(SYNDBG_LO, SYNDBG_HI + 1), anchor_bytes=4)
 
 
 def msr_sites(pe, lo, hi):
@@ -747,24 +821,26 @@ def scan_image(path, sympath, show_coverage=False):
     for rva, name in sorted(union)[:12]:
         print('     %-8s +%06X' % (name, rva))
 
-    written, compared = debug_immediates(pe)
-    print('  0069/006A/006B as an immediate: %d written, %d compared-only'
-          % (len(written), len(compared)))
+    written, compared, unaligned = debug_immediates(pe)
+    print('  0069/006A/006B at a recognised instruction boundary: %d written,'
+          ' %d compared-only' % (len(written), len(compared)))
     for (rva, text) in sorted(written):
         print('     WRITTEN +%06X  %s' % (rva, text))
+    print('  ... and at offsets no pass recognises as a boundary: %d candidate decoding(s)'
+          % len(unaligned))
+    for rva, mnem, ops, _imm in unaligned[:5]:
+        print('     unaligned +%06X  %s %s' % (rva, mnem, ops))
 
-    gaps = pe.sweep_gaps()
-    gap_bytes = sum(len(b) for _s, _r, b in gaps)
-    if gaps:
-        print('  bytes the linear sweep could not decode: %d in %d run(s), each re-read'
-              ' from every possible instruction boundary' % (gap_bytes, len(gaps)))
-        for sec, rva, blob in gaps[:8]:
-            print('     %-8s +%06X  %s' % (sec, rva, blob.hex()))
+    syndbg_imm = syndbg_immediates(pe)
+    print('  SynDbg MSR numbers (400000F0-FF) as an immediate anywhere: %d' % len(syndbg_imm))
+    for rva, mnem, ops, _imm in syndbg_imm[:8]:
+        print('     +%06X  %s %s' % (rva, mnem, ops))
 
     syndbg, syndbg_unres = msr_sites(pe, SYNDBG_LO, SYNDBG_HI)
     synthetic, _ = msr_sites(pe, 0x40000000, 0x4FFFFFFF)
-    print('  SynDbg MSR sites: %d   (any synthetic MSR, as the scanner control: %d;'
-          ' MSR sites whose index did not resolve: %d)'
+    print('  rdmsr/wrmsr with a resolved SynDbg index: %d   (any synthetic MSR, as the'
+          ' scanner control: %d; indices that did not resolve: %d -- which is why the'
+          ' immediate reading above is the one that decides)'
           % (len(syndbg), len(synthetic), len(syndbg_unres)))
 
     # ---- reading B: the repertoire, a lower bound
@@ -804,22 +880,35 @@ def scan_image(path, sympath, show_coverage=False):
 
     # The verdict is reading A's. B can raise an alarm - a debug code it *did* resolve is
     # a finding - but it can never clear one, because it does not follow control flow.
+    # Every mechanism the clean line claims is absent has to be tested here, or the
+    # sentence is broader than the condition that prints it.
+    hypercall_insns = [(r, m) for r, m in union if m in ('vmcall', 'vmmcall')]
     hits = [c for c in DEBUG_CODES if c in codes]
-    if hits or written:
-        print('  DEBUG HYPERCALL ROUTE FOUND: %s'
-              % (', '.join('%04X %s' % (c, DEBUG_CODES[c]) for c in hits)
-                 or 'a debug code is written as an immediate'))
+    found = []
+    if hits:
+        found.append('repertoire resolves %s'
+                     % ', '.join('%04X %s' % (c, DEBUG_CODES[c]) for c in hits))
+    if written:
+        found.append('%d debug code(s) written as an immediate' % len(written))
+    if syndbg_imm:
+        found.append('%d SynDbg MSR number(s) present as an immediate' % len(syndbg_imm))
+    if hypercall_insns:
+        found.append('%d vmcall/vmmcall instruction(s)' % len(hypercall_insns))
+
+    if found:
+        print('  DEBUG HYPERCALL ROUTE FOUND: %s' % '; '.join(found))
     elif inconclusive:
         print('  DEBUG HYPERCALL ROUTE: none found -- INCONCLUSIVE, because:')
         for why in inconclusive:
             print('     - %s' % why)
     else:
         print('  DEBUG HYPERCALL ROUTE: none -- and the scan that says so is complete')
-        print('     (no debug code written as an immediate anywhere in %d executable bytes,'
-              ' no vmcall/vmmcall, no SynDbg MSR)' % cov['executable'])
+        print('     (across %d executable bytes: no debug code as an immediate, no SynDbg'
+              ' MSR number as an immediate, no vmcall/vmmcall)' % cov['executable'])
 
     return dict(path=path, codes=sorted(codes), debug=hits, written=len(written),
-                privileged=len(union), syndbg=len(syndbg), inconclusive=inconclusive)
+                privileged=len(union), syndbg=len(syndbg_imm), found=found,
+                inconclusive=inconclusive)
 
 
 def scan_control(path):
@@ -833,15 +922,22 @@ def scan_control(path):
     _passes, union = privileged_instructions(pe)
     print('  privileged instructions: %d  %s'
           % (len(union), ', '.join('%s@+%06X' % (m, r) for r, m in sorted(union))))
-    written, compared = debug_immediates(pe)
+    written, compared, _unaligned = debug_immediates(pe)
     distinct = sorted(set(written.values()))
     print('  0069/006A/006B as an immediate: %d written (%d distinct: %s), %d compared-only'
           % (len(written), len(distinct), ' '.join('%04X' % c for c in distinct), len(compared)))
     for (rva, text) in sorted(written):
         print('     WRITTEN +%06X  %s' % (rva, text))
-    ok = set(distinct) == set(DEBUG_CODES) and len(union) >= 1
-    print('  CONTROL %s -- the scanner %s all three distinct debug codes and a hypercall'
-          ' instruction where they are known to be'
+    # Specifically a hypercall instruction: `union` also holds rdmsr/wrmsr, and a control
+    # that passes on those would validate the scanner without exercising the mechanism it
+    # exists to demonstrate.
+    hypercall_insns = [(r, m) for r, m in union if m in ('vmcall', 'vmmcall')]
+    ok = set(distinct) == set(DEBUG_CODES) and bool(hypercall_insns)
+    print('  hypercall instructions among them: %d  %s'
+          % (len(hypercall_insns),
+             ', '.join('%s@+%06X' % (m, r) for r, m in sorted(hypercall_insns)) or '(none)'))
+    print('  CONTROL %s -- the scanner %s all three distinct debug codes and a'
+          ' vmcall/vmmcall where they are known to be'
           % ('PASSES' if ok else 'FAILS', 'finds' if ok else 'does NOT find'))
     print('     (this shows the immediate scan works; it does not trace a code into the'
           ' vmcall, which no image is scanned for)')
@@ -872,13 +968,16 @@ def main(argv=None):
         print('%-42s %6s %8s %8s %6s %s'
               % ('image', 'codes', 'debugHC', 'written', 'privil', 'verdict'))
         for r in rows:
-            verdict = ('DEBUG CODE FOUND' if r['debug']
+            verdict = ('ROUTE FOUND' if r['found']
                        else ('inconclusive' if r['inconclusive'] else 'none'))
             print('%-42s %6d %8s %8d %6d %s'
                   % (os.path.basename(r['path']), len(r['codes']),
-                     ('YES' if r['debug'] else 'none'), r['written'],
+                     ('YES' if r['found'] else 'none'), r['written'],
                      r['privileged'], verdict))
-        if any(r['debug'] or r['inconclusive'] for r in rows):
+        # `found` rather than `debug`: a debug code the immediate scan saw but the
+        # heuristic repertoire did not resolve is still a definitive finding, and exiting
+        # 0 on it would hand automation a clean result for the opposite of one.
+        if any(r['found'] or r['inconclusive'] for r in rows):
             ok = False
     return 0 if ok else 1
 

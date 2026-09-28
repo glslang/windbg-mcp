@@ -1683,9 +1683,10 @@ once `hypervisordebugpages` went 1000 → 2000 — and nothing ever connects to 
 `securekernel.exe` ships no KD transport. S5's specification says to start by asking whether those
 are the **same wall**. They are, for the route this scan covers: **Secure Kernel has no hypercall
 or MSR route to that port.** Across ten builds it never writes a debug control code as an immediate
-anywhere in its executable bytes, contains no hypercall instruction of its own, and touches none of
-the synthetic-debugger MSRs. That is a statement about those three readings over those ten images,
-not a proof that no mechanism of any kind exists — the limits are named below, and S5 stays open.
+at any instruction boundary the scan recognises, never materialises a synthetic-debugger MSR number
+at all, and contains no hypercall instruction of its own. That is a statement about those readings
+over those ten images, not a proof that no mechanism of any kind exists — the limits are named
+below, and S5 stays open.
 
 Entirely offline. No VM queried, attached, reconfigured or rebooted; no BCD change; no driver; no
 `int 3`; no reservation change; no re-capture of the activation return — the three "do not"s in the
@@ -1724,12 +1725,29 @@ resolved nothing on nine of ten samples and reported "0 hypercall sites" for eve
 
 **The scan makes two readings and only the first decides anything**, which is the shape the first
 version of this gate got wrong by resting everything on one evaluator. **Reading A** — are the debug
-codes present as immediates, and are there privileged instructions — is taken over *every executable
-byte* by three overlapping passes: the functions the exception directory declares, a linear sweep of
-each executable section that restarts after every undecodable byte, and a raw opcode byte search
-that cannot desynchronise. **Reading B**, the hypercall repertoire, comes from an abstract evaluator
-that walks in address order without following control flow; it is a heuristic lower bound whose job
-is to be the negative control, and it is never allowed to produce the verdict.
+codes and the SynDbg MSR numbers present as immediates, and are there hypercall instructions — is
+taken over *every executable byte*, by passes chosen so that no one of them has to be trusted about
+where instructions begin:
+
+- **instruction boundaries from three seeds**, unioned: the functions the exception directory
+  declares, a linear sweep of each executable section, and a **recursive descent from every direct
+  call and jump target**, iterated to a fixpoint. The third is what reaches **leaf functions**,
+  which need no unwind data and are therefore absent from `.pdata` entirely — and which a linear
+  sweep can stride straight past if it desynchronises on embedded data. A leaf is reached by being
+  called, so its entry is a call target even when nothing else names it.
+- **a raw opcode byte search** for `vmcall`, `vmmcall`, `rdmsr` and `wrmsr`, which cannot
+  desynchronise because it does not decode at all.
+- **a byte-anchored search for the constants themselves.** An immediate is encoded little-endian,
+  so the low bytes of the value appear verbatim whatever the operand width. Finding those bytes and
+  decoding from all sixteen starts that could cover them locates any instruction carrying the value
+  without knowing where instructions begin. For the SynDbg MSR numbers this is both sound and
+  precise, because `0x400000Fx` cannot be encoded as an `imm8` or `imm16` — the full four-byte
+  pattern must be present. For the three debug codes, whose low byte is one byte, it is sound but
+  noisy, so it is reported as a **superset** rather than used as the reading.
+
+**Reading B**, the hypercall repertoire, comes from an abstract evaluator that walks in address
+order without following control flow; it is a heuristic lower bound whose job is to be the negative
+control, and it is never allowed to produce the verdict.
 
 | build | sha256[:16] | executable bytes | `0069/6A/6B` written | `vmcall` | SynDbg MSR | wrapper call sites | codes resolved |
 |---|---|---|---|---|---|---|---|
@@ -1751,24 +1769,24 @@ They agree with the six verified rows and are listed separately rather than coun
 
 **What the scan found, in the order the conclusion depends on it:**
 
-- **No debug code is written as an immediate, anywhere in the executable bytes.** Every occurrence
-  of `0x0069`, `0x006A` or `0x006B` in any of the ten images — 5 to 10 per build — is a `cmp`, in
-  code unrelated to debugging. This is reading A, it covers 100% of each image's executable
-  sections, and it is what the conclusion rests on. Against it, the control writes all three
-  distinct values and compares none.
-- **The enumeration has no holes left to hide in.** The linear sweep leaves 14 to 30 bytes
-  undecoded per build, in 7 to 22 short runs, and on inspection every one is ASCII string data
-  embedded in `.text` — they contain `0x61`, which is invalid in long mode. The scan does not take
-  that on trust: it re-reads each run from *every possible instruction boundary*, with a 15-byte
-  lookback so an instruction overlapping a run is decoded too, and reports the runs and their bytes
-  so the reading can be checked. The raw opcode pass covers those same bytes for the privileged
-  instructions independently.
-- **The synthetic-debugger MSRs are untouched.** Zero accesses to `0x400000F0`–`0x400000FF` in any
-  build, against 22 to 30 *other* synthetic-MSR sites per build — so the MSR scan demonstrably works
-  on these images and simply finds no debug MSR. Its index is read from the evaluator's state
-  rather than from the nearest preceding load, so `mov ecx, 0x400000EF; inc ecx; rdmsr` is followed
-  and an intervening call invalidates it; 16 to 19 sites per build have an index this cannot
-  resolve, and they are reported rather than dropped.
+- **No debug code is written at any instruction boundary the scan recognises.** Every occurrence of
+  `0x0069`, `0x006A` or `0x006B` at such a boundary, in any of the ten images — 5 to 10 per build —
+  is a `cmp`, in code unrelated to debugging. Against it, the control writes all three distinct
+  values and compares none.
+- **And the superset is reported rather than argued away.** The byte-anchored pass also finds 40 to
+  95 decodings per build at offsets *no* pass recognises as a boundary — forms like `in al, 0x6b`
+  and `enter -0x6e18, 0x6b`, and mostly one-byte-shifted shadows of the real `cmp` beside them.
+  They are listed rather than filtered out, because the honest claim is "none at a recognised
+  boundary, and here is everything else that carries these bytes at any alignment", not "none
+  anywhere". Some of them are write-forms, which is exactly why the count is printed.
+- **The synthetic-debugger MSR numbers are never materialised at all.** Zero occurrences of
+  `0x400000F0`–`0x400000FF` as an immediate anywhere in any build, at any alignment — and here the
+  byte-anchored pass is precise as well as sound, since those values need a four-byte encoding.
+  That is what carries this negative, because the other reading cannot: resolving each
+  `rdmsr`/`wrmsr`'s index leaves **16 to 19 sites per build unresolved**, any of which could in
+  principle be in the range. Those sites are reported, and the index reading is kept only as
+  colour — it finds 22 to 30 *other* synthetic-MSR accesses per build, which is what shows the
+  machinery works at all.
 - **The repertoire is the negative control, and it is a lower bound.** 19 to 38 distinct control
   codes per build across 29 to 63 wrapper call sites, spanning `0x0002` to `0x0103`, growing as
   builds add capability — and never a debug code. A Secure Kernel that issued *no* hypercall would
@@ -1797,6 +1815,13 @@ They agree with the six verified rows and are listed separately rather than coun
   was the wrong response: what generated them was a *negative* resting on a component that can only
   ever be approximately right. The split into a sound reading that decides and a heuristic reading
   that corroborates is the fix, and the six defects were repaired underneath it.
+  **And the first version of that fix was itself half a rule**, which is the part worth keeping: it
+  restarted the linear sweep only after an *undecodable* byte, so data that decoded successfully but
+  desynchronised still carried the cursor past a leaf function's real entry — and a leaf is absent
+  from `.pdata` too, so a genuine `mov ecx, 0x69` there would have been missed while every coverage
+  figure read 100%. Recursive descent from call targets is what reaches those. The tell was that the
+  remedy could not express the whole rule: a sweep that resynchronises on *failure* has nothing to
+  say about a boundary it never noticed it had crossed.
 - **Treating every function that calls the hypercall page as a wrapper reads bug check codes as
   hypercall codes.** `SkeBugCheckEx` calls the page directly, so an earlier pass enumerated *its*
   callers and took each `KeBugCheckEx(code, …)` argument for a control code — 271 call sites and 72
