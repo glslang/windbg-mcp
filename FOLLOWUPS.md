@@ -3044,11 +3044,27 @@ validated. The full record is the
   HVCI check. This guest has one, `LsaIso`, and it is inert: **0.3593750 s of CPU in 27.6 hours**,
   unchanged to the tick across a logon burst, because Credential Guard is not configured
   (`LsaCfgFlags` unset, `RequiredSecurityProperties = 0`). At that duty cycle 832,560 samples expect
-  ~3 hits and most of that CPU was spent at boot, so **zero is the predicted result**. **The
-  experiment that would settle it**: `LsaCfgFlags = 1` plus a reboot turns Credential Guard on,
-  logons then drive `LsaIso` in VTL1, and a halt taken while `ActiveVtl = 1` is the unmeasured
-  condition every halted-register reading is conditional on. **Not run** — it reconfigures and
-  restarts a shared lab guest, which is the operator's call.
+  ~3 hits and most of that CPU was spent at boot, so **zero is the predicted result**.
+- **S5g, 2026-09-28: three routes to VTL1 occupancy, all closed on this bench.** Run with the
+  operator's authorisation to reconfigure and reboot the VBS guest. **Credential Guard** is closed
+  by **edition** — `LsaCfgFlags`, the DeviceGuard scenario key and `EnableVirtualizationBasedSecurity`
+  all set, two reboots, `SecurityServicesRunning` still `2` and no DeviceGuard events, because the
+  guest is **Windows 11 Pro** and CG needs Enterprise/Education. **Writing a trustlet** is closed by
+  signing policy: IUM needs a Microsoft certificate with the IUM EKU plus membership in SK's
+  identity list, and test-signing is deliberately not honoured there. **A VBS enclave** is the live
+  one and it is *nearly* there: `CreateEnclave` with the debug flag succeeds every run, and
+  `LoadEnclaveImage` refuses with **193 `ERROR_BAD_EXE_FORMAT`** through nine eliminated suspects —
+  enclave config, load config, page hashes, a `vertdll` import, the enclave-signing EKU, TLS, the
+  enclave CRT, `/INTEGRITYCHECK` (which moved characteristics `0x160` → `0x1E0`), and chain trust
+  (in-guest status `UnknownError` → **`Valid`**). Test-signing moved the error 577 → 193 and trust
+  left it at 193, so the signature path is satisfied and an unidentified **shape** rule remains.
+  **Next**: diff against a known-good enclave binary — the MS sample or the enclave SDK — rather
+  than hypothesise. Note `veclient.lib` does not exist in SDK 10.0.26100; `vertdll.lib` was used
+  instead and whether that substitution is the defect is unmeasured.
+- **The VBS guest is changed and a later gate must know.** Secure Boot **off**, test-signing **on**
+  (VBS/HVCI verified still running after both), a self-signed `CN=VTL1 Enclave Test` cert in
+  `LocalMachine\Root`, Credential Guard keys set and inert, `C:\encl\` staged, and **four reboots**
+  — so the `CR3`, self-map index and SK base have all moved again from the figures in S5c–S5f.
 - **Bench note:** eleven inbox driver images started in the VBS guest to provoke VTL1 will not stop
   and stay loaded until it reboots. Harmless — drivers for hardware the VM lacks — but a later gate
   reading its module list should know why they are there.
