@@ -1911,6 +1911,154 @@ They agree with the six verified rows and are listed separately rather than coun
   fixed snapshot and stays one. What would change that is a route this gate did not test, not the
   one it closed.
 
+### S5b result, 2026-09-28: a parent may install an exception intercept on a child, and may not aim one at VTL1
+
+**Both halves are measured, and they point in opposite directions.** The install works: from the
+root, `HvCallInstallIntercept` (`0x004D`) installs an exception intercept on a *child* partition
+and removes it again, on both lab guests, with the negative controls refusing. And it cannot be
+aimed: the input block has no field to name a VTL, and every byte this run put where one might
+hide was accepted **identically on a child with no VTL1 at all**. So the candidate S5a left
+standing — a stop driven from the root through the primitive Secure Kernel itself uses — is not
+expressible with that primitive. S5's pass condition is untouched and S5 stays open.
+
+The instrument is `h3probe.sys` — the H3 driver — with one IOCTL added that issues a hypercall
+whose input block the *client* composes byte for byte, so each arm is a different 24 or 32 bytes
+rather than a different driver. Its client is `s5b.py`. Measured on the x64 bench: host
+`10.0.26200`, `hvix64.exe` `10.0.26100.9444`, `winhvr.sys` `10.0.26100.8972`, `Vid.sys`
+`10.0.26100.9278`, against child partitions `0x7` (`EnabledVtlSet` `0x0003`) and `0xB` (`0x0001`).
+As in H3, the guests are identified by VSM state and never by partition number.
+
+#### The block is documented, and three readings of it agree
+
+The plan's clean-room condition is that constants come from the published TLFS, and the TLFS
+documents this one completely — `PartitionId` (0, 8), `AccessType` (8, 4), `InterceptType` (12, 4),
+`InterceptParameter` (16, 8), call code `0x004d`, Simple. `HV_INTERCEPT_PARAMETERS` is a union
+whose exception member is a bare `UINT16 ExceptionVector`, and **neither structure has a VTL field
+or a reserved one that could become one**. `HvInterceptTypeException` is `0x00000003`.
+
+Both known callers build exactly that block, read twice each — once with capstone, once with
+Ghidra, the second reading being there because the first was one tool's opinion about a field
+layout this record then publishes. **They are two different images and neither is the lab guest's
+running Secure Kernel**: the SK side is the 26100.9457 *sample* from the build survey, the root side
+is this host's own `winhvr.sys`, and what the live arms below exercise is the hypervisor, which is
+this host's `hvix64.exe`. The static half establishes the shape callers use, not what the guests
+are running:
+
+| | `securekernel.exe` 26100.9457 `ShvlInstallExceptionIntercept` (+`0x092C4C`) | `winhvr.sys` `WinHvInstallIntercept` (+`0x021BB0`) |
+|---|---|---|
+| `PartitionId` | `-1` — **SELF** | the caller's, and Vid.sys passes a *child's* |
+| `AccessType` | `4` (execute) | the caller's; Vid.sys passes 4 to install, **0 to remove** |
+| `InterceptType` | `3` — exception | the caller's; Vid.sys passes 1, 2, 3 and `0xC` at 11 sites |
+| `Parameters` | vector in the low word, six bytes zeroed explicitly | 8 bytes, caller's |
+| input size | `0x18`, passed to the invoker | `0x18`, passed to the invoker |
+
+**So `FOLLOWUPS.md`'s "intercept type 4" was the access mask.** Type 3 is the exception intercept
+and 4 is `HV_INTERCEPT_ACCESS_MASK_EXECUTE`; the two fields are adjacent dwords and the earlier
+reading took the first one it saw. Corrected there.
+
+Secure Kernel's own installer also refuses every vector but **#DB and #BP** — `(vector - 1) & 0xFFFD`
+must be zero, unless a global is set — and sets `1 << vector` in a bitmask after the call succeeds.
+That is SK installing intercepts *for itself*, at `PartitionId` SELF, which is what a higher VTL
+does; it is not a parent naming a child.
+
+#### What the hypervisor did, arm by arm
+
+Every install is paired with its removal, and the removals ran again in a `finally`: the teardown
+line reads `0 intercept(s) still standing`.
+
+| arm | VTL1 child `0x7` | VTL0-only child `0xB` |
+|---|---|---|
+| **negative control** — intercept type `0xFFFFFFFF` | `0x0005 INVALID_PARAMETER` | — |
+| **negative control** — access mask `0xFFFFFFFF` | `0x0005 INVALID_PARAMETER` | — |
+| **negative control** — partition id 0 | `0x000D` | — |
+| baseline — the ABI block, spare bytes zero, vector `0x05` | `SUCCESS`, removed `SUCCESS` | `SUCCESS`, removed `SUCCESS` |
+| byte +`0x12` = `0x11` (`HV_INPUT_VTL(1)`) | `SUCCESS` | `SUCCESS` |
+| byte +`0x12` = `0x01` (bare VTL 1) | `SUCCESS` | `SUCCESS` |
+| dword +`0x14` = 1 | `SUCCESS` | `SUCCESS` |
+| qword +`0x18` = `0x11`, eight bytes *past* the block | `SUCCESS` | `SUCCESS` |
+| the same, declared as **variable header size 1** | `0x0003 INVALID_HYPERCALL_INPUT` | `0x0003 INVALID_HYPERCALL_INPUT` |
+| vector `0x03` (#BP) — what SK installs for itself | `SUCCESS` | `SUCCESS` |
+| vector `0x01` (#DB) — the other one | `SUCCESS` | `SUCCESS` |
+
+**Arms on which the two guests disagree: zero.**
+
+#### Why "accepted" reads as "not a VTL selector", which acceptance alone would not say
+
+A hypercall that succeeds has not said what it did with the bytes, and an earlier draft of this
+section read SUCCESS as *ignored* directly. It does not follow: the hypervisor could have read
+them and installed something else. What carries the reading is the **control partition**, which has
+no VTL1 — `EnabledVtlSet` `0x0001`, `MaximumVtl` 0. Naming VTL1 there must fail if the field is
+read as a VTL, and the same run shows what that failure looks like, because a field the hypervisor
+*does* read per VTL was exercised beside it: `HvCallGetVpRegisters` with `TargetVtl = 1` returns
+`0x0015` on that partition and `SUCCESS` on the VTL1 one. So in one run, on one pair of guests, the
+`TargetVtl` field discriminates and the intercept block's spare bytes do not. That is the
+difference between a field and a gap.
+
+The variable-header arm closes the other door the ABI leaves open. The TLFS says a non-zero
+variable header size on a call not documented to accept one returns
+`HV_STATUS_INVALID_HYPERCALL_INPUT`, and that is exactly what `0x004D` returns — so the call is
+fixed-size on this hypervisor, there is no extended form of the block to carry a VTL, and the
+hypervisor demonstrably parses the control word rather than ignoring it.
+
+#### The trap: a vector chosen to be harmless made every arm unreadable
+
+The first run of this gate picked exception vector `0x1F` because Intel reserves it and no hardware
+raises it, so an install could intercept nothing and nothing could be delivered to a parent with no
+port to receive it. **Every arm came back `0x0005 INVALID_PARAMETER`, including the baseline** — and
+that reads exactly like a clean negative about VTL1 while being a statement about the vector: the
+hypervisor validates it against the architectural set, which `0x1F` is not in. It is the same
+failure H3 wrote its own discipline against — *if both are refused the finding is about privilege or
+plumbing and says nothing about VTL1* — arriving in a different costume, and the only reason it was
+caught is that the control was in the run rather than assumed. The fix is a **vector phase**: the
+script discovers a vector this hypervisor accepts, on the guest with no VTL1, before any arm that
+claims to be about VTL1 runs. `0x05` (#BR) is the first it takes — `BOUND` does not decode in long
+mode, so the vector is architectural *and* unreachable, which is what `0x1F` was meant to be.
+
+A second, smaller one: the client's `HV_STATUS` table was carried over from `h3client.py` and had
+`0x000B` as `INVALID_PARTITION_ID`, which the invalid-partition arm contradicted by returning
+`0x000D`. The TLFS's own `HV_STATUS` page carries no table to check it against, so the client now
+names only the codes this record has a source for and prints the rest as numbers. `0x0015` is left
+unnamed here for the same reason it was in H3.
+
+#### What S5b does not establish
+
+- **Delivery, which is the whole of S5's pass condition.** *A VTL1 execution stop is delivered to a
+  debugger* needs an exception to occur in VTL1 and to arrive somewhere a debugger can see it.
+  Neither was tested: no exception was provoked, and provoking one means planting an `int 3` in
+  VTL1, which the plan excludes and S5a's result makes no safer.
+- **Whether a partition-scoped exception intercept fires for VTL1 execution at all.** This gate
+  shows there is no way to *ask* for VTL1; it does not show that an intercept installed without
+  asking excludes it. That question is now the interesting one, and answering it needs both a VTL1
+  exception and somewhere to observe delivery.
+- **Where an intercept would be delivered.** The child's intercept messages are routed to the port
+  Hyper-V's own `Vid.sys` created; this run holds no port and created none, so nothing here says
+  what a parent-installed intercept would look like to a debugger rather than to the VM worker.
+- **Anything beyond this hypervisor.** One host, one `hvix64.exe` build, one pair of guests, x64.
+  The static half spans the ten `securekernel.exe` builds only for the caller's shape, not for what
+  a hypervisor accepts.
+- **That the spare bytes are unread rather than read-and-rejected-as-zero.** The control makes
+  "not a VTL selector" sound; it does not make them provably inert.
+
+#### What it changes downstream, and where S5 goes next
+
+- **The intercept route is closed for aiming, and open for installing.** A parent *can* install and
+  remove exception intercepts on a child — useful if a later route needs a partition-scoped
+  intercept — and cannot select a VTL while doing it. S5a closed the guest-cooperating route; this
+  closes the named parent-side one.
+- **Breakpoints stay excluded**, unchanged and for the same reason: the catch half is unmeasured.
+- **The next candidate is named by a measurement rather than by a guess, and it is not an
+  intercept.** In the read-only reconnaissance beside the arms above, `HvRegisterExplicitSuspend`
+  (`0x00000000`), `HvRegisterInterceptSuspend` (`0x00000001`) and `HvRegisterDispatchSuspend`
+  (`0x00000003`) are all **readable from the parent at both VTL0 and VTL1** on the VBS guest, and
+  all three are refused at VTL1 on the twin with no VTL1 — the control discriminating exactly as it
+  does for `CR3` in H3. So a stop that needs no exception, no intercept and no guest-side code is at
+  least *nameable* per VTL. What is unmeasured is the **write**, and S4 is the reason not to read
+  the read as an answer: `HvCallReadGpa` and `HvCallWriteGpa` disagreed about VTL1 in exactly that
+  way. `HvCallSetVpRegisters` (`0x0051`) against a child's VTL1 suspend register, with the VTL0
+  control beside it, is the next gate — and note it *stops a running guest's VP*, which every arm
+  in S5b was designed to avoid, so it needs a disposable guest and a written-down recovery before
+  it runs rather than after.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility
