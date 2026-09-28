@@ -903,8 +903,14 @@ def scan_image(path, sympath, show_coverage=False):
             print('     - %s' % why)
     else:
         print('  DEBUG HYPERCALL ROUTE: none -- and the scan that says so is complete')
-        print('     (across %d executable bytes: no debug code as an immediate, no SynDbg'
-              ' MSR number as an immediate, no vmcall/vmmcall)' % cov['executable'])
+        # Each clause here must match the check that produced it. "No debug code as an
+        # immediate" would be broader than the reading: the byte-anchored superset above
+        # is not empty, and saying otherwise is the same defect this scan keeps being
+        # corrected for, committed in its own summary line.
+        print('     (across %d executable bytes: no debug code as an immediate at a'
+              ' recognised instruction boundary -- %d unaligned candidate(s) listed above'
+              ' -- no SynDbg MSR number as an immediate at any alignment, no vmcall/vmmcall)'
+              % (cov['executable'], len(unaligned)))
 
     return dict(path=path, codes=sorted(codes), debug=hits, written=len(written),
                 privileged=len(union), syndbg=len(syndbg_imm), found=found,
@@ -965,8 +971,10 @@ def main(argv=None):
 
     if rows:
         print()
+        # `route`, not `debugHC`: the column is populated from every mechanism the
+        # verdict tests, not from the debug-hypercall reading alone.
         print('%-42s %6s %8s %8s %6s %s'
-              % ('image', 'codes', 'debugHC', 'written', 'privil', 'verdict'))
+              % ('image', 'codes', 'route', 'written', 'privil', 'verdict'))
         for r in rows:
             verdict = ('ROUTE FOUND' if r['found']
                        else ('inconclusive' if r['inconclusive'] else 'none'))
