@@ -3005,9 +3005,13 @@ validated. The full record is the
   open question, and H4's `0x3600000` is unretested by either route.
 - **A correction to H4 fell out of it**: its "the VTL1 `CR3` page reads as zeros by both routes" is
   a **16-byte prefix** of a page whose first present entry is at offset `0x830`. Read whole, it has
-  122 non-zero bytes and **26 present entries** — the same count S0 took from the capture side. The
-  table row is corrected in place, and the same trap caught this gate's own step 3 at 64 bytes.
-  **A prefix is not a page.**
+  122 non-zero bytes and **26 present entries**. What proves the row wrong is H4's *own* table for
+  that boot — first present entry at offset `0x850`, so a 16-byte read returns zeros whether or not
+  the page reads. The S5e census is a **later boot** (the guest restarted 2026-09-27; self-map at
+  index 463, not 388) and is not a second opinion on the first: **a VTL1 `CR3` value can repeat
+  across boots**, so `CR3` equality is not evidence of the same boot — which is what made two
+  correct censuses look contradictory. The same prefix trap caught this gate's own step 3 at 64
+  bytes, and its census helper again at the wrong extent. **A prefix is not a page.**
 - **Do not** re-run S5c's controls; the suspend bit, the refusal code and the VP-wide scope are
   taken. **Do** read the record before building on the halted context, and note what it does *not*
   say: over eight halt cycles the VTL1 `RIP` equalled its own pre-halt value 8/8 while the

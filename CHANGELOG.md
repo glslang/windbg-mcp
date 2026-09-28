@@ -66,9 +66,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   VTL1 `CR3` page as reading "all zeros by both routes", flagged as "a limit of the mapping, a
   fallback, or genuinely zero" and left unmeasured. It is none of the three: every cell in that
   table is **16 bytes** from the start of a page whose first present entry sits at offset `0x830`,
-  because a PML4's low entries describe user space. Read whole, the page carries **122 non-zero
-  bytes and 26 present entries** — the same count S0 recorded from the capture side of the same
-  guest. The row is corrected in place. The same trap caught S5e's own precheck at 64 bytes before
+  because a PML4's low entries describe user space. **H4's own landmark table proves it for its own
+  boot**: it records that page's first present entry at offset `0x850`, so its first 16 bytes were
+  zero whether or not the page was readable. Read whole on a *later* boot — the guest restarted
+  2026-09-27, and its `CR3` is `0x1201000` again with a self-map at index **463** rather than 388 —
+  the page carries 122 non-zero bytes and 26 present entries. Two boots, two consistent censuses,
+  and a trap worth naming: a VTL1 `CR3` value can **repeat** across boots, so `CR3` equality is not
+  evidence of the same boot. The row is corrected in place. The same trap caught S5e's own precheck at 64 bytes before
   the next step walked the page successfully: **a prefix is not a page.**
 - **And the inspector has now run as one thing rather than as two halves joined by an inference.**
   "End to end" originally composed S5c (halt the VPs, read *registers*) with H4 (read VTL1 *memory*
