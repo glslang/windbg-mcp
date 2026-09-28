@@ -3057,8 +3057,13 @@ validated. The full record is the
   events — because Microsoft's edition table reads *Windows Pro: **No***. `LsaCfgFlags = 1` is
   *enabled with UEFI lock*; `2` is without, and a repeat on an eligible edition should use `2`. **Writing a trustlet** is closed by
   signing policy: IUM needs a Microsoft certificate with the IUM EKU plus membership in SK's
-  identity list, and test-signing is deliberately not honoured there. **A VBS enclave** is the live
-  one and it is *nearly* there: `CreateEnclave` with the debug flag succeeds every run, and
+  identity list, and test-signing is deliberately not honoured there. **A VBS enclave WORKS**, once Microsoft's
+  `windows-classic-samples/Samples/VbsEnclave` was used as the reference rather than building from
+  first principles: `LoadEnclaveImage ok` / `InitializeEnclave ok`, and our own `Spin` running **in
+  VTL1 user mode**. The decisive difference was `PolicyFlags = IMAGE_ENCLAVE_POLICY_DEBUGGABLE`
+  against the `0` used here while the host passes `ENCLAVE_VBS_FLAG_DEBUG`; beside it non-zero
+  Family/Image IDs, a 0x10000000 size the host must match, **no `/ENTRY` override** so the enclave
+  CRT starts, `/GUARD:MIXED`, `SubSystem CONSOLE` and a `.def`. Before the reference it was: `CreateEnclave` with the debug flag succeeds every run, and
   `LoadEnclaveImage` refuses with **193 `ERROR_BAD_EXE_FORMAT`** through nine eliminated suspects —
   enclave config, load config, page hashes, a `vertdll` import, the enclave-signing EKU, TLS, the
   enclave CRT, `/INTEGRITYCHECK` (which moved characteristics `0x160` → `0x1E0`), and chain trust
@@ -3067,6 +3072,20 @@ validated. The full record is the
   **Next**: diff against a known-good enclave binary — the MS sample or the enclave SDK — rather
   than hypothesise. Note `veclient.lib` does not exist in SDK 10.0.26100; `vertdll.lib` was used
   instead and whether that substitution is the defect is unmeasured.
+- **The condition every halted-register reading was qualified on is now measured, and `ActiveVtl`
+  is not the way to it.** With the enclave spinning and the VPs measurably busy (**25.8%** and
+  **52.4%** by `HvRegisterVpRuntime`), `ActiveVtl` still read `0` in 274,566 samples — so the parent
+  cannot use it to tell whether VTL1 is running. Halting anyway catches VTL1 mid-execution: **6 of 6
+  halts** found VP 1's VTL1 `RIP` in **user mode inside the enclave** (`0x21456DE509B`–`…50BC`, five
+  distinct addresses across six halts, each stable over 10 reads within its halt), while VP 0 stayed
+  parked at Secure Kernel's `0xFFFFF80679FB0035`. So the halted VTL1 context behaves exactly as it
+  did parked — readable, frozen by the halt, its own rather than VTL0's — and **#411's scoping of the
+  liveness result to VTL0 is superseded: the VTL1 read is live too.**
+- **A method error was caught by that same measurement.** An earlier "zero while our code spins in
+  VTL1" used `Invoke-Command -AsJob`, and each PowerShell invocation here is its own process, so the
+  job and its session died with the call — VP runtime read **0.7%** busy while the spin was
+  supposedly running. A guest-side workload only exists when **detached** with `Start-Process`,
+  which is why the CPU-load arms were real and the first enclave ones were not.
 - **`ActiveVtl` has now read `0` in over 1.15 million samples across four workloads** — idle, a
   user-mode spin, twelve HVCI-verified kernel image loads, and an enclave create/terminate loop.
   **The fourth is weaker than it first looked**: `CreateEnclave` does log a `Secure Trustlet

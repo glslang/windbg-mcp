@@ -23,7 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **Writing a trustlet: closed by signing policy** — IUM wants a Microsoft certificate with the IUM
   EKU plus membership in Secure Kernel's identity list, and test-signing is deliberately not
   honoured there; patching that list from the root was raised and declined, being a HyperGuard
-  bugcheck rather than a trustlet. **A VBS enclave: the mechanism works and the image is refused** —
+  bugcheck rather than a trustlet. **A VBS enclave: it works, and our own code now runs in VTL1** — once Microsoft's
+  `windows-classic-samples/Samples/VbsEnclave` was used as the reference rather than building from
+  first principles. The decisive difference is `PolicyFlags = IMAGE_ENCLAVE_POLICY_DEBUGGABLE`
+  against the `0` this build used while the host passes `ENCLAVE_VBS_FLAG_DEBUG`; beside it
+  non-zero Family/Image IDs, a `0x10000000` size the host must match, **no `/ENTRY` override** so
+  the enclave CRT starts, plus `/GUARD:MIXED`, `SubSystem CONSOLE` and a `.def`. **With it
+  spinning, the condition every halted-register reading was qualified on is measured**: `ActiveVtl`
+  still reads `0` in 274,566 samples while the VPs are 25.8% and 52.4% busy — so the parent cannot
+  use that field to tell whether VTL1 runs — yet halting anyway caught VTL1 **mid-execution in 6 of
+  6 halts**, VP 1's VTL1 `RIP` landing in user mode inside the enclave across five distinct
+  addresses, each frozen within its halt, while VP 0 stayed parked at Secure Kernel's. The halted
+  VTL1 context is readable, stopped and its own, exactly as it was when parked — and the VTL1 read
+  is therefore live, which supersedes this PR's earlier scoping of that result to VTL0. Before the
+  reference existed the image was refused —
   `CreateEnclave` with `ENCLAVE_VBS_FLAG_DEBUG` succeeds every run while `LoadEnclaveImage` returns
   **193 `ERROR_BAD_EXE_FORMAT`** through nine eliminated suspects: enclave config, load config, page
   hashes, a `vertdll` import, `szOID_ENCLAVE_SIGNING`, TLS, the enclave CRT, `/INTEGRITYCHECK`
