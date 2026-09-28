@@ -23,8 +23,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with a three-sample no-suspend null model beside it — because a first attempt at a 60 ms window
   could not tell a suspended VP from an idle one, and an earlier guard looked for a catch-up burst
   on release that an idle guest never produces. While halted the VTL1 context is readable and
-  distinct: `CR3` `0x1201000` — the landmark S0 and H4 both recorded, arriving from a third
-  direction — with `RIP` `0xFFFFF80609990035`, and a separate read-only probe found the VTL1 `RIP`
+  distinct: `CR3` `0x1201000` — the value S0 and H4 recorded on the **2026-09-26 boot**, where this
+  ran on the 2026-09-27 one, so a recurring value rather than a third confirmation of one state —
+  with `RIP` `0xFFFFF80609990035`, and a separate read-only probe found the VTL1 `RIP`
   distinct from VTL0's in **40 of 40 samples on each of both VPs**, moving across a suspend cycle,
   so it is Secure Kernel's own live state rather than a mislabelled read. **Sampling a running
   guest validates only the running path**, so the halt was repeated eight times: the halted VTL1
@@ -80,7 +81,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drives both drivers, with the LiveCloudKd SDK's own freeze and pause **off** so the only stop is
   the measured one: both VPs halted (runtimes 11,149 → 379 and 32,119 → 188), **3 of 3** VTL1 GPAs
   returning content while halted, each read **twice inside the halt** and agreeing 3/3, two of them
-  byte-identical to H4's recorded values. What it does **not** show is that the halt was necessary:
+  byte-identical to H4's recorded values — across two boots, so a statement about those bytes
+  recurring rather than about one state read twice. What it does **not** show is that the halt was
+  necessary:
   the same double reads while running were stable too, since an idle guest changes nothing and
   neither lab guest can be loaded from this host.
 - **S5 still does not pass, and the gap is stated rather than rounded off.** Its condition is *a
