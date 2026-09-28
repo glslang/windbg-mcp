@@ -2519,14 +2519,9 @@ was trying to show, and it is four orders of magnitude rather than one and a hal
   832,560 samples would expect **~3** hits if that time were spread evenly, and most of it was
   spent at boot. **Zero is what the numbers predict**; the sampler was not missing VTL1, there was
   almost none to miss.
-- **So the experiment that would settle it is identified and not run.** Give the guest a trustlet
-  that works — `LsaCfgFlags = 1` and a reboot turns Credential Guard on, after which every logon
-  drives `LsaIso` in VTL1 — then sample during a logon burst, and halt the VP if `ActiveVtl = 1` is
-  caught, which is the unmeasured condition every halted-register reading here is conditional on.
-  It costs a reboot of that guest (its boot-specific landmarks move, as this record now documents)
-  and is reversible. **Not attempted here**: changing a lab guest's security configuration and
-  restarting it is a change to a shared machine rather than a reading of it, and it is the
-  operator's call rather than this gate's.
+- **So the experiment that would settle it is to give the guest a trustlet that works.** That was
+  then attempted, with the operator's authorisation, and is the S5g result below: both routes to a
+  working trustlet are closed on this bench, one by edition and one by signing policy.
 - **The halt's necessity is still not demonstrated.** S5d compared two back-to-back reads, which an
   idle guest passes trivially; the sharper test samples the same pages across a **matched
   wall-clock window** in both conditions. Over 3 s with the guest busy: **80,399 reads while
@@ -2542,6 +2537,86 @@ will not stop (`sc stop` is unsupported for them) and remain loaded until it reb
 inbox drivers for hardware the VM does not have, they failed to find devices, and a reboot clears
 them — but the guest is not byte-for-byte as it was found, and a later gate reading its module list
 should know why there is a FireWire controller in it.
+
+### S5g result, 2026-09-28: three routes to VTL1 occupancy, all closed on this bench
+
+**Nothing here caught VTL1 executing, and the value is in which doors are shut and why** — S5f
+turned "VTL1 runs too rarely to catch" into a number, and this turns "we could make it run" into
+three specific refusals. Run with the operator's authorisation to reconfigure and reboot the VBS
+guest; see *What it cost the bench* at the end, because this one changed the guest materially.
+
+#### Route 1 — Credential Guard: closed by edition
+
+The cheapest workload is the trustlet already present. `LsaCfgFlags = 1` did nothing, so
+`HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard\Enabled = 1` and
+`EnableVirtualizationBasedSecurity = 1` went in beside it. **Two reboots, and
+`SecurityServicesRunning` stayed `2`** — HVCI alone, no Credential Guard, and not one event in
+`Microsoft-Windows-DeviceGuard/Operational` to explain it. The explanation is the edition:
+**`Windows 11 Pro`**, and Credential Guard needs Enterprise or Education. Not a configuration
+problem, so no configuration fixes it.
+
+#### Route 2 — writing a trustlet: closed by signing policy
+
+An IUM process must be signed with a **Microsoft** certificate carrying the Isolated User Mode EKU
+*and* appear in Secure Kernel's trustlet identity list. Test-signing is not honoured for that path,
+by design — arbitrary VTL1 user-mode code is precisely what VBS exists to prevent. There is no
+local route, and this was not attempted.
+
+**Patching SK's identity list from the root was raised and declined.** S4 established VTL1 is
+writable by the direct route, so it is coherent rather than fanciful — and it is the wrong tool:
+SKPG/HyperGuard monitors exactly that, the likely outcome is a bugcheck rather than a trustlet, and
+it means modifying live policy state whose layout nothing here has mapped. If it is ever wanted it
+is its own gate, against a throwaway checkpoint, with the bugcheck as the expected result.
+
+#### Route 3 — a VBS enclave: the mechanism works and the image is refused
+
+An enclave is the documented way to run *your own* code in VTL1 user mode, and unlike a trustlet it
+is a developer facility. The guest supports it — `IsEnclaveTypeSupported(ENCLAVE_TYPE_VBS)` is
+true, `vertdll.dll` is present — and `CreateEnclave` with `ENCLAVE_VBS_FLAG_DEBUG` **succeeds every
+run**. `LoadEnclaveImage` does not, and eight suspects were eliminated one at a time:
+
+| suspect | what was done | result |
+|---|---|---|
+| no enclave config | `IMAGE_ENCLAVE_CONFIG` added, verified by `dumpbin /LOADCONFIG` | still 193 |
+| no load-config directory | forced with `/INCLUDE:_load_config_used`, later an explicit one for `/NODEFAULTLIB` | still 193 |
+| no page hashes | `signtool /ph` — which reports the file **as a VBS enclave image** | still 193 |
+| no imports at all | a `vertdll` import added | still 193 |
+| wrong EKU | signed with `szOID_ENCLAVE_SIGNING`, `1.3.6.1.4.1.311.10.3.42` (from `um/wincrypt.h`) | still 193 |
+| TLS directory | checked — absent | not the cause |
+| desktop CRT | relinked against `ucrt_enclave` and MSVC's `lib\x64\enclave` | still 193 |
+| **missing `/INTEGRITYCHECK`** | added, with `/ENCLAVE /NODEFAULTLIB /INCREMENTAL:NO`; characteristics went `0x160` → **`0x1E0`**, *Check integrity* set | still 193 |
+| signature not trusted | cert imported to the guest's `LocalMachine\Root`; in-guest status went `UnknownError` → **`Valid`** | **still 193** |
+
+**Two of those moved the failure and neither fixed it**, which is the useful part: enabling
+test-signing took the error from **577 `ERROR_INVALID_IMAGE_HASH`** to **193
+`ERROR_BAD_EXE_FORMAT`**, and establishing chain trust left it at 193 with the signature verifying.
+So the signature path is satisfied and what remains is a **shape** rule the loader applies and this
+record has not identified. `veclient.lib`, named in the requirements this build followed, does not
+exist in SDK `10.0.26100`; `vertdll.lib` is its equivalent here, and whether that substitution is
+the defect is unmeasured.
+
+**Where to start next, and what to avoid.** Diff the image against a *known-good* enclave binary —
+Microsoft's VBS enclave sample or the enclave SDK package — rather than forming another hypothesis.
+An attempt to find one by scanning `System32` for images carrying an enclave configuration read the
+wrong offset in `IMAGE_LOAD_CONFIG_DIRECTORY64` and returned 62 false positives including `mfc140`
+and `libomp140`, which is this record's recurring defect (a structure guessed at rather than
+sourced) arriving one more time.
+
+#### What it cost the bench
+
+The VBS guest is **not** as it was found, and a later gate reading it needs to know:
+
+- **Secure Boot off** and **test-signing on** — both required to get as far as a trusted
+  self-signed enclave image, both operator-authorised, both reversible.
+- **VBS and HVCI survived both**, which was checked rather than assumed: `VBSStatus = 2`,
+  `SecurityServicesRunning = 2`, `CodeIntegrityPolicyEnforcement = 2` after Secure Boot came off.
+  So VTL1 is intact and the subject of every earlier gate still exists.
+- A self-signed **`CN=VTL1 Enclave Test`** certificate sits in the guest's `LocalMachine\Root`.
+- `LsaCfgFlags` and the DeviceGuard Credential Guard scenario keys are set and inert.
+- `C:\encl\` holds the enclave, its host and the certificate.
+- **Four reboots**, so every boot-specific landmark has moved again — the `CR3`, the self-map index
+  and Secure Kernel's base are all different from the figures in S5c through S5f, which is exactly
+  the trap the H4 correction above documents.
 
 ## Explicitly out of scope
 

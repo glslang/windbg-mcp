@@ -9,6 +9,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Three routes to making Secure Kernel execute were tried and all three are closed on this
+  bench**, which is what turns S5f's "VTL1 runs too rarely to catch" into a map rather than a
+  shrug. Gate S5g, run with the operator's authorisation to reconfigure and reboot the VBS guest.
+  **Credential Guard: closed by edition** — `LsaCfgFlags`, the DeviceGuard scenario key and
+  `EnableVirtualizationBasedSecurity` all set, two reboots, `SecurityServicesRunning` still `2` and
+  no DeviceGuard events, because the guest is **Windows 11 Pro** and CG needs Enterprise/Education.
+  **Writing a trustlet: closed by signing policy** — IUM wants a Microsoft certificate with the IUM
+  EKU plus membership in Secure Kernel's identity list, and test-signing is deliberately not
+  honoured there; patching that list from the root was raised and declined, being a HyperGuard
+  bugcheck rather than a trustlet. **A VBS enclave: the mechanism works and the image is refused** —
+  `CreateEnclave` with `ENCLAVE_VBS_FLAG_DEBUG` succeeds every run while `LoadEnclaveImage` returns
+  **193 `ERROR_BAD_EXE_FORMAT`** through nine eliminated suspects: enclave config, load config, page
+  hashes, a `vertdll` import, `szOID_ENCLAVE_SIGNING`, TLS, the enclave CRT, `/INTEGRITYCHECK`
+  (characteristics `0x160` → `0x1E0`) and chain trust (in-guest signature `UnknownError` →
+  **`Valid`**). Two of those moved the failure and neither fixed it — test-signing took it from 577
+  to 193, trust left it at 193 — so the signature path is satisfied and an unidentified image-shape
+  rule remains. The next step is a diff against a known-good enclave binary rather than another
+  hypothesis; an attempt to find one by scanning `System32` misread
+  `IMAGE_LOAD_CONFIG_DIRECTORY64` and returned 62 false positives including `mfc140`.
+- **That gate changed the lab guest**, recorded because a later one will read it: Secure Boot
+  **off**, test-signing **on** (VBS and HVCI verified still running after both), a self-signed
+  `CN=VTL1 Enclave Test` certificate in `LocalMachine\Root`, Credential Guard keys set and inert,
+  and **four reboots** — so the `CR3`, self-map index and Secure Kernel base have all moved again
+  from the figures the S5c–S5f entries quote.
 - **The lab guests were reachable the whole time, which retires a limitation stated three times and
   turns the stop's evidence from 40× into 23,854×.** Gate S5f. *"Neither guest answers ICMP or
   WinRM, so there is no way to load them from outside"* equated **no network path** with **no guest
