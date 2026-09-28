@@ -3026,6 +3026,22 @@ validated. The full record is the
   as the VTL0-labelled `RIP` reading as VTL1's. There is no atomic stop-and-observe here, so the
   condition is reportable and not checkable. The record states the observation with its condition
   and gives no consumer rule at all, three attempts at one having been three review findings.
+- **S5f, 2026-09-28: the guests were reachable the whole time, over PowerShell Direct.** "Neither
+  guest answers ICMP or WinRM, so there is no way to load them" appeared three times in the record
+  and equated *no network path* with *no guest access*; `Invoke-Command -VMName` needs neither,
+  only the VMBus and guest credentials. Three things follow, and only the first two are results.
+  **The register interface is live** — under a user-mode spin, 110,638 samples per VP return
+  **6,675 / 6,603 distinct** VTL0 `RIP`s, **88%** of them ring-3, so S5c's whole instrument samples
+  the running processor rather than a cached exit record, which nothing had checked. **The stop,
+  measured on a busy guest, is 23,854×** — 19,512,433 → **818** → 19,447,557 per 2000 ms, before
+  and after within 0.3% — against the 40× the idle guest could show. And **the two open questions
+  stayed open**: `ActiveVtl = 1` was never observed in **832,560+** samples now spanning idle, a
+  two-VP spin and **twelve freshly loaded HVCI-verified kernel images**, and the halt's necessity
+  is still unshown (80,399 reads over a matched 3 s window, one distinct value per page — those
+  pages are static and a user-mode spin does not mutate SK's memory).
+- **Bench note:** eleven inbox driver images started in the VBS guest to provoke VTL1 will not stop
+  and stay loaded until it reboots. Harmless — drivers for hardware the VM lacks — but a later gate
+  reading its module list should know why they are there.
 - **The debugger half is back to S5b's leftover**: whether a partition-scoped intercept fires for
   VTL1 execution, which is still the only candidate that could stop at a *chosen* point, and still
   needs a receiver.

@@ -9,6 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The lab guests were reachable the whole time, which retires a limitation stated three times and
+  turns the stop's evidence from 40× into 23,854×.** Gate S5f. *"Neither guest answers ICMP or
+  WinRM, so there is no way to load them from outside"* equated **no network path** with **no guest
+  access**; **PowerShell Direct** needs neither, only the VMBus and guest credentials, and reaches
+  both. Two results follow. **The register interface is live** — under a user-mode spin, 110,638
+  samples per VP return **6,675 / 6,603 distinct** VTL0 `RIP` values, **88%** of them ring-3, so the
+  parent-side reads every S5c figure rests on sample the running processor rather than a cached exit
+  record; the idle constant was the idle loop. And **the stop measured against a busy guest** reads
+  19,512,433 → **818** → 19,447,557 per 2000 ms, before and after within 0.3% of each other, with
+  both VPs dropping together on the all-VP arm (7,290,238 → 319, 7,300,560 → 269). What driving the
+  guests did **not** settle: `ActiveVtl = 1` is still unobserved across **832,560+** samples now
+  including **twelve freshly loaded HVCI-verified kernel images**, and the halt's necessity is still
+  unshown — 80,399 reads over a matched 3 s window give one distinct value per page, those pages
+  being static under a workload that does not touch Secure Kernel's memory.
 - **The root can halt a running guest's virtual processor and read that guest's VTL1 while it is
   halted — registers, page tables and page contents, with no capture.** The phrase this entry
   first used, *"a live Secure Kernel inspector is feasible end to end"*, is **withdrawn**: S5e
