@@ -36,11 +36,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it and no hardware raises it — and every arm came back `INVALID_PARAMETER`, baseline included,
   which reads exactly like a clean negative about VTL1 and is a statement about the vector. The
   script now *discovers* a vector the hypervisor accepts, on the guest with no VTL1, before any arm
-  that claims to be about VTL1 runs; `0x05` (#BR) is architectural and not raisable by these guests,
-  which is what `0x1F` was meant to be — the second half being a **measurement on this bench**
-  rather than a property of long mode, since `BOUND` does not decode in 64-bit mode but MPX's
-  bound-check instructions raise #BR, and this host has no MPX (`CPUID.7.0:EBX` bit 14 = 0, no MPX
-  state component in `CPUID.D`). And "accepted" reads as "not a VTL selector" only because
+  that claims to be about VTL1 runs; `0x05` (#BR) is the vector it takes. **What is retracted is the
+  other half of that choice** — that the vector cannot fire. Two review rounds each named a way #BR
+  reaches a running x64 guest (MPX's bound-check instructions; the legacy `BOUND`, which still
+  decodes in 32-bit compatibility mode and so in every WOW64 process), an `int 5` is a third, and no
+  CPUID reading settles a claim about every instruction a guest might execute. What protected the
+  run was disposable guests and an install paired with its removal microseconds later — not the
+  vector. And "accepted" reads as "not a VTL selector" only because
   the same run shows what a field the hypervisor *does* read per VTL does on that control guest:
   `HvCallGetVpRegisters` with `TargetVtl = 1` is refused there and succeeds on the VTL1 guest. That
   contrast also names the *second* of S5's two remaining candidates — the three suspend registers

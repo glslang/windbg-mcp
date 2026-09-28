@@ -2026,21 +2026,28 @@ failure H3 wrote its own discipline against — *if both are refused the finding
 plumbing and says nothing about VTL1* — arriving in a different costume, and the only reason it was
 caught is that the control was in the run rather than assumed. The fix is a **vector phase**: the
 script discovers a vector this hypervisor accepts, on the guest with no VTL1, before any arm that
-claims to be about VTL1 runs. `0x05` (#BR) is the first it takes: architectural, so the hypervisor
-accepts it, and not raised by anything these guests can execute — which is what `0x1F` was meant to
-be.
+claims to be about VTL1 runs. `0x05` (#BR) is the first it takes, and it is the vector every arm
+above was installed for.
 
-**That second half is a measurement on this bench, not a property of long mode**, and an earlier
-draft of this paragraph said "unreachable in long mode" as though it were the latter. Review
-pointed out the gap and it is real: the legacy `BOUND` does not decode in 64-bit mode, but **MPX**'s
-bound-check instructions raise #BR and do, so on MPX-capable hardware the vector is live and this
-arm would not be inert. On *this* host it is: `CPUID.7.0:EBX` bit 14 (MPX) is **0** on the i7-14700,
-and `CPUID.D.0:EAX` is `0x00000007` — neither MPX state component (bits 3 and 4) is offered, so no
-guest can enable the feature and Hyper-V has nothing to synthesise it from. The leaf read is
-sound rather than an all-zero answer: `FSGSBASE` and `SMEP` in the same register read 1. A bench
-whose CPU implements MPX needs a different vector or a paused target, and the run's other
-protections — a disposable guest, an install paired with its removal microseconds later — are what
-stood behind this one rather than beside it.
+**The second half of that choice — that the vector cannot fire — is retracted, and the reason is
+the shape of the search rather than any one counterexample.** Two review rounds each named a way
+#BR reaches a running x64 Windows guest, both correct: **MPX**'s bound-check instructions raise it
+on hardware that implements the feature, and the legacy `BOUND` still decodes in **32-bit
+compatibility mode**, which is every WOW64 process on such a guest. A third exists without looking
+far — an explicit `int 5` delivers the vector as a software interrupt, and whether the hypervisor's
+*exception* intercept catches that is itself unmeasured here. Each round's fix was a longer
+qualification, which is the tell: **"no code can raise this vector" is a claim about every
+instruction every guest might execute, and no CPUID reading or decode rule settles it.** The
+enumeration is not certified complete above and is not meant to be — that is the point.
+
+So the record claims only what it can: `0x05` was chosen to make a fire *unlikely*, not impossible,
+and **what actually protected the run is not the vector at all** — a pair of disposable lab guests,
+and an install paired with its removal microseconds later, on a bench whose CPU happens to lack MPX
+(`CPUID.7.0:EBX` bit 14 = `0` on the i7-14700, no MPX state component in `CPUID.D`; `FSGSBASE` and
+`SMEP` read 1 in the same register, so that is a real reading rather than an all-zero answer). Both
+guests came through with continuous uptime. **A re-run that needs a genuinely inert arm pauses the
+target or uses one it is willing to lose, rather than hunting for an unraisable vector** — there is
+no vector this method could have proved safe, and the hunt for one is what generated these rounds.
 
 A second, smaller one: the client's `HV_STATUS` table was carried over from `h3client.py` and had
 `0x000B` as `INVALID_PARTITION_ID`, which the invalid-partition arm contradicted by returning
