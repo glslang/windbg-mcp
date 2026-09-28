@@ -1948,13 +1948,22 @@ are running:
 |---|---|---|
 | `PartitionId` | `-1` — **SELF** | the caller's, and Vid.sys passes a *child's* |
 | `AccessType` | `4` (execute) | the caller's; Vid.sys passes 4 to install, **0 to remove** |
-| `InterceptType` | `3` — exception | the caller's; Vid.sys passes 1, 2, 3 and `0xC` at 11 sites |
+| `InterceptType` | `3` — exception | the caller's; see below |
 | `Parameters` | vector in the low word, six bytes zeroed explicitly | 8 bytes, caller's |
 | input size | `0x18`, passed to the invoker | `0x18`, passed to the invoker |
 
 **So `FOLLOWUPS.md`'s "intercept type 4" was the access mask.** Type 3 is the exception intercept
 and 4 is `HV_INTERCEPT_ACCESS_MASK_EXECUTE`; the two fields are adjacent dwords and the earlier
 reading took the first one it saw. Corrected there.
+
+**The root side is not hypothetical either: Hyper-V's own `Vid.sys` calls it on children.** Eleven
+call sites reach `WinHvInstallIntercept`. Seven carry a literal intercept type — `1`, `2`, `3` and
+`0xC` — and four take it from a caller or a structure, which this pass did not resolve; one of those
+four is a **VID IOCTL passthrough** that length-checks an input buffer at `0x18` and hands the
+descriptor straight through, so user mode supplies the whole block. Four sites pass `AccessType`
+`0`, which is how an intercept is removed and is where this run's removal arm comes from rather than
+from a guess. So a parent installing an exception intercept on a child is ordinary, documented
+behaviour — what S5b adds is that it cannot be pointed at a VTL.
 
 Secure Kernel's own installer also refuses every vector but **#DB and #BP** — `(vector - 1) & 0xFFFD`
 must be zero, unless a global is set — and sets `1 << vector` in a bitmask after the call succeeds.
