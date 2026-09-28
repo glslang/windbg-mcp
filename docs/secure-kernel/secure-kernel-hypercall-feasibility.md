@@ -2546,12 +2546,14 @@ inbox drivers for hardware the VM does not have, they failed to find devices, an
 them — but the guest is not byte-for-byte as it was found, and a later gate reading its module list
 should know why there is a FireWire controller in it.
 
-### S5g result, 2026-09-28: three routes to VTL1 occupancy, all closed on this bench
+### S5g result, 2026-09-28: two routes to VTL1 occupancy closed, the third open and measured
 
-**Nothing here caught VTL1 executing, and the value is in which doors are shut and why** — S5f
-turned "VTL1 runs too rarely to catch" into a number, and this turns "we could make it run" into
-three specific refusals. Run with the operator's authorisation to reconfigure and reboot the VBS
-guest; see *What it cost the bench* at the end, because this one changed the guest materially.
+**Two doors are shut and the third is open: our own code now runs in VTL1, and a halt taken
+while it runs is the condition every earlier gate was qualified on.** The value is in both halves —
+which routes are closed and why, and what the working one finally measured. S5f turned "VTL1 runs
+too rarely to catch" into a number; this turns "we could make it run" into two specific refusals
+and one success. Run with the operator's authorisation to reconfigure and reboot the VBS guest; see
+*What it cost the bench* at the end, because this one changed the guest materially.
 
 #### Route 1 — Credential Guard: closed by edition
 
@@ -2598,7 +2600,30 @@ SKPG/HyperGuard monitors exactly that, the likely outcome is a bugcheck rather t
 it means modifying live policy state whose layout nothing here has mapped. If it is ever wanted it
 is its own gate, against a throwaway checkpoint, with the bugcheck as the expected result.
 
-#### Route 3 — a VBS enclave: the mechanism works and the image is refused
+#### Route 3 — a VBS enclave: **open**, once the official sample was used as the reference
+
+**This route works, and the eight failures below were all one mistake: building from first
+principles instead of from Microsoft's sample.** `windows-classic-samples/Samples/VbsEnclave` is
+the reference; against it the image loads, initialises and runs, and *our own code executes in VTL1
+user mode*:
+
+```text
+LoadEnclaveImage ok
+InitializeEnclave ok
+Spin at 000001CE77FE5030 -- calling 2 x 20000000 rounds IN VTL1
+done: 2 calls in 78 ms
+```
+
+**Five differences mattered, and the first is the one that had been refusing the image.** The
+sample sets `PolicyFlags = IMAGE_ENCLAVE_POLICY_DEBUGGABLE`; this build had `0`, while the *host*
+creates the enclave with `ENCLAVE_VBS_FLAG_DEBUG` — a debug host and a non-debuggable image, which
+the loader is entitled to refuse. Beside it: non-zero `FamilyID`/`ImageID` where this had zeros; an
+`EnclaveSize` of `0x10000000` that the host's `CreateEnclave` must match, against 16 MiB here;
+**no `/ENTRY` override**, so the enclave CRT's `_DllMainCRTStartup` runs rather than a raw
+`DllMain`; and `/GUARD:MIXED` with `SubSystem CONSOLE`, exports through a `.def`, and the *enclave*
+`libcmt`/`libvcruntime` kept rather than removed.
+
+#### Route 3 — the eight attempts before the reference existed
 
 An enclave is the documented way to run *your own* code in VTL1 user mode, and unlike a trustlet it
 is a developer facility. The guest supports it — `IsEnclaveTypeSupported(ENCLAVE_TYPE_VBS)` is
@@ -2647,7 +2672,54 @@ per second per VP that never once lands in VTL1, across workloads that certainly
 easier to explain by the field than by the timing — but neither is established, and the
 halted-register readings stay conditional either way.
 
-**Where to start next, and what to avoid.** Diff the image against a *known-good* enclave binary —
+#### With VTL1 running, the condition every earlier reading was qualified on is finally measured
+
+**`ActiveVtl` still reads `0` while VTL1 is provably executing, so it is not a usable indicator.**
+With the enclave spinning and the VPs measurably busy — VP 0 at **25.8%**, VP 1 at **52.4%** by
+`HvRegisterVpRuntime` — `ActiveVtl` came back `0` in **274,566** samples, and VP 0's *VTL0* `RIP`
+read the idle loop while that VP was a quarter busy. Whether the field cannot express VTL1 or the
+parent-side read is served at a VTL0 boundary is not settled here; either way, **the parent cannot
+use it to tell whether VTL1 is running**, which is what round nine of
+[#409](https://github.com/glslang/windbg-mcp/pull/409) concluded on weaker grounds.
+
+**A method error had to be corrected first, and it invalidated a reading this record nearly kept.**
+An earlier "zero even while our code spins in VTL1" was taken against a spin launched with
+`Invoke-Command -AsJob` — and each of this bench's PowerShell invocations is its own process, so
+the job and its remote session died when the call returned. The VP runtime said so: **0.7% and
+0.3% busy** while the "spin" was supposedly running. The workload only exists when the guest-side
+process is **detached** with `Start-Process`, which is why the earlier CPU-load arms were real and
+the enclave ones were not.
+
+**Halt the VP while the enclave runs, and the VTL1 context is the enclave's own.** Six halts, all
+with the spin confirmed running:
+
+| | VP 0 | VP 1 |
+|---|---|---|
+| VTL1 `RIP` caught | `0xFFFFF80679FB0035` — Secure Kernel, parked | **`0x21456DE509B`–`0x21456DE50BC`** — *user mode, inside the enclave* |
+| halts catching VTL1 executing | 0 of 6 | **6 of 6** |
+| distinct addresses across halts | 1 | **5** |
+| stable within one halt (10 reads) | yes | **yes** |
+
+A ~34-byte span is what a tight loop looks like. **So the halt catches VTL1 mid-execution, freezes
+it, and the VTL1 registers report the running context** — five distinct addresses across six halts
+proves it is sampling live code, and the stability within each halt proves the halt stopped it.
+VP 0 stayed parked at Secure Kernel's address throughout, so the two processors are distinguished
+correctly.
+
+**What this retires.** Every halted-register reading in S5c and S5e was conditional on
+`ActiveVtl = 0` with VTL1 parked, and the record said repeatedly that the `ActiveVtl = 1` case was
+unmeasured and unreachable. It is now measured — by a workload that puts VTL1 in user mode rather
+than by catching `ActiveVtl`, which never reports it. The halted VTL1 context behaves the same way
+it did parked: readable, stable under the halt, and its own rather than VTL0's.
+
+**And it settles the liveness scope from the other direction.** #411's review correctly limited the
+"the register interface is live" result to VTL0, because only VTL0 had been varied. The VTL1 `RIP`
+now moves across halts and tracks code we wrote, so **the VTL1 read is live too** — established
+here rather than assumed there.
+
+**Where to start next, and what to avoid.** *(Superseded above: the image now loads. Kept because
+the elimination order is what a reader repeating this needs.)* Diff the image against a
+*known-good* enclave binary —
 Microsoft's VBS enclave sample or the enclave SDK package — rather than forming another hypothesis.
 An attempt to find one by scanning `System32` for images carrying an enclave configuration read the
 wrong offset in `IMAGE_LOAD_CONFIG_DIRECTORY64` and returned 62 false positives including `mfc140`
