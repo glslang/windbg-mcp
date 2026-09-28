@@ -2026,8 +2026,21 @@ failure H3 wrote its own discipline against — *if both are refused the finding
 plumbing and says nothing about VTL1* — arriving in a different costume, and the only reason it was
 caught is that the control was in the run rather than assumed. The fix is a **vector phase**: the
 script discovers a vector this hypervisor accepts, on the guest with no VTL1, before any arm that
-claims to be about VTL1 runs. `0x05` (#BR) is the first it takes — `BOUND` does not decode in long
-mode, so the vector is architectural *and* unreachable, which is what `0x1F` was meant to be.
+claims to be about VTL1 runs. `0x05` (#BR) is the first it takes: architectural, so the hypervisor
+accepts it, and not raised by anything these guests can execute — which is what `0x1F` was meant to
+be.
+
+**That second half is a measurement on this bench, not a property of long mode**, and an earlier
+draft of this paragraph said "unreachable in long mode" as though it were the latter. Review
+pointed out the gap and it is real: the legacy `BOUND` does not decode in 64-bit mode, but **MPX**'s
+bound-check instructions raise #BR and do, so on MPX-capable hardware the vector is live and this
+arm would not be inert. On *this* host it is: `CPUID.7.0:EBX` bit 14 (MPX) is **0** on the i7-14700,
+and `CPUID.D.0:EAX` is `0x00000007` — neither MPX state component (bits 3 and 4) is offered, so no
+guest can enable the feature and Hyper-V has nothing to synthesise it from. The leaf read is
+sound rather than an all-zero answer: `FSGSBASE` and `SMEP` in the same register read 1. A bench
+whose CPU implements MPX needs a different vector or a paused target, and the run's other
+protections — a disposable guest, an install paired with its removal microseconds later — are what
+stood behind this one rather than beside it.
 
 A second, smaller one: the client's `HV_STATUS` table was carried over from `h3client.py` and had
 `0x000B` as `INVALID_PARTITION_ID`, which the invalid-partition arm contradicted by returning
