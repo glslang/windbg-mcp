@@ -2961,9 +2961,13 @@ outright, so there is no extended form either. The full record, with the arm tab
   intercept dispatch for a check on the active VTL — two attempts have failed on that image, and
   Ghidra is on this bench now where it was not then — or a live test, which needs a port of its own
   to receive on and a VTL1 exception that is **not** a planted `int 3`. Cheaper than the second
-  candidate, and it would make it unnecessary. **Answered on 2026-09-28 by S5h, below, and by the
-  live route**: S5g's enclave supplied the VTL1 exception, the effect is visible at the guest's own
-  exception dispatch without any port, and the static read was not needed.
+  candidate, and it would make it unnecessary. **Half-answered on 2026-09-28 by S5h, below, taking
+  the live route**: S5g's enclave supplied the VTL1 exception, and a `#BP` raised there is held and
+  handed back without any port — so the *behaviour* is measured. **The static read is still
+  needed**, and the sentence above is why it was skipped rather than why it is unnecessary: the live
+  test cannot separate the hypervisor taking the trap in VTL1 from it taking a VTL0 event that
+  dispatching the VTL1 exception produces, so *whether a parent-installed intercept covers VTL1*
+  remains exactly as open as this bullet left it.
 - **The second was measured as S5c on 2026-09-28** — `HvCallSetVpRegisters` (`0x0051`) writing
   `HvRegisterExplicitSuspend` — and it **works, without being the stop S5 asks for**. See below.
 

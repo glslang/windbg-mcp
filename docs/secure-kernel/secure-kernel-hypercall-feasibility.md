@@ -2944,12 +2944,21 @@ the partition that raises that vector**, which is also why an install must be pa
 removal in a `finally`.
 
 **And the first run's runtime figures were read as a livelock, which per-second rates say they are
-not.** Raw `HvRegisterVpRuntime` deltas across a 190 s arm came to 444 M and 664 M 100ns units —
-44 s and 66 s of CPU — which looks like two processors spinning. Divided by the window they are
-`0.12–0.16` and `0.48–0.55` CPU-seconds per second: one VP about an eighth busy and one about half,
-elevated over an idle guest but not saturated. A large delta over a long window is not a rate, and
-this record has no matched-duration idle baseline to put beside it — the null arms are seconds long
-and their wall time is not recorded — so the claim here is only that the VPs are not saturated.
+not.** The rates come from the timestamped sample series the later runs take once a second:
+**`0.12–0.16`** and **`0.48–0.55`** CPU-seconds per second over windows of 25–44 s, one VP about an
+eighth busy and one about half.
+
+The first run took no such series, only a raw `HvRegisterVpRuntime` delta across the whole arm —
+444 M and 664 M 100ns units, which is 44.5 and 66.4 CPU-seconds and looks like two processors
+spinning. That arm's wall time was not recorded; against the ~190 s it must have been it works out
+near **`0.23`** and **`0.35`** per second. An earlier version of this paragraph gave those deltas
+and then quoted the sample-series rates as though they were the result of dividing them, which they
+are not — they are different runs, and the split between the two VPs differs because the raiser
+thread does not always land on the same one.
+
+What both agree on is the only claim made here: **a fraction of one VP, never saturated.** There is
+no matched-duration idle baseline to put beside either — the null arms last seconds and their wall
+time is not recorded — so this does not quantify how much of that is the hold.
 
 Both guests came through every run: teardown reported **0 intercepts still standing** each time, no
 straggler processes, VBS and HVCI still `2` on the VBS guest, no reboot. **This gate cost the bench
