@@ -675,15 +675,32 @@ page itself, which is the one a debugger would need first — still read as zero
 Whether that is a limit of `hvmm.sys`'s mapping, a fallback to the hypercall inside method 1, or
 genuinely zero memory is unmeasured, and it is the next thing to settle.
 
-> **Corrected 2026-09-28 by S5e: the `0x1201000` row above is an artifact of the sample size, and
-> the direct route reads that page fine.** Every cell in this table is **16 bytes** from the start
-> of the page, and a PML4's low entries describe user space, which is empty here. Read whole, the
-> page has **122 non-zero bytes and 26 present entries**, at indices 262, 272–287, 302, 316, 334,
-> 379, 382, 433, 463, 496 and 499 — the first of them at byte offset `0x830`, well past any
-> 16-byte window. The count matches the **26 present entries** S0 recorded for this guest from the
-> capture side. So the answer to "a limit of the mapping, a fallback, or genuinely zero" is *none
-> of the three*: it was a prefix being mistaken for a page. What the row says about `0x3600000`
-> stands unretested. See the S5e result for the walk this makes possible.
+> **Corrected 2026-09-28 by S5e: the `0x1201000` row above is an artifact of the sample size.**
+> Every cell in this table is **16 bytes** from the start of the page, and a PML4's low entries
+> describe user space. **The proof is this record's own data for that same boot**: the H4 landmark
+> table below puts that page's first present entry at byte offset `0x850` and its self-map at index
+> 388, so its first 16 bytes were zero whether or not the page was readable, and a 16-byte read
+> could only ever have returned zeros. So the answer to "a limit of the mapping, a fallback, or
+> genuinely zero" is *none of the three* — the window never covered the data. What the row says
+> about `0x3600000` stands unretested.
+>
+> **The S5e census is a different boot and must not be read as a second opinion on this one.** That
+> guest booted 2026-09-27 10:07, after these measurements; its VTL1 `CR3` is **also** `0x1201000`
+> but its page table is not the same one. Both are internally consistent, each with a self-map
+> pointing at its own root:
+>
+> | | H4 / S0, 2026-09-26 boot | S5e, 2026-09-27 boot |
+> |---|---|---|
+> | VTL1 `CR3` | `0x1201000` | `0x1201000` |
+> | self-map index | 388 | **463** (`0x8000000001201063`) |
+> | present entries | 26 | 26 |
+> | non-zero bytes | 123 | 122 |
+> | first present entry | offset `0x850` | offset `0x830` (index 262) |
+>
+> **And that is a landmark trap worth the line it costs**: this record already says the VTL1 `CR3`
+> is not reboot-stable, citing a boot that used `0x107593000`. What it did not say is that the
+> value can also **repeat** across boots — so `CR3` equality is not evidence of the same boot, and
+> reading it as such is what made two correct censuses look like a contradiction.
 
 **What this does to the route.** The backend table's pricing stands and its conclusion changes: the
 memory half needs the `vid.sys`/direct-mapping route that LiveCloudKd carries a driver for, and
@@ -2149,10 +2166,15 @@ show what idle looks like when nothing is being done to it.
 | test — after release | 61,453 |
 | symmetric arm — VTL0 suspend on the **VBS** child, while suspended | 495 |
 
-Two orders of magnitude below the idle floor, in every suspended arm. An earlier version of the
-guard looked for a **catch-up burst** on release instead and called a clean 100× drop "weak" — an
-idle guest has no queued work to catch up on, so the burst was never the discriminator. The
-`during` sample against the null model is.
+Against the lowest idle sample of the same run — 41,291 — the suspended arms are **40× to 106×**
+below it: control 1 at `45,434 / 430` is 106×, the symmetric arm's 495 is 83×, and the VTL1 test at
+`41,291 / 1,032` is **40×**. An earlier version of this sentence said "two orders of magnitude in
+every suspended arm", which is true of the control and not of the test, and overstated the
+narrowest arm by more than a factor of two. The separation is large and consistent in every arm;
+the figure that carries it is 40×, not 100×. An earlier version of the *guard* looked for a
+**catch-up burst** on release instead, and called a clean drop "weak" — an idle guest has no queued
+work to catch up on, so the burst was never the discriminator. The `during` sample against the null
+model is.
 
 #### What the VTL parameter does, and what it does not
 
