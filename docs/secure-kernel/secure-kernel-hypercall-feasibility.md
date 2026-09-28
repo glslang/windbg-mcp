@@ -2341,11 +2341,22 @@ that answers it reads each page **whole, 4096 bytes, through both routes**:
 | PA `0x1208000` — the page table itself, as a control | **8** non-zero | 0 |
 
 **Each of the three pages is readable by exactly one of the two routes, and which one differs per
-page.** A page holding 4,084 non-zero bytes of 4,096 is what a code page looks like, so the halted
-`RIP` does point at content — reachable, through the route this gate had stopped using. The
-complementarity is the finding: **neither route alone reads VTL1's address space**, and H4's
-framing of the direct route as the one that "sees what the hypercall cannot" is true of the pages
-H4 sampled and false as a general rule.
+page.** The complementarity is the finding: **neither route alone reads VTL1's address space**, and
+H4's framing of the direct route as the one that "sees what the hypercall cannot" is true of the
+pages H4 sampled and false as a general rule.
+
+**And the bytes at the end of the chain are what settle that the chain is right.** At the halted
+`RIP`'s own page offset, `0x035`, the leaf holds:
+
+```text
+c3 90 90 90 90 90 90 90 90 90 90 90 90 90 90 90 …
+```
+
+`ret` followed by `nop` padding — a plausible instruction at a plausible place for a parked Secure
+Kernel to be sitting. Nothing in the walk was checked against an oracle, so this is the check: had
+any level of the descent been misread, the offset would hold arbitrary data rather than an
+instruction that makes sense of `RIP` pointing at it. Halted VP → VTL1 `CR3` → four levels → the
+right route for that page → the instruction the processor is parked on.
 
 A hypothesis consistent with all of it, and **not** established here: the hypercall returns zeros
 for VTL1-*protected* pages (H4's `ReadIntercept` result) while `hvmm`'s mapping returns zeros for
@@ -2367,6 +2378,16 @@ fallback, or genuinely zero" turns out to have been none of the three.
 The general form is worth stating because both instances were mine: **a prefix is not a page**, and
 a structure whose interesting entries are index-addressed will read as empty from any window that
 does not cover them.
+
+**It then happened a third time, inside the fix for the second**, which is the part worth carrying.
+The instrument gained a `census()` that reads whole pages by both routes — written precisely so no
+page-level claim could rest on a window again — and it censused the address it was *handed*. For a
+leaf reached by a walk that address is `…035`, so the read straddled two pages, counted 16 non-zero
+bytes belonging to the *next* one, chose the route those bytes came from, and printed *"neither
+route returned content"* about a page the other route reads 4,084 bytes of. **A census of the wrong
+extent is the same defect as a prefix**, and writing the rule down is demonstrably not the same as
+obeying it: the fix is one `& ~0xFFF` in the helper, where it is exercised on every run, rather than
+a sentence in a document.
 
 #### What this leaves the inspector claim as
 
