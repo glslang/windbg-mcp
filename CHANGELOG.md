@@ -23,7 +23,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   distinct: `CR3` `0x1201000` — the landmark S0 and H4 both recorded, arriving from a third
   direction — with `RIP` `0xFFFFF80609990035`, and a separate read-only probe found the VTL1 `RIP`
   distinct from VTL0's in **40 of 40 samples on each of both VPs**, moving across a suspend cycle,
-  so it is Secure Kernel's own live state rather than a mislabelled read.
+  so it is Secure Kernel's own live state rather than a mislabelled read. **Sampling a running
+  guest validates only the running path**, so the halt was repeated eight times: the halted VTL1
+  `RIP` equals its own pre-halt value **8/8** while the VTL0-labelled `RIP`/`RSP` come back as the
+  VTL1 values **8/8** regardless of where VTL0 was — systematic, not coincidence, since the
+  pre-halt VTL0 `RIP` took two distinct values across those cycles, and `CR3` stayed distinct 8/8.
+  The caution therefore lands on the **VTL0** read, not the VTL1 one: while halted, treat VTL1's
+  registers as VTL1's and the VTL0-labelled `RIP`/`RSP` as unusable.
+- **A live inspector has to halt every VP, not one, and that is now the contract rather than a
+  caveat.** One halted VP brackets per-VP *register* reads; it does not make *memory* consistent,
+  because a second processor goes on running Secure Kernel and mutating the page tables and loader
+  lists a VTL1 walk reads — S4's "identical only at the instant of the first read", arriving on the
+  read side. Halting both VPs of the VBS guest was measured: `SUCCESS` on each, both runtimes
+  frozen (995 and 299 per 2000 ms against 45,005 and 23,046 before, and 229,059 and 30,687 after,
+  the first a catch-up burst from a guest that really had stopped), both released clean.
 - **S5 still does not pass, and the gap is stated rather than rounded off.** Its condition is *a
   VTL1 execution stop delivered to a debugger*: this is the **whole VP**, at an arbitrary point,
   found by polling. Set by naming VTL1, `HvRegisterExplicitSuspend` reads `1` at VTL0 too, and the

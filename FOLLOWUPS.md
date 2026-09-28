@@ -2979,14 +2979,19 @@ validated. The full record is the
   stop *of VTL1*, at a *chosen point*, *delivered* as an event. This is the whole VP, at an
   arbitrary point, found by polling. `ActiveVtl` read `0` in all 80 read-only samples and in every
   arm, so Secure Kernel was never caught executing.
-- **What is genuinely new is the inspector.** Stop the VP (S5c), read VTL1 registers (H3) and VTL1
-  memory by the direct route (H4), resume. That is live-target VTL1 inspection with no capture, and
-  it means S3's snapshot-shaped surface has a live variant that is now measured rather than
-  hypothetical.
+- **What is genuinely new is the inspector, and it must halt *every* VP.** Stop the guest (S5c),
+  read VTL1 registers (H3) and VTL1 memory by the direct route (H4), resume. One halted VP brackets
+  per-VP register reads and does **not** make memory consistent — a second VP goes on running
+  Secure Kernel and mutating the page tables a walk reads, which is S4's "identical only at the
+  instant of the first read" arriving on the read side. Halting both VPs of the VBS guest was
+  measured: `SUCCESS` on each, both runtimes frozen (995 and 299 per 2000 ms against 45,005 and
+  23,046 before), both released clean. So *halt every VP and verify each* is part of the contract.
 - **Do not** re-run S5c's controls; the suspend bit, the refusal code and the VP-wide scope are
-  taken. **Do** re-read `docs/.../secure-kernel-hypercall-feasibility.md` before building on the
-  VTL1 context: the VP's own `RIP`/`RSP` become the VTL1 values during the stop, and whether that
-  is the VP parked at VTL1 entry or the read path relabelling is **not** settled.
+  taken. **Do** read the record before building on the halted context: over **eight** halt cycles
+  the VTL1 `RIP` equalled its own pre-halt value 8/8 — stable, trustworthy — while the
+  **VTL0**-labelled `RIP`/`RSP` came back as the VTL1 values 8/8 regardless of where VTL0 actually
+  was. Treat the VTL1 registers as VTL1's and the VTL0 ones as unusable while halted; which
+  mechanism causes it is unsettled and does not change that rule.
 - **The debugger half is back to S5b's leftover**: whether a partition-scoped intercept fires for
   VTL1 execution, which is still the only candidate that could stop at a *chosen* point, and still
   needs a receiver.

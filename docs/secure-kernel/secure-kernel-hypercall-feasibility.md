@@ -2109,7 +2109,9 @@ unnamed here for the same reason it was in H3.
 **The stop works, it is not a VTL1 stop, and the distinction is measured rather than reasoned
 about.** `HvCallSetVpRegisters` (`0x0051`) writing `HvRegisterExplicitSuspend` halts a running
 child's virtual processor from the root partition — no guest-side code, no exception, no intercept,
-no port — and while it is halted the child's **VTL1 register context is readable and distinct**.
+no port — and while it is halted the child's **VTL1 `CR3` and VTL1 `RIP` read back as VTL1's own,
+while the VTL0-labelled `RIP` and `RSP` do not read back as VTL0's**. That asymmetry is measured
+over repeated halts below, and it is a caution on the *VTL0* read rather than on the VTL1 one.
 What the run also shows is that the halt is **VP-wide**: naming VTL1 stops the whole processor, not
 VTL1's execution, so this is an inspector's stop rather than the debugger's stop S5 asks for.
 
@@ -2172,9 +2174,32 @@ mislabelled — so a separate read-only probe sampled the pair on a *running* gu
 samples on each of both VPs returned a VTL1 `RIP` distinct from the VTL0 one**, with the VTL1 `CR3`
 distinct in every sample too. The VTL1 context is Secure Kernel's own, and it **moves** —
 `0xFFFFF80609990035` to `0xFFFFF80609990003` across one suspend cycle — so it is live state rather
-than a stale copy. What the two readings together do *not* settle is whether the VP is parked at
-the VTL1 entry context during the stop or whether the register path returns VTL1's context under
-both labels while suspended; both fit, and nothing here distinguishes them.
+than a stale copy.
+
+**But sampling while the guest runs validates only the running path, which is what a review round
+pointed out**, so the halt itself was repeated. **Eight halt/read/release cycles**, each comparing
+the pre-halt pair with the halted pair:
+
+| reading over 8 cycles | result |
+|---|---|
+| halted VTL0 `RIP` == halted VTL1 `RIP` | **8/8** |
+| halted VTL1 `RIP` == that cycle's **pre-halt** VTL1 `RIP` | **8/8** |
+| `CR3` still distinct between the two VTLs while halted | **8/8** |
+| distinct pre-halt VTL0 `RIP`s across the eight cycles | 2 — the guest was moving |
+
+**So the coincidence is systematic, not a matter of where the guest happened to be**, and the two
+halves fall on opposite sides. The VTL1 reading is *stable*: it equals its own pre-halt value in
+every cycle, so halting does not disturb it and what comes back is the context that was there
+before. The **VTL0** reading is the one to distrust: it returns the VTL1 value in every cycle
+regardless of where VTL0 actually was, which the two distinct pre-halt VTL0 `RIP`s rule out as
+coincidence. `CR3` staying distinct throughout also rules out the crude version of the mislabelling
+story — the read path is not simply returning VTL1 for everything.
+
+What is still *not* settled is which mechanism produces it: the VP parked at the VTL1 entry
+context, or the register path substituting VTL1's `RIP`/`RSP` while suspended. Both fit all eight
+cycles. **The consumer-facing consequence does not depend on which**: while a VP is halted this
+way, treat the VTL1 registers as VTL1's and do **not** treat the VTL0-labelled `RIP`/`RSP` as
+VTL0's.
 
 #### What S5c does not establish
 
@@ -2193,17 +2218,32 @@ both labels while suspended; both fit, and nothing here distinguishes them.
 - **This is Hyper-V's own pause primitive**, not a new capability: the root suspending a child's VP
   is how a VM pauses. What is new here is only that it is reachable from this probe and that VTL1
   state is readable across it.
-- **One host, one pair of guests, VP 0, idle.** A busy guest would sharpen the runtime evidence and
-  was not available: neither guest answers ICMP or WinRM from this host, so there is no way to load
-  them from outside.
+- **One host, one pair of guests, idle.** A busy guest would sharpen the runtime evidence and was
+  not available: neither guest answers ICMP or WinRM from this host, so there is no way to load
+  them from outside. Every arm but the all-VP one halts **VP 0 alone**, which is enough for a
+  register reading and is *not* enough for a memory walk — see the inspector note below.
+- **Why the VTL0-labelled `RIP`/`RSP` coincide with VTL1's while halted.** Measured as systematic
+  over eight cycles; the mechanism behind it is not established.
 
 #### What it changes downstream
 
-- **A live VTL1 *inspector* is now feasible end to end**, which is the practically useful half.
-  Stop the VP (S5c), read VTL1 registers (H3) and VTL1 memory by the direct route (H4), resume —
+- **A live VTL1 *inspector* is feasible end to end, and it has to halt every VP rather than one.**
+  Stop the guest (S5c), read VTL1 registers (H3) and VTL1 memory by the direct route (H4), resume —
   on a running guest, with no capture. S3's tool surface was shaped for a fixed snapshot because S0
   said most users would have one; this says a *live* source can be given the same shape, with the
   stop bracketing the reads.
+
+  **The "every VP" part is a correction from review, and it is the difference between a stop and a
+  snapshot.** S5c's other arms halt VP 0 alone, and on a two-VP guest the second processor goes on
+  executing Secure Kernel and mutating exactly the page tables and loader lists a VTL1 walk reads —
+  so one halted VP brackets *per-VP register* reads and does not make memory internally consistent.
+  The same S4 hazard the record already carries for writes ("identical only at the instant of the
+  first read"), arriving on the read side. Measured rather than left as a caveat: halting **both**
+  VPs of partition `0x7` succeeds on each (`SUCCESS`, `SUCCESS`) and **both** runtimes freeze —
+  995 and 299 per 2000 ms against 45,005 and 23,046 before, and 229,059 and 30,687 after release,
+  the first of those a catch-up burst from a guest that really had been stopped. Both released
+  cleanly and read back `0`. So the inspector is available, and *halt every VP and verify each* is
+  part of its contract rather than an optimisation.
 - **The debugger half stays open**, and its remaining candidate is the one S5b left: whether a
   partition-scoped intercept fires for VTL1 execution. That is still the only route that could
   produce a stop *at a chosen point*, and it still needs a receiver.
