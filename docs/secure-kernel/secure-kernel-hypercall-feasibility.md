@@ -1788,6 +1788,14 @@ They agree with the six verified rows and are listed separately rather than coun
   apart from the decoders for the same reason in reverse: `0F 01 C1` can sit inside an immediate,
   so a raw match is sound evidence of *absence* and must never be counted as a `vmcall` — 1 to 3
   raw-only matches per build, all shadowed.
+  **And a dismissal only counts if the instruction doing it is at a boundary that cannot be
+  wrong.** The linear sweep *does* desynchronise on these images: measured against `.pdata` as
+  2,617 to 3,221 independent checkpoints per build, it decodes straight through 2 or 3 of them,
+  always in one small region. Finding an instruction is safe from any pass, since a spurious one
+  only gives the scan another place to look; dismissing a candidate as a shadow is not, because a
+  shadow cast by a misaligned decode is worthless. So dismissal uses only the seeds that start at
+  known function entries. Measured before the change: no candidate on any of the ten builds relied
+  on the sweep for its dismissal, so this costs nothing and stops the question arising.
 - **A control code does not have to be bare.** The ABI puts it in bits 0–15 of a hypercall input
   value, with the fast flag at bit 16 — so `0x00010069` is `HvPostDebugData` and an exact-equality
   test misses it, which this scan did while its repertoire reading masked with `& 0xFFFF`. Matching

@@ -267,16 +267,28 @@ class PE:
                     out.add(rva)
         return out
 
-    def aligned_instructions(self):
-        """Instructions at every boundary any pass recognises: {rva: (mnemonic, ops, [imms])}.
+    def aligned_instructions(self, trusted_only=False):
+        """Instructions at recognised boundaries: {rva: (mnemonic, ops, [imms], size)}.
 
-        Three seeds, unioned. The exception directory gives declared function starts; a
-        linear sweep of each section gives everything between them; and a recursive descent
-        from every direct call and jump target, iterated to a fixpoint, gives the **leaf
-        functions** - which need no unwind data, are therefore absent from `.pdata`, and are
-        exactly what a linear sweep can stride past if it desynchronises on embedded data.
-        A leaf is reached by being called, so its entry is a call target even when nothing
-        else names it.
+        Four seeds. The exception directory gives declared function starts; a recursive
+        descent from every direct call and jump target, iterated to a fixpoint, gives the
+        **leaf functions**, which need no unwind data and are therefore absent from
+        `.pdata`; the export table gives a leaf reachable only from outside; and a linear
+        sweep of each section gives everything between them.
+
+        `trusted_only` drops the sweep, and the distinction is load-bearing rather than
+        tidy. **The sweep really does desynchronise on these images** - measured against
+        `.pdata` as 2,617 to 3,221 independent checkpoints per build, it decodes straight
+        through 2 or 3 of them, always in one small region. Everything else starts at a
+        known function entry and so cannot be misaligned.
+
+        That matters in one direction only. Finding an instruction is safe from any pass,
+        because a spurious one merely gives the scan another place to look. *Dismissing* a
+        byte-anchored candidate as the shadow of an instruction covering its bytes is not:
+        if that instruction came from a desynchronised sweep, the dismissal is worthless.
+        So dismissal uses the trusted map. Measured before the change, no candidate on any
+        of the ten builds relied on the sweep for its dismissal - so this costs nothing
+        here and stops the question arising.
         """
         found = {}
 
@@ -290,13 +302,10 @@ class PE:
 
         for _b, _e, insns in self.functions():
             absorb(insns)
-        for _s, insns in self.sweep_code():
-            absorb(insns)
+        if not trusted_only:
+            for _s, insns in self.sweep_code():
+                absorb(insns)
 
-        # Exports are authoritative entry points and the recursive pass would otherwise
-        # miss a leaf reachable only through one: such a function has no .pdata record and
-        # no in-image direct call or jmp naming it, so call targets alone never decode
-        # from its real entry.
         seeds = set(self.exports().values())
         for _s, insns in self.sweep_code():
             seeds |= self.call_targets(insns)
@@ -617,7 +626,7 @@ def privileged_instructions(pe):
 
 
 def covered_bytes(pe, aligned):
-    """Bitmap of bytes lying inside some instruction a decoder placed at a boundary.
+    """Bitmap of bytes lying inside some instruction from a *trusted* boundary.
 
     The discriminator for every "could something hide here?" question this scan faces: a
     candidate whose bytes are all covered is a misreading of the instruction covering them,
@@ -659,7 +668,7 @@ def debug_immediates(pe):
     # misreading of anything, it is unexamined code. So split them. A candidate every one
     # of whose bytes lies inside some aligned instruction is a shadow of that instruction
     # and is dismissible on evidence; anything else is a residual the verdict has to carry.
-    covered = covered_bytes(pe, aligned)
+    covered = covered_bytes(pe, pe.aligned_instructions(trusted_only=True))
     shadowed, unexamined = [], []
     for t in pe.immediate_sites(DEBUG_CODES, match=hypercall_input_code):
         if t[0] in aligned:
@@ -903,7 +912,7 @@ def scan_image(path, sympath, show_coverage=False):
     passes, union = privileged_instructions(pe)
     print('  privileged instructions (vmcall/vmmcall/rdmsr/wrmsr): %d' % len(union))
     raw_shadowed, raw_unexamined = [], []
-    _cov = covered_bytes(pe, pe.aligned_instructions())
+    _cov = covered_bytes(pe, pe.aligned_instructions(trusted_only=True))
     for rva, name in sorted(passes['raw_only']):
         width = 3 if name in ('vmcall', 'vmmcall') else 2
         span = range(rva, min(rva + width, len(_cov)))
