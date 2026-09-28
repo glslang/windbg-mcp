@@ -13,8 +13,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bench**, which is what turns S5f's "VTL1 runs too rarely to catch" into a map rather than a
   shrug. Gate S5g, run with the operator's authorisation to reconfigure and reboot the VBS guest.
   **Credential Guard: closed by edition** — `LsaCfgFlags`, the DeviceGuard scenario key and
-  `EnableVirtualizationBasedSecurity` all set, two reboots, `SecurityServicesRunning` still `2` and
-  no DeviceGuard events, because the guest is **Windows 11 Pro** and CG needs Enterprise/Education.
+  `EnableVirtualizationBasedSecurity` all set, **Secure Boot `On` for both reboots** (it is a
+  documented CG prerequisite, and this gate turns it off only later), `SecurityServicesRunning` still
+  `2` and no DeviceGuard events — because Microsoft's edition table reads *Windows Pro: **No***, and
+  this guest is `Windows 11 Pro`. Review proposed that current Pro releases support it; the table is
+  why that is declined. Note also that `LsaCfgFlags = 1`, which is what was set, is *enabled **with**
+  UEFI lock* and `2` is without: a repeat on an eligible edition should use `2`, and a VM's CG is
+  disableable from the host with `Set-VMSecurity -VirtualizationBasedSecurityOptOut $true`.
   **Writing a trustlet: closed by signing policy** — IUM wants a Microsoft certificate with the IUM
   EKU plus membership in Secure Kernel's identity list, and test-signing is deliberately not
   honoured there; patching that list from the root was raised and declined, being a HyperGuard
@@ -36,11 +41,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The lab guests were reachable the whole time, which retires a limitation stated three times and
   turns the stop's evidence from 40× into 23,854×.** Gate S5f. *"Neither guest answers ICMP or
   WinRM, so there is no way to load them from outside"* equated **no network path** with **no guest
-  access**; **PowerShell Direct** needs neither, only the VMBus and guest credentials, and reaches
-  both. Two results follow. **The register interface is live** — under a user-mode spin, 110,638
+  access**; **PowerShell Direct** needs no network path and no WinRM — it wants a running Windows
+  guest, Hyper-V administration on the host, the VMBus and guest credentials — and reaches
+  both. Two results follow. **The register interface is live for VTL0** — under a user-mode spin, 110,638
   samples per VP return **6,675 / 6,603 distinct** VTL0 `RIP` values, **88%** of them ring-3, so the
-  parent-side reads every S5c figure rests on sample the running processor rather than a cached exit
-  record; the idle constant was the idle loop. And **the stop measured against a busy guest** reads
+  parent-side reads sample the running processor rather than a cached exit record; the idle constant
+  was the idle loop. **That validation is VTL0-only**, since the spin ran there and every sample is a
+  VTL0 `RIP`: a live VTL0 read is compatible with an inactive VTL1 query returning saved context, so
+  S5c's and S5e's *VTL1* readings rest on an instrument checked for the other VTL — raised in review,
+  and it needs a workload that demonstrably moves VTL1, which S5g could not produce. And **the stop measured against a busy guest** reads
   19,512,433 → **818** → 19,447,557 per 2000 ms, before and after within 0.3% of each other, with
   both VPs dropping together on the all-VP arm (7,290,238 → 319, 7,300,560 → 269). What driving the
   guests did **not** settle: `ActiveVtl = 1` is still unobserved across **832,560+** samples now

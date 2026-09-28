@@ -3028,9 +3028,13 @@ validated. The full record is the
   and gives no consumer rule at all, three attempts at one having been three review findings.
 - **S5f, 2026-09-28: the guests were reachable the whole time, over PowerShell Direct.** "Neither
   guest answers ICMP or WinRM, so there is no way to load them" appeared three times in the record
-  and equated *no network path* with *no guest access*; `Invoke-Command -VMName` needs neither,
-  only the VMBus and guest credentials. Three things follow, and only the first two are results.
-  **The register interface is live** — under a user-mode spin, 110,638 samples per VP return
+  and equated *no network path* with *no guest access*; `Invoke-Command -VMName` needs no network
+  path and no WinRM, wanting a running Windows guest, Hyper-V administration on the host, the VMBus
+  and guest credentials. Three things follow, and only the first two are results.
+  **The register interface is live for VTL0** (and only VTL0: the spin ran there, every sample is a
+  VTL0 `RIP`, and a live VTL0 read is compatible with an inactive VTL1 query returning saved
+  context — so the VTL1 readings rest on an instrument validated for the other VTL) — under a
+  user-mode spin, 110,638 samples per VP return
   **6,675 / 6,603 distinct** VTL0 `RIP`s, **88%** of them ring-3, so S5c's whole instrument samples
   the running processor rather than a cached exit record, which nothing had checked. **The stop,
   measured on a busy guest, is 23,854×** — 19,512,433 → **818** → 19,447,557 per 2000 ms, before
@@ -3048,8 +3052,10 @@ validated. The full record is the
 - **S5g, 2026-09-28: three routes to VTL1 occupancy, all closed on this bench.** Run with the
   operator's authorisation to reconfigure and reboot the VBS guest. **Credential Guard** is closed
   by **edition** — `LsaCfgFlags`, the DeviceGuard scenario key and `EnableVirtualizationBasedSecurity`
-  all set, two reboots, `SecurityServicesRunning` still `2` and no DeviceGuard events, because the
-  guest is **Windows 11 Pro** and CG needs Enterprise/Education. **Writing a trustlet** is closed by
+  all set, **Secure Boot `On` for both reboots** (a documented CG prerequisite, disabled only later
+  for the enclave route, so not a confounder), `SecurityServicesRunning` still `2` and no DeviceGuard
+  events — because Microsoft's edition table reads *Windows Pro: **No***. `LsaCfgFlags = 1` is
+  *enabled with UEFI lock*; `2` is without, and a repeat on an eligible edition should use `2`. **Writing a trustlet** is closed by
   signing policy: IUM needs a Microsoft certificate with the IUM EKU plus membership in SK's
   identity list, and test-signing is deliberately not honoured there. **A VBS enclave** is the live
   one and it is *nearly* there: `CreateEnclave` with the debug flag succeeds every run, and

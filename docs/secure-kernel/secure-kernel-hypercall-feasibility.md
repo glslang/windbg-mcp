@@ -2480,7 +2480,15 @@ sustained user-mode spin driven through PowerShell Direct:
 | user-mode `RIP`s | **87.9%** | **88.2%** |
 
 A read that returns ring-3 addresses 88% of the time while the guest spins in ring 3, across
-thousands of distinct values, is sampling the processor and not a cached exit record. **The idle
+thousands of distinct values, is sampling the processor and not a cached exit record — **for VTL0,
+which is the only VTL this experiment varied.** The spin ran in VTL0 and every sample above is a
+VTL0 `RIP`, so it establishes that the *VTL0* read is live and says nothing about the VTL1 one: a
+live VTL0 read is perfectly compatible with an inactive VTL1 query returning saved context, which
+is what the next section's `ActiveVtl = 0` result would predict. The only VTL1 movement this record
+has seen is `RIP` going `…0035` → `…0003` across one suspend cycle, which fits both readings.
+**So S5c's and S5e's VTL1 readings rest on an instrument validated for VTL0 and not for VTL1**, and
+validating it there needs a workload that demonstrably moves VTL1 — the thing S5g could not
+produce. **The idle
 constant was the idle loop, not a stale read** — and S5c's readings rest on an instrument that has
 now been checked rather than assumed.
 
@@ -2551,9 +2559,31 @@ The cheapest workload is the trustlet already present. `LsaCfgFlags = 1` did not
 `HKLM\SYSTEM\CurrentControlSet\Control\DeviceGuard\Scenarios\CredentialGuard\Enabled = 1` and
 `EnableVirtualizationBasedSecurity = 1` went in beside it. **Two reboots, and
 `SecurityServicesRunning` stayed `2`** — HVCI alone, no Credential Guard, and not one event in
-`Microsoft-Windows-DeviceGuard/Operational` to explain it. The explanation is the edition:
-**`Windows 11 Pro`**, and Credential Guard needs Enterprise or Education. Not a configuration
-problem, so no configuration fixes it.
+`Microsoft-Windows-DeviceGuard/Operational` to explain it.
+
+**The explanation is the edition, and it is cited rather than asserted.** Microsoft's Credential
+Guard documentation carries an edition table — *Windows Pro: **No**, Windows Enterprise: Yes,
+Windows Pro Education/SE: No, Windows Education: Yes* — and this guest is `Windows 11 Pro`
+(`EditionID` `Professional`, build 26200). Not a configuration problem, so no configuration fixes
+it. **Review proposed that current Pro releases do support it; the table is why that is declined.**
+The nearest true statement in the same document is that a Pro device *previously* running
+Credential Guard — downgraded from Enterprise — can retain it, which is a legacy state rather than
+support, and this guest shows none of it.
+
+**Secure Boot was `On` for both of those reboots**, which matters because Secure Boot is a
+documented Credential Guard prerequisite and this record later turns it **off** for the enclave
+route. Raised in review as a confounder and it is not one: the ordering was two Credential Guard
+reboots with Secure Boot on, *then* the enclave work that disabled it. The prerequisite was met and
+the activation still did not happen.
+
+**And the value used carries a UEFI lock, which a draft of this section called reversible.**
+Microsoft documents `LsaCfgFlags` `1` as *enabled with UEFI lock* and `2` as *enabled without
+lock*, with the locked form removable only through an `SecConfig.efi` boot-sequence procedure that
+requires physical presence. `1` is what went onto this guest. Credential Guard never activated, so
+no lock is expected to have been established — but **a repeat on an eligible edition must use `2`**,
+and the escape hatch for a VM is worth recording beside it: the same documentation says a virtual
+machine's Credential Guard can be disabled from the host with
+`Set-VMSecurity -VMName <n> -VirtualizationBasedSecurityOptOut $true`.
 
 #### Route 2 — writing a trustlet: closed by signing policy
 
