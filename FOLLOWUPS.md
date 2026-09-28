@@ -2980,8 +2980,9 @@ validated. The full record is the
   arbitrary point, found by polling. `ActiveVtl` read `0` in all 80 read-only samples and in every
   arm, so Secure Kernel was never caught executing.
 - **What is genuinely new is the inspector, it must halt *every* VP, and the whole of it has now
-  run as one thing.** Stop the guest, read VTL1 registers (H3) and VTL1 memory by the direct route
-  (H4), resume. One halted VP brackets per-VP register reads and does **not** make memory
+  run as one thing.** Stop the guest, read VTL1 registers (H3) and VTL1 memory by **whichever of
+  the two routes serves each page** (H4's direct route alone returns a zero page for the very
+  address S5e walked to), resume. One halted VP brackets per-VP register reads and does **not** make memory
   consistent — a second VP goes on running Secure Kernel and mutating the page tables a walk reads,
   which is S4's "identical only at the instant of the first read" arriving on the read side.
   `s5d.py` drives `h3probe.sys` and LiveCloudKd's `hvmm.sys` in one process, with the SDK's own
@@ -3019,9 +3020,12 @@ validated. The full record is the
   **VTL0**-labelled `RIP`/`RSP` came back as the VTL1 values 8/8 — but **every** reading in the
   gate was taken with `VsmVpStatus.ActiveVtl = 0`, and a sampler that took 8,000 reads across both
   VPs with no delay caught `ActiveVtl = 1` **zero** times. The halt with Secure Kernel actually
-  executing is unmeasured and unreachable from this bench. Anything built on the halted registers
-  reads `ActiveVtl` and checks it is zero; the record deliberately states an observation with its
-  condition rather than a rule, because two attempts at a rule were two review findings.
+  executing is unmeasured and unreachable from this bench. **And the condition cannot be enforced
+  with what this gate has**: reading `ActiveVtl` before the suspend races entry into VTL1, and
+  reading it after depends on the suspension preserving it — which is the same unresolved question
+  as the VTL0-labelled `RIP` reading as VTL1's. There is no atomic stop-and-observe here, so the
+  condition is reportable and not checkable. The record states the observation with its condition
+  and gives no consumer rule at all, three attempts at one having been three review findings.
 - **The debugger half is back to S5b's leftover**: whether a partition-scoped intercept fires for
   VTL1 execution, which is still the only candidate that could stop at a *chosen* point, and still
   needs a receiver.
