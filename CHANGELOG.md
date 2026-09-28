@@ -16,8 +16,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   pass condition — a stop at a chosen point, delivered — is untouched.
   `FOLLOWUPS.md` item 103's gate S5c: `HvCallSetVpRegisters` (`0x0051`) writing
   `HvRegisterExplicitSuspend`, from the root partition, with no guest-side code, no exception, no
-  intercept and no port. Stop the VP (S5c), read VTL1 registers (H3) and VTL1 memory by the direct
-  route (H4), resume. **A status is not a stop, so the stop is measured separately**:
+  intercept and no port. Stop every VP (S5c), read VTL1 registers (H3) and VTL1 memory by
+  **whichever of H4's two routes serves each page** — the direct one alone returns an all-zero page
+  for the address S5e walked to — resume. **A status is not a stop, so the stop is measured
+  separately**:
   `HvRegisterVpRuntime` counts executed time and is read-only, and it reads **430** (VTL0 control)
   and **1,032** (VTL1 test) per 2000 ms while suspended against an idle band of **41,291–84,075**,
   with a three-sample no-suspend null model beside it — because a first attempt at a 60 ms window
