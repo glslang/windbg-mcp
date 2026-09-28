@@ -9,6 +9,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A parent may install an exception intercept on a child partition, and may not aim one at that
+  child's VTL1.** `FOLLOWUPS.md` item 103's gate S5b, which is the candidate S5a left standing: a
+  VTL1 stop driven from the root through `HvCallInstallIntercept` (`0x004D`), the primitive Secure
+  Kernel itself issues from `ShvlInstallExceptionIntercept`. The install half works — from the root
+  partition an exception intercept goes onto a running child and comes off again, `SUCCESS` both
+  ways on both lab guests, with the negative controls refusing (`INVALID_PARAMETER` for a bad
+  intercept type or access mask) so that success means something. The aiming half does not exist:
+  the TLFS documents the whole 0x18-byte input block — `PartitionId`, `AccessType`, `InterceptType`,
+  `InterceptParameter` — and `HV_INTERCEPT_PARAMETERS`' exception member is a bare `UINT16
+  ExceptionVector`, with no VTL field and no reserved one; both known callers write exactly those
+  bytes — the 26100.9457 Secure Kernel sample and the host's own `winhvr.sys`, neither of them the
+  guests' running SK — read once with capstone and once with Ghidra because a published field layout
+  should not rest on one tool. Live, the union's six spare bytes and eight bytes appended past the block
+  are accepted **identically on the child with no VTL1 at all**, and declaring them as a
+  variable-sized header is refused with `INVALID_HYPERCALL_INPUT`, so there is no extended form
+  either. **S5's pass condition is untouched** — a VTL1 execution stop delivered to a debugger — and
+  what this closes is the second of its two named routes. It also corrects the plan: SK issues
+  intercept type **3** (`HvInterceptTypeException`) with access mask 4, not "intercept type 4"; the
+  two are adjacent dwords.
+- **What makes that a reading rather than a hopeful one is a control that failed first.** The gate's
+  first run chose exception vector `0x1F` so that an install could intercept nothing — Intel reserves
+  it and no hardware raises it — and every arm came back `INVALID_PARAMETER`, baseline included,
+  which reads exactly like a clean negative about VTL1 and is a statement about the vector. The
+  script now *discovers* a vector the hypervisor accepts, on the guest with no VTL1, before any arm
+  that claims to be about VTL1 runs; `0x05` (#BR) is architectural and unreachable in long mode,
+  which is what `0x1F` was meant to be. And "accepted" reads as "not a VTL selector" only because
+  the same run shows what a field the hypervisor *does* read per VTL does on that control guest:
+  `HvCallGetVpRegisters` with `TargetVtl = 1` is refused there and succeeds on the VTL1 guest. That
+  contrast also names the next gate, which is not an intercept — the three suspend registers
+  (`HvRegisterExplicitSuspend`, `HvRegisterInterceptSuspend`, `HvRegisterDispatchSuspend`) are
+  readable from the parent at VTL1 on the VBS guest and refused at VTL1 on its twin, so a stop
+  needing no exception and no guest-side code is at least nameable per VTL. Whether it is
+  *writeable* is the open question, and S4 is why the read does not answer it.
 - **The hypervisor's VTL1 debug port and Secure Kernel shipping no KD transport turn out to be one
   fact, and `tools/sk_hypercall_scan.py` is how that was established.** `FOLLOWUPS.md` item 103's
   gate S5a. The record held the two apart: the hypervisor's root VTL1 debug context is live — active

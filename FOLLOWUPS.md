@@ -2892,14 +2892,17 @@ on the live trace in the validation record.
 
 **And the mechanism to try is named rather than hypothetical, because Secure Kernel uses it.**
 `ShvlInstallExceptionIntercept` (+`0x092C4C` in 26100.9457) issues **`HvCallInstallIntercept`
-(`0x004D`)** with intercept type 4 and a 0x18-byte parameter block, and registers the vector in a
+(`0x004D`)** with intercept type **3** — `HvInterceptTypeException`; 4 is the *access* mask,
+`EXECUTE`, and this line had the two adjacent dwords the wrong way round until S5b read the block
+against the TLFS — and a 0x18-byte parameter block, and registers the vector in a
 bitmask afterwards — so exception interception is a real hypervisor primitive with a VTL1 caller on
 this very build. SK aims it at VTL0. **The S5 question is whether a parent partition can aim the
 same primitive at a child's VTL1**, which would deliver a `#BP` to the root instead of to SK's own
 dispatcher — the missing catch half, on a route that needs nothing from SK. Unmeasured, and the
 obvious hazard is that `HvCallInstallIntercept` may be partition-scoped with no VTL parameter to ask
 with, which is exactly how `HvCallReadGpa` failed in H4. Test the *install* on its own, against a
-VTL0 control, before anything is patched.
+VTL0 control, before anything is patched. **Run on 2026-09-28 as S5b, below: the hazard was the
+answer.**
 
 - **Do not** re-run S5a, and **do not** go looking for a differently-spelled KD transport in
   `securekernel.exe`. The scan is over the whole image, not over a name.
@@ -2913,6 +2916,39 @@ VTL0 control, before anything is patched.
   breakpoints stay excluded until **route-specific trap delivery** is demonstrated.
 - **Do not** plant an `int 3` in VTL1 to test S5 itself. Without a delivered trap it bugchecks the
   guest and is a plausible SKPG trip; S4 having shown the write lands is not a reason to use it.
+
+#### S5b — **RUN 2026-09-28: the install works on a child, and cannot name a VTL. Do not repeat**
+
+**The hazard the S5a section named is the result.** `HvCallInstallIntercept` is partition-scoped
+with no VTL parameter to ask with — the TLFS documents the whole 0x18-byte block
+(`PartitionId`, `AccessType`, `InterceptType`, `InterceptParameter`), `HV_INTERCEPT_PARAMETERS`'
+exception member is a bare `UINT16 ExceptionVector`, and both known callers write exactly that —
+the 26100.9457 SK sample and this host's `winhvr.sys`, neither of them the guests' running SK —
+read once with capstone and once with Ghidra. Live, from the root: a parent **can** install an
+exception intercept on a child and remove it — `SUCCESS` on both guests, teardown clean — and every
+byte put where a VTL might hide (the union's six spare bytes, eight bytes past the block) is
+accepted **identically on the child with no VTL1**, while a variable-header declaration is refused
+outright, so there is no extended form either. The full record, with the arm table, is the
+[S5b result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+
+- **The control is what makes it readable, and the first run had none that worked.** Vector `0x1F`
+  was picked because no hardware raises it; the hypervisor refuses it as `INVALID_PARAMETER`, every
+  arm including the baseline failed the same way, and that reads exactly like a clean negative about
+  VTL1. The script now *discovers* an accepted vector on the VTL0-only guest before any VTL arm
+  runs — `0x05` (#BR), architectural and unreachable in long mode.
+- **Do not** re-run S5b, and **do not** re-test the spare bytes: the same acceptance on a partition
+  with no VTL1 is what settles them, and that control has been taken.
+- **Still not delivery.** S5's pass condition is untouched. Whether an intercept installed *without*
+  asking fires for VTL1 execution is unmeasured and is the interesting remainder — it needs a VTL1
+  exception and somewhere to watch delivery, and this run holds no intercept port.
+- **The next candidate is measured rather than guessed, and it is not an intercept.**
+  `HvRegisterExplicitSuspend`, `HvRegisterInterceptSuspend` and `HvRegisterDispatchSuspend` read
+  from the parent at **both VTL0 and VTL1** on the VBS guest and are refused at VTL1 on the twin
+  with no VTL1 — the `TargetVtl` field discriminating exactly as it does for `CR3` in H3. So the
+  next gate is `HvCallSetVpRegisters` (`0x0051`) against a child's VTL1 suspend register, with the
+  VTL0 control beside it. **Read S4 before running it**: read and write disagreed about VTL1 there,
+  so the read above is not the answer. And unlike every arm in S5b, it *stops a running guest's
+  VP* — write the recovery down before, not after.
 
 ### Out of scope, with the reason rather than as a list
 
@@ -2939,7 +2975,11 @@ VTL0 control, before anything is patched.
    2026-09-27 not its *transport* either: **S5a settled why SK does not connect to the port, which
    is that it has nothing to connect with.** No debug hypercall, no `vmcall`, no SynDbg MSR, across
    ten builds. So the remaining unknown is narrower and differently shaped — whether a VTL1 stop can
-   be driven from the hypervisor or the root *without* guest-side code. Still decides inspector
+   be driven from the hypervisor or the root *without* guest-side code. **S5b has now closed the
+   named candidate for that too**: a parent can install an exception intercept on a child and has no
+   field to aim one at a VTL, so the route runs through `HvCallSetVpRegisters` against a child's
+   VTL1 suspend registers — readable there, writeability unmeasured — rather than through
+   interception. Still decides inspector
    versus debugger, and still the one that would change the shape of S3's tool surface rather than
    its contents. **That surface now exists**, so the change is to something built rather than to a
    design: a capture session is a fixed snapshot whose whole decode travels with the open, and
