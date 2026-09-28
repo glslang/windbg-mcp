@@ -2987,7 +2987,8 @@ validated. The full record is the
   `s5d.py` drives `h3probe.sys` and LiveCloudKd's `hvmm.sys` in one process, with the SDK's own
   freeze and pause **off** so the only stop is the measured one: both VPs halted (`SUCCESS`,
   runtimes 11,149 → 379 and 32,119 → 188), **3 of 3** VTL1 GPAs returning content while halted,
-  each read twice inside the halt and agreeing 3/3, with two of the three byte-identical to H4's
+  each read twice inside the halt and agreeing 3/3, with two of the three (across two boots,
+  so a recurring value rather than one state read twice) byte-identical to H4's
   recorded values. **Not** shown: that the halt was necessary — the same double reads while running
   were stable too, because an idle guest changes nothing and these guests cannot be loaded from
   this host.

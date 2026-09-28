@@ -2197,8 +2197,10 @@ model is.
 | `RSP` **during** the stop | `0xFFFFBF003EA2DEC8` | `0xFFFFBF003EA2DEC8` |
 | `RIP` after release | `0x00007FFFCDD94F2A` (user mode) | `0xFFFFF80609990003` |
 
-That VTL1 `CR3` is `0x1201000` — the landmark S0 recorded for this boot and H4 before it, arriving
-here from a third direction.
+That VTL1 `CR3` is `0x1201000`, which is the value S0 and H4 recorded **on the 2026-09-26 boot** —
+and this guest restarted on 2026-09-27, so it is the same *value* on a different boot rather than a
+third confirmation of one state. Worth having (the value recurs, and a halted read returns it) and
+not worth more than that; the S5e correction below is where that distinction is worked out.
 
 **The VTL1 context is real, and that needed its own control.** During the stop the VP's *own*
 `RIP` and `RSP` become the VTL1 values, which on its own is equally consistent with the read being
@@ -2298,7 +2300,8 @@ zero**, which is cheap, rather than inherit a rule from a document that only eve
   - **3 of 3** VTL1 GPAs that H4 established the direct route reaches returned content *while both
     VPs were halted* — `0x0C00000`, `0x3E00000`, `0x4800000` — and `0x3E00000`'s
     `ff01000000010000` and `0x4800000`'s `0000000000000060` are byte-identical to what H4 recorded
-    for them;
+    for them — **across two boots**, so that is a statement about those bytes recurring and not
+    about the two runs seeing one state;
   - each address was read **twice inside the halt** and agreed both times, 3/3, which is what
     "fixed source" has to mean.
 
@@ -2396,9 +2399,12 @@ walk could not start — and then step 4 walked it successfully out of entry 496
 entries describe user space; on this guest the first present entry is at index 262, byte offset
 `0x830`. **H4's table has the same artifact at 16 bytes**, which is where its "the VTL1 `CR3` page
 reads as zeros by both routes" came from, and that row has been corrected in place: read whole, the
-page carries **122 non-zero bytes and 26 present entries** — the same count of 26 that S0 recorded
-from the capture side of the same guest. A question H4 left open as "a limit of the mapping, a
-fallback, or genuinely zero" turns out to have been none of the three.
+page carries **122 non-zero bytes and 26 present entries**. S0 also counted 26 from the capture
+side, on the **earlier boot** — the same guest and not the same page table, so that is two boots
+agreeing on a count rather than one reading confirmed twice. What refutes the row needs neither:
+H4's own table puts that boot's first present entry at offset `0x850`, so its 16-byte probe read
+nothing but padding. A question H4 left open as "a limit of the mapping, a fallback, or genuinely
+zero" turns out to have been none of the three.
 
 The general form is worth stating because both instances were mine: **a prefix is not a page**, and
 a structure whose interesting entries are index-addressed will read as empty from any window that
