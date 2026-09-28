@@ -2991,6 +2991,18 @@ validated. The full record is the
   recorded values. **Not** shown: that the halt was necessary — the same double reads while running
   were stable too, because an idle guest changes nothing and these guests cannot be loaded from
   this host.
+- **"End to end" was still wrong, and S5e says how far it actually reaches.** Those three GPAs were
+  preselected, so they never tested whether the halted *registers* can drive the memory path. Taking
+  `CR3` from the halted VP and walking it through the direct route **works** — `PML4E[496]` →
+  `PDPTE[24]` → `PDE[76]` → `PTE[400]`, all present with sane flags — and the **leaf read returns
+  zeros** for the halted `RIP`'s page, with 1 of the 2 present PTEs in that page table returning
+  content. Registers ✔, page tables ✔, contents partial. Why some leaves read and others do not is
+  the next thing to settle.
+- **A correction to H4 fell out of it**: its "the VTL1 `CR3` page reads as zeros by both routes" is
+  a **16-byte prefix** of a page whose first present entry is at offset `0x830`. Read whole, it has
+  122 non-zero bytes and **26 present entries** — the same count S0 took from the capture side. The
+  table row is corrected in place, and the same trap caught this gate's own step 3 at 64 bytes.
+  **A prefix is not a page.**
 - **Do not** re-run S5c's controls; the suspend bit, the refusal code and the VP-wide scope are
   taken. **Do** read the record before building on the halted context, and note what it does *not*
   say: over eight halt cycles the VTL1 `RIP` equalled its own pre-halt value 8/8 while the
