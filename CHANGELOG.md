@@ -42,6 +42,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read side. Halting both VPs of the VBS guest was measured: `SUCCESS` on each, both runtimes
   frozen (995 and 299 per 2000 ms against 45,005 and 23,046 before, and 229,059 and 30,687 after,
   the first a catch-up burst from a guest that really had stopped), both released clean.
+- **The halted `CR3` walks VTL1's page tables, the leaves are only partly readable, and "end to
+  end" was wrong twice before that was measured.** Gate S5e: reading three GPAs preselected from
+  H4's table never tested whether the halted *register* context can drive the memory path, so `CR3`
+  was taken from the halted VP and walked through the direct route — `PML4E[496]` → `PDPTE[24]` →
+  `PDE[76]` → `PTE[400]`, every level present with sane flags (`0x63` = P\|RW\|A\|D, `0x121` =
+  P\|A\|G) — which reaches a physical address for a VTL1 **virtual** address. The leaf then reads
+  **zeros**, and a survey of that page table finds **2 present PTEs of which 1 returns content**.
+  So a live inspector stops the guest, reads VTL1 registers and walks VTL1's address space, and
+  cannot reliably read what the walk points at: three of four steps measured, the fourth partial
+  and unexplained.
+- **That run also corrected H4 and closed a question it had left open.** H4's table records the
+  VTL1 `CR3` page as reading "all zeros by both routes", flagged as "a limit of the mapping, a
+  fallback, or genuinely zero" and left unmeasured. It is none of the three: every cell in that
+  table is **16 bytes** from the start of a page whose first present entry sits at offset `0x830`,
+  because a PML4's low entries describe user space. Read whole, the page carries **122 non-zero
+  bytes and 26 present entries** — the same count S0 recorded from the capture side of the same
+  guest. The row is corrected in place. The same trap caught S5e's own precheck at 64 bytes before
+  the next step walked the page successfully: **a prefix is not a page.**
 - **And the inspector has now run as one thing rather than as two halves joined by an inference.**
   "End to end" originally composed S5c (halt the VPs, read *registers*) with H4 (read VTL1 *memory*
   on a guest nobody stopped), measured in different runs — which review caught. One process now

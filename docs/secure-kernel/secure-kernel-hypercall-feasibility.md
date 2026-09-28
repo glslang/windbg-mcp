@@ -675,6 +675,16 @@ page itself, which is the one a debugger would need first — still read as zero
 Whether that is a limit of `hvmm.sys`'s mapping, a fallback to the hypercall inside method 1, or
 genuinely zero memory is unmeasured, and it is the next thing to settle.
 
+> **Corrected 2026-09-28 by S5e: the `0x1201000` row above is an artifact of the sample size, and
+> the direct route reads that page fine.** Every cell in this table is **16 bytes** from the start
+> of the page, and a PML4's low entries describe user space, which is empty here. Read whole, the
+> page has **122 non-zero bytes and 26 present entries**, at indices 262, 272–287, 302, 316, 334,
+> 379, 382, 433, 463, 496 and 499 — the first of them at byte offset `0x830`, well past any
+> 16-byte window. The count matches the **26 present entries** S0 recorded for this guest from the
+> capture side. So the answer to "a limit of the mapping, a fallback, or genuinely zero" is *none
+> of the three*: it was a prefix being mistaken for a page. What the row says about `0x3600000`
+> stands unretested. See the S5e result for the walk this makes possible.
+
 **What this does to the route.** The backend table's pricing stands and its conclusion changes: the
 memory half needs the `vid.sys`/direct-mapping route that LiveCloudKd carries a driver for, and
 that route demonstrably works against a VBS guest. The register half is already granted and
@@ -2273,6 +2283,11 @@ zero**, which is cheap, rather than inherit a rule from a document that only eve
   neither answers ICMP or WinRM. So the composition is demonstrated and its *value* on a busy guest
   is still an argument from what a second VP can do rather than a measurement of it.
 
+  **And those three GPAs were preselected from H4's table, which review pointed out is not the
+  join**: reads of known-good addresses succeed whether or not the halted *register* context can
+  drive the memory path. The join is data flow — `CR3` taken from the halted VP, used to walk, to
+  reach a **virtual** address. That is the S5e result below, and it changes the claim again.
+
   **The "every VP" part is a correction from review, and it is the difference between a stop and a
   snapshot.** S5c's other arms halt VP 0 alone, and on a two-VP guest the second processor goes on
   executing Secure Kernel and mutating exactly the page tables and loader lists a VTL1 walk reads —
@@ -2288,6 +2303,61 @@ zero**, which is cheap, rather than inherit a rule from a document that only eve
   partition-scoped intercept fires for VTL1 execution. That is still the only route that could
   produce a stop *at a chosen point*, and it still needs a receiver.
 - **Breakpoints stay excluded**, unchanged.
+
+### S5e result, 2026-09-28: the halted `CR3` walks, the leaves are only partly readable
+
+**The join review asked for exists up to the page tables and stops at the contents.** Taking `CR3`
+from the halted VP and walking it through the direct route reaches a physical address for a VTL1
+*virtual* address — that is the register half driving the memory half, in one run, by data flow
+rather than by two experiments standing beside each other. Reading the page at the end of that walk
+is where it breaks: for the halted `RIP`'s own page, the bytes come back zero.
+
+With both VPs halted (runtimes 10,927 → 833 and 15,279 → 212), `ActiveVtl = 0`, VTL1 `CR3`
+`0x1201000` and VTL1 `RIP` `0xFFFFF80609990035`:
+
+| step | result |
+|---|---|
+| `PML4E[496]` @ `0x1201000` | `0x0000000001204063` — present, `0x63` = P\|RW\|A\|D |
+| `PDPTE[24]` @ `0x1204000` | `0x0000000001203063` — present |
+| `PDE[76]` @ `0x1203000` | `0x0000000001208063` — present |
+| `PTE[400]` @ `0x1208000` | `0x000000000081F121` — present, `0x121` = P\|A\|G |
+| the leaf, PA `0x81F035` | **zeros** |
+
+**A coherent four-level descent with sane flags is not something a broken read produces**, and the
+page tables it walks are VTL1's own — so the direct route reads VTL1 page tables while every VP is
+halted. Surveying the page table that serves that `RIP`: **2 present PTEs, of which 1 returns
+content**. So leaf pages are *partly* withheld from this route, `RIP`'s among the withheld, and the
+three GPAs S5d read are among the readable.
+
+#### The trap, which this gate walked into before walking out
+
+The run's own step 3 read **64 bytes** of the `CR3` page, found them zero, and printed that the
+walk could not start — and then step 4 walked it successfully out of entry 496. A PML4's low
+entries describe user space; on this guest the first present entry is at index 262, byte offset
+`0x830`. **H4's table has the same artifact at 16 bytes**, which is where its "the VTL1 `CR3` page
+reads as zeros by both routes" came from, and that row has been corrected in place: read whole, the
+page carries **122 non-zero bytes and 26 present entries** — the same count of 26 that S0 recorded
+from the capture side of the same guest. A question H4 left open as "a limit of the mapping, a
+fallback, or genuinely zero" turns out to have been none of the three.
+
+The general form is worth stating because both instances were mine: **a prefix is not a page**, and
+a structure whose interesting entries are index-addressed will read as empty from any window that
+does not cover them.
+
+#### What this leaves the inspector claim as
+
+- **Registers, halted: yes** (S5c). **Page tables, halted, from the halted `CR3`: yes** (here).
+  **Leaf contents: partial** — 1 of 2 present leaves in the one page table surveyed, and not the
+  one the instruction pointer needs.
+- So a live inspector can stop a guest, read VTL1 registers, and *walk* VTL1's address space, and
+  it cannot reliably read what the walk points at. **"End to end" is wrong** as this record used it
+  twice; the honest statement is that three of four steps are measured and the fourth is partial
+  and unexplained.
+- **Why the leaves differ is unmeasured.** Whether `0x81F000` is withheld by the hypervisor from
+  the root, unmapped in `hvmm.sys`'s view, or genuinely zero is exactly the question H4's corrected
+  row was thought to be, now relocated one level down. It is the next thing to settle, and this
+  time the sample size is not the explanation: the read was 32 bytes of a page reached by a walk,
+  and the neighbouring leaf read fine.
 
 ## Explicitly out of scope
 
