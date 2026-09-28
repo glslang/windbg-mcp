@@ -37,8 +37,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   drafts that phrased it as a rule were two review findings, because a rule invites a counterexample
   per unmeasured condition. `ActiveVtl = 1` is not merely unobserved: a sampler took **8,000 reads
   across both VPs with no delay and caught it zero times**, and neither lab guest can be made to run
-  VTL1 from this host. Anything built on the halted registers should read `ActiveVtl` and check it
-  is zero.
+  VTL1 from this host. And the condition cannot be **enforced** with these primitives: reading
+  `ActiveVtl` before the suspend races entry into VTL1, and reading it after depends on the
+  suspension preserving it, which is the same unresolved question as the VTL0-labelled `RIP`
+  reading as VTL1's. Reportable, not checkable — so the entry gives no consumer rule, three
+  attempts at one having drawn three review findings.
 - **A live inspector has to halt every VP, not one, and that is now the contract rather than a
   caveat.** One halted VP brackets per-VP *register* reads; it does not make *memory* consistent,
   because a second processor goes on running Secure Kernel and mutating the page tables and loader

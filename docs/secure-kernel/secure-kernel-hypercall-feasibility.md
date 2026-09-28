@@ -2248,8 +2248,19 @@ established is narrow and conditional:
 took **4,000 reads per VP with no delay — 8,000 in ~214 ms of wall time — and every one returned
 `ActiveVtl = 0`.** On an idle guest VTL1 runs too rarely to catch, and this bench cannot make it
 run: neither lab guest answers ICMP or WinRM, so there is no way to trigger the secure calls that
-would enter VTL1. Anything built on the halted registers should **read `ActiveVtl` and check it is
-zero**, which is cheap, rather than inherit a rule from a document that only ever saw that case.
+would enter VTL1.
+
+**A third attempt at telling a consumer what to do went the way of the first two, and there will
+not be a fourth.** It said to read `ActiveVtl` and check it is zero, which sounds cheap and does
+not establish the precondition: read *before* the suspend it races entry into VTL1, and read
+*after* it, whether it still reports the VTL that was active at the instant of the stop is the very
+thing the paragraph above leaves unresolved — the same suspension that makes the VTL0-labelled
+`RIP` read as VTL1's could be doing something to this register too, and nothing here says
+otherwise. **These primitives offer no atomic stop-and-observe**, so the condition this gate
+measured under cannot be *enforced* by anything it demonstrated, only reported. That is the state:
+the readings hold for `ActiveVtl = 0`, whether a given halt satisfies that is not decidable from
+here, and an implementer needs a measurement this bench could not take rather than a check this
+document invented.
 
 #### What S5c does not establish
 
@@ -2283,7 +2294,9 @@ zero**, which is cheap, rather than inherit a rule from a document that only eve
   every VP rather than one.** (*"End to end" was this bullet's original wording and is withdrawn —
   see the S5e result: the chain is measured on one virtual address, and each page needs a read
   route chosen for it.*)
-  Stop the guest (S5c), read VTL1 registers (H3) and VTL1 memory by the direct route (H4), resume —
+  Stop the guest (S5c), read VTL1 registers (H3) and VTL1 memory by **whichever of the two routes
+  serves each page** — the direct one alone returns a zero page for the very address S5e walked to
+  — resume —
   on a running guest, with no capture. S3's tool surface was shaped for a fixed snapshot because S0
   said most users would have one; this says a *live* source can be given the same shape, with the
   stop bracketing the reads.
