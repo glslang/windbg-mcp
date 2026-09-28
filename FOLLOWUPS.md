@@ -2935,7 +2935,12 @@ outright, so there is no extended form either. The full record, with the arm tab
   was picked because no hardware raises it; the hypervisor refuses it as `INVALID_PARAMETER`, every
   arm including the baseline failed the same way, and that reads exactly like a clean negative about
   VTL1. The script now *discovers* an accepted vector on the VTL0-only guest before any VTL arm
-  runs — `0x05` (#BR), architectural and unreachable in long mode.
+  runs — `0x05` (#BR): architectural, so the hypervisor takes it, and not raisable by these guests.
+  **That second half is measured on this bench and is not a property of long mode**: `BOUND` does
+  not decode in 64-bit mode but MPX's bound-check instructions raise #BR, and what makes the vector
+  inert here is that this host has no MPX (`CPUID.7.0:EBX` bit 14 = 0, and neither MPX state
+  component offered in `CPUID.D`). On MPX-capable hardware the arm needs a different vector or a
+  paused target.
 - **Do not** re-run S5b, and **do not** re-test the spare bytes: the same acceptance on a partition
   with no VTL1 is what settles them, and that control has been taken.
 - **Aiming is what is closed; scope is not, and the route stays open.** A draft of this block said
