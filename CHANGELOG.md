@@ -10,7 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **The root can halt a running guest's virtual processor and read that guest's VTL1 while it is
-  halted — so a live Secure Kernel inspector is feasible end to end, with no capture.**
+  halted — registers, page tables and page contents, with no capture.** The phrase this entry
+  first used, *"a live Secure Kernel inspector is feasible end to end"*, is **withdrawn**: S5e
+  measured the chain on a single virtual address, each page needed a route chosen for it, and S5's
+  pass condition — a stop at a chosen point, delivered — is untouched.
   `FOLLOWUPS.md` item 103's gate S5c: `HvCallSetVpRegisters` (`0x0051`) writing
   `HvRegisterExplicitSuspend`, from the root partition, with no guest-side code, no exception, no
   intercept and no port. Stop the VP (S5c), read VTL1 registers (H3) and VTL1 memory by the direct
@@ -47,11 +50,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   H4's table never tested whether the halted *register* context can drive the memory path, so `CR3`
   was taken from the halted VP and walked through the direct route — `PML4E[496]` → `PDPTE[24]` →
   `PDE[76]` → `PTE[400]`, every level present with sane flags (`0x63` = P\|RW\|A\|D, `0x121` =
-  P\|A\|G) — which reaches a physical address for a VTL1 **virtual** address. The leaf then reads
-  **zeros**, and a survey of that page table finds **2 present PTEs of which 1 returns content**.
-  So a live inspector stops the guest, reads VTL1 registers and walks VTL1's address space, and
-  cannot reliably read what the walk points at: three of four steps measured, the fourth partial
-  and unexplained.
+  P\|A\|G) — which reaches a physical address for a VTL1 **virtual** address. **The leaf reads
+  too, through the other route.** Censusing each page whole — 4,096 bytes, both routes — gives
+  PA `0x81F000` (the `RIP`'s leaf) **0** non-zero bytes by the direct route and **4,084** by the
+  hypercall, PA `0x3BE1000` **200** by the direct route and 0 by the hypercall, and the page table
+  itself 8 by the direct route and 0 by the hypercall. **Each page is readable by exactly one of
+  the two routes and which one differs per page**, so neither alone reads VTL1's address space and
+  a live inspector must try both per page. An earlier draft of this entry called the leaf
+  *withheld* on the strength of a 32-byte zero window — the same prefix mistake the entry below
+  documents, made one paragraph after documenting it.
 - **That run also corrected H4 and closed a question it had left open.** H4's table records the
   VTL1 `CR3` page as reading "all zeros by both routes", flagged as "a limit of the mapping, a
   fallback, or genuinely zero" and left unmeasured. It is none of the three: every cell in that

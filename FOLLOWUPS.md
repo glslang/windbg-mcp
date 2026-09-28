@@ -2991,13 +2991,16 @@ validated. The full record is the
   recorded values. **Not** shown: that the halt was necessary — the same double reads while running
   were stable too, because an idle guest changes nothing and these guests cannot be loaded from
   this host.
-- **"End to end" was still wrong, and S5e says how far it actually reaches.** Those three GPAs were
-  preselected, so they never tested whether the halted *registers* can drive the memory path. Taking
-  `CR3` from the halted VP and walking it through the direct route **works** — `PML4E[496]` →
-  `PDPTE[24]` → `PDE[76]` → `PTE[400]`, all present with sane flags — and the **leaf read returns
-  zeros** for the halted `RIP`'s page, with 1 of the 2 present PTEs in that page table returning
-  content. Registers ✔, page tables ✔, contents partial. Why some leaves read and others do not is
-  the next thing to settle.
+- **S5e joined the halves by data flow, and the answer is that the routes are complementary.**
+  Those three GPAs were preselected, so they never tested whether the halted *registers* can drive
+  the memory path. Taking `CR3` from the halted VP and walking it through the direct route
+  **works** — `PML4E[496]` → `PDPTE[24]` → `PDE[76]` → `PTE[400]`, all present with sane flags —
+  and the leaf reads too, **through the hypercall rather than the direct route**. Censused whole,
+  4,096 bytes each: the `RIP`'s leaf `0x81F000` gives 0 non-zero bytes direct and **4,084** by
+  hypercall; `0x3BE1000` gives 200 direct and 0 by hypercall; the page table itself 8 direct and 0
+  by hypercall. **Each page readable by exactly one route, and which one differs per page** — so a
+  live inspector tries both per page, and neither alone reads VTL1's address space. Which property
+  decides is unmeasured and is the open question.
 - **A correction to H4 fell out of it**: its "the VTL1 `CR3` page reads as zeros by both routes" is
   a **16-byte prefix** of a page whose first present entry is at offset `0x830`. Read whole, it has
   122 non-zero bytes and **26 present entries** — the same count S0 took from the capture side. The

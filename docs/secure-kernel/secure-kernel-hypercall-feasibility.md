@@ -2255,7 +2255,10 @@ zero**, which is cheap, rather than inherit a rule from a document that only eve
 
 #### What it changes downstream
 
-- **A live VTL1 *inspector* works end to end, and it has to halt every VP rather than one.**
+- **A live VTL1 *inspector* reaches registers, page tables and page contents, and it has to halt
+  every VP rather than one.** (*"End to end" was this bullet's original wording and is withdrawn —
+  see the S5e result: the chain is measured on one virtual address, and each page needs a read
+  route chosen for it.*)
   Stop the guest (S5c), read VTL1 registers (H3) and VTL1 memory by the direct route (H4), resume —
   on a running guest, with no capture. S3's tool surface was shaped for a fixed snapshot because S0
   said most users would have one; this says a *live* source can be given the same shape, with the
@@ -2325,9 +2328,30 @@ With both VPs halted (runtimes 10,927 → 833 and 15,279 → 212), `ActiveVtl = 
 
 **A coherent four-level descent with sane flags is not something a broken read produces**, and the
 page tables it walks are VTL1's own — so the direct route reads VTL1 page tables while every VP is
-halted. Surveying the page table that serves that `RIP`: **2 present PTEs, of which 1 returns
-content**. So leaf pages are *partly* withheld from this route, `RIP`'s among the withheld, and the
-three GPAs S5d read are among the readable.
+halted.
+
+**The leaf is not withheld — it is readable by the *other* route, which the first version of this
+section got backwards by reading 32 bytes and naming a cause.** Review caught that, and the census
+that answers it reads each page **whole, 4096 bytes, through both routes**:
+
+| page | direct (`hvmm`) | hypercall (`HvCallReadGpa`) |
+|---|---|---|
+| `PTE[400]` → PA `0x81F000` — the `RIP`'s own leaf | **0** non-zero bytes | **4,084** of 4,096 |
+| `PTE[378]` → PA `0x3BE1000` — the other present leaf | **200** non-zero | 0 |
+| PA `0x1208000` — the page table itself, as a control | **8** non-zero | 0 |
+
+**Each of the three pages is readable by exactly one of the two routes, and which one differs per
+page.** A page holding 4,084 non-zero bytes of 4,096 is what a code page looks like, so the halted
+`RIP` does point at content — reachable, through the route this gate had stopped using. The
+complementarity is the finding: **neither route alone reads VTL1's address space**, and H4's
+framing of the direct route as the one that "sees what the hypercall cannot" is true of the pages
+H4 sampled and false as a general rule.
+
+A hypothesis consistent with all of it, and **not** established here: the hypercall returns zeros
+for VTL1-*protected* pages (H4's `ReadIntercept` result) while `hvmm`'s mapping returns zeros for
+pages outside whatever physical ranges it maps, so a VTL1 address space — which maps both private
+and shared pages — needs both. Three pages is not a rule, and nothing here identifies which
+property decides.
 
 #### The trap, which this gate walked into before walking out
 
@@ -2347,17 +2371,17 @@ does not cover them.
 #### What this leaves the inspector claim as
 
 - **Registers, halted: yes** (S5c). **Page tables, halted, from the halted `CR3`: yes** (here).
-  **Leaf contents: partial** — 1 of 2 present leaves in the one page table surveyed, and not the
-  one the instruction pointer needs.
-- So a live inspector can stop a guest, read VTL1 registers, and *walk* VTL1's address space, and
-  it cannot reliably read what the walk points at. **"End to end" is wrong** as this record used it
-  twice; the honest statement is that three of four steps are measured and the fourth is partial
-  and unexplained.
-- **Why the leaves differ is unmeasured.** Whether `0x81F000` is withheld by the hypervisor from
-  the root, unmapped in `hvmm.sys`'s view, or genuinely zero is exactly the question H4's corrected
-  row was thought to be, now relocated one level down. It is the next thing to settle, and this
-  time the sample size is not the explanation: the read was 32 bytes of a page reached by a walk,
-  and the neighbouring leaf read fine.
+  **Leaf contents: yes, with the route chosen per page** — all three pages censused returned
+  content through one route or the other, and no page needed a route that does not exist.
+- So a live inspector can stop a guest, read VTL1 registers, walk VTL1's address space and read
+  what the walk points at — **provided it tries both read routes per page.** That last clause is
+  the whole of what this gate adds to the design, and it is not optional: on this sample, picking
+  either route alone would have read one page in three.
+- **What decides which route works is unmeasured**, and it is now the open question rather than
+  "why is this leaf withheld". Three pages, one page table, one guest, one boot.
+- **"End to end" still should not be used**, for a different reason than round four thought: the
+  chain is measured on a single virtual address, the pass condition for S5 is untouched, and the
+  step that would make it a debugger — a stop at a chosen point — remains missing.
 
 ## Explicitly out of scope
 
