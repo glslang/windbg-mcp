@@ -2197,9 +2197,25 @@ story — the read path is not simply returning VTL1 for everything.
 
 What is still *not* settled is which mechanism produces it: the VP parked at the VTL1 entry
 context, or the register path substituting VTL1's `RIP`/`RSP` while suspended. Both fit all eight
-cycles. **The consumer-facing consequence does not depend on which**: while a VP is halted this
-way, treat the VTL1 registers as VTL1's and do **not** treat the VTL0-labelled `RIP`/`RSP` as
-VTL0's.
+cycles.
+
+**This paragraph twice tried to end with a rule for consumers, and both attempts were findings**,
+so it ends with the observation and its condition instead. Every reading above — the 40-sample
+probe, the eight cycles, every suspended arm — was taken with **`VsmVpStatus.ActiveVtl = 0`**, and
+that is not a detail to file under limitations: the labels could behave differently when the halt
+catches a VP with Secure Kernel actually executing, and *nothing here says they do not*. So what is
+established is narrow and conditional:
+
+> **Measured, on this build, with `ActiveVtl = 0` at the halt:** the VTL1 `RIP` reads back its own
+> pre-halt value and the VTL0-labelled `RIP`/`RSP` read back the VTL1 values, 8 cycles of 8, with
+> `CR3` distinct throughout. **Unmeasured:** the same halt with `ActiveVtl = 1`.
+
+**And `ActiveVtl = 1` is not merely unobserved, it could not be reached from here.** A sampler
+took **4,000 reads per VP with no delay — 8,000 in ~214 ms of wall time — and every one returned
+`ActiveVtl = 0`.** On an idle guest VTL1 runs too rarely to catch, and this bench cannot make it
+run: neither lab guest answers ICMP or WinRM, so there is no way to trigger the secure calls that
+would enter VTL1. Anything built on the halted registers should **read `ActiveVtl` and check it is
+zero**, which is cheap, rather than inherit a rule from a document that only ever saw that case.
 
 #### What S5c does not establish
 
@@ -2207,9 +2223,11 @@ VTL0's.
   one. *A VTL1 execution stop delivered to a debugger* wants a stop **of VTL1**, at a chosen point,
   **reported** as an event. This is a stop of the whole VP, at an arbitrary point, discovered by
   polling. Two of the three are missing.
-- **Secure Kernel was never caught executing.** `VsmVpStatus.ActiveVtl` read `0` in every sample of
-  every arm — 80 read-only samples plus each suspended arm — so VTL1 was parked throughout. On an
-  idle guest VTL1 runs rarely, and nothing here made it run.
+- **Secure Kernel was never caught executing, and not for want of trying.** `VsmVpStatus.ActiveVtl`
+  read `0` in every sample of every arm, and a dedicated sampler took **8,000 reads across the two
+  VPs with no delay — ~214 ms of wall time — and caught `ActiveVtl = 1` exactly zero times.** On an
+  idle guest VTL1 runs too rarely to catch, and this bench cannot make it run, so *every* reading
+  in this gate is conditional on VTL1 being parked.
 - **Nothing is delivered.** There is no event, no message and no port: the stop is something the
   root does and then observes. A debugger's stop arrives; this one is taken.
 - **The suspend bit is measured, not documented.** No TLFS page this run could find publishes
