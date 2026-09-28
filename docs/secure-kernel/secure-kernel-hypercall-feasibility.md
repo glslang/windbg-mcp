@@ -2031,8 +2031,8 @@ above was installed for.
 
 **The second half of that choice — that the vector cannot fire — is retracted, and the reason is
 the shape of the search rather than any one counterexample.** Two review rounds each named a way
-#BR reaches a running x64 Windows guest, both correct: **MPX**'s bound-check instructions raise it
-on hardware that implements the feature, and the legacy `BOUND` still decodes in **32-bit
+that #BR reaches a running x64 Windows guest, both correct: **MPX**'s bound-check instructions raise
+it on hardware that implements the feature, and the legacy `BOUND` still decodes in **32-bit
 compatibility mode**, which is every WOW64 process on such a guest. A third exists without looking
 far — an explicit `int 5` delivers the vector as a software interrupt, and whether the hypervisor's
 *exception* intercept catches that is itself unmeasured here. Each round's fix was a longer
