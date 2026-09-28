@@ -2865,6 +2865,41 @@ post-26100 `securekernel.exe` ships no KD transport, every `Kd`-prefixed symbol 
 S5 should start by asking whether those are the same wall — a hypervisor port with nothing on the
 guest side to speak to it — rather than by re-running a completed experiment.
 
+#### S5a — **RUN 2026-09-27: they are the same wall. Do not repeat; S5 continues below it**
+
+**Secure Kernel contains no code that could speak to that port**, measured offline across ten
+builds from 19041.207 to 26100.9457 with `tools/sk_hypercall_scan.py`. The three debug hypercall
+codes are never written as values in any of them — every occurrence of `0x69`, `0x6A` or `0x6B` is
+a `cmp` in unrelated code — the enumerated hypercall repertoire (19–38 distinct codes per build,
+`0x0002`–`0x0103`) contains none of them, there is no `vmcall`/`vmmcall` instruction in any sample,
+and nothing touches the synthetic-debugger MSRs `0x400000F0`–`0x400000FF`. The positive control is
+`kdhvcom.dll`, Windows' own KD-over-hypervisor transport, which is those three hypercalls behind the
+five-function KD export contract and which the same scanner reads correctly. Full result, controls,
+and the three traps that each produced a wrong reading first — a sample whose *filename* silently
+defeats symbol resolution, a control code that is also the rep-count bound, and bug check codes
+being read as hypercall codes — are in
+[the feasibility record](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
+
+**What this closes is one route, not the gate.** S5's pass condition is untouched. The remaining
+candidate is the one that needs no guest-side code at all: a VTL1 stop driven entirely from the
+hypervisor or the root, which Secure Kernel neither cooperates with nor can refuse. **Start there**,
+and note that the receiver half was *not* re-derived statically — two attempts on `hvix64.exe` found
+the IDT and a page-table walk rather than the hypercall dispatch, so the hypervisor side still rests
+on the live trace in the validation record.
+
+**And the mechanism to try is named rather than hypothetical, because Secure Kernel uses it.**
+`ShvlInstallExceptionIntercept` (+`0x092C4C` in 26100.9457) issues **`HvCallInstallIntercept`
+(`0x004D`)** with intercept type 4 and a 0x18-byte parameter block, and registers the vector in a
+bitmask afterwards — so exception interception is a real hypervisor primitive with a VTL1 caller on
+this very build. SK aims it at VTL0. **The S5 question is whether a parent partition can aim the
+same primitive at a child's VTL1**, which would deliver a `#BP` to the root instead of to SK's own
+dispatcher — the missing catch half, on a route that needs nothing from SK. Unmeasured, and the
+obvious hazard is that `HvCallInstallIntercept` may be partition-scoped with no VTL parameter to ask
+with, which is exactly how `HvCallReadGpa` failed in H4. Test the *install* on its own, against a
+VTL0 control, before anything is patched.
+
+- **Do not** re-run S5a, and **do not** go looking for a differently-spelled KD transport in
+  `securekernel.exe`. The scan is over the whole image, not over a name.
 - **Do not** re-capture the activation return, and **do not** raise the reservation further. Both
   are done, and the record says the second is unsupported.
 - **Pass:** a VTL1 execution stop is delivered to a debugger.
@@ -2897,12 +2932,16 @@ guest side to speak to it — rather than by re-running a completed experiment.
    `symbol_for` work against `securekernel.exe` with no debuggee and the rebase onto S1's base is
    arithmetic in `src/sksym.rs`. What the answer *cost* is the half the question did not ask about:
    the public PDB carries **no types**, so "symbols and types" is one of the two.
-3. **S5's unresolved Secure Kernel *attachment*** — not its activation, which is done: the port is
-   up and SK does not connect to it. Decides inspector versus debugger, and is the one that would
-   change the shape of S3's tool surface rather than its contents. **That surface now exists**, so
-   the change is to something built rather than to a design: a capture session is a fixed snapshot
-   whose whole decode travels with the open, and execution state would make it neither. Independent
-   of the rest, so it can run in parallel or not at all.
+3. **S5's unresolved Secure Kernel *attachment*** — not its activation, which is done, and since
+   2026-09-27 not its *transport* either: **S5a settled why SK does not connect to the port, which
+   is that it has nothing to connect with.** No debug hypercall, no `vmcall`, no SynDbg MSR, across
+   ten builds. So the remaining unknown is narrower and differently shaped — whether a VTL1 stop can
+   be driven from the hypervisor or the root *without* guest-side code. Still decides inspector
+   versus debugger, and still the one that would change the shape of S3's tool surface rather than
+   its contents. **That surface now exists**, so the change is to something built rather than to a
+   design: a capture session is a fixed snapshot whose whole decode travels with the open, and
+   execution state would make it neither. Independent of the rest, so it can run in parallel or not
+   at all.
 4. **Build stability of the offsets, and the derivation that replaces them.** **Half-answered
    2026-09-27 by S2**: the PDB derives both offsets per build and agrees with the scan on this one,
    and it reaches `SkLoadedModuleList` directly where the scan cannot. What is *not* answered is the
