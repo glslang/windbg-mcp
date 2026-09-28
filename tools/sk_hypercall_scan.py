@@ -100,6 +100,27 @@ RAW_OPCODES = {b'\x0f\x01\xc1': 'vmcall', b'\x0f\x01\xd9': 'vmmcall',
                b'\x0f\x32': 'rdmsr', b'\x0f\x30': 'wrmsr'}
 PRIVILEGED = ('vmcall', 'vmmcall', 'rdmsr', 'wrmsr')
 
+
+def hypercall_input_code(imm):
+    """The control code in a hypercall input value, or None if it cannot be one.
+
+    A caller does not have to materialise a bare `0x69`: the ABI puts the control code in
+    bits 0-15 of one input value, with the fast flag at bit 16, the variable header size at
+    17-26, and the rep count at 32-43 - which is why the repertoire reading masks with
+    `& 0xFFFF`. An exact-equality test on the immediate therefore misses `0x00010069`, and
+    this file modelled that in one reading and not the other.
+
+    Masking alone is too loose, and measuring said so: across the ten samples it matches 0-5
+    further immediates per build, nearly all of them *branch targets* like `jmp 0x140060069`
+    where the value is a code address. So the reserved fields decide - bits 27-30, 44-47 and
+    60-63 are zero in any real input value - and the caller excludes control-transfer
+    operands, whose immediate is an address rather than data.
+    """
+    if (imm >> 60) or ((imm >> 44) & 0xF) or ((imm >> 27) & 0xF):
+        return None
+    code = imm & 0xFFFF
+    return code if code in DEBUG_CODES else None
+
 MD = Cs(CS_ARCH_X86, CS_MODE_64)
 MD.detail = True
 
@@ -272,7 +293,11 @@ class PE:
         for _s, insns in self.sweep_code():
             absorb(insns)
 
-        seeds = set()
+        # Exports are authoritative entry points and the recursive pass would otherwise
+        # miss a leaf reachable only through one: such a function has no .pdata record and
+        # no in-image direct call or jmp naming it, so call targets alone never decode
+        # from its real entry.
+        seeds = set(self.exports().values())
         for _s, insns in self.sweep_code():
             seeds |= self.call_targets(insns)
         for _b, _e, insns in self.functions():
@@ -294,7 +319,7 @@ class PE:
             seeds |= (self.call_targets(insns) - seen_seeds)
         return found
 
-    def immediate_sites(self, values, lookback=15, anchor_bytes=1):
+    def immediate_sites(self, values, lookback=15, anchor_bytes=1, match=None):
         """Every instruction anywhere in executable bytes carrying one of `values` as an
         immediate - anchored on the constant's own bytes, so no decode alignment can hide it.
 
@@ -334,10 +359,16 @@ class PE:
                             rva = ins.address - self.image_base
                             if not (rva <= s['vaddr'] + i < rva + ins.size):
                                 continue
+                            transfer = (ins.mnemonic.startswith('j')
+                                        or ins.mnemonic.startswith('loop')
+                                        or ins.mnemonic == 'call')
                             for op in ins.operands:
-                                if op.type == CS_OP_IMM and op.imm in candidates:
+                                if op.type == CS_OP_IMM and (
+                                        op.imm in candidates
+                                        or (match is not None and not transfer
+                                            and match(op.imm) in candidates)):
                                     out[(rva, ins.mnemonic, ins.op_str)] = (
-                                        rva, ins.mnemonic, ins.op_str, op.imm)
+                                        rva, ins.mnemonic, ins.op_str, op.imm, ins.size)
                                     break
         return sorted(out.values())
 
@@ -573,7 +604,31 @@ def privileged_instructions(pe):
             if ins.mnemonic in PRIVILEGED:
                 swept.add((ins.address - pe.image_base, ins.mnemonic))
     raw = {(rva, name) for _sec, rva, name in pe.raw_opcode_sites()}
-    return dict(declared=declared, swept=swept, raw=raw), declared | swept | raw
+    # The raw byte pass is sound for *absence* and must not be used as evidence of
+    # *presence*: `0F 01 C1` can sit inside an immediate or in embedded data, and counting
+    # such a match as a `vmcall` would let an image report a route it does not have, and
+    # let the positive control pass with no decoded hypercall in it. So presence comes from
+    # the decoders, and a raw-only hit is a candidate to go and look at - which is the one
+    # thing the raw pass is uniquely able to tell you, since it is what a desynchronised
+    # decode would have missed.
+    decoded = declared | swept
+    return (dict(declared=declared, swept=swept, raw=raw, raw_only=raw - decoded),
+            decoded)
+
+
+def covered_bytes(pe, aligned):
+    """Bitmap of bytes lying inside some instruction a decoder placed at a boundary.
+
+    The discriminator for every "could something hide here?" question this scan faces: a
+    candidate whose bytes are all covered is a misreading of the instruction covering them,
+    and one whose bytes are not is unexamined code. Used for the byte-anchored immediate
+    superset and for raw opcode matches alike, because the question is the same.
+    """
+    covered = bytearray(pe.size_of_image)
+    for rva, (_m, _o, _i, size) in aligned.items():
+        for k in range(rva, min(rva + size, len(covered))):
+            covered[k] = 1
+    return covered
 
 
 def debug_immediates(pe):
@@ -585,20 +640,33 @@ def debug_immediates(pe):
     written, compared = {}, {}
     aligned = pe.aligned_instructions()
     for rva, (mnem, ops, imms, _sz) in aligned.items():
+        transfer = mnem.startswith('j') or mnem.startswith('loop') or mnem == 'call'
         for imm in imms:
-            if imm in DEBUG_CODES:
+            hit = imm if imm in DEBUG_CODES else (
+                None if transfer else hypercall_input_code(imm))
+            if hit is not None:
                 key = (rva, '%s %s' % (mnem, ops))
-                (compared if mnem in ('cmp', 'test') else written)[key] = imm
+                (compared if mnem in ('cmp', 'test') else written)[key] = hit
                 break
     # The byte-anchored superset: every decoding at *any* offset, most of which are not
-    # instruction boundaries at all. Reported rather than used, because it cannot tell a
-    # real instruction from a misreading of the bytes before one - on 26100.9457 it turns
-    # 0 written into 61, all of them forms like `in al, 0x6b` and `enter -0x6e18, 0x6b`.
-    # What it is good for is bounding the claim: if it is empty, no alignment anywhere
-    # carries one of these values, and no argument about boundaries can be needed.
-    unaligned = [t for t in pe.immediate_sites(DEBUG_CODES)
-                 if t[0] not in aligned]
-    return written, compared, unaligned
+    # instruction boundaries at all - on 26100.9457 it turns 0 written into 61, forms like
+    # `in al, 0x6b` and `enter -0x6e18, 0x6b`. The same composed-value rule applies, or the
+    # superset would model a hypercall input value in the reading that decides and not in
+    # the one that bounds it.
+    #
+    # Reporting the whole superset and acting on none of it was the previous shape, and it
+    # left a real gap: a candidate sitting in bytes no aligned instruction covers is not a
+    # misreading of anything, it is unexamined code. So split them. A candidate every one
+    # of whose bytes lies inside some aligned instruction is a shadow of that instruction
+    # and is dismissible on evidence; anything else is a residual the verdict has to carry.
+    covered = covered_bytes(pe, aligned)
+    shadowed, unexamined = [], []
+    for t in pe.immediate_sites(DEBUG_CODES, match=hypercall_input_code):
+        if t[0] in aligned:
+            continue
+        span = range(t[0], min(t[0] + t[4], len(covered)))
+        (shadowed if all(covered[k] for k in span) else unexamined).append(t)
+    return written, compared, shadowed, unexamined
 
 
 def syndbg_immediates(pe):
@@ -834,24 +902,44 @@ def scan_image(path, sympath, show_coverage=False):
     # ---- reading A: sound over every executable byte
     passes, union = privileged_instructions(pe)
     print('  privileged instructions (vmcall/vmmcall/rdmsr/wrmsr): %d' % len(union))
+    raw_shadowed, raw_unexamined = [], []
+    _cov = covered_bytes(pe, pe.aligned_instructions())
+    for rva, name in sorted(passes['raw_only']):
+        width = 3 if name in ('vmcall', 'vmmcall') else 2
+        span = range(rva, min(rva + width, len(_cov)))
+        (raw_shadowed if all(_cov[k] for k in span) else raw_unexamined).append((rva, name))
+    if passes['raw_only']:
+        print('  raw opcode byte matches no decoder placed at a boundary: %d'
+              ' (%d shadowed by an instruction covering their bytes, %d unexamined)'
+              % (len(passes['raw_only']), len(raw_shadowed), len(raw_unexamined)))
+        for rva, name in raw_unexamined[:5]:
+            print('     UNEXAMINED %-8s +%06X' % (name, rva))
+    if raw_unexamined:
+        inconclusive.append('%d raw opcode byte match(es) in bytes no recognised'
+                            ' instruction covers' % len(raw_unexamined))
     print('     by pass: declared-functions %d, linear sweep %d, raw opcode bytes %d'
           % (len(passes['declared']), len(passes['swept']), len(passes['raw'])))
     for rva, name in sorted(union)[:12]:
         print('     %-8s +%06X' % (name, rva))
 
-    written, compared, unaligned = debug_immediates(pe)
+    written, compared, shadowed, unexamined = debug_immediates(pe)
     print('  0069/006A/006B at a recognised instruction boundary: %d written,'
           ' %d compared-only' % (len(written), len(compared)))
     for (rva, text) in sorted(written):
         print('     WRITTEN +%06X  %s' % (rva, text))
     print('  ... and at offsets no pass recognises as a boundary: %d candidate decoding(s)'
-          % len(unaligned))
-    for rva, mnem, ops, _imm in unaligned[:5]:
-        print('     unaligned +%06X  %s %s' % (rva, mnem, ops))
+          % (len(shadowed) + len(unexamined)))
+    print('        of which %d are shadows of an instruction that covers their bytes, and'
+          ' %d sit in bytes no recognised instruction covers' % (len(shadowed), len(unexamined)))
+    for rva, mnem, ops, _imm, _sz in unexamined[:5]:
+        print('     UNEXAMINED +%06X  %s %s' % (rva, mnem, ops))
+    if unexamined:
+        inconclusive.append('%d debug-code candidate(s) in bytes no recognised instruction'
+                            ' covers' % len(unexamined))
 
     syndbg_imm = syndbg_immediates(pe)
     print('  SynDbg MSR numbers (400000F0-FF) as an immediate anywhere: %d' % len(syndbg_imm))
-    for rva, mnem, ops, _imm in syndbg_imm[:8]:
+    for rva, mnem, ops, _imm, _sz in syndbg_imm[:8]:
         print('     +%06X  %s %s' % (rva, mnem, ops))
 
     syndbg, syndbg_unres = msr_sites(pe, SYNDBG_LO, SYNDBG_HI)
@@ -892,6 +980,12 @@ def scan_image(path, sympath, show_coverage=False):
                  len(roles['unresolved'])))
         print('  distinct control codes resolved: %d  (a heuristic lower bound, not the'
               ' verdict)' % len(codes))
+        if not codes:
+            # The repertoire exists to show the scan is not broken. If it recovered
+            # nothing, it has not done that, and a negative resting beside it is not
+            # supported whatever the other readings say.
+            inconclusive.append('the repertoire resolved no control code at all, so the'
+                                ' negative control did not run')
         residual['repertoire'] = unresolved + len(roles['unresolved'])
         line = ['%04X' % c for c in sorted(codes)]
         for i in range(0, len(line), 16):
@@ -930,12 +1024,14 @@ def scan_image(path, sympath, show_coverage=False):
         # and delete the reading rather than qualify it.
         print('  NO DEBUG HYPERCALL ROUTE VISIBLE TO THIS SCAN')
         print('     (across %d executable bytes: no debug code as an immediate at a'
-              ' recognised instruction boundary -- %d unaligned candidate(s) listed above'
-              ' -- no SynDbg MSR number as an immediate at any alignment, no vmcall/vmmcall)'
-              % (cov['executable'], len(unaligned)))
-        print('     residual: %d repertoire site(s) whose control code did not resolve,'
-              ' any of which could carry a value this scan does not read'
-              % residual['repertoire'])
+              ' recognised instruction boundary -- %d unaligned candidate(s), all shadows'
+              ' of instructions that cover their bytes -- no SynDbg MSR number as an'
+              ' immediate at any alignment, no vmcall/vmmcall)'
+              % (cov['executable'], len(shadowed)))
+        print('     residual: %d repertoire site(s) and %d rdmsr/wrmsr site(s) whose'
+              ' operand did not resolve, any of which could carry a value this scan does'
+              ' not read -- a constant in a data section is not an immediate in a code'
+              ' section' % (residual['repertoire'], len(syndbg_unres)))
 
     return dict(path=path, codes=sorted(codes), debug=hits, written=len(written),
                 privileged=len(union), syndbg=len(syndbg_imm), found=found,
@@ -953,7 +1049,7 @@ def scan_control(path):
     _passes, union = privileged_instructions(pe)
     print('  privileged instructions: %d  %s'
           % (len(union), ', '.join('%s@+%06X' % (m, r) for r, m in sorted(union))))
-    written, compared, _unaligned = debug_immediates(pe)
+    written, compared, _shadowed, _unexamined = debug_immediates(pe)
     distinct = sorted(set(written.values()))
     print('  0069/006A/006B as an immediate: %d written (%d distinct: %s), %d compared-only'
           % (len(written), len(distinct), ' '.join('%04X' % c for c in distinct), len(compared)))
