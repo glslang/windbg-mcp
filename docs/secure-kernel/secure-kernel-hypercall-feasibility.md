@@ -2309,11 +2309,14 @@ zero**, which is cheap, rather than inherit a rule from a document that only eve
 
 ### S5e result, 2026-09-28: the halted `CR3` walks, the leaves are only partly readable
 
-**The join review asked for exists up to the page tables and stops at the contents.** Taking `CR3`
-from the halted VP and walking it through the direct route reaches a physical address for a VTL1
-*virtual* address — that is the register half driving the memory half, in one run, by data flow
-rather than by two experiments standing beside each other. Reading the page at the end of that walk
-is where it breaks: for the halted `RIP`'s own page, the bytes come back zero.
+**The join review asked for runs the whole way, and it needs both read routes to do it.** Taking
+`CR3` from the halted VP and walking it through the direct route reaches a physical address for a
+VTL1 *virtual* address — the register half driving the memory half, in one run, by data flow rather
+than by two experiments standing beside each other — and the page at the end of that walk reads
+back the instruction the processor is parked on. **The direct route returns zeros for that leaf and
+the hypercall returns 4,084 non-zero bytes of it**, which is the shape of the whole result: the two
+routes are complementary and a reader who takes only the first will conclude the chain is broken
+where it is not.
 
 With both VPs halted (runtimes 10,927 → 833 and 15,279 → 212), `ActiveVtl = 0`, VTL1 `CR3`
 `0x1201000` and VTL1 `RIP` `0xFFFFF80609990035`:
@@ -2392,14 +2395,17 @@ a sentence in a document.
 #### What this leaves the inspector claim as
 
 - **Registers, halted: yes** (S5c). **Page tables, halted, from the halted `CR3`: yes** (here).
-  **Leaf contents: yes, with the route chosen per page** — all three pages censused returned
-  content through one route or the other, and no page needed a route that does not exist.
-- So a live inspector can stop a guest, read VTL1 registers, walk VTL1's address space and read
-  what the walk points at — **provided it tries both read routes per page.** That last clause is
-  the whole of what this gate adds to the design, and it is not optional: on this sample, picking
-  either route alone would have read one page in three.
-- **What decides which route works is unmeasured**, and it is now the open question rather than
-  "why is this leaf withheld". Three pages, one page table, one guest, one boot.
+  **Leaf contents: yes for the one address walked**, with the route chosen per page.
+- **What is measured is a chain, not a capability over the address space.** One virtual address —
+  the halted `RIP` — walked once, and three pages censused, each of which returned content through
+  one route or the other. That is a demonstration that the chain *can* complete; it is not evidence
+  that an arbitrary VTL1 address will, and it must not be read as one. **An untested page could be
+  unreadable by both routes**: `0x3600000` in H4's table is exactly such a page and remains
+  unretested, and what decides which route serves a given page is unknown, so there is no rule here
+  to predict from. Three pages, one page table, one guest, one boot.
+- **What the gate adds to the design is therefore narrow and firm**: an inspector must try *both*
+  routes per page, because on this sample either alone reads one page in three. What it must not
+  assume is that trying both always succeeds.
 - **"End to end" still should not be used**, for a different reason than round four thought: the
   chain is measured on a single virtual address, the pass condition for S5 is untouched, and the
   step that would make it a debugger — a stop at a chosen point — remains missing.
