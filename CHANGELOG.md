@@ -28,8 +28,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `RIP` equals its own pre-halt value **8/8** while the VTL0-labelled `RIP`/`RSP` come back as the
   VTL1 values **8/8** regardless of where VTL0 was — systematic, not coincidence, since the
   pre-halt VTL0 `RIP` took two distinct values across those cycles, and `CR3` stayed distinct 8/8.
-  The caution therefore lands on the **VTL0** read, not the VTL1 one: while halted, treat VTL1's
-  registers as VTL1's and the VTL0-labelled `RIP`/`RSP` as unusable.
+  **Every one of those readings was taken with `VsmVpStatus.ActiveVtl = 0`**, so the record states
+  them as an observation with that condition attached rather than as a rule for consumers — two
+  drafts that phrased it as a rule were two review findings, because a rule invites a counterexample
+  per unmeasured condition. `ActiveVtl = 1` is not merely unobserved: a sampler took **8,000 reads
+  across both VPs with no delay and caught it zero times**, and neither lab guest can be made to run
+  VTL1 from this host. Anything built on the halted registers should read `ActiveVtl` and check it
+  is zero.
 - **A live inspector has to halt every VP, not one, and that is now the contract rather than a
   caveat.** One halted VP brackets per-VP *register* reads; it does not make *memory* consistent,
   because a second processor goes on running Secure Kernel and mutating the page tables and loader

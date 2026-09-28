@@ -2992,11 +2992,14 @@ validated. The full record is the
   were stable too, because an idle guest changes nothing and these guests cannot be loaded from
   this host.
 - **Do not** re-run S5c's controls; the suspend bit, the refusal code and the VP-wide scope are
-  taken. **Do** read the record before building on the halted context: over **eight** halt cycles
-  the VTL1 `RIP` equalled its own pre-halt value 8/8 — stable, trustworthy — while the
-  **VTL0**-labelled `RIP`/`RSP` came back as the VTL1 values 8/8 regardless of where VTL0 actually
-  was. Treat the VTL1 registers as VTL1's and the VTL0 ones as unusable while halted; which
-  mechanism causes it is unsettled and does not change that rule.
+  taken. **Do** read the record before building on the halted context, and note what it does *not*
+  say: over eight halt cycles the VTL1 `RIP` equalled its own pre-halt value 8/8 while the
+  **VTL0**-labelled `RIP`/`RSP` came back as the VTL1 values 8/8 — but **every** reading in the
+  gate was taken with `VsmVpStatus.ActiveVtl = 0`, and a sampler that took 8,000 reads across both
+  VPs with no delay caught `ActiveVtl = 1` **zero** times. The halt with Secure Kernel actually
+  executing is unmeasured and unreachable from this bench. Anything built on the halted registers
+  reads `ActiveVtl` and checks it is zero; the record deliberately states an observation with its
+  condition rather than a rule, because two attempts at a rule were two review findings.
 - **The debugger half is back to S5b's leftover**: whether a partition-scoped intercept fires for
   VTL1 execution, which is still the only candidate that could stop at a *chosen* point, and still
   needs a receiver.
