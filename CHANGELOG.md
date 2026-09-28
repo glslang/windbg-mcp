@@ -25,7 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are accepted **identically on the child with no VTL1 at all**, and declaring them as a
   variable-sized header is refused with `INVALID_HYPERCALL_INPUT`, so there is no extended form
   either. **S5's pass condition is untouched** — a VTL1 execution stop delivered to a debugger — and
-  what this closes is the second of its two named routes. It also corrects the plan: SK issues
+  what this closes is *aiming*, not the route: with no selector in the ABI, an intercept is either
+  implicitly VTL0 or implicitly every VTL, and the second needs no selector because it would already
+  deliver a VTL1 exception to the parent. Which of those it is stays open and is now the cheapest
+  question in S5, needing no new primitive. It also corrects the plan: SK issues
   intercept type **3** (`HvInterceptTypeException`) with access mask 4, not "intercept type 4"; the
   two are adjacent dwords.
 - **What makes that a reading rather than a hopeful one is a control that failed first.** The gate's
@@ -37,7 +40,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is what `0x1F` was meant to be. And "accepted" reads as "not a VTL selector" only because
   the same run shows what a field the hypervisor *does* read per VTL does on that control guest:
   `HvCallGetVpRegisters` with `TargetVtl = 1` is refused there and succeeds on the VTL1 guest. That
-  contrast also names the next gate, which is not an intercept — the three suspend registers
+  contrast also names the *second* of S5's two remaining candidates — the three suspend registers
   (`HvRegisterExplicitSuspend`, `HvRegisterInterceptSuspend`, `HvRegisterDispatchSuspend`) are
   readable from the parent at VTL1 on the VBS guest and refused at VTL1 on its twin, so a stop
   needing no exception and no guest-side code is at least nameable per VTL. Whether it is

@@ -1917,9 +1917,15 @@ They agree with the six verified rows and are listed separately rather than coun
 root, `HvCallInstallIntercept` (`0x004D`) installs an exception intercept on a *child* partition
 and removes it again, on both lab guests, with the negative controls refusing. And it cannot be
 aimed: the input block has no field to name a VTL, and every byte this run put where one might
-hide was accepted **identically on a child with no VTL1 at all**. So the candidate S5a left
-standing — a stop driven from the root through the primitive Secure Kernel itself uses — is not
-expressible with that primitive. S5's pass condition is untouched and S5 stays open.
+hide was accepted **identically on a child with no VTL1 at all**.
+
+**What that closes is aiming, and not the route.** An earlier draft of this section said the
+candidate S5a left standing was closed, and that does not follow from these arms: with no VTL
+selector in the ABI, an intercept is either implicitly VTL0 or implicitly **every VTL**, and the
+second of those needs no selector because it would already deliver a VTL1 exception to the parent.
+This gate cannot tell those apart — it provoked no exception and holds no port to receive one. So
+the route stands **unresolved on scope**, with its install half measured and available. S5's pass
+condition is untouched and S5 stays open.
 
 The instrument is `h3probe.sys` — the H3 driver — with one IOCTL added that issues a hypercall
 whose input block the *client* composes byte for byte, so each arm is a different 24 or 32 bytes
@@ -2037,8 +2043,9 @@ unnamed here for the same reason it was in H3.
   VTL1, which the plan excludes and S5a's result makes no safer.
 - **Whether a partition-scoped exception intercept fires for VTL1 execution at all.** This gate
   shows there is no way to *ask* for VTL1; it does not show that an intercept installed without
-  asking excludes it. That question is now the interesting one, and answering it needs both a VTL1
-  exception and somewhere to observe delivery.
+  asking excludes it, and the absence of a selector is exactly as consistent with *covers every
+  VTL* as with *means VTL0*. That question is now the interesting one, and answering it needs both
+  a VTL1 exception and somewhere to observe delivery.
 - **Where an intercept would be delivered.** The child's intercept messages are routed to the port
   Hyper-V's own `Vid.sys` created; this run holds no port and created none, so nothing here says
   what a parent-installed intercept would look like to a debugger rather than to the VM worker.
@@ -2050,12 +2057,20 @@ unnamed here for the same reason it was in H3.
 
 #### What it changes downstream, and where S5 goes next
 
-- **The intercept route is closed for aiming, and open for installing.** A parent *can* install and
-  remove exception intercepts on a child — useful if a later route needs a partition-scoped
-  intercept — and cannot select a VTL while doing it. S5a closed the guest-cooperating route; this
-  closes the named parent-side one.
+- **The intercept route is closed for aiming and unresolved on scope.** A parent *can* install and
+  remove exception intercepts on a child, and cannot select a VTL while doing it. Whether what it
+  installed covers VTL1 anyway is the open half, and it is now the *cheapest* question in S5:
+  unlike the aiming question it needs no new primitive, only a VTL1 exception and somewhere to
+  watch. S5a closed the guest-cooperating route; this one is narrowed rather than closed.
 - **Breakpoints stay excluded**, unchanged and for the same reason: the catch half is unmeasured.
-- **The next candidate is named by a measurement rather than by a guess, and it is not an
+- **So S5 has two live candidates, not one, and the intercept one is first.** Settling scope means
+  answering *does a parent-installed exception intercept fire for a VTL1 exception* — and the two
+  ways in are a static read of `hvix64.exe`'s intercept dispatch, asking whether the check consults
+  the active VTL (two attempts have already failed on that image, and Ghidra is on this bench now
+  where it was not then), or a live test, which needs an intercept port of its own to receive on
+  and a VTL1 exception that is not a planted `int 3`. Neither is free; both are cheaper than
+  building a route that already exists.
+- **The second candidate is named by a measurement rather than by a guess, and it is not an
   intercept.** In the read-only reconnaissance beside the arms above, `HvRegisterExplicitSuspend`
   (`0x00000000`), `HvRegisterInterceptSuspend` (`0x00000001`) and `HvRegisterDispatchSuspend`
   (`0x00000003`) are all **readable from the parent at both VTL0 and VTL1** on the VBS guest, and
@@ -2064,9 +2079,10 @@ unnamed here for the same reason it was in H3.
   least *nameable* per VTL. What is unmeasured is the **write**, and S4 is the reason not to read
   the read as an answer: `HvCallReadGpa` and `HvCallWriteGpa` disagreed about VTL1 in exactly that
   way. `HvCallSetVpRegisters` (`0x0051`) against a child's VTL1 suspend register, with the VTL0
-  control beside it, is the next gate — and note it *stops a running guest's VP*, which every arm
+  control beside it, is the gate for it — and note it *stops a running guest's VP*, which every arm
   in S5b was designed to avoid, so it needs a disposable guest and a written-down recovery before
-  it runs rather than after.
+  it runs rather than after. It is second because it is the more expensive of the two and because
+  an intercept that already covers VTL1 would make it unnecessary.
 
 ## Explicitly out of scope
 

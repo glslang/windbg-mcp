@@ -2938,15 +2938,24 @@ outright, so there is no extended form either. The full record, with the arm tab
   runs — `0x05` (#BR), architectural and unreachable in long mode.
 - **Do not** re-run S5b, and **do not** re-test the spare bytes: the same acceptance on a partition
   with no VTL1 is what settles them, and that control has been taken.
-- **Still not delivery.** S5's pass condition is untouched. Whether an intercept installed *without*
-  asking fires for VTL1 execution is unmeasured and is the interesting remainder — it needs a VTL1
-  exception and somewhere to watch delivery, and this run holds no intercept port.
-- **The next candidate is measured rather than guessed, and it is not an intercept.**
+- **Aiming is what is closed; scope is not, and the route stays open.** A draft of this block said
+  S5b closed the parent-side candidate, and Codex was right that it does not: with no VTL selector
+  in the ABI, an intercept is either implicitly VTL0 or implicitly **every VTL**, and the second
+  needs no selector because it would already deliver a VTL1 exception to the parent. S5's pass
+  condition is untouched, and this run provoked no exception and held no intercept port, so it
+  cannot tell the two apart.
+- **So S5 has two live candidates, and interception is the first of them.** *Does a parent-installed
+  exception intercept fire for a VTL1 exception?* Two ways in: a static read of `hvix64.exe`'s
+  intercept dispatch for a check on the active VTL — two attempts have failed on that image, and
+  Ghidra is on this bench now where it was not then — or a live test, which needs a port of its own
+  to receive on and a VTL1 exception that is **not** a planted `int 3`. Cheaper than the second
+  candidate, and it would make it unnecessary.
+- **The second is measured rather than guessed, and it is not an intercept.**
   `HvRegisterExplicitSuspend`, `HvRegisterInterceptSuspend` and `HvRegisterDispatchSuspend` read
   from the parent at **both VTL0 and VTL1** on the VBS guest and are refused at VTL1 on the twin
-  with no VTL1 — the `TargetVtl` field discriminating exactly as it does for `CR3` in H3. So the
-  next gate is `HvCallSetVpRegisters` (`0x0051`) against a child's VTL1 suspend register, with the
-  VTL0 control beside it. **Read S4 before running it**: read and write disagreed about VTL1 there,
+  with no VTL1 — the `TargetVtl` field discriminating exactly as it does for `CR3` in H3. Its gate
+  is `HvCallSetVpRegisters` (`0x0051`) against a child's VTL1 suspend register, with the VTL0
+  control beside it. **Read S4 before running it**: read and write disagreed about VTL1 there,
   so the read above is not the answer. And unlike every arm in S5b, it *stops a running guest's
   VP* — write the recovery down before, not after.
 
@@ -2975,11 +2984,11 @@ outright, so there is no extended form either. The full record, with the arm tab
    2026-09-27 not its *transport* either: **S5a settled why SK does not connect to the port, which
    is that it has nothing to connect with.** No debug hypercall, no `vmcall`, no SynDbg MSR, across
    ten builds. So the remaining unknown is narrower and differently shaped — whether a VTL1 stop can
-   be driven from the hypervisor or the root *without* guest-side code. **S5b has now closed the
-   named candidate for that too**: a parent can install an exception intercept on a child and has no
-   field to aim one at a VTL, so the route runs through `HvCallSetVpRegisters` against a child's
-   VTL1 suspend registers — readable there, writeability unmeasured — rather than through
-   interception. Still decides inspector
+   be driven from the hypervisor or the root *without* guest-side code. **S5b has now split the
+   named candidate for that in two**: a parent can install an exception intercept on a child and has
+   no field to aim one at a VTL, which leaves *whether it covers VTL1 anyway* unresolved and first
+   in line, with `HvCallSetVpRegisters` against a child's VTL1 suspend registers — readable there,
+   writeability unmeasured — as the second. Still decides inspector
    versus debugger, and still the one that would change the shape of S3's tool surface rather than
    its contents. **That surface now exists**, so the change is to something built rather than to a
    design: a capture session is a fixed snapshot whose whole decode travels with the open, and
