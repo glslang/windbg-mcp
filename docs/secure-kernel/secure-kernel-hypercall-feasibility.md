@@ -1848,10 +1848,13 @@ They agree with the six verified rows and are listed separately rather than coun
   validation record — the session handler reached twice with VTL 0 and **zero** times with a
   nonzero VTL — and on the control binary, not on a static read of this build. The `hvix64.exe`
   read was of this workspace's `10.0.26100.9444`, which is not the lab guest's build.
-- **It is static, and a computed code would evade the immediate scan.** The three values are never
-  written as immediates; a value *arrived at* arithmetically (`mov ecx, 0x68` then `inc ecx`) would
-  not show in that reading. This is the one residual gap in the conclusion, and it is not closed by
-  the repertoire, which is only a lower bound.
+- **It is static, and it reads *immediates*, which is narrower than "values".** Two ways a code
+  could reach a register without appearing as one, and neither is closed here: *computed* —
+  `mov ecx, 0x68` then `inc ecx` — and *loaded from data*, `mov ecx, dword ptr [rip+…]` against a
+  constant sitting in `.rdata`, which the scan never looks at because a value in a data section is
+  not an immediate in a code section. This is the residual gap in the conclusion and the repertoire
+  does not close it, being only a lower bound. Both were found by auditing the tool's own claims
+  against the checks behind them rather than by a reviewer, which is the cheaper order.
 - **The repertoire does not follow control flow, and is not sound on its own.** The evaluator walks
   in address order, so a code built across a branch can be missed and a block after an
   unconditional jump can contribute one no path reaches. Discarding state at every branch target
