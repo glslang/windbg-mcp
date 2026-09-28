@@ -2807,9 +2807,9 @@ guest, which is itself a measurement this gate did not have before:
 
 | arm | null | with the intercept standing |
 |---|---|---|
-| **VTL0**, VTL0-only guest | 20,000/20,000, `0.86 us` each | **0 handled** in 120 samples over 24.4 s |
-| **VTL0**, VBS guest | 20,000/20,000, `0.82–0.96 us` each | **0 handled** in 120 samples over 24.4 s |
-| **VTL1**, VBS guest, in the enclave | 20,000/20,000, `9.47–9.97 us` each | **0 handled** in 120 samples over 24.4 s |
+| **VTL0**, VTL0-only guest | 20,000/20,000, `0.86 us` each | **0 handled**, all 120 samples over 24.4 s |
+| **VTL0**, VBS guest | 20,000/20,000, `0.82–0.96 us` each | **0 handled**, all 120 samples over 24.4 s |
+| **VTL1**, VBS guest, in the enclave | 20,000/20,000, `9.47–9.97 us` each | **0 handled**, 120 samples over 24.4 s, the 121st taken after the release |
 
 Every arm reports code `0x80000003` (`STATUS_BREAKPOINT`) in its null, so what the handler caught
 is checkable as the exception that was raised rather than assumed.
@@ -2820,8 +2820,10 @@ the hold is resumable. That is the difference between a stop a debugger could us
 exception, and it is measured rather than inferred. Held for 24.4 s of a 24.6 s run, the arms
 average `1224–1235 us` per exception against nulls of `0.86` and `9.7`.
 
-Longer holds behave the same: without the release, arms were held at zero for 40.4 s, 44.5 s and
-59.5 s across separate runs — 198, 218 and 291 consecutive zero samples.
+Longer holds behave the same. Without the release the arm is killed at its timeout and the teardown
+removes the intercept, so the zeroes are counted up to that point: **198, 218 and 291** consecutive
+zero samples on the VTL0 arms of the 40 s, 45 s and 60 s runs, and **193, 218 and 291** on the VTL1
+arms of the same three, each followed by the single post-release sample the next section is about.
 
 #### The two controls, because either one alone leaves the finding unreadable
 
@@ -2870,8 +2872,15 @@ released in a `finally`; every halt reported `released: True`):
 | | VTL0 arm | VTL1 arm |
 |---|---|---|
 | where the raiser was caught | VTL0 `RIP` **`0x00007FF7D5AF748D`**, user mode | VTL1 `RIP` **`0x000001D1009E500D`**, user mode inside the enclave |
-| same address across halts | yes, with `RSP` `0x000000B3BF7DF968` | yes, with `RSP` `0x000001D0F0B0FEB8` |
+| halts that caught it | **3 of 6** | **6 of 6** |
+| the address, across those halts | one, with `RSP` `0x000000B3BF7DF968` every time | one, with `RSP` `0x000001D0F0B0FEB8` every time |
 | the other VTL on that VP | VTL1 parked at Secure Kernel's `0xFFFFF80679FB0035` | VTL0 read `0xFFFFF80679FB001C`, `RSP` `0xFFFFB18F23D8A648` |
+
+The **3 of 6** is a property of the halt, not of the hold: on the other three the read returned
+Secure Kernel's parked address for both VTLs, which is the shape S5c recorded and means the halt did
+not land on the raiser. The raiser was held throughout all six — the progress file says so
+independently. Which VP carried it moved between halts in both arms, so the table is per-arm rather
+than per-VP.
 
 **The VTL1 arm's thread is caught in VTL1**, at one address, every time. That is what rules out the
 alternative this gate was most exposed to: if the enclave's exception dispatch made a VTL0 excursion
@@ -2889,10 +2898,15 @@ where the raiser was *caught* rather than what every read returned.
 
 **Only the raising thread is held; the guest keeps serving.** A second PowerShell Direct connection
 opened four seconds into every intercept arm answered with the guest's computer name every time, on
-both guests — so a partition-wide `#BP` intercept does not wedge the partition. VP runtime while an
-intercept stood was `0.12–0.16` and `0.48–0.55` CPU-seconds per second against a null-arm baseline
-near `0.03`: elevated, not saturated, and nowhere near the livelock the first run's raw deltas were
-read as.
+both guests — so a partition-wide `#BP` intercept does not wedge the partition.
+
+**And the first run's runtime figures were read as a livelock, which per-second rates say they are
+not.** Raw `HvRegisterVpRuntime` deltas across a 190 s arm came to 444 M and 664 M 100ns units —
+44 s and 66 s of CPU — which looks like two processors spinning. Divided by the window they are
+`0.12–0.16` and `0.48–0.55` CPU-seconds per second: one VP about an eighth busy and one about half,
+elevated over an idle guest but not saturated. A large delta over a long window is not a rate, and
+this record has no matched-duration idle baseline to put beside it — the null arms are seconds long
+and their wall time is not recorded — so the claim here is only that the VPs are not saturated.
 
 Both guests came through every run: teardown reported **0 intercepts still standing** each time, no
 straggler processes, VBS and HVCI still `2` on the VBS guest, no reboot. **This gate cost the bench
