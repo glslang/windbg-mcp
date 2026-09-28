@@ -2999,8 +2999,10 @@ validated. The full record is the
   4,096 bytes each: the `RIP`'s leaf `0x81F000` gives 0 non-zero bytes direct and **4,084** by
   hypercall; `0x3BE1000` gives 200 direct and 0 by hypercall; the page table itself 8 direct and 0
   by hypercall. **Each page readable by exactly one route, and which one differs per page** — so a
-  live inspector tries both per page, and neither alone reads VTL1's address space. Which property
-  decides is unmeasured and is the open question.
+  live inspector tries both per page, and neither alone reads VTL1's address space. **One address
+  walked, three pages censused** — enough to show the chain completes, not enough to claim an
+  arbitrary VTL1 address will: which property decides the serving route is unmeasured and is the
+  open question, and H4's `0x3600000` is unretested by either route.
 - **A correction to H4 fell out of it**: its "the VTL1 `CR3` page reads as zeros by both routes" is
   a **16-byte prefix** of a page whose first present entry is at offset `0x830`. Read whole, it has
   122 non-zero bytes and **26 present entries** — the same count S0 took from the capture side. The

@@ -56,7 +56,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   hypercall, PA `0x3BE1000` **200** by the direct route and 0 by the hypercall, and the page table
   itself 8 by the direct route and 0 by the hypercall. **Each page is readable by exactly one of
   the two routes and which one differs per page**, so neither alone reads VTL1's address space and
-  a live inspector must try both per page. An earlier draft of this entry called the leaf
+  a live inspector must try both per page — on **one** walked address and three censused pages,
+  which shows the chain can complete and not that an arbitrary VTL1 address will, since what
+  decides the serving route is unknown and H4's `0x3600000` remains unretested by either.
+  An earlier draft of this entry called the leaf
   *withheld* on the strength of a 32-byte zero window — the same prefix mistake the entry below
   documents, made one paragraph after documenting it.
 - **That run also corrected H4 and closed a question it had left open.** H4's table records the
