@@ -12,7 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Three routes to making Secure Kernel execute were tried and all three are closed on this
   bench**, which is what turns S5f's "VTL1 runs too rarely to catch" into a map rather than a
   shrug. Gate S5g, run with the operator's authorisation to reconfigure and reboot the VBS guest.
-  **Credential Guard: closed by edition** — `LsaCfgFlags`, the DeviceGuard scenario key and
+  **Credential Guard: unresolved, and the edition was the wrong answer** — an earlier version of this
+  entry closed the route on Microsoft's edition table (*Windows Pro: No*) and used it to decline a
+  review finding that said the edition could not be the cause. The finding was right: a Windows 11
+  Pro machine reports Credential Guard protecting it, and this bench's own Pro host runs `LsaIso`
+  while reading `SecurityServicesRunning = 0` — so Pro runs CG, and the field the guest was judged
+  by is not a sound test either. What was actually seen: `LsaCfgFlags`, the DeviceGuard scenario key and
   `EnableVirtualizationBasedSecurity` all set, **Secure Boot `On` for both reboots** (it is a
   documented CG prerequisite, and this gate turns it off only later), `SecurityServicesRunning` still
   `2` and no DeviceGuard events — because Microsoft's edition table reads *Windows Pro: **No***, and
@@ -98,8 +103,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them as an observation with that condition attached rather than as a rule for consumers — two
   drafts that phrased it as a rule were two review findings, because a rule invites a counterexample
   per unmeasured condition. `ActiveVtl = 1` is not merely unobserved: a sampler took **8,000 reads
-  across both VPs with no delay and caught it zero times**, and neither lab guest can be made to run
-  VTL1 from this host. And the condition cannot be **enforced** with these primitives: reading
+  across both VPs with no delay and caught it zero times**, and at the time of that gate no way was
+  known to make either lab guest run VTL1 from the host. **Superseded by S5g**: a VBS enclave does
+  run guest code in VTL1, `ActiveVtl` still never reports it, and a halt taken during that
+  workload catches VTL1 mid-execution. And the condition cannot be **enforced** with these primitives: reading
   `ActiveVtl` before the suspend races entry into VTL1, and reading it after depends on the
   suspension preserving it, which is the same unresolved question as the VTL0-labelled `RIP`
   reading as VTL1's. Reportable, not checkable — so the entry gives no consumer rule, three
