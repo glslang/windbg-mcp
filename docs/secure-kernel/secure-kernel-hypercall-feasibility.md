@@ -3871,8 +3871,8 @@ partition handle.
 the sequence operates on a partition handle; finding the wrappers says they exist, not that a
 second process can obtain one for a VM Hyper-V is running. Until an arm gets a handle, *"no driver
 left to write"* is **conditional on that**, and if it cannot be obtained the sequence is
-unavailable and a driver or another privileged route may be back on the table. Step 1 below is that
-test.
+unavailable and a driver or another privileged route may be back on the table. Opening a partition
+is the first item in `FOLLOWUPS.md` item 103's ordered plan, and is the test.
 
 That is the third downward re-scope in a row, and it is worth seeing them together, because each
 one deleted the build the previous gate had specified:
@@ -4044,12 +4044,13 @@ Questions, not a schedule; the ordered plan is in `FOLLOWUPS.md` item 103.
 
 - **Nothing was called.** This is three images read statically. Whether `VidAttachPartition`
   succeeds against a *running* Hyper-V VM's partition from a second process, and at what privilege,
-  is **not read here** and is the first thing step 1 will find out. A partition owned by `vmwp.exe`
+  is **not read here** and is the first item in item 103's plan. A partition owned by `vmwp.exe`
   may well refuse a second attach.
 - **`vid.dll`'s exports are not a documented contract.** They are stable entry points with public
   PDB names, which is not the same thing, and a build can move them.
 - **The message-slot protocol is not read** — what `VidSetupMessageQueue` and `VidMessageSlotMap`
-  expect, and the layout a client sees, are step 2's work rather than established here.
+  expect, and the layout a client sees, belong to the receive item in item 103's plan rather than
+  to this gate.
 - **One build each**, named above, and Intel/this host only.
 
 #### What the bench can and cannot debug, since two gates planned around getting this wrong

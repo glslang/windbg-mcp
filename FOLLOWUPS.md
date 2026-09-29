@@ -3429,10 +3429,29 @@ validated. The full record is the
    displaces the entry Hyper-V holds or takes one of its own. **S5k closed that and moved the
    unknown again**: the key is the partition id, Vid holds the entry, and the receiving path already
    exists — Vid is bound and recognises the message, and drops one whose vector is not claimed in
-   its own per-vector table. So the unknown is now **which branch an intercept arm takes**, which
-   S5k could not measure and, the slot being mutable, wants a replicated arm rather than a later
-   read, and then **the IOCTL that claims a vector** and whether a supported user-mode surface
-   reaches it. The other candidate was **answered by S5c**: the
+   its own per-vector table. **S5m then read the IOCTL and found it wrapped by an exported
+   `vid.dll` call, so the unknown moved again — and the ordered plan for it lives here, in one
+   place, because keeping a schedule in each gate section produced a run of review findings against
+   lists a later gate had invalidated:**
+
+   1. **Open a running child's VID partition**, which every later step needs and which nothing had
+      tested. **Run as S5n: refused**, at one integrity level, with an error matching a single-open
+      rule that was not traced to its check.
+   2. **Vary the caller upward** — a run as `SYSTEM` carrying the unused-name control. Cheap, and
+      the only untested condition that could reopen the user-mode route. Not blocked: it installs
+      nothing.
+   3. **Locate the refusing check**, which wants the kernel debugger this bench has disabled and is
+      the only thing that turns S5n's matched error into a cause.
+   4. **Register `#BP` through `vid.dll` and receive** — `VidRegisterExceptionHandler`, then
+      `VidSetupMessageQueue` / `VidMessageSlotMap` / `VidMessageSlotHandleAndGetNext`, with a `#BP`
+      raised in the guest, VTL0 first and then the VTL1 enclave, which is S5's pass condition.
+      Unreachable until 1 succeeds.
+   5. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
+      the standing constraint above, and the first also by kernel-memory access.
+   6. **Only then** the VMM-of-our-own question, which is a rig rather than an arm and is a decision
+      to cost rather than a next step.
+
+   The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
    rather than VTL-selective — so it buys a live *inspector* and not the stop S5 asks for. Still
