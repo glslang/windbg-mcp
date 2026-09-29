@@ -3676,6 +3676,46 @@ validated. The full record is the
   unused. Full record in the
   [S5r result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
+- **S5q steps 1 and 2 — RUN 2026-09-29, both read-only: the imports resolve and the table is read.**
+  Neither installs an intercept, registers a routine nor writes to a partition; **arm 0 has not
+  run**, and no code of ours has executed in the root's dispatch path. **Step 1**, `IOCTL_H3_RESOLVE`:
+  there is **no kernel-mode import library for `winhvr.sys`** — the WDK's only `WinHv*` libraries are
+  the user-mode WHP *Exo* pair — and `MmGetSystemRoutineAddress` covers `ntoskrnl` and `hal` only, so
+  the driver finds the module with `AuxKlibQueryModuleInformation` and parses the export directory
+  itself, bounding every RVA against `SizeOfImage` and **refusing forwarded exports** rather than
+  handing back a `"Dll.Name"` string. **8 of 8 resolved, all inside the image**, and
+  `WinHvSetInterceptRoutine` at **`+0x8020`** is the RVA S5k read statically from the same build —
+  a static read and a runtime walk agreeing on one offset is what makes the other seven worth
+  anything.
+- **Step 2, `IOCTL_H3_WHVPART`: the layout was re-derived from this build rather than taken from
+  S5k's note**, and `WinHvpReferencePartition` (`+0x2B40`) and `WinHvpOnInterception` (`+0x4438`)
+  agree — `WinHvpPartitionArray` (`+0x152D0`) points at `{ULONG Count}` followed by sorted 16-byte
+  `{ULONG64 PartitionId; PVOID Object}` entries at `+8`; the object carries a refcount at `+0x00`,
+  the **routine at `+0x10`** and the **context at `+0x18`**; and the dispatch is
+  **`Routine(Context, Message)`**. Live: **two partitions, `0x2` and `0x3`**, both with
+  `0xFFFFF807502E4170` = **`Vid!VidInterceptIsrCallback`** (`Vid.sys+0x4170`, `VidInterceptPreprocess`
+  the next symbol) — so **S5k's static claim that Vid is bound is now confirmed at runtime**, for
+  both partitions.
+- **The constraint step 2 produced, and a static read could not have.** **One routine, two different
+  contexts** (`0xFFFF818A46AB3000` against `0xFFFF818A46DF5000`): the routine is Vid's single
+  dispatcher and the **context** is what identifies the partition. A chain must therefore save and
+  forward **both**, passing the *original* context — one that saved only the routine pointer and
+  passed its own looks correct and makes Vid dereference the wrong partition object, a **host** bug
+  check on the first non-exception intercept. This is why arm 0 exists and why it came before the
+  exception work.
+- **Two guards, both load-bearing, and one hazard that is bench-dependent.**
+  `WinHvpPartitionArray` is **not exported**, so its RVA is a build-specific constant that would read
+  arbitrary kernel memory on another build: the IOCTL refuses unless the **loaded** image's
+  `TimeDateStamp` **and** `SizeOfImage` match the build it was read from (`0x31B98FBA` / `0x29000`),
+  reporting what it saw either way. And it takes the **same shared push lock**
+  `WinHvpReferencePartition` takes, because a concurrently torn-down partition leaves a stale object
+  pointer whose dereference at `+0x10` faults in the root. **The hazard**: the dispatch is
+  `guard_dispatch_icall`, so a chained routine must be an acceptable **CFG** indirect-call target —
+  a real constraint on an HVCI host, and not on this bench, HVCI being off by the **behavioural**
+  test that test-signed drivers load here rather than by `SecurityServicesRunning`, a field this
+  record has already caught being wrong. Full record in the
+  [S5q steps result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+
 ### Out of scope, with the reason rather than as a list
 
 - **Writes as a *tool surface***: the primitive exists and S1's seam should not pretend otherwise,
