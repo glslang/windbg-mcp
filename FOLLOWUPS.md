@@ -3331,9 +3331,11 @@ validated. The full record is the
   installer, which nothing on this bench has — so the removal can clear a vector another party
   holds. This is a property of *any* arm that arms and disarms a vector, not of a particular one,
   and it is written here rather than against each candidate because blocking them individually is
-  how the loop arm stayed runnable after its twin was stopped. It lifts when the bench can read
-  Vid's slot, or when an arm is redesigned to install nothing, or when there is a way to coordinate
-  with other installers.
+  how the loop arm stayed runnable after its twin was stopped. **It lifts on exactly two things**:
+  an arm redesigned to install nothing, or a way to hold every other installer off for the window.
+  Gaining the ability to read Vid's slot is **not** one of them — an earlier version of this
+  sentence listed it, contradicting the line above it. A read is a diagnostic: a client can register
+  between the read and the teardown, and the removal still clears its bit.
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
