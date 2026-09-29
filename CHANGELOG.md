@@ -24,10 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read — **so that install was not wrong, it was half of the arming sequence**, and the half it
   skipped is the half that makes anyone listen. Of S5j's two explanations of the hold the first is
   dead and the second gains a **competitor rather than a refutation**: which branch S5h's own
-  message took turns on a runtime byte this gate did not read, and nothing already measured stands
-  in for it — the probe's own paired removals clear the hypervisor bit without clearing Vid's slot,
-  so the earlier arms are consistent with both branches. That desynchronisation is also a hazard of
-  its own: a probe teardown can strip a vector a VID client holds and leave Vid believing it armed.
+  message took turns on a **mutable** runtime byte this gate did not read, and nothing already
+  measured stands in for it — the probe writes the same hypervisor mask the earlier arms observe,
+  through a raw removal that touches nothing in `Vid.sys`, and whether that removal clears the
+  shared bit is itself unread. Being mutable, the byte also cannot be recovered later: only a
+  replicated intercept arm reports which branch is taken. If the removal does clear the bit, the
+  desynchronisation is a hazard of its own — a probe teardown stripping a vector a VID client holds
+  while Vid goes on believing it armed.
   The receiver is nonetheless not
   something to build — the message path, the completion and the instruction-pointer advance already
   exist per partition and per vector — and the `WinHvSetInterceptRoutine` prohibition hardens into a

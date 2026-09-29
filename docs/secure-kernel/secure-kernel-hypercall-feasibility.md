@@ -3568,34 +3568,43 @@ would have sent the handler down the enqueue branch instead, which is S5j's rece
 explanation still standing.
 
 **An earlier version of this section argued from S5h's controls that the slot was `0xFF`, and the
-argument is wrong.** It ran: Vid's two register paths bracket the slot in both directions —
+argument does not stand.** It ran: Vid's two register paths bracket the slot in both directions —
 `VidHandlerpExceptionRegisterEntry` claims it and *then* installs, restoring `0xFF` if the hypercall
 fails, and `VidHandlerpExceptionUnregisterEntry` (`+0x63C4C`) restores `0xFF` and calls
 `WinHvInstallIntercept` with `AccessType` **`0`** and the same type-3 descriptor — so a claimed slot
 implies an installed intercept; and S5h's null arms and its `#BR`-installed/`#BP`-raised control
 each handled 20,000/20,000, so no `#BP` intercept stood; so the slot was `0xFF`.
 
-**Both halves are true and the implication between them is not, because Vid is not the only writer
-of the hypervisor mask on these children — the probe is.** `h3probe.sys` calls
+**Both halves are true and the implication between them is not *established*, because Vid is not the
+only writer of the hypervisor mask on these children — the probe is.** `h3probe.sys` calls
 `WinHvInstallIntercept` directly, and **every install it makes is paired with a raw
-`AccessType = 0` removal in a `finally`**, S5b onward. That removal clears the hypervisor bit
-**without touching `[partition+0xB68]`**. So on a child this bench has probed, `slot claimed` and
-`intercept installed` can be desynchronised — a client's claim can survive a probe removal that
-cleared its bit — and in exactly that state the controls pass, S5h's next raw install re-sets the
-bit, and the message enqueues to that client. **The controls are consistent with both branches, so
-they favour neither.**
+`AccessType = 0` removal in a `finally`**, S5b onward, which touches nothing in `Vid.sys`. Whether
+that removal clears the shared bit outright is **not read**: S5i read the install as an
+unconditional `OR` of `1 << vector` and did not read the removal. If it does, then `slot claimed`
+and `intercept installed` can be desynchronised on a probed child — a client's claim surviving a
+probe removal that cleared its bit — and in exactly that state the controls pass, S5h's next raw
+install re-sets the bit, and the message enqueues to that client.
 
-**One live read of `[partition+0xB68][3]` is what settles it**, and it is the cheapest remaining
-measurement in this gate. Nothing should be built on the drop until it is done.
+**Note which way the unread fact cuts.** The controls argument needs *"a claimed slot implies an
+installed intercept"* to hold, and that needs no other writer to be able to clear the bit. One
+other writer exists and its effect is unknown, so the implication is unestablished — which is
+enough to retract the argument **whatever the removal turns out to do**. Establishing the removal
+would decide something different: whether the desynchronisation is real, and therefore whether the
+argument could be rebuilt.
 
-**And the desynchronisation is a hazard in its own right, not only a hole in an argument.** If a
-VID client ever held a vector this probe installs, the probe's teardown strips that client's
-intercept and leaves Vid believing it is still armed — silently, on the child under test, with no
-error anywhere. Whether a removal really clears the bit outright is **not read here**: S5i read the
-install as an unconditional `OR` of `1 << vector` and did not read the removal, so whether the
-hypervisor refcounts installers is open, and it is the same unread fact the reviewer's version of
-this objection and this hazard both depend on. Reading `hvix64.exe`'s type-3 *removal* path settles
-the hazard and the argument together, and is a smaller read than the live one.
+**What settles the question itself is reading `[partition+0xB68][3]` inside a replicated intercept
+arm**, not a bare read now. The slot is mutable runtime state and a client can claim or release it
+at any time, so a read taken today reports today: it can say which branch *a reproduction* takes,
+and it can only say what S5h's runs met to the extent the bench has not changed under it — which is
+an assumption to state, not a result. Read it with the intercept standing and the raiser held, in
+the same triple shape S5h used. Nothing should be built on the drop until that is done.
+
+**And the same desynchronisation, if it is real, is a hazard rather than only a hole in an
+argument.** A VID client holding a vector this probe installs would have its intercept stripped by
+the probe's teardown while Vid went on believing it armed — silently, on the child under test, with
+no error anywhere. Six runs have done this, so it is worth settling rather than leaving as a
+possibility. Reading `hvix64.exe`'s type-3 *removal* path settles the hazard and the rebuildability
+of the argument together, and is a smaller read than the live one.
 
 #### What the hold then is, stated as the inference it is
 
@@ -3664,10 +3673,11 @@ three.
   dispatch entry in Vid's IOCTL table, the input layout, and whether a documented WHP property
   reaches it, which would make the whole receiver a supported call rather than a private one. This
   is the gate that decides whether S5 is one API call from passing or needs a driver.
-- **One live read of `[partition+0xB68][3]`** with an intercept standing, which is the only thing
-  that separates the drop from S5j's retained explanation. Cheapest measurement left in this gate,
-  and it should come before the IOCTL read rather than after: if the slot turns out claimed, the
-  IOCTL is not the next thing to look at.
+- **`[partition+0xB68][3]`, read inside a replicated intercept arm** — the slot is mutable, so this
+  is a statement about the reproduction and about S5h only insofar as the bench is unchanged. It is
+  the only thing that separates the drop from S5j's retained explanation, and it should come before
+  the IOCTL read rather than after: if the slot turns out claimed, the IOCTL is not the next thing
+  to look at.
 - **`hvix64.exe`'s type-3 *removal* path**, which S5i did not read. It decides whether this probe's
   paired removal can strip a vector a VID client holds — a hazard of an experiment already run six
   times — and it is a smaller read than the live one.
@@ -3681,11 +3691,13 @@ three.
   `10.0.26100.8972` and `Vid.sys` `10.0.26100.9278`. No registration was made and no message was
   received.
 - **The one runtime byte the application to S5h turns on was not read**, and **nothing already
-  measured stands in for it.** `[partition+0xB68][3]` is live state; the attempt to substitute
-  S5h's controls is retracted in its own section above, because the probe's own raw removals
-  desynchronise the slot from the hypervisor bit those controls observe. Every statement about *code
-  paths* here is independent of that byte; every statement about *what S5h's message did* is not,
-  and none is made.
+  measured stands in for it.** `[partition+0xB68][3]` is mutable live state; the attempt to
+  substitute S5h's controls is retracted in its own section above, because the probe writes the
+  hypervisor mask those controls observe and cannot be shown not to desynchronise it from the slot.
+  And because it is *mutable*, no later read recovers what it held during S5h — only a replicated
+  arm reports the branch a reproduction takes. Every statement about *code paths* here is
+  independent of that byte; every statement about *what S5h's message did* is not, and none is
+  made.
 - **The reference scans match an encoded displacement, so a computed one is invisible.** The
   "exactly one site" and "exactly two call sites" claims above are exhaustive over
   `call/jmp qword ptr [rip+disp32]`, `call/jmp rel32` and `lea reg, [rip+disp32]` in the executable
