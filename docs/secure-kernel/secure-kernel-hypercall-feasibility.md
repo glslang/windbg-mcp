@@ -4808,7 +4808,7 @@ turned out to be redundant, since the service resolves to the `hvmm-testsigned.s
 
 ### S5r result, 2026-09-29: the IUM-debugging patch reproduces from the Hyper-V root, and the gate had to be found rather than looked up
 
-**A breakpoint raised in VTL1 user mode was caught by a VTL0 debugger and continued, with the guest
+**An `int 3` executing in VTL1 user mode was caught by a VTL0 debugger and continued, with the guest
 under one hypervisor and no nesting.** The published technique needs three levels — VMware
 Workstation as L1 with its GDB stub, Hyper-V nested inside it, the target as L2, IDA driving the
 patch. This is the root partition of the hypervisor already running the guest, S4's write primitive,
@@ -4895,6 +4895,16 @@ things that happen to co-occur. **The after arm is what makes the middle one a r
 returns when the byte does, so the patch is the cause and not the bench drifting. An A-B-A, because a
 one-sided demonstration here would be indistinguishable from a trustlet that happened to be
 debuggable.
+
+**That exception is the attach breakpoint, not one planted at a chosen address**, and the difference
+bounds the claim. `DebugActiveProcess` makes Windows inject a break into the debuggee, so this event
+is the one the attach itself produces — arriving after `CREATE_PROCESS_DEBUG_EVENT` and the module
+loads, which is exactly where the injected break belongs. What it establishes is that the patch
+permits **attachment and debug-event delivery** from a VTL1 user-mode process, and that an `int 3`
+executing there is caught in VTL0 and continued. What it does **not** establish is breakpoint
+*setting*: no breakpoint was written to a chosen address in trustlet code and observed to fire, and
+doing that is what would reproduce the published capability in full. An earlier draft of this
+section read the pass condition as met without that distinction.
 
 `0x80000003` is `EXCEPTION_BREAKPOINT` — an `int 3` executed **in VTL1 user mode**, delivered to a
 debugger in VTL0 and continued by it. That is the gate's pass condition as written, met rather than
@@ -5022,10 +5032,17 @@ seeing one routine against two contexts.
 
 The indirect call goes through `guard_dispatch_icall`, so a chained routine must be an acceptable
 **CFG** indirect-call target. On an HVCI host that is a real constraint on a driver built without
-CFG metadata. On this bench it is not, HVCI being off — asserted from **behaviour**, that
-test-signed drivers load here at all, rather than from `SecurityServicesRunning = 0`, which is a
-field this record has already caught being wrong on another machine. Anyone repeating this on an
-HVCI host should expect to meet it.
+CFG metadata. On this bench it is not, and that is now **measured** rather than inferred:
+`NtQuerySystemInformation(SystemCodeIntegrityInformation)` returns `CodeIntegrityOptions`
+`0x282203`, in which **`HVCI_KMCI_ENABLED` (`0x400`) is clear**, and the
+`HypervisorEnforcedCodeIntegrity` scenario key reads `Enabled = 0`. **`HVCI_IUM_ENABLED`
+(`0x2000`) IS set**, so the precise claim is that *kernel-mode* HVCI is off while IUM code
+integrity runs — the two are separate bits and only the first governs a kernel callback. An
+earlier draft inferred this from **behaviour**, that
+test-signed drivers load here at all — which is **unsound**, because a test-signed driver can load
+under HVCI, as this record's own earlier reading of test-signing coexisting with it shows. The
+inference reached the right answer by a route that could not carry it. Anyone repeating this on an
+HVCI host should expect to meet the constraint.
 
 #### What is still not done
 
@@ -5163,8 +5180,13 @@ the partition object as an *argument*, or obtains it from a helper other than
 `WinHvpReferencePartition`, calls neither anchor and is absent from the 28 even if it reads the pair.
 Closing that needs provenance carried across calls and returns, which the tool does not do �— so
 "functions that can hold a partition object" means "functions that obtain one by the two routes it
-looks for". The tool also ships without a self-test, which the instrument S5p built has and which
-review found holes in twice; treat its function set as a reading rather than a proof.
+looks for". **The `.pdata` hole is closed rather than documented**: `.pdata` claims no leaf
+functions, so a leaf loading the array would have been invisible; the tool now decodes the
+executable bytes `.pdata` leaves out, as `vid_field_census.py` does — 9,599 unclaimed bytes here,
+9,558 of them padding, five gap runs scanned as regions. **The answer did not move**: 28 reaching
+regions and 42 accesses before and after, which is what makes the hole worth reporting as closed
+rather than as a caveat. The tool still ships without a self-test, which the instrument S5p built
+has and which review found holes in twice; treat its region set as a reading rather than a proof.
 
 #### What this does to S5j's two explanations
 

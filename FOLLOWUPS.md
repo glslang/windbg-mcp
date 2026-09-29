@@ -3198,7 +3198,10 @@ validated. The full record is the
   **Build**: the plan's hand-rolled `HvCallCreatePort`/SynIC page is the wrong build. `winhvr.sys`
   exports the lot — `WinHvCreatePort`, `WinHvConnectPort`, `WinHvAllocatePartitionSintIndex`,
   `WinHvGetSintMessage`, `WinHvSetEndOfMessage`, `WinHvSetInterceptRoutine` and
-  `WinHvCompleteIntercept`, which is the *resume* a debugger needs — and `Vid.sys` already consumes
+  `WinHvCompleteIntercept`, which is **half** of the resume a debugger needs — for a *software*
+  exception Vid first calls `VidInterceptAdvanceInstructionPointer` and only then completes, and
+  without that advance the faulting instruction is re-entered rather than resumed — and `Vid.sys`
+  already consumes
   them, including a `VidExceptionInterceptReturnCallback` for this very message type.
   **Hazard, and it is why this is a finding rather than a green light**: `WinHvSetInterceptRoutine`
   stores **one** routine and context per table entry, assigned rather than chained, and `Vid.sys`
@@ -3475,7 +3478,9 @@ validated. The full record is the
 
   **Build**, all in `h3probe.sys`: a kernel-read IOCTL — the capability S5l named as missing, which
   unblocks the replicated `[partition+0xB68][3]` read as a side effect — the chaining receiver, and
-  `WinHvCompleteIntercept` on the resume path.
+  on the resume path **`VidInterceptAdvanceInstructionPointer` and then** `WinHvCompleteIntercept`:
+  completing a software exception without advancing `RIP` re-enters the faulting instruction, so a
+  receiver that only completes would intercept the same `int 3` for ever and read as a broken chain.
 
   **Resolution, read 2026-09-29 before anything was built.** The WDK ships **no kernel-mode import
   library for `winhvr.sys`** — the only `WinHv*` libraries in `10.0.26100.0` are user-mode
@@ -3495,7 +3500,9 @@ validated. The full record is the
   first with nothing in it. **Arm 0, the null receiver**: chain in, forward *every* message to the
   saved routine, handle nothing, install no intercept at all. **Pass:** the guest keeps serving —
   a second PowerShell Direct session answers and the enclave completes a full `L<n>` cycle — and
-  teardown restores the saved pointer. That exercises the whole hazard with no logic in it, and it
+  teardown restores the saved pointer. **That sentence was wrong and the arm 0 result below says
+  so**: this exercises registration and restore, not dispatch, because with no intercept installed
+  nothing is dispatched. What it does test is real, and it
   is also the only arm that can be run without installing a vector, so the standing constraint does
   not reach it. Only if arm 0 is stable does the exception handling go in. **If arm 0 bugchecks the
   host, the in-kernel receiver is retired and step 8's own-partition build is selected** — the same
@@ -3527,9 +3534,12 @@ validated. The full record is the
   of the gate**: restore the saved routine *before* removing the hypervisor intercept bit, and pair
   both in a `finally` — per S5l the removal is an unconditional `and ~bit` with no refcount.
 
-  **What it settles beyond S5's own condition.** A delivered message says directly which branch S5h
-  met — Vid's drop, or Hyper-V receiving and retaining it — which S5k left to a replicated arm and
-  S5m could only half-supersede.
+  **What it was expected to settle, and cannot.** A draft here said a delivered message would show
+  which branch S5h met. **It would not**: this arm *replaces* Vid's routine, so our receiver is
+  reached before Vid's slot check ever runs, and delivery looks identical whether Vid would have
+  dropped the message or retained it. Recovering that branch needs Vid's decision instrumented
+  while it happens, or S5h reproduced with the slot recorded — neither of which this is. **Arm 1
+  then made the question moot from the other side**: nothing was delivered at all.
 
 - **S5r — WRITTEN BEFORE THE RUN, 2026-09-29: reproduce the published IUM-debugging patch from the
   root, with no outer hypervisor.** Quarkslab's
@@ -3545,7 +3555,9 @@ validated. The full record is the
   primitive is a **strictly cheaper delivery** of it.
 
   **Pass:** the patch is applied from the root, a debugger attaches to a trustlet in the VBS guest,
-  and a breakpoint in VTL1 user mode is hit.
+  and a breakpoint in VTL1 user mode is hit. **Read that condition strictly when the arm runs**: the
+  `int 3` Windows injects into a debuggee on attach is not a breakpoint planted at a chosen address,
+  and only the second demonstrates breakpoint *setting*.
 
   **Controls:** the same attach **before** the patch must fail, or the patch is not what admitted
   it; and the patched bytes are read back and restored against the on-disk image, as S4 did with
@@ -3559,9 +3571,11 @@ validated. The full record is the
   this. That is a reading of one function's page on one build, **not** a property of VBS, and the
   claim goes no further than the bytes touched.
 
-  **Stop:** a bugcheck on applying the patch is a **result** rather than a failure — it answers S4's
-  open question in the other direction — and it is taken against a throwaway checkpoint so that it
-  can be. Verify the details against the original write-up before building on this summary: the
+  **Stop:** a bugcheck on applying the patch stops the gate, and it is taken against a throwaway
+  checkpoint so that it can. **It would not by itself answer S4's open question**: a stale offset,
+  wrong patch bytes or an unrelated fault produce the same outcome, so it counts as integrity
+  detection only with evidence attributing it to that mechanism, and is otherwise recorded as
+  inconclusive. Verify the details against the original write-up before building on this summary: the
   gate was written from a fetched précis, and the function name, the build it was read on, and
   whether the patch is applied once or re-applied are each load-bearing.
 
@@ -3581,7 +3595,10 @@ validated. The full record is the
   a breakpoint in `securekernel.exe`. **If it is hit**, execution control over VTL1 exists today,
   and what S5 contributes is the route rather than the capability — say that plainly and rewrite
   the claims. **If it is not**, what the tool provides is inspection of a paused VM, which is then
-  the accurate description of every published VTL1 result outside Quarkslab's.
+  the accurate description of **what this build of this tool provides** — and of nothing else. It
+  says nothing about the other published routes, which rest on their own evidence and which the
+  route table keeps separate; the 2025 thesis in particular reaches execution control that this
+  sentence once implied nobody had.
 
   **Controls:** the same breakpoint set in `nt` through the same CLSID must be hit, or a miss
   measures the rig and not VTL1. And the **passive** CLSID must first resolve SK symbols against
@@ -3711,9 +3728,11 @@ validated. The full record is the
   `WinHvpReferencePartition` takes, because a concurrently torn-down partition leaves a stale object
   pointer whose dereference at `+0x10` faults in the root. **The hazard**: the dispatch is
   `guard_dispatch_icall`, so a chained routine must be an acceptable **CFG** indirect-call target —
-  a real constraint on an HVCI host, and not on this bench, HVCI being off by the **behavioural**
-  test that test-signed drivers load here rather than by `SecurityServicesRunning`, a field this
-  record has already caught being wrong. Full record in the
+  a real constraint on an HVCI host, and not on this bench — **measured**, not inferred:
+  `NtQuerySystemInformation(SystemCodeIntegrityInformation)` gives `CodeIntegrityOptions`
+  `0x282203` with **`HVCI_KMCI_ENABLED` (`0x400`) clear** and the scenario key at `Enabled = 0`,
+  while **`HVCI_IUM_ENABLED` is set**, so it is *kernel-mode* HVCI that is off. An earlier draft
+  inferred it from test-signed drivers loading, which is unsound — they load under HVCI too. Full record in the
   [S5q steps result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
 - **S5q arm 0 — RUN 2026-09-29: the chain installs and restores, and it cannot test what it was
@@ -3767,7 +3786,10 @@ validated. The full record is the
   Three other functions read the pair — `WinHvpOnMirroringNotification`,
   `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
   say they serve other message types, but their objects were not identified, so a dispatch consulting
-  one of those instead is **narrowed, not eliminated**. **The reaching set is itself a lower bound**:
+  one of those instead is **narrowed, not eliminated**. **The `.pdata` hole is closed**, not merely
+  noted — `.pdata` claims no leaf functions, so the tool now decodes the executable bytes it leaves
+  out (9,599 here, 9,558 of them padding, five gap runs), and **the answer did not move**: 28 regions
+  and 42 accesses before and after. **The reaching set is still a lower bound**:
   a function handed the partition object as an *argument* calls neither anchor and is absent from the
   28 even if it reads the pair, which no amount of the above accounts for. The tool ships without a self-test, which
   S5p's instrument has and which review holed twice; treat its function set as a reading.
