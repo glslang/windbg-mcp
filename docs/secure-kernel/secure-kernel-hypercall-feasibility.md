@@ -2989,8 +2989,8 @@ nothing**, which is worth recording because S5g cost it four reboots.
 - **`HvCallCreatePort` / `HvCallConnectPort` are untried**, and the bullet above is why the next
   gate has to establish *where the message goes* before assuming a port of our own would receive
   it. If intercepts are delivered to the partition's designated port, creating a second one is not
-  the answer and the question becomes which port the hypervisor uses and whether a parent may change
-  it.
+  the answer. **S5j ran that step and this is what it found**: the message is already addressed to
+  the parent, and those two hypercalls are not the build — see the S5j result below.
 
 #### What to run next, and what not to repeat
 
@@ -3005,9 +3005,10 @@ nothing**, which is worth recording because S5g cost it four reboots.
     "create a port": first establish **where an exception intercept message on a child is delivered
     today**, since the root's stack already owns a port for that child and is the likeliest
     recipient. `Vid.sys` and `winhvr.sys` were both read for S5b and are the same two images to read
-    for this. Only then does `HvCallCreatePort` / `HvCallConnectPort` plus a SynIC message page in
-    `h3probe.sys` become the right build. Driver work rather than reversing, with the catch half
-    already measured.
+    for this. **Run as S5j below, and it replaced the rest of this bullet**: the hand-rolled port
+    and SynIC page are not the build, because `winhvr.sys` exports the API and `Vid.sys` already
+    consumes it — and registering into it *replaces* Hyper-V's handler, so the next step is
+    identifying what that replacement costs.
   - **The dispatch read**, which is what decides whether any of this reaches Secure Kernel:
     `hvix64.exe`'s exception-intercept path, for a check on the active VTL. S5b named it, two
     attempts had failed on that image, and Ghidra is on this bench now. A receiver that works would

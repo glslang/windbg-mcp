@@ -3209,10 +3209,16 @@ validated. The full record is the
   port. That is not the same as nothing receiving it: the root's own stack owns a port for each
   child (S5b found eleven `Vid.sys` sites installing intercepts on children), and an exception
   intercept it never asked for landing there, never completed, would produce exactly this hold.
-  **The receiver** therefore starts by establishing where the message goes today, from `Vid.sys`
-  and `winhvr.sys`, and only then builds `HvCallCreatePort`/`HvCallConnectPort` and a SynIC message
-  page into `h3probe.sys`. The dispatch read that used to sit beside it **was run as S5i and is
-  done**; nothing in it touches message delivery, so it neither helps nor blocks this one.
+  **That first half was run as S5j, above, and it replaced the plan this bullet used to carry.**
+  Establishing where the message goes was the right first step and it answered two things: the
+  message is already addressed to the parent, so nothing needs redirecting; and the hand-rolled
+  `HvCallCreatePort`/`HvCallConnectPort` plus SynIC page named here is **not** the build, because
+  `winhvr.sys` exports the whole API and `Vid.sys` already consumes it. What is left is narrower and
+  differently shaped: **identify the key of the table `WinHvSetInterceptRoutine` searches**, from
+  `Vid.sys`'s call sites, because registration is a single-slot *replacement* and that key decides
+  whether it costs one child or every VM on the host. Only then is there a receiver to build. The
+  dispatch read that used to sit beside this **was run as S5i and is done**; nothing in it touches
+  message delivery, so it neither helps nor blocks.
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
@@ -3252,8 +3258,10 @@ validated. The full record is the
    user mode never reaches the guest's own dispatch and is handed back intact when it comes down,
    and the hypervisor seeds a parent's installed mask into *every* enabled VTL's effective exception
    bitmap. So the unknown is back to one, and it is the one this gate has never had — whether the
-   root can **receive** what the intercept produces (`HvCallCreatePort`/`HvCallConnectPort`,
-   untried). The other candidate was **answered by S5c**: the
+   root can **receive** what the intercept produces. **S5j narrowed even that**: the message is
+   already delivered to the parent, `winhvr.sys` exports the receiving API, and the open question is
+   the key of the table `WinHvSetInterceptRoutine` searches, since registering replaces the handler
+   already in it. The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
    rather than VTL-selective — so it buys a live *inspector* and not the stop S5 asks for. Still
