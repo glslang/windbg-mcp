@@ -3039,8 +3039,23 @@ instrument is [`tools/sk_vmcs_scan.py`](../../tools/sk_vmcs_scan.py).
 `CF5AF317F300B7DA25F37D5DC6CA75BFF91B6B868D89F337D23EC1773340CE8A` — this host's own hypervisor,
 which is the one S5b and S5h ran against. All RVAs below are image-relative; the image base is
 `0xFFFFF80000000000` and there is no PDB for it. The exception directory yields 5,763 functions
-covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites 373 resolve to an
-immediate field encoding.
+covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites **355** resolve to
+an immediate field encoding.
+
+**The tracker behind that number was unsound when this section was first written**, and review on
+[#413](https://github.com/glslang/windbg-mcp/pull/413) found three ways it could invent a resolved
+field: carrying a constant across a branch that skips its assignment, treating `mov ax, 0x4004` as
+defining all of `rax`, and letting `vmread` leave its destination's old constant in place. All three
+are fixed, each pinned by the counterexample it was named for (`--self-test`), and the tracker now
+clears at every branch target and after every unconditional transfer. **The result below did not
+move**: the same two sites, before and after. What moved is the resolved count, 373 to 355, which is
+the conservative clearing losing real resolutions rather than inventing false ones — the direction
+that cannot manufacture an anchor.
+
+**And the anchor never rested on the tracker anyway.** The two functions it named were read
+instruction by instruction, and in each the `mov` sits immediately before the `vmwrite`/`vmread`
+inside a 48- and 46-byte function with no branch between them. Everything downstream — callers,
+displacement scans, per-function disassembly — uses no register tracking at all.
 
 #### The chain, in the five steps that carry it
 
@@ -3132,7 +3147,7 @@ agreements rather than restatements:
   (`+0x2BECC8` then `+0x2BED3C`), and `+0x1A08` has no writer but the type-16 installer and a
   zeroing at teardown. Why initialisation reads the other field is unestablished.
 - **The scan reads immediates.** A field encoding arriving computed or loaded from data is invisible
-  to it, which is the same limit `sk_hypercall_scan.py` records; 44 of 417 `vmwrite`/`vmread` sites
+  to it, which is the same limit `sk_hypercall_scan.py` records; 62 of 417 `vmwrite`/`vmread` sites
   did not resolve and were not chased.
 - **It says nothing about delivery.** Where the resulting intercept *message* goes is untouched
   here, and remains S5's open half.
