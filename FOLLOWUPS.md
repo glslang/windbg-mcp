@@ -4239,3 +4239,42 @@ which is wrong outright, and both bots caught it.
 **Do not start with step 2.** The layout work is the expensive half and buys nothing until a caller
 knows they are looking at a KMDF driver, which step 1 tells them — and step 1 would have prevented
 both wrong sentences above on its own.
+
+## 109. [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address"
+
+**Origin:** gate S5q arm 1 needed the callers of one internal function in `securekernel.exe` and had
+to hand-roll it in Python, then hand-roll it a second time for `winhvr.sys`
+([`tools/winhv_partition_readers.py`](tools/winhv_partition_readers.py)). Both are analyses this
+server is otherwise well placed to do, and neither is Secure Kernel-specific: *who calls this
+internal helper* is a constant question in the IOCTL work the driver tools exist for.
+
+**What exists, and the shape of the gap.** `reachable_from_dispatch` walks **forward** from a known
+root — is this block reachable from the dispatch routine — over a bounded breadth-first call graph.
+`driver_hazards` finds call sites **to imports**, by IAT slot, with decoded instructions, bounded
+output and explicit accounting for windows it could not read. Neither answers the reverse question
+about an **internal** address, which is the one you have when a symbol is absent, a PDB is public
+and typeless, or the interesting thing is a callback slot rather than a named routine.
+
+**A tool would be `xrefs_to <address>`**, reporting call and jump sites with module and RVA beside
+each, and it should be built on `hazards.rs`'s scan rather than beside it: the bounded section walk,
+the decoded-instruction loop, the unreadable-window accounting and the cap-with-exact-count pattern
+are all there and are the parts that took the review rounds to get right.
+
+**Two things to get right that the ad-hoc versions did not.**
+
+- **Decode, do not pattern-match.** S5q's Python matched `E8`/`E9` displacements over raw bytes,
+  computing for each offset whether `i + 5 + rel32` hit the target. That is cheap and **unsound**: a
+  coincidental `0xE8` inside another instruction's immediate, or inside data, matches exactly as
+  well. It was adequate as a *lead generator* because both hits were then verified by disassembling
+  them, and it is not adequate as a tool. The house style is already right — `hazards.rs` decodes,
+  and `reachable_from_dispatch` parsing `uf` **text** is the habit not to extend
+  (`.claude/rules/tool-surface.md`, and the standing lesson about reading a disassembler's prose).
+- **Answering for an address is not answering for an object.** The winhvr census had to filter by
+  *provenance of the base pointer* before a field offset meant anything, because `+0x10` alone had
+  365 accesses in one image. A call-site tool does not have that problem — a call target is
+  unambiguous — but any sibling that censuses a **field** does, and shipping the second without the
+  first would repeat S5p's review rounds.
+
+**Why it is worth doing beyond this gate:** it works with **no debuggee** against an image target,
+so `securekernel.exe`, `winhvr.sys`, `Vid.sys` and any driver answer offline — which is the mode
+most of item 103's static work has actually run in.
