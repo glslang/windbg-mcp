@@ -3219,11 +3219,18 @@ validated. The full record is the
   message is already addressed to the parent, so nothing needs redirecting; and the hand-rolled
   `HvCallCreatePort`/`HvCallConnectPort` plus SynIC page named here is **not** the build, because
   `winhvr.sys` exports the whole API and `Vid.sys` already consumes it. What is left is narrower and
-  differently shaped: **identify the key of the table `WinHvSetInterceptRoutine` searches**, from
-  `Vid.sys`'s call sites, because registration is a single-slot *replacement* and that key decides
-  whether it costs one child or every VM on the host. Only then is there a receiver to build. The
-  dispatch read that used to sit beside this **was run as S5i and is done**; nothing in it touches
-  message delivery, so it neither helps nor blocks.
+  differently shaped, and it is **two reads, not one** — because S5j could not tell whether the hold
+  it explains is an absent binding or Hyper-V's own handler keeping the intercept:
+  - **The table key** that `WinHvSetInterceptRoutine` searches, from `Vid.sys`'s call sites and from
+    whatever creates the entries. It decides whether a registration collides with Hyper-V's at all,
+    and if it does, whether that costs one child or every VM on the host.
+  - **Vid's own path for `0x80010003`** — preprocess, process, `VidExceptionInterceptReturnCallback`,
+    completion. The key alone says nothing about *why the intercept stays outstanding*, which is the
+    other live explanation of S5h's hold and the one a receiver would not fix. If Vid receives and
+    retains it, building a second receiver is the wrong move whatever the key turns out to be.
+
+  Only after both is there a receiver to build. The dispatch read that used to sit beside this **was
+  run as S5i and is done**; nothing in it touches message delivery, so it neither helps nor blocks.
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
