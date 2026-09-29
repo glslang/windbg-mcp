@@ -2985,9 +2985,11 @@ nothing**, which is worth recording because S5g cost it four reboots.
   exactly this: the trap held, the thread pending, the rest of the partition untouched. Whether that
   is what happens, or the hypervisor queues an undeliverable message some other way, is not
   established by anything here. What is established is the behaviour at the guest's exception
-  dispatch. **S5k answered it, and this candidate was wrong in its second half**: the message does
-  reach Hyper-V's own routine, which then discards it rather than holding it, because a vector
-  installed by hypercall alone is not claimed in the per-partition table that routine consults.
+  dispatch. **S5k read that port's owner and found a third possibility**: the message does reach
+  Hyper-V's own routine, which *discards* it rather than holding it whenever the vector is not
+  claimed in a per-partition table an install hypercall does not touch. Whether this gate's own
+  message met that branch turns on a runtime byte S5k did not read — the controls above are what
+  argue it did.
 - **`HvCallCreatePort` / `HvCallConnectPort` are untried**, and the bullet above is why the next
   gate has to establish *where the message goes* before assuming a port of our own would receive
   it. If intercepts are delivered to the partition's designated port, creating a second one is not
@@ -3269,8 +3271,9 @@ records that `Vid.sys` has a handler for this exact message type. So "nothing wa
 existing handler received the unsolicited intercept and retained it" are **both** live explanations
 of S5h's hold, and they are not the same gate: the first wants a binding built, the second wants
 Hyper-V's handler understood. Distinguishing them is what comes next, so this record does not pick
-one. **S5k, below, picked neither**: the handler received the message and *dropped* it, the vector
-never having been claimed in a per-partition table of Vid's own.
+one. **S5k, below, killed the first and added a third**: `Vid.sys` is bound, so nothing-was-bound is
+out — and the handler *drops* a message whose vector is not claimed in a per-partition table of
+Vid's own. Dropped and retained are separated by a runtime byte S5k did not read.
 
 #### What the root side already has
 
@@ -3347,20 +3350,29 @@ that dispatches to Vid's own per-vector table. Do not call it.
   cannot answer that, and if Hyper-V's handler is receiving and retaining the message then a second
   receiver is the wrong build whatever the key turns out to be.
 
-  **Both were run as S5k, below, and neither explanation survived.** Vid was bound and its routine
-  ran; it recognises `0x80010003`, and then discards it because the vector is not claimed in a
-  per-partition table that lives in `Vid.sys` and that the install hypercall knows nothing about. A
-  second receiver is the wrong build for a third reason: the right one already exists.
+  **Both were run as S5k, below.** The first explanation is dead — Vid is bound, per partition, and
+  recognises `0x80010003`. The second gains a competitor rather than a refutation: the handler
+  *drops* a message whose vector is not claimed in a per-partition table that lives in `Vid.sys` and
+  that the install hypercall knows nothing about, and which of those two S5h met turns on a runtime
+  byte S5k did not read. A second receiver is the wrong build either way, for a third reason: the
+  right one already exists.
 
-### S5k result, 2026-09-29: the message was received and dropped, and the receiver is an IOCTL rather than a build
+### S5k result, 2026-09-29: an unclaimed vector is dropped inside `Vid.sys`, and the receiver is an IOCTL rather than a build
 
-**Both reads S5j called for are done, and between them they retire both of S5j's live explanations
-of S5h's hold.** It was not "nothing was bound" — `Vid.sys` is bound, per partition, and its routine
-ran. It was not "the existing handler received the unsolicited intercept and retained it" — the
-handler received it and **discarded** it, in four instructions, because the vector was not
-registered in a second table that lives in `Vid.sys` and that `HvCallInstallIntercept` knows nothing
-about. The hypervisor-level install S5b built and S5h fired is **half** of what the root's own stack
-does to arm an exception intercept, and the half it skipped is the half that makes anyone listen.
+**Both reads S5j called for are done, and between them they move S5h's hold from "unexplained" to
+"one branch of a path that is now read end to end".** `Vid.sys` *is* bound, per partition, and it
+recognises `0x80010003` — so "nothing was bound" is dead on the static read alone. What the static
+read then shows is a **third** possibility S5j did not have: a handler that receives the message and
+**discards** it, in four instructions, because the vector is not registered in a second table that
+lives in `Vid.sys` and that `HvCallInstallIntercept` knows nothing about. The hypervisor-level
+install S5b built and S5h fired is **half** of what the root's own stack does to arm an exception
+intercept, and the half it skipped is the half that makes anyone listen.
+
+**Which branch S5h's own message took is a question about live state, and this gate did not read
+it** — `[partition+0xB68][3]` is runtime, and a VID client that had already claimed `#BP` on that
+child would have made the handler enqueue rather than drop. A separate section below argues from
+S5h's controls that the slot was unclaimed, and names the one-line live read that would settle it
+directly. Read that before treating the drop as what happened rather than as what the code does.
 
 So S5's missing piece is not a receiver to build. It is `Vid!VidHandlerIoctlExceptionRegister`, an
 IOCTL that takes a vector, claims a per-partition slot for it, and *then* calls
@@ -3542,9 +3554,39 @@ VidExceptionInterceptReturnCallback -> VidInterceptAdvanceInstructionPointer (so
              -> VidCompleteInterceptReturnCallback
 ```
 
-and S5h entered it at the third line with the first line never having run.
+and S5h entered it at the third line with the first line never having run — **for its own install**.
+Whether some *other* client had run the first line for `#BP` on that child, before S5h started, is
+the next section.
 
-#### The mechanism of S5h's hold, stated as the inference it is
+#### Was the slot claimed? Not read, and S5h's own controls say no
+
+The whole application of this read to S5h turns on one runtime byte,
+`[partition+0xB68][3]`, and **this gate did not read it.** A VID client holding `#BP` on that child
+would have sent the handler down the enqueue branch instead, which is S5j's received-and-retained
+explanation still standing. So the argument has to come from somewhere, and it comes from S5h.
+
+**The two register paths bracket the slot in both directions**, which is what makes the argument
+possible at all. `VidHandlerpExceptionRegisterEntry` claims the slot and *then* installs, restoring
+`0xFF` if the hypercall fails; `VidHandlerpExceptionUnregisterEntry` (`+0x63C4C`) restores `0xFF`
+and calls `WinHvInstallIntercept` with `AccessType` **`0`** and the same type-3 descriptor — the
+removal S5b read. Neither can leave one set without the other, so **a claimed slot implies an
+installed intercept on that partition.**
+
+**And S5h measured the absence of that intercept, twice per run.** Its null arms raise 20,000 `#BP`
+with nothing installed and the guest handles 20,000 of them; its first control installs `#BR`
+(`0x05`) and raises `#BP`, and the guest again handles 20,000 of them. Both say no `#BP` intercept
+stood on that partition except the one the probe installed — so by the implication above the slot
+was `0xFF`, on both guests and in every run.
+
+**That is a chain, not a reading**, and it is worth naming what could break it: the implication is
+read from code rather than measured; the controls establish the state at the *start* of each
+triple, so a client claiming the slot between the control and the intercept arm is not excluded by
+them; and both are about the two children this bench runs rather than about Hyper-V in general.
+**One live read of `[partition+0xB68][3]` on a child with an intercept standing settles all three
+at once**, and it is the cheapest remaining measurement in this gate — worth doing before anything
+is built on the drop.
+
+#### What the hold then is, stated as the inference it is
 
 **What is read, not inferred:** with no registration the handler returns 0, no message is enqueued,
 and the VP's intercept-pending bit is cleared by the common tail in `VidInterceptProcess`, which
@@ -3594,9 +3636,11 @@ three.
   API too: the receiving side already exists, per partition and per vector, with completion and
   instruction-pointer advance written. What S5 needs is the IOCTL that reaches
   `VidHandlerIoctlExceptionRegister`.
-- **S5h's hold is explained, and neither of S5j's two candidates was right.** The record carried
-  "nothing was bound" and "the handler received and retained it"; the answer is "the handler
-  received it and dropped it, because the vector was never claimed".
+- **"Nothing was bound" is dead, and a third candidate joins the other one.** `Vid.sys` is bound
+  per partition and recognises the type, which the static read settles outright. What replaces it is
+  "the handler received it and dropped it, the vector never having been claimed" — **which competes
+  with S5j's retained explanation rather than retiring it**, because the two are separated by a
+  runtime byte this gate did not read. S5h's controls argue for the drop; the live read decides it.
 - **S5b's install is vindicated and re-scoped.** The descriptor Vid sends is identical. The gap was
   never the hypercall.
 - **Still not measured**: no message has been received. **S5 does not pass.** Nothing here touches
@@ -3609,6 +3653,10 @@ three.
   dispatch entry in Vid's IOCTL table, the input layout, and whether a documented WHP property
   reaches it, which would make the whole receiver a supported call rather than a private one. This
   is the gate that decides whether S5 is one API call from passing or needs a driver.
+- **One live read of `[partition+0xB68][3]`** with an intercept standing, which is the only thing
+  that separates the drop from S5j's retained explanation directly rather than through S5h's
+  controls. Cheapest measurement left in this gate, and it should come before the IOCTL read rather
+  than after: if the slot turns out claimed, the IOCTL is not the next thing to look at.
 - **Whether the hold is a loop**, per the inference above, since a loop and a held trap want
   different things from a debugger design and the distinction is cheap to measure live.
 - **Not** a second receiver, **not** a port, and **not** `WinHvSetInterceptRoutine`.
@@ -3618,6 +3666,10 @@ three.
 - **Two images, one build pair, no live arm.** Everything above is static, from `winhvr.sys`
   `10.0.26100.8972` and `Vid.sys` `10.0.26100.9278`. No registration was made and no message was
   received.
+- **The one runtime byte the application to S5h turns on was not read.** `[partition+0xB68][3]` is
+  live state; what stands in for it is a chain through S5h's controls, set out in its own section
+  above with what could break it. Every statement about *code paths* here is independent of that
+  byte; every statement about *what S5h's message did* is not.
 - **The reference scans match an encoded displacement, so a computed one is invisible.** The
   "exactly one site" and "exactly two call sites" claims above are exhaustive over
   `call/jmp qword ptr [rip+disp32]`, `call/jmp rel32` and `lea reg, [rip+disp32]` in the executable
