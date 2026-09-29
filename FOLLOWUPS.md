@@ -3198,11 +3198,13 @@ validated. The full record is the
   them, including a `VidExceptionInterceptReturnCallback` for this very message type.
   **Hazard, and it is why this is a finding rather than a green light**: `WinHvSetInterceptRoutine`
   stores **one** routine and context per table entry, assigned rather than chained, and `Vid.sys`
-  imports it — so registering *replaces* Hyper-V's handler instead of joining it. **How much it
-  replaces depends on the table's key, which this read did not identify**: per-partition means one
-  child, per-message-type or per-SINT means every VM on the host, since the displaced handler
-  services IO-port, MSR and CPUID intercepts. **Do not call `WinHvSetInterceptRoutine` on this bench
-  until the key is known** — read it from `Vid.sys`'s own call sites, which pass it. Full record in
+  imports it. **What follows from that is narrower than an earlier draft said**: the import proves
+  `Vid.sys` calls the function, not that its call selects the same entry ours would, so whether a
+  registration displaces anything turns on the table's key — which this read did not identify.
+  Per-partition means one child; per-message-type or per-SINT means every VM on the host, since the
+  displaced handler services IO-port, MSR and CPUID intercepts; an allocated per-client handle means
+  no displacement at all. Assume displacement because the cost of being wrong is asymmetric, and
+  **do not call `WinHvSetInterceptRoutine` on this bench until the key is known** — read it from `Vid.sys`'s own call sites, which pass it. Full record in
   the [S5j result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
@@ -3260,8 +3262,8 @@ validated. The full record is the
    bitmap. So the unknown is back to one, and it is the one this gate has never had — whether the
    root can **receive** what the intercept produces. **S5j narrowed even that**: the message is
    already delivered to the parent, `winhvr.sys` exports the receiving API, and the open question is
-   the key of the table `WinHvSetInterceptRoutine` searches, since registering replaces the handler
-   already in it. The other candidate was **answered by S5c**: the
+   the key of the table `WinHvSetInterceptRoutine` searches, which decides whether registering
+   displaces the entry Hyper-V holds or takes one of its own. The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
    rather than VTL-selective — so it buys a live *inspector* and not the stop S5 asks for. Still
