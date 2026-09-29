@@ -3043,7 +3043,7 @@ covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites 
 an immediate field encoding.
 
 **The tracker behind that number was unsound when this section was first written**, and review on
-[#413](https://github.com/glslang/windbg-mcp/pull/413) found **fourteen** defects in it over five
+[#413](https://github.com/glslang/windbg-mcp/pull/413) found **sixteen** defects in it over six
 rounds, and they are mostly one mistake wearing many costumes: **reading rendered text where
 capstone had already decoded the thing itself**, plus two places that used a decoded field without
 asking what it meant.
@@ -3053,13 +3053,15 @@ asking what it meant.
   leave its destination's old constant in place; invalidating only the first of two comma-separated
   operands, so `inc eax` and `pop rax` left a stale value; and an alias table with no
   `ah`/`bh`/`ch`/`dh` in it.
-- *`--imm`*, four: a substring match over the printed operands; an equivalence that compared only
-  the low 32 bits; counting a `call`/`jmp` destination as a data constant; and then applying the
-  imm32 sign-extension equivalence to operands that were **not** encoded as imm32, so
-  `--imm 0x80010003` matched `movabs rax, 0xffffffff80010003` — a genuinely different immediate.
-  Both review bots reported that last one independently, which is what a real defect looks like
-  against a tool's own claim of soundness. The discriminator is `encoding.imm_size`, 8 for a
-  `movabs` and 4 for an imm32 however wide its destination register.
+- *`--imm`*, five, and the last three are one equivalence corrected three times: a substring match
+  over the printed operands; an equivalence that compared only the low 32 bits; counting a
+  `call`/`jmp` destination as a data constant; applying the imm32 sign-extension equivalence to
+  operands **not** encoded as imm32, so `--imm 0x80010003` matched
+  `movabs rax, 0xffffffff80010003` (both bots reported that one independently); and then applying
+  it **symmetrically**, so a query for a sign-extended value matched `mov eax, 0x80004004` — whose
+  32-bit destination *zero*-extends, so the instruction does not carry it. The rule that survives
+  is narrow: `encoding.imm_size == 4`, and only a decoded value normalised toward a 32-bit query,
+  never the reverse.
 - *`--offset`*, two: matching a rendered `0x…]`, which a small displacement never produces, and
   inferring "written" from operand position — which labels `call qword ptr [rax + 0x1a04]` a write.
 - *`--range`*, two: no validation at all, then validating only the start, so a range running off
@@ -3071,9 +3073,9 @@ asking what it meant.
   nothing in this section was ever inflated by it — but that is a measurement, not the reason the
   bug was acceptable.)
 
-All fourteen are fixed, each pinned by the counterexample it was named for, and the branch-target,
+All sixteen are fixed, each pinned by the counterexample it was named for, and the branch-target,
 immediate and displacement decisions live in one helper apiece rather than at each call site.
-`--self-test` runs 19 cases, one of which caught a mistake in another test's hand-assembled bytes
+`--self-test` runs 20 cases, one of which caught a mistake in another test's hand-assembled bytes
 rather than in the code.
 
 **Every figure in this section and in S5j was re-derived after each round, and none has moved:**
@@ -3184,6 +3186,14 @@ agreements rather than restatements:
 - **The scan reads immediates.** A field encoding arriving computed or loaded from data is invisible
   to it, which is the same limit `sk_hypercall_scan.py` records; 62 of 417 `vmwrite`/`vmread` sites
   did not resolve and were not chased.
+- **It walks each function linearly**, so inline constants, padding or a jump table a branch skips
+  over decode as though they were instructions — a data sequence could in principle be reported as
+  a VMCS access, or a stray `E8` pair counted as a caller. Real instruction boundaries need a
+  reachable-block traversal and this does not do one. **The mitigation is procedural**: every
+  anchor above was then read as disassembly in full, and every call site was read in context, so a
+  decode that was really data had to survive a human reading of the surrounding function to reach
+  this page. That is weaker than a traversal and stronger than nothing, and it is stated here
+  rather than left for a reader to discover.
 - **It says nothing about delivery.** Where the resulting intercept *message* goes is untouched
   here, and remains S5's open half.
 
