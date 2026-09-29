@@ -3716,6 +3716,32 @@ validated. The full record is the
   record has already caught being wrong. Full record in the
   [S5q steps result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
+- **S5q arm 0 — RUN 2026-09-29: the chain installs and restores, and it cannot test what it was
+  written to test.** Registration and restore are safe and verified; **dispatch is untested**, and the
+  gate text above that called arm 0 the step which "exercises the whole hazard with no logic in it"
+  is **wrong**. Established: the chain installs on partition `0x3` saving
+  `Vid!VidInterceptIsrCallback` and that partition's own context, leaves partition `0x2` untouched
+  throughout, the guest keeps serving (two concurrent PowerShell Direct sessions, 0.9 s round trip,
+  `LsaIso` alive, the enclave completing 20 VTL1 calls), and the restore is **exact** — routine and
+  context back byte for byte — after which the driver unloaded clean. No host reboot, no
+  Kernel-Power 41, no dump.
+- **The forward counter read `0`, and it is the only reason that is known.** Our routine was never
+  called — not during the enclave's VTL1 calls, not during twelve seconds of guest CPU and
+  file-system churn. Without the counter every other measure reads as a clean pass and the arm would
+  have been written up as *"our code ran in the dispatch path and nothing broke"*, on evidence that
+  says nothing of the kind. Zero is **consistent with S5k**: `VidHandlerpExceptionRegisterEntry`
+  claims its slot and *then* installs the intercept, so with no intercept installed there are no
+  exception-intercept messages to dispatch, and ordinary guest activity produced no IO-port, MSR or
+  CPUID intercept routed to VTL0 either.
+- **So there are two hazards where the gate assumed one**, and the cheap-arm-first ordering does not
+  survive it. **Registration and restore** — replacing a pointer Hyper-V holds and putting it back —
+  is what arm 0 tests, and it passes. **Dispatch** — our code running when Hyper-V calls it — cannot
+  be reached without an intercept existing, and an intercept means installing a vector. That moves
+  the dispatch hazard into **arm 1**, beside the vector-install hazards S5l described, rather than
+  ahead of them. Arm 0 is still worth what it measured: a failed restore or a forwarded-wrong context
+  would each have been a host bug check, and both were live before this run. Full record in the
+  [S5q arm 0 result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+
 ### Out of scope, with the reason rather than as a list
 
 - **Writes as a *tool surface***: the primitive exists and S1's seam should not pretend otherwise,

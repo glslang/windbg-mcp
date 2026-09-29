@@ -5032,3 +5032,70 @@ HVCI host should expect to meet it.
 Arm 0 — the null receiver — has not run. Nothing in these two steps registered a routine, and no
 code of ours has executed in the root's dispatch path. The driver was stopped after each read and
 `h3probe.c`'s two new IOCTLs are read-only by construction.
+
+### S5q arm 0, 2026-09-29: the chain installs and restores, and it cannot test what it was written to test
+
+**Registration and restore are safe and now verified. Dispatch is untested, and the gate text that
+said otherwise was wrong.** Arm 0 was specified as the step that "exercises the whole hazard with no
+logic in it" — our code executing inside `WinHvpOnInterception`, in the root, where a fault is a host
+bug check. It does not, and cannot, because with no intercept installed nothing dispatches to the
+routine at all.
+
+#### What the arm established
+
+| | |
+|---|---|
+| chain installs | `SUCCESS` on partition `0x3`; saved pair is `Vid!VidInterceptIsrCallback` and that partition's own context |
+| per-partition | partition `0x2` untouched for the whole arm — the same routine and context before, during and after |
+| the guest keeps serving | two concurrent PowerShell Direct sessions, 0.9 s round trip, 102 processes, `LsaIso` alive; the enclave completed 20 VTL1 calls |
+| restore | exact: routine **and** context back to `0xFFFFF807502E4170` / `0xFFFF818A46DF5000` byte for byte |
+| unload | clean, with nothing chained |
+| host | no reboot, no Kernel-Power 41, no dump |
+
+While chained, partition `0x3` carried our routine at `0xFFFFF80752B318A0` with our static chain slot
+`0xFFFFF80752B37570` as its context, and partition `0x2` still carried Vid's — so the registration is
+per-partition, as the table layout said it would be.
+
+#### What it did not establish, and how that is known
+
+**The forward counter read `0`** — after the enclave made 20 VTL1 calls, and after twelve seconds of
+guest CPU and file-system churn. Our routine was never called. So the hazard this arm exists for is
+**untested**: nothing of ours has executed in the root's dispatch path.
+
+**The counter is the only reason that is known.** Without it this run reads as a clean pass on every
+other measure, and would have been written up as *"our code ran in the dispatch path and nothing
+broke"* on evidence that says nothing of the kind. It is the same defect this record keeps meeting
+from the other direction — a green arm whose greenness is about something other than the question.
+
+**Why zero is consistent with what S5k read.** `VidHandlerpExceptionRegisterEntry` claims its slot and
+*then* installs the hypervisor intercept, so with no intercept installed there are no
+exception-intercept messages to dispatch. Ordinary guest activity produced no IO-port, MSR or CPUID
+intercept routed to VTL0 either, on this Gen 2 configuration.
+
+#### The correction
+
+The gate text claimed arm 0 "exercises the whole hazard with no logic in it", and separated the
+hazard into a cheap arm and an expensive one on that basis. **That separation does not hold.** There
+are two hazards, not one:
+
+- **Registration and restore** — replacing a pointer Hyper-V holds, and putting it back. Arm 0 tests
+  this, and it passes.
+- **Dispatch** — our code running when Hyper-V calls it. Arm 0 **cannot** test this, because an
+  intercept has to exist before anything is dispatched.
+
+So the ordering that was meant to meet the dangerous part cheaply does not: there is no way to
+exercise the callback without generating traffic for it, and generating traffic means installing a
+vector. That moves the dispatch hazard into arm 1, alongside the vector-install hazards S5l
+described, rather than ahead of them. What arm 0 is still worth is everything in the table above —
+which is not nothing, since a failed restore or a wrong context would have been a host bug check and
+both were live possibilities before this run.
+
+#### The design that survived contact
+
+Two decisions from the read-only step were load-bearing and are worth keeping for anyone repeating
+this. The chain forwards the **saved context**, not its own, because Vid binds one routine for every
+partition and distinguishes them by context. And the chain records are a **static array, never
+pool**, so the address registered as a context cannot become freed memory; `H3Unload` unchains before
+anything else, because there is no way to refuse an unload and an image that goes away while
+Hyper-V still points into it bug checks the host on the next intercept — long after the run looked
+clean.
