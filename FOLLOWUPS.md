@@ -3545,8 +3545,12 @@ validated. The full record is the
   bench rather than a guest. **That, and not the displacement, is the hazard this gate carries**;
   the displacement is bounded to one child and is what the lift above accepts. A guest that wedges
   only with the chain installed stops the gate until the chain is fixed. **Teardown order is part
-  of the gate**: restore the saved routine *before* removing the hypervisor intercept bit, and pair
-  both in a `finally` — per S5l the removal is an unconditional `and ~bit` with no refcount.
+  of the gate**: remove the hypervisor intercept bit **first**, then restore the saved routine, and
+  pair both in a `finally` — per S5l the removal is an unconditional `and ~bit` with no refcount.
+  **An earlier draft of this sentence had the order the other way round**, which contradicted the
+  non-atomic-swap paragraph above and the order arm 1 actually used: restoring while the vector is
+  still armed leaves an exception able to dispatch through a half-swapped pair, which is the host
+  bug check that paragraph is about.
 
   **What it was expected to settle, and cannot.** A draft here said a delivered message would show
   which branch S5h met. **It would not**: this arm *replaces* Vid's routine, so our receiver is
@@ -3750,7 +3754,9 @@ validated. The full record is the
   [S5q steps result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
 - **S5q arm 0 — RUN 2026-09-29: the chain installs and restores, and it cannot test what it was
-  written to test.** Registration and restore are safe and verified; **dispatch is untested**, and the
+  written to test.** Registration and restore **completed and were verified exactly**, on a partition
+  where nothing was dispatched across the swap — which is not the same as safe, the swap being
+  non-atomic per the paragraph above; **dispatch is untested**, and the
   gate text above that called arm 0 the step which "exercises the whole hazard with no logic in it"
   is **wrong**. Established: the chain installs on partition `0x3` saving
   `Vid!VidInterceptIsrCallback` and that partition's own context, leaves partition `0x2` untouched
@@ -3795,7 +3801,12 @@ validated. The full record is the
   with capstone's read/write classification and stack traffic dropped. **Two sites trace end to end
   to the same field**: `WinHvSetInterceptRoutine` (`+0x8020`) writes `[rax+0x10]`/`[rax+0x18]` off
   `WinHvpReferencePartition`'s return, and `WinHvpOnInterception` (`+0x4438`) reads the same pair off
-  the array-derived object. **The message did not reach `WinHvpOnInterception`.**
+  the array-derived object. **So what the zero measures is that *our registered routine was not
+  called*.** That is as far as it goes: the census is a lower bound over two anchors, so it cannot
+  establish that `WinHvpOnInterception` did not run, and the readings it leaves open — an argument-
+  passed holder, a helper this does not follow — are exactly the ones that would let it run and
+  consult something else. **That the message was never delivered is an inference from the zero, not
+  a measurement of the delivery path**, and the path itself is unresolved.
 - **The limit, stated rather than glossed.** The census is function-scoped, not provenance-scoped.
   Three other functions read the pair — `WinHvpOnMirroringNotification`,
   `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
@@ -3816,7 +3827,7 @@ validated. The full record is the
   runs. The likeliest remaining account is an **inference, not a measurement**: S5k's "half of the
   arming sequence" may be not merely the per-vector flag but the delivery plumbing itself — the port
   and SINT whose API `winhvr.sys` exports — without which the hypervisor has the intercept armed and
-  nowhere to post. **So the receiver is not a routine to chain.** Chaining works, is safe, restores
+  nowhere to post. **So the receiver is not a routine to chain.** Chaining installs and restores
   cleanly and receives nothing; what is missing is a delivery path, and the only known way to
   establish one is S5m's registration, which S5n and S5o showed needs a partition handle a running VM
   will not give up. **Arm 1 closes the route this gate was built on and returns the question to

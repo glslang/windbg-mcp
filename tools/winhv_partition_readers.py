@@ -59,6 +59,27 @@ def sections(data):
     return base, out
 
 
+def decode_all(md, code, base):
+    """Decode a byte range, resuming past anything capstone refuses.
+
+    `md.disasm` STOPS at the first undecodable byte and reports no error, so a
+    single bad byte silently hides every instruction after it in that range --
+    which in a `.pdata` gap means hiding exactly the leaf code the gap scan
+    exists to find. Returns the instructions and the count of bytes skipped, so
+    "scanned" is reported with what it could not read.
+    """
+    out, skipped, at = [], 0, 0
+    while at < len(code):
+        got = list(md.disasm(code[at:], base + at))
+        if not got:
+            at += 1
+            skipped += 1
+            continue
+        out.extend(got)
+        at = (got[-1].address + got[-1].size) - base
+    return out, skipped
+
+
 def rva_to_off(secs, rva):
     for s in secs:
         if s["va"] <= rva < s["va"] + max(s["vs"], s["rs"]):
@@ -151,32 +172,40 @@ def main():
                 continue
             blob = data[off:off + (he - hs)]
             gap_bytes += len(blob)
-            # Trim padding from both ends, then decode whatever is left.
-            i, j = 0, len(blob)
-            while i < j and blob[i] in (0xCC, 0x00):
-                i += 1
-            while j > i and blob[j - 1] in (0xCC, 0x00):
-                j -= 1
-            pad_bytes += len(blob) - (j - i)
-            if j > i:
+            # Split at EVERY padding run, not just the outer edges: one span can
+            # hold several leaf-code islands separated by 0xCC/0x00, and
+            # decoding the whole span as one stream misaligns across the padding
+            # and loses the later islands.
+            i = 0
+            while i < len(blob):
+                if blob[i] in (0xCC, 0x00):
+                    pad_bytes += 1
+                    i += 1
+                    continue
+                j = i
+                while j < len(blob) and blob[j] not in (0xCC, 0x00):
+                    j += 1
                 gap_runs += 1
                 # A gap run has no unwind record, so nothing licenses treating
                 # its `rbp` as a frame pointer: keep those operands.
                 regions.append((hs + i, hs + j, True, 0))
+                i = j
     print("executable bytes .pdata does not claim: %d (%d of them 0xCC/0x00 padding); "
-          "%d gap run(s) held anything else and are scanned as regions"
+          "%d gap run(s) held anything else, each split at padding and scanned as its own region"
           % (gap_bytes, pad_bytes, gap_runs))
 
     reaching = {}   # region start -> set of reasons
     bodies = {}
     from_gap = set()
     framereg = {}
+    undecoded = 0
     for start, end, is_gap, fr in regions:
         off = rva_to_off(secs, start)
         if off is None:
             continue
         code = data[off:off + (end - start)]
-        ins = list(md.disasm(code, start))
+        ins, skipped = decode_all(md, code, start)
+        undecoded += skipped
         bodies[start] = ins
         framereg[start] = fr
         if is_gap:
@@ -197,6 +226,7 @@ def main():
     print("image                : %s" % a.image)
     print(".pdata functions     : %d" % len(funcs))
     print("regions scanned      : %d (.pdata functions plus decoded gap runs)" % len(bodies))
+    print("bytes capstone refused, skipped and resumed past: %d" % undecoded)
     print("regions that can hold a partition object: %d" % len(reaching))
     print()
     for start in sorted(reaching):

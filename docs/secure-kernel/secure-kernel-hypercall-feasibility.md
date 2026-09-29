@@ -5052,7 +5052,8 @@ code of ours has executed in the root's dispatch path. The driver was stopped af
 
 ### S5q arm 0, 2026-09-29: the chain installs and restores, and it cannot test what it was written to test
 
-**Registration and restore are safe and now verified. Dispatch is untested, and the gate text that
+**Registration and restore completed and were verified exactly — across a swap nothing was
+dispatched through, which is not the same as safe. Dispatch is untested, and the gate text that
 said otherwise was wrong.** Arm 0 was specified as the step that "exercises the whole hazard with no
 logic in it" — our code executing inside `WinHvpOnInterception`, in the root, where a fault is a host
 bug check. It does not, and cannot, because with no intercept installed nothing dispatches to the
@@ -5165,8 +5166,13 @@ and `+0x18`, with capstone's own read/write classification and with stack-relati
 - `WinHvpOnInterception` (`+0x4438`) **reads** `[rcx+0x10]` and `[rcx+0x18]` where `rcx` came from
   the array lookup `[r8+rcx*8+0x10]` — the same object.
 
-So the slot we chained is the slot the interception dispatch reads. **The message did not reach
-`WinHvpOnInterception`.**
+So the slot we chained is the slot that interception dispatch reads. **What the zero measures is
+that our registered routine was not called**, and that is the whole of it. The census is a lower
+bound over two anchors, so it cannot establish that `WinHvpOnInterception` did not run — an
+argument-passed holder or a helper it does not follow would let it run and consult something this
+never looked at. **That the message was never delivered is therefore an inference from the zero,
+not a measurement of the delivery path.** The path is unresolved; what is closed is the route that
+chains this slot.
 
 **The limit of that, stated rather than glossed.** The census is function-scoped, not
 provenance-scoped: it proves those two sites touch a partition object because their base registers
@@ -5178,7 +5184,7 @@ not identified. A dispatch for exception intercepts that consulted one of those 
 not eliminated. **And the reaching set is a lower bound, not an enumeration**: a function that receives
 the partition object as an *argument*, or obtains it from a helper other than
 `WinHvpReferencePartition`, calls neither anchor and is absent from the 28 even if it reads the pair.
-Closing that needs provenance carried across calls and returns, which the tool does not do �— so
+Closing that needs provenance carried across calls and returns, which the tool does not do — so
 "functions that can hold a partition object" means "functions that obtain one by the two routes it
 looks for". **The `.pdata` hole is closed rather than documented**: `.pdata` claims no leaf
 functions, so a leaf loading the array would have been invisible; the tool now decodes the
@@ -5211,7 +5217,7 @@ next.
 #### What it means for the build
 
 This is the fourth downward re-scope in this line, and it moves in the opposite direction from the
-last three. The receiver is **not a routine to chain**: chaining works, is safe, restores cleanly,
+last three. The receiver is **not a routine to chain**: chaining installs, restores exactly,
 and receives nothing. What is missing is a *delivery path*, and the only known way to establish one
 is the registration S5m found — which S5n and S5o showed needs a partition handle that a running
 VM will not give up. So arm 1 does not open a route; it closes the one this gate was built on, and
