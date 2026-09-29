@@ -3767,7 +3767,9 @@ validated. The full record is the
   Three other functions read the pair — `WinHvpOnMirroringNotification`,
   `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
   say they serve other message types, but their objects were not identified, so a dispatch consulting
-  one of those instead is **narrowed, not eliminated**. The tool ships without a self-test, which
+  one of those instead is **narrowed, not eliminated**. **The reaching set is itself a lower bound**:
+  a function handed the partition object as an *argument* calls neither anchor and is absent from the
+  28 even if it reads the pair, which no amount of the above accounts for. The tool ships without a self-test, which
   S5p's instrument has and which review holed twice; treat its function set as a reading.
 - **What it does to S5j's two explanations, and to the build.** S5k killed *nothing was bound*;
   step 2 confirmed Vid bound at runtime for both partitions. Arm 1 bears against the second, *the

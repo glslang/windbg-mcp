@@ -5133,7 +5133,7 @@ could mean anything about delivery, the alternative had to be excluded: **that t
 is not the field this dispatch consults.**
 
 That is a static question and
-[`tools/winhv_partition_readers.py`](tools/winhv_partition_readers.py) answers it. A census of
+[`tools/winhv_partition_readers.py`](../../tools/winhv_partition_readers.py) answers it. A census of
 `+0x10` alone cannot — it is one of the commonest displacements in any image, and
 `vid_field_census.py` finds **365** accesses to it in `winhvr.sys`. What makes an access a
 *partition object* access is the provenance of the base pointer, so the tool first finds every
@@ -5158,7 +5158,12 @@ functions read `+0x10`/`+0x18` as a pair — `WinHvpOnMirroringNotification` (`+
 `WinHvpSendRestartNotificationToAllPartitions` (`+0x1D84C`) and `WinHvIssueSnpPspGuestRequest`
 (`+0x20DB0`) — and their names say they serve other message types, but the objects they read were
 not identified. A dispatch for exception intercepts that consulted one of those instead is narrowed,
-not eliminated. The tool also ships without a self-test, which the instrument S5p built has and which
+not eliminated. **And the reaching set is a lower bound, not an enumeration**: a function that receives
+the partition object as an *argument*, or obtains it from a helper other than
+`WinHvpReferencePartition`, calls neither anchor and is absent from the 28 even if it reads the pair.
+Closing that needs provenance carried across calls and returns, which the tool does not do �— so
+"functions that can hold a partition object" means "functions that obtain one by the two routes it
+looks for". The tool also ships without a self-test, which the instrument S5p built has and which
 review found holes in twice; treat its function set as a reading rather than a proof.
 
 #### What this does to S5j's two explanations
