@@ -3435,12 +3435,140 @@ validated. The full record is the
   no raw installer holds the vector**, and on this bench the only known raw installer is
   `h3probe.sys`, which this plan controls and is retiring for exception vectors. A third-party raw
   installer cannot be excluded, so this is a condition to check rather than a property to rely on.
+  **Lifted 2026-09-29 by the operator, for guests the bench owns.** Both lift conditions above are
+  about *other parties* — the constraint exists because a removal can clear a vector someone else
+  holds. On a guest this bench owns and is willing to lose there is no other party whose loss
+  matters, and the operator has authorised exactly that: the lab was built to be spent on this. So
+  the constraint stands unchanged for any guest that is shared or that something depends on, and it
+  does **not** block S5q below. Two things do not lift with it. The hazard S5q actually carries is
+  not the one this paragraph is about — the receiver's callback runs in the **root's** dispatch
+  path, where a fault is a host bugcheck rather than a guest one, and no authorisation about guests
+  reaches it. And S5a's prohibition on planting an `int 3` in Secure Kernel is untouched: it is a
+  different prohibition for a different reason, and S5r below is the route to that question that
+  does not need it.
+
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
   is selected by VTL and a VMCS bitmap is privilege-blind — so what remains is an architectural
   inference rather than an open mechanism. S5a's prohibition on planting an `int 3` in Secure Kernel
   to check is unchanged.
+
+- **S5q — WRITTEN BEFORE THE RUN, 2026-09-29: chain Vid's intercept routine and receive a VTL1
+  `#BP`.** With the standing constraint lifted above for disposable guests, the route S5k
+  prohibited becomes the cheapest one to S5's pass condition. `WinHvSetInterceptRoutine` is a
+  `winhvr.sys` **kernel** export keyed by `HV_PARTITION_ID` (S5k read the key out of
+  `WinHvpReferencePartition`'s binary search), so a root driver reaches it with no VID partition
+  handle at all — **S5n's and S5o's refused `CreateFileW` is a fact about the *user-mode* route and
+  does not bind this one**, which is the thing the ordered plan below had stopped seeing. What S5k
+  called a permanent prohibition was a policy about shared guests, and its stated cost — one
+  child's intercepts — is one the operator accepts on a guest the bench owns.
+
+  **Replacing the routine defeats the arm, so chaining is the design rather than a refinement.**
+  `WinHvpOnInterception` (`+0x4438`) dispatches IO-port, MSR and CPUID intercepts through the same
+  routine it looks up at `+0x10`/`+0x18` of the partition object, so a receiver that merely assigns
+  over Vid's stops the child being serviced — and a child that is not serviced runs no enclave and
+  raises no `#BP`. The receiver must save the previous routine and context, handle **only**
+  `HvMessageTypeX64ExceptionIntercept` (`0x80010003`) carrying the vector it installed, and
+  tail-call the saved pair for everything else. That else-branch is also what keeps the arm clear of
+  `VidInterceptPreprocess`'s `__fastfail` holes (S5k): nothing is synthesised, only forwarded.
+
+  **Build**, all in `h3probe.sys`: a kernel-read IOCTL — the capability S5l named as missing, which
+  unblocks the replicated `[partition+0xB68][3]` read as a side effect — the chaining receiver, and
+  `WinHvCompleteIntercept` on the resume path.
+
+  **Pass:** a `#BP` raised in VTL1 user mode is delivered to **our** callback, its context is
+  readable, and `WinHvCompleteIntercept` resumes the raiser. Nothing in S5 has met this; S5h
+  measured a hold with no receiver at all.
+
+  **Controls, and the gate is withdrawn rather than caveated without them:**
+
+  - **`BP0` on the same guest.** A VTL0-raised `#BP` must arrive first, or the receiver is unproven
+    and nothing VTL1 rests on anything.
+  - **The VTL0-only twin.** Same install, same raise, must arrive. If a delivered message cannot
+    distinguish a VTL1 arrival from a VTL0 one, **say so** rather than inferring the VTL from the
+    arm that produced it — S5i's dispatch read is what carries the VTL claim, and this gate does
+    not re-derive it.
+  - **`#BR` installed with nothing raising it** — must deliver nothing. S5h's null arm, unchanged.
+  - **The chaining control, which is the one a green run would skip.** With the receiver installed
+    and no `#BP` raised, the guest keeps serving: a second PowerShell Direct session answers and the
+    enclave completes a full `L<n>` cycle. A wedged guest means the chain is wrong, and every
+    reading downstream of it is measuring that instead.
+
+  **Stop conditions.** A **host** bugcheck retires the in-kernel receiver and selects step 8's
+  own-partition build — the callback runs in the root's dispatch path, so a fault there takes the
+  bench rather than a guest. **That, and not the displacement, is the hazard this gate carries**;
+  the displacement is bounded to one child and is what the lift above accepts. A guest that wedges
+  only with the chain installed stops the gate until the chain is fixed. **Teardown order is part
+  of the gate**: restore the saved routine *before* removing the hypervisor intercept bit, and pair
+  both in a `finally` — per S5l the removal is an unconditional `and ~bit` with no refcount.
+
+  **What it settles beyond S5's own condition.** A delivered message says directly which branch S5h
+  met — Vid's drop, or Hyper-V receiving and retaining it — which S5k left to a replicated arm and
+  S5m could only half-supersede.
+
+- **S5r — WRITTEN BEFORE THE RUN, 2026-09-29: reproduce the published IUM-debugging patch from the
+  root, with no outer hypervisor.** Quarkslab's
+  [*Debugging Windows Isolated User Mode (IUM) processes*](https://blog.quarkslab.com/debugging-windows-isolated-user-mode-ium-processes.html)
+  (2023-09-07) debugs VTL1 **user** mode — breakpoints, single-stepping, registers, against
+  Microsoft's own shipped trustlets — by patching Secure Kernel's `SkpsIsProcessDebuggingEnabled`
+  in physical memory so that the guest's own VTL0 debugger is permitted to attach. Their access to
+  that memory is an **outer hypervisor**: VMware Workstation as L1 with its GDB stub enabled,
+  Hyper-V nested inside it, the target as L2, IDA driving the patch. **S4's direct route reaches
+  the same bytes from the Hyper-V root with no nesting and no second hypervisor**, which is the rig
+  [the EXDI stub plan](docs/secure-kernel/exdi-stub-plan.md) went looking for and this plan escaped.
+  So the question is not whether the technique works — it is published — but whether this plan's
+  primitive is a **strictly cheaper delivery** of it.
+
+  **Pass:** the patch is applied from the root, a debugger attaches to a trustlet in the VBS guest,
+  and a breakpoint in VTL1 user mode is hit.
+
+  **Controls:** the same attach **before** the patch must fail, or the patch is not what admitted
+  it; and the patched bytes are read back and restored against the on-disk image, as S4 did with
+  the `.text` cave rather than from memory.
+
+  **What a pass is worth, stated now so it is not overread.** It is a *reproduction with a simpler
+  rig*, not a new capability, and the write-up says so in its own first sentence. Its second value
+  is evidential and points at a question S4 left open: their patch **persists** for the length of a
+  debugging session, which is exactly the persistent-modification experiment S4 declined to run —
+  so a pass is evidence that Secure Kernel's own `.text` is not checksummed in a way that catches
+  this. That is a reading of one function's page on one build, **not** a property of VBS, and the
+  claim goes no further than the bytes touched.
+
+  **Stop:** a bugcheck on applying the patch is a **result** rather than a failure — it answers S4's
+  open question in the other direction — and it is taken against a throwaway checkpoint so that it
+  can be. Verify the details against the original write-up before building on this summary: the
+  gate was written from a fetched précis, and the function name, the build it was read on, and
+  whether the patch is applied once or re-applied are each load-bearing.
+
+- **S5s — WRITTEN BEFORE THE RUN, 2026-09-29: does LiveCloudKd's active CLSID deliver a VTL1
+  breakpoint, or is it inspection of a paused VM?** E2a in
+  [the EXDI stub plan](docs/secure-kernel/exdi-stub-plan.md) named this arm and **it was never
+  run**, which is why this plan has carried "the active CLSID's breakpoint support is undemonstrated
+  by its own write-up" as an observation about someone's documentation rather than a measurement.
+  It decides what every novelty claim here is worth. The tool's headline is a *debugger*; its
+  published write-up claims you can "(potentially) set breakpoints and walk through code" and
+  demonstrates module enumeration and memory reads through `dx` — no breakpoint, no step, no
+  exception anywhere in it.
+
+  **Binary, and either outcome is useful.** Register the active CLSID
+  (`{67030926-1754-4FDA-9788-7F731CBDAE42}`; the passive one is
+  `{53838F70-0936-44A9-AB4E-ABB568401508}`), attach to the VBS guest from its Hyper-V host, and set
+  a breakpoint in `securekernel.exe`. **If it is hit**, execution control over VTL1 exists today,
+  and what S5 contributes is the route rather than the capability — say that plainly and rewrite
+  the claims. **If it is not**, what the tool provides is inspection of a paused VM, which is then
+  the accurate description of every published VTL1 result outside Quarkslab's.
+
+  **Controls:** the same breakpoint set in `nt` through the same CLSID must be hit, or a miss
+  measures the rig and not VTL1. And the **passive** CLSID must first resolve SK symbols against
+  live memory with the VBS-off twin finding no SK data block — E2a's original control, unchanged,
+  and the one that says the tool is pointed at a Secure Kernel at all.
+
+  **Cost and hazard, which are on the debugger host rather than a guest.** `hvmm.sys` carries a
+  revoked certificate (`CN=Atheros Communications Inc.`, expired 2013) and needs re-signing plus
+  test signing on the **Hyper-V host of the target**, and its own `Start-ExdiDebugger.ps1` carries a
+  `Stop-ExdiContainingDllHosts` because the surrogate outlives the debugger — the same E0 activation
+  stall this plan already hit. Both weakenings outlive the run: record them and reverse them.
 
 ### Out of scope, with the reason rather than as a list
 
@@ -3531,8 +3659,11 @@ validated. The full record is the
       functions absent from `.pdata`, and addresses formed in two steps — and both are closed or
       measured, with neither changing the result. **Residuals**: an inter-procedural pointer, a
       bulk copy spanning the field, and `[p+0x3060]`'s writers being bounded rather than closed.
-   6. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
-      the standing constraint above, and the first also by kernel-memory access. Unchanged by S5o.
+   6. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — were
+      held by the standing constraint above, which lifted for guests the bench owns on
+      2026-09-29, and the first also by root kernel-memory access, which S5q's kernel-read IOCTL
+      supplies. Both are runnable under S5q rather than blocked, and a delivered message answers
+      the second outright.
    7. **Handle duplication and inheritance, which S5n excluded rather than closed and which this
       plan twice wrote out of existence.** A process that duplicates or inherits a handle
       `vmwp.exe` already holds reaches the exported receiver **without** passing the create path's
@@ -3541,12 +3672,23 @@ validated. The full record is the
       protected, and taking a handle out of it is an attack on the platform rather than an
       experiment on it), and *declining to attempt* is not *excluding*. It stays here until it is
       one or the other.
-   8. **← active step, and a decision rather than an arm.** The VMM-of-our-own question: own the
+   8. **The fallback S5q's host-bugcheck stop selects, and a decision rather than an arm.**
+      The VMM-of-our-own question: own the
       partition from creation, where `VidPartitionCreate` admits any name for an administrator and
       the whole `vid.dll` sequence is then reachable by construction. S5p measured the warrant S5o
       lacked for the admission path — but only for writes a decoded-operand census can see, and
       only alongside step 7 still being open, so this is the route with **no known obstacle**
       rather than the only one. Still a reason to **cost** the rig rather than start building it.
+
+   **The list above is the *ownership* route, and S5q goes around it rather than continuing it.**
+   Every step in it exists because the exported user-mode receiver needs a partition handle.
+   `WinHvSetInterceptRoutine` needs none — it is a `winhvr.sys` kernel export keyed by partition id
+   — so with the standing constraint lifted for disposable guests the active work is **S5q**, and
+   steps 6 to 8 are what matters only if S5q's stop conditions fire. Step 7 stays open on its own
+   terms; step 8 is the fallback the host-bugcheck condition selects. **This is the second time
+   this plan has kept walking a route after a cheaper one opened beside it** — S5m already deleted
+   the driver S5k specified — and the cause both times was a schedule written against the obstacle
+   in front of it rather than against the question.
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from
