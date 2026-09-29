@@ -3676,9 +3676,14 @@ review findings against lists a later gate had already invalidated.
 - **The IOCTL code and the user-mode surface for `VidHandlerIoctlExceptionRegister`** — its
   dispatch entry in Vid's IOCTL table, the input layout, and whether a documented API reaches it.
   That is what decides whether S5's receiver is a supported call, a private one, or a driver.
+  **Answered by S5m**: `0x221148`, wrapped by the exported `vid!VidRegisterExceptionHandler`, with
+  attach, receive, complete and unregister exported beside it — not reached by WHP, so exported
+  rather than documented, and not a driver.
 - **`[partition+0xB68][3]` during an intercept arm**, which is the only thing that separates the
   drop from S5j's retained explanation. The slot is mutable, so any reading is about the arm that
-  takes it rather than about S5h.
+  takes it rather than about S5h. **S5m answers half of this and leaves half open**: a registration
+  reports whether the slot is claimed *at that call*, but it also *claims* it, so it cannot observe
+  what an unregistered vector meets. That still wants a contemporaneous, non-mutating read.
 - **Whether the hold is a loop**, per the inference above, since a loop and a held trap want
   different things from a debugger design.
 - **Answered while this gate was in review**: `hvix64.exe`'s type-3 *removal* path, read as S5l —
@@ -3833,6 +3838,12 @@ So the honest statement is a constraint with no remedy attached: **treat *"an in
 free"* as false.** It is free only if nobody else holds the vector; nothing in the ABI says whether
 anybody does; on this bench nothing yet can look; and looking would not be enough.
 
+**S5m then found the remedy, which is not to look but to stop using the raw call.**
+`vid!VidRegisterExceptionHandler` arms the same intercept through Vid, which refuses a claimed slot
+with `STATUS_VID_DUPLICATE_HANDLER` before touching the hypervisor, and `VidUnregisterHandler`
+clears the slot and the bit together. The pre-check this section wanted is inside the supported
+path, so the destructive pair should simply be retired.
+
 #### Limits
 
 - **One build, Intel only, static.** `10.0.26100.9444`, the same image as S5i and S5j; `hvax64.exe`
@@ -3843,6 +3854,175 @@ anybody does; on this bench nothing yet can look; and looking would not be enoug
 - **`+0x6124`'s writers are not read**, so what puts a vector in a child's allowed mask is open.
   The `#BP` exemption above does not depend on it.
 - **Nothing was run live**, and no bench state was touched.
+
+### S5m result, 2026-09-29: the receiver is a user-mode export, and there is no driver left to write
+
+**`vid.dll` exports the whole thing.** The IOCTL S5k found is `0x221148`, and it has a thin
+user-mode wrapper — `vid!VidRegisterExceptionHandler` — beside the attach, receive, complete and
+unregister calls that go with it. So S5's receiver needs **no driver of our own, no port, and no
+hypercall**: it is a sequence of exported calls from an ordinary user-mode process holding a
+partition handle.
+
+That is the third downward re-scope in a row, and it is worth seeing them together, because each
+one deleted the build the previous gate had specified:
+
+| gate | what it said to build | why the next one deleted it |
+|---|---|---|
+| plan → S5j | `HvCallCreatePort` + a hand-rolled SynIC page in `h3probe.sys` | `winhvr.sys` exports the whole kernel API |
+| S5j → S5k | a `winhvr.sys` client in `h3probe.sys` | the receiving path exists in `Vid.sys`; it wants a *vector registration*, which is an IOCTL |
+| S5k → S5m | an IOCTL client in `h3probe.sys` | the IOCTL has a user-mode export, and so does everything around it |
+
+**Measured against** `C:\Windows\System32\drivers\Vid.sys` **`10.0.26100.9278`** (the same image as
+S5k), `C:\Windows\System32\vid.dll` **`10.0.26100.8457`**, SHA-256 `9B538C07FA65C09D…`, and
+`C:\Windows\System32\WinHvPlatform.dll` **`10.0.26100.9278`**, SHA-256 `07FEC05320E576C3…`. All
+three read as DbgEng image targets with public PDBs, plus byte-level PE scans for the import,
+export and reference tables. Nothing was called and nothing was run.
+
+#### The IOCTL, read from the dispatcher rather than guessed
+
+`VidIoControlPartition` (`+0x32980`) is a compare chain on the control code, and the exception case
+has exactly one entry — an exhaustive scan for branches into `+0x33706` finds one:
+
+```text
+0x33602  mov  eax, r9d                ; the IoControlCode
+0x33605  sub  eax, 0x221144
+0x3360A  je   0x3373C                 ; 0x221144 -> VidHandlerIoctlCpuidRegister
+0x33610  mov  edi, 4
+0x33615  sub  eax, edi
+0x33617  je   0x33706                 ; 0x221148 -> VidHandlerIoctlExceptionRegister
+```
+
+**`0x221148`** decodes as `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x452, METHOD_BUFFERED, FILE_ANY_ACCESS)` —
+device type `0x22`, function `0x452`, method `0`, access `0`. **`FILE_ANY_ACCESS` is not the access
+control here**: the code is dispatched by `VidIoControlPartition`, which is reached with a
+*partition* in `rcx`, so what gates it is possession of a partition handle rather than a permission
+on the device.
+
+The case block states the buffer contract before it calls:
+
+```text
+0x33706  cmp   dword ptr [rbp+0x40], 0x10     ; input length  >= 0x10
+0x33714  cmp   dword ptr [rbp+0x50], 8        ; output length >= 8
+0x3371E  mov   r9,  qword ptr [r11 + 8]       ; Context
+0x33726  mov   r8d, dword ptr [r11 + 4]       ; Parameter
+0x3372A  mov   dl,  byte  ptr [r11]           ; Vector
+0x3372D  mov   qword ptr [rsp+0x20], rax      ; &out handle
+0x33732  call  Vid!VidHandlerIoctlExceptionRegister
+```
+
+so the input is `{ u8 Vector; u8 pad[3]; u32 Parameter; u64 Context; }` and the output is the
+`8`-byte handle S5k read being taken from `[entry+0x60]`.
+
+#### The user-mode side, which is the finding
+
+`vid.dll` carries `0x221148` as an immediate at exactly one place, `+0x16C50`, inside
+**`vid!VidRegisterExceptionHandler`** — one of the library's **215 exports**. It is a wrapper and
+nothing more: an event, one `NtDeviceIoControlFile`, a `STATUS_PENDING` wait, and
+`RtlNtStatusToDosError`/`SetLastError` on failure.
+
+```text
+0x16C25  mov   dword ptr [rsp+0x48], 8        ; OutputLength
+0x16C39  mov   dword ptr [rsp+0x38], 0x10     ; InputLength
+0x16C50  mov   dword ptr [rsp+0x28], 0x221148 ; IoControlCode
+0x16C60  call  qword ptr [vid!_imp_NtDeviceIoControlFile]
+```
+
+Its arguments map straight onto the buffer above: `rcx` the partition handle, `dl` the vector,
+`r8d` the parameter, `r9` the context, and the fifth argument the `8`-byte output. **And the rest
+of the sequence is exported beside it:**
+
+| for | exports |
+|---|---|
+| a partition handle | `VidAttachPartition`, `VidGetPartitionIds`, `VidGetHvPartitionId`, `VidDetachPartition` |
+| arming a vector | **`VidRegisterExceptionHandler`**, and siblings for CPUID, MSR, IO port, APIC EOI and triple fault |
+| receiving | `VidMessageSlotMap`, `VidSetupMessageQueue`, `VidMessageSlotHandleAndGetNext`, `VidHandleMessageAndGetNextMessage` |
+| releasing | `VidUnregisterHandler` |
+
+`VidGetPartitionIds` and `VidGetHvPartitionId` matter more than they look: they are the translation
+between a VID partition handle and the `HV_PARTITION_ID` every gate from S5b onward has been
+passing to hypercalls, so the two halves of this record address the same child by construction
+rather than by the operator lining up numbers.
+
+#### The public API does not reach it, and that is worth stating plainly
+
+`WinHvPlatform.dll` — the documented WHP surface — **delay-imports 31 functions from `vid.dll`, and
+`VidRegisterExceptionHandler` is not one of them.** What it imports is the *Exo* family:
+`VidCreateExoPartition`, `VidReopenExoPartition`, `VidGetExoPartitionProperty`,
+`VidSetPartitionProperty`, `VidDeletePartition`, `VidResetPartition`. So WHP's exception exits are
+a mechanism for WHP's **own** partitions, and the path to a Hyper-V VM's exception intercept is
+`vid.dll`'s export rather than anything public.
+
+**So the answer to "is S5 one supported call from passing" is no, and the reason is narrower than
+"no API exists".** The API exists, it is exported, and it is stable enough that Microsoft's own
+`vmwp.exe` is built on it — it is simply not part of a documented contract, so anything built on it
+is built on an observed interface. That is a materially different position from the hand-rolled
+driver this plan carried three gates ago, and it should be recorded as such rather than as a pass.
+
+#### What this does to S5l's hazard: it removes it by construction
+
+S5l established that an install/remove pair on the raw hypercall is destructive to whoever else
+holds the vector, and that the pre-check it wanted — Vid's `[partition+0xB68][vector]` — needs root
+kernel memory this bench cannot read. **Going through `VidRegisterExceptionHandler` makes the
+pre-check unnecessary**, because the kernel side does it: `VidHandlerpExceptionRegisterEntry`
+refuses a claimed slot with `0xC0370001` `STATUS_VID_DUPLICATE_HANDLER` **before** touching the
+hypervisor, and `VidUnregisterHandler` clears the slot and the hypervisor bit together.
+
+So the registration's own return value is the measurement S5k has been waiting for:
+
+- **`STATUS_VID_DUPLICATE_HANDLER`** ⇒ a VID client already holds `#BP` on that child ⇒ S5j's
+  retained explanation is the live one.
+- **Success** ⇒ the slot was `0xFF` ⇒ the drop is what an unregistered vector meets, and the arm
+  now holds the registration itself and can receive what the intercept produces.
+
+Either way it is non-destructive, it needs no reboot and no kernel read, and it replaces the raw
+hypercall the probe has been using since S5b. **That supersedes the replicated-arm plan S5k and
+S5l wrote**, which wanted a kernel-memory read this bench cannot do.
+
+#### What to run next
+
+1. **Attach to a child's partition and register `#BP` through `vid.dll`.** The return value answers
+   the branch question on its own, per the table above.
+2. **If it succeeds, receive.** `VidSetupMessageQueue` / `VidMessageSlotMap` /
+   `VidMessageSlotHandleAndGetNext`, and a `#BP` raised in the guest — in VTL0 first, then in the
+   VTL1 enclave, which is S5's actual pass condition.
+3. **Stop using the raw `WinHvInstallIntercept` pair** for exception vectors. It is the destructive
+   version of a call that has a safe one.
+
+#### Limits
+
+- **Nothing was called.** This is three images read statically. Whether `VidAttachPartition`
+  succeeds against a *running* Hyper-V VM's partition from a second process, and at what privilege,
+  is **not read here** and is the first thing step 1 will find out. A partition owned by `vmwp.exe`
+  may well refuse a second attach.
+- **`vid.dll`'s exports are not a documented contract.** They are stable entry points with public
+  PDB names, which is not the same thing, and a build can move them.
+- **The message-slot protocol is not read** — what `VidSetupMessageQueue` and `VidMessageSlotMap`
+  expect, and the layout a client sees, are step 2's work rather than established here.
+- **One build each**, named above, and Intel/this host only.
+
+#### What the bench can and cannot debug, since two gates planned around getting this wrong
+
+**No machine in this lab has kernel debugging enabled — not the host, and neither guest** — and the
+setting that looks like it says otherwise says something else. Measured 2026-09-29, host directly
+and both guests over PowerShell Direct:
+
+| | `{current}` | `bcdedit /dbgsettings` |
+|---|---|---|
+| host | no `debug` entry | `debugtype Local` |
+| Lab Guest Control | no `debug` entry | `debugtype Local` |
+| Lab Guest Hyper-V | no `debug` entry (`testsigning Yes`) | `debugtype Local` |
+
+`/dbgsettings` prints the **global debugger-settings store**, which is `debugtype Local` on a stock
+image whether or not anything is debugged; only `debug Yes` in the boot entry enables it. Reading
+the first as the second is what made S5k's and S5l's "just read the slot" plan look cheap, and
+`attach_kernel_local` answering `0x80004001` is what corrected it. **Neither guest has KDNET
+configured either**, so any plan wanting a kernel debugger *inside* a guest starts with a reboot
+there too.
+
+**None of that blocks what comes next**, and it is written down so nobody re-derives it: every S5
+arm from S5b onward drives `h3probe.sys` on the **host** and a raiser in the guest over
+**PowerShell Direct**, which needs no network, no KDNET and no guest debugger. S5m's steps are
+host-side user-mode calls plus that same raiser.
 
 ## Explicitly out of scope
 
