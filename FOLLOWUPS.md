@@ -3477,6 +3477,30 @@ validated. The full record is the
   unblocks the replicated `[partition+0xB68][3]` read as a side effect — the chaining receiver, and
   `WinHvCompleteIntercept` on the resume path.
 
+  **Resolution, read 2026-09-29 before anything was built.** The WDK ships **no kernel-mode import
+  library for `winhvr.sys`** — the only `WinHv*` libraries in `10.0.26100.0` are user-mode
+  `WinHvPlatform.lib` and `WinHvEmulation.lib`, which are the WHP *Exo* family S5m already found to
+  be the wrong mechanism. And `MmGetSystemRoutineAddress`, which is how `h3probe.c` resolves
+  `nt!HvlInvokeHypercall` today, is documented to cover `ntoskrnl` and `hal` only. **So the receiver
+  resolves its imports itself**: find `winhvr.sys`'s base in the loaded-module list and parse its
+  export directory by name. The eight exports the gate needs were read out of this host's own
+  `winhvr.sys` (201 exports) rather than taken from S5j's record — `WinHvSetInterceptRoutine`,
+  `WinHvCompleteIntercept`, `WinHvInstallIntercept`, `WinHvGetSintMessage`, `WinHvSetEndOfMessage`,
+  `WinHvCreatePort`, `WinHvConnectPort` and `WinHvAllocatePartitionSintIndex`, all present. That
+  export walk is the one piece of this gate with no precedent in the driver, so it is written and
+  tested before the intercept goes anywhere near it.
+
+  **Staged, because the dangerous part is the smallest part.** A fault in our callback is a **host**
+  bugcheck, and the callback is the only new code executing in the root's dispatch path — so it runs
+  first with nothing in it. **Arm 0, the null receiver**: chain in, forward *every* message to the
+  saved routine, handle nothing, install no intercept at all. **Pass:** the guest keeps serving —
+  a second PowerShell Direct session answers and the enclave completes a full `L<n>` cycle — and
+  teardown restores the saved pointer. That exercises the whole hazard with no logic in it, and it
+  is also the only arm that can be run without installing a vector, so the standing constraint does
+  not reach it. Only if arm 0 is stable does the exception handling go in. **If arm 0 bugchecks the
+  host, the in-kernel receiver is retired and step 8's own-partition build is selected** — the same
+  stop condition as below, reached for a tenth of the cost.
+
   **Pass:** a `#BP` raised in VTL1 user mode is delivered to **our** callback, its context is
   readable, and `WinHvCompleteIntercept` resumes the raiser. Nothing in S5 has met this; S5h
   measured a hold with no receiver at all.
