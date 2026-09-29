@@ -2989,8 +2989,9 @@ nothing**, which is worth recording because S5g cost it four reboots.
   Hyper-V's own routine, which *discards* it rather than holding it whenever the vector is not
   claimed in a per-partition table an install hypercall does not touch. Whether this gate's own
   message met that branch turns on a runtime byte S5k did not read, and **the controls above cannot
-  stand in for it**: this probe's raw removals clear the hypervisor bit without clearing that table,
-  so a control arm passes either way. See S5k.
+  stand in for it**: they observe a hypervisor mask this probe's own raw removals also write, and
+  whether those removals clear it is itself unread — so the implication a controls-based argument
+  would need is unestablished. See S5k, which sets the argument out and retracts it.
 - **`HvCallCreatePort` / `HvCallConnectPort` are untried**, and the bullet above is why the next
   gate has to establish *where the message goes* before assuming a port of our own would receive
   it. If intercepts are delivered to the partition's designated port, creating a second one is not
