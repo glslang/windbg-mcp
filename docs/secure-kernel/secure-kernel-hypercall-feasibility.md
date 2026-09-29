@@ -4920,3 +4920,115 @@ it is not.
 Restored and verified byte-for-byte; `LsaIso` alive; both guests running continuously with no reboot;
 host not rebooted. Checkpoint `pre-S5r-patch` (2026-09-29 18:31) was taken before the write and was not
 needed — it can be deleted once nobody wants the rollback. `SdkWriteVirtualMemory` was not used again.
+
+### S5q steps 1 and 2, 2026-09-29: the receiver's imports resolve, and the table it must chain into is read
+
+**Two read-only steps of the S5q build, run before anything executes in Hyper-V's dispatch path.**
+Neither installs an intercept, registers a routine or writes to a partition. What they are for is
+that the *next* step — chaining — has no unexamined unknowns left in it, and step 2 produced a
+constraint that a static read could not have given.
+
+#### Step 1 — the imports resolve, and there is no way to link them
+
+`h3probe.sys` gains `IOCTL_H3_RESOLVE` (0x805), which reports what its `winhvr.sys` export walk
+found and does nothing else.
+
+**There is no kernel-mode import library.** The only `WinHv*` libraries in the 26100 WDK are
+user-mode `WinHvPlatform.lib` and `WinHvEmulation.lib`, which are the WHP *Exo* family S5m
+established is a different mechanism; and `MmGetSystemRoutineAddress`, which is how this driver
+resolves `nt!HvlInvokeHypercall`, is documented to cover `ntoskrnl` and `hal` only. So the driver
+finds the module with `AuxKlibQueryModuleInformation` — the documented API, in preference to a
+`PsLoadedModuleList` walk off `DriverSection`, because code whose faults bug check the **root**
+should not also depend on an undocumented structure layout — and parses the export directory
+itself.
+
+Three properties of that walk are deliberate rather than incidental. Every RVA is **bounded against
+`SizeOfImage`** before it is dereferenced. A **forwarded** export — one whose function RVA falls
+back inside the export directory, where the value is a `"Dll.Name"` string rather than code — is
+**refused** rather than returned, because calling a forwarder string is exactly the wrong-pointer
+fault this gate cannot afford. And resolution failure is **non-fatal to the load**: a probe that
+answers *"six of eight, and here is which"* tells the operator more than one that refuses to load,
+and every consumer checks its own pointer.
+
+Against `winhvr.sys` `10.0.26100.8972`, **8 of 8 resolved and all 8 inside the image** — the client
+checks containment separately, because an address outside `[base, base+size)` is not an export of
+that module however plausible it looks.
+
+| export | RVA |
+|---|---|
+| `WinHvSetInterceptRoutine` | **`+0x8020`** |
+| `WinHvCompleteIntercept` | `+0x8D80` |
+| `WinHvInstallIntercept` | `+0x21BB0` |
+| `WinHvGetSintMessage` | `+0x62B0` |
+| `WinHvSetEndOfMessage` | `+0x41A0` |
+| `WinHvCreatePort` | `+0x21C10` |
+| `WinHvConnectPort` | `+0x21AE0` |
+| `WinHvAllocatePartitionSintIndex` | `+0x1BA20` |
+
+**`+0x8020` is the RVA S5k recorded** for `WinHvSetInterceptRoutine` from a DbgEng image-target read
+of the same build. A static read and a runtime export walk agreeing on one offset is the check that
+makes the other seven worth anything.
+
+#### Step 2 — the table, read with its own lock and guarded by a build check
+
+`IOCTL_H3_WHVPART` (0x806) reads the routine and context Hyper-V currently has registered per
+partition. **The layout is read out of this build's code, not taken from S5k's note**, and the two
+functions that use it agree on all of it — `WinHvpReferencePartition` (`+0x2B40`) and
+`WinHvpOnInterception` (`+0x4438`):
+
+```text
+WinHvpPartitionArray (+0x152D0)  ->  [0x00] ULONG  Count
+                                     [0x08] { ULONG64 PartitionId; PVOID Object; }[]   sorted, binary-searched
+
+Object  ->  [0x00] ULONG  RefCount        (`lock inc [rbx]`)
+            [0x10] PVOID  Routine
+            [0x18] PVOID  Context
+```
+
+and the dispatch is **`Routine(Context, Message)`** — context in `rcx`, message in `rdx` — reached
+through **`guard_dispatch_icall`**.
+
+**Two guards, and both are the point of the step.** `WinHvpPartitionArray` is **not exported**, so
+its RVA is a build-specific constant and using it on another build reads arbitrary kernel memory;
+the IOCTL therefore refuses unless the **loaded** image's `TimeDateStamp` *and* `SizeOfImage` match
+the build the RVA came from (`0x31B98FBA` / `0x29000`), and reports what it saw either way. And it
+takes the **same shared push lock** `WinHvpReferencePartition` takes (`WinHvpPartitionArrayLock`,
+`+0x152C8`), for the same reason: a partition torn down concurrently leaves a stale `Object` pointer
+whose dereference at `+0x10` faults in the root.
+
+Live, on the bench host:
+
+| partition | object | refcount | routine | context |
+|---|---|---|---|---|
+| `0x2` | `0xFFFF818A46A41C40` | 1 | `0xFFFFF807502E4170` | `0xFFFF818A46AB3000` |
+| `0x3` | `0xFFFF818A469BAA20` | 1 | `0xFFFFF807502E4170` | `0xFFFF818A46DF5000` |
+
+`0xFFFFF807502E4170` is **`Vid!VidInterceptIsrCallback`** (`Vid.sys+0x4170`), with
+`VidInterceptPreprocess` the next symbol — the pair S5k read statically, now confirmed **at
+runtime**: Vid is bound, for both partitions, and its routine is the one the hypervisor would call.
+The two partition ids are the same `0x2`/`0x3` every earlier enumeration found, and the base the
+driver reported for `winhvr.sys` matched an independent user-mode `EnumDeviceDrivers` walk exactly.
+
+#### The constraint this produced, which the static read could not
+
+**One routine, two different contexts.** The routine is Vid's single dispatcher; the **context** is
+what identifies the partition. So a chain must save and forward **both**, and forward the *original*
+context for that partition — a chain that saved only the routine pointer and passed its own context
+looks correct and makes Vid dereference the wrong partition object, which is a **host** bug check on
+the first non-exception intercept. Nothing in S5j's or S5k's static reading says this; it comes from
+seeing one routine against two contexts.
+
+#### And a hazard for the chaining step, which is bench-dependent
+
+The indirect call goes through `guard_dispatch_icall`, so a chained routine must be an acceptable
+**CFG** indirect-call target. On an HVCI host that is a real constraint on a driver built without
+CFG metadata. On this bench it is not, HVCI being off — asserted from **behaviour**, that
+test-signed drivers load here at all, rather than from `SecurityServicesRunning = 0`, which is a
+field this record has already caught being wrong on another machine. Anyone repeating this on an
+HVCI host should expect to meet it.
+
+#### What is still not done
+
+Arm 0 — the null receiver — has not run. Nothing in these two steps registered a routine, and no
+code of ours has executed in the root's dispatch path. The driver was stopped after each read and
+`h3probe.c`'s two new IOCTLs are read-only by construction.
