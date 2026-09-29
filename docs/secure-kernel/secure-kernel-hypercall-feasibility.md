@@ -2985,7 +2985,9 @@ nothing**, which is worth recording because S5g cost it four reboots.
   exactly this: the trap held, the thread pending, the rest of the partition untouched. Whether that
   is what happens, or the hypervisor queues an undeliverable message some other way, is not
   established by anything here. What is established is the behaviour at the guest's exception
-  dispatch.
+  dispatch. **S5k answered it, and this candidate was wrong in its second half**: the message does
+  reach Hyper-V's own routine, which then discards it rather than holding it, because a vector
+  installed by hypercall alone is not claimed in the per-partition table that routine consults.
 - **`HvCallCreatePort` / `HvCallConnectPort` are untried**, and the bullet above is why the next
   gate has to establish *where the message goes* before assuming a port of our own would receive
   it. If intercepts are delivered to the partition's designated port, creating a second one is not
@@ -3009,6 +3011,9 @@ nothing**, which is worth recording because S5g cost it four reboots.
     and SynIC page are not the build, because `winhvr.sys` exports the API and `Vid.sys` already
     consumes it — and a registration may *displace* whatever entry Hyper-V holds, so the next
     step is identifying the table's key, which decides whether it displaces anything at all.
+    **S5k ran that step too, and the exported API is not the build either**: the key is the
+    partition id, the entry is Vid's, and the receiving path Vid already runs needs a *vector
+    registration*, which is an IOCTL rather than anything built here.
   - **The dispatch read**, which is what decides whether any of this reaches Secure Kernel:
     `hvix64.exe`'s exception-intercept path, for a check on the active VTL. S5b named it, two
     attempts had failed on that image, and Ghidra is on this bench now. A receiver that works would
@@ -3264,7 +3269,8 @@ records that `Vid.sys` has a handler for this exact message type. So "nothing wa
 existing handler received the unsolicited intercept and retained it" are **both** live explanations
 of S5h's hold, and they are not the same gate: the first wants a binding built, the second wants
 Hyper-V's handler understood. Distinguishing them is what comes next, so this record does not pick
-one.
+one. **S5k, below, picked neither**: the handler received the message and *dropped* it, the vector
+never having been claimed in a per-partition table of Vid's own.
 
 #### What the root side already has
 
@@ -3316,6 +3322,10 @@ displaced handler services IO-port, MSR and CPUID intercepts; and if it is an al
 is no displacement at all. All three are open. **Establishing which is the next thing to do** — from
 `Vid.sys`'s own call sites, which pass the key, and from whatever creates the entries.
 
+**Answered by S5k, below: the key is the partition id, so the blast radius is one child** — and the
+prohibition hardens rather than lifts, because the routine a registration would displace is the one
+that dispatches to Vid's own per-vector table. Do not call it.
+
 #### What this settles and what it leaves
 
 - **The routing question is answered**: a parent-installed intercept's message is delivered to the
@@ -3336,6 +3346,294 @@ is no displacement at all. All three are open. **Establishing which is the next 
   completion — which is the only thing that says *why the intercept stays outstanding*. The key
   cannot answer that, and if Hyper-V's handler is receiving and retaining the message then a second
   receiver is the wrong build whatever the key turns out to be.
+
+  **Both were run as S5k, below, and neither explanation survived.** Vid was bound and its routine
+  ran; it recognises `0x80010003`, and then discards it because the vector is not claimed in a
+  per-partition table that lives in `Vid.sys` and that the install hypercall knows nothing about. A
+  second receiver is the wrong build for a third reason: the right one already exists.
+
+### S5k result, 2026-09-29: the message was received and dropped, and the receiver is an IOCTL rather than a build
+
+**Both reads S5j called for are done, and between them they retire both of S5j's live explanations
+of S5h's hold.** It was not "nothing was bound" — `Vid.sys` is bound, per partition, and its routine
+ran. It was not "the existing handler received the unsolicited intercept and retained it" — the
+handler received it and **discarded** it, in four instructions, because the vector was not
+registered in a second table that lives in `Vid.sys` and that `HvCallInstallIntercept` knows nothing
+about. The hypervisor-level install S5b built and S5h fired is **half** of what the root's own stack
+does to arm an exception intercept, and the half it skipped is the half that makes anyone listen.
+
+So S5's missing piece is not a receiver to build. It is `Vid!VidHandlerIoctlExceptionRegister`, an
+IOCTL that takes a vector, claims a per-partition slot for it, and *then* calls
+`WinHvInstallIntercept` with the same type-3 descriptor S5b read — after which the delivery path
+S5j traced ends in a message to whoever opened the handle, with an instruction-pointer advance and a
+resume already written.
+
+**Measured against** this host's own `C:\Windows\System32\drivers\winhvr.sys` **`10.0.26100.8972`**,
+SHA-256 `7D407FC49711176E…ECA1CE`, and `Vid.sys` **`10.0.26100.9278`**, SHA-256
+`6611BCD768EFCFF9…B06697` — the same two images and the same build pair as S5b and S5j, so this
+read sits on the record those two left rather than beside it. Both were opened as DbgEng image
+targets (`open_dump` on the `.sys` itself) with public PDBs from the Microsoft symbol server, which
+is what makes every name below a name rather than an offset. Exhaustive reference scans over the
+executable sections were done with two throwaway byte scanners rather than a disassembler — see the
+limits at the end.
+
+#### Read one: the table key is the partition id, and the slot belongs to whoever created the partition
+
+`WinHvSetInterceptRoutine` (`winhvr+0x8020`) is four instructions once the prologue is off:
+
+```text
+0x8030  call  winhvr!WinHvpReferencePartition   ; look up by the FIRST argument
+0x8038  jne   0x8041                            ; not found -> 0xC035000D
+0x8044  mov   qword ptr [rax+0x10], rdi         ; routine
+0x8048  mov   qword ptr [rax+0x18], rbx         ; context
+```
+
+and `WinHvpReferencePartition` (`+0x2B40`) takes `WinHvpPartitionArrayLock` shared, binary-searches
+`WinHvpPartitionArray` — a count at `+0`, then 16-byte entries of `{ qword key, qword object }` — and
+refcounts the object it finds. **The key is an `HV_PARTITION_ID`**, which the failure path states
+outright: `0xC035000D` is `STATUS_HV_INVALID_PARTITION_ID`, *"a partition with the specified
+partition Id does not exist"*. It is not a message type, not a SINT, and not an allocated per-client
+handle.
+
+`WinHvpOnInterception` (`+0x4438`) is the other end of the same array, and it settles that the two
+agree:
+
+```text
+0x444C  mov   r11, qword ptr [rcx+8]            ; HV_MESSAGE_HEADER.Sender = sending partition
+          ... the same binary search over WinHvpPartitionArray ...
+0x4488  mov   rcx, qword ptr [r8+rcx*8+0x10]    ; the partition object
+0x4492  mov   rax, qword ptr [rcx+0x10]         ; its routine
+0x4499  mov   rcx, qword ptr [rcx+0x18]         ; its context
+0x449D  call  winhvr!guard_dispatch_icall       ; routine(context, message)
+```
+
+**So the blast radius of a registration is exactly one partition, and displacement is real.** The
+three outcomes S5j could not choose between resolve to the first: per-partition means one child, and
+a second caller registering for a child Vid created replaces `VidInterceptIsrCallback` for that
+child — taking its IO-port, MSR, CPUID, halt and memory intercepts with it, since one routine serves
+all of them.
+
+Vid's own two call sites confirm the shape from the other side, and they are the **only** two in the
+image — an exhaustive scan for `call qword ptr [rip+disp32]` resolving to
+`Vid!_imp_WinHvSetInterceptRoutine` (`+0x57CA0`) finds `+0x7CB21` and `+0xC2166` and nothing else:
+
+| site | in | passes |
+|---|---|---|
+| `+0xC2166` | `VsmmPhuStoreHvPartitionRestore` | `rcx = [partition+0x288]`, routine `VidInterceptIsrCallback`, context = the Vid partition object |
+| `+0x7CB21` | `VsmmPhuStoreHvPartitionTeardown` | the same id, routine `VsmmPhuStorepHvPartitionInactiveInterceptRoutine` |
+
+An activate/deactivate pair on one field — **Vid itself relies on assignment replacing**, which is
+the cleanest available proof that the slot is not chained. And `[Vid partition object + 0x288]` is
+the partition id, since it is what Vid passes as the first argument to `WinHvSetVpRegisters`,
+`WinHvInstallIntercept`, `WinHvCompleteIntercept` and `WinHvCancelVpDispatchLoop` as well.
+
+The slot is also not first-come-first-served: `WinHvpCreatePartitionObject` (`+0x1D42C`) allocates
+the `0x100`-byte object and writes the routine and context into that same `+0x10`/`+0x18` pair **at
+creation**, from its third and fourth arguments, and its only caller is `WinHvCreatePartitionEx`.
+Vid supplies them there too — `VsmmPhuStorepHvPartitionDeserialize` passes
+`VsmmPhuStorepHvPartitionInactiveInterceptRoutine` straight into `WinHvCreatePartition`, and
+`VidPartitionIoctlSetup` picks between `VidInterceptIsrCallback` and
+`VidExoVpInterceptIsrCallback` and does the same. **To hold the slot without displacing anyone you
+would have to be the partition's creator**, and for a Hyper-V guest that is Vid.
+
+#### Read two: Vid receives `0x80010003`, recognises it, and drops it
+
+`VidInterceptIsrCallback` (`+0x4170`) — the routine registered above — has **no filter that could
+lose an exception intercept**. It special-cases three notification types (`0x80000071`,
+`0x80000072`, `0x80000073`) and sends *everything else* into the VP path:
+
+```text
+0x4191  mov   eax, dword ptr [rdx+0x10]         ; the intercept header's VpIndex
+0x4194  imul  rbx, rax, 0x980                   ; -> the VP object
+0x419B  add   rbx, qword ptr [rcx+0xAB0]
+0x41A5  call  Vid!VidInterceptPreprocess
+```
+
+`VidInterceptPreprocess` (`+0x4270`) marks the VP intercept-pending (`lock bts [vp+0x130], 0`),
+`memcpy`s the whole message — header plus `[msg+4]` payload bytes — to `vp+0x30`, and switches on the
+type to choose a handler for `[vp+0x158]` and an internal reason code for `[vp+0x200]`. For the
+range `0x80010002 … 0x80010013` that switch is a jump table at RVA `0x3D137`, and **index 1 —
+`0x80010003` — is a real entry**:
+
+```text
+0x4450  lea   rax, [Vid!VidHandleExceptionIntercept]
+0x4457  mov   esi, 2
+0x445C  jmp   back to the common tail
+```
+
+Its neighbours are `VidHandleCpuidIntercept`, `VidHandleApicEoiIntercept`,
+`VidHandleRegisterIntercept`, `VidHandleHaltIntercept`, `VidHandleInterruptionDeliverableIntercept`,
+`VidHandleSevCtrlRegIntercept`, `VidHandleSnpGuestRequestIntercept` and
+`VidHandleTripleFaultIntercept`. An exhaustive scan for the address `Vid+0x11690` being taken finds
+**one** site, this stub, so the preprocess switch is the only thing that selects the exception
+handler.
+
+**And `VidHandleExceptionIntercept` (`+0x11690`) gates on a table `HvCallInstallIntercept` has never
+heard of:**
+
+```text
+0x116A4  movzx ebp, byte ptr [rcx+0x68]           ; the faulting vector, out of the copied message
+0x116C2  mov   rax, qword ptr [r8+0xB68]          ; the partition's per-vector table
+0x116C9  movzx ecx, byte ptr [rbp+rax]            ; its entry for this vector
+0x116CE  cmp   cl, 0xFF
+0x116D1  je    0x116EE                            ; 0xFF -> no registration -> return 0
+0x116D3  imul  rcx, rcx, 0xB0                     ; else the handler entry that claimed it
+0x116DA  add   rcx, qword ptr [r8+0xB58]
+```
+
+`VidPartitionInitialize` (`+0x9428`) allocates both: `[partition+0xB58]` is 255 handler entries of
+`0xB0` bytes, and `[partition+0xB68]` is **`0x100` bytes filled with `0xFF`** — one byte per
+exception vector, holding the index of the entry that owns it, `0xFF` meaning none. An exhaustive
+scan for `0xB68` as a displacement finds eight sites and no others: that initialisation, the
+teardown free, this read, and the register/unregister pair below.
+
+With `0xFF` the function returns **0** having enqueued nothing, signalled nobody and woken no
+thread. With a registration it builds a VID message carrying the vector, the error code, the
+exception parameter and the software-exception flag, and enqueues it with
+`VidExceptionInterceptReturnCallback` — whose address, again, is taken at exactly one site, inside
+this enqueue. So **the return callback cannot run for an unregistered vector**, which is what makes
+the drop silent: `VidInterceptAdvanceInstructionPointer` and `VidCompleteInterceptReturnCallback`
+both sit behind it.
+
+#### What arms it, and why our install could not
+
+`VidHandlerpExceptionRegisterEntry` (`+0x63B80`) is the writer, and its order of operations is the
+finding:
+
+```text
+0x63B9E  movzx ecx, byte ptr [rdx+0x74]           ; the vector, from the handler entry
+0x63BAE  mov   r8, qword ptr [rbx+0xB68]
+0x63BB5  cmp   byte ptr [r8+rcx], 0xFF
+0x63BBA  je    0x63BC3
+0x63BBC  mov   edx, 0xC0370001                    ; STATUS_VID_DUPLICATE_HANDLER
+...
+0x63BDB  mov   byte ptr [r8+rcx], dl              ; claim the slot for this entry
+0x63BDF  lea   r8, [rsp+0x20]                     ; the descriptor
+0x63BE4  mov   word ptr [rsp+0x28], cx            ;   .Vector
+0x63BE9  mov   edx, 4                             ; AccessType = execute
+0x63BEE  mov   rcx, qword ptr [rbx+0x288]         ; the child's partition id
+0x63BF5  mov   dword ptr [rsp+0x20], 3            ;   .Type = 3 (exception)
+0x63BFD  call  qword ptr [Vid!_imp_WinHvInstallIntercept]
+0x63C20  ... on failure, restore 0xFF
+```
+
+**That descriptor is byte-for-byte the one S5b read and S5h installed** — type 3, `AccessType` 4,
+the vector in the same field — which is the strongest possible statement that our install was not
+wrong, merely incomplete. Vid does the identical hypercall; it just claims the slot first, and the
+slot is what the delivery path consults.
+
+Its single caller is `VidHandlerIoctlExceptionRegister` (`+0x63630`), which allocates a handler
+entry (`VidHandlerpEntryAllocate`), stores the vector at `+0x74` and a caller-supplied context at
+`+0x80`, calls the above, and returns a handle to the client. `VidHandlerpExceptionUnregisterEntry`
+(`+0x63C4C`) restores `0xFF`; its single caller is `VidHandlerpUnregisterSingle`, the generic
+handler-entry teardown.
+
+So the root-side chain, end to end, is:
+
+```text
+IOCTL -> VidHandlerIoctlExceptionRegister -> VidHandlerpExceptionRegisterEntry
+             -> claim [partition+0xB68][vector], then WinHvInstallIntercept(id, 4, {3, vector})
+  ... the guest faults ...
+hvix64 -> WinHvpOnInterception -> VidInterceptIsrCallback -> VidInterceptPreprocess
+             -> VidHandleExceptionIntercept -> [partition+0xB68][vector] != 0xFF
+             -> VidMessageBufferEnqueue(..., VidExceptionInterceptReturnCallback)
+  ... the client answers ...
+VidExceptionInterceptReturnCallback -> VidInterceptAdvanceInstructionPointer (software exceptions)
+             -> VidCompleteInterceptReturnCallback
+```
+
+and S5h entered it at the third line with the first line never having run.
+
+#### The mechanism of S5h's hold, stated as the inference it is
+
+**What is read, not inferred:** with no registration the handler returns 0, no message is enqueued,
+and the VP's intercept-pending bit is cleared by the common tail in `VidInterceptProcess`, which
+also flushes a queued `WinHvSetVpRegisters` writing register name `1` — which the TLFS names
+`HvRegisterInterceptSuspend`; the name is from the specification, the number is what was read — to
+zero. Nothing on that path injects the exception into the guest and nothing advances `RIP`,
+because both of those live behind the return callback that did not run.
+
+**What follows, and is an inference this gate did not measure:** the faulting instruction is
+re-entered and faults again, so a standing intercept on an unregistered vector is a *loop* rather
+than a queue. It predicts S5h exactly — no progress past the trap while the intercept stands, and
+all 20,000 traps intact the moment it is removed, because the very next execution takes the ordinary
+path into the guest's dispatcher. It is also consistent with, but not proved by, S5h's runtime
+figures: a fraction of one VP, never saturated, is what a loop whose period is a root-side round
+trip looks like from `HvRegisterVpRuntime`, which counts only guest time. **Distinguishing a loop
+from a single held trap needs a live arm** — a retired-instruction or intercept counter across the
+window — and none was run here. The record should not carry "livelock" as established.
+
+#### A hazard this read found that nothing had anticipated
+
+`VidInterceptPreprocess` ends its switch at `+0x44E7` with a WPP trace and then `int 29h` with
+`ecx = 5` — `__fastfail(FAST_FAIL_INVALID_ARG)`, in the **root** partition, which is a host bugcheck
+rather than a guest one.
+
+It is reached by any intercept message type the switch does not cover, and **the coverage is sparse
+inside the ranges as well as outside them.** Two range checks bound it — `0x80000000`–`0x80000060`
+and `0x80010000`–`0x80010013` — and within the first a byte index table at RVA `0x3D0D8` maps all
+but **ten** of its ninety-five values to that same stub, while within the second the jump table's
+holes do:
+`0x80010005`, `0x80010009` through `0x8001000F`, and `0x80010012`.
+
+So *"install an intercept type and see what happens"* is not a cheap experiment on a bench that
+matters: an intercept whose message type Vid does not handle takes the machine down, not the VM.
+Exception (`0x80010003`), CPUID, MSR and IO-port are safe by this table; the rest must be checked
+against it first. It belongs beside this plan's two existing prohibitions — no `int 3` in Secure
+Kernel (S5a), and no `WinHvSetInterceptRoutine` on this bench — and `FOLLOWUPS.md` carries all
+three.
+
+#### What this changes
+
+- **The `WinHvSetInterceptRoutine` prohibition becomes permanent and gets a better reason.** It is
+  not "do not call it until the key is known" — the key is known, and calling it would displace
+  `VidInterceptIsrCallback` for one child partition, which is the very routine that would dispatch
+  to a registration. It is the wrong call, not a risky one. Do not call it.
+- **The build is re-scoped a second time, downward.** S5j retired the hand-rolled
+  `HvCallCreatePort`/SynIC page in favour of `winhvr.sys`'s exported API. This retires the exported
+  API too: the receiving side already exists, per partition and per vector, with completion and
+  instruction-pointer advance written. What S5 needs is the IOCTL that reaches
+  `VidHandlerIoctlExceptionRegister`.
+- **S5h's hold is explained, and neither of S5j's two candidates was right.** The record carried
+  "nothing was bound" and "the handler received and retained it"; the answer is "the handler
+  received it and dropped it, because the vector was never claimed".
+- **S5b's install is vindicated and re-scoped.** The descriptor Vid sends is identical. The gap was
+  never the hypercall.
+- **Still not measured**: no message has been received. **S5 does not pass.** Nothing here touches
+  the Secure Kernel scope limit, which stands as S5i left it, and nothing here was run live — this
+  is two static reads.
+
+#### What to read or run next
+
+- **The IOCTL code and the user-mode surface for `VidHandlerIoctlExceptionRegister`** — its
+  dispatch entry in Vid's IOCTL table, the input layout, and whether a documented WHP property
+  reaches it, which would make the whole receiver a supported call rather than a private one. This
+  is the gate that decides whether S5 is one API call from passing or needs a driver.
+- **Whether the hold is a loop**, per the inference above, since a loop and a held trap want
+  different things from a debugger design and the distinction is cheap to measure live.
+- **Not** a second receiver, **not** a port, and **not** `WinHvSetInterceptRoutine`.
+
+#### Limits of this read, stated rather than left to be found
+
+- **Two images, one build pair, no live arm.** Everything above is static, from `winhvr.sys`
+  `10.0.26100.8972` and `Vid.sys` `10.0.26100.9278`. No registration was made and no message was
+  received.
+- **The reference scans match an encoded displacement, so a computed one is invisible.** The
+  "exactly one site" and "exactly two call sites" claims above are exhaustive over
+  `call/jmp qword ptr [rip+disp32]`, `call/jmp rel32` and `lea reg, [rip+disp32]` in the executable
+  sections, which is the same class of limit `sk_vmcs_scan.py` records for immediates: a target
+  reached through a pointer in data, or a base held in a register, would not be found. Each claim is
+  therefore "no other *direct* reference", and the ones that matter — the `0xB68` table's writers,
+  and who selects `VidHandleExceptionIntercept` — were also read as disassembly in full.
+- **`VidDeviceExtension+0x288` bit `0x40` forks several of these paths** and was not identified. It
+  chooses between the DPC-and-message-slot shape and a dispatch-loop shape (`WinHvDispatchVp`,
+  `WinHvCancelVpDispatchLoop`), which is almost certainly the root scheduler. The finding does not
+  turn on it — the `0xFF` gate is ahead of the fork — but the resume detail in the inference section
+  is read off the bit-clear path only.
+- **The internal reason code is not the public one.** `[vp+0x200]` takes `2` for an exception, `1`
+  for CPUID, `5` for IO port, `6` for MSR, `7` for unmapped GPA, `0x10` for halt, `0x15` for triple
+  fault. Those are not `WHV_RUN_VP_EXIT_REASON` values and are not named here as anything else.
+- **Intel and this hypervisor only**, as with S5i and S5j; `hvax64.exe` is not read.
 
 ## Explicitly out of scope
 
