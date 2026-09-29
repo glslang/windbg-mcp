@@ -9,6 +9,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The hypervisor's exception mask is one bit with no owner, so an install/remove pair is not
+  free.** Gate S5l, the removal read S5k left open, against the same `hvix64.exe`
+  `10.0.26100.9444` and the same instrument. Install and remove are **the same function and the
+  same bit**: one compare on `AccessType` picks `or` or `and ~`, the store goes to that VTL's mask,
+  and the per-VTL recompute follows. There is **no refcount and nowhere for one** — two writers in
+  the whole image, the other a partition-teardown zeroing, and a 32-bit bitmask has no room to
+  count. So two parties holding one vector are one bit, the second remover clears it for both, and
+  this probe's `finally` strips a VID client's intercept while Vid's own per-vector table still
+  says armed. That confirms the hazard S5k left conditional, and makes the controls argument S5k
+  retracted false on a probed child rather than merely unestablished; it says nothing about which
+  branch the earlier hold took, which still wants a replicated arm. Three bounds came free from the
+  same function: `AccessType` must be exactly `0` or `4`, the vector is a `word` at `+8` of the
+  intercept parameter bounded to `0x1F`, and a per-partition allowed-vector mask gates installs
+  **except** that target VTL 0 admits `#BP` and `#OF` unconditionally — which is why a `#BP`
+  install on a child never depended on the partition's configuration.
 - **An unclaimed vector is dropped inside `Vid.sys`, and the receiver is an IOCTL rather than a
   build.** Gate S5k, both reads S5j called for, against `winhvr.sys` `10.0.26100.8972` and `Vid.sys`
   `10.0.26100.9278` opened as DbgEng image targets with public PDBs. **The table key** is the
@@ -26,11 +41,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dead and the second gains a **competitor rather than a refutation**: which branch S5h's own
   message took turns on a **mutable** runtime byte this gate did not read, and nothing already
   measured stands in for it — the probe writes the same hypervisor mask the earlier arms observe,
-  through a raw removal that touches nothing in `Vid.sys`, and whether that removal clears the
-  shared bit is itself unread. Being mutable, the byte also cannot be recovered later: only a
-  replicated intercept arm reports which branch is taken. If the removal does clear the bit, the
-  desynchronisation is a hazard of its own — a probe teardown stripping a vector a VID client holds
-  while Vid goes on believing it armed.
+  through a raw removal that touches nothing in `Vid.sys` and that S5l then read clearing the
+  shared bit. Being mutable, the byte also cannot be recovered later: only a
+  replicated intercept arm reports which branch is taken. The desynchronisation is a hazard of its
+  own — a probe teardown stripping a vector a VID client holds while Vid goes on believing it
+  armed.
   The receiver is nonetheless not
   something to build — the message path, the completion and the instruction-pointer advance already
   exist per partition and per vector — and the `WinHvSetInterceptRoutine` prohibition hardens into a
