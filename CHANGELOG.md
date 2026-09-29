@@ -12,8 +12,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The refusal is a partition-state test with no token in it, and the branch behind it is an
   ownership handoff.** Gate S5o, a static read of `Vid.sys` — DbgEng opening the image as a target
   of its own, no debuggee, nothing executed, no VM touched — which answered the **two** steps the
-  plan had left, neither by the arm it was waiting for. `Vid.sys` is a WDF driver, which is why the
-  previous gate could find no `IRP_MJ_CREATE` dispatcher to read: the create callback is
+  plan had left, neither by the arm it was waiting for. `Vid.sys` is a KMDF driver, which is why
+  the previous gate could find no `IRP_MJ_CREATE` dispatcher to read — **not** because there is no
+  `MajorFunction` table, as this entry first said, but because `Wdf01000!FxDriver::Initialize`
+  fills all 28 entries with the framework's own `FxDevice::Dispatch`/`DispatchWithLock` and routes
+  a create through `FxPkgGeneral::OnCreate` to the callback the driver registered. What the image
+  lacks is a VID-owned dispatcher, not the table. The create callback is
   `VidFileCreate` → `VidFileObjectCreate`, and the refusal is a single site testing
   `[partition+0x3060] == 2` and `[partition+0x3079] == 1`. **It reads no token**, so the planned run
   as `SYSTEM` cannot change the outcome and was not performed — recorded as *not run* rather than
@@ -25,18 +29,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **common cause**: on the non-Exo arm there is exactly one such site, so its own held name and a
   live guest's name are refused by the same instruction, and the 62 candidate sites it counted are
   real and irrelevant. **And the branch the refusal guards is not a second client joining** —
-  `VidPartitionAttach` makes the opener the partition's owning process, and is admitted only after
-  the current owner's detach IOCTL, which first unregisters the handlers and detaches every virtual
-  processor. So on a VM Hyper-V runs, the step that would let us in dismantles what the previous
-  gate found. Also corrected: `VidPartitionIoctlAttach` is the second half of that handoff and
-  refuses a partition nobody has detached, not merely "start the virtual processors". **What this
-  does not establish**: no writers of either field are enumerated (the displacements are shared
-  with unrelated `Vid` structures, and the first attempt to census them used a dword-aligned scan
-  that missed unaligned sites), neither state value is decoded, one build was read, and Exo
-  partitions and handle duplication are untouched. **S5 does not pass**, and the user-mode route to
-  a VM this host did not create is closed with a cause rather than a match — leaving the
-  VMM-of-our-own question as the only remaining one, which raises what it is worth costing without
-  making it any smaller.
+  `VidPartitionAttach` makes the opener the partition's owning process, and the one way in this
+  gate located runs through the current owner's detach IOCTL, which first unregisters the handlers
+  and detaches every virtual processor. So on that route the step that would let us in dismantles
+  what the previous gate found. Also corrected: `VidPartitionIoctlAttach` is the second half of that
+  handoff and refuses a partition nobody has detached, not merely "start the virtual processors".
+  **What this does not establish** — and the first draft of this entry claimed it: that the located
+  handoff is the *only* way into the admitting state. No writers of either field are enumerated
+  (the displacements are shared with unrelated `Vid` structures, and the first attempt to census
+  them used a dword-aligned scan that missed unaligned sites), so another writer would leave
+  registration alongside Hyper-V open; settling it needs a writer census or live confirmation.
+  Neither state value is decoded, one build was read, and Exo partitions and handle duplication are
+  untouched. **S5 does not pass**: the refusal is understood by cause rather than by match, and the
+  route behind it empties the room it opens — with the writer census, not the VMM-of-our-own
+  question, as the next cheap thing that could change either reading.
 - **Two gate sections still carried a "what to run next" list, and both had gone stale.** The class
   fix recorded against the previous round — one ordered plan in `FOLLOWUPS.md`, result sections
   stating what they leave *open* rather than what to run — was applied to two of the four sections
