@@ -4679,3 +4679,129 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
 - **Which of the two fields a running guest actually refuses on**, which this gate cannot say and
   an earlier draft of it assumed. It wants a live partition object.
 - **The two arms blocked by the standing constraint**, untouched.
+
+### S5s result, 2026-09-29: the active CLSID refuses live Hyper-V debugging in this build, and the passive one is an inspector that resolves Secure Kernel
+
+**E2a was named in the EXDI stub plan on 2026-09-22 and never run; it is run now, and it answers in
+the branch the gate called "if it is not".** What LiveCloudKd provides against a running VBS guest
+is **inspection with Secure Kernel symbols on top** — not execution control over VTL1. The
+distinction matters to every novelty claim in this plan, and it is now a measurement rather than an
+observation about someone's documentation.
+
+Release `v3.3.2.20260720`, `ExdiHvSrv.dll` registered with `regsvr32`, both CLSIDs present:
+`{53838F70-0936-44A9-AB4E-ABB568401508}` = `StaticExdiSampleServer`,
+`{67030926-1754-4FDA-9788-7F731CBDAE42}` = `LiveExdiSampleServer`, the two names read out of the
+DLL's own registration script.
+
+#### The active CLSID does not start
+
+`kd.exe -kx exdi:CLSID={67030926-…},Kd=Guess` produces a modal dialog and nothing else. The text is
+a hardcoded string in `ExdiHvSrv.dll`:
+
+```text
+That build of EXDI plugin is not supported live Hyper-V debugging
+```
+
+kd's log ends at the version banner: no `Kernel Debugger connection established`, no target, no
+`bp`. **So the gate's `nt` breakpoint control was never reached, and it did not need to be.** That
+control exists to separate "the rig is broken" from "VTL1 refused"; here the server declined before
+a target existed, which is neither and is unambiguous. A breakpoint in `securekernel.exe` cannot be
+attempted through this build at all.
+
+**What this does not establish.** That no build ever supported it. The message is build-conditional
+by its own wording — *"That build of…"* — so the author gates it, and an earlier release or a
+differently-gated one may behave differently. The claim is about this release, and the refusal
+string is the evidence for it.
+
+#### The passive CLSID is a working inspector
+
+It connects, finds `ntkrnlmp` by itself, resolves NT symbols from the public store and walks the
+process list. `IeXdiControlComponentFunctions` is **not implemented** (`0x80004002`), so
+`.exdicmd` target commands are unavailable beside the missing execution control.
+
+**Partition identity was established three independent ways before any VTL1 reading was taken**,
+because the two guests are deliberate twins — same build, same 2 vCPU / 4096 MB, and after the host
+reset below their uptimes matched to under a second, so the discriminator this plan used in earlier
+gates was gone:
+
+| | `VmId` 0 | `VmId` 1 |
+|---|---|---|
+| NT kernel base | `0xfffff802a2800000` | `0xfffff80691800000` |
+| VTL0 processes | — | **`Secure System`, `LsaIso.exe`** |
+| hvlib `InfoPartitionId` / name | 2, `Lab Guest Control` | 3, `Lab Guest Hyper-V` |
+| host `Get-VMSecurity` | `VBSOptOut=True` | `VBSOptOut=False` |
+
+`VmId` is a DWORD **index over VMs only** — 2 and 3 fail with `CO_E_SERVER_EXEC_FAILURE`, so the VSM
+scan adds no pseudo-partition and there is no separate "secure kernel target" to select.
+
+#### Secure Kernel, and the control that licenses reading it
+
+`hvlib.dll`'s own information classes answer directly. Numbering is zero-based from the shipped
+`sdk/hvlib/public/HvlibEnumPublic.h`, checked against the six classes the bundled `hvlib.py`
+already names (1, 2, 3, 6, 11, 20), which all land where that numbering puts them —
+`InfoHvddGetCr3Securekernel` = 45, `InfoSecureKernelBase` = 47, `InfoSecureKernelSize` = 48.
+
+| | partition 2 (VBS off) | partition 3 (VBS on) |
+|---|---|---|
+| `InfoSecureKernelBase` | **`0x0`** | `0xFFFFF80629B4A000` |
+| `InfoSecureKernelSize` | **`0x0`** | `0x175000` |
+| `InfoHvddGetCr3Securekernel` | **`0x0`** | `0x1201000` |
+
+**The control holds at the SDK level and again in the debugger**, which is what makes the reading
+about VBS rather than about the instrument. Identical commands, identical address, the two guests
+differing in one variable:
+
+| on the VBS guest | on the VBS-off twin |
+|---|---|
+| `db 0xFFFFF80629B4A000 L10` → `4d 5a 90 00 …` **`MZ`** | → `00 00 00 00 …` **all zeros** |
+| `.reload /f securekernel.exe=0x…` → `securekernel` **(pdb symbols)**, `0xFFFFF80629B4A000`–`0xFFFFF80629CBF000` | → *Unable to verify timestamp*, one page, **(no symbols)** |
+
+**No CR3 override was needed.** `RegCr3` exists as a value name in `ExdiHvSrv.dll` and was
+deliberately left unset; SK's virtual addresses read anyway, so whatever translation the server
+uses already reaches VTL1's address space on this path. Why it does is unmeasured and is not this
+gate's question.
+
+Two symbols resolve in the debug-gate area, given as **image-relative offsets**, which are the
+build's property where the VAs beside them are the boot's:
+
+| symbol | VA this boot | RVA |
+|---|---|---|
+| `securekernel!SkpsEnableDebugging` | `0xFFFFF80629BEE658` | **`+0xA4658`** |
+| `securekernel!SkpsSendDebugAttachNotifications` | `0xFFFFF80629BEED50` | **`+0xA4D50`** |
+
+**`SkpsIsProcessDebuggingEnabled` does not exist in this build's public PDB**, and that corrects
+S5r, which was written with that name out of a fetched précis of the Quarkslab write-up rather than
+out of the write-up. `SkpsEnableDebugging` is a **candidate** for the gate that work patches and is
+not established to be it; S5r's instruction to verify the name against the original stands, and now
+has a specific thing to verify against.
+
+#### What it cost, and the harness that came out of it
+
+**The first attempt hung the host and it had to be reset**, losing both guests, which rebooted with
+it and moved every VTL1 landmark again — the `0x1201000` above is a *later* boot than S5c–S5f's
+identical value, which is this record's own warning about `CR3` equality arriving a third time.
+
+The cause was the harness rather than the attach: `kd.exe` launched through PowerShell
+`Start-Process -NoNewWindow -RedirectStandardOutput <file>` wrote **281 KB of
+`kd: Could not write to pipe, 1450`** — `ERROR_NO_SYSTEM_RESOURCES` in a tight loop — while a modal
+dialog blocked it. The dialog was the plugin asking for `VmId`, which is a DWORD in
+`HKLM\SOFTWARE\LiveCloudKd\Parameters` and was absent. Kernel-Power 41, previous shutdown
+unexpected, **no dump**: a hung machine that was reset, not a bug check. It is the same signature
+this bench already recorded for `cdb.exe -server`, so the rule generalises to any debugger child
+and `-RedirectStandardOutput` is **not** the "redirect to a file" that rule means.
+
+The replacement harness ran six times with no recurrence, and the rules in it are the transferable
+part: pre-supply every setting the tool could prompt for; give the child **its own window** so a
+modal blocks the debugger and not the caller; use the debugger's **own** `-logo <file>` and never a
+redirected stdout; put it in a **job object** with `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE` so nothing
+outlives the invocation; bound the wait, kill explicitly on every path, and sweep `dllhost`
+processes holding the EXDI DLL afterwards — the surrogate outlives the debugger, which the
+distribution's own `Stop-ExdiContainingDllHosts` exists to handle.
+
+#### Bench state this gate leaves behind
+
+Reversible, and left in place only because S5r may want it: the `ExdiHvSrv.dll` COM registration,
+`HKLM\SOFTWARE\LiveCloudKd\Parameters` (created by this gate; it did not exist before), the `hvmm`
+service, and a copy of `hvmm.sys` re-signed with this bench's `CN=H3Probe Test` certificate — which
+turned out to be redundant, since the service resolves to the `hvmm-testsigned.sys` staged for H4 on
+2026-09-26. **No guest was modified**, no intercept was installed, and nothing was written to VTL1.
