@@ -2988,8 +2988,9 @@ nothing**, which is worth recording because S5g cost it four reboots.
   dispatch. **S5k read that port's owner and found a third possibility**: the message does reach
   Hyper-V's own routine, which *discards* it rather than holding it whenever the vector is not
   claimed in a per-partition table an install hypercall does not touch. Whether this gate's own
-  message met that branch turns on a runtime byte S5k did not read — the controls above are what
-  argue it did.
+  message met that branch turns on a runtime byte S5k did not read, and **the controls above cannot
+  stand in for it**: this probe's raw removals clear the hypervisor bit without clearing that table,
+  so a control arm passes either way. See S5k.
 - **`HvCallCreatePort` / `HvCallConnectPort` are untried**, and the bullet above is why the next
   gate has to establish *where the message goes* before assuming a port of our own would receive
   it. If intercepts are delivered to the partition's designated port, creating a second one is not
@@ -3370,9 +3371,10 @@ intercept, and the half it skipped is the half that makes anyone listen.
 
 **Which branch S5h's own message took is a question about live state, and this gate did not read
 it** — `[partition+0xB68][3]` is runtime, and a VID client that had already claimed `#BP` on that
-child would have made the handler enqueue rather than drop. A separate section below argues from
-S5h's controls that the slot was unclaimed, and names the one-line live read that would settle it
-directly. Read that before treating the drop as what happened rather than as what the code does.
+child would have made the handler enqueue rather than drop. A section below sets out why S5h's own
+controls cannot stand in for that read, and names the one live read that settles it. **So the drop
+competes with S5j's retained explanation and does not replace it**, and nothing here should be read
+as saying what S5h's message did.
 
 So S5's missing piece is not a receiver to build. It is `Vid!VidHandlerIoctlExceptionRegister`, an
 IOCTL that takes a vector, claims a per-partition slot for it, and *then* calls
@@ -3558,33 +3560,42 @@ and S5h entered it at the third line with the first line never having run — **
 Whether some *other* client had run the first line for `#BP` on that child, before S5h started, is
 the next section.
 
-#### Was the slot claimed? Not read, and S5h's own controls say no
+#### Was the slot claimed? Not read, and the probe's own removals make S5h's controls silent on it
 
 The whole application of this read to S5h turns on one runtime byte,
 `[partition+0xB68][3]`, and **this gate did not read it.** A VID client holding `#BP` on that child
 would have sent the handler down the enqueue branch instead, which is S5j's received-and-retained
-explanation still standing. So the argument has to come from somewhere, and it comes from S5h.
+explanation still standing.
 
-**The two register paths bracket the slot in both directions**, which is what makes the argument
-possible at all. `VidHandlerpExceptionRegisterEntry` claims the slot and *then* installs, restoring
-`0xFF` if the hypercall fails; `VidHandlerpExceptionUnregisterEntry` (`+0x63C4C`) restores `0xFF`
-and calls `WinHvInstallIntercept` with `AccessType` **`0`** and the same type-3 descriptor — the
-removal S5b read. Neither can leave one set without the other, so **a claimed slot implies an
-installed intercept on that partition.**
+**An earlier version of this section argued from S5h's controls that the slot was `0xFF`, and the
+argument is wrong.** It ran: Vid's two register paths bracket the slot in both directions —
+`VidHandlerpExceptionRegisterEntry` claims it and *then* installs, restoring `0xFF` if the hypercall
+fails, and `VidHandlerpExceptionUnregisterEntry` (`+0x63C4C`) restores `0xFF` and calls
+`WinHvInstallIntercept` with `AccessType` **`0`** and the same type-3 descriptor — so a claimed slot
+implies an installed intercept; and S5h's null arms and its `#BR`-installed/`#BP`-raised control
+each handled 20,000/20,000, so no `#BP` intercept stood; so the slot was `0xFF`.
 
-**And S5h measured the absence of that intercept, twice per run.** Its null arms raise 20,000 `#BP`
-with nothing installed and the guest handles 20,000 of them; its first control installs `#BR`
-(`0x05`) and raises `#BP`, and the guest again handles 20,000 of them. Both say no `#BP` intercept
-stood on that partition except the one the probe installed — so by the implication above the slot
-was `0xFF`, on both guests and in every run.
+**Both halves are true and the implication between them is not, because Vid is not the only writer
+of the hypervisor mask on these children — the probe is.** `h3probe.sys` calls
+`WinHvInstallIntercept` directly, and **every install it makes is paired with a raw
+`AccessType = 0` removal in a `finally`**, S5b onward. That removal clears the hypervisor bit
+**without touching `[partition+0xB68]`**. So on a child this bench has probed, `slot claimed` and
+`intercept installed` can be desynchronised — a client's claim can survive a probe removal that
+cleared its bit — and in exactly that state the controls pass, S5h's next raw install re-sets the
+bit, and the message enqueues to that client. **The controls are consistent with both branches, so
+they favour neither.**
 
-**That is a chain, not a reading**, and it is worth naming what could break it: the implication is
-read from code rather than measured; the controls establish the state at the *start* of each
-triple, so a client claiming the slot between the control and the intercept arm is not excluded by
-them; and both are about the two children this bench runs rather than about Hyper-V in general.
-**One live read of `[partition+0xB68][3]` on a child with an intercept standing settles all three
-at once**, and it is the cheapest remaining measurement in this gate — worth doing before anything
-is built on the drop.
+**One live read of `[partition+0xB68][3]` is what settles it**, and it is the cheapest remaining
+measurement in this gate. Nothing should be built on the drop until it is done.
+
+**And the desynchronisation is a hazard in its own right, not only a hole in an argument.** If a
+VID client ever held a vector this probe installs, the probe's teardown strips that client's
+intercept and leaves Vid believing it is still armed — silently, on the child under test, with no
+error anywhere. Whether a removal really clears the bit outright is **not read here**: S5i read the
+install as an unconditional `OR` of `1 << vector` and did not read the removal, so whether the
+hypervisor refcounts installers is open, and it is the same unread fact the reviewer's version of
+this objection and this hazard both depend on. Reading `hvix64.exe`'s type-3 *removal* path settles
+the hazard and the argument together, and is a smaller read than the live one.
 
 #### What the hold then is, stated as the inference it is
 
@@ -3640,7 +3651,7 @@ three.
   per partition and recognises the type, which the static read settles outright. What replaces it is
   "the handler received it and dropped it, the vector never having been claimed" — **which competes
   with S5j's retained explanation rather than retiring it**, because the two are separated by a
-  runtime byte this gate did not read. S5h's controls argue for the drop; the live read decides it.
+  runtime byte this gate did not read and nothing already measured can stand in for.
 - **S5b's install is vindicated and re-scoped.** The descriptor Vid sends is identical. The gap was
   never the hypercall.
 - **Still not measured**: no message has been received. **S5 does not pass.** Nothing here touches
@@ -3654,9 +3665,12 @@ three.
   reaches it, which would make the whole receiver a supported call rather than a private one. This
   is the gate that decides whether S5 is one API call from passing or needs a driver.
 - **One live read of `[partition+0xB68][3]`** with an intercept standing, which is the only thing
-  that separates the drop from S5j's retained explanation directly rather than through S5h's
-  controls. Cheapest measurement left in this gate, and it should come before the IOCTL read rather
-  than after: if the slot turns out claimed, the IOCTL is not the next thing to look at.
+  that separates the drop from S5j's retained explanation. Cheapest measurement left in this gate,
+  and it should come before the IOCTL read rather than after: if the slot turns out claimed, the
+  IOCTL is not the next thing to look at.
+- **`hvix64.exe`'s type-3 *removal* path**, which S5i did not read. It decides whether this probe's
+  paired removal can strip a vector a VID client holds — a hazard of an experiment already run six
+  times — and it is a smaller read than the live one.
 - **Whether the hold is a loop**, per the inference above, since a loop and a held trap want
   different things from a debugger design and the distinction is cheap to measure live.
 - **Not** a second receiver, **not** a port, and **not** `WinHvSetInterceptRoutine`.
@@ -3666,10 +3680,12 @@ three.
 - **Two images, one build pair, no live arm.** Everything above is static, from `winhvr.sys`
   `10.0.26100.8972` and `Vid.sys` `10.0.26100.9278`. No registration was made and no message was
   received.
-- **The one runtime byte the application to S5h turns on was not read.** `[partition+0xB68][3]` is
-  live state; what stands in for it is a chain through S5h's controls, set out in its own section
-  above with what could break it. Every statement about *code paths* here is independent of that
-  byte; every statement about *what S5h's message did* is not.
+- **The one runtime byte the application to S5h turns on was not read**, and **nothing already
+  measured stands in for it.** `[partition+0xB68][3]` is live state; the attempt to substitute
+  S5h's controls is retracted in its own section above, because the probe's own raw removals
+  desynchronise the slot from the hypervisor bit those controls observe. Every statement about *code
+  paths* here is independent of that byte; every statement about *what S5h's message did* is not,
+  and none is made.
 - **The reference scans match an encoded displacement, so a computed one is invisible.** The
   "exactly one site" and "exactly two call sites" claims above are exhaustive over
   `call/jmp qword ptr [rip+disp32]`, `call/jmp rel32` and `lea reg, [rip+disp32]` in the executable
