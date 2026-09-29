@@ -3288,6 +3288,30 @@ validated. The full record is the
   mode or a kernel-read path in `h3probe.sys`. Until then the constraint stands without a remedy:
   an install/remove pair is not free. Full record in the
   [S5l result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+- **S5m, 2026-09-29: the receiver is a user-mode export, and there is no driver left to write.**
+  The IOCTL read S5k named, against `Vid.sys` `10.0.26100.9278`, `vid.dll` `10.0.26100.8457` and
+  `WinHvPlatform.dll` `10.0.26100.9278`. **The code is `0x221148`** —
+  `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x452, METHOD_BUFFERED, FILE_ANY_ACCESS)`, read from
+  `VidIoControlPartition`'s compare chain, with input `{ u8 Vector; u8 pad[3]; u32 Parameter;
+  u64 Context; }` and an `8`-byte handle out. `FILE_ANY_ACCESS` is not the access control: the
+  dispatcher is reached with a *partition* in `rcx`, so what gates it is holding a partition handle.
+  **`vid.dll` exports a wrapper for it** — `VidRegisterExceptionHandler`, one of 215 exports,
+  carrying that code and layout into a single `NtDeviceIoControlFile` — **and exports attach,
+  receive, complete and unregister beside it**: `VidAttachPartition`, `VidGetHvPartitionId`
+  (which translates a VID handle to the `HV_PARTITION_ID` every hypercall gate has been passing),
+  `VidMessageSlotMap`, `VidSetupMessageQueue`, `VidMessageSlotHandleAndGetNext`,
+  `VidHandleMessageAndGetNextMessage`, `VidUnregisterHandler`. **So no driver, no port, no
+  hypercall** — the third downward re-scope in a row, each one deleting the build the previous gate
+  specified. **But it is not a documented call**: `WinHvPlatform.dll` delay-imports 31 `vid.dll`
+  functions and this is not one of them — what WHP imports is the *Exo* family, its own partitions'
+  mechanism. So S5 is not one supported call from passing; it is one *observed, exported* call from
+  passing, which is a different and weaker thing to build on.
+  **It also removes S5l's hazard by construction**: the kernel side refuses a claimed slot with
+  `STATUS_VID_DUPLICATE_HANDLER` before touching the hypervisor, and unregister clears slot and bit
+  together — so the raw `WinHvInstallIntercept` pair should be retired rather than guarded. **And
+  the registration's return value supersedes the replicated arm** S5k and S5l wanted: duplicate
+  means the slot was claimed, success means it was `0xFF`. Full record in the
+  [S5m result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
   port. That is not the same as nothing receiving it: the root's own stack owns a port for each
@@ -3317,13 +3341,17 @@ validated. The full record is the
   `[partition+0xB68]`, the per-vector table it consults. The receiving path — message,
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
-  `WinHvInstallIntercept` S5b read. That pointed at reading `[partition+0xB68][3]` inside a
-  replicated intercept arm, and at a second candidate — **whether the hold is a loop**, since
-  nothing on the drop path injects the exception or advances `RIP`, so the faulting instruction is
-  presumably re-entered, an inference S5k did not measure. **Both are blocked by the standing
-  constraint below**, because both need an intercept installed on a child and later removed, and
-  the replicated arm additionally needs root kernel-memory access this bench does not have — a host
-  reboot into debug mode, or a kernel-read path in `h3probe.sys`.
+  `WinHvInstallIntercept` S5b read. That pointed at a replicated arm reading `[partition+0xB68][3]`,
+  **and S5m supersedes half of it.** The IOCTL has an exported user-mode wrapper, so *"is the slot
+  claimed"* is answered by the registration's own return value, read as `GetLastError()`:
+  `0xC0370001` means claimed, success means it was `0xFF`. **It does not supersede the other half**,
+  because registering *claims* the slot — so a `#BP` raised afterwards exercises the registered
+  receive path and cannot reproduce the unregistered drop, and a success says what the slot holds at
+  that call rather than what it held during S5h. The other half, and the second candidate —
+  **whether the hold is a loop**, since nothing on the drop path injects the exception or advances
+  `RIP`, so the faulting instruction is presumably re-entered, an inference S5k did not measure —
+  are **both blocked by the standing constraint below**, and the replicated arm additionally needs
+  root kernel-memory access this bench does not have.
 
   **Standing constraint, from S5l: no arm may install an exception vector on a child until the
   teardown hazard has a remedy.** The pair is unremediable here — per S5l a pre-read is a
@@ -3336,6 +3364,15 @@ validated. The full record is the
   Gaining the ability to read Vid's slot is **not** one of them — an earlier version of this
   sentence listed it, contradicting the line above it. A read is a diagnostic: a client can register
   between the read and the teardown, and the removal still clears its bit.
+
+  **A `vid.dll` registration is not an exemption, it is the second lift condition partially met.**
+  Vid claims and releases the slot with the bit, so it cannot collide with another *VID* client —
+  the duplicate check holds every one of them off. It does not hold off a **raw**
+  `WinHvInstallIntercept` installer, which leaves the slot `0xFF`, and against one of those the
+  unregister still clears a bit it does not own. So the registration arm is permitted **only while
+  no raw installer holds the vector**, and on this bench the only known raw installer is
+  `h3probe.sys`, which this plan controls and is retiring for exception vectors. A third-party raw
+  installer cannot be excluded, so this is a condition to check rather than a property to rely on.
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
