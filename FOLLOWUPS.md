@@ -3465,19 +3465,21 @@ validated. The full record is the
    place, because keeping a schedule in each gate section produced a run of review findings against
    lists a later gate had invalidated:**
 
-   1. **Open a running child's VID partition**, which every later step needs and which nothing has
-      tested. `CreateFileW` on the VID device interface path plus the VM Id, `OPEN_EXISTING`, with
-      a well-formed unused name as the control — **not yet run**, and nothing below it is reachable
-      until it is.
-   2. **Vary the caller upward** if step 1 is refused — a run as `SYSTEM` carrying the same control.
-      Cheap, and the only untested condition that could reopen the user-mode route. Not blocked: it
-      installs nothing.
-   3. **Locate the refusing check**, which wants the kernel debugger this bench has disabled and is
-      the only thing that turns S5n's matched error into a cause.
+   1. ~~**Open a running child's VID partition.**~~ **Run as S5n: refused.** `CreateFileW` on the VID
+      device interface path plus the VM Id, `OPEN_EXISTING`, from an elevated process, gives
+      `ERROR_BAD_COMMAND` (22) on both running guests, while a well-formed unused name opens — an
+      error matching a single-open rule that S5n could not trace to its check.
+   2. **← active step. Vary the caller upward** — a run as `SYSTEM` carrying the same unused-name
+      control. Cheap, installs nothing, and the only untested condition that could reopen the
+      user-mode route. **It forks the plan**: if it *succeeds*, go straight to step 4, because a
+      handle is all the receive sequence needed. If it is *refused too*, go to step 3.
+   3. **Locate the refusing check** — only if step 2 is also refused. It wants the kernel debugger
+      this bench has disabled, and it is the only thing that turns S5n's matched error into a cause.
    4. **Register `#BP` through `vid.dll` and receive** — `VidRegisterExceptionHandler`, then
       `VidSetupMessageQueue` / `VidMessageSlotMap` / `VidMessageSlotHandleAndGetNext`, with a `#BP`
       raised in the guest, VTL0 first and then the VTL1 enclave, which is S5's pass condition.
-      Unreachable until 1 succeeds.
+      Reachable the moment any step obtains a handle, and gated by the raw-installer condition on
+      the standing constraint above.
    5. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
       the standing constraint above, and the first also by kernel-memory access.
    6. **Only then** the VMM-of-our-own question, which is a rig rather than an arm and is a decision
