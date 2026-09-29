@@ -3272,8 +3272,14 @@ validated. The full record is the
   gates installs **except** that target VTL 0 admits vectors `3` (`#BP`) and `4` (`#OF`)
   unconditionally — which, with S5i's "a parent naming a child always installs at VTL 0", is why
   `#BP` on a child never depended on the partition's configuration. **Remediation for the next
-  arm**: read `array[0].0x1A04` before installing, decline if the bit is already set, and restore
-  it after removing. Full record in the
+  arm**: not the hypervisor mask — `array[0].0x1A04` is hypervisor memory the root cannot read and
+  the ABI has no query to go with its install and remove — but Vid's own
+  `[partition+0xB68][vector]`, which says whether a VID client holds it. **That read is not
+  available on this bench yet**: local kernel debugging is off (`bcdedit /dbgsettings` says
+  `debugtype Local`, which is the global store, not the boot entry; `{current}` carries no
+  `debug Yes` and `attach_kernel_local` answers `0x80004001`), so it needs a host reboot into debug
+  mode or a kernel-read path in `h3probe.sys`. Until then the constraint stands without a remedy:
+  an install/remove pair is not free. Full record in the
   [S5l result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
@@ -3305,9 +3311,11 @@ validated. The full record is the
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
   `WinHvInstallIntercept` S5b read. **So the next step is reading `[partition+0xB68][3]` inside a
-  replicated intercept arm** — which, per S5l, must read `array[0].0x1A04` before installing and
-  decline if the vector's bit is already set, since the install/remove pair is destructive to
-  whoever else holds it. That arm is what separates the drop from S5j's retained explanation, and
+  replicated intercept arm** — and per S5l that same read is what the arm would also need *before*
+  installing, since the install/remove pair is destructive to whoever else holds the vector. **It
+  needs root kernel-memory access this bench does not have today**: a host reboot into debug mode,
+  or a kernel-read path in `h3probe.sys`. That arm is what separates the drop from S5j's retained
+  explanation, and
   which decides whether the IOCTL is the thing to look at next at all. **Then
   the IOCTL code and its user-mode surface**, and whether a documented WHP property reaches it —
   which decides whether S5 is one supported call from passing or needs a driver. A third candidate

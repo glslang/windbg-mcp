@@ -3802,14 +3802,24 @@ They cost nothing extra and they bound what any future arm may ask for:
 
 #### What to do about the hazard
 
-The cheap remediation is in the probe rather than in the record: **read `array[0].0x1A04` before
-installing and compare after removing.** A bit already set before the install means another party
-holds the vector — the arm should decline rather than proceed — and the same read makes the
-teardown restorable instead of destructive. That is a change to bench code this repo does not ship,
-so it is recorded here as the protocol the next arm should use, not as work done.
+**The obvious remediation is to read the mask before installing, and it is not available.**
+`array[0].0x1A04` lives in the hypervisor's own memory, which the root cannot read by any of this
+plan's mechanisms — that is H2's whole question, one level further out. Nor is there a hypercall
+that reports installed intercepts: the ABI has an install and a remove and no query, which is the
+same asymmetry that leaves a caller unable to tell a fresh install from a redundant one.
 
-Until it is, treat *"an install/remove pair is free"* as false: it is free only if nobody else holds
-the vector, and nothing in the ABI says whether anybody does.
+**What is readable, in principle, is Vid's `[partition+0xB68][vector]`** — kernel memory in the
+root, and the thing that actually matters, since it says whether a *VID client* holds the vector.
+A probe that reads it before installing could decline rather than proceed, and restore rather than
+strip on the way out. **On this bench it needs a capability nothing here has yet**: local kernel
+debugging is not enabled (`bcdedit /dbgsettings` reports `debugtype Local`, which is the *global
+setting store* and not the boot entry — `{current}` carries no `debug Yes`, and `attach_kernel_local`
+answers `0x80004001` accordingly), so reading it means either a host reboot into debug mode or a
+kernel-read path added to `h3probe.sys`. Both are bench work this repo does not ship.
+
+So the honest statement is a constraint rather than a remedy: **treat *"an install/remove pair is
+free"* as false.** It is free only if nobody else holds the vector; nothing in the ABI says whether
+anybody does; and on this bench nothing yet can look.
 
 #### Limits
 
