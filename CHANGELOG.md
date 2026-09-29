@@ -15,9 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   recipient is chosen by scanning VTLs from the active one upward, wrapping to the lowest, and
   delivering to the first whose **own** installed mask holds the faulting vector. A `#BP` raised in
   VTL1 whose vector the parent installed therefore wraps to VTL0 and is delivered as a VTL0
-  intercept, down the parent-directed path. **So S5's missing half is a binding, not a route** —
+  intercept, down the parent-directed path. **So the route is not what is missing** —
   nothing needs redirecting, and the hold S5h measured is explained as a message posted to a port
-  whose owner never asked for an exception intercept and never completed it.
+  whose owner never asked for an exception intercept — though what happened at the other end is not
+  established, `Vid.sys` having a handler for this type, so that and "nothing was bound" are both
+  live explanations the next gate must separate.
   **Build**: the hand-rolled `HvCallCreatePort` and SynIC message page this gate was specified
   around are unnecessary. `winhvr.sys` exports the whole API — ports, SINT message retrieval,
   `WinHvSetInterceptRoutine`, and `WinHvCompleteIntercept`, which is the *resume* that separates a

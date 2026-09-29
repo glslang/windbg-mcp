@@ -3209,10 +3209,10 @@ agreements rather than restatements:
 - **What is left for S5 is exactly one thing, the receiver**, and this read does not help with it:
   nothing above touches message delivery. That gate stands as written under S5h.
 
-### S5j result, 2026-09-29: the message is already addressed to the parent, and the receiver is a displacement rather than an addition
+### S5j result, 2026-09-29: the message is already addressed to the parent, and binding to it may displace Hyper-V's handler
 
-**Two findings, and the second is the one that changes what to build.** The intercept message S5h's
-hold produces is routed to the **parent** — the hypervisor picks the recipient by asking which VTL
+**One finding and one hazard, and the hazard is the one that changes what to build.** The intercept
+message S5h's hold produces is routed to the **parent** — the hypervisor picks the recipient by asking which VTL
 *installed* the vector, and for a parent-installed intercept that is VTL0 whatever VTL the exception
 occurred in. And the root-side API for receiving it already exists, exported, so the hand-rolled
 `HvCallCreatePort` / SynIC page this gate was specified around is **not** what it needs. What it
@@ -3255,10 +3255,16 @@ exception it intercepted for itself before VTL0 does.
 **And the post forks on exactly that byte** (`+0x2EB134`): zero takes the parent-directed path,
 stamping the message header from `partition + 0x4550` and posting through `+0x2EC204`; non-zero
 posts to `[VP + VTL*8 + 0x148] + 0x80`, the higher VTL's own SynIC. **So nothing needs to be
-redirected.** The message S5h's hold produced was already addressed to the parent; there was simply
-nothing bound to receive it. That also explains the hold's shape — posted to a port whose owner
-never asked for an exception intercept, never completed, and the VP held until the intercept came
-down.
+redirected.** The message S5h's hold produced was already addressed to the parent.
+
+**What that does *not* establish is what happened at the other end**, and an earlier version of this
+section said the hold was explained by a message posted to a port with nobody listening. The static
+read shows where the message is *sent*; nothing here observed its receipt — and this same section
+records that `Vid.sys` has a handler for this exact message type. So "nothing was bound" and "the
+existing handler received the unsolicited intercept and retained it" are **both** live explanations
+of S5h's hold, and they are not the same gate: the first wants a binding built, the second wants
+Hyper-V's handler understood. Distinguishing them is what comes next, so this record does not pick
+one.
 
 #### What the root side already has
 
@@ -3313,8 +3319,10 @@ is no displacement at all. All three are open. **Establishing which is the next 
 #### What this settles and what it leaves
 
 - **The routing question is answered**: a parent-installed intercept's message is delivered to the
-  parent even when the exception occurred in VTL1. No redirection is needed, and S5's missing half
-  is a *binding*, not a route.
+  parent even when the exception occurred in VTL1. **So the route is not what is missing** — which
+  is narrower than saying a binding is: what is missing is whatever stands between that delivery
+  and a debugger seeing it, and this read cannot say whether that is an absent binding or Hyper-V's
+  own handler consuming it.
 - **The build is re-scoped**: exported kernel API rather than hand-rolled hypercalls and a SynIC
   page, with `WinHvCompleteIntercept` supplying the resume.
 - **A hazard the plan did not anticipate**: a registration may displace the entry Hyper-V holds,
