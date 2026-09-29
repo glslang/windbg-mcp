@@ -203,6 +203,7 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = True
     hits: list[Hit] = []
+    seen: set[tuple[int, int, str]] = set()
     # base register -> displacements seen, per function, for the fingerprint.
     prints: dict[tuple[int, str], set[int]] = {}
     stats = {
@@ -213,6 +214,7 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
         "gap_padding": 0,
         "gap_instructions": 0,
         "gap_runs": 0,
+        "unexamined_bytes": 0,
     }
 
     def scan(start: int, code: bytes, label: int, outside: bool) -> None:
@@ -226,14 +228,36 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
         """
         aliases: dict[str, tuple[str, int]] = {}
         decoded = list(md.disasm(code, img.image_base + start))
+        consumed = sum(i.size for i in decoded)
         if outside:
             stats["gap_instructions"] += len(decoded)
         else:
             stats["instructions"] += len(decoded)
-            if sum(i.size for i in decoded) < len(code):
+            if consumed < len(code):
                 stats["undecodable"] += 1
+        # Capstone stops at an invalid encoding, leaving everything after it
+        # unexamined. Counting those bytes is the difference between "nothing
+        # writes this field" and "nothing in the part I could read does".
+        stats["unexamined_bytes"] += len(code) - consumed
+
+        # Alias state is only sound inside a straight-line run. A join point can
+        # be reached with a different value in the register, and following this
+        # decode's physical order across one would let a later block's `lea`
+        # answer for a path that never executed it -- so the table is dropped at
+        # every branch target and after every control transfer. That trades a
+        # class of false positives for a stated blind spot: an alias formed in
+        # one basic block and used in another is not resolved.
+        targets = {
+            ins.operands[0].imm
+            for ins in decoded
+            if ins.group(capstone.x86.X86_GRP_JUMP)
+            and ins.operands
+            and ins.operands[0].type == capstone.x86.X86_OP_IMM
+        }
 
         for ins in decoded:
+            if ins.address in targets:
+                aliases.clear()
             if ins.mnemonic == "call":
                 for reg in [r for r in aliases if r in VOLATILE]:
                     del aliases[reg]
@@ -245,14 +269,15 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
                     continue
                 base = widen(ins.reg_name(op.mem.base))
                 disp = op.mem.disp
-                if disp > 0:
-                    prints.setdefault((label, base), set()).add(disp)
-
-                effective, via, root = disp, "", base
-                if disp not in wanted and base in aliases:
-                    root, off = aliases[base]
-                    if off + disp in wanted:
-                        effective, via = off + disp, f"{base} = {root}{off:+#x}"
+                # Resolve through the alias *before* comparing, never only when
+                # the raw displacement misses: after `lea rax,[rbx+0x3000]`, a
+                # `[rax+0x3079]` is `rbx+0x6079` and reporting it as `+0x3079`
+                # is a false hit on the field this census exists to count.
+                root, off = aliases.get(base, (base, 0))
+                effective = off + disp
+                via = f"{base} = {root}{off:+#x}" if off else ""
+                if effective > 0:
+                    prints.setdefault((label, root), set()).add(effective)
                 if effective not in wanted:
                     continue
 
@@ -272,6 +297,9 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
                     text += f"   [via {via}]"
                 if outside:
                     text += "   [OUTSIDE .pdata]"
+                if (ins.address, effective, text) in seen:
+                    continue  # a gap decoded from several starts repeats itself
+                seen.add((ins.address, effective, text))
                 hits.append(
                     Hit(
                         rva=ins.address - img.image_base,
@@ -287,20 +315,24 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
 
             # Update the alias table *after* reading operands, so an instruction
             # that both reads and redefines a register is read before the kill.
+            #
+            # Only 64-bit destinations are tracked. `lea eax,[rbx+0x3000]` writes
+            # the 32-bit register, which zero-extends into `rax` -- so `rax` is
+            # NOT `rbx+0x3000` for any pointer above 4 GiB, and treating it as
+            # one manufactures a hit on a later `[rax+0x79]`.
             handled = False
             ops = ins.operands
-            if ins.mnemonic == "lea" and len(ops) == 2 and ops[1].mem.base:
-                if ops[1].mem.index == 0 and ops[1].mem.base != capstone.x86.X86_REG_RIP:
+            if ins.mnemonic == "lea" and len(ops) == 2 and ops[0].size == 8:
+                mem = ops[1].mem
+                if mem.base and mem.index == 0 and mem.base != capstone.x86.X86_REG_RIP:
                     dst = widen(ins.reg_name(ops[0].reg))
-                    src = widen(ins.reg_name(ops[1].mem.base))
+                    src = widen(ins.reg_name(mem.base))
                     prev = aliases.get(src)
                     aliases[dst] = (
-                        (prev[0], prev[1] + ops[1].mem.disp)
-                        if prev
-                        else (src, ops[1].mem.disp)
+                        (prev[0], prev[1] + mem.disp) if prev else (src, mem.disp)
                     )
                     handled = True
-            elif ins.mnemonic == "mov" and len(ops) == 2:
+            elif ins.mnemonic == "mov" and len(ops) == 2 and ops[0].size == 8:
                 if (
                     ops[0].type == capstone.x86.X86_OP_REG
                     and ops[1].type == capstone.x86.X86_OP_REG
@@ -309,7 +341,7 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
                     src = widen(ins.reg_name(ops[1].reg))
                     aliases[dst] = aliases.get(src, (src, 0))
                     handled = True
-            elif ins.mnemonic == "add" and len(ops) == 2:
+            elif ins.mnemonic == "add" and len(ops) == 2 and ops[0].size == 8:
                 if (
                     ops[0].type == capstone.x86.X86_OP_REG
                     and ops[1].type == capstone.x86.X86_OP_IMM
@@ -320,8 +352,20 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
                         aliases[dst] = (root, off + ops[1].imm)
                         handled = True
             if not handled:
-                for reg in ins.regs_write:
+                # `regs_write` carries only IMPLICIT writes -- measured here,
+                # `xor eax,eax` reports `rflags` alone and `mov rax,[rbx]`
+                # reports nothing at all -- so invalidating from it leaves a
+                # stale alias exactly where a pointer was overwritten.
+                # `regs_access()` is the one that includes the destination, and
+                # `tools/sk_vmcs_scan.py` already learned this the same way.
+                _, writes = ins.regs_access()
+                for reg in writes:
                     aliases.pop(widen(ins.reg_name(reg)), None)
+
+            # End of a straight-line run: nothing after a control transfer is
+            # reached with this state guaranteed.
+            if ins.group(capstone.x86.X86_GRP_JUMP) or ins.group(capstone.x86.X86_GRP_RET):
+                aliases.clear()
 
     for begin, end in img.pdata:
         code = img.read(begin, end - begin)
@@ -350,9 +394,21 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
                 # ends: a gap of padding/code/padding would otherwise report
                 # its whole length as padding and hide the code in the middle.
                 stats["gap_padding"] += sum(1 for byte in blob if byte in (0xCC, 0x00))
-                if any(byte not in (0xCC, 0x00) for byte in blob):
+                starts = [
+                    i
+                    for i, byte in enumerate(blob)
+                    if byte not in (0xCC, 0x00)
+                    and (i == 0 or blob[i - 1] in (0xCC, 0x00))
+                ]
+                if starts:
                     stats["gap_runs"] += 1
-                    scan(cursor, blob, cursor, outside=True)
+                    # A linear decode from one boundary can begin mid-instruction
+                    # and swallow or skip what follows, so no single pass licenses
+                    # a negative here. These runs are tiny, so decode from every
+                    # plausible start -- each first byte after padding -- and take
+                    # the union. `seen` keeps the repeats out of the report.
+                    for offset in starts:
+                        scan(cursor + offset, blob[offset:], cursor, outside=True)
             cursor = max(cursor, e)
     return hits, {"stats": stats, "prints": prints}
 
@@ -362,14 +418,15 @@ def report(hits: list[Hit], extra: dict, wanted: set[int]) -> None:
     prints = extra["prints"]
     print(
         f"decoded {stats['instructions']} instructions in {stats['functions']} "
-        f"functions from .pdata ({stats['undecodable']} with an undecodable tail)"
+        f"functions from .pdata ({stats['undecodable']} with an undecodable tail); "
+        f"{stats['unexamined_bytes']} bytes left unexamined after a decode stop"
     )
     print(
         f"executable bytes .pdata does not claim: {stats['gap_bytes']} "
         f"({stats['gap_padding']} of them 0xCC/0x00 padding); "
         f"{stats['gap_runs']} gap run(s) held anything else, decoding to "
-        f"{stats['gap_instructions']} instructions (best effort: a linear decode "
-        f"of a gap can start mid-instruction)"
+        f"{stats['gap_instructions']} instructions, decoded from every start "
+        f"after padding"
     )
     for disp in sorted(wanted):
         rows = [h for h in hits if h.disp == disp]
@@ -466,15 +523,62 @@ def self_test() -> int:
 
     # And the same shape must NOT fire when the halves do not add up, or the
     # alias table would manufacture writers wherever two small numbers appear.
-    miss = b"\x48\x8d\x83\x00\x30\x00\x00" b"\xc6\x40\x7a\x01"  # +0x307a
-    img2 = Image(data=b"", sections=[], image_base=0x140000000)
-    img2.read = lambda rva, n: miss if rva == 0x1000 else None  # type: ignore[method-assign]
-    img2.pdata = [(0x1000, 0x1000 + len(miss))]
-    hits2, _ = census(img2, {0x3079}, {})
-    print(f"  {'FAIL' if hits2 else 'ok  '} a split address to +0x307a is not reported")
-    failures += int(bool(hits2))
+    #
+    # The rest of these are the false positives review found in the first
+    # version of the alias table. Each one reported a write to +0x3079 that the
+    # code does not perform, so each is a way the census could have overcounted
+    # while looking more thorough. They are listed as (bytes, why).
+    NEGATIVE = [
+        (
+            b"\x48\x8d\x83\x00\x30\x00\x00" b"\xc6\x40\x7a\x01",
+            "a split address to +0x307a is not reported",
+        ),
+        (
+            # lea rax,[rbx+3000h]; xor eax,eax; mov byte ptr [rax+79h],1
+            b"\x48\x8d\x83\x00\x30\x00\x00" b"\x31\xc0" b"\xc6\x40\x79\x01",
+            "an alias killed by `xor eax,eax` is not still live",
+        ),
+        (
+            # lea rax,[rbx+3000h]; mov rax,[rbx]; mov byte ptr [rax+79h],1
+            b"\x48\x8d\x83\x00\x30\x00\x00" b"\x48\x8b\x03" b"\xc6\x40\x79\x01",
+            "an alias killed by a load is not still live",
+        ),
+        (
+            # lea eax,[rbx+3000h]; mov byte ptr [rax+79h],1 -- 32-bit lea
+            b"\x8d\x83\x00\x30\x00\x00" b"\xc6\x40\x79\x01",
+            "a 32-bit lea does not carry a 64-bit pointer alias",
+        ),
+        (
+            # lea rax,[rbx+3000h]; jne +2; lea rax,[rcx+20h]; mov byte [rax+79h],1
+            b"\x48\x8d\x83\x00\x30\x00\x00" b"\x75\x04" b"\x48\x8d\x41\x20"
+            b"\xc6\x40\x79\x01",
+            "an alias is not carried across a branch",
+        ),
+    ]
+    for code, why in NEGATIVE:
+        probe = Image(data=b"", sections=[], image_base=0x140000000)
+        probe.read = lambda rva, n, c=code: c if rva == 0x1000 else None  # type: ignore[method-assign]
+        probe.pdata = [(0x1000, 0x1000 + len(code))]
+        got, _ = census(probe, {0x3079}, {})
+        print(f"  {'FAIL' if got else 'ok  '} {why}")
+        failures += int(bool(got))
 
-    total = len(SELF_TEST) + 3
+    # And the matching-displacement case, which is a false positive in the other
+    # direction: on an aliased base, an encoded 0x3079 is NOT the field.
+    code = b"\x48\x8d\x83\x00\x30\x00\x00" b"\xc6\x80\x79\x30\x00\x00\x01"
+    probe = Image(data=b"", sections=[], image_base=0x140000000)
+    probe.read = lambda rva, n: code if rva == 0x1000 else None  # type: ignore[method-assign]
+    probe.pdata = [(0x1000, 0x1000 + len(code))]
+    wrong, _ = census(probe, {0x3079}, {})
+    right, _ = census(probe, {0x6079}, {})
+    ok = not wrong and len(right) == 1
+    print(
+        f"  {'ok  ' if ok else 'FAIL'} an aliased base with an encoded 0x3079 "
+        f"resolves to +0x6079, not +0x3079"
+    )
+    failures += int(not ok)
+
+    total = len(SELF_TEST) + 2 + len(NEGATIVE) + 1
     print(f"\n  {total - failures}/{total} passed")
     return 1 if failures else 0
 
