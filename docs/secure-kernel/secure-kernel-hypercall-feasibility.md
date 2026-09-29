@@ -4515,12 +4515,11 @@ Nothing was executed. This is a decoded read of one image.
 #### The instrument, and why a byte scan could not do this
 
 [`tools/vid_field_census.py`](../../tools/vid_field_census.py) walks the image's own `.pdata`
-function table — exact on x86-64 and needing no symbols — disassembles every function with
-capstone, and reports only instructions carrying a **real memory operand** at the displacement
-asked for, classified read/write by capstone's own operand access rather than guessed from the
-mnemonic. `--self-test` decodes six instructions whose bytes were read out of this image during
-S5o, so a pass means it agrees with what the debugger showed for the same instructions; a seventh
-case pins the thing that makes it necessary, that `mov eax,3060h` must **not** count. 7/7 here.
+function table, disassembles every function with capstone, and reports only instructions carrying a
+**real memory operand** resolving to the field, classified read/write by capstone's own operand
+access rather than guessed from the mnemonic. `--self-test` decodes six instructions whose bytes
+were read out of this image during S5o, so a pass means it agrees with what the debugger showed for
+the same instructions, plus three cases pinning the things that make it necessary. 9/9 here.
 
 Three ways the obvious search is wrong, all of which bit:
 
@@ -4529,6 +4528,27 @@ Three ways the obvious search is wrong, all of which bit:
   `VidPartitionDetach` itself. S5o recorded that it had, which is why it claimed no census.
 - **It matches non-operands.** Immediates, relative offsets and data all contain those bytes.
 - **It cannot see a write through a taken address**, which is not hypothetical here — see below.
+
+**And two ways the first version of *this* tool was wrong, both found by review rather than by
+me**, because a census's whole value is the negative it licenses and a negative is only as good as
+its coverage:
+
+- **`.pdata` is not the whole image.** On x86-64 a *leaf* function — no stack frame, no calls, no
+  saved non-volatiles — needs no unwind data and may be absent from the table, and such a function
+  could write the field unobserved. The tool now measures what it is not looking at: of
+  **20,622** executable bytes `.pdata` does not claim, **20,570 are `0xCC`/`0x00` padding**, leaving
+  **52 bytes** across ten runs. Those are decoded too, best effort, and hold no access to the field.
+  The residual is therefore bounded by a measurement rather than by an assumption.
+- **A displacement is not the only way to form an address.** `lea rax,[rbx+3000h]` followed by
+  `mov byte ptr [rax+79h],1` writes `+0x3079` with no `0x3079` encoded anywhere, so counting exact
+  `lea`s says nothing about pointers built in two steps. The tool now carries an intra-procedural
+  alias table — `lea r,[b+k]`, register-to-register `mov`, `add r,imm`, with volatile registers
+  dropped across a `call` — and resolves such a pair to the field it actually touches. The
+  self-test pins both directions: that example resolves, and the same shape aimed at `+0x307a`
+  does **not**, so the table cannot manufacture writers out of two small numbers.
+
+**Neither changed the result**, which is the useful part: the same 19 accesses and 4 writers, no
+split address anywhere in the image, and nothing outside `.pdata`.
 
 #### `[p+0x3079]`: 19 accesses, 4 writers, **0 address-taken**
 
@@ -4539,9 +4559,9 @@ Three ways the obvious search is wrong, all of which bit:
 | `VidPartitionUninitialize+0x413` | `0` — `mov byte ptr [rdi+3079h],sil`, and `sil` is `0` from the `xor esi,esi` at `+0x5b`, which is the function's null register: every other use of it in the function nulls a pointer field (`[+0xB58]`, `[+0xB68]`, `[+0x70]`, `[+0x3780]`, `[+0x3788]`, `[+0x3EB8]`) |
 | `VsmmPhuIoctlEnd+0xbe` | `0` |
 
-The other fifteen accesses are reads. **No site takes the field's address**, so for this field the
-census is *complete*: there is no pointer through which some other function could write it, and the
-four sites above are every instruction in the image that can change it.
+The other fifteen accesses are reads. **No site takes the field's address, in one step or in two**,
+and nothing in the 52 bytes of code outside `.pdata` touches it — so within the coverage stated
+above, these four are every instruction in the image that can change the field.
 
 **Three of the four clear it. One sets it, and that one is the detach IOCTL** — which itself
 demands `[p+0x3060] == 2`, `[p+0x3064] == 2` and `[p+0x3079] == 0` before it will, so the caller
@@ -4589,11 +4609,18 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
 
 #### Limits
 
-- **A bulk copy is outside this method.** The census covers instructions with an explicit
-  displacement operand plus every `lea` of one. A `memcpy`-shaped restore whose length spans the
-  field would write it without either, and `VsmmPhuPartitionRestore` is in the persistence family
-  that would do such a thing. Nothing here excludes it, and it is the one residual on the
-  `[p+0x3079]` result rather than a residual on the reasoning above it.
+- **Two residuals on the `[p+0x3079]` result, and they are what the coverage does not reach rather
+  than things it declined to look at.** The census sees a memory operand that resolves to the field
+  — by its own displacement, or through a pointer the same function built with `lea`/`mov`/`add`.
+  It does not see:
+  - **a pointer to the field formed in one function and written through in another**, since the
+    alias table is intra-procedural and stops at a call boundary. Closing that wants
+    inter-procedural argument tracking, which this instrument does not do;
+  - **a bulk copy whose length spans the field.** `VsmmPhuPartitionRestore` is in the persistence
+    family that would plausibly do such a thing, and nothing here excludes it.
+
+  Both were narrowed rather than invented by this gate: the first version of the tool also missed
+  split addresses within a function and everything outside `.pdata`, and review caught both.
 - **`[p+0x3060]`'s writers are not claimed complete**, per the taken address above.
 - **Static, one build** — `Vid.sys 10.0.26100.9278`. No partition object was inspected live, so
   this says what the code can do, not what any particular partition's fields hold.
