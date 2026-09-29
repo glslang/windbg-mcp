@@ -3742,6 +3742,47 @@ validated. The full record is the
   would each have been a host bug check, and both were live before this run. Full record in the
   [S5q arm 0 result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
+- **S5q arm 1 — RUN 2026-09-29: the trap is held and the partition's routine is never called, so the
+  message is not delivered.** Partition `0x3` with our routine chained into its slot,
+  `HvCallInstallIntercept` type 3 / access 4 / vector `0x03`, and `spin_host.exe BP0` — S5h's own
+  VTL0 raiser — launched detached. The install succeeded, the **raiser was held** at all ten
+  2-second samples across 20 s (against **878 µs** to finish all 1000 rounds with no intercept
+  standing, measured immediately before), and **`forwarded` stayed 0 throughout**. Teardown removed
+  the intercept, released the raiser, restored the chain, left nothing standing; host and both
+  guests untouched. **So this is not arm 0's vacuous zero**: the trap fired, the hypervisor took it,
+  and our routine still was not called.
+- **The alternative had to be excluded before the zero meant anything**, because this instrument has
+  never been observed to carry a message — zero in arm 0 across guest churn and 20 VTL1 enclave
+  calls, zero here with a trap held. The alternative was *the field we patched is not the field this
+  dispatch consults*, and it is a static question.
+  [`tools/winhv_partition_readers.py`](tools/winhv_partition_readers.py) answers it: a census of
+  `+0x10` alone cannot (365 accesses in `winhvr.sys` by `vid_field_census.py`'s count), so it first
+  finds the **28 of 497** functions that can hold a partition object at all — those calling
+  `WinHvpReferencePartition` or loading `WinHvpPartitionArray` — and only then reports `+0x10`/`+0x18`
+  with capstone's read/write classification and stack traffic dropped. **Two sites trace end to end
+  to the same field**: `WinHvSetInterceptRoutine` (`+0x8020`) writes `[rax+0x10]`/`[rax+0x18]` off
+  `WinHvpReferencePartition`'s return, and `WinHvpOnInterception` (`+0x4438`) reads the same pair off
+  the array-derived object. **The message did not reach `WinHvpOnInterception`.**
+- **The limit, stated rather than glossed.** The census is function-scoped, not provenance-scoped.
+  Three other functions read the pair — `WinHvpOnMirroringNotification`,
+  `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
+  say they serve other message types, but their objects were not identified, so a dispatch consulting
+  one of those instead is **narrowed, not eliminated**. The tool ships without a self-test, which
+  S5p's instrument has and which review holed twice; treat its function set as a reading.
+- **What it does to S5j's two explanations, and to the build.** S5k killed *nothing was bound*;
+  step 2 confirmed Vid bound at runtime for both partitions. Arm 1 bears against the second, *the
+  handler received it and retained it*: the bound routine is **not called**, so the hold is not
+  something a receiver retains after receiving — it happens before the root's intercept dispatch
+  runs. The likeliest remaining account is an **inference, not a measurement**: S5k's "half of the
+  arming sequence" may be not merely the per-vector flag but the delivery plumbing itself — the port
+  and SINT whose API `winhvr.sys` exports — without which the hypervisor has the intercept armed and
+  nowhere to post. **So the receiver is not a routine to chain.** Chaining works, is safe, restores
+  cleanly and receives nothing; what is missing is a delivery path, and the only known way to
+  establish one is S5m's registration, which S5n and S5o showed needs a partition handle a running VM
+  will not give up. **Arm 1 closes the route this gate was built on and returns the question to
+  ownership** — step 8. Full record in the
+  [S5q arm 1 result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+
 ### Out of scope, with the reason rather than as a list
 
 - **Writes as a *tool surface***: the primitive exists and S1's seam should not pretend otherwise,

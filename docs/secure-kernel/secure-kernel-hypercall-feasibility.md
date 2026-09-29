@@ -5099,3 +5099,90 @@ pool**, so the address registered as a context cannot become freed memory; `H3Un
 anything else, because there is no way to refuse an unload and an image that goes away while
 Hyper-V still points into it bug checks the host on the next intercept — long after the run looked
 clean.
+
+### S5q arm 1, 2026-09-29: the trap is held and the partition's routine is never called, so the message is not delivered
+
+**A `#BP` raised in a child with a parent-installed intercept is held by the hypervisor, and the
+routine registered for that partition is not invoked.** Arm 0 could not test dispatch because nothing
+was dispatched; arm 1 supplies the traffic, and what it finds is that the traffic does not arrive.
+
+#### The arm
+
+Partition `0x3`, our routine chained into its slot (verified in the table), then
+`HvCallInstallIntercept` type 3 / `AccessType` 4 / vector `0x03`, then `spin_host.exe BP0` launched
+detached in the guest — S5h's own VTL0 raiser, 1000 `#BP`s in a loop each counted by its own
+`__except`.
+
+| | |
+|---|---|
+| install | `SUCCESS` |
+| raiser **held** | alive at every one of ten 2-second samples, 20 s in total — against **878 µs** to complete all 1000 rounds with no intercept standing, measured immediately before |
+| our routine | **`forwarded = 0`** at every sample |
+| teardown | intercept removed, raiser released and gone, chain restored, 0 standing, host and both guests untouched |
+
+The hold reproduces S5h's signature on a VTL0 raise, so the trap fired and the hypervisor took it.
+The zero is therefore **not** the vacuous zero arm 0 produced: something happened, and our routine
+still was not called.
+
+#### The reading, and what had to be ruled out first
+
+A zero from an instrument never observed to work says nothing, and this instrument has never been
+observed to carry a single message — arm 0 counted zero across twelve seconds of guest churn and
+twenty VTL1 enclave calls, and arm 1 counted zero with a trap demonstrably held. So before the zero
+could mean anything about delivery, the alternative had to be excluded: **that the field we patched
+is not the field this dispatch consults.**
+
+That is a static question and
+[`tools/winhv_partition_readers.py`](tools/winhv_partition_readers.py) answers it. A census of
+`+0x10` alone cannot — it is one of the commonest displacements in any image, and
+`vid_field_census.py` finds **365** accesses to it in `winhvr.sys`. What makes an access a
+*partition object* access is the provenance of the base pointer, so the tool first finds every
+function that can hold one — by calling `WinHvpReferencePartition` or by loading
+`WinHvpPartitionArray` — which is **28 of 497**, and only then reports what those do with `+0x10`
+and `+0x18`, with capstone's own read/write classification and with stack-relative traffic dropped.
+
+**Two sites are traced end to end, and they are the same field:**
+
+- `WinHvSetInterceptRoutine` (`+0x8020`) **writes** `[rax+0x10]` and `[rax+0x18]` where `rax` is
+  `WinHvpReferencePartition`'s return — the partition object.
+- `WinHvpOnInterception` (`+0x4438`) **reads** `[rcx+0x10]` and `[rcx+0x18]` where `rcx` came from
+  the array lookup `[r8+rcx*8+0x10]` — the same object.
+
+So the slot we chained is the slot the interception dispatch reads. **The message did not reach
+`WinHvpOnInterception`.**
+
+**The limit of that, stated rather than glossed.** The census is function-scoped, not
+provenance-scoped: it proves those two sites touch a partition object because their base registers
+were traced by hand, and it does **not** prove the remaining pair-fetches do not. Three other
+functions read `+0x10`/`+0x18` as a pair — `WinHvpOnMirroringNotification` (`+0x8394`),
+`WinHvpSendRestartNotificationToAllPartitions` (`+0x1D84C`) and `WinHvIssueSnpPspGuestRequest`
+(`+0x20DB0`) — and their names say they serve other message types, but the objects they read were
+not identified. A dispatch for exception intercepts that consulted one of those instead is narrowed,
+not eliminated. The tool also ships without a self-test, which the instrument S5p built has and which
+review found holes in twice; treat its function set as a reading rather than a proof.
+
+#### What this does to S5j's two explanations
+
+S5j left two live readings of S5h's hold: **nothing was bound**, or **the existing handler received
+it and retained it**. S5k killed the first — Vid is bound, and S5q step 2 confirmed that at runtime
+for both partitions. Arm 1 now bears on the second, and against it: the bound routine is **not
+called**, so the hold is not something a receiver retains after receiving. It happens before the
+root's intercept dispatch runs at all.
+
+**The likeliest remaining account, and it is an inference rather than a measurement**: S5k found that
+`VidHandlerpExceptionRegisterEntry` claims its slot in `[partition+0xB68]` and *then* calls
+`WinHvInstallIntercept`, and called S5b's raw install "half of the arming sequence". This arm is
+consistent with the missing half being not merely a per-vector flag Vid consults on receipt, but the
+establishment of the delivery itself — the port and SINT plumbing whose API `winhvr.sys` exports
+(`WinHvAllocatePartitionSintIndex`, `WinHvCreatePort`, `WinHvConnectPort`), without which the
+hypervisor has the intercept armed and nowhere to post. **Untested**, and it is the thing to test
+next.
+
+#### What it means for the build
+
+This is the fourth downward re-scope in this line, and it moves in the opposite direction from the
+last three. The receiver is **not a routine to chain**: chaining works, is safe, restores cleanly,
+and receives nothing. What is missing is a *delivery path*, and the only known way to establish one
+is the registration S5m found — which S5n and S5o showed needs a partition handle that a running
+VM will not give up. So arm 1 does not open a route; it closes the one this gate was built on, and
+returns the question to ownership.
