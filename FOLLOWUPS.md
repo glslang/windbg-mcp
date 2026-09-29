@@ -3247,9 +3247,10 @@ validated. The full record is the
   unestablished.** What settles the question itself is reading that byte **inside a replicated
   intercept arm** — it is mutable, so a later read reports the reproduction and says nothing about
   the historical runs beyond an unchanged bench — and it comes before the IOCTL read.
-  **Second hazard, confirmed by S5l**: a VID client holding a vector this probe installs has its
-  intercept stripped by the probe's teardown while Vid goes on believing it armed, silently, on the
-  child under test — and six runs have done it. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
+  **Second hazard, mechanism confirmed by S5l**: a VID client holding a vector this probe installs
+  *would* have its intercept stripped by the probe's teardown while Vid went on believing it armed,
+  silently, on the child under test. Six runs executed that teardown and none read the slot, so
+  what is established is the exposure, not a loss. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
   in the **root** — a host bugcheck, not a guest one — for any intercept message type it does not
   handle, including the holes `0x80010005`, `0x80010009`–`0x8001000F` and `0x80010012` inside the
   range it otherwise covers. Full record in the
@@ -3261,9 +3262,11 @@ validated. The full record is the
   `AccessType` alone — `or edx, 1 << vector` for `4`, `not`/`and` for `0` — stores back to
   `array[VTL].0x1A04` and calls the `+0x2BECC8` recompute S5i read. **No refcount, and nowhere for
   one**: two writers in the whole image, this store and a partition-teardown zeroing, and a 32-bit
-  bitmask has no room to count. So **two parties holding one vector are one bit**, the second
-  remover clears it for both, and the probe's `finally` strips a VID client's intercept while
-  `[partition+0xB68]` still says armed. The hazard S5k left conditional is real, and the controls
+  bitmask has no room to count. So **two parties holding one vector are one bit**, and since removal
+  is a plain `and ~bit` the **first** removal clears it for both, whichever party makes it — so the
+  probe's `finally` would strip a VID client's intercept while `[partition+0xB68]` still said armed.
+  The hazard's *mechanism* is established; whether a client ever held one is not, no arm having read
+  the slot. The controls
   argument S5k retracted is **false on a probed child** rather than merely unestablished. It does
   **not** say which branch S5h met — that is still the replicated arm. **Three bounds read free
   from the same 215 bytes**: `AccessType` must be exactly `0` or `4` (status `5` otherwise, which

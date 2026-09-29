@@ -3598,11 +3598,13 @@ an assumption to state, not a result. Read it with the intercept standing and th
 the same triple shape S5h used. Nothing should be built on the drop until that is done.
 
 **And the same desynchronisation is a hazard rather than only a hole in an argument.** A VID client
-holding a vector this probe installs has its intercept stripped by the probe's teardown while Vid
-goes on believing it armed — silently, on the child under test, with no error anywhere. Six runs
-have done this. **S5l confirms it**: install and remove are the same function acting on the same
-bit, with no refcount and nowhere for one to live, so two parties holding one vector are one bit and
-the second remover clears it for both.
+holding a vector this probe installs *would* have its intercept stripped by the probe's teardown
+while Vid went on believing it armed — silently, on the child under test, with no error anywhere.
+**S5l confirms the mechanism**: install and remove are the same function acting on the same bit,
+with no refcount and nowhere for one to live, so two parties holding one vector are one bit and the
+**first** removal clears it for both. What is not established is whether any client ever held one:
+six runs executed that teardown and none read the slot, so this is an exposure rather than a
+recorded loss.
 
 #### What the hold then is, stated as the inference it is
 
@@ -3763,12 +3765,14 @@ Nothing increments, nothing decrements, and a 32-bit bitmask has no room to.
 
 #### What that settles
 
-- **The hazard is confirmed and stops being conditional.** Two parties installing the same vector
-  on one partition are not two installs — they are **the same bit**, and the second remover clears
-  it for both. A VID client that had claimed `#BP` through
-  `VidHandlerpExceptionRegisterEntry` loses its intercept to this probe's `finally`, while
-  `[partition+0xB68][3]` still says it is armed and no error is raised anywhere. Six S5h runs have
-  executed that teardown.
+- **The *mechanism* of the hazard is confirmed and stops being conditional.** Two parties
+  installing the same vector on one partition are not two installs — they are **the same bit**, and
+  because removal is a plain `and ~bit`, **the first removal clears it for both**, whichever party
+  makes it. There is no "my install" to take back. So a VID client that had claimed `#BP` through
+  `VidHandlerpExceptionRegisterEntry` would lose its intercept to this probe's `finally` while
+  `[partition+0xB68][3]` still said it was armed, with no error raised anywhere.
+  **Whether that ever happened is still unknown**: six S5h runs executed that teardown, and no arm
+  has read the slot, so what is established is the exposure rather than an occurrence.
 - **It propagates.** The store is followed by the `+0x2BECC8` recompute S5i read, which rebuilds
   every enabled VTL's effective mask from the per-VTL `+0x1A04` values seeded with VTL 0's. So
   clearing the parent's bit clears it from every VTL's effective mask — *except* for a VTL that
@@ -3810,16 +3814,23 @@ same asymmetry that leaves a caller unable to tell a fresh install from a redund
 
 **What is readable, in principle, is Vid's `[partition+0xB68][vector]`** — kernel memory in the
 root, and the thing that actually matters, since it says whether a *VID client* holds the vector.
-A probe that reads it before installing could decline rather than proceed, and restore rather than
-strip on the way out. **On this bench it needs a capability nothing here has yet**: local kernel
-debugging is not enabled (`bcdedit /dbgsettings` reports `debugtype Local`, which is the *global
-setting store* and not the boot entry — `{current}` carries no `debug Yes`, and `attach_kernel_local`
-answers `0x80004001` accordingly), so reading it means either a host reboot into debug mode or a
-kernel-read path added to `h3probe.sys`. Both are bench work this repo does not ship.
+**On this bench it needs a capability nothing here has yet**: local kernel debugging is not enabled
+(`bcdedit /dbgsettings` reports `debugtype Local`, which is the *global setting store* and not the
+boot entry — `{current}` carries no `debug Yes`, and `attach_kernel_local` answers `0x80004001`
+accordingly), so reading it means either a host reboot into debug mode or a kernel-read path added
+to `h3probe.sys`. Both are bench work this repo does not ship.
 
-So the honest statement is a constraint rather than a remedy: **treat *"an install/remove pair is
+**And a pre-read would not make the pair safe even if it were available**, which is worth stating
+because it is the remedy that suggests itself and an earlier draft of this section proposed it.
+The per-partition lock at `+0x63F0` serialises one update; it does not span read-then-install-then-
+remove. A client registering between the read and the teardown still loses its bit, and a
+comparison *after* removal cannot say who owned what was cleared. Making the pair safe needs
+exclusive coordination with every other installer, or an ownership mechanism the bitmask does not
+have — not a check.
+
+So the honest statement is a constraint with no remedy attached: **treat *"an install/remove pair is
 free"* as false.** It is free only if nobody else holds the vector; nothing in the ABI says whether
-anybody does; and on this bench nothing yet can look.
+anybody does; on this bench nothing yet can look; and looking would not be enough.
 
 #### Limits
 
