@@ -3344,16 +3344,32 @@ validated. The full record is the
   `VidPartitionIoctlAttach`, which loops the VPs calling `VidVpAttach` — the VM worker's *start the
   virtual processors* operation. It was not called.
   **So S5's obstacle has changed shape**: the mechanism exists and is exported, and what blocks it
-  is a refused open. **Next, cheapest first**: vary the caller **upward** — a run as `SYSTEM` with
-  the unused-name control, since a non-elevated run only varies privilege downward and cannot
-  reopen the route; then locate the check, which wants the kernel debugger this bench has disabled
-  and is the only thing that turns the matched error into a cause; and only then the
-  VMM-of-our-own question — `VidCreatePartition`, `VidVsmEnableVpVtl`, `VidVsmSetPartitionConfig` —
-  **which is a rig rather than an arm and should be costed as its own decision.** A stopped-VM arm
+  is a refused open. A stopped-VM arm
   was proposed and **dropped**: stopping the guest moves both candidate causes at once, and if the
   partition object goes with the VM then its Id is just another unused name, so neither outcome
-  discriminates. Full record in the
+  discriminates. The order of what was left runs in the numbered plan below rather than here. Full
+  record in the
   [S5n result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+- **S5o, 2026-09-29: the refusal is a partition-state test with no token in it, and the branch
+  behind it is an ownership handoff.** A static read of `Vid.sys` — DbgEng opening the image as a
+  target, no debuggee, nothing executed — answered the plan's next **two** steps at once.
+  `Vid.sys` is WDF, which is why S5n could find no `IRP_MJ_CREATE` dispatcher: the callback is
+  `VidFileCreate` → `VidFileObjectCreate`, and the refusal is a single site testing
+  `[partition+0x3060] == 2` and `[partition+0x3079] == 1`. **It consults no token**, so the
+  `SYSTEM` arm cannot change the outcome and was not run — and the one token check on the path,
+  `VidSidPartitionCheck`, gates *creating* a partition, admitting any administrator outright and
+  otherwise demanding the caller's own `NT VIRTUAL MACHINE` SID match the name. S5n's matched error
+  becomes a **common cause**: on the non-Exo arm that site is the only `0xC0000184`.
+  **And the branch behind the refusal is not what the plan wanted.** `VidPartitionAttach` makes the
+  opener the partition's owning process — storing `PsGetCurrentProcess()` and switching the thread
+  pool — and it is admitted only after the current owner's detach IOCTL, which first calls
+  `VidHandlerUnregister` and detaches every VP. So on a VM Hyper-V runs, the step that would admit
+  us dismantles the receive path S5m found. **This also corrects S5n on `VidPartitionIoctlAttach`**:
+  it is the second half of a handoff, not merely "start the virtual processors", and it refuses a
+  partition nobody has detached. What the gate does **not** establish: it enumerates no writers of
+  either field, decodes neither state value, reads one build, executed nothing, and leaves Exo
+  partitions and handle duplication untouched. Full record in the
+  [S5o result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
   port. That is not the same as nothing receiving it: the root's own stack owns a port for each
@@ -3461,7 +3477,11 @@ validated. The full record is the
    unknown again**: the key is the partition id, Vid holds the entry, and the receiving path already
    exists — Vid is bound and recognises the message, and drops one whose vector is not claimed in
    its own per-vector table. **S5m then read the IOCTL and found it wrapped by an exported
-   `vid.dll` call, so the unknown moved again — and the ordered plan for it lives here, in one
+   `vid.dll` call**, and **S5n and S5o between them settled what that is worth on a VM Hyper-V
+   runs: nothing.** The sequence needs a partition handle, a second open is refused, the refusal is
+   a partition-state test with no token in it, and the branch it guards hands the partition to a
+   new owner only after the old one has torn the receive path down. **So the unknown is no longer
+   "can the root receive" but "can the root own", and the ordered plan for it lives here, in one
    place, because keeping a schedule in each gate section produced a run of review findings against
    lists a later gate had invalidated:**
 
@@ -3469,21 +3489,34 @@ validated. The full record is the
       device interface path plus the VM Id, `OPEN_EXISTING`, from an elevated process, gives
       `ERROR_BAD_COMMAND` (22) on both running guests, while a well-formed unused name opens — an
       error matching a single-open rule that S5n could not trace to its check.
-   2. **← active step. Vary the caller upward** — a run as `SYSTEM` carrying the same unused-name
-      control. Cheap, installs nothing, and the only untested condition that could reopen the
-      user-mode route. **It forks the plan**: if it *succeeds*, go straight to step 4, because a
-      handle is all the receive sequence needed. If it is *refused too*, go to step 3.
-   3. **Locate the refusing check** — only if step 2 is also refused. It wants the kernel debugger
-      this bench has disabled, and it is the only thing that turns S5n's matched error into a cause.
-   4. **Register `#BP` through `vid.dll` and receive** — `VidRegisterExceptionHandler`, then
-      `VidSetupMessageQueue` / `VidMessageSlotMap` / `VidMessageSlotHandleAndGetNext`, with a `#BP`
-      raised in the guest, VTL0 first and then the VTL1 enclave, which is S5's pass condition.
-      Reachable the moment any step obtains a handle, and gated by the raw-installer condition on
-      the standing constraint above.
+   2. ~~**Vary the caller upward.**~~ **Answered by S5n's successor without running it — see
+      step 3**, which read the check and found it consults no token. The arm — a run as `SYSTEM`
+      carrying the unused-name control — was never performed, and performing it now would add
+      nothing: `SeTokenIsAdmin` is true for both that account and the elevated one already
+      measured, so it reaches the same instruction with the same two fields. Recorded as *not run*
+      rather than as *refused*, because those are different readings and only the second would have
+      been a measurement.
+   3. ~~**Locate the refusing check.**~~ **Run as S5o: located, statically.** `Vid.sys` is a WDF
+      driver, which is why no `IRP_MJ_CREATE` dispatcher was findable by name; the callback is
+      `VidFileCreate` → `VidFileObjectCreate`, and the refusal is one site (RVA `0x8f6f`) testing
+      `[partition+0x3060] == 2` and `[partition+0x3079] == 1`. **This step's cost estimate here was
+      wrong** — it said a host reboot into kernel-debug mode, and the answer came from opening the
+      image in DbgEng with no target attached. The error S5n matched is now a common cause: on the
+      non-Exo arm there is exactly one such site.
+   4. ~~**Register `#BP` through `vid.dll` and receive.**~~ **Unreachable by this route, and not
+      merely gated on a handle.** S5o read the branch the refusal guards: it is
+      `VidPartitionAttach`, which makes the opener the partition's owning process, and it is
+      admitted only once the current owner has called the detach IOCTL — which first calls
+      `VidHandlerUnregister` and detaches every VP. So the sequence S5m found cannot be run
+      *alongside* Hyper-V on a VM Hyper-V runs; the step that would admit us dismantles what we
+      came for. It remains the pass condition for a partition **we** own, which is step 6.
    5. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
-      the standing constraint above, and the first also by kernel-memory access.
-   6. **Only then** the VMM-of-our-own question, which is a rig rather than an arm and is a decision
-      to cost rather than a next step.
+      the standing constraint above, and the first also by kernel-memory access. Unchanged by S5o.
+   6. **← active step, and it is a decision rather than an arm.** The VMM-of-our-own question: own
+      the partition from creation, where `VidPartitionCreate` admits any name for an administrator
+      and the whole `vid.dll` sequence is then reachable by construction. S5o makes this the **only
+      remaining user-mode route** rather than the clearest of several, which is a stronger reason to
+      cost it and not a reason to start it. Nothing below it is blocked on it.
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from

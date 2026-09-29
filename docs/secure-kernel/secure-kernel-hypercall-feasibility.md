@@ -2998,7 +2998,7 @@ nothing**, which is worth recording because S5g cost it four reboots.
   the answer. **S5j ran that step and this is what it found**: the message is already addressed to
   the parent, and those two hypercalls are not the build — see the S5j result below.
 
-#### What to run next, and what not to repeat
+#### What this gate leaves open, and what not to repeat
 
 - **Do not** re-run the controls. The `#BR`-installed and `#DE`-raised arms are taken on both VTLs,
   and the negative control ran in every one of six runs.
@@ -3006,7 +3006,9 @@ nothing**, which is worth recording because S5g cost it four reboots.
   this gate's own retracted reading, and the script now refuses to make it.
 - **Do not** plant an `int 3` in Secure Kernel to extend the result from VTL1 user mode to VTL1
   kernel mode. S5a's prohibition is unchanged and the guest would bugcheck.
-- **There are now two next experiments, and they are independent.**
+- **Two questions were left open here, and both have since been carried forward** — the ordering
+  lives in `FOLLOWUPS.md` item 103 rather than in this list, which is what kept it from going stale
+  a fourth time.
   - **The receiver**, which is what S5's pass condition needs — but it starts one step earlier than
     "create a port": first establish **where an exception intercept message on a child is delivered
     today**, since the root's stack already owns a port for that child and is the likeliest
@@ -4180,6 +4182,14 @@ opens under another token needs nothing this bench lacks, and the plan's next ar
 as `SYSTEM`. The other two are what want a kernel debugger or a VM stop, and only the first of those
 turns out to discriminate.
 
+**S5o closed this paragraph from an angle it did not consider, and two of its cost estimates were
+wrong.** The check is readable in the image — `Vid.sys` is WDF, so the dispatcher this paragraph
+could not find by name is a file-object callback rather than a `MajorFunction` entry — and reading
+it settles all three residual causes at once: the refusal tests **partition-specific state** and
+nothing else, consulting neither the caller's token nor the VM's lifecycle. So caller identity was
+*not* the cheap one, because it needed no run at all; and the alternative that "wants a kernel
+debugger" wanted an image and a PDB.
+
 #### What this does to the plan
 
 - **The exported receiver S5m found has no handle this gate could obtain.** Every call in that
@@ -4190,7 +4200,10 @@ turns out to discriminate.
   run at one integrity level with one token, so *"running as SYSTEM changes it"* is untested rather
   than excluded. What the controls do show is that the rule they exercise is indifferent to
   *which* process asks — which makes privilege an unlikely explanation for the VM case without
-  ruling it out. Varying it is one cheap arm if this route is worth another look.
+  ruling it out. Varying it is one cheap arm if this route is worth another look. **S5o ruled it
+  out** by reading the check rather than by varying anything: the refusal consults no token, and
+  the one token check on the create path is on *creating* a partition, where an administrator —
+  which both this account and `SYSTEM` are — is admitted unconditionally.
 - **Handle duplication and inheritance are excluded routes, not closed ones.** They would produce a
   second handle without a second open, so the measurement above does not reach them. They are not
   attempted: `vmwp.exe` runs protected, and taking a handle out of it would be an attack on the
@@ -4204,10 +4217,13 @@ turns out to discriminate.
   rather than *the only* route: **two** cheaper ones this gate could not reach — varying the caller
   upward, and locating the failing check — come before it in item 103's plan. A third, a stopped VM,
   was proposed and dropped because it moves two candidate causes together; the plan records why.
+  **S5o ran the second cheap one and it answered the first as well, so this is now *the only*
+  route**, which raises what it is worth costing without making it any smaller.
 - **S5 does not pass**, and the obstacle has changed shape. It is no longer a missing mechanism:
   the mechanism exists and is exported. What blocks it is that opening the partition of a VM this
   host did not create is refused, for a reason consistent with a single-open rule and not yet traced
-  to its check.
+  to its check. **S5o traced it**, and the shape changed once more: the refusal is a partition-state
+  test, and the branch behind it transfers ownership rather than admitting a second client.
 
 #### Limits
 
@@ -4216,9 +4232,14 @@ turns out to discriminate.
   located: `0xC0000184`, the status that maps to `ERROR_BAD_COMMAND`, appears at 62 sites in
   `Vid.sys` and no create dispatcher was identifiable by symbol name. So two different checks could
   give the same error, and the eight arms above narrow the alternatives without eliminating them.
+  **Lifted by S5o**, which located it — and the guess in this bullet is why it took a second gate:
+  the driver is WDF and has no `IRP_MJ_CREATE` handler to find.
 - **Measured at one integrity level, with one token.** Nothing here varies the caller, so the
   refusal's independence from privilege is an inference from the rule's indifference to *which*
-  process asks, not a measurement.
+  process asks, not a measurement. **Still true of this gate** — S5o did not vary the caller
+  either. It established the same conclusion by a different kind of evidence, reading the check
+  instead of sampling its behaviour, which is why the plan records the `SYSTEM` arm as *not run*
+  rather than as *refused*.
 - **The constraint measured is "no second open", not "one handle".** `DuplicateHandle` and handle
   inheritance are untested and untried.
 - **Two guests, one host, one build.** `vid.dll 10.0.26100.8457`, `Vid.sys 10.0.26100.9278`.
@@ -4237,26 +4258,27 @@ turns out to discriminate.
   first two counting a subset of the names and the third counting names where the audit wants
   objects.
 
-#### What to run next, cheapest first
+#### What this gate leaves open
 
-1. **Vary the caller — upward, and that is the point.** The arm this section first proposed was a
-   medium-integrity, non-elevated run, which only varies privilege *downward*: if that also fails it
-   says nothing about the alternative that could actually reopen the route, which is **SYSTEM**. So
-   the arm is a run as `SYSTEM` (a scheduled task or a service is enough), carrying the unused-name
-   control with it so a success can be told from the device simply being reachable. A non-elevated
-   run is worth including in the same pass — three points beat one — but it is the SYSTEM arm that
-   decides anything.
-2. ~~**A stopped VM.**~~ **Dropped: it does not discriminate**, and an earlier draft of this list
-   proposed it as though it did. Stopping the guest moves *both* candidate causes at once —
-   `vmwp.exe` releases its open **and** the VM's lifecycle state changes — so neither outcome
-   separates them. Worse, if the partition object goes away with the VM, as the limits above allow,
-   then the VM Id becomes just another well-formed unused name and a successful open says only what
-   the unused-name arm already said. Making it discriminate would need an independent check of
-   whether the object still exists, which is the same kernel visibility item 3 is about.
-3. **Locate the check**, which needs the kernel debugger this bench does not have enabled and is
-   therefore the expensive one — a host reboot into debug mode. With items 1 and 2 as they now
-   stand, this is the only thing that would turn the match into a cause.
-4. **Only then** the VMM-of-our-own question, which is a rig rather than an arm.
+- **Whether privilege lifts the refusal.** Nothing here varies the caller, so this section could
+  only infer the refusal's independence from privilege out of the rule's indifference to *which*
+  process asks. **Answered by S5o, and by reading rather than by running**: the refusing check
+  consults no token, so a caller varied upward reaches the same instruction.
+- **Where the refusal is enforced.** `0xC0000184` has 62 sites in `Vid.sys` and no create
+  dispatcher was identifiable by symbol name, so two different checks could give the same error.
+  **Answered by S5o**: the driver is WDF, which is why no `MajorFunction` entry was findable, and
+  the check reads statically out of the image. This bullet's predecessor costed the answer at a
+  host reboot into kernel-debug mode; that was wrong, and wrong in a way worth keeping visible —
+  it assumed locating a dispatcher meant catching it running.
+- ~~**A stopped VM.**~~ **Dropped: it does not discriminate**, and an earlier draft proposed it as
+  though it did. Stopping the guest moves *both* candidate causes at once — `vmwp.exe` releases its
+  open **and** the VM's lifecycle state changes — so neither outcome separates them. Worse, if the
+  partition object goes away with the VM, as the limits above allow, then the VM Id becomes just
+  another well-formed unused name and a successful open says only what the unused-name arm already
+  said. Making it discriminate would need an independent check of whether the object still exists,
+  which is the same kernel visibility this gate does not have.
+- **Owning the partition rather than opening one** — the VMM-of-our-own question, which is a rig to
+  cost rather than an arm to run, and which `FOLLOWUPS.md` item 103 orders against everything else.
 
 ## Explicitly out of scope
 
@@ -4284,3 +4306,147 @@ Written here so they are not renegotiated later:
 - **H4 passes and H5a finds DbgEng contributes no SK awareness.** Not a failure: it selects H5b and
   retires the EXDI work for this route, which is a saving rather than a loss.
 - **Any gate passes without its control having passed.** The result is withdrawn, not caveated.
+
+### S5o result, 2026-09-29: the refusal is a partition-state test with no token in it, and the branch behind it is an ownership handoff
+
+**Two of the plan's open steps are answered by one read, and neither needed the arm it was waiting
+for.** S5n left the live VM's refusal *matched* to a single-open rule rather than traced to a check,
+and left privilege untested; the plan's next two steps were a run as `SYSTEM` and — expensively, as
+a host reboot into kernel-debug mode — locating the check. The check is in `Vid.sys`'s create path
+and reads out of the image with no debugger attached to anything, and having read it:
+
+- **The refusing check consults no token at all.** It tests two fields of the partition object. So
+  the `SYSTEM` run cannot change the outcome, and the plan's fork collapses onto its "refused too"
+  branch **without being run** — which is the better evidence of the two, because a refusal under
+  `SYSTEM` would have been one more match and this is the instruction.
+- **The branch it guards is not a second client joining. It is the partition changing owner**, and
+  it is reachable only after the current owner has asked to give the partition up.
+
+So the user-mode route to a handle on a **Hyper-V-run** VM is closed with a cause rather than a
+match, and closed twice over: the door is locked, and behind it is not the room S5m was heading for.
+
+This gate executed nothing. No VM was touched, no partition object created, no handle opened, no
+intercept installed, no reboot — it is a static read of one image.
+
+#### How it was read
+
+`DbgEng` opens a PE image as a target of its own, which the repo already relies on for
+`securekernel.exe` (S2) and is what makes this cheap: `open_dump` on
+`C:\Windows\System32\drivers\Vid.sys` loads the image at `0x140000000` with its public PDB, and
+`uf` walks the code with symbols. There is no debuggee, no live kernel and no VM in the picture, so
+the kernel-debug reboot S5n costed for this step was never needed for the *static* half of the
+question — a distinction that section did not draw, because it assumed locating the dispatcher
+meant catching it running.
+
+`Vid.sys` is a **WDF** driver, which is why S5n looked for an `IRP_MJ_CREATE` dispatcher by name and
+found none: there is no `MajorFunction` table to read. The create callback is
+`Vid!VidFileCreate` (RVA `0xe030`), a one-line forwarder to `Vid!VidFileObjectCreate`
+(RVA `0x8d20`) passing a fourth argument of `0`. `Vid!VidExopFileCreate` (RVA `0x61dc0`) forwards to
+the same function passing `1`, which is how that argument is identified as the **Exo** selector
+rather than guessed. The device we open is the VID interface, so every reading below is the `0` arm.
+
+The `FILE_OBJECT` is identified by two offsets rather than asserted: the function reads a
+`UNICODE_STRING` at `+0x58` and writes its result to `+0x18`, which are `FileName` and `FsContext`.
+
+#### The create path, and a cause for every row S5n measured
+
+| what the caller asks for | what `VidFileObjectCreate` does |
+|---|---|
+| a name of length `0`, or of length `2` whose one character is `\` | returns success with no partition — the **bare device** open |
+| a name `VidPartitionNameParse` (RVA `0x31990`) rejects | that function's own VID-facility status — the measured `0xC0370005` |
+| a parsed name, device tag `!= 1` | `VidPartitionCreate` |
+| a parsed name, tag `== 1`, `VidPartitionTableLookup` misses | `VidPartitionCreate` — which **creates**, and is why the probe left transient objects |
+| a parsed name, tag `== 1`, found, `[p+0x3060] != 2` **or** `[p+0x3079] != 1` | **`STATUS_INVALID_DEVICE_STATE`** at RVA `0x8f6f`, which `RtlNtStatusToDosError` maps to `ERROR_BAD_COMMAND` (22) |
+| a parsed name, tag `== 1`, found, both hold | `VidPartitionAttach`, and a handle |
+
+**The two arms predict different errors, and the measurements pick one — so the branch is
+identified rather than assumed.** If the VID device's context tag were `0`, the lookup would be
+skipped and `VidPartitionCreate` would take its *other* arm, which looks a partition up instead of
+allocating one and answers a miss with `0xC0370009`; an unused name would then have **failed**
+rather than created anything. S5n measured an unused name creating an object and an existing name
+answering `0xC0000184`, which is only the `tag == 1` path.
+
+**S5n's "a match, not a proof of common cause" can now be upgraded to a common cause.** On this arm
+there is exactly one `0xC0000184` site — the other in the function sits under `exo != 0`, and
+`VidFileCreate` passes `0` — so the probe's own held name and a live guest's name are refused by the
+**same instruction**. The 62 sites S5n counted are real and irrelevant: 61 of them are not on this
+path.
+
+#### Why privilege cannot lift it
+
+**The only token check anywhere on the create path is on *creating*, not on the refusal.**
+`VidPartitionCreate` calls `Vid!VidSidPartitionCheck` (RVA `0xbebec`), which is:
+
+- `VidCurrentProcessIsAdmin` (RVA `0x5e468`) — `SeTokenIsAdmin` on the primary token — and an admin
+  **returns success immediately, with no further check**;
+- otherwise the caller's user SID must have exactly six sub-authorities beginning `S-1-5-83-1`, and
+  its last four must `memcmp` equal against the partition name — the per-VM
+  `NT VIRTUAL MACHINE\<vm id>` identity, which is how a `vmwp.exe` is confined to its own VM's
+  partition. Anything else is `STATUS_INVALID_SID`.
+
+**That our elevated token took the admin arm is measured, not assumed**: S5n's unused-name opens
+created partitions under names that are not this account's SID, and the non-admin arm would have
+rejected that account's five-sub-authority user SID outright. `SeTokenIsAdmin` is true for `SYSTEM`
+as well, so the `SYSTEM` run reaches the **same instruction with the same two fields**, and that
+instruction reads neither a token nor a process.
+
+Identity *is* consulted before any of this, by the object manager against the device's own security
+descriptor — and the probe passes it, which is why the error is `22` and not `ERROR_ACCESS_DENIED`.
+`SYSTEM` cannot do better than passing.
+
+#### What the guarded branch actually is, and why reaching it would not have helped
+
+`Vid!VidPartitionAttach` (RVA `0x10b08`) rearms the two file-object counters, unblocks the
+partition's op control, takes a reference, stores **`PsGetCurrentProcess()`** at `[p+0x3780]`,
+references that process, and calls `VidThreadPoolSwitchProcess`. Its inverse
+`Vid!VidPartitionDetach` (RVA `0xb06c`) returns immediately unless `[p+0x3079]` is set, and
+otherwise unmaps the statistics page, calls **`VidHandlerUnregister`**, detaches every VP,
+un-shares both client buffers per VP, uninitialises the dispatch interface, switches the thread pool
+away and dereferences the stored process.
+
+So `[p+0x3079]` is a **detached** flag, and the pair is a handoff protocol rather than a lock:
+
+- `Vid!VidPartitionIoctlDetach` (RVA `0x66164`) requires `[p+0x3060] == 2`, `[p+0x3064] == 2` and
+  `[p+0x3079] == 0`, then **sets `[p+0x3079] = 1`**;
+- `Vid!VidPartitionIoctlAttach` (RVA `0xc1f4`) requires the same two states and `[p+0x3079] != 0`,
+  then attaches every VP. **This corrects S5n's reading of that IOCTL** as merely "start the virtual
+  processors": it is the second half of a handoff, and it refuses a partition nobody has detached;
+- and the create path demands the same detached flag before it will hand a *new process* a handle.
+
+**The consequence for S5 is stronger than a refusal.** Even a successful open would not have
+produced a second receiver alongside Hyper-V's. It would have taken the partition over — becoming
+the process the thread pool runs in — and it could only have happened after `vmwp.exe` had
+already called `VidHandlerUnregister` and detached the VPs. The standing receive path S5m found is
+dismantled by the very step that would have let us in.
+
+#### Limits
+
+- **Nothing was executed, and no live partition object was read.** Which of the two fields a
+  running guest's partition fails on is therefore not measured — only that at least one must.
+- **The writers of these fields are not enumerated.** `VidPartitionIoctlDetach` is the writer this
+  gate *located* for `[p+0x3079]`; it is not established to be the only one. A byte scan for either
+  displacement cannot separate partition objects from the several other `Vid` structures with
+  fields at the same offsets — most hits for both land in `Vsmm*` code on unrelated objects — so
+  "only the owner can set it" is the shape of the protocol read from three functions, not a
+  census. An earlier draft of this section claimed the census, from a `s -d` scan that was
+  **dword-aligned** and silently missed unaligned displacements, including one in
+  `VidPartitionDetach` itself.
+- **`[p+0x3060]` and `[p+0x3064]` are read as "both must be 2", not decoded.** What state 2 *is*
+  was not established, and it is not needed for the conclusion: entering the admitting state at all
+  requires the owner's detach.
+- **One build, read statically.** `Vid.sys 10.0.26100.9278`, the image on this host.
+- **Exo partitions are out of scope.** The `exo != 0` arm has its own create path and its own
+  `0xC0000184` site, and none of the above was read for it.
+- **Handle duplication and inheritance are still excluded routes**, exactly as S5n left them.
+  Nothing here reaches them.
+
+#### What this gate leaves open
+
+- **Whether owning the partition from creation reaches S5's pass condition** — the VMM-of-our-own
+  question, unchanged by this gate except that it is now the only user-mode route left rather than
+  the clearest of several. It is a rig to cost, not an arm to run.
+- **The two arms blocked by the standing constraint** — the replicated slot read and whether the
+  hold is a loop — which this gate does not touch and does not unblock.
+- **Whether a guest's partition is ever momentarily in the admitting state** — answerable only with
+  live kernel visibility, and worth little if it is: the state is entered by the owner detaching,
+  which is not a window to race but a handoff to intercept.
