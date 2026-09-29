@@ -3317,19 +3317,16 @@ validated. The full record is the
   `[partition+0xB68]`, the per-vector table it consults. The receiving path — message,
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
-  `WinHvInstallIntercept` S5b read. **So the next step is reading `[partition+0xB68][3]` inside a
-  replicated intercept arm** — as a *diagnostic*, since per S5l a pre-read does not make the
-  install/remove pair safe and nothing on this bench can: that would need coordination with every
-  other installer. **It needs root kernel-memory access this bench does not have today**: a host
-  reboot into debug mode, or a kernel-read path in `h3probe.sys`. That arm is what separates the
-  drop from S5j's retained
-  explanation, and
-  which decides whether the IOCTL is the thing to look at next at all. **Then
-  the IOCTL code and its user-mode surface**, and whether a documented WHP property reaches it —
-  which decides whether S5 is one supported call from passing or needs a driver. A third candidate
-  is live and cheap: **whether the hold is a loop**, since nothing on the drop path injects the
-  exception or advances `RIP`, so the faulting instruction is presumably re-entered. That is an
-  inference S5k did not measure.
+  `WinHvInstallIntercept` S5b read. That pointed at reading `[partition+0xB68][3]` inside a
+  replicated intercept arm, **and that arm is now blocked rather than scheduled.** Two things block
+  it, and neither is a matter of effort. It needs root kernel-memory access this bench does not
+  have — a host reboot into debug mode, or a kernel-read path in `h3probe.sys`. And the arm's own
+  install/remove pair is unsafe with no remedy available: per S5l a pre-read is a diagnostic rather
+  than a guard, and making the pair safe would need exclusive coordination with every other
+  installer, which nothing here has. **Do not run it until one of those changes.** A separate
+  candidate is unaffected and still live: **whether the hold is a loop**, since nothing on the drop
+  path injects the exception or advances `RIP`, so the faulting instruction is presumably
+  re-entered. That is an inference S5k did not measure.
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
