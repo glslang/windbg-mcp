@@ -202,17 +202,27 @@ def _invalidate(regs, ins):
         regs.pop(_norm(ins.reg_name(r)), None)
 
 
-def imm_equal(value, want):
+def imm_equal(value, want, encoded_size=0):
     """Is a decoded immediate the one asked for?
 
-    Exact, with one deliberate exception: an `imm32` operand can be decoded already
-    sign-extended to 64 bits, so `0x80010003` may arrive as `0xFFFFFFFF80010003`. An
-    earlier version handled that by comparing the low 32 bits of *everything*, which
-    made `--imm 0x4004` match `movabs rax, 0x100004004` and vice versa. The equivalence
-    is now exactly the sign-extension, in either direction, and nothing else.
+    Exact, with one deliberate exception: an **imm32** operand can be decoded already
+    sign-extended to 64 bits, so `0x80010003` may arrive as `0xFFFFFFFF80010003`.
+
+    Two earlier versions got the exception wrong in opposite ways. The first compared
+    the low 32 bits of everything, so `--imm 0x4004` matched `movabs rax, 0x100004004`.
+    The second applied the sign-extension equivalence to *any* pair of values, so
+    `--imm 0x80010003` matched `movabs rax, 0xffffffff80010003` -- an instruction
+    carrying a genuinely distinct 64-bit immediate. Both bots reported the second
+    independently.
+
+    The discriminator is how many bytes were **encoded**, which capstone reports as
+    `encoding.imm_size` and which is 8 for a `movabs` and 4 for an imm32 however wide
+    the destination register is. The equivalence applies only at 4.
     """
     if value == want:
         return True
+    if encoded_size != 4:
+        return False
     for small, big in ((want, value), (value, want)):
         if small <= 0xFFFFFFFF and small & 0x80000000:
             if big == (small | 0xFFFFFFFF00000000):
@@ -239,20 +249,28 @@ def mem_operands(ins):
     return out
 
 
-def branch_target(ins):
+def branch_target(ins, include_conditional=True):
     """The address a direct branch transfers to, or None.
 
     Capstone reports a `call`/`jmp`/`jcc` destination as an ordinary `X86_OP_IMM`, so
     the same operand is a code address here and a data constant in `immediates()`.
     Keeping the two apart in one place is what stops `--imm 0x4004` reporting a call
-    that happens to land on `0x4004`, and it is also how branch targets are collected
-    for the basic-block boundaries the tracker needs.
+    that happens to land on `0x4004`.
+
+    `include_conditional` is the difference between the two callers. Collecting basic
+    block boundaries wants **every** edge, `jcc` included. Enumerating who *calls* a
+    function does not: a `je` landing on the entry is a control-flow edge and not a
+    caller, and counting it inflates the very numbers a chain is walked by.
     """
     try:
         groups, ops = ins.groups, ins.operands
     except capstone.CsError:
         return None
-    if not any(g in groups for g in (capstone.CS_GRP_JUMP, capstone.CS_GRP_CALL)):
+    is_call = capstone.CS_GRP_CALL in groups
+    is_jump = capstone.CS_GRP_JUMP in groups
+    if not (is_call or is_jump):
+        return None
+    if not include_conditional and not is_call and ins.mnemonic != "jmp":
         return None
     if len(ops) == 1 and ops[0].type == capstone.x86.X86_OP_IMM:
         return ops[0].imm & 0xFFFFFFFFFFFFFFFF
@@ -260,7 +278,7 @@ def branch_target(ins):
 
 
 def immediates(ins):
-    """The instruction's immediate operands, as unsigned 64-bit values.
+    """The instruction's immediate operands, as (unsigned value, encoded byte width).
 
     Capstone's structured operands, not the printed text. A substring test over
     `op_str` matches `0x40040` and `[rcx + 0x4004]` when asked for `0x4004` -- neither
@@ -274,9 +292,13 @@ def immediates(ins):
         ops = ins.operands
     except capstone.CsError:
         return out
+    try:
+        size = ins.encoding.imm_size
+    except (capstone.CsError, AttributeError):
+        size = 0
     for op in ops:
         if op.type == capstone.x86.X86_OP_IMM:
-            out.append(op.imm & 0xFFFFFFFFFFFFFFFF)
+            out.append((op.imm & 0xFFFFFFFFFFFFFFFF, size))
     return out
 
 
@@ -327,6 +349,26 @@ IMM_TEST = [
      False),                                                # movabs rax, 0x100004004
     ("a branch target is a code address, not a data immediate",
      bytes([0xE9, 0xFF, 0x2F, 0x00, 0x00]), False),         # jmp 0x4004 (from 0x1000)
+    # Both review bots reported this one independently: a true imm64 must not be
+    # equated with the imm32 whose sign-extension it happens to equal.
+    ("a real imm64 is not the imm32 it sign-extends from",
+     bytes([0x48, 0xB8, 0x04, 0x40, 0x00, 0x80, 0xFF, 0xFF, 0xFF, 0xFF]),
+     False),                                                # movabs rax, 0xffffffff80004004
+]
+
+# imm32 sign-extension is a real equivalence and must survive the fix above.
+SEXT_TEST = [
+    ("an imm32 sign-extended into a 64-bit register still matches",
+     bytes([0x48, 0xC7, 0xC0, 0x04, 0x40, 0x00, 0x80]),     # mov rax, 0xffffffff80004004
+     0x80004004, True),
+]
+
+# direct_callers must not count a conditional edge as a call.
+CALLER_TEST = [
+    ("a call is a caller", bytes([0xE8, 0xFF, 0x2F, 0x00, 0x00]), True),   # call 0x4004
+    ("a tail jmp is a caller", bytes([0xE9, 0xFF, 0x2F, 0x00, 0x00]), True),
+    ("a conditional branch is not",
+     bytes([0x0F, 0x84, 0xFE, 0x2F, 0x00, 0x00]), False),                  # je 0x4004
 ]
 
 # For the memory-operand matcher: a displacement too small to render as hex, and an
@@ -347,12 +389,29 @@ def self_test():
     bad = 0
     for name, code, want in IMM_TEST:
         ins = next(md.disasm(code, 0x1000), None)
-        got = bool(ins) and 0x4004 in immediates(ins)
+        got = bool(ins) and any(imm_equal(v, 0x4004, n)
+                                for v, n in immediates(ins))
         ok = (got == want)
         bad += not ok
         print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
               f"        0x4004 among immediates of `{ins.mnemonic} {ins.op_str}`: "
               f"{got}, expected {want}")
+    for name, code, want, expect in SEXT_TEST:
+        ins = next(md.disasm(code, 0x1000), None)
+        got = bool(ins) and any(imm_equal(v, want, n) for v, n in immediates(ins))
+        ok = (got == expect)
+        bad += not ok
+        print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
+              f"        `{ins.mnemonic} {ins.op_str}` vs {want:#x}: {got}, "
+              f"expected {expect}")
+    for name, code, expect in CALLER_TEST:
+        ins = next(md.disasm(code, 0x1000), None)
+        got = bool(ins) and branch_target(ins, include_conditional=False) == 0x4004
+        ok = (got == expect)
+        bad += not ok
+        print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
+              f"        `{ins.mnemonic} {ins.op_str}`: counted={got}, "
+              f"expected {expect}")
     for name, code, disp, want_found, want_write in MEM_TEST:
         ins = next(md.disasm(code, 0x1000), None)
         mems = [w for d, w in mem_operands(ins)] if ins else []
@@ -372,7 +431,8 @@ def self_test():
         print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
               f"        expected {want if want is None else hex(want)}, got "
               f"{got if not isinstance(got, int) else hex(got)}")
-    total = len(SELF_TEST) + len(IMM_TEST) + len(MEM_TEST)
+    total = (len(SELF_TEST) + len(IMM_TEST) + len(MEM_TEST) + len(SEXT_TEST)
+             + len(CALLER_TEST))
     print(f"\n  {total - bad}/{total} passed")
     return 1 if bad else 0
 
@@ -400,7 +460,7 @@ def direct_callers(pe, md, funcs, target):
         if not code:
             continue
         for ins in md.disasm(code, b):
-            if branch_target(ins) == target:
+            if branch_target(ins, include_conditional=False) == target:
                 out.append((b, e, ins.address, ins.mnemonic))
     return out
 
@@ -529,7 +589,7 @@ def main(argv=None):
             if not code:
                 continue
             for ins in md.disasm(code, b):
-                if any(imm_equal(v, want) for v in immediates(ins)):
+                if any(imm_equal(v, want, n) for v, n in immediates(ins)):
                     found.append((ins.address, b, e, ins.mnemonic, ins.op_str))
         print(f"\n=== immediate {needle}: {len(found)} site(s) ===")
         for addr, b, e, mn, ops in sorted(found):

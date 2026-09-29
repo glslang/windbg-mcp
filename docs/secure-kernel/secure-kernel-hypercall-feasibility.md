@@ -3043,26 +3043,38 @@ covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites 
 an immediate field encoding.
 
 **The tracker behind that number was unsound when this section was first written**, and review on
-[#413](https://github.com/glslang/windbg-mcp/pull/413) found **twelve** defects in it over four
-rounds, and they are one mistake wearing twelve costumes: **reading rendered text where capstone
-had already decoded the thing itself.**
+[#413](https://github.com/glslang/windbg-mcp/pull/413) found **fourteen** defects in it over five
+rounds, and they are mostly one mistake wearing many costumes: **reading rendered text where
+capstone had already decoded the thing itself**, plus two places that used a decoded field without
+asking what it meant.
 
 - *The constant tracker*, five ways to invent a resolved field: carrying a constant across a branch
   that skips its assignment; treating `mov ax, 0x4004` as defining all of `rax`; letting `vmread`
   leave its destination's old constant in place; invalidating only the first of two comma-separated
   operands, so `inc eax` and `pop rax` left a stale value; and an alias table with no
   `ah`/`bh`/`ch`/`dh` in it.
-- *`--imm`*, three: a substring match over the printed operands, an equivalence that compared only
-  the low 32 bits, and counting a `call`/`jmp` destination as a data constant.
+- *`--imm`*, four: a substring match over the printed operands; an equivalence that compared only
+  the low 32 bits; counting a `call`/`jmp` destination as a data constant; and then applying the
+  imm32 sign-extension equivalence to operands that were **not** encoded as imm32, so
+  `--imm 0x80010003` matched `movabs rax, 0xffffffff80010003` — a genuinely different immediate.
+  Both review bots reported that last one independently, which is what a real defect looks like
+  against a tool's own claim of soundness. The discriminator is `encoding.imm_size`, 8 for a
+  `movabs` and 4 for an imm32 however wide its destination register.
 - *`--offset`*, two: matching a rendered `0x…]`, which a small displacement never produces, and
   inferring "written" from operand position — which labels `call qword ptr [rax + 0x1a04]` a write.
 - *`--range`*, two: no validation at all, then validating only the start, so a range running off
   the end of its section decoded whatever followed **in the file** and labelled it with RVAs it does
   not have.
+- *Caller enumeration*, one: `branch_target()` accepted every `CS_GRP_JUMP` instruction, so a `jcc`
+  landing on a function's entry counted as a direct caller. A conditional edge is not a call, and
+  the counts here are what a reader walks the chain by. (Re-derived after the fix: unchanged, so
+  nothing in this section was ever inflated by it — but that is a measurement, not the reason the
+  bug was acceptable.)
 
-All twelve are fixed, each pinned by the counterexample it was named for, and the branch-target,
-immediate and displacement decisions now live in one helper apiece rather than at each call site.
-`--self-test` runs 14 cases across three matchers.
+All fourteen are fixed, each pinned by the counterexample it was named for, and the branch-target,
+immediate and displacement decisions live in one helper apiece rather than at each call site.
+`--self-test` runs 19 cases, one of which caught a mistake in another test's hand-assembled bytes
+rather than in the code.
 
 **Every figure in this section and in S5j was re-derived after each round, and none has moved:**
 417 `vmwrite`/`vmread` sites with 355 resolved, the same two functions for field `0x4004`, caller
