@@ -4130,6 +4130,14 @@ processors* operation, gated on the partition being in states `2`/`2` and a flag
 has nothing to do with a second client joining, and calling it on a running VM would be disruptive
 rather than useless. It was not called.
 
+**Superseded in part by S5o, and the half that survives is the half that mattered here.** Reading
+the flag at `+0x3079` rather than only noting it shows what this IOCTL is: it requires the
+partition to be **detached**, which is the second half of an ownership handoff rather than a
+start-up step — so "nothing to do with a second client joining" is wrong, and the correct statement
+is *nothing to do with a second client joining* **alongside** *the first*. The operational reading
+that follows from it is unchanged and was right: calling it on a running VM would be disruptive,
+and it was not called.
+
 #### What the opens actually do, with the controls that make the reading sound
 
 Every row is one `CreateFileW` with the arguments above:
@@ -4183,12 +4191,14 @@ as `SYSTEM`. The other two are what want a kernel debugger or a VM stop, and onl
 turns out to discriminate.
 
 **S5o closed this paragraph from an angle it did not consider, and two of its cost estimates were
-wrong.** The check is readable in the image — `Vid.sys` is WDF, so the dispatcher this paragraph
-could not find by name is a file-object callback rather than a `MajorFunction` entry — and reading
+wrong.** The check is readable in the image — `Vid.sys` is KMDF, so the dispatcher this paragraph
+could not find by name is a file-object callback reached *through* the framework's `MajorFunction`
+entries rather than named in one — and reading
 it settles all three residual causes at once: the refusal tests **partition-specific state** and
-nothing else, consulting neither the caller's token nor the VM's lifecycle. So caller identity was
-*not* the cheap one, because it needed no run at all; and the alternative that "wants a kernel
-debugger" wanted an image and a PDB.
+nothing else, consulting neither the caller's token nor the VM's lifecycle. So this paragraph had
+both costs wrong. Caller identity needed no run at all — the static read made one unnecessary
+rather than merely cheap — and the alternative filed here as wanting a kernel debugger wanted an
+image and a PDB.
 
 #### What this does to the plan
 
@@ -4233,7 +4243,8 @@ debugger" wanted an image and a PDB.
   `Vid.sys` and no create dispatcher was identifiable by symbol name. So two different checks could
   give the same error, and the eight arms above narrow the alternatives without eliminating them.
   **Lifted by S5o**, which located it — and the guess in this bullet is why it took a second gate:
-  the driver is WDF and has no `IRP_MJ_CREATE` handler to find.
+  the driver is KMDF, so its `IRP_MJ_CREATE` entry is the framework's, and the handler to find is
+  the file-object callback behind it.
 - **Measured at one integrity level, with one token.** Nothing here varies the caller, so the
   refusal's independence from privilege is an inference from the rule's indifference to *which*
   process asks, not a measurement. **Still true of this gate** — S5o did not vary the caller
@@ -4266,8 +4277,9 @@ debugger" wanted an image and a PDB.
   consults no token, so a caller varied upward reaches the same instruction.
 - **Where the refusal is enforced.** `0xC0000184` has 62 sites in `Vid.sys` and no create
   dispatcher was identifiable by symbol name, so two different checks could give the same error.
-  **Answered by S5o**: the driver is WDF, which is why no `MajorFunction` entry was findable, and
-  the check reads statically out of the image. This bullet's predecessor costed the answer at a
+  **Answered by S5o**: the driver is KMDF, so its `MajorFunction` entries are the framework's and
+  name nothing in `Vid.sys`, and the check reads statically out of the image once you follow the
+  file-object callback instead. This bullet's predecessor costed the answer at a
   host reboot into kernel-debug mode; that was wrong, and wrong in a way worth keeping visible —
   it assumed locating a dispatcher meant catching it running.
 - ~~**A stopped VM.**~~ **Dropped: it does not discriminate**, and an earlier draft proposed it as
@@ -4320,10 +4332,15 @@ and reads out of the image with no debugger attached to anything, and having rea
   branch **without being run** — which is the better evidence of the two, because a refusal under
   `SYSTEM` would have been one more match and this is the instruction.
 - **The branch it guards is not a second client joining. It is the partition changing owner**, and
-  it is reachable only after the current owner has asked to give the partition up.
+  the one route into it this gate located runs through the current owner asking to give the
+  partition up. Whether any *other* writer can put the gating fields into the admitting state is
+  **not** established — see the limits — so this closes the route as far as the located path goes,
+  not as far as the driver goes.
 
-So the user-mode route to a handle on a **Hyper-V-run** VM is closed with a cause rather than a
-match, and closed twice over: the door is locked, and behind it is not the room S5m was heading for.
+So the **refusal** is now understood by cause rather than by match, and the route behind it is not
+the room S5m was heading for: the door is locked, and the one key found unlocks it by emptying the
+room. What this gate does **not** do is prove there is no second key — the writer census that would
+settle that was not run, and the limits below say so.
 
 This gate executed nothing. No VM was touched, no partition object created, no handle opened, no
 intercept installed, no reboot — it is a static read of one image.
@@ -4338,8 +4355,20 @@ the kernel-debug reboot S5n costed for this step was never needed for the *stati
 question — a distinction that section did not draw, because it assumed locating the dispatcher
 meant catching it running.
 
-`Vid.sys` is a **WDF** driver, which is why S5n looked for an `IRP_MJ_CREATE` dispatcher by name and
-found none: there is no `MajorFunction` table to read. The create callback is
+`Vid.sys` is a **KMDF** driver, which is why S5n looked for an `IRP_MJ_CREATE` dispatcher by name
+and found none — though **not** because there is no `MajorFunction` table. There is one, and the
+framework fills it: `Wdf01000!FxDriver::Initialize` runs a 28-entry loop (`0` through `0x1B`,
+`IRP_MJ_MAXIMUM_FUNCTION_CODE + 1`) writing `Wdf01000!FxDevice::Dispatch` or
+`FxDevice::DispatchWithLock` into every slot, picked per device by `FxDevice::_RequiresRemLock`.
+So all 28 entries point into **`Wdf01000.sys`**, none into the client driver, and an `IRP_MJ_CREATE`
+travels `FxDevice::Dispatch` → `FxPkgGeneral::OnCreate` → the callback the driver registered in its
+file-object config. What the image lacks is a **VID-owned** create dispatcher, not the table — a
+distinction worth keeping, because the first version of this paragraph gave the wrong model for
+tracing any KMDF driver, and every in-box Hyper-V component here is one. (Read from
+`Wdf01000.sys 1.35.26100.3323` the same way, as a PE target with its public PDB — the framework is
+a separate image with its own version line, which is itself the point.)
+
+The create callback is
 `Vid!VidFileCreate` (RVA `0xe030`), a one-line forwarder to `Vid!VidFileObjectCreate`
 (RVA `0x8d20`) passing a fourth argument of `0`. `Vid!VidExopFileCreate` (RVA `0x61dc0`) forwards to
 the same function passing `1`, which is how that argument is identified as the **Exo** selector
@@ -4413,11 +4442,20 @@ So `[p+0x3079]` is a **detached** flag, and the pair is a handoff protocol rathe
   processors": it is the second half of a handoff, and it refuses a partition nobody has detached;
 - and the create path demands the same detached flag before it will hand a *new process* a handle.
 
-**The consequence for S5 is stronger than a refusal.** Even a successful open would not have
-produced a second receiver alongside Hyper-V's. It would have taken the partition over — becoming
-the process the thread pool runs in — and it could only have happened after `vmwp.exe` had
-already called `VidHandlerUnregister` and detached the VPs. The standing receive path S5m found is
-dismantled by the very step that would have let us in.
+**The consequence for S5 is stronger than a refusal, and it is bounded by what was enumerated.**
+Even a successful open would not have produced a second receiver alongside Hyper-V's: it would have
+taken the partition over, becoming the process the thread pool runs in. **On the route located
+here** it could only have happened after `vmwp.exe` had already called `VidHandlerUnregister` and
+detached the VPs — so that route dismantles the receive path S5m found by the very step that lets
+us in.
+
+**What is not established is that it is the only route in.** The limits below say the writers of
+the two gating fields were not enumerated, and this paragraph must not quietly claim otherwise: if
+some other path sets `[p+0x3079]` without running the detach sequence, a registration alongside
+Hyper-V is not excluded by anything read here. Two reviewers caught that overreach independently,
+and the correction is the reason it is spelled out rather than softened — **what would settle it is
+a writer census or live confirmation**, and until one of those exists the honest statement is *no
+admission that preserves the receive path has been found*, not *none exists*.
 
 #### Limits
 
@@ -4443,10 +4481,16 @@ dismantled by the very step that would have let us in.
 #### What this gate leaves open
 
 - **Whether owning the partition from creation reaches S5's pass condition** — the VMM-of-our-own
-  question, unchanged by this gate except that it is now the only user-mode route left rather than
-  the clearest of several. It is a rig to cost, not an arm to run.
+  question, unchanged by this gate except that it is now the route with no known obstacle rather
+  than the clearest of several. It is a rig to cost, not an arm to run.
+- **A writer census for `[p+0x3060]` and `[p+0x3079]`**, which is the cheaper of the two things
+  that would decide whether the previous bullet is the *only* route. It wants a way to tell
+  partition objects from the other `Vid` structures sharing those displacements — a type-aware
+  cross-reference rather than a byte scan — and it is desk work on an image this gate already has
+  open. The other is live confirmation on a running guest's partition.
 - **The two arms blocked by the standing constraint** — the replicated slot read and whether the
   hold is a loop — which this gate does not touch and does not unblock.
 - **Whether a guest's partition is ever momentarily in the admitting state** — answerable only with
-  live kernel visibility, and worth little if it is: the state is entered by the owner detaching,
-  which is not a window to race but a handoff to intercept.
+  live kernel visibility. On the located path it would be worth little, since that state is entered
+  by the owner detaching, which is not a window to race but a handoff to intercept; if the census
+  above finds another writer, that changes.

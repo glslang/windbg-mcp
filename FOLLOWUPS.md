@@ -3353,7 +3353,9 @@ validated. The full record is the
 - **S5o, 2026-09-29: the refusal is a partition-state test with no token in it, and the branch
   behind it is an ownership handoff.** A static read of `Vid.sys` — DbgEng opening the image as a
   target, no debuggee, nothing executed — answered the plan's next **two** steps at once.
-  `Vid.sys` is WDF, which is why S5n could find no `IRP_MJ_CREATE` dispatcher: the callback is
+  `Vid.sys` is KMDF, which is why S5n could find no `IRP_MJ_CREATE` dispatcher — not for want of a
+  `MajorFunction` table, which `Wdf01000!FxDriver::Initialize` fills with the framework's own
+  dispatch for all 28 entries, but for want of a *VID-owned* one. The callback is
   `VidFileCreate` → `VidFileObjectCreate`, and the refusal is a single site testing
   `[partition+0x3060] == 2` and `[partition+0x3079] == 1`. **It consults no token**, so the
   `SYSTEM` arm cannot change the outcome and was not run — and the one token check on the path,
@@ -3362,13 +3364,15 @@ validated. The full record is the
   becomes a **common cause**: on the non-Exo arm that site is the only `0xC0000184`.
   **And the branch behind the refusal is not what the plan wanted.** `VidPartitionAttach` makes the
   opener the partition's owning process — storing `PsGetCurrentProcess()` and switching the thread
-  pool — and it is admitted only after the current owner's detach IOCTL, which first calls
-  `VidHandlerUnregister` and detaches every VP. So on a VM Hyper-V runs, the step that would admit
-  us dismantles the receive path S5m found. **This also corrects S5n on `VidPartitionIoctlAttach`**:
-  it is the second half of a handoff, not merely "start the virtual processors", and it refuses a
-  partition nobody has detached. What the gate does **not** establish: it enumerates no writers of
-  either field, decodes neither state value, reads one build, executed nothing, and leaves Exo
-  partitions and handle duplication untouched. Full record in the
+  pool — and the one route into it this gate located runs through the current owner's detach IOCTL,
+  which first calls `VidHandlerUnregister` and detaches every VP. So *on that route*, the step that
+  would admit us dismantles the receive path S5m found. **This also corrects S5n on
+  `VidPartitionIoctlAttach`**: it is the second half of a handoff, not merely "start the virtual
+  processors", and it refuses a partition nobody has detached. **It is not established to be the
+  only route in** — the gate enumerates no writers of either gating field, so another path into the
+  admitting state would leave registration alongside Hyper-V open, and closing the question needs a
+  writer census or live confirmation. It also decodes neither state value, reads one build,
+  executed nothing, and leaves Exo partitions and handle duplication untouched. Full record in the
   [S5o result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
@@ -3503,20 +3507,28 @@ validated. The full record is the
       wrong** — it said a host reboot into kernel-debug mode, and the answer came from opening the
       image in DbgEng with no target attached. The error S5n matched is now a common cause: on the
       non-Exo arm there is exactly one such site.
-   4. ~~**Register `#BP` through `vid.dll` and receive.**~~ **Unreachable by this route, and not
-      merely gated on a handle.** S5o read the branch the refusal guards: it is
-      `VidPartitionAttach`, which makes the opener the partition's owning process, and it is
-      admitted only once the current owner has called the detach IOCTL — which first calls
-      `VidHandlerUnregister` and detaches every VP. So the sequence S5m found cannot be run
-      *alongside* Hyper-V on a VM Hyper-V runs; the step that would admit us dismantles what we
-      came for. It remains the pass condition for a partition **we** own, which is step 6.
-   5. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
+   4. ~~**Register `#BP` through `vid.dll` and receive.**~~ **Not reachable by the route S5o
+      located, and not merely gated on a handle.** S5o read the branch the refusal guards: it is
+      `VidPartitionAttach`, which makes the opener the partition's owning process, and the way in
+      that this gate found runs through the current owner's detach IOCTL — which first calls
+      `VidHandlerUnregister` and detaches every VP. So on that route the sequence S5m found cannot
+      be run *alongside* Hyper-V; the step that would admit us dismantles what we came for. It
+      remains the pass condition for a partition **we** own, which is step 6.
+   5. **← active step, and the cheap one. Census the writers of `[p+0x3060]` and `[p+0x3079]`.**
+      S5o did not, and without it step 4 is closed only on the path it read: another writer that
+      reaches the admitting state without the detach sequence would reopen registration alongside
+      Hyper-V and make step 6 unnecessary. It is desk work on an image, but **not** a byte scan —
+      both displacements are shared with unrelated `Vid` structures, and the scan that suggested
+      otherwise was dword-aligned and incomplete. It wants a type-aware cross-reference, or live
+      confirmation on a running guest's partition instead.
+   6. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
       the standing constraint above, and the first also by kernel-memory access. Unchanged by S5o.
-   6. **← active step, and it is a decision rather than an arm.** The VMM-of-our-own question: own
-      the partition from creation, where `VidPartitionCreate` admits any name for an administrator
-      and the whole `vid.dll` sequence is then reachable by construction. S5o makes this the **only
-      remaining user-mode route** rather than the clearest of several, which is a stronger reason to
-      cost it and not a reason to start it. Nothing below it is blocked on it.
+   7. **A decision rather than an arm, and only if step 5 comes back empty.** The VMM-of-our-own
+      question: own the partition from creation, where `VidPartitionCreate` admits any name for an
+      administrator and the whole `vid.dll` sequence is then reachable by construction. S5o makes
+      this the route with no *known* obstacle rather than the clearest of several — which is a
+      stronger reason to cost it and not a reason to start it, and a weaker claim than "the only
+      one", which two reviewers were right to refuse.
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from
@@ -3751,3 +3763,106 @@ whose doc comments record what each raise bought. If the eval arm is ever added 
 `"tools": 51` label for `full`, which was the count when it was written and is 67 now: the records
 carry the served surface, so the label is a reader's hint rather than a measurement, and a new arm is
 the moment to re-derive it.
+
+## 107. [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok`
+
+**Repo:** `windbg-mcp`. **Origin:** hit live, 2026-09-29, during item 103's S5o gate. Three
+`disassemble` calls passed `target` — which is not a parameter; the parameter is `address` — and
+each was served as though it had asked for nothing: `address` deserialised to `None`, the tool
+disassembled at the current instruction pointer, and the result came back `"status": "ok"` with a
+`start` that was the image entry point. It read as a tool defect for several minutes, and the gate
+fell back to `execute` + `uf` to get the disassembly it wanted — which is the text hatch this repo
+tries not to reach for.
+
+**The failure shape is the one this repo has already written down, in `src/batch.rs`:** *"Serde
+ignores unknown fields by default, which is the wrong default for a step: a misspelt `expect` is a
+step that asserts nothing while reading as though it asserts, and it fails open."* A misspelt
+`address` is a call that disassembles somewhere else while reading as though it disassembled where
+asked, and it fails open the same way. **So this is an unfinished class fix rather than a new
+idea** — `#[serde(deny_unknown_fields)]` is already the convention here and reaches **3 of the 52**
+`*Args` structs in `src/server.rs` (`BreakpointArgs`, `ClearBreakpointsArgs`, `DebugBatchArgs`).
+
+**The MCP spec neither requires nor forbids rejecting unknown arguments, and that shapes the fix
+rather than excusing it.** The 2025-06-18 tools page makes servers responsible — *"Servers MUST:
+Validate all tool inputs"* — and lists *"Invalid arguments"* among the protocol errors carrying
+JSON-RPC `-32602`. What it does not say is that a property absent from `inputSchema` is invalid,
+and **JSON Schema's default is that it is not**: without `additionalProperties: false`, an extra
+key conforms. So a client sending `target` is, today, sending something our own published contract
+calls valid, and rejecting it while advertising otherwise would be the server breaking its own
+schema.
+
+**Which makes the remedy two halves that must land together**, and is the reason this is an item
+rather than a one-line patch:
+
+1. `#[serde(deny_unknown_fields)]` on the remaining `*Args` structs, so the argument is refused
+   rather than dropped; and
+2. the published `inputSchema` carrying `additionalProperties: false` to match, so a client can see
+   the constraint before it violates it. `schemars` emits that from the same attribute, so the two
+   halves are one change per struct — but **verify it reaches the served schema**, since
+   `src/schema.rs` walks and rewrites schemas for per-client surfaces and treats
+   `additionalProperties` as a subschema keyword (`SUBSCHEMA`), with a boolean form handled
+   specially at `schema.rs:293`.
+
+**Two things to check before doing it wholesale.** `deny_unknown_fields` and `#[serde(flatten)]`
+are mutually exclusive, which is exactly why `batch.rs` collects leftovers by hand instead — so any
+args struct that flattens needs the `batch.rs` treatment rather than the attribute. And the
+per-client surface work means a tool's schema is not always served verbatim; a test that asserts
+the refusal should drive it through the served surface, not the struct, or it pins the wrong thing.
+
+**Worth a regression test of the shape this repo prefers**: not "an unknown field is refused" on
+one struct, but a test that enumerates the `*Args` types and asserts the property holds for each,
+so the next tool added cannot quietly opt out. The three that already carry it would pass today and
+the other 49 would not, which is the point.
+
+## 108. [windbg-mcp] The driver tools assume a WDM dispatch table, and every in-box Hyper-V driver is KMDF
+
+**Repo:** `windbg-mcp`. **Origin:** item 103's S5o gate, 2026-09-29, where it cost a gate's worth of
+detour and produced a wrong sentence in a checked-in document before review caught it.
+
+**What the tools assume.** `driver_object`, `ioctl_map`, `reachable_from_dispatch`,
+`driver_surface` and the `MajorFunction[0x0e]` recipes in `skills/windbg-debugging/driver-ioctl.md`
+and `.claude/skills/live-kernel/SKILL.md` all read a driver's dispatch out of
+`DRIVER_OBJECT->MajorFunction` and expect the entries to name routines **in that driver**. For a
+WDM driver they do. For a KMDF driver they do not, and the tools do not say so.
+
+**Measured on this bench, from the images themselves** (`Wdf01000.sys 1.35.26100.3323`,
+`Vid.sys 10.0.26100.9278`, both opened as PE targets with public PDBs):
+`Wdf01000!FxDriver::Initialize` runs a loop over `0` through `0x1B` — 28 entries,
+`IRP_MJ_MAXIMUM_FUNCTION_CODE + 1` — writing `Wdf01000!FxDevice::Dispatch` or
+`FxDevice::DispatchWithLock` into every slot, chosen per device by `FxDevice::_RequiresRemLock`.
+So **all 28 entries point into `Wdf01000.sys`**, none into the client driver, and the driver's own
+handlers are callbacks the framework holds: an `IRP_MJ_CREATE` travels `FxDevice::Dispatch` →
+`FxPkgGeneral::OnCreate` → the driver's file-object create callback, and device control reaches an
+I/O queue's `EvtIoDeviceControl` rather than a dispatch routine.
+
+**What that costs today.** `driver_object` on a KMDF driver reports 28 identical framework pointers
+and looks like a driver that dispatches nothing of its own; `ioctl_map` and
+`reachable_from_dispatch` start from an entry that is not the driver's code and find no IOCTL
+switch, because there is not one to find — the codes are compared inside the queue callback the
+framework calls. None of that is *wrong* as a reading of the table; it is the tools answering a
+question the caller did not mean to ask, which is the same failure mode as item 107.
+
+**Why it matters here rather than in general.** The secure-kernel line of work reads in-box Hyper-V
+components, and they are KMDF: `Vid.sys` is the one measured, and `DriverEntry` → `FxDriverEntry`
+→ `WdfVersionBind` is the tell that costs nothing to check. S5n spent an arm looking for an
+`IRP_MJ_CREATE` dispatcher by symbol name and concluded none existed, which was right about the
+symbol and wrong about the cause; S5o then shipped *"there is no `MajorFunction` table to read"*,
+which is wrong outright, and both bots caught it.
+
+**Sketch of the fix, cheapest first, and the first is most of the value.**
+
+1. **Recognise the case and say so.** A driver importing `WdfVersionBind`, or carrying a
+   `WdfBindInfo`, is KMDF. `driver_object` reporting that — and that its `MajorFunction` entries
+   belong to the framework — turns a silently useless answer into a true one, and is a field on an
+   existing result rather than new machinery.
+2. **Resolve the real callbacks.** The framework's per-device config holds them; the create/close/
+   cleanup trio comes from the file-object config, device control from the I/O queue's. This is
+   structure-walking against `Wdf01000.sys`'s public types and is the part that wants a measured
+   layout per framework version rather than a constant — `Wdf01000.sys` carries its own version
+   line (1.35 here) independent of the OS build, which is the trap to design around.
+3. **UMDF is a different image again** (`WUDFx02000.dll`, user mode) and is out of scope until
+   something needs it. Say so rather than implying coverage.
+
+**Do not start with step 2.** The layout work is the expensive half and buys nothing until a caller
+knows they are looking at a KMDF driver, which step 1 tells them — and step 1 would have prevented
+both wrong sentences above on its own.
