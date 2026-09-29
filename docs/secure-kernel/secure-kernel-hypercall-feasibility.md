@@ -5183,8 +5183,11 @@ Closing that needs provenance carried across calls and returns, which the tool d
 looks for". **The `.pdata` hole is closed rather than documented**: `.pdata` claims no leaf
 functions, so a leaf loading the array would have been invisible; the tool now decodes the
 executable bytes `.pdata` leaves out, as `vid_field_census.py` does — 9,599 unclaimed bytes here,
-9,558 of them padding, five gap runs scanned as regions. **The answer did not move**: 28 reaching
-regions and 42 accesses before and after, which is what makes the hole worth reporting as closed
+9,558 of them padding, five gap runs scanned as regions. **And `rbp` is no longer assumed to be a frame pointer**: in optimized
+x64 it is an ordinary callee-saved register unless the function's `UNWIND_INFO` names it as the
+frame register, so it is suppressed only where that record says so — 16 `+0x10`/`+0x18` operands
+across the image are based in `rbp`, and none of them falls in a reaching region. **The answer did
+not move** through either change: 28 reaching regions and 42 accesses before and after, which is what makes the hole worth reporting as closed
 rather than as a caveat. The tool still ships without a self-test, which the instrument S5p built
 has and which review found holes in twice; treat its region set as a reading rather than a proof.
 
