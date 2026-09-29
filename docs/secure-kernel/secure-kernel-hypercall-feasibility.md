@@ -3043,21 +3043,34 @@ covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites 
 an immediate field encoding.
 
 **The tracker behind that number was unsound when this section was first written**, and review on
-[#413](https://github.com/glslang/windbg-mcp/pull/413) found **five** ways it could invent a
-resolved field, over three rounds: carrying a constant across a branch that skips its assignment;
-treating `mov ax, 0x4004` as defining all of `rax`; letting `vmread` leave its destination's old
-constant in place; invalidating only the first of two comma-separated operands, so `inc eax`,
-`pop rax` and `neg` left a stale constant behind; and an alias table with no `ah`/`bh`/`ch`/`dh` in
-it, so a high-byte write invalidated nothing. **Two sibling searches were text-based and wrong the
-same way** — `--imm` matched its value as a substring of the printed operands, and `--offset`
-matched a rendered `0x…]` and guessed "written" from operand position. Both now read capstone's
-structured operands, which is also the only way to see that `call qword ptr [rax + 0x1a04]` reads
-its pointer rather than writing it.
+[#413](https://github.com/glslang/windbg-mcp/pull/413) found **twelve** defects in it over four
+rounds, and they are one mistake wearing twelve costumes: **reading rendered text where capstone
+had already decoded the thing itself.**
 
-All seven are fixed and each is pinned by the counterexample it was named for; `--self-test` runs
-13 cases. **Every figure in this section and in S5j was re-derived afterwards and none moved**:
-the same two `0x4004` sites, 355 resolved, `+0x1A04` at 9 sites with 2 writers and the same two,
-`+0x1A08` 9/2, `+0x1A0C` 4/2, `+0x6124` 6/3, and `0x80010003` still exactly one site. **The result below did not
+- *The constant tracker*, five ways to invent a resolved field: carrying a constant across a branch
+  that skips its assignment; treating `mov ax, 0x4004` as defining all of `rax`; letting `vmread`
+  leave its destination's old constant in place; invalidating only the first of two comma-separated
+  operands, so `inc eax` and `pop rax` left a stale value; and an alias table with no
+  `ah`/`bh`/`ch`/`dh` in it.
+- *`--imm`*, three: a substring match over the printed operands, an equivalence that compared only
+  the low 32 bits, and counting a `call`/`jmp` destination as a data constant.
+- *`--offset`*, two: matching a rendered `0x…]`, which a small displacement never produces, and
+  inferring "written" from operand position — which labels `call qword ptr [rax + 0x1a04]` a write.
+- *`--range`*, two: no validation at all, then validating only the start, so a range running off
+  the end of its section decoded whatever followed **in the file** and labelled it with RVAs it does
+  not have.
+
+All twelve are fixed, each pinned by the counterexample it was named for, and the branch-target,
+immediate and displacement decisions now live in one helper apiece rather than at each call site.
+`--self-test` runs 14 cases across three matchers.
+
+**Every figure in this section and in S5j was re-derived after each round, and none has moved:**
+417 `vmwrite`/`vmread` sites with 355 resolved, the same two functions for field `0x4004`, caller
+counts of 14, 2, 2 and 2 along the chain, `+0x1A04` at 9 sites with the same 2 writers, `+0x1A08`
+9/2, `+0x1A0C` 4/2, `+0x6124` 6/3, and `0x80010003` at exactly one site. That stability is the
+argument, not the fix list: **the conclusions never rested on the tracker.** Each anchor was read
+instruction by instruction before it was used, and the chain past it is caller enumeration and
+per-function disassembly, which no amount of constant tracking can bend. **The result below did not
 move**: the same two sites, before and after. What moved is the resolved count, 373 to 355, which is
 the conservative clearing losing real resolutions rather than inventing false ones — the direction
 that cannot manufacture an anchor.
