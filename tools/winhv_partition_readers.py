@@ -67,17 +67,38 @@ def rva_to_off(secs, rva):
 
 
 def pdata_functions(data, secs):
+    """Each entry is (start, end, unwind_rva); the third is what says whether
+    `rbp` is this function's frame register or just another callee-saved
+    general-purpose register, which decides whether `[rbp+0x10]` is a stack
+    access or a field access."""
     for s in secs:
         if s["name"] == ".pdata":
             n = s["rs"] // 12
             out = []
             for i in range(n):
                 b = s["raw"] + i * 12
-                start, end, _ = struct.unpack_from("<III", data, b)
+                start, end, unwind = struct.unpack_from("<III", data, b)
                 if start and end > start:
-                    out.append((start, end))
+                    out.append((start, end, unwind))
             return sorted(set(out))
     return []
+
+
+RBP_ENCODING = 5
+
+
+def frame_register(data, secs, unwind_rva):
+    """UNWIND_INFO byte 3 is FrameRegister:4 | FrameOffset:4, and FrameRegister
+    is 0 when the function establishes none. Returns the register encoding, or
+    0 when there is no usable unwind record."""
+    if not unwind_rva:
+        return 0
+    off = rva_to_off(secs, unwind_rva)
+    if off is None or off + 4 > len(data):
+        return 0
+    if (data[off] & 0x07) != 1:          # UNWIND_INFO version 1 only
+        return 0
+    return data[off + 3] & 0x0F
 
 
 def main():
@@ -107,11 +128,8 @@ def main():
     # invisible to a scan that stopped here. `vid_field_census.py` decodes the
     # executable bytes `.pdata` leaves out, and so does this: the gap runs are
     # scanned as regions of their own, padding skipped.
-    regions = [(s, e, False) for s, e in funcs]
-    claimed = []
-    for s, e in funcs:
-        claimed.append((s, e))
-    claimed.sort()
+    regions = [(s, e, False, frame_register(data, secs, u)) for s, e, u in funcs]
+    claimed = sorted((s, e) for s, e, _ in funcs)
     gap_bytes = pad_bytes = 0
     gap_runs = 0
     for sec in secs:
@@ -142,7 +160,9 @@ def main():
             pad_bytes += len(blob) - (j - i)
             if j > i:
                 gap_runs += 1
-                regions.append((hs + i, hs + j, True))
+                # A gap run has no unwind record, so nothing licenses treating
+                # its `rbp` as a frame pointer: keep those operands.
+                regions.append((hs + i, hs + j, True, 0))
     print("executable bytes .pdata does not claim: %d (%d of them 0xCC/0x00 padding); "
           "%d gap run(s) held anything else and are scanned as regions"
           % (gap_bytes, pad_bytes, gap_runs))
@@ -150,13 +170,15 @@ def main():
     reaching = {}   # region start -> set of reasons
     bodies = {}
     from_gap = set()
-    for start, end, is_gap in regions:
+    framereg = {}
+    for start, end, is_gap, fr in regions:
         off = rva_to_off(secs, start)
         if off is None:
             continue
         code = data[off:off + (end - start)]
         ins = list(md.disasm(code, start))
         bodies[start] = ins
+        framereg[start] = fr
         if is_gap:
             from_gap.add(start)
         why = set()
@@ -191,11 +213,18 @@ def main():
             for op in i.operands:
                 if op.type != capstone.x86.X86_OP_MEM:
                     continue
-                # Stack frames are not partition objects. rsp/rbp-relative
-                # traffic at these offsets is spill noise and swamps the answer.
+                # Stack frames are not partition objects, and rsp-relative
+                # traffic at these offsets is spill noise that swamps the
+                # answer. `rbp` is NOT stack traffic by default: in optimized
+                # x64 it is an ordinary callee-saved register unless the
+                # function's UNWIND_INFO names it as the frame register, so it
+                # is suppressed only when that record says so and is otherwise
+                # reported and tagged for classification by hand.
                 if op.mem.base in (capstone.x86.X86_REG_RIP,
-                                   capstone.x86.X86_REG_RSP,
-                                   capstone.x86.X86_REG_RBP):
+                                   capstone.x86.X86_REG_RSP):
+                    continue
+                if (op.mem.base == capstone.x86.X86_REG_RBP
+                        and framereg.get(start) == RBP_ENCODING):
                     continue
                 if op.mem.disp not in fields:
                     continue
@@ -205,7 +234,10 @@ def main():
                     rw += "W"
                 if op.access & capstone.CS_AC_READ:
                     rw += "R"
-                hits.append((i.address, rw or "?", i.mnemonic, i.op_str))
+                tag = ""
+                if op.mem.base == capstone.x86.X86_REG_RBP:
+                    tag = "  <== rbp base, not this function's frame register"
+                hits.append((i.address, rw or "?", i.mnemonic, i.op_str + tag))
         if not hits:
             continue
         print("  function +0x%06X" % start)

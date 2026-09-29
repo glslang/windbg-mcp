@@ -3802,8 +3802,10 @@ validated. The full record is the
   say they serve other message types, but their objects were not identified, so a dispatch consulting
   one of those instead is **narrowed, not eliminated**. **The `.pdata` hole is closed**, not merely
   noted — `.pdata` claims no leaf functions, so the tool now decodes the executable bytes it leaves
-  out (9,599 here, 9,558 of them padding, five gap runs), and **the answer did not move**: 28 regions
-  and 42 accesses before and after. **The reaching set is still a lower bound**:
+  out (9,599 here, 9,558 of them padding, five gap runs); and **`rbp` is no longer assumed to be a
+  frame pointer**, being suppressed only where the function's `UNWIND_INFO` names it as the frame
+  register — 16 such operands exist image-wide and none is in a reaching region. **The answer did not
+  move** through either: 28 regions and 42 accesses before and after. **The reaching set is still a lower bound**:
   a function handed the partition object as an *argument* calls neither anchor and is absent from the
   28 even if it reads the pair, which no amount of the above accounts for. The tool ships without a self-test, which
   S5p's instrument has and which review holed twice; treat its function set as a reading.
