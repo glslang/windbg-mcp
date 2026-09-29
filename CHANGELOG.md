@@ -82,8 +82,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **S5 still does not pass, and there are two next gates rather than one.** Nothing was delivered to
   *us*, because this probe holds no port — though the root's own stack owns one for each child, and
   an exception intercept it never asked for landing there uncompleted is the likeliest mechanism of
-  the hold, so **the receiver gate** establishes where that message goes before building one. The
-  dispatch-read gate that stood beside it was run as S5i, above, and is done.
+  the hold, so **the receiver gate** establishes where that message goes before building one — run
+  as S5j, above, which found it already addressed to the parent. The dispatch-read gate that stood
+  beside it was run as S5i, also above.
   **A working receiver would still leave Secure Kernel's own code untested**: the enclave is VTL1
   *user* mode and Secure Kernel is VTL1 *kernel* mode. Before S5i that gap was a mechanism question,
   since an excursion-mediated hold would not have reached Secure Kernel at all; S5i retires that and
