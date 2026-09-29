@@ -4174,8 +4174,10 @@ that maps to Win32 `22`, confirmed by `RtlNtStatusToDosError` in the S5m measure
 at 62 sites in `Vid.sys`, and the create dispatcher was not located, so two different checks could
 produce the same error. The controls rule out the two alternatives they can reach: it is not
 per-process, and it is not the device being busy. **Not ruled out** are VM lifecycle state, caller
-identity and partition-specific state, none of which this gate can vary without either a kernel
-debugger or stopping a VM.
+identity and partition-specific state. **Caller identity is the cheap one** — rerunning the same
+opens under another token needs nothing this bench lacks, and the plan's next arm is exactly that,
+as `SYSTEM`. The other two are what want a kernel debugger or a VM stop, and only the first of those
+turns out to discriminate.
 
 #### What this does to the plan
 
@@ -4198,9 +4200,9 @@ debugger or stopping a VM.
   — and that last group is the interesting part, because VSM configuration is what a VTL1 target
   needs. **That is a different and much larger rig than anything this plan has built**, and it
   should be costed as its own decision rather than slipped in as the next step. It is *the clearest*
-  rather than *the only* route: the three cheaper ones this gate could not reach — locating the
-  failing check with a kernel debugger, varying privilege, and a stopped VM — are listed under what
-  to run next rather than dismissed.
+  rather than *the only* route: **two** cheaper ones this gate could not reach — varying the caller
+  upward, and locating the failing check — come before it in item 103's plan. A third, a stopped VM,
+  was proposed and dropped because it moves two candidate causes together; the plan records why.
 - **S5 does not pass**, and the obstacle has changed shape. It is no longer a missing mechanism:
   the mechanism exists and is exported. What blocks it is that opening the partition of a VM this
   host did not create is refused, for a reason consistent with a single-open rule and not yet traced
