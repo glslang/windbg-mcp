@@ -4033,19 +4033,23 @@ substitute for the diagnosis. It does replace the raw hypercall the probe has be
 Questions, not a schedule; the ordered plan is in `FOLLOWUPS.md` item 103.
 
 - **Whether a second process can open a running VM's partition**, which every call in the sequence
-  needs and this gate did not test. Everything above is conditional on it.
+  needs and this gate did not test. Everything above is conditional on it. **S5n tried and could
+  not**: the open is refused at one integrity level, with an error matching a single-open rule that
+  was not traced to its check. Read S5n's limits before treating that as final — privilege is
+  untested and duplication untried.
 - **Whether the registration then receives**, through `VidSetupMessageQueue` / `VidMessageSlotMap` /
   `VidMessageSlotHandleAndGetNext`, with a `#BP` raised in the guest — VTL0 first, then the VTL1
-  enclave, which is S5's pass condition.
+  enclave, which is S5's pass condition. Not reached.
 - **Settled here regardless**: the raw `WinHvInstallIntercept` pair should be retired in favour of
   the registration for exception vectors — better, though per S5l not safe against a raw installer.
 
 #### Limits
 
-- **Nothing was called.** This is three images read statically. Whether `VidAttachPartition`
-  succeeds against a *running* Hyper-V VM's partition from a second process, and at what privilege,
-  is **not read here** and is the first item in item 103's plan. A partition owned by `vmwp.exe`
-  may well refuse a second attach.
+- **Nothing was called.** This is three images read statically. Whether a second process can get a
+  partition handle on a *running* Hyper-V VM at all, and at what privilege, is **not read here**;
+  it is the first item in item 103's plan. **S5n ran it and could not get one** — and
+  `VidAttachPartition` turned out not to be the call this bullet assumed: it starts the VPs rather
+  than joining a partition.
 - **`vid.dll`'s exports are not a documented contract.** They are stable entry points with public
   PDB names, which is not the same thing, and a build can move them.
 - **The message-slot protocol is not read** — what `VidSetupMessageQueue` and `VidMessageSlotMap`
@@ -4076,6 +4080,114 @@ there too.
 arm from S5b onward drives `h3probe.sys` on the **host** and a raiser in the guest over
 **PowerShell Direct**, which needs no network, no KDNET and no guest debugger. S5m's steps are
 host-side user-mode calls plus that same raiser.
+
+### S5n result, 2026-09-29: one handle per partition, ever — so the receiver is unavailable for a VM you did not create
+
+**A VID partition can be open exactly once, and Hyper-V holds that one handle for every running
+VM.** S5m found the receiver exported in `vid.dll` and named the first thing to find out: whether a
+second process can get a partition handle on a running VM at all. It cannot, and the reason is not
+a permission — it is a single-open rule that Vid enforces against everybody, including the process
+that opened it first.
+
+So the sequence S5m laid out — attach, register `#BP`, receive — **is structurally unavailable for a
+VM run by Hyper-V.** It is available to whoever *created* the partition, which for a Hyper-V guest
+is `vmwp.exe` and for nobody else.
+
+This is a live result and it cost the bench nothing: no VM was touched, no intercept installed, no
+reboot, and the only objects created were two transient VID partitions under names no VM uses, both
+closed immediately.
+
+#### The namespace, read rather than guessed
+
+`VidCreatePartition` calls `VidpCreateVidObject`, which builds a path and opens it:
+
+```text
+prefix = the device interface path for GUID_DEVICEINTERFACE_VID  (or "\\?\VidExo" for Exo)
+path   = StringCchPrintfW("%s\%s", prefix, name)
+handle = CreateFileW(path, GENERIC_READ, FILE_SHARE_READ, NULL,
+                     OPEN_EXISTING, 0x40100080, NULL)
+```
+
+`GUID_DEVICEINTERFACE_VID` is `{7896E901-FE60-446E-828D-D65920654A23}`, read out of `vid.dll` at
+`+0x23B50`, and SetupAPI resolves it on this host to
+`\\?\root#vid#0000#{7896e901-fe60-446e-828d-d65920654a23}`. The leaf is the partition name, which
+for a Hyper-V guest is its **VM Id**. So the whole "open a partition" operation is one `CreateFileW`
+— no IOCTL, no privilege beyond opening the device.
+
+**`VidAttachPartition` is not the call its name suggests**, which is worth recording because the
+plan briefly assumed it was. IOCTL `0x221014` reaches `Vid!VidPartitionIoctlAttach`, which loops
+over the partition's VPs calling `VidVpAttach` — it is the VM-worker's *start the virtual
+processors* operation, gated on the partition being in states `2`/`2` and a flag at `+0x3079`. It
+has nothing to do with a second client joining, and calling it on a running VM would be disruptive
+rather than useless. It was not called.
+
+#### What the opens actually do, with the controls that make the reading sound
+
+Every row is one `CreateFileW` with the arguments above:
+
+| name | result |
+|---|---|
+| `Lab Guest Control`'s VM Id, lower and upper case | **`ERROR_BAD_COMMAND` (22)** |
+| `Lab Guest Hyper-V`'s VM Id, lower and upper case | **`ERROR_BAD_COMMAND` (22)** |
+| either VM Id wrapped in braces | `0xC0370005`, a VID-facility status |
+| `zzzz-not-a-partition` | `0xC0370005` |
+| a well-formed GUID no VM uses | **opens** |
+| the bare device path, no leaf | opens |
+
+So a malformed name and a live VM's name fail *differently*, and a well-formed unused name
+**succeeds** — which already says the VM's name was recognised and the open refused, rather than not
+found.
+
+**The control that identifies the refusal** reproduces `22` with no VM involved at all:
+
+| step | result |
+|---|---|
+| open a fresh unused name | **succeeds**, handle `0x1D8` |
+| open the *same* name again, same process, `FILE_SHARE_READ` | **`ERROR_BAD_COMMAND` (22)** |
+| open the same name again, `FILE_SHARE_READ \| FILE_SHARE_WRITE` | **`ERROR_BAD_COMMAND` (22)** |
+| close both handles, open again | **succeeds**, handle `0x1D8` |
+
+**`ERROR_BAD_COMMAND` here means "this partition name is already open".** It is not access control —
+the same process, with the same token, holding the first handle, is refused the second — and it is
+not a share-mode negotiation, since widening the share mask changes nothing. The name becomes
+available again the moment the last handle closes.
+
+A running Hyper-V VM's partition is held open by `vmwp.exe` for the VM's lifetime, so there is no
+window in which a second handle can exist.
+
+#### What this does to the plan
+
+- **The exported receiver S5m found is real and out of reach.** Every call in that sequence —
+  `VidRegisterExceptionHandler`, `VidMessageSlotMap`, `VidHandleMessageAndGetNextMessage`,
+  `VidUnregisterHandler` — takes the partition handle, and there is exactly one.
+- **It is not a privilege problem**, so running as SYSTEM, or as a protected process, or with any
+  privilege set, does not change it. That closes a family of workarounds before anyone spends time
+  on them.
+- **Handle duplication is not a route either** and is not attempted here: `vmwp.exe` runs
+  protected, and taking a handle out of it would be an attack on the platform rather than an
+  experiment on it.
+- **What remains is to own the partition**, which means running the guest under a VMM of our own
+  rather than under Hyper-V's. `vid.dll` exports enough to consider it — `VidCreatePartition`,
+  `VidVsmEnableVpVtl`, `VidVsmSetPartitionConfig`, `VidVsmGetPartitionConfig` — and that last group
+  is the interesting part, because VSM configuration is what a VTL1 target needs. **That is a
+  different and much larger rig than anything this plan has built**, and it should be costed as its
+  own decision rather than slipped in as the next step.
+- **S5 does not pass**, and for the first time the obstacle is not a missing mechanism. The
+  mechanism exists, is exported, and is reserved to the partition's creator.
+
+#### Limits
+
+- **The single-open rule is measured, not read.** Where Vid enforces it — presumably its
+  `IRP_MJ_CREATE` handler — was **not** located: the status `0xC0000184` that maps to
+  `ERROR_BAD_COMMAND` appears at 62 sites in `Vid.sys` and no create dispatcher was identifiable by
+  symbol name. The behaviour is pinned by the control table above rather than by its source, so
+  *why* it refuses is an inference from *that* it refuses, consistently, in four arms.
+- **Two guests, one host, one build.** `vid.dll 10.0.26100.8457`, `Vid.sys 10.0.26100.9278`.
+- **Stopped VMs were not tried.** Both lab guests are running, and stopping one is a bench change
+  this gate did not need. Whether a stopped VM's partition object exists at all is untested.
+- **The probe created two transient partitions**, under `00000000-0000-0000-0000-000000000000` and
+  `11111111-2222-3333-4444-555566667777`, and closed every handle. Named here because a reader
+  should know the probe is not purely passive.
 
 ## Explicitly out of scope
 
