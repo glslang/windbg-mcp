@@ -3667,22 +3667,23 @@ three.
   the Secure Kernel scope limit, which stands as S5i left it, and nothing here was run live — this
   is two static reads.
 
-#### What to read or run next
+#### What this gate leaves open
+
+**Questions, not a schedule** — the ordered plan lives in `FOLLOWUPS.md` item 103 and is maintained
+in one place, because keeping a "run this next" list in every gate section is what produced a run of
+review findings against lists a later gate had already invalidated.
 
 - **The IOCTL code and the user-mode surface for `VidHandlerIoctlExceptionRegister`** — its
-  dispatch entry in Vid's IOCTL table, the input layout, and whether a documented WHP property
-  reaches it, which would make the whole receiver a supported call rather than a private one. This
-  is the gate that decides whether S5 is one API call from passing or needs a driver.
-- **`[partition+0xB68][3]`, read inside a replicated intercept arm** — the slot is mutable, so this
-  is a statement about the reproduction and about S5h only insofar as the bench is unchanged. It is
-  the only thing that separates the drop from S5j's retained explanation, and it should come before
-  the IOCTL read rather than after: if the slot turns out claimed, the IOCTL is not the next thing
-  to look at.
-- ~~**`hvix64.exe`'s type-3 *removal* path**, which S5i did not read.~~ **Run as S5l**: it clears
-  the bit, so the hazard is real and the retracted argument cannot be rebuilt.
+  dispatch entry in Vid's IOCTL table, the input layout, and whether a documented API reaches it.
+  That is what decides whether S5's receiver is a supported call, a private one, or a driver.
+- **`[partition+0xB68][3]` during an intercept arm**, which is the only thing that separates the
+  drop from S5j's retained explanation. The slot is mutable, so any reading is about the arm that
+  takes it rather than about S5h.
 - **Whether the hold is a loop**, per the inference above, since a loop and a held trap want
-  different things from a debugger design and the distinction is cheap to measure live.
-- **Not** a second receiver, **not** a port, and **not** `WinHvSetInterceptRoutine`.
+  different things from a debugger design.
+- **Answered while this gate was in review**: `hvix64.exe`'s type-3 *removal* path, read as S5l —
+  it clears the bit, so the hazard is real and the retracted argument cannot be rebuilt.
+- **Ruled out, not open**: a second receiver, a port of our own, and `WinHvSetInterceptRoutine`.
 
 #### Limits of this read, stated rather than left to be found
 
