@@ -3180,17 +3180,19 @@ validated. The full record is the
   separates VTL1 *user* mode from VTL1 *kernel* mode. That retires the specific reason to doubt the
   extension to Secure Kernel's own code without making it a measurement, and S5a's prohibition on
   planting an `int 3` there to check is unchanged.
-- **S5j, 2026-09-29: the message is already addressed to the parent, and the receiver is a
-  displacement rather than an addition.** The gate's first half, run with the same instrument as S5i
+- **S5j, 2026-09-29: the message is already addressed to the parent, and binding to it may displace
+  Hyper-V's handler.** The gate's first half, run with the same instrument as S5i
   plus `winhvr.sys` and `Vid.sys` read with symbols. **Routing**: `HvMessageTypeX64ExceptionIntercept`
   (`0x80010003`) appears once in `hvix64.exe`, at `+0x2C9A9E`; the recipient is chosen at `+0x2C95B8`
   by scanning VTLs from the active one upward and then wrapping to the lowest, delivering to the
   first whose **own** `+0x1A04` holds the faulting vector. A `#BP` in VTL1 whose vector the parent
   installed therefore wraps to VTL0, matches, and is delivered as a VTL0 intercept — and `+0x2EB134`
   forks on that byte, sending VTL0 to the parent-directed post at `+0x2EC204` and any higher VTL to
-  its own SynIC. **So nothing needs redirecting: S5's missing half is a binding, not a route**, and
-  the hold's shape is explained — posted to a port whose owner never asked for an exception
-  intercept and never completed it.
+  its own SynIC. **So nothing needs redirecting — the route is not what is missing**, and
+  **what happened at the other end is not established** — the read shows where the message is sent,
+  and `Vid.sys` has a handler for this very type, so "nothing was bound" and "the existing handler
+  received it and retained it" are both live explanations of S5h's hold, wanting different next
+  gates. Telling them apart is what comes next.
   **Build**: the plan's hand-rolled `HvCallCreatePort`/SynIC page is the wrong build. `winhvr.sys`
   exports the lot — `WinHvCreatePort`, `WinHvConnectPort`, `WinHvAllocatePartitionSintIndex`,
   `WinHvGetSintMessage`, `WinHvSetEndOfMessage`, `WinHvSetInterceptRoutine` and
@@ -3210,7 +3212,8 @@ validated. The full record is the
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
   port. That is not the same as nothing receiving it: the root's own stack owns a port for each
   child (S5b found eleven `Vid.sys` sites installing intercepts on children), and an exception
-  intercept it never asked for landing there, never completed, would produce exactly this hold.
+  intercept it never asked for landing there would produce exactly this hold — as would nothing
+  being bound at all, which is why the next gate must tell them apart rather than assume one.
   **That first half was run as S5j, above, and it replaced the plan this bullet used to carry.**
   Establishing where the message goes was the right first step and it answered two things: the
   message is already addressed to the parent, so nothing needs redirecting; and the hand-rolled
