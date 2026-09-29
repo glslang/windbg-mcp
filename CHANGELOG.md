@@ -9,22 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **One handle per partition, ever — so the receiver is unavailable for a VM you did not create.**
-  Gate S5n, the first live arm since S5h, and it cost the bench nothing: no VM touched, no intercept
-  installed, no reboot. Opening a VID partition is a single `CreateFileW` on the VID device
-  interface path plus the VM's Id, with `OPEN_EXISTING` — the path the library builds internally.
-  Both running guests refuse with `ERROR_BAD_COMMAND`, while a well-formed unused name **opens** and
-  a malformed one fails differently, so the name is recognised and the open refused. The control
-  identifies the refusal without a VM in it: a fresh name opens, **the same name refuses a second
-  open from the same process** under either share mask, and it opens again once every handle is
-  closed. So the error means *"already open"* — not access control, not share-mode negotiation — and
-  the VM worker holds that one handle for the VM's lifetime. The exported receiving sequence the
-  previous gate found therefore has no reachable handle to run on, and privilege does not change it.
-  Also corrected: the library's "attach partition" call is the VM worker's *start the virtual
-  processors* operation, not a second client joining; it was not called. **S5's obstacle is no
-  longer a missing mechanism** — the mechanism exists, is exported, and is reserved to the
-  partition's creator, which leaves owning the partition as the only remaining route and makes that
-  a decision to cost rather than a next step.
+- **A VID partition takes no second *open*, so the receiver has no reachable handle.** Gate S5n, the
+  first live arm since S5h, and it cost the bench nothing: no VM touched, no intercept installed, no
+  reboot. Opening a VID partition is a single `CreateFileW` on the VID device interface path plus
+  the VM's Id, with `OPEN_EXISTING` — the path the library builds internally. Both running guests
+  refuse with `ERROR_BAD_COMMAND`, while a well-formed unused name **opens** and a malformed one
+  fails differently, so the name is recognised and the open refused. Two controls reproduce that
+  error with no VM in them: a second open of the same name fails under either share mask and frees
+  when the handle closes, and **across two processes** a name a child holds refuses the parent while
+  a *different* unused name opens at the same moment — so the rule is global rather than
+  per-process, and per name rather than per device. **What is not established** is that the live
+  VM's failure has the same cause: the underlying status has 62 sites in the driver and the create
+  dispatcher was not located, so the controls narrow the alternatives without eliminating them. The
+  constraint measured is *no second open* rather than *one handle* — duplication and inheritance are
+  untested and untried — and the caller was never varied, so privilege is unlikely rather than
+  excluded. The exported receiving sequence the previous gate found therefore has no handle this
+  arm could obtain. Also corrected: the library's "attach partition" call is the VM worker's *start
+  the virtual processors* operation, not a second client joining; it was not called. **S5's
+  obstacle has changed shape** — the mechanism exists and is exported, and what blocks it is a
+  refused open — with three cheap arms left before the VMM-of-our-own question, which is a rig
+  rather than an arm.
 - **The receiver is a user-mode export, and there is no driver left to write.** Gate S5m, the IOCTL
   read S5k named, against `Vid.sys`, `vid.dll` and `WinHvPlatform.dll`. The control code is
   `0x221148` — read from the dispatcher's compare chain, with a `0x10`-byte input carrying the
