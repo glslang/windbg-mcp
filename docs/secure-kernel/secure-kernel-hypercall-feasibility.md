@@ -3043,15 +3043,21 @@ covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites 
 an immediate field encoding.
 
 **The tracker behind that number was unsound when this section was first written**, and review on
-[#413](https://github.com/glslang/windbg-mcp/pull/413) found **four** ways it could invent a
-resolved field, over two rounds: carrying a constant across a branch that skips its assignment;
+[#413](https://github.com/glslang/windbg-mcp/pull/413) found **five** ways it could invent a
+resolved field, over three rounds: carrying a constant across a branch that skips its assignment;
 treating `mov ax, 0x4004` as defining all of `rax`; letting `vmread` leave its destination's old
-constant in place; and invalidating only the first of two comma-separated operands, so that
-`inc eax`, `pop rax`, `neg` and every other single-operand write left a stale constant behind. All
-four are fixed and each is pinned by the counterexample it was named for (`--self-test`). The
-tracker now clears at every branch target and after every unconditional transfer, and takes the
-registers an instruction writes from capstone rather than from the operand text — which is the only
-way to see the implicit ones. **The result below did not
+constant in place; invalidating only the first of two comma-separated operands, so `inc eax`,
+`pop rax` and `neg` left a stale constant behind; and an alias table with no `ah`/`bh`/`ch`/`dh` in
+it, so a high-byte write invalidated nothing. **Two sibling searches were text-based and wrong the
+same way** — `--imm` matched its value as a substring of the printed operands, and `--offset`
+matched a rendered `0x…]` and guessed "written" from operand position. Both now read capstone's
+structured operands, which is also the only way to see that `call qword ptr [rax + 0x1a04]` reads
+its pointer rather than writing it.
+
+All seven are fixed and each is pinned by the counterexample it was named for; `--self-test` runs
+13 cases. **Every figure in this section and in S5j was re-derived afterwards and none moved**:
+the same two `0x4004` sites, 355 resolved, `+0x1A04` at 9 sites with 2 writers and the same two,
+`+0x1A08` 9/2, `+0x1A0C` 4/2, `+0x6124` 6/3, and `0x80010003` still exactly one site. **The result below did not
 move**: the same two sites, before and after. What moved is the resolved count, 373 to 355, which is
 the conservative clearing losing real resolutions rather than inventing false ones — the direction
 that cannot manufacture an anchor.
