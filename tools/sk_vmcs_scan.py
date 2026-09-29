@@ -118,14 +118,9 @@ def _branch_targets(insns, lo, hi):
     """
     out = set()
     for ins in insns:
-        if (ins.mnemonic.startswith("j") or ins.mnemonic.startswith("loop")) \
-                and ins.op_str.startswith("0x"):
-            try:
-                t = int(ins.op_str, 0)
-            except ValueError:
-                continue
-            if lo <= t < hi:
-                out.add(t)
+        t = branch_target(ins)
+        if t is not None and lo <= t < hi:
+            out.add(t)
     return out
 
 
@@ -244,6 +239,26 @@ def mem_operands(ins):
     return out
 
 
+def branch_target(ins):
+    """The address a direct branch transfers to, or None.
+
+    Capstone reports a `call`/`jmp`/`jcc` destination as an ordinary `X86_OP_IMM`, so
+    the same operand is a code address here and a data constant in `immediates()`.
+    Keeping the two apart in one place is what stops `--imm 0x4004` reporting a call
+    that happens to land on `0x4004`, and it is also how branch targets are collected
+    for the basic-block boundaries the tracker needs.
+    """
+    try:
+        groups, ops = ins.groups, ins.operands
+    except capstone.CsError:
+        return None
+    if not any(g in groups for g in (capstone.CS_GRP_JUMP, capstone.CS_GRP_CALL)):
+        return None
+    if len(ops) == 1 and ops[0].type == capstone.x86.X86_OP_IMM:
+        return ops[0].imm & 0xFFFFFFFFFFFFFFFF
+    return None
+
+
 def immediates(ins):
     """The instruction's immediate operands, as unsigned 64-bit values.
 
@@ -252,6 +267,8 @@ def immediates(ins):
     of which is an immediate equal to it -- and the option that used one advertised
     itself as sound. Review caught both halves.
     """
+    if branch_target(ins) is not None:
+        return []          # its only immediate is a code address, not a constant
     out = []
     try:
         ops = ins.operands
@@ -308,6 +325,8 @@ IMM_TEST = [
     ("a 64-bit constant sharing the low half does not",
      bytes([0x48, 0xB8, 0x04, 0x40, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]),
      False),                                                # movabs rax, 0x100004004
+    ("a branch target is a code address, not a data immediate",
+     bytes([0xE9, 0xFF, 0x2F, 0x00, 0x00]), False),         # jmp 0x4004 (from 0x1000)
 ]
 
 # For the memory-operand matcher: a displacement too small to render as hex, and an
@@ -381,13 +400,8 @@ def direct_callers(pe, md, funcs, target):
         if not code:
             continue
         for ins in md.disasm(code, b):
-            if ins.mnemonic in ("call", "jmp") and ins.op_str.startswith("0x"):
-                try:
-                    dst = int(ins.op_str, 0)
-                except ValueError:
-                    continue
-                if dst == target:
-                    out.append((b, e, ins.address, ins.mnemonic))
+            if branch_target(ins) == target:
+                out.append((b, e, ins.address, ins.mnemonic))
     return out
 
 
@@ -476,8 +490,17 @@ def main(argv=None):
         if hi <= lo:
             print(f"\n--range needs START < END (got 0x{lo:X}:0x{hi:X})")
             return 2
-        if pe.rva_to_off(lo) is None:
-            print(f"\nrva 0x{lo:X} is not in any mapped section of this image")
+        # Validating only `lo` is not enough: PE.read translates the first RVA and then
+        # slices contiguous FILE bytes, so a range running off the end of its section
+        # decodes whatever follows in the file and labels it with RVAs it does not have.
+        # Requiring the interval to stay contiguous in both spaces rules that out.
+        o_lo, o_hi = pe.rva_to_off(lo), pe.rva_to_off(hi - 1)
+        if o_lo is None or o_hi is None:
+            print(f"\n0x{lo:X}-0x{hi:X} is not fully inside a mapped section")
+            return 2
+        if o_hi - o_lo != (hi - 1) - lo:
+            print(f"\n0x{lo:X}-0x{hi:X} crosses a section or a gap, so its file bytes "
+                  f"are not contiguous;\nread it in pieces instead")
             return 2
         lines = disasm_range(md, pe, lo, hi)
         if not lines:
