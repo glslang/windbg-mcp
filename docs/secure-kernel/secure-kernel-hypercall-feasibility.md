@@ -3043,11 +3043,15 @@ covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites 
 an immediate field encoding.
 
 **The tracker behind that number was unsound when this section was first written**, and review on
-[#413](https://github.com/glslang/windbg-mcp/pull/413) found three ways it could invent a resolved
-field: carrying a constant across a branch that skips its assignment, treating `mov ax, 0x4004` as
-defining all of `rax`, and letting `vmread` leave its destination's old constant in place. All three
-are fixed, each pinned by the counterexample it was named for (`--self-test`), and the tracker now
-clears at every branch target and after every unconditional transfer. **The result below did not
+[#413](https://github.com/glslang/windbg-mcp/pull/413) found **four** ways it could invent a
+resolved field, over two rounds: carrying a constant across a branch that skips its assignment;
+treating `mov ax, 0x4004` as defining all of `rax`; letting `vmread` leave its destination's old
+constant in place; and invalidating only the first of two comma-separated operands, so that
+`inc eax`, `pop rax`, `neg` and every other single-operand write left a stale constant behind. All
+four are fixed and each is pinned by the counterexample it was named for (`--self-test`). The
+tracker now clears at every branch target and after every unconditional transfer, and takes the
+registers an instruction writes from capstone rather than from the operand text — which is the only
+way to see the implicit ones. **The result below did not
 move**: the same two sites, before and after. What moved is the resolved count, 373 to 355, which is
 the conservative clearing losing real resolutions rather than inventing false ones — the direction
 that cannot manufacture an anchor.
