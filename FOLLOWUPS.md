@@ -3434,12 +3434,13 @@ validated. The full record is the
    place, because keeping a schedule in each gate section produced a run of review findings against
    lists a later gate had invalidated:**
 
-   1. **Open a running child's VID partition**, which every later step needs and which nothing had
-      tested. **Run as S5n: refused**, at one integrity level, with an error matching a single-open
-      rule that was not traced to its check.
-   2. **Vary the caller upward** — a run as `SYSTEM` carrying the unused-name control. Cheap, and
-      the only untested condition that could reopen the user-mode route. Not blocked: it installs
-      nothing.
+   1. **Open a running child's VID partition**, which every later step needs and which nothing has
+      tested. `CreateFileW` on the VID device interface path plus the VM Id, `OPEN_EXISTING`, with
+      a well-formed unused name as the control — **not yet run**, and nothing below it is reachable
+      until it is.
+   2. **Vary the caller upward** if step 1 is refused — a run as `SYSTEM` carrying the same control.
+      Cheap, and the only untested condition that could reopen the user-mode route. Not blocked: it
+      installs nothing.
    3. **Locate the refusing check**, which wants the kernel debugger this bench has disabled and is
       the only thing that turns S5n's matched error into a cause.
    4. **Register `#BP` through `vid.dll` and receive** — `VidRegisterExceptionHandler`, then
