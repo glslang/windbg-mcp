@@ -4227,8 +4227,13 @@ image and a PDB.
   rather than *the only* route: **two** cheaper ones this gate could not reach — varying the caller
   upward, and locating the failing check — come before it in item 103's plan. A third, a stopped VM,
   was proposed and dropped because it moves two candidate causes together; the plan records why.
-  **S5o ran the second cheap one and it answered the first as well, so this is now *the only*
-  route**, which raises what it is worth costing without making it any smaller.
+  **S5o ran the second cheap one and it answered the first as well** — so both of those are gone,
+  and what stands between here and *"the only route"* is a third cheap one S5o opened rather than
+  closed: a **writer census** of the two fields its refusal tests. Until that comes back empty this
+  is the route with no *known* obstacle, which is a weaker claim and the right one. An earlier
+  version of this sentence said *the only* route, which contradicted S5o's own limits two screens
+  below and would have sent the work at the large rig before the cheap check that can make it
+  unnecessary.
 - **S5 does not pass**, and the obstacle has changed shape. It is no longer a missing mechanism:
   the mechanism exists and is exported. What blocks it is that opening the partition of a VM this
   host did not create is refused, for a reason consistent with a single-open rule and not yet traced
