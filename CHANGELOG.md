@@ -24,10 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Two consequences: the registration refuses a claimed vector with `STATUS_VID_DUPLICATE_HANDLER`
   **before** touching the hypervisor, which covers gate S5l's hazard **against clients that
   registered through the same path** and not against a raw installer, which leaves the table entry
-  clear and is still exposed; and that same return value supersedes the kernel-memory read the
-  previous two gates wanted, since duplicate and success are exactly the two branches they were
-  trying to tell apart — read as `GetLastError()`, since the wrapper maps failures through
-  `RtlNtStatusToDosError` and VID-facility statuses pass through it verbatim.
+  clear and is still exposed; and that same return value replaces **half** of the kernel-memory read
+  the previous two gates wanted — it says whether the slot is claimed *at the moment of the call*,
+  read as `GetLastError()`, since the wrapper maps failures through `RtlNtStatusToDosError` and
+  VID-facility statuses pass through it verbatim. It does not replace the other half: registering
+  *claims* the slot, so a fault raised afterwards travels the registered path and no longer observes
+  the drop, and a reading taken now says nothing about a mutable byte's value during the earlier
+  runs.
 - **The hypervisor's exception mask is one bit with no owner, so an install/remove pair is not
   free.** Gate S5l, the removal read S5k left open, against the same `hvix64.exe`
   `10.0.26100.9444` and the same instrument. Install and remove are **the same function and the
