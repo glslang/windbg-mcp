@@ -94,6 +94,12 @@ def _build_subregs():
         for s in (a, b, c, d):
             SUB64[s] = a
         WIDE.update((a, b))
+    # The high-byte aliases, which have no `r`-prefixed spelling and so are easy to
+    # leave out of a table built from the other four. Capstone reports a write to `ah`
+    # as `ah`, and without this `mov eax, 0x4004; mov ah, 0x41; vmwrite rax, rdx` kept
+    # a tracked 0x4004 for a register that now holds 0x4104. They are never in WIDE.
+    for full, high in (("rax", "ah"), ("rbx", "bh"), ("rcx", "ch"), ("rdx", "dh")):
+        SUB64[high] = full
     for i in range(8, 16):
         for suf in ("", "d", "w", "b"):
             SUB64["r%d%s" % (i, suf)] = "r%d" % i
@@ -201,6 +207,43 @@ def _invalidate(regs, ins):
         regs.pop(_norm(ins.reg_name(r)), None)
 
 
+def imm_equal(value, want):
+    """Is a decoded immediate the one asked for?
+
+    Exact, with one deliberate exception: an `imm32` operand can be decoded already
+    sign-extended to 64 bits, so `0x80010003` may arrive as `0xFFFFFFFF80010003`. An
+    earlier version handled that by comparing the low 32 bits of *everything*, which
+    made `--imm 0x4004` match `movabs rax, 0x100004004` and vice versa. The equivalence
+    is now exactly the sign-extension, in either direction, and nothing else.
+    """
+    if value == want:
+        return True
+    for small, big in ((want, value), (value, want)):
+        if small <= 0xFFFFFFFF and small & 0x80000000:
+            if big == (small | 0xFFFFFFFF00000000):
+                return True
+    return False
+
+
+def mem_operands(ins):
+    """(displacement, writes) for each memory operand, from capstone rather than text.
+
+    Two things the rendered string cannot answer. A small displacement prints as
+    `[rcx + 8]`, with no `0x8` in it, so a substring search for one silently finds
+    nothing; and a memory operand's position does not say whether it is written --
+    `call qword ptr [rax + 0x1a04]` has it first and only reads it.
+    """
+    out = []
+    try:
+        ops = ins.operands
+    except capstone.CsError:
+        return out
+    for op in ops:
+        if op.type == capstone.x86.X86_OP_MEM:
+            out.append((op.mem.disp, bool(op.access & capstone.CS_AC_WRITE)))
+    return out
+
+
 def immediates(ins):
     """The instruction's immediate operands, as unsigned 64-bit values.
 
@@ -245,6 +288,11 @@ SELF_TEST = [
             0xFF, 0xC0,                        # inc eax  -> now 0x4005
             0x0F, 0x79, 0xC2]),                # vmwrite rax, rdx
      None),
+    ("a high-byte write invalidates the whole register",
+     bytes([0xB8, 0x04, 0x40, 0x00, 0x00,      # mov eax, 0x4004
+            0xB4, 0x41,                        # mov ah, 0x41  -> now 0x4104
+            0x0F, 0x79, 0xC2]),                # vmwrite rax, rdx
+     None),
     ("the positive control still resolves",
      bytes([0xB9, 0x04, 0x40, 0x00, 0x00,      # mov ecx, 0x4004
             0x0F, 0x79, 0xC8]),                # vmwrite rcx, rax
@@ -257,6 +305,20 @@ IMM_TEST = [
     ("a longer constant does not", bytes([0xB8, 0x40, 0x00, 0x04, 0x00]), False),
     ("a memory displacement is not an immediate",
      bytes([0x8B, 0x81, 0x04, 0x40, 0x00, 0x00]), False),   # mov eax, [rcx+0x4004]
+    ("a 64-bit constant sharing the low half does not",
+     bytes([0x48, 0xB8, 0x04, 0x40, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00]),
+     False),                                                # movabs rax, 0x100004004
+]
+
+# For the memory-operand matcher: a displacement too small to render as hex, and an
+# instruction whose memory operand comes first and is only read.
+MEM_TEST = [
+    ("a small displacement is found at all",
+     bytes([0x8B, 0x41, 0x08]), 8, True, False),            # mov eax, [rcx+8]
+    ("an indirect call reads its pointer, it does not write it",
+     bytes([0xFF, 0x90, 0x04, 0x1A, 0x00, 0x00]), 0x1A04, True, False),
+    ("a genuine store is a write",
+     bytes([0x89, 0x90, 0x04, 0x1A, 0x00, 0x00]), 0x1A04, True, True),
 ]
 
 
@@ -272,6 +334,16 @@ def self_test():
         print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
               f"        0x4004 among immediates of `{ins.mnemonic} {ins.op_str}`: "
               f"{got}, expected {want}")
+    for name, code, disp, want_found, want_write in MEM_TEST:
+        ins = next(md.disasm(code, 0x1000), None)
+        mems = [w for d, w in mem_operands(ins)] if ins else []
+        found = bool(ins) and any(d == disp for d, _ in mem_operands(ins))
+        writes = any(mems) if found else False
+        ok = (found == want_found and writes == want_write)
+        bad += not ok
+        print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
+              f"        `{ins.mnemonic} {ins.op_str}`: found={found} writes={writes}, "
+              f"expected found={want_found} writes={want_write}")
     for name, code, want in SELF_TEST:
         hits, _ = scan_function(md, code, 0x1000)
         writes = [h for h in hits if h["mnemonic"] == "vmwrite"]
@@ -281,7 +353,7 @@ def self_test():
         print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
               f"        expected {want if want is None else hex(want)}, got "
               f"{got if not isinstance(got, int) else hex(got)}")
-    total = len(SELF_TEST) + len(IMM_TEST)
+    total = len(SELF_TEST) + len(IMM_TEST) + len(MEM_TEST)
     print(f"\n  {total - bad}/{total} passed")
     return 1 if bad else 0
 
@@ -399,8 +471,20 @@ def main(argv=None):
     if args.range is not None:
         lo, _, hi = args.range.partition(":")
         lo, hi = int(lo, 0), int(hi, 0)
+        # An empty print and exit 0 is how a mistyped range looks exactly like a
+        # successful read of a region with nothing in it. Refuse instead.
+        if hi <= lo:
+            print(f"\n--range needs START < END (got 0x{lo:X}:0x{hi:X})")
+            return 2
+        if pe.rva_to_off(lo) is None:
+            print(f"\nrva 0x{lo:X} is not in any mapped section of this image")
+            return 2
+        lines = disasm_range(md, pe, lo, hi)
+        if not lines:
+            print(f"\n0x{lo:X}-0x{hi:X} decoded to no instructions")
+            return 2
         print(f"\n=== 0x{lo:X}-0x{hi:X} ===")
-        print("\n".join(disasm_range(md, pe, lo, hi)))
+        print("\n".join(lines))
         return 0
 
     if args.disasm is not None:
@@ -422,10 +506,7 @@ def main(argv=None):
             if not code:
                 continue
             for ins in md.disasm(code, b):
-                # Compare the decoded immediate, and also its 32-bit truncation, since
-                # a 32-bit operand carrying 0x80010003 may be decoded sign-extended.
-                if any(v == want or (v & 0xFFFFFFFF) == (want & 0xFFFFFFFF)
-                       for v in immediates(ins)):
+                if any(imm_equal(v, want) for v in immediates(ins)):
                     found.append((ins.address, b, e, ins.mnemonic, ins.op_str))
         print(f"\n=== immediate {needle}: {len(found)} site(s) ===")
         for addr, b, e, mn, ops in sorted(found):
@@ -434,20 +515,16 @@ def main(argv=None):
         return 0
 
     if args.offset is not None:
-        pat = "0x%x]" % args.offset
         found = []
         for b, e in funcs:
             code = pe.read(b, e - b)
             if not code:
                 continue
             for ins in md.disasm(code, b):
-                if pat not in ins.op_str:
+                hits = [w for disp, w in mem_operands(ins) if disp == args.offset]
+                if not hits:
                     continue
-                # Destination-first on x86: if the operand containing the displacement
-                # is the first one, the instruction writes it.
-                ops = ins.op_str.split(",")
-                writes = pat in ops[0] and ins.mnemonic not in (
-                    "cmp", "test", "push", "bt")
+                writes = any(hits)
                 if args.writes_only and not writes:
                     continue
                 found.append((ins.address, b, e, ins.mnemonic, ins.op_str, writes))
