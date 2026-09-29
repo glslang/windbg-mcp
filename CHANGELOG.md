@@ -15,9 +15,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same bit**: one compare on `AccessType` picks `or` or `and ~`, the store goes to that VTL's mask,
   and the per-VTL recompute follows. There is **no refcount and nowhere for one** — two writers in
   the whole image, the other a partition-teardown zeroing, and a 32-bit bitmask has no room to
-  count. So two parties holding one vector are one bit, the second remover clears it for both, and
-  this probe's `finally` strips a VID client's intercept while Vid's own per-vector table still
-  says armed. That confirms the hazard S5k left conditional, and makes the controls argument S5k
+  count. So two parties holding one vector are one bit, and since removal is a plain `and ~bit` the
+  **first** removal clears it for both, whichever party makes it — so this probe's `finally` *would*
+  strip a VID client's intercept while Vid's own per-vector table still said armed. That confirms
+  the *mechanism* of the hazard S5k left conditional, though not that it ever fired: no arm has read
+  the slot, so what is established is the exposure. It also makes the controls argument S5k
   retracted false on a probed child rather than merely unestablished; it says nothing about which
   branch the earlier hold took, which still wants a replicated arm. Three bounds came free from the
   same function: `AccessType` must be exactly `0` or `4`, the vector is a `word` at `+8` of the
@@ -44,8 +46,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   through a raw removal that touches nothing in `Vid.sys` and that S5l then read clearing the
   shared bit. Being mutable, the byte also cannot be recovered later: only a
   replicated intercept arm reports which branch is taken. The desynchronisation is a hazard of its
-  own — a probe teardown stripping a vector a VID client holds while Vid goes on believing it
-  armed.
+  own — a probe teardown would strip a vector a VID client holds while Vid went on believing it
+  armed, an exposure rather than an observed loss.
   The receiver is nonetheless not
   something to build — the message path, the completion and the instruction-pointer advance already
   exist per partition and per vector — and the `WinHvSetInterceptRoutine` prohibition hardens into a
