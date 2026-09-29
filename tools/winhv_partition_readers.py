@@ -102,15 +102,63 @@ def main():
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = True
 
-    reaching = {}   # func start -> set of reasons
+    # `.pdata` is exact for the functions it claims and does not claim leaf
+    # functions, so a leaf that loads the array or reads the pair would be
+    # invisible to a scan that stopped here. `vid_field_census.py` decodes the
+    # executable bytes `.pdata` leaves out, and so does this: the gap runs are
+    # scanned as regions of their own, padding skipped.
+    regions = [(s, e, False) for s, e in funcs]
+    claimed = []
+    for s, e in funcs:
+        claimed.append((s, e))
+    claimed.sort()
+    gap_bytes = pad_bytes = 0
+    gap_runs = 0
+    for sec in secs:
+        if not sec["exec"]:
+            continue
+        at, end_rva = sec["va"], sec["va"] + min(sec["vs"] or sec["rs"], sec["rs"])
+        covered = [(s, e) for s, e in claimed if e > at and s < end_rva]
+        cursor = at
+        holes = []
+        for s, e in covered:
+            if s > cursor:
+                holes.append((cursor, s))
+            cursor = max(cursor, e)
+        if cursor < end_rva:
+            holes.append((cursor, end_rva))
+        for hs, he in holes:
+            off = rva_to_off(secs, hs)
+            if off is None:
+                continue
+            blob = data[off:off + (he - hs)]
+            gap_bytes += len(blob)
+            # Trim padding from both ends, then decode whatever is left.
+            i, j = 0, len(blob)
+            while i < j and blob[i] in (0xCC, 0x00):
+                i += 1
+            while j > i and blob[j - 1] in (0xCC, 0x00):
+                j -= 1
+            pad_bytes += len(blob) - (j - i)
+            if j > i:
+                gap_runs += 1
+                regions.append((hs + i, hs + j, True))
+    print("executable bytes .pdata does not claim: %d (%d of them 0xCC/0x00 padding); "
+          "%d gap run(s) held anything else and are scanned as regions"
+          % (gap_bytes, pad_bytes, gap_runs))
+
+    reaching = {}   # region start -> set of reasons
     bodies = {}
-    for start, end in funcs:
+    from_gap = set()
+    for start, end, is_gap in regions:
         off = rva_to_off(secs, start)
         if off is None:
             continue
         code = data[off:off + (end - start)]
         ins = list(md.disasm(code, start))
         bodies[start] = ins
+        if is_gap:
+            from_gap.add(start)
         why = set()
         for i in ins:
             if i.mnemonic in ("call", "jmp") and i.operands:
@@ -126,10 +174,12 @@ def main():
 
     print("image                : %s" % a.image)
     print(".pdata functions     : %d" % len(funcs))
-    print("functions that can hold a partition object: %d" % len(reaching))
+    print("regions scanned      : %d (.pdata functions plus decoded gap runs)" % len(bodies))
+    print("regions that can hold a partition object: %d" % len(reaching))
     print()
     for start in sorted(reaching):
-        print("  +0x%06X  (%s)" % (start, ", ".join(sorted(reaching[start]))))
+        tag = " [gap run, not a .pdata function]" if start in from_gap else ""
+        print("  +0x%06X  (%s)%s" % (start, ", ".join(sorted(reaching[start])), tag))
     print()
 
     print("=== accesses to %s inside those functions ===" %
