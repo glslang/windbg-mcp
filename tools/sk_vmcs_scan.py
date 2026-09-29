@@ -162,37 +162,62 @@ def scan_function(md, code, base):
             hits.append(dict(rva=ins.address, mnemonic=m, op_str=ins.op_str,
                              field=field, field_reg=_norm(field_op),
                              value_reg=_norm(value_op), index=i))
-            if m == "vmread" and ops:
-                regs.pop(_norm(ops[0]), None)     # it wrote its destination
+            _invalidate(regs, ins)
             continue
-        if m in ("mov", "movzx", "movsx", "movabs", "lea") and "," in ins.op_str:
+        # Every register this instruction writes loses its tracked value, taken from
+        # capstone rather than from the operand text. An earlier version invalidated
+        # only the first of two comma-separated operands, so `inc eax`, `pop rax`,
+        # `neg`, `not` and every other single-operand write left a stale constant
+        # behind -- `mov eax, 0x4004; inc eax; vmwrite rax, rdx` reported the write as
+        # the exception bitmap. Review caught it; the ask is broader than the operand
+        # string can answer, because some writes are implicit.
+        _invalidate(regs, ins)
+        if m == "mov" and "," in ins.op_str:
             dst, src = (x.strip() for x in ins.op_str.split(",", 1))
-            d = _norm(dst)
-            if d is None or "[" in dst:
-                continue
-            if m == "mov" and _defines_full(dst) and (src.startswith("0x")
-                                                      or src.isdigit()):
+            if "[" not in dst and _defines_full(dst) and (src.startswith("0x")
+                                                          or src.isdigit()):
                 try:
-                    regs[d] = int(src, 0)
-                    continue
+                    regs[_norm(dst)] = int(src, 0)
                 except ValueError:
                     pass
-            regs.pop(d, None)
         elif m == "xor" and "," in ins.op_str:
             dst, src = (x.strip() for x in ins.op_str.split(",", 1))
             if dst == src and _defines_full(dst):
                 regs[_norm(dst)] = 0
-            else:
-                regs.pop(_norm(dst), None)
         elif m == "call":
             regs.clear()
-        elif "," in ins.op_str:
-            dst = ins.op_str.split(",", 1)[0].strip()
-            if "[" not in dst:
-                regs.pop(_norm(dst), None)
         if m in ("ret", "jmp"):
             regs.clear()          # the next instruction begins a new block
     return hits, insns
+
+
+def _invalidate(regs, ins):
+    """Drop every register capstone says this instruction writes."""
+    try:
+        _, written = ins.regs_access()
+    except capstone.CsError:
+        return
+    for r in written:
+        regs.pop(_norm(ins.reg_name(r)), None)
+
+
+def immediates(ins):
+    """The instruction's immediate operands, as unsigned 64-bit values.
+
+    Capstone's structured operands, not the printed text. A substring test over
+    `op_str` matches `0x40040` and `[rcx + 0x4004]` when asked for `0x4004` -- neither
+    of which is an immediate equal to it -- and the option that used one advertised
+    itself as sound. Review caught both halves.
+    """
+    out = []
+    try:
+        ops = ins.operands
+    except capstone.CsError:
+        return out
+    for op in ops:
+        if op.type == capstone.x86.X86_OP_IMM:
+            out.append(op.imm & 0xFFFFFFFFFFFFFFFF)
+    return out
 
 
 # Hand-assembled counterexamples, one per soundness rule, each taken from the review
@@ -215,16 +240,38 @@ SELF_TEST = [
             0x0F, 0x78, 0xC8,                  # vmread rax, rcx
             0x0F, 0x79, 0xC2]),                # vmwrite rax, rdx
      None),
+    ("a single-operand write invalidates the field register",
+     bytes([0xB8, 0x04, 0x40, 0x00, 0x00,      # mov eax, 0x4004
+            0xFF, 0xC0,                        # inc eax  -> now 0x4005
+            0x0F, 0x79, 0xC2]),                # vmwrite rax, rdx
+     None),
     ("the positive control still resolves",
      bytes([0xB9, 0x04, 0x40, 0x00, 0x00,      # mov ecx, 0x4004
             0x0F, 0x79, 0xC8]),                # vmwrite rcx, rax
      0x4004),
 ]
 
+# For the immediate matcher, which does not go through scan_function.
+IMM_TEST = [
+    ("an exact immediate matches", bytes([0xB8, 0x04, 0x40, 0x00, 0x00]), True),
+    ("a longer constant does not", bytes([0xB8, 0x40, 0x00, 0x04, 0x00]), False),
+    ("a memory displacement is not an immediate",
+     bytes([0x8B, 0x81, 0x04, 0x40, 0x00, 0x00]), False),   # mov eax, [rcx+0x4004]
+]
+
 
 def self_test():
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md.detail = True
     bad = 0
+    for name, code, want in IMM_TEST:
+        ins = next(md.disasm(code, 0x1000), None)
+        got = bool(ins) and 0x4004 in immediates(ins)
+        ok = (got == want)
+        bad += not ok
+        print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
+              f"        0x4004 among immediates of `{ins.mnemonic} {ins.op_str}`: "
+              f"{got}, expected {want}")
     for name, code, want in SELF_TEST:
         hits, _ = scan_function(md, code, 0x1000)
         writes = [h for h in hits if h["mnemonic"] == "vmwrite"]
@@ -234,7 +281,8 @@ def self_test():
         print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
               f"        expected {want if want is None else hex(want)}, got "
               f"{got if not isinstance(got, int) else hex(got)}")
-    print(f"\n  {len(SELF_TEST) - bad}/{len(SELF_TEST)} passed")
+    total = len(SELF_TEST) + len(IMM_TEST)
+    print(f"\n  {total - bad}/{total} passed")
     return 1 if bad else 0
 
 
@@ -346,7 +394,7 @@ def main(argv=None):
           f"of {exec_bytes:,} executable ({100.0 * covered / exec_bytes:.1f}%)")
 
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    md.detail = False
+    md.detail = True   # regs_access() and structured operands both need it
 
     if args.range is not None:
         lo, _, hi = args.range.partition(":")
@@ -367,13 +415,17 @@ def main(argv=None):
 
     if args.imm is not None:
         needle = "0x%x" % args.imm
+        want = args.imm & 0xFFFFFFFFFFFFFFFF
         found = []
         for b, e in funcs:
             code = pe.read(b, e - b)
             if not code:
                 continue
             for ins in md.disasm(code, b):
-                if needle in ins.op_str.lower():
+                # Compare the decoded immediate, and also its 32-bit truncation, since
+                # a 32-bit operand carrying 0x80010003 may be decoded sign-extended.
+                if any(v == want or (v & 0xFFFFFFFF) == (want & 0xFFFFFFFF)
+                       for v in immediates(ins)):
                     found.append((ins.address, b, e, ins.mnemonic, ins.op_str))
         print(f"\n=== immediate {needle}: {len(found)} site(s) ===")
         for addr, b, e, mn, ops in sorted(found):
