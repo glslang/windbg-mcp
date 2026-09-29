@@ -2990,8 +2990,8 @@ nothing**, which is worth recording because S5g cost it four reboots.
   claimed in a per-partition table an install hypercall does not touch. Whether this gate's own
   message met that branch turns on a runtime byte S5k did not read, and **the controls above cannot
   stand in for it**: they observe a hypervisor mask this probe's own raw removals also write, and
-  whether those removals clear it is itself unread — so the implication a controls-based argument
-  would need is unestablished. See S5k, which sets the argument out and retracts it.
+  S5l read those removals clearing it — so the implication a controls-based argument would need is
+  false on a probed child. See S5k, which sets the argument out and retracts it.
 - **`HvCallCreatePort` / `HvCallConnectPort` are untried**, and the bullet above is why the next
   gate has to establish *where the message goes* before assuming a port of our own would receive
   it. If intercepts are delivered to the partition's designated port, creating a second one is not
@@ -3579,19 +3579,16 @@ each handled 20,000/20,000, so no `#BP` intercept stood; so the slot was `0xFF`.
 **Both halves are true and the implication between them is not *established*, because Vid is not the
 only writer of the hypervisor mask on these children — the probe is.** `h3probe.sys` calls
 `WinHvInstallIntercept` directly, and **every install it makes is paired with a raw
-`AccessType = 0` removal in a `finally`**, S5b onward, which touches nothing in `Vid.sys`. Whether
-that removal clears the shared bit outright is **not read**: S5i read the install as an
-unconditional `OR` of `1 << vector` and did not read the removal. If it does, then `slot claimed`
-and `intercept installed` can be desynchronised on a probed child — a client's claim surviving a
-probe removal that cleared its bit — and in exactly that state the controls pass, S5h's next raw
-install re-sets the bit, and the message enqueues to that client.
-
-**Note which way the unread fact cuts.** The controls argument needs *"a claimed slot implies an
-installed intercept"* to hold, and that needs no other writer to be able to clear the bit. One
-other writer exists and its effect is unknown, so the implication is unestablished — which is
-enough to retract the argument **whatever the removal turns out to do**. Establishing the removal
-would decide something different: whether the desynchronisation is real, and therefore whether the
-argument could be rebuilt.
+`AccessType = 0` removal in a `finally`**, S5b onward, which touches nothing in `Vid.sys`. When this
+section was written, whether that removal clears the shared bit outright was **not read** — S5i had
+read the install as an unconditional `OR` of `1 << vector` and not the removal — and the argument
+was retracted on that alone: the implication it needs, *"a claimed slot implies an installed
+intercept"*, needs no other writer to be able to clear the bit, and one other writer existed whose
+effect was unknown. **S5l then read it, and it clears the bit** — so the implication is not merely
+unestablished but false on a probed child. `slot claimed` and `intercept installed` do
+desynchronise there: a client's claim survives a probe removal that cleared its bit, the controls
+pass in exactly that state, S5h's next raw install re-sets the bit, and the message enqueues to
+that client.
 
 **What settles the question itself is reading `[partition+0xB68][3]` inside a replicated intercept
 arm**, not a bare read now. The slot is mutable runtime state and a client can claim or release it
@@ -3600,12 +3597,12 @@ and it can only say what S5h's runs met to the extent the bench has not changed 
 an assumption to state, not a result. Read it with the intercept standing and the raiser held, in
 the same triple shape S5h used. Nothing should be built on the drop until that is done.
 
-**And the same desynchronisation, if it is real, is a hazard rather than only a hole in an
-argument.** A VID client holding a vector this probe installs would have its intercept stripped by
-the probe's teardown while Vid went on believing it armed — silently, on the child under test, with
-no error anywhere. Six runs have done this, so it is worth settling rather than leaving as a
-possibility. Reading `hvix64.exe`'s type-3 *removal* path settles the hazard and the rebuildability
-of the argument together, and is a smaller read than the live one.
+**And the same desynchronisation is a hazard rather than only a hole in an argument.** A VID client
+holding a vector this probe installs has its intercept stripped by the probe's teardown while Vid
+goes on believing it armed — silently, on the child under test, with no error anywhere. Six runs
+have done this. **S5l confirms it**: install and remove are the same function acting on the same
+bit, with no refcount and nowhere for one to live, so two parties holding one vector are one bit and
+the second remover clears it for both.
 
 #### What the hold then is, stated as the inference it is
 
@@ -3679,9 +3676,8 @@ three.
   the only thing that separates the drop from S5j's retained explanation, and it should come before
   the IOCTL read rather than after: if the slot turns out claimed, the IOCTL is not the next thing
   to look at.
-- **`hvix64.exe`'s type-3 *removal* path**, which S5i did not read. It decides whether this probe's
-  paired removal can strip a vector a VID client holds — a hazard of an experiment already run six
-  times — and it is a smaller read than the live one.
+- ~~**`hvix64.exe`'s type-3 *removal* path**, which S5i did not read.~~ **Run as S5l**: it clears
+  the bit, so the hazard is real and the retracted argument cannot be rebuilt.
 - **Whether the hold is a loop**, per the inference above, since a loop and a held trap want
   different things from a debugger design and the distinction is cheap to measure live.
 - **Not** a second receiver, **not** a port, and **not** `WinHvSetInterceptRoutine`.
@@ -3694,7 +3690,7 @@ three.
 - **The one runtime byte the application to S5h turns on was not read**, and **nothing already
   measured stands in for it.** `[partition+0xB68][3]` is mutable live state; the attempt to
   substitute S5h's controls is retracted in its own section above, because the probe writes the
-  hypervisor mask those controls observe and cannot be shown not to desynchronise it from the slot.
+  hypervisor mask those controls observe and — S5l — desynchronises it from the slot.
   And because it is *mutable*, no later read recovers what it held during S5h — only a replicated
   arm reports the branch a reproduction takes. Every statement about *code paths* here is
   independent of that byte; every statement about *what S5h's message did* is not, and none is
@@ -3715,6 +3711,116 @@ three.
   for CPUID, `5` for IO port, `6` for MSR, `7` for unmapped GPA, `0x10` for halt, `0x15` for triple
   fault. Those are not `WHV_RUN_VP_EXIT_REASON` values and are not named here as anything else.
 - **Intel and this hypervisor only**, as with S5i and S5j; `hvax64.exe` is not read.
+
+### S5l result, 2026-09-29: the mask is one bit with no owner, so the probe's removal is a real hazard
+
+**The removal clears the bit outright. There is no refcount, and there is nowhere for one to
+live.** S5k left this unread and two things turned on it: whether the probe's paired
+`AccessType = 0` teardown can strip an intercept another party installed, and whether the controls
+argument S5k retracted could be rebuilt. Both are now answered, and in the same direction — **the
+hazard is real and the argument cannot be rebuilt.**
+
+What this does **not** do is say which branch S5h's message took. That still wants the replicated
+arm S5k named; this read removes the alternative reading of the retraction, not the need for the
+measurement.
+
+**Measured against** the same `C:\Windows\System32\hvix64.exe` **`10.0.26100.9444`**, SHA-256
+`CF5AF317…40CE8A`, with the same instrument — [`tools/sk_vmcs_scan.py`](../../tools/sk_vmcs_scan.py),
+`--self-test` 20/20, and the ledger figures re-derived once more: `+0x1A04` at **9 sites with 2
+writers**, `+0x6124` at **6 with 3**, both unchanged since S5i.
+
+#### Install and remove are the same function, and the same bit
+
+S5i named `+0x2C9430` as where `InterceptType == 3` lands and read the install. It is the removal
+too — the direction is a single compare on `AccessType`:
+
+```text
+0x2C94A5  mov   rax, qword ptr [r10 + r11*8 + 0x63c8]   ; array[VTL]
+0x2C94AD  mov   edx, dword ptr [rax + 0x1a04]           ; the current mask
+0x2C94B3  cmp   r8d, 4                                  ; AccessType
+0x2C94B7  jne   0x2c94be
+0x2C94B9  or    edx, r9d                                ; 4  -> set 1 << vector
+0x2C94BC  jmp   0x2c94c4
+0x2C94BE  not   r9d                                     ; 0  -> clear it
+0x2C94C1  and   edx, r9d
+0x2C94C4  mov   rcx, qword ptr [r10 + r11*8 + 0x63c8]
+0x2C94CC  mov   dword ptr [rcx + 0x1a04], edx           ; store back
+0x2C94D2  mov   rcx, r10
+0x2C94D5  call  0x2becc8                                ; recompute every VTL (S5i step 4)
+0x2C94E8  call  0x2bed3c                                ; notify the VPs
+```
+
+**`or` to install, `and ~bit` to remove, one dword per VTL.** The whole update runs under a
+per-partition lock — `lock bts qword ptr [r10 + 0x63f0], 0` on the way in, `lock and … , 0` on the
+way out, `0x78` returned to a caller that finds it held — so it is serialised and still
+last-writer-wins, which is a different thing.
+
+**And there is no second structure carrying a count.** An exhaustive displacement scan puts
+`+0x1A04` at nine sites with exactly **two writers** in the whole image: this store, and a zeroing
+at `+0x2C0F84` in the partition-teardown path that clears `+0x1A04`, `+0x1A08` and `+0x1A0C`
+together. Six of the seven readers are the recompute, the routing scan S5j read, and two siblings.
+Nothing increments, nothing decrements, and a 32-bit bitmask has no room to.
+
+#### What that settles
+
+- **The hazard is confirmed and stops being conditional.** Two parties installing the same vector
+  on one partition are not two installs — they are **the same bit**, and the second remover clears
+  it for both. A VID client that had claimed `#BP` through
+  `VidHandlerpExceptionRegisterEntry` loses its intercept to this probe's `finally`, while
+  `[partition+0xB68][3]` still says it is armed and no error is raised anywhere. Six S5h runs have
+  executed that teardown.
+- **It propagates.** The store is followed by the `+0x2BECC8` recompute S5i read, which rebuilds
+  every enabled VTL's effective mask from the per-VTL `+0x1A04` values seeded with VTL 0's. So
+  clearing the parent's bit clears it from every VTL's effective mask — *except* for a VTL that
+  installed the vector into its own slot, which is Secure Kernel's `SELF` path and not a VID
+  client's.
+- **The retracted controls argument cannot be rebuilt.** S5k retracted it on the ground that the
+  implication *"a claimed slot implies an installed intercept"* was unestablished, which held
+  whichever way this read went. It goes the way that makes the desynchronisation real, so the
+  implication is not merely unestablished but false on a probed child.
+- **It does not say what S5h met.** Nothing here reads `[partition+0xB68]`. The replicated arm
+  stands exactly as S5k left it.
+
+#### Three more bounds, read from the same 215 bytes
+
+They cost nothing extra and they bound what any future arm may ask for:
+
+- **`AccessType` must be exactly `0` or `4`.** `test r8d, 0xfffffffb; jne` rejects everything else
+  with status `5`, which is where S5b's `INVALID_PARAMETER` negative control was landing.
+- **The vector is a `word` at `+8` of the `InterceptParameter`, and must be `<= 0x1F`.**
+  `movzx ecx, word ptr [r9 + 8]; cmp cx, 0x1f; ja` — consistent with a 32-bit mask, and it explains
+  why S5b found the neighbouring bytes inert.
+- **There is a per-partition allowed-vector mask at `+0x6124`, with an exemption for `#BP` and
+  `#OF` at VTL 0.** `test dword ptr [r10 + 0x6124], r9d` admits the vector directly; failing that,
+  `lea eax, [r11 - 1]; cmp al, 1; jbe` refuses target VTLs 1 and 2, and `test r9b, 0x18; je`
+  refuses every vector but **3** (`#BP`) and **4** (`#OF`). Since S5i established that a parent
+  naming a child always installs at VTL 0, **`#BP` on a child is installable unconditionally** —
+  which is why S5b's and S5h's installs never depended on the partition's configuration. It also
+  predicts that S5h's `#BR` (`0x05`) control succeeded only because `+0x6124` carried bit 5 on
+  those children; that is a prediction this read does not check, and `+0x6124`'s three writers
+  (all in `0x32FEF0-0x3305D9`) are not read here.
+
+#### What to do about the hazard
+
+The cheap remediation is in the probe rather than in the record: **read `array[0].0x1A04` before
+installing and compare after removing.** A bit already set before the install means another party
+holds the vector — the arm should decline rather than proceed — and the same read makes the
+teardown restorable instead of destructive. That is a change to bench code this repo does not ship,
+so it is recorded here as the protocol the next arm should use, not as work done.
+
+Until it is, treat *"an install/remove pair is free"* as false: it is free only if nobody else holds
+the vector, and nothing in the ABI says whether anybody does.
+
+#### Limits
+
+- **One build, Intel only, static.** `10.0.26100.9444`, the same image as S5i and S5j; `hvax64.exe`
+  is not read and nothing here transfers to it.
+- **The scan finds encoded displacements**, so a `+0x1A04` reached through a computed base is
+  invisible to the "two writers" claim — the same bound S5i and S5k record. The two writers found
+  were read as disassembly in full, as was the whole of `0x2C9430-0x2C9507`.
+- **`+0x6124`'s writers are not read**, so what puts a vector in a child's allowed mask is open.
+  The `#BP` exemption above does not depend on it.
+- **Nothing was run live**, and no bench state was touched.
 
 ## Explicitly out of scope
 

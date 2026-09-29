@@ -3242,19 +3242,39 @@ validated. The full record is the
   install is paired with a raw `AccessType = 0` removal that touches nothing in `Vid.sys`** — and
   whether that removal clears the shared bit is unread, S5i having read the install as an
   unconditional `OR` and not the removal. An implication needing *no other writer* to be able to
-  clear the bit is therefore unestablished, which retracts the argument whichever way the removal
-  turns out. What settles the question itself is reading that byte **inside a replicated intercept
-  arm** — it is mutable, so a later read reports the reproduction and says nothing about the
-  historical runs beyond an unchanged bench — and it comes before the IOCTL read.
-  **Second hazard, conditional on the same unread fact**: if the removal does clear the bit, a VID
-  client holding a vector this probe installs has its intercept stripped by the probe's teardown
-  while Vid goes on believing it armed, silently, on the child under test — and six runs have done
-  it. `hvix64.exe`'s type-3 removal path settles that and the rebuildability of the argument
-  together, and is the smaller read. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
+  clear the bit is therefore unestablished, which retracted the argument whichever way the removal
+  turned out — **and S5l then read the removal clearing the bit, so it is false rather than merely
+  unestablished.** What settles the question itself is reading that byte **inside a replicated
+  intercept arm** — it is mutable, so a later read reports the reproduction and says nothing about
+  the historical runs beyond an unchanged bench — and it comes before the IOCTL read.
+  **Second hazard, confirmed by S5l**: a VID client holding a vector this probe installs has its
+  intercept stripped by the probe's teardown while Vid goes on believing it armed, silently, on the
+  child under test — and six runs have done it. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
   in the **root** — a host bugcheck, not a guest one — for any intercept message type it does not
   handle, including the holes `0x80010005`, `0x80010009`–`0x8001000F` and `0x80010012` inside the
   range it otherwise covers. Full record in the
   [S5k result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+- **S5l, 2026-09-29: the exception mask is one bit with no owner, so an install/remove pair is not
+  free.** The removal read S5k left open, same image and instrument as S5i — `hvix64.exe`
+  `10.0.26100.9444`, `--self-test` 20/20, `+0x1A04` still 9 sites / 2 writers and `+0x6124` still
+  6 / 3. **Install and remove are the same function and the same bit**: `+0x2C9430` branches on
+  `AccessType` alone — `or edx, 1 << vector` for `4`, `not`/`and` for `0` — stores back to
+  `array[VTL].0x1A04` and calls the `+0x2BECC8` recompute S5i read. **No refcount, and nowhere for
+  one**: two writers in the whole image, this store and a partition-teardown zeroing, and a 32-bit
+  bitmask has no room to count. So **two parties holding one vector are one bit**, the second
+  remover clears it for both, and the probe's `finally` strips a VID client's intercept while
+  `[partition+0xB68]` still says armed. The hazard S5k left conditional is real, and the controls
+  argument S5k retracted is **false on a probed child** rather than merely unestablished. It does
+  **not** say which branch S5h met — that is still the replicated arm. **Three bounds read free
+  from the same 215 bytes**: `AccessType` must be exactly `0` or `4` (status `5` otherwise, which
+  is where S5b's negative control landed); the vector is a `word` at `+8` of the
+  `InterceptParameter` and must be `<= 0x1F`; and a per-partition allowed-vector mask at `+0x6124`
+  gates installs **except** that target VTL 0 admits vectors `3` (`#BP`) and `4` (`#OF`)
+  unconditionally — which, with S5i's "a parent naming a child always installs at VTL 0", is why
+  `#BP` on a child never depended on the partition's configuration. **Remediation for the next
+  arm**: read `array[0].0x1A04` before installing, decline if the bit is already set, and restore
+  it after removing. Full record in the
+  [S5l result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
   port. That is not the same as nothing receiving it: the root's own stack owns a port for each
@@ -3285,7 +3305,9 @@ validated. The full record is the
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
   `WinHvInstallIntercept` S5b read. **So the next step is reading `[partition+0xB68][3]` inside a
-  replicated intercept arm**, which is what separates the drop from S5j's retained explanation, and
+  replicated intercept arm** — which, per S5l, must read `array[0].0x1A04` before installing and
+  decline if the vector's bit is already set, since the install/remove pair is destructive to
+  whoever else holds it. That arm is what separates the drop from S5j's retained explanation, and
   which decides whether the IOCTL is the thing to look at next at all. **Then
   the IOCTL code and its user-mode surface**, and whether a documented WHP property reaches it —
   which decides whether S5 is one supported call from passing or needs a driver. A third candidate
