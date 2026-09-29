@@ -3302,15 +3302,26 @@ validated. The full record is the
   `VidMessageSlotMap`, `VidSetupMessageQueue`, `VidMessageSlotHandleAndGetNext`,
   `VidHandleMessageAndGetNextMessage`, `VidUnregisterHandler`. **So no driver, no port, no
   hypercall** — the third downward re-scope in a row, each one deleting the build the previous gate
-  specified. **But it is not a documented call**: `WinHvPlatform.dll` delay-imports 31 `vid.dll`
+  specified — **conditional on getting a partition handle**, which every call in the sequence takes
+  and which this gate does not test; if a second process cannot obtain one for a running VM, the
+  sequence is unavailable and a driver may be back on the table.
+  **But it is not a documented call**: `WinHvPlatform.dll` delay-imports 31 `vid.dll`
   functions and this is not one of them — what WHP imports is the *Exo* family, its own partitions'
   mechanism. So S5 is not one supported call from passing; it is one *observed, exported* call from
   passing, which is a different and weaker thing to build on.
-  **It also removes S5l's hazard by construction**: the kernel side refuses a claimed slot with
-  `STATUS_VID_DUPLICATE_HANDLER` before touching the hypervisor, and unregister clears slot and bit
-  together — so the raw `WinHvInstallIntercept` pair should be retired rather than guarded. **And
-  the registration's return value supersedes the replicated arm** S5k and S5l wanted: duplicate
-  means the slot was claimed, success means it was `0xFF`. Full record in the
+  **It covers S5l's hazard for one class of owner, not in general**: the kernel side refuses a
+  claimed slot with `STATUS_VID_DUPLICATE_HANDLER` before touching the hypervisor, and unregister
+  clears slot and bit together — but that check reads `[partition+0xB68]`, so it sees only parties
+  that registered *through Vid*. A raw `WinHvInstallIntercept` owner — this plan's own probe since
+  S5b — leaves the slot `0xFF`, a Vid registration succeeds beside it, and unregister later clears
+  the shared bit out from under them. The rule that follows is *one installer per vector per
+  partition, and let it be the Vid registration*, not "the hazard is solved".
+  **And the registration's return value supersedes the replicated arm** S5k and S5l wanted —
+  **read as `GetLastError()`, not as the `BOOL`**: the wrapper passes failures through
+  `RtlNtStatusToDosError`, and VID-facility statuses have no Win32 mapping, so `0xC0370001` comes
+  back verbatim and is unambiguous against invalid-handle (`6`), access-denied (`5`) and
+  allocation failure (`1450`) — all measured. Duplicate means the slot was claimed, success means
+  it was `0xFF`, anything else classifies nothing. Full record in the
   [S5m result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
