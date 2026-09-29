@@ -3238,15 +3238,19 @@ validated. The full record is the
   refutation**: the drop. **Which of the two S5h met turns on `[partition+0xB68][3]`, a runtime byte
   this gate did not read and nothing already measured stands in for.** An attempt to substitute
   S5h's controls was retracted in review: Vid's register and unregister paths do set and clear the
-  slot and the hypervisor intercept together, but `h3probe.sys` writes that mask too, and **every
-  probe install is paired with a raw `AccessType = 0` removal that clears the bit without clearing
-  the slot** — so on a probed child the two desynchronise and a control arm passes either way. One
-  live read of that byte settles it, and it comes before the IOCTL read.
-  **Second new hazard, from the same fact**: if a VID client ever holds a vector this probe
-  installs, the probe's teardown strips that client's intercept and leaves Vid believing it armed,
-  silently. Whether a removal clears the bit outright is unread — S5i read the install as an
-  unconditional `OR` and not the removal — so `hvix64.exe`'s type-3 removal path settles the hazard
-  and the retracted argument together. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
+  slot and the hypervisor intercept together, but `h3probe.sys` writes that mask too — **every probe
+  install is paired with a raw `AccessType = 0` removal that touches nothing in `Vid.sys`** — and
+  whether that removal clears the shared bit is unread, S5i having read the install as an
+  unconditional `OR` and not the removal. An implication needing *no other writer* to be able to
+  clear the bit is therefore unestablished, which retracts the argument whichever way the removal
+  turns out. What settles the question itself is reading that byte **inside a replicated intercept
+  arm** — it is mutable, so a later read reports the reproduction and says nothing about the
+  historical runs beyond an unchanged bench — and it comes before the IOCTL read.
+  **Second hazard, conditional on the same unread fact**: if the removal does clear the bit, a VID
+  client holding a vector this probe installs has its intercept stripped by the probe's teardown
+  while Vid goes on believing it armed, silently, on the child under test — and six runs have done
+  it. `hvix64.exe`'s type-3 removal path settles that and the rebuildability of the argument
+  together, and is the smaller read. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
   in the **root** — a host bugcheck, not a guest one — for any intercept message type it does not
   handle, including the holes `0x80010005`, `0x80010009`–`0x8001000F` and `0x80010012` inside the
   range it otherwise covers. Full record in the
@@ -3280,9 +3284,9 @@ validated. The full record is the
   `[partition+0xB68]`, the per-vector table it consults. The receiving path — message,
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
-  `WinHvInstallIntercept` S5b read. **So the next step is one live read of `[partition+0xB68][3]`**,
-  which is what separates the drop from S5j's retained explanation directly instead of through
-  S5h's controls, and which decides whether the IOCTL is the thing to look at next at all. **Then
+  `WinHvInstallIntercept` S5b read. **So the next step is reading `[partition+0xB68][3]` inside a
+  replicated intercept arm**, which is what separates the drop from S5j's retained explanation, and
+  which decides whether the IOCTL is the thing to look at next at all. **Then
   the IOCTL code and its user-mode surface**, and whether a documented WHP property reaches it —
   which decides whether S5 is one supported call from passing or needs a driver. A third candidate
   is live and cheap: **whether the hold is a loop**, since nothing on the drop path injects the
@@ -3333,9 +3337,10 @@ validated. The full record is the
    displaces the entry Hyper-V holds or takes one of its own. **S5k closed that and moved the
    unknown again**: the key is the partition id, Vid holds the entry, and the receiving path already
    exists — Vid is bound and recognises the message, and drops one whose vector is not claimed in
-   its own per-vector table. So the unknown is now **whether that slot was claimed during S5h**,
-   which is one live read and which S5k argued rather than measured, and then **the IOCTL that
-   claims a vector** and whether a supported user-mode surface reaches it. The other candidate was **answered by S5c**: the
+   its own per-vector table. So the unknown is now **which branch an intercept arm takes**, which
+   S5k could not measure and, the slot being mutable, wants a replicated arm rather than a later
+   read, and then **the IOCTL that claims a vector** and whether a supported user-mode surface
+   reaches it. The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
    rather than VTL-selective — so it buys a live *inspector* and not the stop S5 asks for. Still
