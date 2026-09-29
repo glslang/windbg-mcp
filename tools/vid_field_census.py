@@ -347,10 +347,15 @@ def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit
                     and ops[1].type == capstone.x86.X86_OP_IMM
                 ):
                     dst = widen(ins.reg_name(ops[0].reg))
-                    if dst in aliases:
-                        root, off = aliases[dst]
-                        aliases[dst] = (root, off + ops[1].imm)
-                        handled = True
+                    # Seed from the register's own pre-`add` value when it is not
+                    # already an alias, or `add rbx,0x3000` followed by
+                    # `[rbx+0x79]` records nothing and the write is missed --
+                    # which the docstring claimed was covered when it was not.
+                    # The root then names the register's *earlier* value, which
+                    # is the same convention `lea rax,[rbx+k]` already uses.
+                    root, off = aliases.get(dst, (dst, 0))
+                    aliases[dst] = (root, off + ops[1].imm)
+                    handled = True
             if not handled:
                 # `regs_write` carries only IMPLICIT writes -- measured here,
                 # `xor eax,eax` reports `rflags` alone and `mov rax,[rbx]`
@@ -563,6 +568,21 @@ def self_test() -> int:
         print(f"  {'FAIL' if got else 'ok  '} {why}")
         failures += int(bool(got))
 
+    # `add` with no prior alias, which the first version silently ignored while
+    # the docstring claimed to cover it -- a false NEGATIVE, and those are the
+    # dangerous ones for a census whose product is "nothing else writes this".
+    code = b"\x48\x81\xc3\x00\x30\x00\x00" b"\xc6\x43\x79\x01"  # add rbx,3000h
+    probe = Image(data=b"", sections=[], image_base=0x140000000)
+    probe.read = lambda rva, n: code if rva == 0x1000 else None  # type: ignore[method-assign]
+    probe.pdata = [(0x1000, 0x1000 + len(code))]
+    got, _ = census(probe, {0x3079}, {})
+    ok = len(got) == 1 and got[0].kind == "write"
+    print(
+        f"  {'ok  ' if ok else 'FAIL'} an add-formed pointer with no prior alias "
+        f"resolves to +0x3079"
+    )
+    failures += int(not ok)
+
     # And the matching-displacement case, which is a false positive in the other
     # direction: on an aliased base, an encoded 0x3079 is NOT the field.
     code = b"\x48\x8d\x83\x00\x30\x00\x00" b"\xc6\x80\x79\x30\x00\x00\x01"
@@ -578,7 +598,7 @@ def self_test() -> int:
     )
     failures += int(not ok)
 
-    total = len(SELF_TEST) + 2 + len(NEGATIVE) + 1
+    total = len(SELF_TEST) + 2 + len(NEGATIVE) + 2
     print(f"\n  {total - failures}/{total} passed")
     return 1 if failures else 0
 
