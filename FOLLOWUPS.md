@@ -3570,6 +3570,49 @@ validated. The full record is the
   `Stop-ExdiContainingDllHosts` because the surrogate outlives the debugger — the same E0 activation
   stall this plan already hit. Both weakenings outlive the run: record them and reverse them.
 
+- **S5s — RUN 2026-09-29: the active CLSID refuses to start, so the answer is the "if it is not"
+  branch.** `kd -kx exdi:CLSID={67030926-…}` against release `v3.3.2.20260720` produces one modal
+  dialog carrying a string hardcoded in `ExdiHvSrv.dll` — *"That build of EXDI plugin is not
+  supported live Hyper-V debugging"* — and kd's log ends at the version banner with no connection,
+  no target and no `bp`. **The gate's `nt` breakpoint control was never reached and did not need to
+  be**: it exists to separate a broken rig from a refused VTL1, and the server declined before a
+  target existed, which is neither. A breakpoint in `securekernel.exe` cannot be attempted through
+  this build at all. **So what LiveCloudKd provides is inspection with Secure Kernel symbols on
+  top**, and every novelty claim in this plan may be stated against that — for **this release**,
+  the refusal being build-conditional by its own wording.
+- **And the inspector half passes, with its control.** The passive CLSID connects, finds
+  `ntkrnlmp`, resolves NT symbols and walks the process list; `IeXdiControlComponentFunctions` is
+  unimplemented (`0x80004002`), so `.exdicmd` is missing beside the execution control.
+  `hvlib.dll`'s own classes give the VBS guest `InfoSecureKernelBase` `0xFFFFF80629B4A000`, size
+  `0x175000`, `InfoHvddGetCr3Securekernel` `0x1201000` — and the twin **`0x0` on all three**. In the
+  debugger, `.reload /f securekernel.exe=<base>` loads `securekernel` **with PDB symbols** and
+  `db` at that base reads `4d 5a 90 00`, while the **identical commands at the identical address on
+  the VBS-off twin** give all zeros, *Unable to verify timestamp* and one page with no symbols. **No
+  `RegCr3` override was needed**, though the value name exists. `SkpsEnableDebugging` (**+0xA4658**)
+  and `SkpsSendDebugAttachNotifications` (**+0xA4D50**) resolve, and
+  **`SkpsIsProcessDebuggingEnabled` does not exist in this build's public PDB** — which corrects
+  S5r, written with that name from a fetched précis rather than from the write-up. The new name is
+  a **candidate** for the gate that work patches, not an identification.
+- **The partition identity was established three ways before any VTL1 reading was taken**, because
+  the host reset below left the twins matched on uptime to under a second and killed the
+  discriminator earlier gates used: NT kernel base, the presence of `Secure System` and
+  `LsaIso.exe` in VTL0, and hvlib's own `InfoPartitionId`/name — all agreeing with the host's
+  `Get-VMSecurity`, and all saying `VmId` 0 is the control and `VmId` 1 the VBS guest. `VmId` is a
+  DWORD index over **VMs only**; 2 and 3 fail with `CO_E_SERVER_EXEC_FAILURE`, so the VSM scan adds
+  no pseudo-partition to select.
+- **The first attempt hung the host, and the cause was the harness rather than the attach.** `kd`
+  launched with `Start-Process -NoNewWindow -RedirectStandardOutput` wrote **281 KB of
+  `kd: Could not write to pipe, 1450`** while a modal blocked it — the modal being the plugin asking
+  for `VmId`, a DWORD in `HKLM\SOFTWARE\LiveCloudKd\Parameters` that did not exist yet. Kernel-Power
+  41, unexpected shutdown, **no dump**: a reset of a hung machine, not a bug check, and the same
+  signature this bench recorded for `cdb -server`, so the rule is about **any** debugger child and
+  `-RedirectStandardOutput` is not the "redirect to a file" it means. Both guests rebooted with the
+  host, so the S5g landmarks have moved again. The replacement harness — pre-supplied settings, the
+  child in **its own window**, kd's own `-logo`, a **job object** with `KILL_ON_JOB_CLOSE`, a bounded
+  wait, an explicit kill on every path and a `dllhost` sweep — then ran six times with no
+  recurrence. **No guest was modified, no intercept installed and nothing written to VTL1.** Full
+  record in the [S5s result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+
 ### Out of scope, with the reason rather than as a list
 
 - **Writes as a *tool surface***: the primitive exists and S1's seam should not pretend otherwise,
