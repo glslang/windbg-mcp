@@ -4632,9 +4632,13 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
     inter-procedural argument tracking, which this instrument does not do;
   - **a pointer formed in one basic block and used in another.** The alias table is dropped at
     every branch target and after every control transfer, because carrying it across a join in
-    physical decode order would let one path's `lea` answer for a path that never ran. That choice
-    trades a class of false positives for this blind spot, deliberately — a census that
-    *overcounts* writers is worse than useless here, since its only product is a negative;
+    physical decode order would let one path's `lea` answer for a path that never ran. **This is
+    the largest residual on the result, and an earlier draft defended it with the argument the
+    wrong way round** — it claimed overcounting was the worse failure "since the product is a
+    negative", when the opposite is true: a spurious writer is a row a reader examines and
+    dismisses, while a missed one silently falsifies the whole claim. The trade is made anyway,
+    for a different reason: an alias carried across a join is not merely noisy, it asserts a chain
+    no execution performs, and a blind spot that can be named beats a wrongness that cannot;
   - **a bulk copy whose length spans the field.** `VsmmPhuPartitionRestore` is in the persistence
     family that would plausibly do such a thing, and nothing here excludes it.
 
@@ -4650,7 +4654,11 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
   it kept a 64-bit alias through a 32-bit `lea`, which zero-extends and cannot carry a kernel
   pointer; and it skipped alias resolution whenever the encoded displacement already matched, so a
   `[rax+0x3079]` on an aliased base was reported as the field when it was really `+0x6079`. Each
-  was a way to **overcount**, and each is now a self-test.
+  was a way to **overcount**, and each is now a self-test. A fourth round then found the
+  **undercount** that mattered more: `add r,imm` updated the alias table only when the register
+  was *already* tracked, so `add rbx,0x3000` followed by `[rbx+0x79]` recorded nothing at all —
+  while this tool's own docstring claimed `add` was covered. It now seeds from the register's
+  pre-`add` value, and that is a self-test too. The result did not move.
 - **`[p+0x3060]`'s writers are not claimed complete**, per the taken address above.
 - **Static, one build** — `Vid.sys 10.0.26100.9278`. No partition object was inspected live, so
   this says what the code can do, not what any particular partition's fields hold.

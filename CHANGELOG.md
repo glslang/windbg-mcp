@@ -41,8 +41,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   are fixed and each is now a self-test, alias state is dropped at basic-block boundaries rather
   than carried across joins in decode order, unexamined bytes after a decode stop are counted (`0`
   here), and each gap is decoded from every start after padding instead of once from a raw
-  boundary. None of it changed the result. It exists because the obvious search is wrong three
-  ways, all
+  boundary. **A further round found the undercount that mattered more than any of those**:
+  `add r,imm` updated the alias table only for a register already tracked, so
+  `add rbx,0x3000` then `[rbx+0x79]` recorded nothing — while the tool's own docstring claimed
+  `add` was covered. It now seeds from the pre-`add` value. That round also corrected a piece of
+  reasoning in the write-up that had the failure directions backwards: for a census whose product
+  is *"nothing else writes this"*, a **missed** writer silently falsifies the claim while a
+  spurious one is only a row a reader dismisses. None of it changed the result. The instrument
+  exists because the obvious search is wrong three ways, all
   of which bit here: a `s -d` scan walks **dword-aligned** and a displacement does not, so it misses
   sites silently; a byte scan matches immediates and data; and neither can see a write through a
   **taken address** — of which this census found a real one, `VsmmPhuPartitionTeardown` executing
