@@ -4034,9 +4034,10 @@ Questions, not a schedule; the ordered plan is in `FOLLOWUPS.md` item 103.
 
 - **Whether a second process can open a running VM's partition**, which every call in the sequence
   needs and this gate did not test. Everything above is conditional on it. **S5n tried and could
-  not**: the open is refused at one integrity level, with an error matching a single-open rule that
-  was not traced to its check. Read S5n's limits before treating that as final — privilege is
-  untested and duplication untried.
+  not** — the open is refused at one integrity level, with an error matching a single-open rule that
+  was not traced to its check. **Read that as "this arm could not obtain an open", not as a closed
+  door**: S5n's limits keep privilege untested, duplication untried and the failing site unlocated,
+  and its own plan keeps cheaper arms ahead of abandoning the route.
 - **Whether the registration then receives**, through `VidSetupMessageQueue` / `VidMessageSlotMap` /
   `VidMessageSlotHandleAndGetNext`, with a `#BP` raised in the guest — VTL0 first, then the VTL1
   enclave, which is S5's pass condition. Not reached.
@@ -4099,8 +4100,8 @@ VM run by Hyper-V.** It is available to whoever *created* the partition, which f
 is `vmwp.exe` and for nobody else.
 
 This is a live result and it cost the bench nothing: no VM was touched, no intercept installed, no
-reboot, and the only objects created were two transient VID partitions under names no VM uses, both
-closed immediately.
+reboot, and the only objects created were **four** transient VID partitions under names no VM uses,
+every handle closed. The limits section lists them by name.
 
 #### The namespace, read rather than guessed
 
@@ -4220,14 +4221,24 @@ debugger or stopping a VM.
 - **Two guests, one host, one build.** `vid.dll 10.0.26100.8457`, `Vid.sys 10.0.26100.9278`.
 - **Stopped VMs were not tried.** Both lab guests are running, and stopping one is a bench change
   this gate did not need. Whether a stopped VM's partition object exists at all is untested.
-- **The probe created three transient partitions**, under `00000000-0000-0000-0000-000000000000`,
-  `11111111-2222-3333-4444-555566667777` and the two names the cross-process control used, and
-  closed every handle. Named here because a reader should know the probe is not purely passive.
+- **The probe created four transient partitions**, and every handle was closed. The full list,
+  because this is the audit record for the arm's host-side effects: `00000000-0000-0000-0000-000000000000`
+  (the well-formed-unused-name arm), `11111111-2222-3333-4444-555566667777` (the same-process
+  control), and `aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee` plus
+  `ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb` (the cross-process control's held name and its concurrent
+  control). No VM uses any of them. Named here because a reader should know the probe is not purely
+  passive — and because two earlier drafts of this section said "two" and "three", each counting a
+  different subset.
 
 #### What to run next, cheapest first
 
-1. **Vary the caller.** One run of the same opens from a medium-integrity, non-elevated process.
-   It costs nothing and it is the only untested alternative that would reopen the user-mode route.
+1. **Vary the caller — upward, and that is the point.** The arm this section first proposed was a
+   medium-integrity, non-elevated run, which only varies privilege *downward*: if that also fails it
+   says nothing about the alternative that could actually reopen the route, which is **SYSTEM**. So
+   the arm is a run as `SYSTEM` (a scheduled task or a service is enough), carrying the unused-name
+   control with it so a success can be told from the device simply being reachable. A non-elevated
+   run is worth including in the same pass — three points beat one — but it is the SYSTEM arm that
+   decides anything.
 2. **A stopped VM.** Whether its partition object exists, and whether its name then opens, separates
    "held open by `vmwp.exe`" from "refused on VM state". It costs one guest stop/start.
 3. **Locate the check**, which needs the kernel debugger this bench does not have enabled and is

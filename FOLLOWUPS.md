@@ -3344,7 +3344,9 @@ validated. The full record is the
   `VidPartitionIoctlAttach`, which loops the VPs calling `VidVpAttach` — the VM worker's *start the
   virtual processors* operation. It was not called.
   **So S5's obstacle has changed shape**: the mechanism exists and is exported, and what blocks it
-  is a refused open. **Next, cheapest first**: vary the caller (one non-elevated run); try a stopped
+  is a refused open. **Next, cheapest first**: vary the caller **upward** — a run as `SYSTEM` with
+  the unused-name control, since a non-elevated run only varies privilege downward and cannot
+  reopen the route; try a stopped
   VM; locate the check, which wants the kernel debugger this bench has disabled; and only then the
   VMM-of-our-own question — `VidCreatePartition`, `VidVsmEnableVpVtl`, `VidVsmSetPartitionConfig` —
   **which is a rig rather than an arm and should be costed as its own decision.** Full record in the
