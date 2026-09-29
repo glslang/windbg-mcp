@@ -64,7 +64,8 @@ VMCS_FIELDS = {
 
 EXCEPTION_BITMAP = 0x4004
 
-SUB64 = {}   # capstone gives sub-registers; normalise to the 64-bit name
+SUB64 = {}    # capstone gives sub-registers; normalise to the 64-bit name
+WIDE = set()  # the names whose write defines the whole 64-bit value
 
 
 def _norm(name):
@@ -72,10 +73,17 @@ def _norm(name):
     immediate into eax and then used as rax by vmwrite, so tracking must span the two."""
     if not name:
         return None
-    n = name.lower()
-    if n in SUB64:
-        return SUB64[n]
-    return n
+    return SUB64.get(name.lower(), name.lower())
+
+
+def _defines_full(name):
+    """Does writing this register name determine all 64 bits?
+
+    Only the 64- and 32-bit forms do: a 32-bit write zero-extends, while `mov ax, 0x4004`
+    and `xor al, al` leave the upper bits as they were. Treating those as full writes
+    let a stale upper half be reported as a resolved field encoding, which review caught.
+    """
+    return bool(name) and name.lower() in WIDE
 
 
 def _build_subregs():
@@ -85,26 +93,65 @@ def _build_subregs():
                        ("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl")):
         for s in (a, b, c, d):
             SUB64[s] = a
+        WIDE.update((a, b))
     for i in range(8, 16):
         for suf in ("", "d", "w", "b"):
             SUB64["r%d%s" % (i, suf)] = "r%d" % i
+        WIDE.update(("r%d" % i, "r%dd" % i))
 
 
 _build_subregs()
+
+
+def _branch_targets(insns, lo, hi):
+    """Every address inside the function that a branch lands on.
+
+    These are join points: what a register holds there depends on which edge arrived,
+    so the tracker cannot carry a value across one. Collected in a first pass because a
+    backward jump's target precedes the jump.
+    """
+    out = set()
+    for ins in insns:
+        if (ins.mnemonic.startswith("j") or ins.mnemonic.startswith("loop")) \
+                and ins.op_str.startswith("0x"):
+            try:
+                t = int(ins.op_str, 0)
+            except ValueError:
+                continue
+            if lo <= t < hi:
+                out.add(t)
+    return out
 
 
 def scan_function(md, code, base):
     """Walk one function, tracking reg <- immediate, and report every vmwrite/vmread
     with the field encoding it used when that encoding is a tracked constant.
 
-    Deliberately simple: a linear pass with a constant map that is cleared per call and
-    per unknown write to a register. It cannot follow a field encoding through memory or
-    arithmetic, which is exactly the `immediates` limit the module docstring states.
+    A constant is reported only when it was set **in the same basic block**, by a write
+    that defines all 64 bits. Three ways an earlier version got this wrong, all found by
+    review on #413 and all able to invent a resolved field that the instruction does not
+    use:
+
+    * it carried constants across branches, so a `mov eax, 0x4004` jumped over could
+      still label a later `vmwrite`. The map is now cleared at every branch target and
+      after every unconditional transfer, which is conservative: it loses real
+      resolutions rather than inventing false ones;
+    * it treated `mov ax, 0x4004` as defining `rax`, when only the 64- and 32-bit forms
+      do;
+    * it let `vmread` leave its destination's old constant in place, so
+      `mov eax, 0x4004; vmread rax, rcx; vmwrite rax, rdx` reported the third
+      instruction as the exception bitmap.
+
+    It still cannot follow an encoding through memory or arithmetic, which is the
+    `immediates` limit the module docstring states.
     """
     regs = {}
     hits = []
     insns = list(md.disasm(code, base))
+    targets = _branch_targets(insns, base, base + len(code))
     for i, ins in enumerate(insns):
+        if ins.address in targets:
+            regs.clear()          # a join: what arrives here depends on the edge
         m = ins.mnemonic
         if m in ("vmwrite", "vmread"):
             ops = [o.strip() for o in ins.op_str.split(",")]
@@ -115,13 +162,16 @@ def scan_function(md, code, base):
             hits.append(dict(rva=ins.address, mnemonic=m, op_str=ins.op_str,
                              field=field, field_reg=_norm(field_op),
                              value_reg=_norm(value_op), index=i))
+            if m == "vmread" and ops:
+                regs.pop(_norm(ops[0]), None)     # it wrote its destination
             continue
-        if m in ("mov", "movzx", "movabs") and "," in ins.op_str:
+        if m in ("mov", "movzx", "movsx", "movabs", "lea") and "," in ins.op_str:
             dst, src = (x.strip() for x in ins.op_str.split(",", 1))
             d = _norm(dst)
             if d is None or "[" in dst:
                 continue
-            if src.startswith("0x") or src.isdigit():
+            if m == "mov" and _defines_full(dst) and (src.startswith("0x")
+                                                      or src.isdigit()):
                 try:
                     regs[d] = int(src, 0)
                     continue
@@ -130,7 +180,7 @@ def scan_function(md, code, base):
             regs.pop(d, None)
         elif m == "xor" and "," in ins.op_str:
             dst, src = (x.strip() for x in ins.op_str.split(",", 1))
-            if dst == src:
+            if dst == src and _defines_full(dst):
                 regs[_norm(dst)] = 0
             else:
                 regs.pop(_norm(dst), None)
@@ -138,8 +188,54 @@ def scan_function(md, code, base):
             regs.clear()
         elif "," in ins.op_str:
             dst = ins.op_str.split(",", 1)[0].strip()
-            regs.pop(_norm(dst), None)
+            if "[" not in dst:
+                regs.pop(_norm(dst), None)
+        if m in ("ret", "jmp"):
+            regs.clear()          # the next instruction begins a new block
     return hits, insns
+
+
+# Hand-assembled counterexamples, one per soundness rule, each taken from the review
+# finding that named it. A rule nobody can break is a rule nobody has tested: these
+# exist so that backing any of the three fixes out fails here rather than silently
+# producing a confident wrong anchor in a later gate.
+SELF_TEST = [
+    ("a constant jumped over does not resolve the write",
+     bytes([0xB8, 0x04, 0x40, 0x00, 0x00,      # mov eax, 0x4004
+            0xEB, 0x05,                        # jmp +5 -> the vmwrite
+            0xB8, 0x02, 0x40, 0x00, 0x00,      # mov eax, 0x4002 (skipped)
+            0x0F, 0x79, 0xC2]),                # vmwrite rax, rdx
+     None),
+    ("a 16-bit write does not define the field register",
+     bytes([0x66, 0xB8, 0x04, 0x40,            # mov ax, 0x4004
+            0x0F, 0x79, 0xC2]),                # vmwrite rax, rdx
+     None),
+    ("vmread clobbers its destination",
+     bytes([0xB8, 0x04, 0x40, 0x00, 0x00,      # mov eax, 0x4004
+            0x0F, 0x78, 0xC8,                  # vmread rax, rcx
+            0x0F, 0x79, 0xC2]),                # vmwrite rax, rdx
+     None),
+    ("the positive control still resolves",
+     bytes([0xB9, 0x04, 0x40, 0x00, 0x00,      # mov ecx, 0x4004
+            0x0F, 0x79, 0xC8]),                # vmwrite rcx, rax
+     0x4004),
+]
+
+
+def self_test():
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    bad = 0
+    for name, code, want in SELF_TEST:
+        hits, _ = scan_function(md, code, 0x1000)
+        writes = [h for h in hits if h["mnemonic"] == "vmwrite"]
+        got = writes[-1]["field"] if writes else "no vmwrite decoded"
+        ok = (got == want)
+        bad += not ok
+        print(f"  [{'ok ' if ok else 'BAD'}] {name}\n"
+              f"        expected {want if want is None else hex(want)}, got "
+              f"{got if not isinstance(got, int) else hex(got)}")
+    print(f"\n  {len(SELF_TEST) - bad}/{len(SELF_TEST)} passed")
+    return 1 if bad else 0
 
 
 def disasm_range(md, pe, start, end, limit=None):
@@ -212,11 +308,22 @@ def main(argv=None):
                          "who can change it and under what scope.")
     ap.add_argument("--writes-only", action="store_true",
                     help="with --offset, show only sites where it is the destination")
+    ap.add_argument("--imm", type=lambda v: int(v, 0), default=None,
+                    help="find every instruction carrying this immediate. Unlike the "
+                         "field resolution it needs no register tracking, so it is "
+                         "sound where that is merely conservative.")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run the scanner against the counterexamples its soundness "
+                         "rules exist for, and stop")
     ap.add_argument("--field", type=lambda v: int(v, 0), default=EXCEPTION_BITMAP,
                     help="the VMCS field encoding to report on (default 0x4004)")
     ap.add_argument("--all-fields", action="store_true",
                     help="list every vmwrite/vmread site with a resolved field")
     args = ap.parse_args(argv)
+
+    if args.self_test:
+        print("=== scanner self-test ===")
+        return self_test()
 
     pe = PE(args.image)
     print(f"image   : {args.image}")
@@ -245,6 +352,22 @@ def main(argv=None):
         b, e = owner[0]
         print(f"\n=== func 0x{b:X}-0x{e:X} ({e - b} bytes) ===")
         print("\n".join(disasm_range(md, pe, b, e)))
+        return 0
+
+    if args.imm is not None:
+        needle = "0x%x" % args.imm
+        found = []
+        for b, e in funcs:
+            code = pe.read(b, e - b)
+            if not code:
+                continue
+            for ins in md.disasm(code, b):
+                if needle in ins.op_str.lower():
+                    found.append((ins.address, b, e, ins.mnemonic, ins.op_str))
+        print(f"\n=== immediate {needle}: {len(found)} site(s) ===")
+        for addr, b, e, mn, ops in sorted(found):
+            print(f"  0x{addr:X}  {mn:<9} {ops}   in func 0x{b:X}-0x{e:X}")
+        print(f"\n  {len({f[1] for f in found})} distinct function(s)")
         return 0
 
     if args.offset is not None:
