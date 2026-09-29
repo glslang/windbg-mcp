@@ -4005,15 +4005,24 @@ a failed registration returns `0xC0370001` itself and is unambiguous against eve
 The check is therefore on that exact value, and the arm must read `GetLastError()` rather than
 inferring from the `BOOL` alone:
 
-- **`GetLastError() == 0xC0370001`** ⇒ a VID client already holds `#BP` on that child ⇒ S5j's
-  retained explanation is the live one.
-- **Success** ⇒ the slot was `0xFF` ⇒ the drop is what an unregistered vector meets, and the arm
-  now holds the registration itself and can receive what the intercept produces.
+- **`GetLastError() == 0xC0370001`** ⇒ a VID client holds `#BP` on that child **at the moment of
+  this call** ⇒ S5j's retained explanation is the live one.
+- **Success** ⇒ the slot was `0xFF` **at that moment**, and the arm now holds the registration
+  itself and can receive what the intercept produces.
 - **Anything else** ⇒ classify nothing; it is a failure of the call, not a reading of the slot.
 
-It needs no reboot and no kernel read, and it replaces the raw hypercall the probe has been using
-since S5b. **That supersedes the replicated-arm plan S5k and S5l wrote**, which wanted a
-kernel-memory read this bench cannot do.
+**It supersedes half of the replicated-arm plan and not the other half**, which an earlier draft of
+this section did not separate. The half it answers is *"is the slot claimed"*, and it answers it
+with no reboot and no kernel read. The half it cannot answer is *"what does an unregistered vector
+meet"* — because **registering claims the slot**, so a `#BP` raised afterwards travels the
+*registered* path and the drop is no longer what is being observed. Nor does a reading taken now
+say what the slot held during S5h; the byte is mutable, as S5k recorded. Observing the drop still
+wants a contemporaneous, **non-mutating** read inside a replicated arm, which is the kernel-memory
+access this bench does not have.
+
+So the registration is the better *next* move — it settles the current state and, on success, hands
+over a receiver, which is S5's pass condition rather than its diagnosis — and it is not a
+substitute for the diagnosis. It does replace the raw hypercall the probe has been using since S5b.
 
 #### What to run next
 
