@@ -3838,11 +3838,15 @@ So the honest statement is a constraint with no remedy attached: **treat *"an in
 free"* as false.** It is free only if nobody else holds the vector; nothing in the ABI says whether
 anybody does; on this bench nothing yet can look; and looking would not be enough.
 
-**S5m then found the remedy, which is not to look but to stop using the raw call.**
+**S5m then found a better call, and it is a remedy against one class of collision only.**
 `vid!VidRegisterExceptionHandler` arms the same intercept through Vid, which refuses a claimed slot
 with `STATUS_VID_DUPLICATE_HANDLER` before touching the hypervisor, and `VidUnregisterHandler`
-clears the slot and the bit together. The pre-check this section wanted is inside the supported
-path, so the destructive pair should simply be retired.
+clears the slot and the bit together. **That check reads `[partition+0xB68]`, so it sees only
+parties that registered through Vid.** Against a raw `WinHvInstallIntercept` owner — which leaves
+the slot `0xFF` — the registration succeeds beside them and the unregister still clears their
+shared bit, exactly as this section describes. So the raw pair should be retired in favour of the
+registration, and that is an improvement rather than a fix: the general collision hazard survives,
+because the bitmask has no owner to consult. S5m states the qualification in full.
 
 #### Limits
 
@@ -4024,15 +4028,17 @@ So the registration is the better *next* move — it settles the current state a
 over a receiver, which is S5's pass condition rather than its diagnosis — and it is not a
 substitute for the diagnosis. It does replace the raw hypercall the probe has been using since S5b.
 
-#### What to run next
+#### What this gate leaves open
 
-1. **Attach to a child's partition and register `#BP` through `vid.dll`.** The return value answers
-   the branch question on its own, per the table above.
-2. **If it succeeds, receive.** `VidSetupMessageQueue` / `VidMessageSlotMap` /
-   `VidMessageSlotHandleAndGetNext`, and a `#BP` raised in the guest — in VTL0 first, then in the
-   VTL1 enclave, which is S5's actual pass condition.
-3. **Stop using the raw `WinHvInstallIntercept` pair** for exception vectors. It is the destructive
-   version of a call that has a safe one.
+Questions, not a schedule; the ordered plan is in `FOLLOWUPS.md` item 103.
+
+- **Whether a second process can open a running VM's partition**, which every call in the sequence
+  needs and this gate did not test. Everything above is conditional on it.
+- **Whether the registration then receives**, through `VidSetupMessageQueue` / `VidMessageSlotMap` /
+  `VidMessageSlotHandleAndGetNext`, with a `#BP` raised in the guest — VTL0 first, then the VTL1
+  enclave, which is S5's pass condition.
+- **Settled here regardless**: the raw `WinHvInstallIntercept` pair should be retired in favour of
+  the registration for exception vectors — better, though per S5l not safe against a raw installer.
 
 #### Limits
 
