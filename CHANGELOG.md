@@ -16,14 +16,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   it**, `VidRegisterExceptionHandler`, with attach, receive, complete and unregister exported
   beside it. So S5's receiver needs **no driver, no port and no hypercall**: it is a sequence of
   exported calls from a process holding a partition handle, which is the third downward re-scope in
-  a row and deletes the build the previous gate specified. **It is not, however, a documented
-  call**: the public WHP library delay-imports 31 `vid.dll` functions and this is not one of them —
-  what it imports is the *Exo* family, a mechanism for WHP's own partitions. So S5 is one
-  *observed, exported* call from passing rather than one supported call. Two consequences: the
-  registration refuses a claimed vector with `STATUS_VID_DUPLICATE_HANDLER` **before** touching the
-  hypervisor, which removes gate S5l's hazard by construction and retires the raw install/remove
-  pair; and that same return value supersedes the kernel-memory read the previous two gates wanted,
-  since duplicate and success are exactly the two branches they were trying to tell apart.
+  a row and deletes the build the previous gate specified — **conditional on obtaining such a
+  handle**, which every call in the sequence takes and which this gate does not test. **It is not,
+  however, a documented call**: the public WHP library delay-imports 31 `vid.dll` functions and
+  this is not one of them — what it imports is the *Exo* family, a mechanism for WHP's own
+  partitions. So S5 is one *observed, exported* call from passing rather than one supported call.
+  Two consequences: the registration refuses a claimed vector with `STATUS_VID_DUPLICATE_HANDLER`
+  **before** touching the hypervisor, which covers gate S5l's hazard **against clients that
+  registered through the same path** and not against a raw installer, which leaves the table entry
+  clear and is still exposed; and that same return value supersedes the kernel-memory read the
+  previous two gates wanted, since duplicate and success are exactly the two branches they were
+  trying to tell apart — read as `GetLastError()`, since the wrapper maps failures through
+  `RtlNtStatusToDosError` and VID-facility statuses pass through it verbatim.
 - **The hypervisor's exception mask is one bit with no owner, so an install/remove pair is not
   free.** Gate S5l, the removal read S5k left open, against the same `hvix64.exe`
   `10.0.26100.9444` and the same instrument. Install and remove are **the same function and the

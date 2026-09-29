@@ -3863,6 +3863,13 @@ unregister calls that go with it. So S5's receiver needs **no driver of our own,
 hypercall**: it is a sequence of exported calls from an ordinary user-mode process holding a
 partition handle.
 
+**That last clause carries the whole conclusion, and this gate does not test it.** Every call in
+the sequence operates on a partition handle; finding the wrappers says they exist, not that a
+second process can obtain one for a VM Hyper-V is running. Until an arm gets a handle, *"no driver
+left to write"* is **conditional on that**, and if it cannot be obtained the sequence is
+unavailable and a driver or another privileged route may be back on the table. Step 1 below is that
+test.
+
 That is the third downward re-scope in a row, and it is worth seeing them together, because each
 one deleted the build the previous gate had specified:
 
@@ -3958,25 +3965,55 @@ a mechanism for WHP's **own** partitions, and the path to a Hyper-V VM's excepti
 is built on an observed interface. That is a materially different position from the hand-rolled
 driver this plan carried three gates ago, and it should be recorded as such rather than as a pass.
 
-#### What this does to S5l's hazard: it removes it by construction
+#### What this does to S5l's hazard: it covers the VID-table owners, and only those
 
 S5l established that an install/remove pair on the raw hypercall is destructive to whoever else
 holds the vector, and that the pre-check it wanted — Vid's `[partition+0xB68][vector]` — needs root
-kernel memory this bench cannot read. **Going through `VidRegisterExceptionHandler` makes the
-pre-check unnecessary**, because the kernel side does it: `VidHandlerpExceptionRegisterEntry`
-refuses a claimed slot with `0xC0370001` `STATUS_VID_DUPLICATE_HANDLER` **before** touching the
-hypervisor, and `VidUnregisterHandler` clears the slot and the hypervisor bit together.
+kernel memory this bench cannot read. **Going through `VidRegisterExceptionHandler` makes that
+pre-check unnecessary for one class of owner**, because the kernel side does it:
+`VidHandlerpExceptionRegisterEntry` refuses a claimed slot with `0xC0370001`
+`STATUS_VID_DUPLICATE_HANDLER` **before** touching the hypervisor, and `VidUnregisterHandler`
+clears the slot and the hypervisor bit together.
 
-So the registration's own return value is the measurement S5k has been waiting for:
+**It does not remove the hazard in general, and an earlier draft of this section said it did.**
+The duplicate check consults `[partition+0xB68]`, so it sees only parties that registered *through
+Vid*. Anyone who installed the same vector with a raw `WinHvInstallIntercept` — which is exactly
+what this plan's own probe has done since S5b, and the class S5l is about — leaves the slot at
+`0xFF`. A Vid registration then succeeds beside it, and `VidUnregisterHandler` later clears the
+shared, unrefcounted hypervisor bit out from under them. **So the supported path is safe against
+supported clients and no safer than the raw one against raw installers**, and there is no check
+that closes the second case: the bitmask has no owner field to consult. What follows is a rule for
+this bench rather than a guarantee — **one installer per vector per partition at a time, and that
+installer should be the Vid registration** — not "the collision hazard is solved".
 
-- **`STATUS_VID_DUPLICATE_HANDLER`** ⇒ a VID client already holds `#BP` on that child ⇒ S5j's
+So the registration's own return value is the measurement S5k has been waiting for — **provided it
+is read precisely**, which takes one more fact than the paragraph above. `VidRegisterExceptionHandler`
+returns a `BOOL` and puts the failure through `RtlNtStatusToDosError`/`SetLastError`, so the caller
+sees a Win32 error rather than the `NTSTATUS`, and by default a duplicate would be
+indistinguishable from an invalid handle or an allocation failure. **Measured here:**
+
+| `NTSTATUS` | what `RtlNtStatusToDosError` returns |
+|---|---|
+| `0xC0370001` `STATUS_VID_DUPLICATE_HANDLER` | **`0xC0370001`, unchanged** |
+| `0xC0370005` (the VID status a malformed partition name gives) | `0xC0370005`, unchanged |
+| `0xC0000008` `STATUS_INVALID_HANDLE` | `6` |
+| `0xC0000022` `STATUS_ACCESS_DENIED` | `5` |
+| `0xC000009A` `STATUS_INSUFFICIENT_RESOURCES` | `1450` |
+
+**VID-facility statuses have no Win32 mapping and pass through verbatim**, so `GetLastError()` after
+a failed registration returns `0xC0370001` itself and is unambiguous against every ordinary failure.
+The check is therefore on that exact value, and the arm must read `GetLastError()` rather than
+inferring from the `BOOL` alone:
+
+- **`GetLastError() == 0xC0370001`** ⇒ a VID client already holds `#BP` on that child ⇒ S5j's
   retained explanation is the live one.
 - **Success** ⇒ the slot was `0xFF` ⇒ the drop is what an unregistered vector meets, and the arm
   now holds the registration itself and can receive what the intercept produces.
+- **Anything else** ⇒ classify nothing; it is a failure of the call, not a reading of the slot.
 
-Either way it is non-destructive, it needs no reboot and no kernel read, and it replaces the raw
-hypercall the probe has been using since S5b. **That supersedes the replicated-arm plan S5k and
-S5l wrote**, which wanted a kernel-memory read this bench cannot do.
+It needs no reboot and no kernel read, and it replaces the raw hypercall the probe has been using
+since S5b. **That supersedes the replicated-arm plan S5k and S5l wrote**, which wanted a
+kernel-memory read this bench cannot do.
 
 #### What to run next
 
