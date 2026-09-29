@@ -9,6 +9,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The writer census, and a retracted claim comes back as a measurement.** Gate S5p, answering the
+  step review added to the plan when it refused S5o's overreach. `[partition+0x3079]` — one of the
+  two fields the VID create path tests before handing a second process a partition handle — has
+  **19 accesses, 4 writers and no address-taken site**, so that field's census is *complete*: three
+  writers clear it and **exactly one sets it**, inside the detach IOCTL, which itself requires the
+  caller to hold the partition. Since the create path needs that field **and** the other one, and
+  only the detach IOCTL can produce the first, no admission can occur that an owner's detach did not
+  enable — whatever else writes the second. So S5o's conclusion stands with the evidence it was
+  missing, and the retraction was right to demand it rather than wrong about the answer.
+  **New instrument**: `tools/vid_field_census.py`, which walks a PE's own `.pdata` function table,
+  disassembles with capstone and reports only real memory operands at a given displacement,
+  classified read/write by operand access rather than by mnemonic. `--self-test` decodes six
+  instructions whose bytes were read out of the image under study, plus one case pinning that
+  `mov eax,3060h` must not count; 7/7. It exists because the obvious search is wrong three ways, all
+  of which bit here: a `s -d` scan walks **dword-aligned** and a displacement does not, so it misses
+  sites silently; a byte scan matches immediates and data; and neither can see a write through a
+  **taken address** — of which this census found a real one, `VsmmPhuPartitionTeardown` executing
+  `and dword ptr [rsi],0` after `lea rsi,[rcx+3060h]`, a write with displacement zero that no search
+  for the displacement can reach. Also identified: both gating fields belong to the `VsmmPhu*`
+  **persistence** state machine, with `VID_PARTITION_UNPERSIST_START`/`_STOP` either side of one of
+  them — so the second open is the reconnect half of persist-and-restore, which is why it demands a
+  persisted, detached partition and re-owns rather than joins. **Residuals**, both named: a bulk copy
+  spanning the field would evade an operand census, and the second field's writers are bounded
+  rather than closed — the conclusion does not rest on them, because a conjunction is gated by its
+  weakest reachable term.
 - **The refusal is a partition-state test with no token in it, and the branch behind it is an
   ownership handoff.** Gate S5o, a static read of `Vid.sys` — DbgEng opening the image as a target
   of its own, no debuggee, nothing executed, no VM touched — which answered the **two** steps the

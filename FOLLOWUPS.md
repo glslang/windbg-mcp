@@ -3514,21 +3514,26 @@ validated. The full record is the
       `VidHandlerUnregister` and detaches every VP. So on that route the sequence S5m found cannot
       be run *alongside* Hyper-V; the step that would admit us dismantles what we came for. It
       remains the pass condition for a partition **we** own, which is step 6.
-   5. **← active step, and the cheap one. Census the writers of `[p+0x3060]` and `[p+0x3079]`.**
-      S5o did not, and without it step 4 is closed only on the path it read: another writer that
-      reaches the admitting state without the detach sequence would reopen registration alongside
-      Hyper-V and make step 6 unnecessary. It is desk work on an image, but **not** a byte scan —
-      both displacements are shared with unrelated `Vid` structures, and the scan that suggested
-      otherwise was dword-aligned and incomplete. It wants a type-aware cross-reference, or live
-      confirmation on a running guest's partition instead.
+   5. ~~**Census the writers of `[p+0x3060]` and `[p+0x3079]`.**~~ **Run as S5p: done, and it
+      confirms step 4.** `[p+0x3079]` has **19 accesses, 4 writers and no address-taken site**, so
+      that field's census is *complete*; three writers clear it and **exactly one sets it**,
+      `VidPartitionIoctlDetach+0x43`. Since the create path needs `0x3079 == 1` **and**
+      `0x3060 == 2`, and only the detach IOCTL can produce the first, no admission can occur that
+      an owner's detach did not enable — whatever else writes the other field. Built
+      [`tools/vid_field_census.py`](tools/vid_field_census.py) for it (decoded operands, `.pdata`
+      function walk, `--self-test` 7/7 against bytes read from this image), because a byte scan
+      cannot do this: it scans aligned, it matches immediates, and it cannot see a write through a
+      taken address — of which S5p found a real one, `VsmmPhuPartitionTeardown` doing
+      `and dword ptr [rsi],0` after `lea rsi,[rcx+3060h]`. Residual: a bulk copy spanning the field
+      would evade an operand census, and `[p+0x3060]`'s writers are bounded rather than closed.
    6. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
       the standing constraint above, and the first also by kernel-memory access. Unchanged by S5o.
-   7. **A decision rather than an arm, and only if step 5 comes back empty.** The VMM-of-our-own
-      question: own the partition from creation, where `VidPartitionCreate` admits any name for an
-      administrator and the whole `vid.dll` sequence is then reachable by construction. S5o makes
-      this the route with no *known* obstacle rather than the clearest of several — which is a
-      stronger reason to cost it and not a reason to start it, and a weaker claim than "the only
-      one", which two reviewers were right to refuse.
+   7. **← active step, and a decision rather than an arm. Step 5 came back empty, so this is now
+      the only remaining user-mode route on evidence.** The VMM-of-our-own question: own the
+      partition from creation, where `VidPartitionCreate` admits any name for an administrator and
+      the whole `vid.dll` sequence is then reachable by construction. The claim two reviewers were
+      right to refuse from S5o is the claim S5p measured — so what changed is the warrant, not the
+      wording, and it is still a reason to **cost** the rig rather than to start building it.
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from

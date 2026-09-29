@@ -4499,3 +4499,113 @@ admission that preserves the receive path has been found*, not *none exists*.
   live kernel visibility. On the located path it would be worth little, since that state is entered
   by the owner detaching, which is not a window to race but a handoff to intercept; if the census
   above finds another writer, that changes.
+
+### S5p result, 2026-09-29: the writer census, and S5o's retracted sentence comes back as a measurement
+
+**Exactly one instruction in `Vid.sys` sets `[partition+0x3079]` to the value the create path
+requires, and it is inside the detach IOCTL.** S5o read the create path's refusal and then claimed
+more than it had measured — that the ownership handoff was the *only* way into the admitting state
+— and two reviewers independently refused the claim, correctly, because the writers had never been
+enumerated. This gate enumerates them. The claim is now true on evidence rather than on inference,
+and the retraction was right to demand it: what was unestablished then is established now, by a
+different kind of work.
+
+Nothing was executed. This is a decoded read of one image.
+
+#### The instrument, and why a byte scan could not do this
+
+[`tools/vid_field_census.py`](../../tools/vid_field_census.py) walks the image's own `.pdata`
+function table — exact on x86-64 and needing no symbols — disassembles every function with
+capstone, and reports only instructions carrying a **real memory operand** at the displacement
+asked for, classified read/write by capstone's own operand access rather than guessed from the
+mnemonic. `--self-test` decodes six instructions whose bytes were read out of this image during
+S5o, so a pass means it agrees with what the debugger showed for the same instructions; a seventh
+case pins the thing that makes it necessary, that `mov eax,3060h` must **not** count. 7/7 here.
+
+Three ways the obvious search is wrong, all of which bit:
+
+- **It scans aligned.** S5o's first attempt used `s -d`, which walks dword-aligned, and a
+  displacement sits after a variable-length opcode and ModRM — so it missed sites, including one in
+  `VidPartitionDetach` itself. S5o recorded that it had, which is why it claimed no census.
+- **It matches non-operands.** Immediates, relative offsets and data all contain those bytes.
+- **It cannot see a write through a taken address**, which is not hypothetical here — see below.
+
+#### `[p+0x3079]`: 19 accesses, 4 writers, **0 address-taken**
+
+| site | writes |
+|---|---|
+| `VidPartitionIoctlDetach+0x43` | **`1`** |
+| `VidPartitionIoctlAttach+0xca` | `0` |
+| `VidPartitionUninitialize+0x413` | `0` — `mov byte ptr [rdi+3079h],sil`, and `sil` is `0` from the `xor esi,esi` at `+0x5b`, which is the function's null register: every other use of it in the function nulls a pointer field (`[+0xB58]`, `[+0xB68]`, `[+0x70]`, `[+0x3780]`, `[+0x3788]`, `[+0x3EB8]`) |
+| `VsmmPhuIoctlEnd+0xbe` | `0` |
+
+The other fifteen accesses are reads. **No site takes the field's address**, so for this field the
+census is *complete*: there is no pointer through which some other function could write it, and the
+four sites above are every instruction in the image that can change it.
+
+**Three of the four clear it. One sets it, and that one is the detach IOCTL** — which itself
+demands `[p+0x3060] == 2`, `[p+0x3064] == 2` and `[p+0x3079] == 0` before it will, so the caller
+must already hold the partition.
+
+#### Why that settles the question without a complete census of the other field
+
+The create path requires **both** `[p+0x3060] == 2` **and** `[p+0x3079] == 1`. A conjunction is
+gated by its weakest reachable term, and `[p+0x3079] == 1` is reachable from exactly one
+instruction — so whatever else may write `[p+0x3060]`, **no admission can occur that the detach
+IOCTL did not enable.** The `[p+0x3060]` census is therefore reported below for what it says about
+the field's meaning, not because the conclusion needs it.
+
+**So S5o's conclusion stands, and now with the evidence it was missing.** The route into
+`VidPartitionAttach` runs through an owner who called detach, and detach calls
+`VidHandlerUnregister` and detaches every VP before returning. There is no second client alongside
+Hyper-V to be had on a VM Hyper-V runs.
+
+#### `[p+0x3060]` / `[p+0x3064]`: what they are, and one write the displacement alone would have missed
+
+47 and 38 accesses, 7 and 6 writers — and **2 address-taken sites on `0x3060`**, which is where the
+instrument paid for itself. Following them:
+
+- `VsmmPhuIoctlEnd+0x42` takes `lea rdi,[rbx+3060h]` and only ever reads through it.
+- `VsmmPhuPartitionTeardown+0x16` takes `lea rsi,[rcx+3060h]` and later executes
+  **`and dword ptr [rsi],0`** — a write to `[p+0x3060]` whose displacement is **zero**. No search
+  for `0x3060`, byte or decoded, can see that instruction. It is only reachable by noticing the
+  address was taken and following it, which is exactly what the `lea` column is for.
+
+So the `[p+0x3060]` writer set is **bounded but not closed**, and is reported as such.
+
+**What the fields are** is now much less anonymous. Every writer of the pair is in the `VsmmPhu*`
+family — `PartitionInitialize` (zeroes both), `IoctlBegin`, `IoctlCommit`, `PartitionRestore`,
+`PhupUncommit`, `PartitionTeardown` (zeroes both) — and the ETW events either side of
+`VsmmPhuIoctlEnd` are literally `VID_PARTITION_UNPERSIST_START` / `_STOP`. So this is the
+partition **persistence** state machine, not a general lifecycle counter, and the create path's
+`== 2` names a state reached through the persist Begin/Commit sequence. **Which value 2 is
+precisely, and which of Begin or Commit produces it, is not decoded here** — but the domain
+answers the question S5o left hanging about why a running guest fails the test: its partition is
+not in a committed-persist state, because nothing has persisted it.
+
+That also makes the design read coherently for the first time. The second open is the reconnect
+half of **persist-and-restore** — a worker process handing a partition on, or picking one back up —
+which is why it demands a persisted, detached partition and why it re-owns rather than joins.
+
+#### Limits
+
+- **A bulk copy is outside this method.** The census covers instructions with an explicit
+  displacement operand plus every `lea` of one. A `memcpy`-shaped restore whose length spans the
+  field would write it without either, and `VsmmPhuPartitionRestore` is in the persistence family
+  that would do such a thing. Nothing here excludes it, and it is the one residual on the
+  `[p+0x3079]` result rather than a residual on the reasoning above it.
+- **`[p+0x3060]`'s writers are not claimed complete**, per the taken address above.
+- **Static, one build** — `Vid.sys 10.0.26100.9278`. No partition object was inspected live, so
+  this says what the code can do, not what any particular partition's fields hold.
+- **The fingerprint column is per `(function, base register)`**, so a function that reuses a
+  register for two different objects shows their offsets merged. It is a reading aid for telling a
+  partition from a memory block by hand, not a type recovery.
+
+#### What this gate leaves open
+
+- **The VMM-of-our-own question**, which is now the only remaining user-mode route **on evidence**
+  rather than on assumption — the distinction this gate exists to supply. Still a rig to cost.
+- **What persistence state `2` is**, if anyone needs to know whether a guest's partition can be
+  driven into it deliberately. Note what that would mean: persisting a running guest's partition,
+  which is a disruptive operation on somebody else's VM, not an observation.
+- **The two arms blocked by the standing constraint**, untouched.
