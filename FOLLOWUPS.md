@@ -3180,6 +3180,30 @@ validated. The full record is the
   separates VTL1 *user* mode from VTL1 *kernel* mode. That retires the specific reason to doubt the
   extension to Secure Kernel's own code without making it a measurement, and S5a's prohibition on
   planting an `int 3` there to check is unchanged.
+- **S5j, 2026-09-29: the message is already addressed to the parent, and the receiver is a
+  displacement rather than an addition.** The gate's first half, run with the same instrument as S5i
+  plus `winhvr.sys` and `Vid.sys` read with symbols. **Routing**: `HvMessageTypeX64ExceptionIntercept`
+  (`0x80010003`) appears once in `hvix64.exe`, at `+0x2C9A9E`; the recipient is chosen at `+0x2C95B8`
+  by scanning VTLs from the active one upward and then wrapping to the lowest, delivering to the
+  first whose **own** `+0x1A04` holds the faulting vector. A `#BP` in VTL1 whose vector the parent
+  installed therefore wraps to VTL0, matches, and is delivered as a VTL0 intercept — and `+0x2EB134`
+  forks on that byte, sending VTL0 to the parent-directed post at `+0x2EC204` and any higher VTL to
+  its own SynIC. **So nothing needs redirecting: S5's missing half is a binding, not a route**, and
+  the hold's shape is explained — posted to a port whose owner never asked for an exception
+  intercept and never completed it.
+  **Build**: the plan's hand-rolled `HvCallCreatePort`/SynIC page is the wrong build. `winhvr.sys`
+  exports the lot — `WinHvCreatePort`, `WinHvConnectPort`, `WinHvAllocatePartitionSintIndex`,
+  `WinHvGetSintMessage`, `WinHvSetEndOfMessage`, `WinHvSetInterceptRoutine` and
+  `WinHvCompleteIntercept`, which is the *resume* a debugger needs — and `Vid.sys` already consumes
+  them, including a `VidExceptionInterceptReturnCallback` for this very message type.
+  **Hazard, and it is why this is a finding rather than a green light**: `WinHvSetInterceptRoutine`
+  stores **one** routine and context per table entry, assigned rather than chained, and `Vid.sys`
+  imports it — so registering *replaces* Hyper-V's handler instead of joining it. **How much it
+  replaces depends on the table's key, which this read did not identify**: per-partition means one
+  child, per-message-type or per-SINT means every VM on the host, since the displaced handler
+  services IO-port, MSR and CPUID intercepts. **Do not call `WinHvSetInterceptRoutine` on this bench
+  until the key is known** — read it from `Vid.sys`'s own call sites, which pass it. Full record in
+  the [S5j result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
   port. That is not the same as nothing receiving it: the root's own stack owns a port for each
