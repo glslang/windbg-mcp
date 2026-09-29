@@ -3318,15 +3318,22 @@ validated. The full record is the
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
   `WinHvInstallIntercept` S5b read. That pointed at reading `[partition+0xB68][3]` inside a
-  replicated intercept arm, **and that arm is now blocked rather than scheduled.** Two things block
-  it, and neither is a matter of effort. It needs root kernel-memory access this bench does not
-  have — a host reboot into debug mode, or a kernel-read path in `h3probe.sys`. And the arm's own
-  install/remove pair is unsafe with no remedy available: per S5l a pre-read is a diagnostic rather
-  than a guard, and making the pair safe would need exclusive coordination with every other
-  installer, which nothing here has. **Do not run it until one of those changes.** A separate
-  candidate is unaffected and still live: **whether the hold is a loop**, since nothing on the drop
-  path injects the exception or advances `RIP`, so the faulting instruction is presumably
-  re-entered. That is an inference S5k did not measure.
+  replicated intercept arm, and at a second candidate — **whether the hold is a loop**, since
+  nothing on the drop path injects the exception or advances `RIP`, so the faulting instruction is
+  presumably re-entered, an inference S5k did not measure. **Both are blocked by the standing
+  constraint below**, because both need an intercept installed on a child and later removed, and
+  the replicated arm additionally needs root kernel-memory access this bench does not have — a host
+  reboot into debug mode, or a kernel-read path in `h3probe.sys`.
+
+  **Standing constraint, from S5l: no arm may install an exception vector on a child until the
+  teardown hazard has a remedy.** The pair is unremediable here — per S5l a pre-read is a
+  diagnostic rather than a guard, and safety would need exclusive coordination with every other
+  installer, which nothing on this bench has — so the removal can clear a vector another party
+  holds. This is a property of *any* arm that arms and disarms a vector, not of a particular one,
+  and it is written here rather than against each candidate because blocking them individually is
+  how the loop arm stayed runnable after its twin was stopped. It lifts when the bench can read
+  Vid's slot, or when an arm is redesigned to install nothing, or when there is a way to coordinate
+  with other installers.
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
