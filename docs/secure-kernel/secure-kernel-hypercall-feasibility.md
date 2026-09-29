@@ -3007,8 +3007,8 @@ nothing**, which is worth recording because S5g cost it four reboots.
     recipient. `Vid.sys` and `winhvr.sys` were both read for S5b and are the same two images to read
     for this. **Run as S5j below, and it replaced the rest of this bullet**: the hand-rolled port
     and SynIC page are not the build, because `winhvr.sys` exports the API and `Vid.sys` already
-    consumes it — and registering into it *replaces* Hyper-V's handler, so the next step is
-    identifying what that replacement costs.
+    consumes it — and a registration may *displace* whatever entry Hyper-V holds, so the next
+    step is identifying the table's key, which decides whether it displaces anything at all.
   - **The dispatch read**, which is what decides whether any of this reaches Secure Kernel:
     `hvix64.exe`'s exception-intercept path, for a check on the active VTL. S5b named it, two
     attempts had failed on that image, and Ghidra is on this bench now. A receiver that works would
@@ -3291,16 +3291,24 @@ merely have the plumbing; it has a handler for this message type today.
 0x8048  mov   qword ptr [rax + 0x18], rbx    ; context
 ```
 
-and `+0x2B40` is a binary search over a sorted global table. **One routine and one context per
-entry**, assigned rather than chained — and `Vid.sys` imports `WinHvSetInterceptRoutine`, so an
-entry is already held. Registering does not add a handler beside Hyper-V's; it **replaces** one.
+and `+0x2B40` is a binary search over a sorted global table. **What is established is per entry:
+one routine, one context, assigned rather than chained.** So *if* two callers select the same entry,
+the second replaces the first.
 
-**What it would replace, and how much, depends on the table's key, which this read did not
-identify.** If the key is per-partition the blast radius is one child; if it is per-message-type or
-per-SINT it is every VM on the host, because the displaced handler is what services IO-port, MSR and
-CPUID intercepts. That distinction is the difference between an experiment on a disposable guest and
-one that takes the bench down with it, and it is **the next thing to establish** — from `Vid.sys`'s
-own call sites, which pass the key.
+**Whether they do is exactly what this read did not establish, and an earlier version of this
+section asserted it anyway.** It reasoned that `Vid.sys` imports `WinHvSetInterceptRoutine`,
+therefore the entry is held, therefore registering replaces Hyper-V's handler. The import proves
+`Vid.sys` *calls* the function; it says nothing about which entry the call selects. Review was
+right that the next paragraph then contradicts it — the key is unidentified, so a per-client or
+allocated handle that lets another driver own a **separate** entry is not ruled out, and ruling it
+out on this evidence would send the next gate looking for a way round a wall that may not be there.
+
+So the honest shape is a **hazard, not a finding**: displacement is what to assume until the key is
+known, because the cost of being wrong is asymmetric. If the key is per-partition the blast radius
+is one child; if it is per-message-type or per-SINT it is every VM on the host, because the
+displaced handler services IO-port, MSR and CPUID intercepts; and if it is an allocated handle there
+is no displacement at all. All three are open. **Establishing which is the next thing to do** — from
+`Vid.sys`'s own call sites, which pass the key, and from whatever creates the entries.
 
 #### What this settles and what it leaves
 
@@ -3309,8 +3317,9 @@ own call sites, which pass the key.
   is a *binding*, not a route.
 - **The build is re-scoped**: exported kernel API rather than hand-rolled hypercalls and a SynIC
   page, with `WinHvCompleteIntercept` supplying the resume.
-- **A hazard the plan did not anticipate**: registration is a displacement, and its scope is
-  unidentified. **Do not call `WinHvSetInterceptRoutine` on this bench until the key is known.**
+- **A hazard the plan did not anticipate**: a registration may displace the entry Hyper-V holds,
+  and whether it does — and at what scope — turns on a key this read did not identify. **Do not
+  call `WinHvSetInterceptRoutine` on this bench until it is known.**
 - **Still not measured**: no message has been received. S5 does not pass, and nothing here changes
   the Secure Kernel scope limit, which stands as S5i left it.
 

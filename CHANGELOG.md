@@ -24,10 +24,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   debugger from an observer — and `Vid.sys` already consumes it, including a
   `VidExceptionInterceptReturnCallback` for this message type.
   **Hazard**: `WinHvSetInterceptRoutine` stores one routine per table entry, assigned rather than
-  chained, and `Vid.sys` imports it, so registering *replaces* Hyper-V's handler. How much it
-  replaces depends on the table's key, which this read did not identify — per-partition means one
-  child, per-message-type means every VM on the host. Identifying it is the next step, and nothing
-  should call that function here until it is known.
+  chained, and `Vid.sys` imports it. That the import proves `Vid.sys` *calls* the function and not
+  that its call selects the same entry is a distinction an earlier draft of this entry skipped:
+  whether a registration displaces anything turns on the table's key, which this read did not
+  identify — per-partition means one child, per-message-type means every VM on the host, an
+  allocated handle means no displacement at all. Assume displacement, since the cost of being wrong
+  is asymmetric; identifying the key is the next step, and nothing should call that function here
+  until it is known.
 - **The hypervisor applies a parent-installed exception intercept at every enabled VTL, by design.**
   Gate S5i, the dispatch read S5b named and S5h skipped, against this host's own `hvix64.exe`
   `10.0.26100.9444`. **It worked where two earlier attempts on that image failed because it asked an
