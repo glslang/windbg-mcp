@@ -4095,13 +4095,14 @@ was attempted — so duplication is an **excluded route**, recorded below, rathe
 gate closed. And the refusal's *cause* on a live VM is established less tightly than the refusal
 itself; the controls below say what they rule out and what they do not.
 
-So the sequence S5m laid out — attach, register `#BP`, receive — **is structurally unavailable for a
+So the sequence S5m laid out — **open** the partition, register `#BP`, receive (*not* "attach":
+that call starts the virtual processors, as below) — **is structurally unavailable for a
 VM run by Hyper-V.** It is available to whoever *created* the partition, which for a Hyper-V guest
 is `vmwp.exe` and for nobody else.
 
 This is a live result and it cost the bench nothing: no VM was touched, no intercept installed, no
-reboot, and the only objects created were **four** transient VID partitions under names no VM uses,
-every handle closed. The limits section lists them by name.
+reboot, and the only objects created were **six** transient VID partitions, under four names no VM
+uses, every handle closed. The limits section lists the names and explains why the two counts differ.
 
 #### The namespace, read rather than guessed
 
@@ -4223,14 +4224,18 @@ turns out to discriminate.
 - **Two guests, one host, one build.** `vid.dll 10.0.26100.8457`, `Vid.sys 10.0.26100.9278`.
 - **Stopped VMs were not tried.** Both lab guests are running, and stopping one is a bench change
   this gate did not need. Whether a stopped VM's partition object exists at all is untested.
-- **The probe created four transient partitions**, and every handle was closed. The full list,
+- **The probe created six transient partition objects under four names**, and every handle was
+  closed. The two counts differ because a name frees when its last handle closes and both controls
+  then reopen it, which creates a *new* object: `11111111-…` was opened, refused twice, and reopened
+  after closing (two objects), and `aaaaaaaa-…` likewise (two more). The names,
   because this is the audit record for the arm's host-side effects: `00000000-0000-0000-0000-000000000000`
   (the well-formed-unused-name arm), `11111111-2222-3333-4444-555566667777` (the same-process
   control), and `aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee` plus
   `ffffffff-eeee-dddd-cccc-bbbbbbbbbbbb` (the cross-process control's held name and its concurrent
   control). No VM uses any of them. Named here because a reader should know the probe is not purely
-  passive — and because two earlier drafts of this section said "two" and "three", each counting a
-  different subset.
+  passive — and because three earlier drafts of this section said "two", "three" and "four", the
+  first two counting a subset of the names and the third counting names where the audit wants
+  objects.
 
 #### What to run next, cheapest first
 
