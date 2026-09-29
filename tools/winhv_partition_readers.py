@@ -23,6 +23,15 @@ a structure it would then misreport.
 Decoded, not byte-scanned, for the reason `vid_field_census.py` records: a
 displacement is not a byte pattern, and a `call` target is not an immediate that
 a search for bytes can recognise.
+
+What it does NOT see, and the reason the count below is a lower bound rather
+than an enumeration: a function that receives the partition object as an
+**argument**, or obtains it from some helper other than
+`WinHvpReferencePartition`, calls neither anchor, so it is absent from the
+reaching set even when it reads the callback pair. Closing that needs provenance
+propagated across calls and returns, which this does not do. Read
+"functions that can hold a partition object" as "functions that can obtain one
+by the two routes this looks for".
 """
 import argparse
 import struct
