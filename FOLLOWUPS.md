@@ -3613,6 +3613,45 @@ validated. The full record is the
   recurrence. **No guest was modified, no intercept installed and nothing written to VTL1.** Full
   record in the [S5s result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
+- **S5r — RUN 2026-09-29: PASS, end to end, and the gate had to be found rather than looked up.** A
+  `#BP` raised in **VTL1 user mode** was caught by a **VTL0 debugger** and continued, with the guest
+  under one hypervisor and no nesting — against the published route's VMware L1 plus nested Hyper-V
+  plus IDA. **The claim is a cheaper delivery of a published capability, not a new one**, and the
+  write-up says so first.
+- **The original work is the gate.** `SkpsIsProcessDebuggingEnabled` does not exist in 26100, so the
+  equivalent was located by dumping SK's image out of live VTL1 (`.writemem`, 1,527,808 bytes) and
+  **computing `E8`/`E9` displacements over the dump** to find call sites into
+  `securekernel!SkpsEnableDebugging`. Two of the three are inside **`IumInvokeSecureService`**, the
+  VTL0→VTL1 secure-call dispatcher. `SkpsEnableDebugging` is a **setter**, not a predicate — S5r's own
+  gate text treated it as the gate and that was wrong. The guard is at `securekernel.exe+0x1434C`:
+  `test bl,bl` / `jne` / `mov ebx,0C0000022h` (`STATUS_ACCESS_DENIED`) / `jmp`, with `bl` from
+  `sete bl` on `cmp eax,80430006h`. **One byte opens it** — `0x75` → `0xEB` at **`+0x1434E`** — and
+  only the opcode is written, the displacement being identical in both encodings so a torn write
+  cannot retarget the branch.
+- **The A-B-A is the result, not the middle arm.** `DebugActiveProcess` against `LsaIso.exe`
+  (pid 928, a Microsoft-signed trustlet in VTL1 user mode) over PowerShell Direct: **before**
+  `False`/`ERROR_ACCESS_DENIED (5)`; **patched** `True`, then `CREATE_PROCESS_DEBUG_EVENT`, five
+  `LOAD_DLL_DEBUG_EVENT` and **`EXCEPTION_BREAKPOINT 0x80000003` at `0x7FFE381E3AB0`** on tid 4432,
+  continued with `DBG_CONTINUE` and detached cleanly; **after restore** `False`/`5` again. The before
+  arm ties the disassembly to the observable — Win32 `5` is the mapping of the `0xC0000022` the guard
+  writes — and the after arm makes the middle one a result rather than a trustlet that happened to be
+  debuggable.
+- **`SdkWriteVirtualMemory` segfaults on a VTL1 address while `SdkReadVirtualMemory` at the same
+  address works**, so the write goes through S4's physical route: SK base and SK `CR3` read per run
+  (`0xFFFFF80629B4A000`, `0x1201000` this boot), a four-level walk to GPA **`0xCE534E`** agreeing with
+  an independent `!vtop`, and the page identified by diffing **48 live bytes against the dumped image**
+  with the gate byte masked. **The crash printed nothing** — Python's stdout buffer dies with the
+  process — so what established the write had not half-landed was a re-read, not the absence of output.
+- **Twelve minutes of live Secure Kernel code modification, exercised, with no bugcheck.** Bounded by
+  guest uptime `1:03:31` at the patch and `1:17:43` at the post-restore check, across two complete
+  debug-attach cycles. S4's write lasted milliseconds between two reads and the record rightly said
+  that showed nothing about a periodic check; this one stood while the modified path was *used*.
+  **It is one byte on one build and not a property of VBS** — no check was located, so this is not a
+  measurement *of* one — but it retires the specific reason this plan gave for not trying, which was
+  that a bugcheck is the expected outcome. Bench restored and verified; checkpoint `pre-S5r-patch`
+  unused. Full record in the
+  [S5r result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+
 ### Out of scope, with the reason rather than as a list
 
 - **Writes as a *tool surface***: the primitive exists and S1's seam should not pretend otherwise,

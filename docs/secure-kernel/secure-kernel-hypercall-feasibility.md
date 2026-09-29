@@ -4805,3 +4805,118 @@ Reversible, and left in place only because S5r may want it: the `ExdiHvSrv.dll` 
 service, and a copy of `hvmm.sys` re-signed with this bench's `CN=H3Probe Test` certificate — which
 turned out to be redundant, since the service resolves to the `hvmm-testsigned.sys` staged for H4 on
 2026-09-26. **No guest was modified**, no intercept was installed, and nothing was written to VTL1.
+
+### S5r result, 2026-09-29: the IUM-debugging patch reproduces from the Hyper-V root, and the gate had to be found rather than looked up
+
+**A breakpoint raised in VTL1 user mode was caught by a VTL0 debugger and continued, with the guest
+under one hypervisor and no nesting.** The published technique needs three levels — VMware
+Workstation as L1 with its GDB stub, Hyper-V nested inside it, the target as L2, IDA driving the
+patch. This is the root partition of the hypervisor already running the guest, S4's write primitive,
+and nothing else. **That is the whole of the claim: a cheaper delivery of a published capability,
+not a new one** — with one piece of original work inside it, which is where the gate is.
+
+#### The gate is not the one the write-up names, and locating it was the work
+
+`SkpsIsProcessDebuggingEnabled` **does not exist** in 26100's public PDB (S5s), so the equivalent had
+to be found in this build. The route was: dump Secure Kernel's image out of live VTL1 through the
+passive EXDI session (`.writemem`, 1,527,808 bytes = the `InfoSecureKernelSize` hvlib reports), then
+find call sites into `securekernel!SkpsEnableDebugging` by **computing `E8`/`E9` displacements over
+the dump** rather than searching disassembly — for each offset *i*, test whether
+`i + 5 + rel32` equals the target RVA. Three call sites, and the two that matter are both inside
+**`IumInvokeSecureService`**, the VTL0→VTL1 secure-call dispatcher:
+
+| call site | into |
+|---|---|
+| `IumInvokeSecureService+0xB71` | `SkpsEnableDebugging` |
+| `IumInvokeSecureService+0xEF7` | `SkpsSendDebugAttachNotifications` |
+| `SkpsRundownProcess+0x1B9` | `SkpsEnableDebugging` (teardown) |
+
+`SkpsEnableDebugging` itself is a **setter**, not a predicate — it does `lock or [rcx],0x40` /
+`lock or [rcx],0x10` to set, `lock and [rcx],~0x10` to clear, then calls `SkiAttachProcess`. An
+earlier draft of S5r treated it as the gate; it is the thing the gate guards.
+
+The guard, at `securekernel.exe+0x1434C`:
+
+```text
++0x01434C  84db            test  bl, bl
++0x01434E  7507            jne   +0x014357          <-- the gate
++0x014350  bb220000c0      mov   ebx, 0C0000022h    <-- STATUS_ACCESS_DENIED
++0x014355  eb12            jmp   out
++0x014357  410fb65610      movzx edx, byte ptr [r14+10h]
++0x01435C  488b4c2478      mov   rcx, qword ptr [rsp+78h]
++0x014361  e8f2020900      call  securekernel!SkpsEnableDebugging
+```
+
+`bl` is produced further up by `sete bl` on `cmp eax, 80430006h` after a policy call at `+0x142FD`,
+with a second path setting `bl` to 1 outright. **One byte opens it**: `0x75` → `0xEB` at
+**`+0x1434E`**, turning the conditional into an unconditional taken branch. The displacement byte is
+identical in both encodings, so a torn write cannot produce a different branch target — which is why
+only the opcode is written.
+
+#### The write goes through the physical route, and the virtual one is a hazard worth recording
+
+**`SdkWriteVirtualMemory` segfaults on a VTL1 virtual address** while `SdkReadVirtualMemory` at the
+*same* address returns correct bytes. The virtual read path handles the Secure Kernel context and the
+virtual write path does not. The crash killed the Python process with its stdout buffer unflushed, so
+the run printed **nothing at all** — and a re-read afterwards showed the gate byte unchanged, which is
+the only reason it is known the write did not half-land. A probe that writes to VTL1 should read back
+through a route it has already proven, and should not infer anything from the absence of output.
+
+So the write is S4's route: walk SK's own page tables and write the GPA. Derived per run rather than
+remembered, since all three of these move across boots:
+
+| | this run |
+|---|---|
+| `InfoSecureKernelBase` | `0xFFFFF80629B4A000` |
+| `InfoHvddGetCr3Securekernel` | `0x1201000` |
+| gate VA | `0xFFFFF80629B5E34E` |
+| gate GPA (walked: PML4E `0x1201f80` → PDPE `0x12040c0` → PDE `0x1203a68` → PTE `0x1202af0`) | **`0xCE534E`** |
+
+The walk agrees with `!vtop 1201000 0xFFFFF80629B5E34E` taken independently through the debugger. The
+page is then identified by comparing **48 live bytes spanning the gate against the dumped image**, with
+the gate byte itself masked so the check passes in either state — so the probe's constant is a file it
+can diff, not a transcribed pattern, and a wrong translation cannot quietly write into an unrelated
+page.
+
+#### The arms, and the control on both sides of the patch
+
+The observable is `DebugActiveProcess` against **`LsaIso.exe`** — a real Microsoft-signed trustlet
+running in VTL1 user mode on the VBS guest, pid 928 — driven over PowerShell Direct.
+
+| arm | result |
+|---|---|
+| **before** the patch | `False`, `ERROR_ACCESS_DENIED (5)` |
+| **patched** | **`True`**; `CREATE_PROCESS_DEBUG_EVENT`, five `LOAD_DLL_DEBUG_EVENT`, then **`EXCEPTION_BREAKPOINT` `0x80000003`** at `0x7FFE381E3AB0` on tid 4432, continued with `DBG_CONTINUE`; detached cleanly, trustlet alive |
+| **after** restore | `False`, `ERROR_ACCESS_DENIED (5)` |
+
+**The before arm is what ties the located code to the observable**: Win32 error 5 is the mapping of the
+`0xC0000022` the guard writes, so the disassembly and the refusal are the same thing rather than two
+things that happen to co-occur. **The after arm is what makes the middle one a result**: the refusal
+returns when the byte does, so the patch is the cause and not the bench drifting. An A-B-A, because a
+one-sided demonstration here would be indistinguishable from a trustlet that happened to be
+debuggable.
+
+`0x80000003` is `EXCEPTION_BREAKPOINT` — an `int 3` executed **in VTL1 user mode**, delivered to a
+debugger in VTL0 and continued by it. That is the gate's pass condition as written, met rather than
+approximated.
+
+#### What it says about integrity checking, and the limit of that
+
+**The modification stood for roughly twelve minutes** — bounded by guest uptime `1:03:31` when the
+patch landed and `1:17:43` at the post-restore check — across two complete debug-attach cycles on a
+live trustlet, **and nothing bugchecked**. S4's write existed for milliseconds between two reads and
+the record was careful to say that showed nothing about a periodic integrity check; this one was in
+place while the modified path was *exercised*, repeatedly.
+
+**It is still evidence about one byte on one build, and is not a property of VBS.** What it does not
+say: that SKPG/HyperGuard checksums nothing in Secure Kernel's `.text`, that a larger or longer-lived
+modification would survive, or that any particular check exists and was beaten — no check was located,
+so nothing here is a measurement *of* one. What it does retire is the specific reason the plan gave for
+not trying: that the expected outcome of patching SK's code is a bugcheck. On this gate, on this build,
+it is not.
+
+#### Bench state
+
+Restored and verified byte-for-byte; `LsaIso` alive; both guests running continuously with no reboot;
+host not rebooted. Checkpoint `pre-S5r-patch` (2026-09-29 18:31) was taken before the write and was not
+needed — it can be deleted once nobody wants the rollback. `SdkWriteVirtualMemory` was not used again.
