@@ -3323,27 +3323,31 @@ validated. The full record is the
   allocation failure (`1450`) — all measured. Duplicate means the slot was claimed, success means
   it was `0xFF`, anything else classifies nothing. Full record in the
   [S5m result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
-- **S5n, 2026-09-29: one handle per partition, ever — so the receiver is unavailable for a VM you
-  did not create.** The first live arm since S5h, and it cost the bench nothing: no VM touched, no
+- **S5n, 2026-09-29: a VID partition takes no second *open*, so the receiver has no reachable
+  handle.** The first live arm since S5h, and it cost the bench nothing: no VM touched, no
   intercept installed, no reboot. Opening a partition is one `CreateFileW` on
   `\\?\root#vid#0000#{7896e901-fe60-446e-828d-d65920654a23}\<VM Id>` with `OPEN_EXISTING` —
   the path `vid!VidpCreateVidObject` builds, with `GUID_DEVICEINTERFACE_VID` read out of `vid.dll`.
   **Both running guests' VM Ids refuse with `ERROR_BAD_COMMAND` (22)**, while a well-formed unused
   name **opens** and a malformed one gives `0xC0370005` — so the name is recognised and the open
-  refused rather than not found. **The control identifies the refusal**: opening a fresh unused
-  name succeeds, opening *the same name again from the same process* fails with the same `22` under
-  either share mask, and it opens again once every handle is closed. So `22` means **"this
-  partition name is already open"** — not access control, not share-mode negotiation — and
-  `vmwp.exe` holds that one handle for a running VM's lifetime.
+  refused rather than not found. **Two controls reproduce `22` with no VM in them**: a second open
+  of the same name fails under either share mask and frees when the handle closes, and — across two
+  processes — a name a *child* holds refuses the parent while a **different** unused name opens at
+  the same moment. So the rule is global rather than per-process, and per name rather than per
+  device; it is not share-mode negotiation.
+  **What that does not establish** is that the live VM's `22` has the same cause: `0xC0000184` has
+  62 sites in `Vid.sys` and the create dispatcher was not located, so the controls narrow the
+  alternatives without eliminating them. The constraint measured is *no second open*, not *one
+  handle* — `DuplicateHandle` and inheritance are untested and untried — and the caller was never
+  varied, so privilege is an unlikely explanation rather than an excluded one.
   **Also corrected**: `VidAttachPartition` is not "join a partition". IOCTL `0x221014` reaches
   `VidPartitionIoctlAttach`, which loops the VPs calling `VidVpAttach` — the VM worker's *start the
   virtual processors* operation. It was not called.
-  **So S5's obstacle is no longer a missing mechanism**: it exists, it is exported, and it is
-  reserved to the partition's creator. Privilege does not help, and handle theft from a protected
-  `vmwp.exe` is not an experiment. What remains is owning the partition — running the guest under a
-  VMM of our own, for which `vid.dll` exports `VidCreatePartition`, `VidVsmEnableVpVtl` and
-  `VidVsmSetPartitionConfig` — **a much larger rig that should be costed as its own decision rather
-  than slipped in as a next step.** Full record in the
+  **So S5's obstacle has changed shape**: the mechanism exists and is exported, and what blocks it
+  is a refused open. **Next, cheapest first**: vary the caller (one non-elevated run); try a stopped
+  VM; locate the check, which wants the kernel debugger this bench has disabled; and only then the
+  VMM-of-our-own question — `VidCreatePartition`, `VidVsmEnableVpVtl`, `VidVsmSetPartitionConfig` —
+  **which is a rig rather than an arm and should be costed as its own decision.** Full record in the
   [S5n result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no

@@ -4081,13 +4081,18 @@ arm from S5b onward drives `h3probe.sys` on the **host** and a raiser in the gue
 **PowerShell Direct**, which needs no network, no KDNET and no guest debugger. S5m's steps are
 host-side user-mode calls plus that same raiser.
 
-### S5n result, 2026-09-29: one handle per partition, ever — so the receiver is unavailable for a VM you did not create
+### S5n result, 2026-09-29: a VID partition takes no second *open*, so the receiver has no reachable handle
 
-**A VID partition can be open exactly once, and Hyper-V holds that one handle for every running
-VM.** S5m found the receiver exported in `vid.dll` and named the first thing to find out: whether a
-second process can get a partition handle on a running VM at all. It cannot, and the reason is not
-a permission — it is a single-open rule that Vid enforces against everybody, including the process
-that opened it first.
+**A VID partition name can be opened once at a time, globally, and Hyper-V holds that open for
+every running VM.** S5m found the receiver exported in `vid.dll` and named the first thing to find
+out: whether a second process can get a partition handle on a running VM by opening it. It cannot.
+
+**Two precisions the first draft of this section did not make**, both from review. The measured
+constraint is *no second **open***, not "one handle can exist": `DuplicateHandle` and handle
+inheritance create further handles to the same file object without a create request, and neither
+was attempted — so duplication is an **excluded route**, recorded below, rather than something this
+gate closed. And the refusal's *cause* on a live VM is established less tightly than the refusal
+itself; the controls below say what they rule out and what they do not.
 
 So the sequence S5m laid out — attach, register `#BP`, receive — **is structurally unavailable for a
 VM run by Hyper-V.** It is available to whoever *created* the partition, which for a Hyper-V guest
@@ -4138,7 +4143,7 @@ So a malformed name and a live VM's name fail *differently*, and a well-formed u
 **succeeds** — which already says the VM's name was recognised and the open refused, rather than not
 found.
 
-**The control that identifies the refusal** reproduces `22` with no VM involved at all:
+**Two controls reproduce `22` with no VM involved at all.** Within one process:
 
 | step | result |
 |---|---|
@@ -4147,47 +4152,87 @@ found.
 | open the same name again, `FILE_SHARE_READ \| FILE_SHARE_WRITE` | **`ERROR_BAD_COMMAND` (22)** |
 | close both handles, open again | **succeeds**, handle `0x1D8` |
 
-**`ERROR_BAD_COMMAND` here means "this partition name is already open".** It is not access control —
-the same process, with the same token, holding the first handle, is refused the second — and it is
-not a share-mode negotiation, since widening the share mask changes nothing. The name becomes
-available again the moment the last handle closes.
+and across two processes, which is the shape a VM actually presents:
 
-A running Hyper-V VM's partition is held open by `vmwp.exe` for the VM's lifetime, so there is no
-window in which a second handle can exist.
+| step | result |
+|---|---|
+| a child process opens a fresh unused name and holds it | **succeeds** |
+| the parent opens **that** name | **`ERROR_BAD_COMMAND` (22)** |
+| the parent opens a **different** unused name, at the same moment | **succeeds** |
+| the child exits; the parent opens the held name again | **succeeds** |
+
+**So the rule is global rather than per-process, and per *name* rather than per device** — a
+second name opens happily while the first is held, so `22` is not a busy device or a lock over the
+whole interface. It is not share-mode negotiation either, since widening the mask changes nothing.
+The name frees the moment the last handle closes.
+
+**What that does and does not establish about a live VM.** A running Hyper-V VM's partition is held
+open by `vmwp.exe` for the VM's lifetime, and its name refuses with the same error under the same
+call. **That is a match, not a proof of common cause**: `STATUS_INVALID_DEVICE_STATE` — the status
+that maps to Win32 `22`, confirmed by `RtlNtStatusToDosError` in the S5m measurement table — appears
+at 62 sites in `Vid.sys`, and the create dispatcher was not located, so two different checks could
+produce the same error. The controls rule out the two alternatives they can reach: it is not
+per-process, and it is not the device being busy. **Not ruled out** are VM lifecycle state, caller
+identity and partition-specific state, none of which this gate can vary without either a kernel
+debugger or stopping a VM.
 
 #### What this does to the plan
 
-- **The exported receiver S5m found is real and out of reach.** Every call in that sequence —
-  `VidRegisterExceptionHandler`, `VidMessageSlotMap`, `VidHandleMessageAndGetNextMessage`,
-  `VidUnregisterHandler` — takes the partition handle, and there is exactly one.
-- **It is not a privilege problem**, so running as SYSTEM, or as a protected process, or with any
-  privilege set, does not change it. That closes a family of workarounds before anyone spends time
-  on them.
-- **Handle duplication is not a route either** and is not attempted here: `vmwp.exe` runs
-  protected, and taking a handle out of it would be an attack on the platform rather than an
-  experiment on it.
-- **What remains is to own the partition**, which means running the guest under a VMM of our own
-  rather than under Hyper-V's. `vid.dll` exports enough to consider it — `VidCreatePartition`,
-  `VidVsmEnableVpVtl`, `VidVsmSetPartitionConfig`, `VidVsmGetPartitionConfig` — and that last group
-  is the interesting part, because VSM configuration is what a VTL1 target needs. **That is a
-  different and much larger rig than anything this plan has built**, and it should be costed as its
-  own decision rather than slipped in as the next step.
-- **S5 does not pass**, and for the first time the obstacle is not a missing mechanism. The
-  mechanism exists, is exported, and is reserved to the partition's creator.
+- **The exported receiver S5m found has no handle this gate could obtain.** Every call in that
+  sequence — `VidRegisterExceptionHandler`, `VidMessageSlotMap`,
+  `VidHandleMessageAndGetNextMessage`, `VidUnregisterHandler` — takes the partition handle, and
+  opening one is refused.
+- **Nothing here says privilege would help**, and nothing here says it would not. The controls were
+  run at one integrity level with one token, so *"running as SYSTEM changes it"* is untested rather
+  than excluded. What the controls do show is that the rule they exercise is indifferent to
+  *which* process asks — which makes privilege an unlikely explanation for the VM case without
+  ruling it out. Varying it is one cheap arm if this route is worth another look.
+- **Handle duplication and inheritance are excluded routes, not closed ones.** They would produce a
+  second handle without a second open, so the measurement above does not reach them. They are not
+  attempted: `vmwp.exe` runs protected, and taking a handle out of it would be an attack on the
+  platform rather than an experiment on it.
+- **The route with the clearest path is to own the partition**, which means running the guest under
+  a VMM of our own rather than under Hyper-V's. `vid.dll` exports enough to consider it —
+  `VidCreatePartition`, `VidVsmEnableVpVtl`, `VidVsmSetPartitionConfig`, `VidVsmGetPartitionConfig`
+  — and that last group is the interesting part, because VSM configuration is what a VTL1 target
+  needs. **That is a different and much larger rig than anything this plan has built**, and it
+  should be costed as its own decision rather than slipped in as the next step. It is *the clearest*
+  rather than *the only* route: the three cheaper ones this gate could not reach — locating the
+  failing check with a kernel debugger, varying privilege, and a stopped VM — are listed under what
+  to run next rather than dismissed.
+- **S5 does not pass**, and the obstacle has changed shape. It is no longer a missing mechanism:
+  the mechanism exists and is exported. What blocks it is that opening the partition of a VM this
+  host did not create is refused, for a reason consistent with a single-open rule and not yet traced
+  to its check.
 
 #### Limits
 
-- **The single-open rule is measured, not read.** Where Vid enforces it — presumably its
-  `IRP_MJ_CREATE` handler — was **not** located: the status `0xC0000184` that maps to
-  `ERROR_BAD_COMMAND` appears at 62 sites in `Vid.sys` and no create dispatcher was identifiable by
-  symbol name. The behaviour is pinned by the control table above rather than by its source, so
-  *why* it refuses is an inference from *that* it refuses, consistently, in four arms.
+- **The single-open rule is measured, not read, and the live VM's refusal is matched to it rather
+  than traced.** Where Vid enforces it — presumably its `IRP_MJ_CREATE` handler — was **not**
+  located: `0xC0000184`, the status that maps to `ERROR_BAD_COMMAND`, appears at 62 sites in
+  `Vid.sys` and no create dispatcher was identifiable by symbol name. So two different checks could
+  give the same error, and the eight arms above narrow the alternatives without eliminating them.
+- **Measured at one integrity level, with one token.** Nothing here varies the caller, so the
+  refusal's independence from privilege is an inference from the rule's indifference to *which*
+  process asks, not a measurement.
+- **The constraint measured is "no second open", not "one handle".** `DuplicateHandle` and handle
+  inheritance are untested and untried.
 - **Two guests, one host, one build.** `vid.dll 10.0.26100.8457`, `Vid.sys 10.0.26100.9278`.
 - **Stopped VMs were not tried.** Both lab guests are running, and stopping one is a bench change
   this gate did not need. Whether a stopped VM's partition object exists at all is untested.
-- **The probe created two transient partitions**, under `00000000-0000-0000-0000-000000000000` and
-  `11111111-2222-3333-4444-555566667777`, and closed every handle. Named here because a reader
-  should know the probe is not purely passive.
+- **The probe created three transient partitions**, under `00000000-0000-0000-0000-000000000000`,
+  `11111111-2222-3333-4444-555566667777` and the two names the cross-process control used, and
+  closed every handle. Named here because a reader should know the probe is not purely passive.
+
+#### What to run next, cheapest first
+
+1. **Vary the caller.** One run of the same opens from a medium-integrity, non-elevated process.
+   It costs nothing and it is the only untested alternative that would reopen the user-mode route.
+2. **A stopped VM.** Whether its partition object exists, and whether its name then opens, separates
+   "held open by `vmwp.exe`" from "refused on VM state". It costs one guest stop/start.
+3. **Locate the check**, which needs the kernel debugger this bench does not have enabled and is
+   therefore the expensive one — a host reboot into debug mode.
+4. **Only then** the VMM-of-our-own question, which is a rig rather than an arm.
 
 ## Explicitly out of scope
 
