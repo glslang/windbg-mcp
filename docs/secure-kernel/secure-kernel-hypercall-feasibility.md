@@ -4239,10 +4239,16 @@ debugger or stopping a VM.
    control with it so a success can be told from the device simply being reachable. A non-elevated
    run is worth including in the same pass — three points beat one — but it is the SYSTEM arm that
    decides anything.
-2. **A stopped VM.** Whether its partition object exists, and whether its name then opens, separates
-   "held open by `vmwp.exe`" from "refused on VM state". It costs one guest stop/start.
+2. ~~**A stopped VM.**~~ **Dropped: it does not discriminate**, and an earlier draft of this list
+   proposed it as though it did. Stopping the guest moves *both* candidate causes at once —
+   `vmwp.exe` releases its open **and** the VM's lifecycle state changes — so neither outcome
+   separates them. Worse, if the partition object goes away with the VM, as the limits above allow,
+   then the VM Id becomes just another well-formed unused name and a successful open says only what
+   the unused-name arm already said. Making it discriminate would need an independent check of
+   whether the object still exists, which is the same kernel visibility item 3 is about.
 3. **Locate the check**, which needs the kernel debugger this bench does not have enabled and is
-   therefore the expensive one — a host reboot into debug mode.
+   therefore the expensive one — a host reboot into debug mode. With items 1 and 2 as they now
+   stand, this is the only thing that would turn the match into a cause.
 4. **Only then** the VMM-of-our-own question, which is a rig rather than an arm.
 
 ## Explicitly out of scope

@@ -3346,10 +3346,13 @@ validated. The full record is the
   **So S5's obstacle has changed shape**: the mechanism exists and is exported, and what blocks it
   is a refused open. **Next, cheapest first**: vary the caller **upward** — a run as `SYSTEM` with
   the unused-name control, since a non-elevated run only varies privilege downward and cannot
-  reopen the route; try a stopped
-  VM; locate the check, which wants the kernel debugger this bench has disabled; and only then the
+  reopen the route; then locate the check, which wants the kernel debugger this bench has disabled
+  and is the only thing that turns the matched error into a cause; and only then the
   VMM-of-our-own question — `VidCreatePartition`, `VidVsmEnableVpVtl`, `VidVsmSetPartitionConfig` —
-  **which is a rig rather than an arm and should be costed as its own decision.** Full record in the
+  **which is a rig rather than an arm and should be costed as its own decision.** A stopped-VM arm
+  was proposed and **dropped**: stopping the guest moves both candidate causes at once, and if the
+  partition object goes with the VM then its Id is just another unused name, so neither outcome
+  discriminates. Full record in the
   [S5n result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 - **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
