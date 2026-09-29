@@ -312,6 +312,10 @@ def main(argv=None):
                     help="find every instruction carrying this immediate. Unlike the "
                          "field resolution it needs no register tracking, so it is "
                          "sound where that is merely conservative.")
+    ap.add_argument("--range", default=None,
+                    help="disassemble START:END regardless of function bounds. The "
+                         "exception directory splits some functions across several "
+                         "RUNTIME_FUNCTIONs, so --disasm can stop after a few bytes.")
     ap.add_argument("--self-test", action="store_true",
                     help="run the scanner against the counterexamples its soundness "
                          "rules exist for, and stop")
@@ -343,6 +347,13 @@ def main(argv=None):
 
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = False
+
+    if args.range is not None:
+        lo, _, hi = args.range.partition(":")
+        lo, hi = int(lo, 0), int(hi, 0)
+        print(f"\n=== 0x{lo:X}-0x{hi:X} ===")
+        print("\n".join(disasm_range(md, pe, lo, hi)))
+        return 0
 
     if args.disasm is not None:
         owner = [(b, e) for b, e in funcs if b <= args.disasm < e]
