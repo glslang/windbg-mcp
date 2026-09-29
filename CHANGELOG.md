@@ -16,9 +16,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   touching it in the 52 bytes of code outside `.pdata`: three
   writers clear it and **exactly one sets it**, inside the detach IOCTL, which itself requires the
   caller to hold the partition. Since the create path needs that field **and** the other one, and
-  only the detach IOCTL can produce the first, no admission can occur that an owner's detach did not
-  enable — whatever else writes the second. So S5o's conclusion stands with the evidence it was
-  missing, and the retraction was right to demand it rather than wrong about the answer.
+  the first has exactly one located producer, **every admission this census can account for** was
+  enabled by an owner's detach — a claim about located writes rather than a proof, because the
+  method sees neither a pointer handed to another function nor a bulk copy spanning the field. So
+  S5o's conclusion holds within that scope, with the evidence it was missing, and the retraction was
+  right to demand it rather than wrong about the answer.
   **New instrument**: `tools/vid_field_census.py`, which walks a PE's own `.pdata` function table,
   disassembles with capstone and reports only real memory operands at a given displacement,
   classified read/write by operand access rather than by mnemonic. `--self-test` decodes six
@@ -30,8 +32,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   executable bytes the table does not claim and reports them (20,622 bytes here, 20,570 of them
   padding, leaving 52 across ten runs, none touching the field); and a displacement is not the only
   way to form an address, so it now carries an intra-procedural alias table that resolves
-  `lea rax,[rbx+3000h]` plus `mov byte ptr [rax+79h],1` to the field it really writes. Neither
-  changed the result. It exists because the obvious search is wrong three ways, all
+  `lea rax,[rbx+3000h]` plus `mov byte ptr [rax+79h],1` to the field it really writes. **A second
+  round then found three ways that alias table could *overcount*** — invalidating from capstone's
+  `regs_write`, which carries only implicit writes, so `mov rax,[rbx]` left the overwritten pointer
+  looking live; keeping a 64-bit alias through a 32-bit `lea`, which zero-extends and cannot hold a
+  kernel pointer; and skipping alias resolution when the encoded displacement already matched, so
+  `[rax+0x3079]` on an aliased base was reported as the field rather than as `+0x6079`. All three
+  are fixed and each is now a self-test, alias state is dropped at basic-block boundaries rather
+  than carried across joins in decode order, unexamined bytes after a decode stop are counted (`0`
+  here), and each gap is decoded from every start after padding instead of once from a raw
+  boundary. None of it changed the result. It exists because the obvious search is wrong three
+  ways, all
   of which bit here: a `s -d` scan walks **dword-aligned** and a displacement does not, so it misses
   sites silently; a byte scan matches immediates and data; and neither can see a write through a
   **taken address** — of which this census found a real one, `VsmmPhuPartitionTeardown` executing
@@ -41,9 +52,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   them — so the second open is the reconnect half of persist-and-restore, which is why it demands a
   persisted, detached partition and re-owns rather than joins. **Residuals**, all named: a pointer
   to the field formed in one function and written through in another, since the alias table stops
-  at a call boundary; a bulk copy spanning the field; and the second field's writers being bounded
-  rather than closed — the conclusion does not rest on that last one, because a conjunction is
-  gated by its weakest reachable term.
+  at a call boundary; one formed in a different basic block, since it stops there too by design;
+  a bulk copy spanning the field; and the second field's writers being bounded rather than closed —
+  the conclusion does not rest on that last one, because a conjunction is gated by its weakest
+  reachable term. Also corrected: this gate does **not** establish that a running guest's refusal
+  comes from the persistence field. The create path refuses when either gating field is wrong, no
+  live partition was inspected, and the simpler reading is the other field — a guest that was never
+  detached.
 - **The refusal is a partition-state test with no token in it, and the branch behind it is an
   ownership handoff.** Gate S5o, a static read of `Vid.sys` — DbgEng opening the image as a target
   of its own, no debuggee, nothing executed, no VM touched — which answered the **two** steps the

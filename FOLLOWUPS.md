@@ -3519,8 +3519,9 @@ validated. The full record is the
       address in one step or two and nothing touching it in the 52 bytes of code outside `.pdata`;
       three writers clear it and **exactly one sets it**,
       `VidPartitionIoctlDetach+0x43`. Since the create path needs `0x3079 == 1` **and**
-      `0x3060 == 2`, and only the detach IOCTL can produce the first, no admission can occur that
-      an owner's detach did not enable — whatever else writes the other field. Built
+      `0x3060 == 2`, and the first has exactly one located producer, **every admission this census
+      can account for** was enabled by an owner's detach — a claim about located writes, not a
+      proof, since the method sees neither an inter-procedural pointer nor a bulk copy. Built
       [`tools/vid_field_census.py`](tools/vid_field_census.py) for it — decoded operands, a `.pdata`
       function walk plus the executable bytes `.pdata` does not claim, an intra-procedural alias
       table for split addresses, `--self-test` 9/9 — because a byte scan cannot do this: it scans
@@ -3532,12 +3533,20 @@ validated. The full record is the
       bulk copy spanning the field, and `[p+0x3060]`'s writers being bounded rather than closed.
    6. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
       the standing constraint above, and the first also by kernel-memory access. Unchanged by S5o.
-   7. **← active step, and a decision rather than an arm. Step 5 came back empty, so this is now
-      the only remaining user-mode route on evidence.** The VMM-of-our-own question: own the
+   7. **Handle duplication and inheritance, which S5n excluded rather than closed and which this
+      plan twice wrote out of existence.** A process that duplicates or inherits a handle
+      `vmwp.exe` already holds reaches the exported receiver **without** passing the create path's
+      admission check and without owning the partition — so no amount of writer census makes the
+      next step "the only route". S5n declined to attempt it for a good reason (`vmwp.exe` runs
+      protected, and taking a handle out of it is an attack on the platform rather than an
+      experiment on it), and *declining to attempt* is not *excluding*. It stays here until it is
+      one or the other.
+   8. **← active step, and a decision rather than an arm.** The VMM-of-our-own question: own the
       partition from creation, where `VidPartitionCreate` admits any name for an administrator and
-      the whole `vid.dll` sequence is then reachable by construction. The claim two reviewers were
-      right to refuse from S5o is the claim S5p measured — so what changed is the warrant, not the
-      wording, and it is still a reason to **cost** the rig rather than to start building it.
+      the whole `vid.dll` sequence is then reachable by construction. S5p measured the warrant S5o
+      lacked for the admission path — but only for writes a decoded-operand census can see, and
+      only alongside step 7 still being open, so this is the route with **no known obstacle**
+      rather than the only one. Still a reason to **cost** the rig rather than start building it.
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from

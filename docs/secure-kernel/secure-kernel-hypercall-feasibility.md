@@ -4567,18 +4567,26 @@ above, these four are every instruction in the image that can change the field.
 demands `[p+0x3060] == 2`, `[p+0x3064] == 2` and `[p+0x3079] == 0` before it will, so the caller
 must already hold the partition.
 
-#### Why that settles the question without a complete census of the other field
+#### What that does and does not settle
 
 The create path requires **both** `[p+0x3060] == 2` **and** `[p+0x3079] == 1`. A conjunction is
-gated by its weakest reachable term, and `[p+0x3079] == 1` is reachable from exactly one
-instruction — so whatever else may write `[p+0x3060]`, **no admission can occur that the detach
-IOCTL did not enable.** The `[p+0x3060]` census is therefore reported below for what it says about
-the field's meaning, not because the conclusion needs it.
+gated by its weakest reachable term, and `[p+0x3079] == 1` has exactly one located producer — so
+whatever else may write `[p+0x3060]`, **every admission this census can account for was enabled by
+the detach IOCTL.** The `[p+0x3060]` census is therefore reported below for what it says about the
+field's meaning, not because the conclusion needs it.
 
-**So S5o's conclusion stands, and now with the evidence it was missing.** The route into
-`VidPartitionAttach` runs through an owner who called detach, and detach calls
-`VidHandlerUnregister` and detaches every VP before returning. There is no second client alongside
-Hyper-V to be had on a VM Hyper-V runs.
+**That is a statement about located writes, and the difference matters.** The limits below name two
+kinds of write this method does not see — a pointer to the field handed to another function, and a
+bulk copy spanning it — and either could set `0x3079` without the detach instruction executing. So
+the honest form is: **no other producer of the admitting state exists in this image that a
+decoded-operand census can find**, which is a much stronger search than S5o had and still not a
+proof. Review pressed this point twice, on S5o and again here, and it was right both times: a
+conclusion may not outrun the coverage stated three paragraphs below it.
+
+**Within that scope S5o's conclusion holds.** The route into `VidPartitionAttach` runs through an
+owner who called detach, and detach calls `VidHandlerUnregister` and detaches every VP before
+returning — so the receive path S5m found is dismantled by the only admission this gate can
+account for.
 
 #### `[p+0x3060]` / `[p+0x3064]`: what they are, and one write the displacement alone would have missed
 
@@ -4599,9 +4607,15 @@ family — `PartitionInitialize` (zeroes both), `IoctlBegin`, `IoctlCommit`, `Pa
 `VsmmPhuIoctlEnd` are literally `VID_PARTITION_UNPERSIST_START` / `_STOP`. So this is the
 partition **persistence** state machine, not a general lifecycle counter, and the create path's
 `== 2` names a state reached through the persist Begin/Commit sequence. **Which value 2 is
-precisely, and which of Begin or Commit produces it, is not decoded here** — but the domain
-answers the question S5o left hanging about why a running guest fails the test: its partition is
-not in a committed-persist state, because nothing has persisted it.
+precisely, and which of Begin or Commit produces it, is not decoded here.**
+
+**It does not follow that a running guest fails on *this* field, and an earlier draft of this
+paragraph said it did.** The create path refuses when **either** gating field is wrong, no running
+partition object was inspected, and the meaning of `2` is undecoded — so "its partition is not in a
+committed-persist state" was an interpretation presented as a finding. The straightforward reading
+is the other field: a guest Hyper-V is running has never been detached, so `[p+0x3079]` is `0` and
+the refusal needs no help from `[p+0x3060]` at all. Which field actually refuses is untested either
+way, and distinguishing them wants a live partition object.
 
 That also makes the design read coherently for the first time. The second open is the reconnect
 half of **persist-and-restore** — a worker process handing a partition on, or picking one back up —
@@ -4616,11 +4630,27 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
   - **a pointer to the field formed in one function and written through in another**, since the
     alias table is intra-procedural and stops at a call boundary. Closing that wants
     inter-procedural argument tracking, which this instrument does not do;
+  - **a pointer formed in one basic block and used in another.** The alias table is dropped at
+    every branch target and after every control transfer, because carrying it across a join in
+    physical decode order would let one path's `lea` answer for a path that never ran. That choice
+    trades a class of false positives for this blind spot, deliberately — a census that
+    *overcounts* writers is worse than useless here, since its only product is a negative;
   - **a bulk copy whose length spans the field.** `VsmmPhuPartitionRestore` is in the persistence
     family that would plausibly do such a thing, and nothing here excludes it.
 
-  Both were narrowed rather than invented by this gate: the first version of the tool also missed
-  split addresses within a function and everything outside `.pdata`, and review caught both.
+  **What is no longer a residual, because it is now measured:** capstone stops at an invalid
+  encoding and leaves the rest of a run unexamined, so the tool counts those bytes — **`0`** here,
+  in `.pdata` and in the gaps alike. And a linear decode of a gap can begin mid-instruction, so
+  each gap is decoded from *every* start following padding and the results unioned, rather than
+  once from a raw boundary.
+
+  **Three of these limits were review's, not mine.** The first version of this tool invalidated
+  aliases from capstone's `regs_write`, which carries only *implicit* writes — `mov rax,[rbx]`
+  reports none at all — so a stale alias survived the very instruction that overwrote the pointer;
+  it kept a 64-bit alias through a 32-bit `lea`, which zero-extends and cannot carry a kernel
+  pointer; and it skipped alias resolution whenever the encoded displacement already matched, so a
+  `[rax+0x3079]` on an aliased base was reported as the field when it was really `+0x6079`. Each
+  was a way to **overcount**, and each is now a self-test.
 - **`[p+0x3060]`'s writers are not claimed complete**, per the taken address above.
 - **Static, one build** — `Vid.sys 10.0.26100.9278`. No partition object was inspected live, so
   this says what the code can do, not what any particular partition's fields hold.
@@ -4630,9 +4660,14 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
 
 #### What this gate leaves open
 
-- **The VMM-of-our-own question**, which is now the only remaining user-mode route **on evidence**
-  rather than on assumption — the distinction this gate exists to supply. Still a rig to cost.
+- **The VMM-of-our-own question**, which this gate strengthens the case for without making it the
+  only route: what it supplies is evidence where S5o had assumption, and two things still stand
+  beside it — the residuals above, and **handle duplication or inheritance**, which S5n declined to
+  attempt rather than excluded and which reaches the receiver without passing the create path at
+  all. Still a rig to cost.
 - **What persistence state `2` is**, if anyone needs to know whether a guest's partition can be
   driven into it deliberately. Note what that would mean: persisting a running guest's partition,
   which is a disruptive operation on somebody else's VM, not an observation.
+- **Which of the two fields a running guest actually refuses on**, which this gate cannot say and
+  an earlier draft of it assumed. It wants a live partition object.
 - **The two arms blocked by the standing constraint**, untouched.
