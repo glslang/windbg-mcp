@@ -25,11 +25,22 @@ So:
 to look for than "a dispatch table".
 
 What this tool does NOT do, and the limits are the same family as `sk_hypercall_scan.py`'s:
-it reads **immediates**, so a field encoding that arrives computed or loaded from data is
-invisible to it; it decodes each function from the exception directory rather than
-sweeping, so bytes in no `RUNTIME_FUNCTION` are not covered and the tool reports how many;
-and finding a write site is not the same as knowing what VTL state feeds it -- that is the
-read this tool exists to make possible, not one it performs.
+
+* it reads **immediates**, so a field encoding that arrives computed or loaded from data is
+  invisible to it;
+* it decodes each function from the exception directory rather than sweeping, so bytes in no
+  `RUNTIME_FUNCTION` are not covered and the tool reports how many;
+* **it walks each function linearly**, so inline constants, padding or a jump table that a
+  branch skips over are decoded as though they were instructions. A data sequence that
+  happens to decode as `mov eax, 0x4004; vmwrite rax, rdx` would be reported as a VMCS
+  access, and a stray `E8`/`E9` byte pair can be counted as a caller. Establishing real
+  instruction boundaries means traversing reachable blocks, which this does not do. **The
+  mitigation is procedural and belongs with the result, not with the tool**: every anchor
+  this repo has published from it was then read as disassembly, in full, and every call site
+  it reported was read in context -- so a decode that was really data had to survive a human
+  reading of the surrounding function to reach a record;
+* and finding a write site is not the same as knowing what VTL state feeds it -- that is the
+  read this tool exists to make possible, not one it performs.
 """
 import argparse
 import os
@@ -223,10 +234,14 @@ def imm_equal(value, want, encoded_size=0):
         return True
     if encoded_size != 4:
         return False
-    for small, big in ((want, value), (value, want)):
-        if small <= 0xFFFFFFFF and small & 0x80000000:
-            if big == (small | 0xFFFFFFFF00000000):
-                return True
+    # Directional on purpose. The case that needs normalising is a DECODED operand
+    # that arrived sign-extended (`mov rax, imm32` reports 0xFFFFFFFF80004004) against
+    # a query typed as the 32-bit value. The reverse is not the same case: `mov eax,
+    # imm32` zero-extends, so 0x80004004 there is not 0xFFFFFFFF80004004 and matching
+    # a query for the latter would be a false anchor. An earlier symmetric loop did
+    # exactly that.
+    if want <= 0xFFFFFFFF and want & 0x80000000:
+        return value == (want | 0xFFFFFFFF00000000)
     return False
 
 
@@ -361,6 +376,11 @@ SEXT_TEST = [
     ("an imm32 sign-extended into a 64-bit register still matches",
      bytes([0x48, 0xC7, 0xC0, 0x04, 0x40, 0x00, 0x80]),     # mov rax, 0xffffffff80004004
      0x80004004, True),
+    # A 32-bit destination ZERO-extends, so the instruction does not carry the
+    # sign-extended value and must not answer a query for it.
+    ("a zero-extending imm32 is not its sign extension",
+     bytes([0xB8, 0x04, 0x40, 0x00, 0x80]),                 # mov eax, 0x80004004
+     0xFFFFFFFF80004004, False),
 ]
 
 # direct_callers must not count a conditional edge as a call.
