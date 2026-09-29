@@ -3274,11 +3274,15 @@ validated. The full record is the
   `InterceptParameter` and must be `<= 0x1F`; and a per-partition allowed-vector mask at `+0x6124`
   gates installs **except** that target VTL 0 admits vectors `3` (`#BP`) and `4` (`#OF`)
   unconditionally — which, with S5i's "a parent naming a child always installs at VTL 0", is why
-  `#BP` on a child never depended on the partition's configuration. **Remediation for the next
-  arm**: not the hypervisor mask — `array[0].0x1A04` is hypervisor memory the root cannot read and
-  the ABI has no query to go with its install and remove — but Vid's own
-  `[partition+0xB68][vector]`, which says whether a VID client holds it. **That read is not
-  available on this bench yet**: local kernel debugging is off (`bcdedit /dbgsettings` says
+  `#BP` on a child never depended on the partition's configuration. **No remediation, and the one
+  that suggests itself does not work**: reading a slot before installing is a *diagnostic*, not a
+  guard, because the per-partition lock serialises one update and not
+  read-then-install-then-remove — a client registering inside that window still loses its bit.
+  Making the pair safe needs exclusive coordination with every other installer, which nothing here
+  has. The diagnostic itself would be Vid's `[partition+0xB68][vector]`, not the hypervisor mask
+  (`array[0].0x1A04` is hypervisor memory the root cannot read, and the ABI has no query beside its
+  install and remove). **Even that read is not available on this bench**: local kernel debugging is
+  off (`bcdedit /dbgsettings` says
   `debugtype Local`, which is the global store, not the boot entry; `{current}` carries no
   `debug Yes` and `attach_kernel_local` answers `0x80004001`), so it needs a host reboot into debug
   mode or a kernel-read path in `h3probe.sys`. Until then the constraint stands without a remedy:
@@ -3314,10 +3318,11 @@ validated. The full record is the
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
   `WinHvInstallIntercept` S5b read. **So the next step is reading `[partition+0xB68][3]` inside a
-  replicated intercept arm** — and per S5l that same read is what the arm would also need *before*
-  installing, since the install/remove pair is destructive to whoever else holds the vector. **It
-  needs root kernel-memory access this bench does not have today**: a host reboot into debug mode,
-  or a kernel-read path in `h3probe.sys`. That arm is what separates the drop from S5j's retained
+  replicated intercept arm** — as a *diagnostic*, since per S5l a pre-read does not make the
+  install/remove pair safe and nothing on this bench can: that would need coordination with every
+  other installer. **It needs root kernel-memory access this bench does not have today**: a host
+  reboot into debug mode, or a kernel-read path in `h3probe.sys`. That arm is what separates the
+  drop from S5j's retained
   explanation, and
   which decides whether the IOCTL is the thing to look at next at all. **Then
   the IOCTL code and its user-mode surface**, and whether a documented WHP property reaches it —
