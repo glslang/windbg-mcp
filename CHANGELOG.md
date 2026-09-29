@@ -12,7 +12,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **The writer census, and a retracted claim comes back as a measurement.** Gate S5p, answering the
   step review added to the plan when it refused S5o's overreach. `[partition+0x3079]` — one of the
   two fields the VID create path tests before handing a second process a partition handle — has
-  **19 accesses, 4 writers and no address-taken site**, so that field's census is *complete*: three
+  **19 accesses and 4 writers**, with no site taking its address in one step or two and nothing
+  touching it in the 52 bytes of code outside `.pdata`: three
   writers clear it and **exactly one sets it**, inside the detach IOCTL, which itself requires the
   caller to hold the partition. Since the create path needs that field **and** the other one, and
   only the detach IOCTL can produce the first, no admission can occur that an owner's detach did not
@@ -21,8 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **New instrument**: `tools/vid_field_census.py`, which walks a PE's own `.pdata` function table,
   disassembles with capstone and reports only real memory operands at a given displacement,
   classified read/write by operand access rather than by mnemonic. `--self-test` decodes six
-  instructions whose bytes were read out of the image under study, plus one case pinning that
-  `mov eax,3060h` must not count; 7/7. It exists because the obvious search is wrong three ways, all
+  instructions whose bytes were read out of the image under study, plus three cases pinning what
+  makes it necessary — that `mov eax,3060h` must not count, that a two-step address resolves, and
+  that a two-step address to a *neighbouring* field does not; 9/9. **Review found two holes in the
+  instrument itself and both are now closed or measured**, which matters because a census's whole
+  value is the negative it licenses: `.pdata` omits leaf functions, so the tool now also decodes the
+  executable bytes the table does not claim and reports them (20,622 bytes here, 20,570 of them
+  padding, leaving 52 across ten runs, none touching the field); and a displacement is not the only
+  way to form an address, so it now carries an intra-procedural alias table that resolves
+  `lea rax,[rbx+3000h]` plus `mov byte ptr [rax+79h],1` to the field it really writes. Neither
+  changed the result. It exists because the obvious search is wrong three ways, all
   of which bit here: a `s -d` scan walks **dword-aligned** and a displacement does not, so it misses
   sites silently; a byte scan matches immediates and data; and neither can see a write through a
   **taken address** — of which this census found a real one, `VsmmPhuPartitionTeardown` executing
@@ -30,10 +39,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   for the displacement can reach. Also identified: both gating fields belong to the `VsmmPhu*`
   **persistence** state machine, with `VID_PARTITION_UNPERSIST_START`/`_STOP` either side of one of
   them — so the second open is the reconnect half of persist-and-restore, which is why it demands a
-  persisted, detached partition and re-owns rather than joins. **Residuals**, both named: a bulk copy
-  spanning the field would evade an operand census, and the second field's writers are bounded
-  rather than closed — the conclusion does not rest on them, because a conjunction is gated by its
-  weakest reachable term.
+  persisted, detached partition and re-owns rather than joins. **Residuals**, all named: a pointer
+  to the field formed in one function and written through in another, since the alias table stops
+  at a call boundary; a bulk copy spanning the field; and the second field's writers being bounded
+  rather than closed — the conclusion does not rest on that last one, because a conjunction is
+  gated by its weakest reachable term.
 - **The refusal is a partition-state test with no token in it, and the branch behind it is an
   ownership handoff.** Gate S5o, a static read of `Vid.sys` — DbgEng opening the image as a target
   of its own, no debuggee, nothing executed, no VM touched — which answered the **two** steps the

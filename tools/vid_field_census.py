@@ -51,6 +51,7 @@ class Section:
     vsize: int
     raw: int
     rawsize: int
+    flags: int = 0
 
 
 @dataclass
@@ -114,7 +115,8 @@ def load(path: str) -> Image:
         base = sec_off + i * 40
         name = data[base : base + 8].rstrip(b"\0").decode("latin-1")
         vsize, va, rawsize, raw = struct.unpack_from("<IIII", data, base + 8)
-        sections.append(Section(name, va, vsize, raw, rawsize))
+        flags, = struct.unpack_from("<I", data, base + 36)
+        sections.append(Section(name, va, vsize, raw, rawsize, flags))
 
     img = Image(data, sections, image_base)
 
@@ -173,60 +175,185 @@ ACCESS = {
 }
 
 
+# Volatile registers: a call may clobber them, so an alias held in one stops
+# being trustworthy across a call and is dropped there.
+VOLATILE = {"rax", "rcx", "rdx", "r8", "r9", "r10", "r11"}
+
+_NARROW = {
+    "eax": "rax", "ebx": "rbx", "ecx": "rcx", "edx": "rdx",
+    "esi": "rsi", "edi": "rdi", "ebp": "rbp", "esp": "rsp",
+}
+
+
+def widen(name: str) -> str:
+    """Normalise a 32-bit register name to its 64-bit container.
+
+    `lea eax,[rbx+3000h]` and a later `[rax+0x79]` name the same physical
+    register, and an alias table that treats them as different misses exactly
+    the split-address pattern it exists to catch.
+    """
+    if name in _NARROW:
+        return _NARROW[name]
+    if len(name) > 2 and name[0] == "r" and name.endswith("d") and name[1:-1].isdigit():
+        return "r" + name[1:-1]
+    return name
+
+
 def census(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Hit], dict]:
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = True
     hits: list[Hit] = []
     # base register -> displacements seen, per function, for the fingerprint.
     prints: dict[tuple[int, str], set[int]] = {}
-    stats = {"functions": 0, "instructions": 0, "undecodable": 0}
+    stats = {
+        "functions": 0,
+        "instructions": 0,
+        "undecodable": 0,
+        "gap_bytes": 0,
+        "gap_padding": 0,
+        "gap_instructions": 0,
+        "gap_runs": 0,
+    }
 
-    for begin, end in img.pdata:
-        code = img.read(begin, end - begin)
-        if not code:
-            continue
-        stats["functions"] += 1
-        decoded = list(md.disasm(code, img.image_base + begin))
-        stats["instructions"] += len(decoded)
-        consumed = sum(i.size for i in decoded)
-        if consumed < len(code):
-            stats["undecodable"] += 1
+    def scan(start: int, code: bytes, label: int, outside: bool) -> None:
+        """Decode one run of bytes and record every hit in it.
+
+        `aliases` maps a register to `(root register, offset)`, built from
+        `lea r,[b+k]`, register-to-register `mov` and `add r,imm`. It is what
+        catches a field written as `lea rax,[rbx+3000h]` then
+        `mov byte ptr [rax+79h],1`, where no encoded displacement equals the
+        field at all and a displacement-only census sees nothing.
+        """
+        aliases: dict[str, tuple[str, int]] = {}
+        decoded = list(md.disasm(code, img.image_base + start))
+        if outside:
+            stats["gap_instructions"] += len(decoded)
+        else:
+            stats["instructions"] += len(decoded)
+            if sum(i.size for i in decoded) < len(code):
+                stats["undecodable"] += 1
+
         for ins in decoded:
-            rva = ins.address - img.image_base
+            if ins.mnemonic == "call":
+                for reg in [r for r in aliases if r in VOLATILE]:
+                    del aliases[reg]
+
             for op in ins.operands:
                 if op.type != capstone.x86.X86_OP_MEM:
                     continue
-                base_reg = op.mem.base
-                if base_reg == 0 or base_reg == capstone.x86.X86_REG_RIP:
+                if op.mem.base in (0, capstone.x86.X86_REG_RIP):
                     continue
-                base = ins.reg_name(base_reg)
+                base = widen(ins.reg_name(op.mem.base))
                 disp = op.mem.disp
                 if disp > 0:
-                    prints.setdefault((begin, base), set()).add(disp)
-                if disp not in wanted:
+                    prints.setdefault((label, base), set()).add(disp)
+
+                effective, via, root = disp, "", base
+                if disp not in wanted and base in aliases:
+                    root, off = aliases[base]
+                    if off + disp in wanted:
+                        effective, via = off + disp, f"{base} = {root}{off:+#x}"
+                if effective not in wanted:
                     continue
-                if ins.mnemonic == "lea":
-                    kind = "lea"
-                else:
-                    kind = ACCESS.get(
+
+                kind = (
+                    "lea"
+                    if ins.mnemonic == "lea"
+                    else ACCESS.get(
                         (
                             bool(op.access & capstone.CS_AC_READ),
                             bool(op.access & capstone.CS_AC_WRITE),
                         ),
                         "unknown",
                     )
+                )
+                text = f"{ins.mnemonic} {ins.op_str}"
+                if via:
+                    text += f"   [via {via}]"
+                if outside:
+                    text += "   [OUTSIDE .pdata]"
                 hits.append(
                     Hit(
-                        rva=rva,
-                        func_rva=begin,
-                        func_name=name_for(begin, syms),
+                        rva=ins.address - img.image_base,
+                        func_rva=label,
+                        func_name=name_for(label, syms),
                         mnemonic=ins.mnemonic,
-                        text=f"{ins.mnemonic} {ins.op_str}",
-                        base=base,
-                        disp=disp,
+                        text=text,
+                        base=root,
+                        disp=effective,
                         kind=kind,
                     )
                 )
+
+            # Update the alias table *after* reading operands, so an instruction
+            # that both reads and redefines a register is read before the kill.
+            handled = False
+            ops = ins.operands
+            if ins.mnemonic == "lea" and len(ops) == 2 and ops[1].mem.base:
+                if ops[1].mem.index == 0 and ops[1].mem.base != capstone.x86.X86_REG_RIP:
+                    dst = widen(ins.reg_name(ops[0].reg))
+                    src = widen(ins.reg_name(ops[1].mem.base))
+                    prev = aliases.get(src)
+                    aliases[dst] = (
+                        (prev[0], prev[1] + ops[1].mem.disp)
+                        if prev
+                        else (src, ops[1].mem.disp)
+                    )
+                    handled = True
+            elif ins.mnemonic == "mov" and len(ops) == 2:
+                if (
+                    ops[0].type == capstone.x86.X86_OP_REG
+                    and ops[1].type == capstone.x86.X86_OP_REG
+                ):
+                    dst = widen(ins.reg_name(ops[0].reg))
+                    src = widen(ins.reg_name(ops[1].reg))
+                    aliases[dst] = aliases.get(src, (src, 0))
+                    handled = True
+            elif ins.mnemonic == "add" and len(ops) == 2:
+                if (
+                    ops[0].type == capstone.x86.X86_OP_REG
+                    and ops[1].type == capstone.x86.X86_OP_IMM
+                ):
+                    dst = widen(ins.reg_name(ops[0].reg))
+                    if dst in aliases:
+                        root, off = aliases[dst]
+                        aliases[dst] = (root, off + ops[1].imm)
+                        handled = True
+            if not handled:
+                for reg in ins.regs_write:
+                    aliases.pop(widen(ins.reg_name(reg)), None)
+
+    for begin, end in img.pdata:
+        code = img.read(begin, end - begin)
+        if code:
+            stats["functions"] += 1
+            scan(begin, code, begin, outside=False)
+
+    # Everything executable that .pdata does not claim. A leaf function -- no
+    # stack frame, no calls, no saved non-volatiles -- needs no unwind data and
+    # may be absent from the table, so walking .pdata alone cannot support a
+    # claim that a census is complete: such a function could write the field and
+    # never be looked at. Measure the uncovered bytes, report how many are
+    # padding, and decode whatever is left.
+    covered = sorted(img.pdata)
+    for sec in img.sections:
+        if not (sec.flags & 0x20000000) or not sec.rawsize:  # IMAGE_SCN_MEM_EXECUTE
+            continue
+        limit = sec.va + min(sec.vsize or sec.rawsize, sec.rawsize)
+        cursor = sec.va
+        spans = [(b, e) for b, e in covered if b < limit and e > sec.va]
+        for b, e in spans + [(limit, limit)]:
+            if b > cursor:
+                blob = img.read(cursor, b - cursor) or b""
+                stats["gap_bytes"] += len(blob)
+                # Count padding bytes outright rather than by stripping the
+                # ends: a gap of padding/code/padding would otherwise report
+                # its whole length as padding and hide the code in the middle.
+                stats["gap_padding"] += sum(1 for byte in blob if byte in (0xCC, 0x00))
+                if any(byte not in (0xCC, 0x00) for byte in blob):
+                    stats["gap_runs"] += 1
+                    scan(cursor, blob, cursor, outside=True)
+            cursor = max(cursor, e)
     return hits, {"stats": stats, "prints": prints}
 
 
@@ -236,6 +363,13 @@ def report(hits: list[Hit], extra: dict, wanted: set[int]) -> None:
     print(
         f"decoded {stats['instructions']} instructions in {stats['functions']} "
         f"functions from .pdata ({stats['undecodable']} with an undecodable tail)"
+    )
+    print(
+        f"executable bytes .pdata does not claim: {stats['gap_bytes']} "
+        f"({stats['gap_padding']} of them 0xCC/0x00 padding); "
+        f"{stats['gap_runs']} gap run(s) held anything else, decoding to "
+        f"{stats['gap_instructions']} instructions (best effort: a linear decode "
+        f"of a gap can start mid-instruction)"
     )
     for disp in sorted(wanted):
         rows = [h for h in hits if h.disp == disp]
@@ -313,7 +447,34 @@ def self_test() -> int:
     print(f"  {'FAIL' if bad else 'ok  '} mov eax,3060h is not a memory access")
     failures += int(bad)
 
-    total = len(SELF_TEST) + 1
+    # The split address, which review caught the first version of this tool
+    # missing entirely: `lea rax,[rbx+3000h]` then `mov byte ptr [rax+79h],1`
+    # writes +0x3079 with no encoded 0x3079 anywhere. A pass here means the
+    # alias table resolved it; a fail means the census is displacement-only and
+    # must not claim completeness.
+    split = b"\x48\x8d\x83\x00\x30\x00\x00" b"\xc6\x40\x79\x01"
+    img = Image(data=b"", sections=[], image_base=0x140000000)
+    img.read = lambda rva, n: split if rva == 0x1000 else None  # type: ignore[method-assign]
+    img.pdata = [(0x1000, 0x1000 + len(split))]
+    hits, _ = census(img, {0x3079}, {})
+    found = [h for h in hits if h.kind == "write" and "via" in h.text]
+    print(
+        f"  {'ok  ' if found else 'FAIL'} split address lea+disp8 resolves to +0x3079"
+        + (f" ({found[0].text})" if found else " (not resolved)")
+    )
+    failures += int(not found)
+
+    # And the same shape must NOT fire when the halves do not add up, or the
+    # alias table would manufacture writers wherever two small numbers appear.
+    miss = b"\x48\x8d\x83\x00\x30\x00\x00" b"\xc6\x40\x7a\x01"  # +0x307a
+    img2 = Image(data=b"", sections=[], image_base=0x140000000)
+    img2.read = lambda rva, n: miss if rva == 0x1000 else None  # type: ignore[method-assign]
+    img2.pdata = [(0x1000, 0x1000 + len(miss))]
+    hits2, _ = census(img2, {0x3079}, {})
+    print(f"  {'FAIL' if hits2 else 'ok  '} a split address to +0x307a is not reported")
+    failures += int(bool(hits2))
+
+    total = len(SELF_TEST) + 3
     print(f"\n  {total - failures}/{total} passed")
     return 1 if failures else 0
 

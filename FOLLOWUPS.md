@@ -3515,17 +3515,21 @@ validated. The full record is the
       be run *alongside* Hyper-V; the step that would admit us dismantles what we came for. It
       remains the pass condition for a partition **we** own, which is step 6.
    5. ~~**Census the writers of `[p+0x3060]` and `[p+0x3079]`.**~~ **Run as S5p: done, and it
-      confirms step 4.** `[p+0x3079]` has **19 accesses, 4 writers and no address-taken site**, so
-      that field's census is *complete*; three writers clear it and **exactly one sets it**,
+      confirms step 4.** `[p+0x3079]` has **19 accesses and 4 writers**, with no site taking its
+      address in one step or two and nothing touching it in the 52 bytes of code outside `.pdata`;
+      three writers clear it and **exactly one sets it**,
       `VidPartitionIoctlDetach+0x43`. Since the create path needs `0x3079 == 1` **and**
       `0x3060 == 2`, and only the detach IOCTL can produce the first, no admission can occur that
       an owner's detach did not enable — whatever else writes the other field. Built
-      [`tools/vid_field_census.py`](tools/vid_field_census.py) for it (decoded operands, `.pdata`
-      function walk, `--self-test` 7/7 against bytes read from this image), because a byte scan
-      cannot do this: it scans aligned, it matches immediates, and it cannot see a write through a
-      taken address — of which S5p found a real one, `VsmmPhuPartitionTeardown` doing
-      `and dword ptr [rsi],0` after `lea rsi,[rcx+3060h]`. Residual: a bulk copy spanning the field
-      would evade an operand census, and `[p+0x3060]`'s writers are bounded rather than closed.
+      [`tools/vid_field_census.py`](tools/vid_field_census.py) for it — decoded operands, a `.pdata`
+      function walk plus the executable bytes `.pdata` does not claim, an intra-procedural alias
+      table for split addresses, `--self-test` 9/9 — because a byte scan cannot do this: it scans
+      aligned, it matches immediates, and it cannot see a write through a taken address, of which
+      S5p found a real one (`VsmmPhuPartitionTeardown` doing `and dword ptr [rsi],0` after
+      `lea rsi,[rcx+3060h]`). **Review then found two holes in the instrument itself** — leaf
+      functions absent from `.pdata`, and addresses formed in two steps — and both are closed or
+      measured, with neither changing the result. **Residuals**: an inter-procedural pointer, a
+      bulk copy spanning the field, and `[p+0x3060]`'s writers being bounded rather than closed.
    6. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — held by
       the standing constraint above, and the first also by kernel-memory access. Unchanged by S5o.
    7. **← active step, and a decision rather than an arm. Step 5 came back empty, so this is now
