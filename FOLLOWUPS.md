@@ -3192,8 +3192,9 @@ validated. The full record is the
   **what happened at the other end is not established** — the read shows where the message is sent,
   and `Vid.sys` has a handler for this very type, so "nothing was bound" and "the existing handler
   received it and retained it" are both live explanations of S5h's hold, wanting different next
-  gates. Telling them apart is what comes next. **S5k, below, told them apart and neither was
-  right**: the handler received the message and *discarded* it.
+  gates. Telling them apart is what comes next. **S5k, below, killed the first and added a third**:
+  Vid is bound, and its handler *drops* a message whose vector nothing claimed — which competes with
+  the second rather than retiring it, the two being separated by a runtime byte S5k did not read.
   **Build**: the plan's hand-rolled `HvCallCreatePort`/SynIC page is the wrong build. `winhvr.sys`
   exports the lot — `WinHvCreatePort`, `WinHvConnectPort`, `WinHvAllocatePartitionSintIndex`,
   `WinHvGetSintMessage`, `WinHvSetEndOfMessage`, `WinHvSetInterceptRoutine` and
@@ -3212,8 +3213,8 @@ validated. The full record is the
   prohibition hardens into a permanent one**, because the routine a registration would displace is
   the one that dispatches to Vid's own per-vector table. Do not call it at all. Full record in
   the [S5j result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
-- **S5k, 2026-09-29: the message was received and dropped, and the receiver is an IOCTL rather than
-  a build.** Both reads S5j called for, against the same two images — `winhvr.sys` `10.0.26100.8972`
+- **S5k, 2026-09-29: an unclaimed vector is dropped inside `Vid.sys`, and the receiver is an IOCTL
+  rather than a build.** Both reads S5j called for, against the same two images — `winhvr.sys` `10.0.26100.8972`
   and `Vid.sys` `10.0.26100.9278`, opened as DbgEng image targets with public PDBs. **The table
   key** is the `HV_PARTITION_ID`: `WinHvSetInterceptRoutine` (`+0x8020`) calls
   `WinHvpReferencePartition`, which binary-searches `WinHvpPartitionArray` by 64-bit key and fails
@@ -3232,9 +3233,14 @@ validated. The full record is the
   *before* calling `WinHvInstallIntercept` with the byte-for-byte descriptor S5b read — type 3,
   `AccessType` 4, the same vector field — reached from `VidHandlerIoctlExceptionRegister`
   (`+0x63630`). **So S5b's install was not wrong, it was half of the arming sequence**, and the half
-  it skipped is the half that makes anyone listen. Neither of S5j's two explanations of S5h's hold
-  survives: Vid was bound and its routine ran, and it discarded the message rather than retaining
-  it. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
+  it skipped is the half that makes anyone listen. Of S5j's two explanations of S5h's hold the first
+  is dead — Vid was bound and its routine ran — and the second gains a **competitor rather than a
+  refutation**: the drop. **Which of the two S5h met turns on `[partition+0xB68][3]`, a runtime byte
+  this gate did not read**, and what stands in for it is a chain — the register and unregister paths
+  set and clear the slot and the hypervisor intercept together, so a claimed slot implies an
+  installed intercept, and S5h's null arms and its `#BR`-installed/`#BP`-raised control both show no
+  `#BP` intercept standing but the probe's own. One live read of that byte settles it directly, and
+  it should come before the IOCTL read. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
   in the **root** — a host bugcheck, not a guest one — for any intercept message type it does not
   handle, including the holes `0x80010005`, `0x80010009`–`0x8001000F` and `0x80010012` inside the
   range it otherwise covers. Full record in the
@@ -3264,15 +3270,18 @@ validated. The full record is the
   run as S5i and is done**; nothing in it touches message delivery, so it neither helps nor blocks.
 
   **Both reads were run as S5k, and there is no receiver to build.** The key is the partition id;
-  Vid was bound, received the message and discarded it because the vector was never claimed in
-  `[partition+0xB68]`, the per-vector table its handler consults. The receiving path — message,
+  Vid is bound and recognises the message, and its handler drops one whose vector is not claimed in
+  `[partition+0xB68]`, the per-vector table it consults. The receiving path — message,
   completion and instruction-pointer advance — already exists per partition and per vector, and what
   arms it is `VidHandlerIoctlExceptionRegister`, which claims the slot and *then* issues the same
-  `WinHvInstallIntercept` S5b read. **So the next step is the IOCTL code and its user-mode surface**,
-  and whether a documented WHP property reaches it — which decides whether S5 is one supported call
-  from passing or needs a driver. A second candidate is live and cheap: **whether the hold is a
-  loop**, since nothing on the drop path injects the exception or advances `RIP`, so the faulting
-  instruction is presumably re-entered. That is an inference S5k did not measure.
+  `WinHvInstallIntercept` S5b read. **So the next step is one live read of `[partition+0xB68][3]`**,
+  which is what separates the drop from S5j's retained explanation directly instead of through
+  S5h's controls, and which decides whether the IOCTL is the thing to look at next at all. **Then
+  the IOCTL code and its user-mode surface**, and whether a documented WHP property reaches it —
+  which decides whether S5 is one supported call from passing or needs a driver. A third candidate
+  is live and cheap: **whether the hold is a loop**, since nothing on the drop path injects the
+  exception or advances `RIP`, so the faulting instruction is presumably re-entered. That is an
+  inference S5k did not measure.
 - **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
   gap rather than one of two. Before S5i it was the mechanism question that governed it: an
   excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
@@ -3317,9 +3326,10 @@ validated. The full record is the
    the key of the table `WinHvSetInterceptRoutine` searches, which decides whether registering
    displaces the entry Hyper-V holds or takes one of its own. **S5k closed that and moved the
    unknown again**: the key is the partition id, Vid holds the entry, and the receiving path already
-   exists — Vid received S5h's message, recognised it, and dropped it because the vector was never
-   claimed in its own per-vector table. So the unknown is now **the IOCTL that claims a vector**,
-   and whether a supported user-mode surface reaches it. The other candidate was **answered by S5c**: the
+   exists — Vid is bound and recognises the message, and drops one whose vector is not claimed in
+   its own per-vector table. So the unknown is now **whether that slot was claimed during S5h**,
+   which is one live read and which S5k argued rather than measured, and then **the IOCTL that
+   claims a vector** and whether a supported user-mode surface reaches it. The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
    rather than VTL-selective — so it buys a live *inspector* and not the stop S5 asks for. Still

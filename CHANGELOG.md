@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The intercept message was received and dropped, and the receiver is an IOCTL rather than a
+- **An unclaimed vector is dropped inside `Vid.sys`, and the receiver is an IOCTL rather than a
   build.** Gate S5k, both reads S5j called for, against `winhvr.sys` `10.0.26100.8972` and `Vid.sys`
   `10.0.26100.9278` opened as DbgEng image targets with public PDBs. **The table key** is the
   partition id — `WinHvSetInterceptRoutine` binary-searches a global partition array and fails with
@@ -22,8 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the handler returns having enqueued nothing, signalled nobody and woken no thread. What claims a
   vector is an IOCTL that reserves the slot and *then* issues the byte-for-byte descriptor gate S5b
   read — **so that install was not wrong, it was half of the arming sequence**, and the half it
-  skipped is the half that makes anyone listen. Neither of S5j's two explanations of the hold
-  survives: the handler received the message and discarded it. The receiver is therefore not
+  skipped is the half that makes anyone listen. Of S5j's two explanations of the hold the first is
+  dead and the second gains a **competitor rather than a refutation**: which branch S5h's own
+  message took turns on a runtime byte this gate did not read, and what stands in for it is a chain
+  through S5h's own controls, with the one live read that would settle it named. The receiver is
+  nonetheless not
   something to build — the message path, the completion and the instruction-pointer advance already
   exist per partition and per vector — and the `WinHvSetInterceptRoutine` prohibition hardens into a
   permanent one, because the routine a registration would displace is the one that would dispatch to
@@ -40,7 +43,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   nothing needs redirecting, and the hold S5h measured is explained as a message posted to a port
   whose owner never asked for an exception intercept — though what happened at the other end is not
   established, `Vid.sys` having a handler for this type, so that and "nothing was bound" are both
-  live explanations the next gate must separate — **separated by S5k above, and neither was right**.
+  live explanations the next gate must separate — **S5k above killed the first and added a third**.
   **Build**: the hand-rolled `HvCallCreatePort` and SynIC message page this gate was specified
   around are unnecessary. `winhvr.sys` exports the whole API — ports, SINT message retrieval,
   `WinHvSetInterceptRoutine`, and `WinHvCompleteIntercept`, which is the *resume* that separates a
