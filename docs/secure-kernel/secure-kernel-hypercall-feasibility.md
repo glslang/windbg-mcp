@@ -3208,6 +3208,111 @@ agreements rather than restatements:
 - **What is left for S5 is exactly one thing, the receiver**, and this read does not help with it:
   nothing above touches message delivery. That gate stands as written under S5h.
 
+### S5j result, 2026-09-29: the message is already addressed to the parent, and the receiver is a displacement rather than an addition
+
+**Two findings, and the second is the one that changes what to build.** The intercept message S5h's
+hold produces is routed to the **parent** — the hypervisor picks the recipient by asking which VTL
+*installed* the vector, and for a parent-installed intercept that is VTL0 whatever VTL the exception
+occurred in. And the root-side API for receiving it already exists, exported, so the hand-rolled
+`HvCallCreatePort` / SynIC page this gate was specified around is **not** what it needs. What it
+does need is a way in that does not take something already taken: `WinHvSetInterceptRoutine` stores
+**one** routine per table entry, and `Vid.sys` imports it.
+
+Same instrument and same image as S5i — [`tools/sk_vmcs_scan.py`](../../tools/sk_vmcs_scan.py)
+against `hvix64.exe` `10.0.26100.9444` — plus `winhvr.sys` and `Vid.sys` read with symbols from the
+Microsoft symbol server, which is what makes the root side legible where the hypervisor has no PDB.
+
+#### Where the message goes, in the hypervisor
+
+`HvMessageTypeX64ExceptionIntercept` is `0x80010003`, and like `0x4004` before it that is one
+constant to look for rather than a structure to recognise. It appears **once** in the whole image,
+at `+0x2C9A9E`, inside the builder at `+0x2C98A8` that fills a `0xF0`-byte payload with the
+faulting context and hands it to `+0x2C5728`, which forwards to the post at `+0x2EB134`.
+
+**The recipient is chosen at `+0x2C95B8`, and this is the part that matters:**
+
+```text
+0x2C9679  mov   dl, byte ptr [rcx + 0x14]        ; start at the ACTIVE VTL
+0x2C967C  movzx r10d, byte ptr [rbx + 0x14]      ; the faulting vector
+0x2C9681  mov   r8d, dword ptr [r9 + 0x63b8]     ; the enabled-VTL set
+          ... next enabled VTL above the current one, else wrap to the lowest ...
+0x2C96CC  mov   rax, qword ptr [r9 + rax*8 + 0x63c8]   ; array[candidate VTL]
+0x2C96D4  mov   eax, dword ptr [rax + 0x1a04]          ; that VTL's OWN installed mask
+0x2C96DD  bt    dword ptr [rcx], r10d                  ; does it contain this vector?
+0x2C96E1  jae   0x2c9688                               ; no -> try the next VTL
+0x2C96F1  call  0x2c98a8                               ; yes -> deliver, VTL = this one
+```
+
+So the scan starts at the VTL that faulted, tries **higher** VTLs first, then wraps to the lowest,
+and delivers to the first whose *own* `+0x1A04` holds the vector. On a `{0,1}` guest, a `#BP` taken
+in VTL1 whose vector the parent installed finds no higher VTL, wraps to **VTL0**, matches the mask
+S5i showed the parent writes — and is delivered as a VTL0 intercept.
+
+That the higher VTL is tried first is the VSM precedence one would want: Secure Kernel sees an
+exception it intercepted for itself before VTL0 does.
+
+**And the post forks on exactly that byte** (`+0x2EB134`): zero takes the parent-directed path,
+stamping the message header from `partition + 0x4550` and posting through `+0x2EC204`; non-zero
+posts to `[VP + VTL*8 + 0x148] + 0x80`, the higher VTL's own SynIC. **So nothing needs to be
+redirected.** The message S5h's hold produced was already addressed to the parent; there was simply
+nothing bound to receive it. That also explains the hold's shape — posted to a port whose owner
+never asked for an exception intercept, never completed, and the VP held until the intercept came
+down.
+
+#### What the root side already has
+
+`winhvr.sys` exports **201** functions, and the ones this gate needs are among them:
+
+| for | exports |
+|---|---|
+| a port | `WinHvCreatePort`, `WinHvConnectPort`, `WinHvDeletePort`, `WinHvAllocatePortId`, `WinHvSetPortProperty` |
+| a message stream | `WinHvAllocatePartitionSintIndex`, `WinHvGetSintMessage`, `WinHvSetEndOfMessage`, `WinHvSetSint` |
+| intercepts | `WinHvInstallIntercept`, **`WinHvSetInterceptRoutine`**, `WinHvCompleteIntercept`, `WinHvRegisterInterceptResult` |
+
+**So the build this gate was specified around is the wrong build.** The plan said
+`HvCallCreatePort`/`HvCallConnectPort` and a SynIC message page hand-rolled into `h3probe.sys`;
+none of that is necessary, because the root's own kernel API does it and a driver can import it.
+`WinHvCompleteIntercept` matters as much as the receive half — it is the *resume*, which is what
+separates a debugger from an observer.
+
+`Vid.sys` is already a full consumer of it, with an intercept thread, a DPC, a preprocess/process
+pair, and — named for this exact case — **`VidExceptionInterceptReturnCallback`**. The root does not
+merely have the plumbing; it has a handler for this message type today.
+
+#### The hazard, which is why this is a finding and not a green light
+
+`WinHvSetInterceptRoutine` is three instructions of substance:
+
+```text
+0x8030  call  0x2b40                         ; look the entry up by the first argument
+0x8038  jne   0x8041                         ; not found -> 0xC035000D
+0x8044  mov   qword ptr [rax + 0x10], rdi    ; routine
+0x8048  mov   qword ptr [rax + 0x18], rbx    ; context
+```
+
+and `+0x2B40` is a binary search over a sorted global table. **One routine and one context per
+entry**, assigned rather than chained — and `Vid.sys` imports `WinHvSetInterceptRoutine`, so an
+entry is already held. Registering does not add a handler beside Hyper-V's; it **replaces** one.
+
+**What it would replace, and how much, depends on the table's key, which this read did not
+identify.** If the key is per-partition the blast radius is one child; if it is per-message-type or
+per-SINT it is every VM on the host, because the displaced handler is what services IO-port, MSR and
+CPUID intercepts. That distinction is the difference between an experiment on a disposable guest and
+one that takes the bench down with it, and it is **the next thing to establish** — from `Vid.sys`'s
+own call sites, which pass the key.
+
+#### What this settles and what it leaves
+
+- **The routing question is answered**: a parent-installed intercept's message is delivered to the
+  parent even when the exception occurred in VTL1. No redirection is needed, and S5's missing half
+  is a *binding*, not a route.
+- **The build is re-scoped**: exported kernel API rather than hand-rolled hypercalls and a SynIC
+  page, with `WinHvCompleteIntercept` supplying the resume.
+- **A hazard the plan did not anticipate**: registration is a displacement, and its scope is
+  unidentified. **Do not call `WinHvSetInterceptRoutine` on this bench until the key is known.**
+- **Still not measured**: no message has been received. S5 does not pass, and nothing here changes
+  the Secure Kernel scope limit, which stands as S5i left it.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility

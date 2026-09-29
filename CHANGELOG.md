@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The intercept message is already addressed to the parent, and the receiver is a displacement
+  rather than an addition.** Gate S5j, the first half of the receiver work. **Routing**:
+  `HvMessageTypeX64ExceptionIntercept` (`0x80010003`) appears once in `hvix64.exe`, and the
+  recipient is chosen by scanning VTLs from the active one upward, wrapping to the lowest, and
+  delivering to the first whose **own** installed mask holds the faulting vector. A `#BP` raised in
+  VTL1 whose vector the parent installed therefore wraps to VTL0 and is delivered as a VTL0
+  intercept, down the parent-directed path. **So S5's missing half is a binding, not a route** —
+  nothing needs redirecting, and the hold S5h measured is explained as a message posted to a port
+  whose owner never asked for an exception intercept and never completed it.
+  **Build**: the hand-rolled `HvCallCreatePort` and SynIC message page this gate was specified
+  around are unnecessary. `winhvr.sys` exports the whole API — ports, SINT message retrieval,
+  `WinHvSetInterceptRoutine`, and `WinHvCompleteIntercept`, which is the *resume* that separates a
+  debugger from an observer — and `Vid.sys` already consumes it, including a
+  `VidExceptionInterceptReturnCallback` for this message type.
+  **Hazard**: `WinHvSetInterceptRoutine` stores one routine per table entry, assigned rather than
+  chained, and `Vid.sys` imports it, so registering *replaces* Hyper-V's handler. How much it
+  replaces depends on the table's key, which this read did not identify — per-partition means one
+  child, per-message-type means every VM on the host. Identifying it is the next step, and nothing
+  should call that function here until it is known.
 - **The hypervisor applies a parent-installed exception intercept at every enabled VTL, by design.**
   Gate S5i, the dispatch read S5b named and S5h skipped, against this host's own `hvix64.exe`
   `10.0.26100.9444`. **It worked where two earlier attempts on that image failed because it asked an
