@@ -27,7 +27,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   arm could obtain. Also corrected: the library's "attach partition" call is the VM worker's *start
   the virtual processors* operation, not a second client joining; it was not called. **S5's
   obstacle has changed shape** — the mechanism exists and is exported, and what blocks it is a
-  refused open — with three cheap arms left before the VMM-of-our-own question, which is a rig
+  refused open — with two arms left before the VMM-of-our-own question, which is a rig
   rather than an arm.
 - **The receiver is a user-mode export, and there is no driver left to write.** Gate S5m, the IOCTL
   read S5k named, against `Vid.sys`, `vid.dll` and `WinHvPlatform.dll`. The control code is
