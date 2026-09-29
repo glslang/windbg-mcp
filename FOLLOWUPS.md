@@ -3236,11 +3236,17 @@ validated. The full record is the
   it skipped is the half that makes anyone listen. Of S5j's two explanations of S5h's hold the first
   is dead — Vid was bound and its routine ran — and the second gains a **competitor rather than a
   refutation**: the drop. **Which of the two S5h met turns on `[partition+0xB68][3]`, a runtime byte
-  this gate did not read**, and what stands in for it is a chain — the register and unregister paths
-  set and clear the slot and the hypervisor intercept together, so a claimed slot implies an
-  installed intercept, and S5h's null arms and its `#BR`-installed/`#BP`-raised control both show no
-  `#BP` intercept standing but the probe's own. One live read of that byte settles it directly, and
-  it should come before the IOCTL read. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
+  this gate did not read and nothing already measured stands in for.** An attempt to substitute
+  S5h's controls was retracted in review: Vid's register and unregister paths do set and clear the
+  slot and the hypervisor intercept together, but `h3probe.sys` writes that mask too, and **every
+  probe install is paired with a raw `AccessType = 0` removal that clears the bit without clearing
+  the slot** — so on a probed child the two desynchronise and a control arm passes either way. One
+  live read of that byte settles it, and it comes before the IOCTL read.
+  **Second new hazard, from the same fact**: if a VID client ever holds a vector this probe
+  installs, the probe's teardown strips that client's intercept and leaves Vid believing it armed,
+  silently. Whether a removal clears the bit outright is unread — S5i read the install as an
+  unconditional `OR` and not the removal — so `hvix64.exe`'s type-3 removal path settles the hazard
+  and the retracted argument together. **New hazard**: `VidInterceptPreprocess` ends its switch in `__fastfail(FAST_FAIL_INVALID_ARG)`
   in the **root** — a host bugcheck, not a guest one — for any intercept message type it does not
   handle, including the holes `0x80010005`, `0x80010009`–`0x8001000F` and `0x80010012` inside the
   range it otherwise covers. Full record in the
