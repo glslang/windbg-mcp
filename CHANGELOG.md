@@ -31,8 +31,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whether a registration displaces anything turns on the table's key, which this read did not
   identify — per-partition means one child, per-message-type means every VM on the host, an
   allocated handle means no displacement at all. Assume displacement, since the cost of being wrong
-  is asymmetric; identifying the key is the next step, and nothing should call that function here
-  until it is known.
+  is asymmetric, and call nothing here until it is known. **Two reads come next, not one**: that
+  key, and Vid's own path for `0x80010003` through to completion — the key says whether a
+  registration collides, and only the path says why the intercept stays outstanding, which is the
+  other live explanation of the hold and the one a second receiver would not fix.
 - **The hypervisor applies a parent-installed exception intercept at every enabled VTL, by design.**
   Gate S5i, the dispatch read S5b named and S5h skipped, against this host's own `hvix64.exe`
   `10.0.26100.9444`. **It worked where two earlier attempts on that image failed because it asked an

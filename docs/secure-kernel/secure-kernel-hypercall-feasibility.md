@@ -3330,6 +3330,12 @@ is no displacement at all. All three are open. **Establishing which is the next 
   call `WinHvSetInterceptRoutine` on this bench until it is known.**
 - **Still not measured**: no message has been received. S5 does not pass, and nothing here changes
   the Secure Kernel scope limit, which stands as S5i left it.
+- **Two reads come next, not one**, because the hold has two live explanations and they diverge:
+  the **table key**, which says whether a registration collides at all and at what scope; and
+  **Vid's own path for `0x80010003`** — preprocess, process, `VidExceptionInterceptReturnCallback`,
+  completion — which is the only thing that says *why the intercept stays outstanding*. The key
+  cannot answer that, and if Hyper-V's handler is receiving and retaining the message then a second
+  receiver is the wrong build whatever the key turns out to be.
 
 ## Explicitly out of scope
 
