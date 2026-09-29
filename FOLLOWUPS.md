@@ -3476,6 +3476,20 @@ validated. The full record is the
   tail-call the saved pair for everything else. That else-branch is also what keeps the arm clear of
   `VidInterceptPreprocess`'s `__fastfail` holes (S5k): nothing is synthesised, only forwarded.
 
+  **The swap is not atomic, and the ABI offers nothing that would make it so.**
+  `WinHvSetInterceptRoutine` stores the routine and the context in two separate stores and
+  `WinHvpOnInterception` loads them in two separate loads, so an intercept dispatched *during*
+  either the install or the restore can pair the new routine with Vid's context, or Vid's routine
+  with ours — and either is the host bug check this gate exists to avoid, with both callbacks
+  perfectly correct. There is no quiesce: nothing exported pauses or drains intercept dispatch for
+  a partition, so this cannot be remedied, only narrowed and declared. **What narrows it** is the
+  ordering the arms use, which is deliberate rather than incidental: chain **before** arming any
+  vector and remove the vector **before** unchaining, so no exception intercept is ever armed
+  across a swap and only an IO-port, MSR or CPUID intercept could land in the window. **What it
+  does not do is close it**, and the window is real on any busy partition. Both arms swapped with
+  the forward counter at zero throughout, so on this bench it was never exercised — which is an
+  absence of dispatch, not evidence that the race is benign.
+
   **Build**, all in `h3probe.sys`: a kernel-read IOCTL — the capability S5l named as missing, which
   unblocks the replicated `[partition+0xB68][3]` read as a side effect — the chaining receiver, and
   on the resume path **`VidInterceptAdvanceInstructionPointer` and then** `WinHvCompleteIntercept`:
