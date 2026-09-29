@@ -9,11 +9,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The hypervisor applies a parent-installed exception intercept at every enabled VTL, by design.**
+  Gate S5i, the dispatch read S5b named and S5h skipped, against this host's own `hvix64.exe`
+  `10.0.26100.9444`. **It worked where two earlier attempts on that image failed because it asked an
+  architectural question instead of a structural one**: those went looking for a hypercall dispatch
+  table by shape and found the IDT and a page-table walk, while on Intel VMX an exception intercept
+  *is* the VMCS exception bitmap, field `0x4004` — one constant in one instruction. New tool
+  `tools/sk_vmcs_scan.py` finds it and walks outward from it.
+  Five steps carry the result: `HvCallInstallIntercept` at `+0x295800`; **the VTL decision at
+  `+0x295879`**, which compares the target partition against the caller's own and sets **VTL := 0
+  for any child**, while the self branch takes the caller's active VTL and refuses VTL 0 — which is
+  why the ABI needs no VTL field and why S5b found every byte it put where one might hide was
+  ignored; `InterceptType == 3` landing at `+0x2C9430`, which ORs `1 << vector` into
+  `array[VTL].0x1A04`; the recompute at `+0x2BECC8`, which descends the enabled-VTL set **seeded
+  with `array[0].0x1A04`**, so a parent's mask lands in *every* VTL's effective mask; and
+  `+0x331AA8`, which programs the bitmap for whichever VTL the VP is running.
+  **So S5b's scope question closes in the second direction — implicitly every VTL — and S5h's hold
+  was genuine VTL1 interception.** The retraction in #412 was right about what the halt evidence
+  could carry and wrong about the conclusion, which is true on other evidence.
+  The read also independently explains four things S5b measured from the other side: the
+  `AccessType` 0-or-4 rule, the vector ceiling and the per-partition permitted-vector mask that
+  refused `0x1F`, the block layout, and the ignored spare bytes.
+  **And the Secure Kernel limit narrows**: a VMCS exception bitmap does not distinguish CPL 0 from
+  CPL 3 and the bitmap is selected by VTL alone, so nothing in the mechanism separates VTL1 user
+  mode from VTL1 kernel mode. That retires the specific reason to doubt it without making it a
+  measurement.
 - **A VTL1-raised exception is held by a parent-installed intercept and handed back intact — and
-  which VTL takes it is not settled.** Gate S5h. S5b installed and removed an intercept without
-  provoking anything, so it could not tell an implicitly-VTL0 intercept from an
+  which VTL takes it was settled separately.** Gate S5h. S5b installed and removed an intercept
+  without provoking anything, so it could not tell an implicitly-VTL0 intercept from an
   implicitly-every-VTL one and recorded the route as *unresolved on scope*; this gate measures the
-  **behaviour** and leaves that scope question open. S5g's enclave supplies
+  **behaviour** and leaves that scope question to S5i above, which answers it. S5g's enclave supplies
   the missing piece — a VTL1 exception raised by code we wrote, rather than a planted `int 3` in
   Secure Kernel, which the plan excludes. One guest-side binary raises `#BP` in both VTLs and counts
   what its own `__except` catches, so the arms differ in the VTL and in nothing else, and the count
@@ -38,13 +63,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **S5 still does not pass, and there are two next gates rather than one.** Nothing was delivered to
   *us*, because this probe holds no port — though the root's own stack owns one for each child, and
   an exception intercept it never asked for landing there uncompleted is the likeliest mechanism of
-  the hold, so **the receiver gate** establishes where that message goes before building one. **The
-  dispatch-read gate** — `hvix64.exe`'s intercept path, for a check on the active VTL — is
-  independent, and is what the mechanism turns on.
-  **A working receiver would not close the gate by itself**: the enclave is VTL1 *user* mode and
-  Secure Kernel is VTL1 *kernel* mode, dispatching its own exceptions without returning to VTL0, so
-  an excursion-mediated hold would not reach it at all. The mechanism question governs the scope
-  question rather than sitting beside it.
+  the hold, so **the receiver gate** establishes where that message goes before building one. The
+  dispatch-read gate that stood beside it was run as S5i, above, and is done.
+  **A working receiver would still leave Secure Kernel's own code untested**: the enclave is VTL1
+  *user* mode and Secure Kernel is VTL1 *kernel* mode. Before S5i that gap was a mechanism question,
+  since an excursion-mediated hold would not have reached Secure Kernel at all; S5i retires that and
+  leaves an architectural inference.
 - **The first four runs of that gate read the VTL1 arm as *advancing*, and it is retracted here.**
   The counts — 1,902, 6,396, 15,076, 18,486 — were all the monitor's final sample, written *after*
   teardown removed the intercept and the raiser finished, and one of them became a "405x slower but

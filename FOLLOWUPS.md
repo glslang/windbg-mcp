@@ -2000,10 +2000,10 @@ overstated the first two into blockers and got the third wrong.**
   VTL1 is fully read/write from the root by that route and refused both directions by the
   hypercall, and the **patch** half of a software breakpoint is solved while the **catch** half
   (S5) is not. **S5h has since measured a catch for VTL1 *user* mode** — a parent-installed exception
-  intercept holds a `#BP` raised there and hands it back on removal — while leaving two things
-  untested: whether anything can *receive* the resulting stop, and whether the intercept acts in VTL1
-  at all rather than on a VTL0 event the dispatch produces. Extending either to Secure Kernel's own
-  code is an inference this record has not tested.
+  intercept holds a `#BP` raised there and hands it back on removal, and **S5i has since read the
+  hypervisor and found that intercept applied at every enabled VTL by design**. What is still
+  untested is whether anything can *receive* the resulting stop, and whether any of it reaches
+  Secure Kernel's own code — an architectural inference after S5i rather than an open mechanism.
 
 ### S0 — the gate that decides how much setup a user needs — **RUN 2026-09-26, PASS**
 
@@ -2963,11 +2963,11 @@ outright, so there is no extended form either. The full record, with the arm tab
   to receive on and a VTL1 exception that is **not** a planted `int 3`. Cheaper than the second
   candidate, and it would make it unnecessary. **Half-answered on 2026-09-28 by S5h, below, taking
   the live route**: S5g's enclave supplied the VTL1 exception, and a `#BP` raised there is held and
-  handed back without any port — so the *behaviour* is measured. **The static read is still
-  needed**, and the sentence above is why it was skipped rather than why it is unnecessary: the live
+  handed back without any port — so the *behaviour* was measured while the scope was not: the live
   test cannot separate the hypervisor taking the trap in VTL1 from it taking a VTL0 event that
-  dispatching the VTL1 exception produces, so *whether a parent-installed intercept covers VTL1*
-  remains exactly as open as this bullet left it.
+  dispatching the VTL1 exception produces. **Fully answered on 2026-09-29 by S5i**, which took the
+  other way in this bullet names and found the parent's mask seeded into every enabled VTL's
+  effective bitmap. Both ways in were needed in the end, and neither made the other unnecessary.
 - **The second was measured as S5c on 2026-09-28** — `HvCallSetVpRegisters` (`0x0051`) writing
   `HvRegisterExplicitSuspend` — and it **works, without being the stop S5 asks for**. See below.
 
@@ -3120,10 +3120,11 @@ validated. The full record is the
   Eleven inbox driver images started in the VBS guest to provoke VTL1 would not stop
   and stay loaded until it reboots. Harmless — drivers for hardware the VM lacks — but a later gate
   reading its module list should know why they are there.
-- **S5h, 2026-09-28: a VTL1-raised exception is held and handed back, and which VTL takes it is not
-  settled.** S5g's enclave supplies a VTL1 exception that is not a planted `int 3`, so S5b's leftover
-  could finally be provoked — though what came back answers the *behaviour* and not S5b's scope
-  question, which stays open (see the retraction two bullets down).
+- **S5h, 2026-09-28: a VTL1-raised exception is held and handed back.** S5g's enclave supplies a
+  VTL1 exception that is not a planted `int 3`, so S5b's leftover could finally be provoked. What
+  came back answered the *behaviour* and not S5b's scope question — **S5i settled that separately
+  on 2026-09-29**, by reading the hypervisor; the retraction two bullets down is about what the
+  halt evidence could carry, and it stands.
   One binary raises `#BP` in both VTLs and counts what
   its own `__except` catches, so the arms differ in the VTL and nothing else. With the intercept
   standing, **the guest handled 0 of 20,000 in every arm** — 120 consecutive zero samples over 24.4 s
@@ -3147,28 +3148,53 @@ validated. The full record is the
   exception over a VTL0 one is if anything a reason to take the excursion seriously. And *"only the
   raising thread is held"* was inferred from a connection that raises no `#BP` at all. **What would
   settle the first** is the route S5b named and this gate skipped: `hvix64.exe`'s intercept dispatch,
-  read for a check on the active VTL, with Ghidra now on this bench.
+  read for a check on the active VTL. **Run as S5i on 2026-09-29, and it found one**: the check is
+  at install time rather than in delivery, and it sets the VTL to 0 for any child while seeding that
+  slot into every VTL's effective mask — so the intercept does cover VTL1 and the retraction above
+  stands as a statement about the halt evidence, not about the conclusion.
 - **The first four runs read the VTL1 arm as *advancing* and that is retracted.** The counts
   reported — 1,902, 6,396, 15,076, 18,486 — were all written by the monitor's final sample, *after*
   teardown removed the intercept and the raiser finished, and one of them became a "405x slower but
   advancing" rate supporting a reading in which the two VTLs were reached differently. The trace says
   the count first moves at sample 121/121 and 219/219. **Read where a count first moved, not what it
   ended at**; the last sample is on the wrong side of the release.
-- **S5 still does not pass, and there are now two next gates rather than one.** Its condition wants a
+- **S5i, 2026-09-29: the dispatch read is done, and the intercept reaches VTL1 by design.** The
+  route S5b named and S5h skipped, run against this host's own `hvix64.exe` `10.0.26100.9444`
+  (SHA-256 `CF5AF317…40CE8A`) with [`tools/sk_vmcs_scan.py`](tools/sk_vmcs_scan.py). **It worked
+  where two earlier attempts failed because it asked an architectural question instead of a
+  structural one**: on Intel VMX an exception intercept *is* the VMCS exception bitmap, field
+  `0x4004`, so the anchor is one constant in one instruction rather than a table to recognise. Five
+  steps carry it: `HvCallInstallIntercept` at `+0x295800`; the VTL decision at `+0x295879`, which
+  compares the target partition against `gs:[0x360]` and sets **VTL := 0 for any child** while the
+  self branch takes the caller's own VTL and refuses VTL 0; `InterceptType == 3` landing at
+  `+0x2C9430`, which ORs `1 << vector` into `array[VTL].0x1A04` indexed `[partition + VTL*8 +
+  0x63C8]`; the recompute at `+0x2BECC8`, which descends the enabled-VTL set **seeded with
+  `array[0].0x1A04`** so that a parent's mask lands in *every* VTL's effective mask at `+0x1A0C`;
+  and `+0x331AA8`, which programs the bitmap for whichever VTL the VP is running. **So S5b's scope
+  question closes in the second direction — implicitly every VTL — and S5h's hold was genuine VTL1
+  interception.** #412 was right to withdraw that claim from the halt evidence, which did not carry
+  it; the claim is true on different evidence. Full record, with the cross-checks against S5b's live
+  arms, in the [S5i result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
+- **The Secure Kernel limit narrows but is still not measured.** A VMCS exception bitmap does not
+  distinguish CPL 0 from CPL 3, and step 5 selects it by VTL alone, so nothing in the mechanism
+  separates VTL1 *user* mode from VTL1 *kernel* mode. That retires the specific reason to doubt the
+  extension to Secure Kernel's own code without making it a measurement, and S5a's prohibition on
+  planting an `int 3` there to check is unchanged.
+- **S5 still does not pass, and after S5i there is one next gate rather than two.** Its condition wants a
   stop *delivered to a debugger*, and nothing here was delivered to **us** — this probe holds no
   port. That is not the same as nothing receiving it: the root's own stack owns a port for each
   child (S5b found eleven `Vid.sys` sites installing intercepts on children), and an exception
   intercept it never asked for landing there, never completed, would produce exactly this hold.
-  **(a) The receiver** therefore starts by establishing where the message goes today, from `Vid.sys`
+  **The receiver** therefore starts by establishing where the message goes today, from `Vid.sys`
   and `winhvr.sys`, and only then builds `HvCallCreatePort`/`HvCallConnectPort` and a SynIC message
-  page into `h3probe.sys`. **(b) The dispatch read** — `hvix64.exe`'s intercept path, for a check on
-  the active VTL — is independent of it and is what the mechanism question turns on.
-- **A working receiver would not close the gate on its own, and the scope limit is why.** The enclave
-  is VTL1 **user** mode; Secure Kernel is VTL1 **kernel** mode and dispatches its own exceptions
-  without returning to VTL0. So if the hold is excursion-mediated it would not reach Secure Kernel at
-  all, and the mechanism question (b) *governs* the scope question rather than sitting beside it —
-  a port that receives an enclave's `#BP` would still leave S5's actual target untested. S5a's
-  prohibition on planting an `int 3` in Secure Kernel to check is unchanged.
+  page into `h3probe.sys`. The dispatch read that used to sit beside it **was run as S5i and is
+  done**; nothing in it touches message delivery, so it neither helps nor blocks this one.
+- **A working receiver would still leave Secure Kernel's own code untested**, which is now the only
+  gap rather than one of two. Before S5i it was the mechanism question that governed it: an
+  excursion-mediated hold would not have reached Secure Kernel at all. S5i retires that — the bitmap
+  is selected by VTL and a VMCS bitmap is privilege-blind — so what remains is an architectural
+  inference rather than an open mechanism. S5a's prohibition on planting an `int 3` in Secure Kernel
+  to check is unchanged.
 
 ### Out of scope, with the reason rather than as a list
 
@@ -3197,13 +3223,13 @@ validated. The full record is the
    ten builds. So the remaining unknown is narrower and differently shaped — whether a VTL1 stop can
    be driven from the hypervisor or the root *without* guest-side code. **S5b split the
    named candidate for that in two**: a parent can install an exception intercept on a child and has
-   no field to aim one at a VTL, which left *whether it covers VTL1 anyway* unresolved — **and S5h
-   leaves it unresolved**, having measured the behaviour rather than the scope: with the intercept
-   standing, a `#BP` raised in VTL1 user mode never reaches the guest's own dispatch and is handed
-   back intact when it comes down, but whether the hypervisor took it *in VTL1* or took a VTL0 event
-   that dispatching it produced is open. So there are two unknowns where there was one — whether the
-   root can **receive** (`HvCallCreatePort`/`HvCallConnectPort`, untried) and which VTL the intercept
-   acts in (`hvix64.exe`'s dispatch, unread). The other candidate was **answered by S5c**: the
+   no field to aim one at a VTL, which left *whether it covers VTL1 anyway* unresolved. **S5h then
+   measured the behaviour and S5i the scope**: with the intercept standing, a `#BP` raised in VTL1
+   user mode never reaches the guest's own dispatch and is handed back intact when it comes down,
+   and the hypervisor seeds a parent's installed mask into *every* enabled VTL's effective exception
+   bitmap. So the unknown is back to one, and it is the one this gate has never had — whether the
+   root can **receive** what the intercept produces (`HvCallCreatePort`/`HvCallConnectPort`,
+   untried). The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
    rather than VTL-selective — so it buys a live *inspector* and not the stop S5 asks for. Still

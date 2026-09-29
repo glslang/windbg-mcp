@@ -3014,6 +3014,140 @@ nothing**, which is worth recording because S5g cost it four reboots.
     also answer it from the other side, through the delivery metadata — so either experiment can go
     first, and neither makes the other unnecessary for the *other* question.
 
+### S5i result, 2026-09-29: the intercept reaches VTL1 by design, and the hypervisor says so in five steps
+
+**A parent-installed exception intercept is applied at every enabled VTL, and that is deliberate
+rather than incidental.** S5b left the scope question open — with no VTL selector in the ABI, an
+intercept is either implicitly VTL0 or implicitly every VTL — and S5h could not close it, because
+its halt readings fit an excursion just as well as a VTL1 interception. Reading the hypervisor
+settles it: the mask a parent installs is seeded at the child's VTL0 slot and **OR'd into every
+VTL's effective mask** by a loop whose whole purpose is that propagation.
+
+So S5b's question resolves in the second direction, and **S5h's hold was genuine VTL1
+interception.** #412 was right to withdraw that claim from the halt evidence — the evidence did not
+carry it — and the claim itself turns out to be true on different evidence.
+
+**Why this read succeeded where two earlier ones failed.** Both earlier attempts went looking for a
+*hypercall dispatch table* by structural heuristics and found the IDT and a 512-entry page-table
+walk (recorded under S5a). This one asked an architectural question instead. On Intel VMX an
+exception intercept **is** the VMCS exception bitmap, field encoding `0x4004`: the hypervisor must
+`vmwrite` it, and an exception whose bit is clear never exits to the hypervisor at all. That is one
+constant in one instruction, and it is reachable by scanning rather than by guessing at layout. The
+instrument is [`tools/sk_vmcs_scan.py`](../../tools/sk_vmcs_scan.py).
+
+**Measured against** `C:\Windows\System32\hvix64.exe`, **`10.0.26100.9444`**, SHA-256
+`CF5AF317F300B7DA25F37D5DC6CA75BFF91B6B868D89F337D23EC1773340CE8A` — this host's own hypervisor,
+which is the one S5b and S5h ran against. All RVAs below are image-relative; the image base is
+`0xFFFFF80000000000` and there is no PDB for it. The exception directory yields 5,763 functions
+covering **97.2%** of the executable bytes, and of 417 `vmwrite`/`vmread` sites 373 resolve to an
+immediate field encoding.
+
+#### The chain, in the five steps that carry it
+
+| # | where | what it does |
+|---|---|---|
+| 1 | `+0x295800` | `HvCallInstallIntercept`: reads `PartitionId` at `+0`, `AccessType` at `+8`, `InterceptType` at `+0xC`, `InterceptParameter` at `+0x10`, and looks the partition up |
+| 2 | `+0x295879` | **the VTL decision.** `cmp rdi, rax` against `gs:[0x360]`, the caller's own partition |
+| 3 | `+0x2C9430` | `InterceptType == 3` lands here: `array[VTL].0x1A04 \|= 1 << vector`, indexed `[partition + VTL*8 + 0x63C8]` |
+| 4 | `+0x2BECC8` | for every VTL in the set at `+0x63B8`, descending: `array[vtl].0x1A0C = accumulated 0x1A04 \| array[vtl].0x1A08`, **seeded with `array[0].0x1A04`** |
+| 5 | `+0x331AA8` | programs the VMCS bitmap from `array[current VTL].0x1A0C`, through the `vmwrite 0x4004` accessor at `+0x32F3D8` |
+
+**Step 2 is the answer to the question as asked.** There is a check on the VTL, and it is not in the
+dispatch of a delivered exception — it is at *install* time, and it decides which VTL slot the
+intercept is written to:
+
+```text
+0x295868  mov  rax, qword ptr gs:[0x360]     ; the calling partition
+0x295871  mov  rdi, qword ptr [rbp + 0x20]   ; the target partition
+0x295879  cmp  rdi, rax
+0x29587C  je   0x295931                      ; target IS self -> use the caller's own VTL
+0x295882  mov  cl, r14b                      ; target is a CHILD -> VTL := 0
+```
+
+`r14d` is zeroed on entry, so **a parent naming a child always installs at VTL 0** — which is
+exactly why the ABI needs no VTL field, and why S5b found every byte it put where a VTL might hide
+was ignored. The self branch instead takes the caller's own active VTL and *requires it to be
+non-zero*, returning status `8` otherwise:
+
+```text
+0x295931  mov   rax, qword ptr gs:[0x358]    ; the current virtual processor
+0x29593E  mov   rcx, qword ptr [rax + 0x3c0] ; its per-VTL context
+0x295945  mov   cl, byte ptr [rcx + 0x14]    ; the active VTL
+0x295948  test  cl, cl
+0x29594A  jne   0x295885                     ; VTL 0 installing on itself is refused
+```
+
+That is Secure Kernel's own path — `ShvlInstallExceptionIntercept` issues `0x004D` with
+`PartitionId` **SELF**, which S5b read from the 26100.9457 sample — and it explains why only a
+higher VTL may use it.
+
+**Step 4 is why VTL0's slot is not a VTL0-only slot.** The recompute descends the enabled-VTL set
+and carries a mask down with it, starting from VTL0's:
+
+```text
+0x2BECD2  mov  r9d, dword ptr [rax + 0x1a04]        ; seed := array[0].1A04
+0x2BECE7  movzx edx, cl                             ; loop: edx := this VTL
+0x2BECED  mov  rcx, qword ptr [r8 + rdx*8 + 0x63c8]
+0x2BECF5  or   eax, dword ptr [rcx + 0x1a08]
+0x2BECFB  mov  dword ptr [rcx + 0x1a0c], eax        ; effective := seed | own
+0x2BED0E  or   r9d, dword ptr [rax + 0x1a04]        ; seed |= this VTL's own
+```
+
+On a guest with VTLs `{0,1}` that is: `array[1].1A0C = array[0].1A04 | array[1].1A08`, then
+`array[0].1A0C = array[0].1A04 | array[1].1A04 | array[0].1A08`. **The parent's mask is in VTL1's
+effective mask**, and a higher VTL's own intercepts reach itself and every VTL below it.
+
+**Step 5 is privilege-blind, which matters for Secure Kernel.** The bitmap is selected by
+`byte ptr [r9 + 0x14]` — the same field step 2 reads as the caller's VTL, used in a second, independent
+function, which is the strongest cross-check available without symbols — and a VMCS exception
+bitmap does not distinguish CPL 0 from CPL 3. So nothing in this mechanism separates VTL1 *user*
+mode from VTL1 *kernel* mode. That removes the specific reason S5h had to doubt that its result
+extends to Secure Kernel's own code; it does not make that a measurement, and the prohibition on
+planting an `int 3` in Secure Kernel is unchanged.
+
+#### Four things S5b measured that this read independently explains
+
+The read was done from the callee side and the live arms from the caller side, so these are
+agreements rather than restatements:
+
+| S5b measured | the code says |
+|---|---|
+| access mask `0xFFFFFFFF` → `0x0005 INVALID_PARAMETER` | `test r8d, 0xfffffffb` — `AccessType` may only be `0` or `4` |
+| vector `0x1F` refused, `#BP` and `#BR` accepted | `cmp cx, 0x1f / ja` rejects above `0x1F`, then a per-partition permitted-vector mask at `+0x6124` gates the rest, with `or eax, 0x18` always permitting `#BP` and `#OF` |
+| the block is `PartitionId`, `AccessType`, `InterceptType`, `InterceptParameter` | the handler reads exactly those at `+0`, `+8`, `+0xC`, `+0x10` |
+| every byte put where a VTL might hide was ignored | nothing downstream of step 2 reads the block again for a VTL; the VTL comes from the self/child comparison |
+
+#### What this does not establish
+
+- **It is static, and hvix64 has no PDB.** Every field name here is inferred from use:
+  `+0x14` as the VTL (two independent uses, both consistent), `+0x63B8 & 7` as the enabled-VTL set
+  (three bits, matching the `EnabledVtlSet` of `0x3` and `0x1` the live arms read), `+0x63C8` as the
+  per-VTL array (indexed by the same quantity in four functions). No symbol confirms any of them.
+- **One build, one hypervisor, Intel only.** `10.0.26100.9444`, the host's own. `hvax64.exe` — the
+  AMD hypervisor, which uses an SVM intercept vector rather than a VMCS bitmap — is not read here
+  and nothing above transfers to it.
+- **A loose end that is not a contradiction.** The VP-initialisation path at `+0x334223` programs
+  the bitmap from `array[vtl].0x1A08` where the runtime path uses `+0x1A0C`. It cannot be what
+  applies a *later* install, because an install recomputes `+0x1A0C` and then notifies the VPs
+  (`+0x2BECC8` then `+0x2BED3C`), and `+0x1A08` has no writer but the type-16 installer and a
+  zeroing at teardown. Why initialisation reads the other field is unestablished.
+- **The scan reads immediates.** A field encoding arriving computed or loaded from data is invisible
+  to it, which is the same limit `sk_hypercall_scan.py` records; 44 of 417 `vmwrite`/`vmread` sites
+  did not resolve and were not chased.
+- **It says nothing about delivery.** Where the resulting intercept *message* goes is untouched
+  here, and remains S5's open half.
+
+#### What it changes, and what to run next
+
+- **S5b's scope question is closed**: implicitly every VTL. Do not re-open it and do not re-run the
+  spare-byte arms.
+- **S5h's mechanism question is closed**: the hold is VTL1 interception. The excursion hypothesis is
+  retired.
+- **The Secure Kernel limit narrows to an architectural inference** rather than an open mechanism,
+  as step 5 explains — still not measured.
+- **What is left for S5 is exactly one thing, the receiver**, and this read does not help with it:
+  nothing above touches message delivery. That gate stands as written under S5h.
+
 ## Explicitly out of scope
 
 **Execution control.** Breakpoints and single-stepping in VTL1 are not part of this feasibility

@@ -1,0 +1,336 @@
+r"""Find where a hypervisor programs the VMX exception bitmap, and whether it is per-VTL.
+
+`FOLLOWUPS.md` item 103 gate S5. S5h measured the behaviour: with a parent-installed
+exception intercept standing, a `#BP` raised in VTL1 user mode never reaches the guest's
+own dispatch, and is handed back intact when the intercept comes down. What S5h could
+**not** settle is the mechanism -- whether the hypervisor takes the trap in VTL1, or
+takes a VTL0 event that dispatching the VTL1 exception produces. Its halt readings are
+consistent with both, and that question governs whether any of it reaches Secure Kernel,
+which dispatches its own exceptions without returning to VTL0.
+
+**Why the VMCS and not the dispatch table.** Two earlier static attempts on this image
+went looking for a hypercall dispatch table by structural heuristics and found the IDT
+and a 512-entry page-table walk instead (S5a's record). This asks an architectural
+question instead. On Intel VMX an exception intercept *is* the VMCS **exception bitmap**,
+field encoding `0x4004`: the hypervisor must `vmwrite` it, and a guest exception whose
+bit is clear never exits to the hypervisor at all. Hyper-V runs each VTL on its own VMCS.
+So:
+
+  * if the bitmap a parent installs is programmed into **every** VTL's VMCS, a VTL1 `#BP`
+    exits directly and S5h's hold is genuine VTL1 interception;
+  * if it reaches only VTL0's, a VTL1 `#BP` cannot exit on it, and the hold must be
+    mediated by something else.
+
+`0x4004` is a specific constant in a specific instruction, which is a far narrower thing
+to look for than "a dispatch table".
+
+What this tool does NOT do, and the limits are the same family as `sk_hypercall_scan.py`'s:
+it reads **immediates**, so a field encoding that arrives computed or loaded from data is
+invisible to it; it decodes each function from the exception directory rather than
+sweeping, so bytes in no `RUNTIME_FUNCTION` are not covered and the tool reports how many;
+and finding a write site is not the same as knowing what VTL state feeds it -- that is the
+read this tool exists to make possible, not one it performs.
+"""
+import argparse
+import os
+import struct
+import sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+import capstone                                        # noqa: E402
+from sk_hypercall_scan import PE                       # noqa: E402
+
+# Intel SDM vol 3, VMCS field encodings. The 32-bit control fields; the exception bitmap
+# is the one this gate is about, and the neighbours are here so a hit can be read in
+# context rather than in isolation -- a function that writes several of these is the
+# VMCS setup path, one that writes only 0x4004 is an update.
+VMCS_FIELDS = {
+    0x0000: "VPID",
+    0x4000: "PIN_BASED_VM_EXEC_CONTROL",
+    0x4002: "CPU_BASED_VM_EXEC_CONTROL",
+    0x4004: "EXCEPTION_BITMAP",
+    0x4006: "PAGE_FAULT_ERROR_CODE_MASK",
+    0x4008: "PAGE_FAULT_ERROR_CODE_MATCH",
+    0x400A: "CR3_TARGET_COUNT",
+    0x400C: "VM_EXIT_CONTROLS",
+    0x4012: "VM_ENTRY_CONTROLS",
+    0x4016: "VM_ENTRY_INTR_INFO_FIELD",
+    0x401E: "SECONDARY_VM_EXEC_CONTROL",
+    0x4402: "EXIT_REASON",
+    0x4404: "VM_EXIT_INTR_INFO",
+    0x681E: "GUEST_RIP",
+}
+
+EXCEPTION_BITMAP = 0x4004
+
+SUB64 = {}   # capstone gives sub-registers; normalise to the 64-bit name
+
+
+def _norm(name):
+    """eax/ax/al -> rax, r8d/r8w/r8b -> r8. A field encoding is loaded as a 32-bit
+    immediate into eax and then used as rax by vmwrite, so tracking must span the two."""
+    if not name:
+        return None
+    n = name.lower()
+    if n in SUB64:
+        return SUB64[n]
+    return n
+
+
+def _build_subregs():
+    for a, b, c, d in (("rax", "eax", "ax", "al"), ("rbx", "ebx", "bx", "bl"),
+                       ("rcx", "ecx", "cx", "cl"), ("rdx", "edx", "dx", "dl"),
+                       ("rsi", "esi", "si", "sil"), ("rdi", "edi", "di", "dil"),
+                       ("rbp", "ebp", "bp", "bpl"), ("rsp", "esp", "sp", "spl")):
+        for s in (a, b, c, d):
+            SUB64[s] = a
+    for i in range(8, 16):
+        for suf in ("", "d", "w", "b"):
+            SUB64["r%d%s" % (i, suf)] = "r%d" % i
+
+
+_build_subregs()
+
+
+def scan_function(md, code, base):
+    """Walk one function, tracking reg <- immediate, and report every vmwrite/vmread
+    with the field encoding it used when that encoding is a tracked constant.
+
+    Deliberately simple: a linear pass with a constant map that is cleared per call and
+    per unknown write to a register. It cannot follow a field encoding through memory or
+    arithmetic, which is exactly the `immediates` limit the module docstring states.
+    """
+    regs = {}
+    hits = []
+    insns = list(md.disasm(code, base))
+    for i, ins in enumerate(insns):
+        m = ins.mnemonic
+        if m in ("vmwrite", "vmread"):
+            ops = [o.strip() for o in ins.op_str.split(",")]
+            # vmwrite FIELD, VALUE  /  vmread DEST, FIELD
+            field_op = ops[0] if m == "vmwrite" else (ops[1] if len(ops) > 1 else None)
+            value_op = ops[1] if m == "vmwrite" and len(ops) > 1 else None
+            field = regs.get(_norm(field_op))
+            hits.append(dict(rva=ins.address, mnemonic=m, op_str=ins.op_str,
+                             field=field, field_reg=_norm(field_op),
+                             value_reg=_norm(value_op), index=i))
+            continue
+        if m in ("mov", "movzx", "movabs") and "," in ins.op_str:
+            dst, src = (x.strip() for x in ins.op_str.split(",", 1))
+            d = _norm(dst)
+            if d is None or "[" in dst:
+                continue
+            if src.startswith("0x") or src.isdigit():
+                try:
+                    regs[d] = int(src, 0)
+                    continue
+                except ValueError:
+                    pass
+            regs.pop(d, None)
+        elif m == "xor" and "," in ins.op_str:
+            dst, src = (x.strip() for x in ins.op_str.split(",", 1))
+            if dst == src:
+                regs[_norm(dst)] = 0
+            else:
+                regs.pop(_norm(dst), None)
+        elif m == "call":
+            regs.clear()
+        elif "," in ins.op_str:
+            dst = ins.op_str.split(",", 1)[0].strip()
+            regs.pop(_norm(dst), None)
+    return hits, insns
+
+
+def disasm_range(md, pe, start, end, limit=None):
+    code = pe.read(start, end - start)
+    out = []
+    for ins in md.disasm(code or b"", start):
+        out.append(f"  0x{ins.address:X}  {ins.mnemonic:<9} {ins.op_str}")
+        if limit and len(out) >= limit:
+            break
+    return out
+
+
+def direct_callers(pe, md, funcs, target):
+    """Every function containing a direct `call`/`jmp` whose rel32 lands on `target`.
+
+    Direct only: a call through a pointer table is invisible here, which is why the
+    caller also greps the data sections for the address as a qword. Saying which of the
+    two found a caller matters -- an indirect one is a weaker link than a rel32.
+    """
+    out = []
+    for b, e in funcs:
+        code = pe.read(b, e - b)
+        if not code:
+            continue
+        for ins in md.disasm(code, b):
+            if ins.mnemonic in ("call", "jmp") and ins.op_str.startswith("0x"):
+                try:
+                    dst = int(ins.op_str, 0)
+                except ValueError:
+                    continue
+                if dst == target:
+                    out.append((b, e, ins.address, ins.mnemonic))
+    return out
+
+
+def data_references(pe, target_rva):
+    """The target's VA appearing as a qword anywhere -- a function-pointer table."""
+    va = pe.image_base + target_rva
+    needle = struct.pack("<Q", va)
+    hits = []
+    for s in pe.sections:
+        if not s["rawsize"]:
+            continue
+        blob = pe.data[s["rawptr"]:s["rawptr"] + s["rawsize"]]
+        start = 0
+        while True:
+            i = blob.find(needle, start)
+            if i < 0:
+                break
+            hits.append((s["name"], s["vaddr"] + i))
+            start = i + 1
+    return hits
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("image", nargs="?", default=r"C:\Windows\System32\hvix64.exe")
+    ap.add_argument("--disasm", type=lambda v: int(v, 0), default=None,
+                    help="disassemble the function containing this RVA and stop")
+    ap.add_argument("--callers", type=lambda v: int(v, 0), default=None,
+                    help="find direct callers of this function RVA, and any data "
+                         "reference to it, then stop")
+    ap.add_argument("--context", type=int, default=0,
+                    help="with --callers, disassemble this many instructions before "
+                         "each call site")
+    ap.add_argument("--offset", type=lambda v: int(v, 0), default=None,
+                    help="find every instruction with this displacement in a memory "
+                         "operand, split by whether it reads or writes. Once a field "
+                         "is identified by what consumes it, its writers are what say "
+                         "who can change it and under what scope.")
+    ap.add_argument("--writes-only", action="store_true",
+                    help="with --offset, show only sites where it is the destination")
+    ap.add_argument("--field", type=lambda v: int(v, 0), default=EXCEPTION_BITMAP,
+                    help="the VMCS field encoding to report on (default 0x4004)")
+    ap.add_argument("--all-fields", action="store_true",
+                    help="list every vmwrite/vmread site with a resolved field")
+    args = ap.parse_args(argv)
+
+    pe = PE(args.image)
+    print(f"image   : {args.image}")
+    print(f"sha256  : {pe.sha256}")
+    print(f"machine : 0x{pe.machine:04X}   image base 0x{pe.image_base:X}")
+    print("sections:")
+    for s in pe.sections:
+        x = "X" if s["chars"] & 0x20000000 else " "
+        print(f"  {s['name']:<8} rva 0x{s['vaddr']:08X} vsize 0x{s['vsize']:08X} "
+              f"raw 0x{s['rawsize']:08X} {x}")
+
+    funcs = pe.runtime_functions()
+    exec_bytes = pe.executable_bytes()
+    covered = sum(e - b for b, e in funcs)
+    print(f"\nexception directory: {len(funcs)} functions covering {covered:,} bytes "
+          f"of {exec_bytes:,} executable ({100.0 * covered / exec_bytes:.1f}%)")
+
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md.detail = False
+
+    if args.disasm is not None:
+        owner = [(b, e) for b, e in funcs if b <= args.disasm < e]
+        if not owner:
+            print(f"\nrva 0x{args.disasm:X} is in no RUNTIME_FUNCTION")
+            return 1
+        b, e = owner[0]
+        print(f"\n=== func 0x{b:X}-0x{e:X} ({e - b} bytes) ===")
+        print("\n".join(disasm_range(md, pe, b, e)))
+        return 0
+
+    if args.offset is not None:
+        pat = "0x%x]" % args.offset
+        found = []
+        for b, e in funcs:
+            code = pe.read(b, e - b)
+            if not code:
+                continue
+            for ins in md.disasm(code, b):
+                if pat not in ins.op_str:
+                    continue
+                # Destination-first on x86: if the operand containing the displacement
+                # is the first one, the instruction writes it.
+                ops = ins.op_str.split(",")
+                writes = pat in ops[0] and ins.mnemonic not in (
+                    "cmp", "test", "push", "bt")
+                if args.writes_only and not writes:
+                    continue
+                found.append((ins.address, b, e, ins.mnemonic, ins.op_str, writes))
+        w = sum(1 for f in found if f[5])
+        print(f"\n=== displacement +0x{args.offset:X}: {len(found)} site(s), "
+              f"{w} writing ===")
+        for addr, b, e, mn, ops, writes in sorted(found):
+            kind = "W" if writes else "r"
+            print(f"  [{kind}] 0x{addr:X}  {mn:<9} {ops}   in func 0x{b:X}-0x{e:X}")
+        return 0
+
+    if args.callers is not None:
+        callers = direct_callers(pe, md, funcs, args.callers)
+        print(f"\n=== direct callers of 0x{args.callers:X}: {len(callers)} ===")
+        for b, e, site, mn in callers:
+            print(f"  {mn} at rva 0x{site:X} in func 0x{b:X}-0x{e:X}")
+            if args.context:
+                lines = disasm_range(md, pe, b, e)
+                idx = next((i for i, l in enumerate(lines)
+                            if l.strip().startswith(f"0x{site:X} ")), None)
+                if idx is not None:
+                    for l in lines[max(0, idx - args.context):idx + 2]:
+                        print("   " + l)
+                print()
+        refs = data_references(pe, args.callers)
+        print(f"=== data references to its VA: {len(refs)} ===")
+        for name, rva in refs:
+            print(f"  {name} at rva 0x{rva:X}")
+        return 0
+
+    all_hits = []
+    for b, e in funcs:
+        code = pe.read(b, e - b)
+        if not code:
+            continue
+        hits, _ = scan_function(md, code, b)
+        for h in hits:
+            h["func"] = b
+            h["func_end"] = e
+        all_hits.extend(hits)
+
+    resolved = [h for h in all_hits if h["field"] is not None]
+    print(f"vmwrite/vmread sites: {len(all_hits)} total, {len(resolved)} with a "
+          f"resolved immediate field encoding")
+
+    if args.all_fields:
+        print("\n=== every resolved site ===")
+        for h in sorted(resolved, key=lambda h: h["rva"]):
+            name = VMCS_FIELDS.get(h["field"], "")
+            print(f"  {h['mnemonic']:<8} field 0x{h['field']:04X} {name:<28} "
+                  f"at rva 0x{h['rva']:X} in func 0x{h['func']:X}")
+
+    want = [h for h in resolved if h["field"] == args.field]
+    name = VMCS_FIELDS.get(args.field, "")
+    print(f"\n=== field 0x{args.field:04X} {name} ===")
+    if not want:
+        print("  no site resolved to this field. That is not the same as none existing: "
+              "an\n  encoding that arrives computed or loaded from memory is invisible "
+              "to an\n  immediate scan. See the module docstring.")
+    for h in sorted(want, key=lambda h: h["rva"]):
+        print(f"  {h['mnemonic']:<8} at rva 0x{h['rva']:X}  ({h['op_str']})  "
+              f"in func 0x{h['func']:X}-0x{h['func_end']:X}")
+
+    funcs_with = sorted({h["func"] for h in want})
+    if funcs_with:
+        print(f"\n  {len(funcs_with)} distinct function(s) touch it: "
+              + ", ".join(f"0x{f:X}" for f in funcs_with))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
