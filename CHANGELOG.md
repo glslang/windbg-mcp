@@ -21,9 +21,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **interleaved** backed-out arms on both sides show no exception markers and a raiser that
   completes. So `forwarded = 0` in S5q arm 1 was the chained slot being bypassed rather than nothing
   arriving, and the correction that section took in review — two dispatch-loop paths never read
-  `[partition+0x10]` — is now the measured explanation rather than one of two. What is measured is
-  reception **at preprocess** and nothing about retention: a held trap is produced by *both*
-  branches of `VidHandleExceptionIntercept`. **Not settled**: which branch the
+  `[partition+0x10]` — is measured **in one run** rather than paired across two: a **combined arm**
+  chains the callback, installs the intercept and reads the markers and `forwarded` at the same
+  samples, giving `forwarded = 0` while both VPs read `0x80010003` at stamps ~1.08 × 10⁹ ticks past
+  baselines taken *after* chaining. That arm's own first run was **vacuous and the driver's guard
+  caught it** — while chained the registered pair is the probe's own, so the read was refused and
+  the client reported "no arrival observed" from a zeroed buffer it never status-checked; the driver
+  now takes the saved pair from its chain record and the client raises on a refusal. What is
+  measured is reception **at preprocess** and nothing about retention: a held trap is produced by
+  *both* branches of `VidHandleExceptionIntercept`. **Not settled**: which branch the
   handler took (`[P+0xB68][3]` read `0xFF` on both sides, consistent with the unclaimed-vector arm
   and corroborated by the trap staying held, but a claim-and-restore between samples reads as
   unchanged); and the raise was in **VTL0**, so a VTL1 raise is the next arm rather than something
