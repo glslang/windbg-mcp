@@ -29,9 +29,13 @@ is the safe one for a negative: the union can only widen the set, so an empty
 gap section is a measurement rather than an artefact of one reading.
 
 **Two data encodings are searched as well**, in EVERY section including the
-executable ones, because a function reached from a table is reached without any
-instruction naming it: the 8-byte image-based VA (a function pointer, which
-carries a base relocation) and the 4-byte RVA (the form
+executable ones and in the PE headers, because a function reached from a table
+-- or from the loader -- is reached without any instruction naming it. The
+image's `AddressOfEntryPoint` is reported by name for the same reason: a
+driver's `DriverEntry` has no caller in its own image at all, so a scan that
+read only sections would report zero references for the one function the loader
+is guaranteed to call. The encodings are the 8-byte image-based VA (a pointer,
+which carries a base relocation) and the 4-byte RVA (the form
 `Vid!VidInterceptPreprocess`'s own type switch uses -- `mov eax,[rdx+rax*4+X];
 add rax,rdx; jmp rax`). Both are byte searches and are reported as such: they
 are here to keep a negative honest, not to attribute anything. A hit in a code
@@ -73,7 +77,10 @@ question is about. Stored addresses were searched only outside code sections,
 which hid a dispatch table in `.text` from the byte scan at the same time as the
 decoder could not recover it. And one refused byte ended the decode of a
 `.pdata` function, leaving every later call in it unexamined while the range
-still counted as claimed, so the gap detector did not pick it up either.
+still counted as claimed, so the gap detector did not pick it up either. And the
+PE headers were not read at all, so the image entry point -- the loader's own
+route into a driver's `DriverEntry`, which has no caller in its own image -- was
+a zero-reference result.
 
 So "0 references" means "no instruction in this image names it, and no section of
 it holds its address in either of the two searched forms" -- which is what a
@@ -147,6 +154,8 @@ class Image:
     sections: list[Section]
     image_base: int
     pdata: list[tuple[int, int]] = field(default_factory=list)
+    entry_point: int = 0
+    headers_size: int = 0
 
     def rva_to_off(self, rva: int) -> int | None:
         for s in self.sections:
@@ -187,6 +196,8 @@ def load(path: str) -> Image:
         raise ValueError("only PE32+ (x64) images are supported")
     (image_base,) = struct.unpack_from("<Q", data, opt + 24)
     exc_rva, exc_size = struct.unpack_from("<II", data, opt + 112 + 3 * 8)
+    (entry_point,) = struct.unpack_from("<I", data, opt + 16)
+    (headers_size,) = struct.unpack_from("<I", data, opt + 60)
 
     sec_off = opt + opt_size
     sections = []
@@ -197,7 +208,8 @@ def load(path: str) -> Image:
         (chars,) = struct.unpack_from("<I", data, base + 36)
         sections.append(Section(name, va, vsize, raw, rawsize, chars))
 
-    img = Image(data, sections, image_base)
+    img = Image(data, sections, image_base, entry_point=entry_point,
+                headers_size=headers_size)
     if exc_rva and exc_size:
         blob = img.read(exc_rva, exc_size)
         if blob:
@@ -372,17 +384,29 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
     # possibly instruction bytes rather than hidden -- a four-byte pattern in a
     # megabyte of code is often just code, and saying so is the reader's job to
     # finish, not this tool's to pre-empt.
+    # The PE headers are not a section, so a loop over sections never reads
+    # them -- and `AddressOfEntryPoint` lives there and is a route the LOADER
+    # takes. Scanned as a region of their own, and the entry point is reported
+    # by name as well, because "bytes matching in the headers" is a much weaker
+    # thing to hand a reader than "this RVA is the image entry point".
+    # Review round 3 on #425.
+    regions = [(s.name, s.va, s.raw, s.rawsize, s.executable) for s in img.sections]
+    if img.headers_size:
+        regions.insert(0, ("(PE headers)", 0, 0, img.headers_size, False))
+
     data_hits = []
     for w in sorted(wanted):
-        for s in img.sections:
-            blob = img.data[s.raw : s.raw + s.rawsize]
+        if w and w == img.entry_point:
+            data_hits.append(("(optional header)", 0, "AddressOfEntryPoint", w, False))
+        for name, va, raw, rawsize, is_exec in regions:
+            blob = img.data[raw : raw + rawsize]
             for pat, kind in (
                 ((img.image_base + w).to_bytes(8, "little"), "VA (8 bytes)"),
                 (w.to_bytes(4, "little"), "RVA (4 bytes)"),
             ):
                 i = blob.find(pat)
                 while i != -1:
-                    data_hits.append((s.name, s.va + i, kind, w, s.executable))
+                    data_hits.append((name, va + i, kind, w, is_exec))
                     i = blob.find(pat, i + 1)
 
     return refs, {
@@ -413,6 +437,10 @@ def report(refs: list[Ref], extra: dict, wanted: set[int], syms: dict[int, str])
         rows = [d for d in extra["data"] if d[3] == w]
         if rows:
             for name, rva, kind, _w, is_exec in rows:
+                if kind == "AddressOfEntryPoint":
+                    print("  route: this RVA is the image ENTRY POINT -- the loader calls it, "
+                          "so no instruction in this image has to")
+                    continue
                 note = STRUCTURAL.get(name, "")
                 if not note and is_exec:
                     note = ("  -- in an executable section: these bytes may be a "
@@ -439,36 +467,40 @@ def parse_targets(spec: str) -> set[int]:
 
 
 def _img(text: bytes, base: int = 0x140000000, claim=None, data: bytes = b"",
-         code_name: str = ".text") -> Image:
-    """A synthetic image: one executable section at rva 0x1000, one read-only
-    data section at 0x8000, and whatever `.pdata` claims (by default the whole
-    code section). `code_name` exists so a case can give the code section a
-    name no list would guess."""
+         code_name: str = ".text", entry_point: int = 0, headers: bytes = b"") -> Image:
+    """A synthetic image: `headers` at rva 0, one executable section at rva
+    0x1000, one read-only data section at 0x8000, and whatever `.pdata` claims
+    (by default the whole code section). `code_name` exists so a case can give
+    the code section a name no list would guess."""
+    head = headers.ljust(0x400, b"\0")
     secs = [
         Section(code_name, 0x1000, len(text), 0x400, len(text), IMAGE_SCN_MEM_EXECUTE),
         Section(".rdata", 0x8000, len(data), 0x400 + len(text), len(data), 0x40000040),
     ]
-    img = Image(b"\0" * 0x400 + text + data, secs, base)
+    img = Image(head + text + data, secs, base, entry_point=entry_point,
+                headers_size=len(headers))
     img.pdata = [(0x1000, 0x1000 + len(text))] if claim is None else list(claim)
     return img
 
 
-TOTAL = 17
+TOTAL = 20
 
 # Mutation-verified, so the cases below share one denominator and none of them
 # is passing for a reason unrelated to the rule it names. Backing each of these
 # out of the code above, every one applied and every one was caught:
 #
-#   gap union -> a single start                      15/17
-#   decode window shrunk below one instruction       13/17
-#   sections selected by name again                  16/17
-#   the data scan skips executable sections again    15/17
-#   every immediate counts as a branch target        16/17
-#   gap hits attributed as `.pdata` hits             13/17
-#   padding-only runs kept as runs                   16/17
-#   no resume after a refused byte                   16/17
-#   refused bytes not counted                        16/17
-#   `--targets` reads a bare value as hex            16/17
+#   gap union -> a single start                      18/20
+#   decode window shrunk below one instruction       16/20
+#   sections selected by name again                  19/20
+#   the data scan skips executable sections again    18/20
+#   the PE headers region dropped                    19/20
+#   the entry point not reported                     19/20
+#   every immediate counts as a branch target        19/20
+#   gap hits attributed as `.pdata` hits             16/20
+#   padding-only runs kept as runs                   19/20
+#   no resume after a refused byte                   19/20
+#   refused bytes not counted                        19/20
+#   `--targets` reads a bare value as hex            19/20
 #
 # Two of those earn the comment. The immediate case's FIRST version used
 # `mov eax,0x40001000`, whose immediate is a *neighbouring* number rather than
@@ -605,6 +637,20 @@ def self_test() -> int:
     # refusals, so the count above is about the byte and not about the harness.
     case("a clean function reports no refusals",
          _img(b"\x90" * 6 + b"\xe8\xf5\xff\xff\xff"), {0x1000}, 1, 0, 0, want_refused=0)
+
+    # The loader's own route in. `AddressOfEntryPoint` is in the optional
+    # header, which is not a section, so a loop over sections never reads it --
+    # and for a driver's `DriverEntry` that is the one caller there is. The
+    # entry point is reported by name, and the header bytes are scanned as a
+    # region of their own so a data directory pointing at the target is not
+    # missed either.
+    case("the image entry point is reported as a route",
+         _img(b"\x90" * 8, entry_point=0x1000), {0x1000}, 0, 0, 1)
+    case("a target that is not the entry point is not credited with one",
+         _img(b"\x90" * 8, entry_point=0x1000), {0x2000}, 0, 0, 0)
+    case("an RVA stored in the PE headers is found",
+         _img(b"\x90" * 8, headers=b"MZ" + (0x1000).to_bytes(4, "little")),
+         {0x1000}, 0, 0, 1)
 
     # An unrelated target is not reported for any of the shapes above, which is
     # what makes the zeros elsewhere mean something.
