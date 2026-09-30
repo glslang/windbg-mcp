@@ -16,15 +16,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   admin, so that ground is not there. Each worker holds **four** handles to the VID device and
   **all four duplicate out** with an ordinary `DuplicateHandle` (385 of 518 handles duplicated;
   the 133 refusals resolve by object-type index to `EtwRegistration` and `PcwObject`).
-  `VidGetHvPartitionId` through them then returns `ERROR_INVALID_FUNCTION` on three and
-  **`ERROR_ACCESS_DENIED`** on one, against `ERROR_INVALID_HANDLE` for a non-VID control — they
-  reach `Vid.sys` and are turned away. **A draft of this nearly shipped the opposite**: it
+  `VidGetHvPartitionId` through all **eight** then returns `ERROR_INVALID_FUNCTION` on six and
+  **`ERROR_ACCESS_DENIED`** on two — the same 3-and-1 split in each worker independently — against
+  `ERROR_INVALID_HANDLE` for a non-VID control, so they reach `Vid.sys` and are turned away. **A draft of this nearly shipped the opposite**: it
   searched handle names for *"Vid"*, found none, and concluded there was nothing to duplicate —
   but `Vid.sys` is PnP root-enumerated, so
   `\GLOBAL??\ROOT#VID#0000#{7896e901-…}` resolves to **`\Device\00000006`**, and this record
   already wrote the prefix as the device interface path. **Not established**: that the route
-  reaches the receiver — every duplicate was `DUPLICATE_SAME_ACCESS` carrying read-only
-  `0x00120089`. Controls, errors and limits in the **Step 7** section of
+  reaches the receiver, which nothing here tests. A draft inferred that read-only duplicated
+  access is insufficient; **withdrawn as the wrong axis, and S5m had already written the answer** —
+  the receiver is IOCTL `0x221148` with `FILE_ANY_ACCESS`, gated on *holding a partition handle*,
+  not on an access mask. Invoking it means `VidRegisterExceptionHandler`, which per S5m claims the
+  slot it asks about, so it is an arm with a hazard rather than a probe and was not run. Controls,
+  errors and limits in the **Step 7** section of
   [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 - **Item 103 step 8 is costed, and the costing does not yield the decision — which a first draft
   of it claimed anyway.** The solid result is a negative: the **documented** partition API

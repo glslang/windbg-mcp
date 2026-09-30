@@ -6520,21 +6520,29 @@ prefix as *"the device interface path for `GUID_DEVICEINTERFACE_VID` (or `\\?\Vi
 and an earlier section notes both are present in `\GLOBAL??`. The draft ran a string scan over the
 image instead of reading the two sentences that named the mechanism.
 
-#### What the handle grants: refused, and the errors say where
+#### What the handle grants: refused, the same way on both workers
 
 `VidGetHvPartitionId` through each duplicated handle, out-parameter poisoned, with a **negative
 control** — the same call on this process's own handle, which is not a VID object:
 
-| handle | result |
-|---|---|
-| control, own process handle | `ERROR_INVALID_HANDLE` (6), poison intact |
-| 3 of the 4 VID handles | `ERROR_INVALID_FUNCTION` (1), poison intact |
-| 1 of the 4 VID handles | **`ERROR_ACCESS_DENIED`** (5), poison intact |
+**All eight handles, both workers, reported separately** — a draft collapsed them into one
+four-row table, which read as though only one VM had been tested:
+
+| worker | handle | result |
+|---|---|---|
+| — | control, this process's own handle | `ERROR_INVALID_HANDLE` (6) |
+| pid 5508 | `0x278`, `0x2C0`, `0x2EC` | `ERROR_INVALID_FUNCTION` (1) |
+| pid 5508 | `0x2C8` | **`ERROR_ACCESS_DENIED`** (5) |
+| pid 5928 | `0x2A8`, `0x2D0`, `0x300` | `ERROR_INVALID_FUNCTION` (1) |
+| pid 5928 | `0x2D8` | **`ERROR_ACCESS_DENIED`** (5) |
+
+The poison survives every arm, so nothing wrote a partition id. **The two workers gave the same
+3-and-1 split independently**, which is a replication rather than a repetition — they are separate
+processes holding separate handles to separate partitions.
 
 **The control earns its place**: it fails with a *different* error, at the API layer, while the
 duplicated handles fail with driver responses. So the duplicated handles do reach `Vid.sys` and are
-turned away there — three as an unsupported operation on that object, one on access. The poison
-survives every arm, so nothing wrote a partition id.
+turned away there.
 
 #### What this closes, and what it does not
 
@@ -6543,21 +6551,37 @@ configuration.** An elevated administrator can take VID handles out of an unprot
 with an ordinary `DuplicateHandle`. That is the half S5n declined, and the ground it declined on is
 not there.
 
-**It does not follow that the route reaches the exported receiver**, and this record should not say
-it does. Every handle here was duplicated `DUPLICATE_SAME_ACCESS`, carrying the source's read-only
-`0x00120089`; whether a larger requested access is granted, and whether one of these four is the
-partition rather than the raw device, are both unmeasured. `ERROR_ACCESS_DENIED` on exactly one
-handle is the interesting thread and is where a next arm would start.
+**It does not follow that the route reaches the exported receiver**, and nothing above tests it.
+A draft went further and inferred that *read-only duplicated access is not sufficient by itself* —
+**withdrawn, because it is the wrong axis, and this record says so.** S5m decoded the receiver as
+IOCTL `0x221148`, `CTL_CODE(FILE_DEVICE_UNKNOWN, 0x452, METHOD_BUFFERED, FILE_ANY_ACCESS)`, and
+wrote the conclusion out in full: *"`FILE_ANY_ACCESS` is not the access control: the dispatcher is
+reached with a partition in `rcx`, so what gates it is holding a partition handle."* An access mask
+cannot be what refuses a `FILE_ANY_ACCESS` operation, so a broader duplicate would not test the
+receiver's gate and the refusals above say nothing about it.
+
+**What they may say instead**, offered as a candidate rather than a finding: `VidGetHvPartitionId`
+is the call S5m names as translating a VID handle to an `HV_PARTITION_ID`, so
+`ERROR_INVALID_FUNCTION` on six of the eight is consistent with those being the raw device rather
+than a partition, and `ERROR_ACCESS_DENIED` on the remaining two with the driver's **own** check on
+a partition it does not consider ours — which is step 4's territory, where `VidPartitionAttach`
+makes the opener the owning process. Both readings are untested.
+
+**Testing the receiver means invoking it, and that is an arm with a hazard rather than a probe.**
+The operation is `VidRegisterExceptionHandler`, and S5m's own result is that registering to ask
+whether the slot is claimed *claims* it — so running it against a live lab VM's partition would
+displace that VM's handler rather than observe it. It was deliberately not run here, and step 6's
+slot read exists precisely because this question needed a non-mutating instrument.
 
 **The inheritance half is nearly closed by size**: each worker has **one** handle marked
 `OBJ_INHERIT` out of 518, and its children are `vmmem` and `vmsp.exe`.
 
-**LiveCloudKd is narrowed and still not settled.** This line's record says its procedure duplicates
-handles from `vmwp.exe`; the handles exist and are takeable, so the procedure is plausible on its
-face rather than describing an older Windows. What the refusals above suggest is that read-only
-duplicated access is not sufficient by itself — which is consistent with that tool shipping a
-driver. **Read off this record's summary of the tool, not its source**, which has not been read
-here.
+**LiveCloudKd is narrowed only as far as the handles go.** This line's record says its procedure
+duplicates handles from `vmwp.exe`; the handles exist and are takeable, so the procedure is
+plausible on its face rather than describing an older Windows. **Any further inference is withdrawn
+with the access-bit one above** — the refusals do not bear on what that tool needs, and a driver is
+a guess about it rather than a reading of these errors. **Read off this record's summary of the
+tool, not its source**, which has not been read here.
 
 **Configuration limits.** One host, one build, two VMs, neither shielded, client Hyper-V rather than
 Server, elevated administrator rather than SYSTEM, and `DUPLICATE_SAME_ACCESS` throughout. Every row
