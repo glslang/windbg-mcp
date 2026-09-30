@@ -3854,8 +3854,9 @@ validated. The full record is the
   a function handed the partition object as an *argument* calls neither anchor and is absent from the
   28 even if it reads the pair, which no amount of the above accounts for. The tool now has
   `--self-test`, **21/21**, pinning all three defects with the broken reading asserted to fail and two
-  negative controls; mutation-verified — the span-wide region scores 17/21 and a summed refusal count
-  20/21. Treat its function set as a reading.
+  negative controls; mutation-verified against those cases so the scores share a denominator — the
+  candidate starts reduced to the span start scores 10/21, one span-wide region 17/21, and a summed
+  refusal count 20/21. Treat its function set as a reading.
 - **What it does to S5j's two explanations, and to the build.** S5k killed *nothing was bound*;
   step 2 confirmed Vid bound at runtime for both partitions. Arm 1 bears against the second, *the
   handler received it and retained it*: the routine chained into `[partition+0x10]` is **not
