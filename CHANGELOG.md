@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The message IS delivered: item 103 step 9's arm, and S5q's third explanation is eliminated.** A
+  `#BP` raised in a guest under a standing raw `HvCallInstallIntercept` reaches the root's
+  `Vid!VidInterceptPreprocess`, which copies the message, stamps the VP and selects
+  `VidHandleExceptionIntercept` — read on **both** VPs of the partition, every marker as the static
+  read of the jump table at `Vid+0x3D137` predicted, with stamps **+27,772,140** and
+  **+32,260,001** past baselines taken immediately before the raise. The copied message decodes as
+  itself: `Sender` = the partition id, `VpIndex` `0` on VP 0 and `1` on VP 1 — so the message's own
+  view of which processor raised agrees with the slot it was read from — `InstructionLength` `1`,
+  `InterceptAccessType` `2`. The raiser was **held**, which is S5h's signature, and the
+  **interleaved** backed-out arms on both sides show no exception markers and a raiser that
+  completes. So `forwarded = 0` in S5q arm 1 was the chained slot being bypassed rather than nothing
+  arriving, and the correction that section took in review — two dispatch-loop paths never read
+  `[partition+0x10]` — is now the measured explanation rather than one of two. S5j's
+  received-and-retained reading is measured rather than inferred. **Not settled**: which branch the
+  handler took (`[P+0xB68][3]` read `0xFF` on both sides, consistent with the unclaimed-vector arm
+  and corroborated by the trap staying held, but a claim-and-restore between samples reads as
+  unchanged); and the raise was in **VTL0**, so a VTL1 raise is the next arm rather than something
+  this one covered. The Secure Kernel scope limit stands as S5i left it. **And one defect worth the
+  line**: run 1 called the arm confounded because the interleaved backed-out arm *after* the armed
+  one showed a **stale** marker — the hit test compared type and vector and ignored the timestamp,
+  which is exactly the defect review round 3 had filed against this plan, reproduced in the code
+  written to honour it. Bench intact: teardown reported 0 intercepts standing on both runs, raiser
+  killed after every arm, both guests up 2h50m unbroken, no bug check since boot.
 - **The step 9 read is built, and the walk holds at run time.** Steps 1–2 of item 103 step 9:
   `h3probe.sys` gains `IOCTL_H3_VIDVP`, which takes a partition **id** rather than a pointer,
   resolves the VID partition object through Hyper-V's own locked table, refuses unless the
@@ -26,8 +49,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   corroboration. One caveat the output made plain and the record now states: `[V+0x68]` is the
   exception vector **only** for message type `0x80010003`; on the IO-port message it is payload.
   Bench untouched — driver stopped after, host uptime continuous, no bug check, both guests up
-  throughout. **Nothing was raised**, so the delivery question is where the feasibility gate left
-  it; what this retires is the risk in the arm, not the arm.
+  throughout. **Nothing was raised** in this step, so what it retires is the risk in the arm rather
+  than the arm — which the entry above then ran and answered.
 - **The convergence point records its own arrivals, so the instrument is a read.** Item 103 step 9
   asked how the **root** partition's `Vid.sys` could be instrumented — *"a patch, a breakpoint on a
   host kernel this bench cannot freeze, or neither"* — and said to cost that before scheduling the

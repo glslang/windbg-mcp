@@ -2001,9 +2001,13 @@ overstated the first two into blockers and got the third wrong.**
   hypercall, and the **patch** half of a software breakpoint is solved while the **catch** half
   (S5) is not. **S5h has since measured a catch for VTL1 *user* mode** — a parent-installed exception
   intercept holds a `#BP` raised there and hands it back on removal, and **S5i has since read the
-  hypervisor and found that intercept applied at every enabled VTL by design**. What is still
-  untested is whether anything can *receive* the resulting stop, and whether any of it reaches
-  Secure Kernel's own code — an architectural inference after S5i rather than an open mechanism.
+  hypervisor and found that intercept applied at every enabled VTL by design**. **Step 9's arm has
+  since measured that the root DOES receive the resulting stop** — a `#BP` raised under a standing
+  raw intercept arrives at `Vid!VidInterceptPreprocess`, which copies the message, stamps the VP and
+  selects `VidHandleExceptionIntercept`. So the *catch* half has a receiver. What is still untested
+  is whether the same holds for a raise in **VTL1** (step 9's arm raised in VTL0) and whether any of
+  it reaches Secure Kernel's own code — the second remains an architectural inference after S5i
+  rather than an open mechanism, because VTL1 user mode is not VTL1 kernel mode.
 
 ### S0 — the gate that decides how much setup a user needs — **RUN 2026-09-26, PASS**
 
@@ -3886,7 +3890,10 @@ validated. The full record is the
   receiver is not a routine to chain**: chaining installs and restores cleanly and receives nothing.
   What it does **not** establish is that no delivery path exists, so it leaves the delivery question
   open rather than answered against, and step 8 is where the *chaining* failure points rather than
-  where the evidence forces the build. **The successor is step 9 below, not step 8.** Full record in the
+  where the evidence forces the build. **The successor is step 9 below, not step 8** — and step 9's
+  arm has since closed the delivery question **in the affirmative** and eliminated arm (3): the
+  message arrives at `VidInterceptPreprocess`, so `forwarded = 0` here was the chained slot being
+  bypassed rather than nothing arriving. Full record in the
   [S5q arm 1 result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
 ### Out of scope, with the reason rather than as a list
@@ -4002,7 +4009,10 @@ validated. The full record is the
       lacked for the admission path — but only for writes a decoded-operand census can see, and
       only alongside step 7 still being open, so this is the route with **no known obstacle**
       rather than the only one. Still a reason to **cost** the rig rather than start building it.
-   9. **Measure delivery at the convergence point, which is what S5q's zero could not.** Added
+   9. ~~**Measure delivery at the convergence point, which is what S5q's zero could not.**~~
+      **RUN 2026-09-30, and the message IS delivered** — feasibility, the read, and the arm, all
+      three; the result is below and the reasoning is kept because the next arm (a VTL1 raise) is
+      built from it. Added
       2026-09-30 with the correction above. All three known callers of `VidInterceptPreprocess`
       converge on it, and only one of them reads `[partition+0x10]`, so **arrivals counted at
       `VidInterceptPreprocess` itself answer delivery whichever path carried the message** where a
@@ -4069,15 +4079,49 @@ validated. The full record is the
       made plain: `[V+0x68]` is the exception vector **only** for message type `0x80010003` — on
       the IO-port message it read `0x71`, which is payload.
 
-      **Still open, and what it now needs.** Nothing has been *raised*, so no exception intercept
-      has been observed and the delivery question is exactly where the feasibility gate left it.
-      What steps 1–2 retired is the risk in the arm rather than the arm: the walk is confirmed, the
-      guards are exercised, and the markers are known to carry live state rather than zeros — which
-      is what would have made a first arm's reading uninterpretable. The remaining act is the arm
-      itself — the raise, the three reads around it, the interleaved backed-out arm and the
-      positive control. (The three checks this paragraph used to name as the arm's first act —
+      **THE ARM IS RUN, 2026-09-30, AND THE MESSAGE IS DELIVERED.** A `#BP` raised in the guest
+      under a standing raw `HvCallInstallIntercept` (type 3 / `AccessType` 4 / vector `0x03`)
+      arrives at `Vid!VidInterceptPreprocess` on **both** VPs of partition `0x3`: `[V+0x30]` =
+      `0x80010003`, `[V+0x68]` = `3`, `[V+0x158]` = `Vid+0x11690` `VidHandleExceptionIntercept`,
+      `[V+0x200]` = `2` — every marker as the static read of the jump table predicted — with stamps
+      **+27,772,140** and **+32,260,001** past baselines taken immediately before the raise. The
+      copied message decodes as itself: `Sender` = partition `3`, `VpIndex` `0` on VP 0 and `1` on
+      VP 1 (so the message's own view of which processor raised agrees with the slot it was read
+      from), `InstructionLength` `1`, `InterceptAccessType` `2`. The raiser was **held** — S5h's
+      signature — and the interleaved backed-out arms on **both** sides show no exception markers
+      and a raiser that completes. **So S5q arm 1's third explanation, *not delivered because the
+      arming sequence is incomplete*, is eliminated, and `forwarded = 0` there was the chained slot
+      being bypassed rather than nothing arriving.** S5j's second reading — received and retained —
+      is now measured rather than inferred.
+
+      **What the arm did NOT settle.** Which branch `VidHandleExceptionIntercept` took:
+      `[P+0xB68][3]` read `0xFF` before the install and `0xFF` after the removal, consistent with
+      arm 1 and corroborated by the trap staying held while nothing completed it, but not decided —
+      a claim-and-restore between samples reads as unchanged. And the raise was in **VTL0**, as
+      S5q arm 1's was; reading the markers for a **VTL1** raise is the cheap next arm rather than
+      something this one covered. The Secure Kernel scope limit stands exactly as S5i left it:
+      VTL1 user mode is not VTL1 kernel mode.
+
+      **One defect worth keeping, because it was this plan's own warning landing in this plan's own
+      code.** Run 1 reported the arm CONFOUNDED: the second backed-out arm showed an exception
+      marker. It was **stale** — that VP had taken the intercept during the armed arm and gone
+      idle, so the marker stood with a stamp byte-identical to the previous phase's read. The hit
+      test compared type and vector and ignored the timestamp, which is exactly the defect review
+      round 3 filed against this plan. The rule now requires a stamp later than that arm's own
+      baseline. The interleaved backed-out arm *after* an armed one is the one case that walks into
+      staleness, and interleaving is what the plan asked for — the two requirements interact and
+      only running them together showed it.
+
+      Bench: intercept installed once per armed arm and removed in the phase after it, teardown
+      reporting **0 standing** on both runs, raiser killed after every arm, driver stopped, guest
+      responsive with 105 processes, both guests up 2h50m unbroken, host uptime continuous, no bug
+      check since boot. Nothing written to a partition object, nothing chained. Full record in the
+      **step 9, the arm** section of
+      [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
+
+      (The three checks this paragraph used to name as the arm's first act —
       `[VP+0] == P`, a plausible `[P+0xAA8]`, and `[P+0xB68]` pointing at a table of mostly
-      `0xFF` — are the ones steps 1–2 just ran, and all three passed.) **The arm's shape, settled across three
+      `0xFF` — are the ones steps 1–2 ran, and all three passed.) **The arm's shape, settled across three
       review rounds and cheaper than any of them sounded: one IOCTL called three times per raise —
       before, during the hold, and after.** Delivery is `V+0x208` **moving**, never its value,
       because a previous `#BP` on that VP leaves all four markers already reading as a delivery and
@@ -4101,10 +4145,15 @@ validated. The full record is the
    `WinHvSetInterceptRoutine` needs none — it is a `winhvr.sys` kernel export keyed by partition id
    — so with the standing constraint lifted for disposable guests the active work is **S5q**, and
    steps 6 to 8 are what matters only if S5q's stop conditions fire. Step 7 stays open on its own
-   terms; step 8 is the fallback the host-bugcheck condition selects. **Step 9 is now ahead of
-   both**, and it is there because arm 1's conclusion was narrowed: the delivery question is open
-   rather than answered against, so the cheapest thing that can move it comes before the routes that
-   need ownership or a duplicated handle. **This is the second time
+   terms; step 8 is the fallback the host-bugcheck condition selects. **Step 9 went ahead of both
+   and is now RUN** — it was put there because arm 1's conclusion was narrowed from *answered
+   against* to *open*, and putting the cheapest thing that could move it before the routes needing
+   ownership or a duplicated handle is what got the question answered: the message is delivered.
+   **What the answer does to this list: nothing yet, deliberately.** Steps 6–8 exist to get the
+   root a *receiver it owns*, and delivery being established does not supply one — it removes the
+   possibility that there was nothing to receive. Whether that changes the case for owning a
+   partition depends on the next arm (a VTL1 raise) rather than on this one, so the order below is
+   left as it stands rather than rewritten on a result it does not turn on. **This is the second time
    this plan has kept walking a route after a cheaper one opened beside it** — S5m already deleted
    the driver S5k specified — and the cause both times was a schedule written against the obstacle
    in front of it rather than against the question. **This correction is a third instance of the same
