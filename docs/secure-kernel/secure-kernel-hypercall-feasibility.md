@@ -3716,7 +3716,12 @@ review findings against lists a later gate had already invalidated.
   chooses between the DPC-and-message-slot shape and a dispatch-loop shape (`WinHvDispatchVp`,
   `WinHvCancelVpDispatchLoop`), which is almost certainly the root scheduler. The finding does not
   turn on it — the `0xFF` gate is ahead of the fork — but the resume detail in the inference section
-  is read off the bit-clear path only.
+  is read off the bit-clear path only. **S5q then drew a conclusion that did turn on it and had to be
+  narrowed** (2026-09-30): the dispatch-loop shape reaches `VidInterceptPreprocess` without the
+  partition callback, from `VidXSchedulerpVpRun` and `VidXSchedulerVpThreadStartRoutine`, which is why
+  a zero on the callback does not place the hold ahead of root dispatch. This limit is load-bearing
+  for anything read off the other path; see the
+  [S5j-explanations section under S5q arm 1](#what-this-does-to-s5js-two-explanations).
 - **The internal reason code is not the public one.** `[vp+0x200]` takes `2` for an exception, `1`
   for CPUID, `5` for IO port, `6` for MSR, `7` for unmapped GPA, `0x10` for halt, `0x15` for triple
   fault. Those are not `WHV_RUN_VP_EXIT_REASON` values and are not named here as anything else.
@@ -4713,6 +4718,29 @@ by its own wording — *"That build of…"* — so the author gates it, and an e
 differently-gated one may behave differently. The claim is about this release, and the refusal
 string is the evidence for it.
 
+**And there is a specific other release, which this gate did not test.** The maintainer's
+live-debugging procedure links a **separate** asset — `LiveCloudKd.EXDI.debugger.v1.0.20251103.zip`,
+under tag `v1.0.20251103`, confirmed in the repository's release list 2026-09-30 — and tells the
+reader to register **`ExdiKdSample.dll`** with `regsvr32.exe /i`, not the `ExdiHvSrv.dll` this gate
+registered out of `v3.3.2.20260720`. So the refusal above is a negative about the *main release
+line*, and `docs/secure-kernel/exdi-stub-plan.md` was not entitled to write the procedure's naming off
+as stale: that asset is a separate download post-dating `v2.8.4.20241221`'s *"EXDI plugin renamed to
+`ExdiHvSrv.dll`"* by eleven months, and those notes never say what the old name was. What is inside
+the zip was **not** read, so whether its DLL is a distinct binary or the same one under another name
+is **open** — which is the point, because the refusal string is build-conditional and only that zip
+can answer whether its build carries the same gate.
+
+**Two things about it are already settled and both bear on whether it is worth opening.** Its
+procedure requires the **Classic** scheduler (its own check is Hyper-V-Hypervisor event ID 2, value
+1 or 2) and this host reports **Root** — the conflict recorded in the
+[EXDI host preflight decision](secure-kernel-debugging-validation.md#exdi-host-preflight-and-topology-decision-2026-09-19)
+on 2026-09-19, together with the decision not to change a shared client host's scheduler. And the
+procedure states the tool **duplicates handles from `vmwp.exe`**, which is how it reaches a partition
+without owning one — the same route `FOLLOWUPS.md` item 103 step 7 holds open, and which S5n declined
+to attempt because `vmwp.exe` runs protected and taking a handle out of it is an attack on the
+platform rather than an experiment on it. **That makes this a scope decision for the maintainer, not
+a compatibility investigation**, and it is the reason the package is named here rather than queued.
+
 #### The passive CLSID is a working inspector
 
 It connects, finds `ntkrnlmp` by itself, resolves NT symbols from the public store and walks the
@@ -5186,39 +5214,114 @@ the partition object as an *argument*, or obtains it from a helper other than
 `WinHvpReferencePartition`, calls neither anchor and is absent from the 28 even if it reads the pair.
 Closing that needs provenance carried across calls and returns, which the tool does not do — so
 "functions that can hold a partition object" means "functions that obtain one by the two routes it
-looks for". **The `.pdata` hole is closed rather than documented**: `.pdata` claims no leaf
-functions, so a leaf loading the array would have been invisible; the tool now decodes the
-executable bytes `.pdata` leaves out, as `vid_field_census.py` does — 9,599 unclaimed bytes here,
-9,558 of them padding, five gap runs scanned as regions. **And `rbp` is no longer assumed to be a frame pointer**: in optimized
+looks for". **The `.pdata` hole is narrowed, and it took three readings to get the decoding right**:
+`.pdata` claims no leaf functions, so a leaf loading the array would have been invisible, and the
+tool decodes the executable bytes `.pdata` leaves out as `vid_field_census.py` does — **9,599
+unclaimed bytes here, 9,569 of them `0xCC`/`0x00`, five spans holding anything else**, with **0
+bytes capstone refused** (re-derived 2026-09-30 against the same `winhvr.sys`). A gap carries no
+unwind record, so nothing in the image says where an instruction in it begins, and **each of the
+first two readings lost real leaf code**:
+
+- Decoding a span as one stream loses an island after an **odd-length run of `0x00`**, because
+  `00 00` decodes as a two-byte `add byte ptr [rax], al` — so the odd byte shifts everything after
+  it. (`0xCC` is one byte and keeps alignment, which is why the defect needs a zero run.)
+- Splitting the span at **every** `0xCC`/`0x00` byte — the fix for the first, and what this section
+  originally recorded — cuts instructions apart instead. **A single zero byte is not padding**:
+  a 12-byte leaf that loads the array anchor and reads `+0x10` encodes as
+  `48 8B 05 D9 1F 00 00 / 48 8B 40 10 / C3`, and almost every RIP-relative load in a driver carries
+  a zero in its high displacement byte, so the split lands inside the one instruction that makes the
+  region reaching. That leaf is now a regression case and it reported **zero** reaching regions.
+
+What the tool does instead is decode each span from its own start **and** from every island start in
+it, unioning by `(address, size)`. That union is a lower bound with possible phantoms — a misaligned
+start decodes bytes that are not instructions — so it can only widen the reaching set, never narrow
+it, which is why the two sites that carry the finding are read back as disassembly by hand.
+
+**The sibling instrument already did it this way, and that is the tell worth keeping.**
+`vid_field_census.py` decodes each gap "from every plausible start … and take[s] the union", on the
+stated ground that "no single pass licenses a negative here" — and the paragraph above claimed this
+tool decoded the gaps *"as `vid_field_census.py` does"* while doing something else in both readings.
+Naming the right sibling is not copying its method: the claim of equivalence was in the prose from the
+start and neither reading matched it.
+
+**And `rbp` is no longer assumed to be a frame pointer**: in optimized
 x64 it is an ordinary callee-saved register unless the function's `UNWIND_INFO` names it as the
 frame register, so it is suppressed only where that record says so — 16 `+0x10`/`+0x18` operands
 across the image are based in `rbp`, and none of them falls in a reaching region. **The answer did
-not move** through either change: 28 reaching regions and 42 accesses before and after, which is what makes the hole worth reporting as closed
-rather than as a caveat. The tool still ships without a self-test, which the instrument S5p built
-has and which review found holes in twice; treat its region set as a reading rather than a proof.
+not move** through any of the three: 28 reaching regions and 42 accesses throughout — which is
+exactly why the gap scan needed a test of its own rather than agreement on the real image, since a
+run on `winhvr.sys` reports 28 and 42 under all three readings and so cannot detect the defect.
+`--self-test` now carries both, **12/12**, each pinned with the broken reading asserted to fail and
+with two negative controls; verified by mutation, the one-stream reading scoring 10/12 and the
+split-at-every-padding-byte reading 9/12.
 
 #### What this does to S5j's two explanations
 
 S5j left two live readings of S5h's hold: **nothing was bound**, or **the existing handler received
 it and retained it**. S5k killed the first — Vid is bound, and S5q step 2 confirmed that at runtime
-for both partitions. Arm 1 now bears on the second, and against it: the bound routine is **not
-called**, so the hold is not something a receiver retains after receiving. It happens before the
-root's intercept dispatch runs at all.
+for both partitions. Arm 1 bears on the second only as far as the slot it patched: the routine
+chained into `[partition+0x10]` was **not called**, so the hold is not something *that* routine
+retains after receiving.
 
-**The likeliest remaining account, and it is an inference rather than a measurement**: S5k found that
-`VidHandlerpExceptionRegisterEntry` claims its slot in `[partition+0xB68]` and *then* calls
-`WinHvInstallIntercept`, and called S5b's raw install "half of the arming sequence". This arm is
-consistent with the missing half being not merely a per-vector flag Vid consults on receipt, but the
-establishment of the delivery itself — the port and SINT plumbing whose API `winhvr.sys` exports
-(`WinHvAllocatePartitionSintIndex`, `WinHvCreatePort`, `WinHvConnectPort`), without which the
-hypervisor has the intercept armed and nowhere to post. **Untested**, and it is the thing to test
-next.
+**It does not place the hold ahead of root dispatch, and an earlier version of this section said it
+did.** *"It happens before the root's intercept dispatch runs at all"* was written here and in
+`FOLLOWUPS.md`, and it does not follow from the zero, because on a **root-scheduler** host — which
+this one is: `Microsoft-Windows-Hyper-V-Hypervisor` event ID 2 reports **`0x4`** on each of the three
+most recent boots, the latest 2026-09-29 17:58:30, read 2026-09-30, and Microsoft maps `4` to **Root**
+— there are two further paths into VID's
+preprocessing that never consult the partition callback at all. Measured 2026-09-30 against the same
+`Vid.sys` `10.0.26100.9278`, SHA-256 `6611BCD7…B06697`, opened as a DbgEng image target with its
+public PDB:
+
+| Function in `Vid.sys` | Dispatch-loop call | Reason inspected | Message loaded | Direct call to `VidInterceptPreprocess` |
+|---|---|---|---|---|
+| `VidXSchedulerpVpRun` (`+0x2CB80`) | `+0x2CC09` | `+0x2CC15`, `cmp dword ptr [rsp+40h],1` | `+0x2CC20`, `mov rdx,[rbx+8D8h]` | **`+0x2CC2A`** |
+| `VidXSchedulerVpThreadStartRoutine` (`+0x2D900`) | `+0x2DAA8` | `+0x2DAB4`, `cmp dword ptr [rbp-41h],1` | `+0x2DABE`, `mov rdx,[rbx+8D8h]` | **`+0x2DAC8`** |
+
+Both call `[_imp_WinHvRunVpDispatchLoop]`, test the reason it returns, load the message at
+`[VP+0x8D8]` into `rdx` with the VP in `rcx`, and call `VidInterceptPreprocess` **directly** — so
+neither reaches the `WinHvpOnInterception` path that reads `[partition+0x10]`. `forwarded = 0` is
+therefore consistent with VID having received the intercept through its dispatch loop, and **S5j's
+second explanation is narrowed to the chained slot rather than eliminated.**
+
+**The record already contained the warning.** S5k flagged this fork at
+[its own limits section](#limits-of-this-read-stated-rather-than-left-to-be-found) —
+`VidDeviceExtension+0x288` bit `0x40`, "almost certainly the root scheduler" — and scoped its
+finding to the bit-clear path. S5q did not carry that scoping forward, which is the same failure
+mode as the `CLAUDE.md` restructure's: the qualifier is in the paragraph above and gets dropped by
+the sentence that concludes it.
+
+**Two accounts survive, both inferences rather than measurements, and the dispatch-loop paths
+reorder them.**
+
+1. **The message was delivered and VID took the unregistered-vector branch.** S5k found that
+   `VidHandlerpExceptionRegisterEntry` claims its slot in `[partition+0xB68]` and *then* calls
+   `WinHvInstallIntercept`, so a raw install leaves the per-vector slot unclaimed. With the two
+   direct calls above, the message can reach `VidInterceptPreprocess` without the callback, hit that
+   gate, and be held — which accounts for S5h's signature **and** for `forwarded = 0` together.
+   This is now the **better-supported** of the two, because the paths carrying it are measured while
+   the alternative's mechanism is not.
+2. **Nothing was delivered, because the arming sequence is incomplete.** The missing half may be not
+   a per-vector flag but the establishment of delivery itself — the port and SINT plumbing whose API
+   `winhvr.sys` exports (`WinHvAllocatePartitionSintIndex`, `WinHvCreatePort`, `WinHvConnectPort`) —
+   without which the hypervisor has the intercept armed and nowhere to post.
+
+**Neither is decided by counting forwards through the partition callback, and that is the instrument
+lesson.** All three known callers converge on `VidInterceptPreprocess`, so **the convergence point is
+the instrument site**: arrivals counted there answer delivery whichever path carried the message,
+where a counter on the chained slot cannot see two of the three. That is also the positive control
+this gate lacked — a zero from an instrument two of three paths bypass is uninterpretable in exactly
+the way arm 0's zero was. Whether the root partition's `Vid.sys` can be instrumented that way on this
+bench is a separate question and is **not established here**; `FOLLOWUPS.md` item 103 carries it.
 
 #### What it means for the build
 
 This is the fourth downward re-scope in this line, and it moves in the opposite direction from the
-last three. The receiver is **not a routine to chain**: chaining installs, restores exactly,
-and receives nothing. What is missing is a *delivery path*, and the only known way to establish one
-is the registration S5m found — which S5n and S5o showed needs a partition handle that a running
-VM will not give up. So arm 1 does not open a route; it closes the one this gate was built on, and
-returns the question to ownership.
+last three — **but it is narrower than this section first claimed.** What arm 1 establishes is that
+the receiver is **not a routine to chain**: chaining into `[partition+0x10]` installs, restores
+exactly, and receives nothing. What it does **not** establish is that no delivery path exists, since
+two of the three paths into preprocessing never read that slot. So arm 1 closes the route this gate
+was built on and leaves the delivery question **open rather than answered against**; the ownership
+route (item 103 step 8) is where the *chaining* failure points, not somewhere the evidence forces the
+build to go. The cheaper successor is the convergence-point measurement above, and it is ahead of any
+ownership work in the order item 103 records.

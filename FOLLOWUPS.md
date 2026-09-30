@@ -3639,6 +3639,19 @@ validated. The full record is the
   this build at all. **So what LiveCloudKd provides is inspection with Secure Kernel symbols on
   top**, and every novelty claim in this plan may be stated against that — for **this release**,
   the refusal being build-conditional by its own wording.
+- **Narrowed 2026-09-30: S5s tested the main release line, not the asset the procedure links.** The
+  maintainer's live-debugging page links `LiveCloudKd.EXDI.debugger.v1.0.20251103.zip` (tag
+  `v1.0.20251103`, confirmed in the release list) and says to register **`ExdiKdSample.dll`** — a
+  separate download post-dating `v2.8.4.20241221`'s *"EXDI plugin renamed to `ExdiHvSrv.dll`"* by
+  eleven months, and those notes never name the old spelling, so `exdi-stub-plan.md`'s "the article's
+  naming is stale" was an inference from two filenames and is corrected. **Its contents were not
+  read**, so whether its DLL is a distinct binary is open — and since the refusal string is
+  build-conditional, only that zip answers whether its build carries the same gate. **It is not
+  queued, for two reasons that are already on the record**: its procedure
+  requires the **Classic** scheduler against this host's **Root** (the 2026-09-19 preflight decision,
+  which also declined to change a shared host), and it reaches VTL1 by **duplicating handles from
+  `vmwp.exe`** — step 7 below, declined on scope grounds rather than open on technical ones. So this
+  is a decision for the maintainer, not a compatibility investigation.
 - **And the inspector half passes, with its control.** The passive CLSID connects, finds
   `ntkrnlmp`, resolves NT symbols and walks the process list; `IeXdiControlComponentFunctions` is
   unimplemented (`0x80004002`), so `.exdicmd` is missing beside the execution control.
@@ -3811,27 +3824,53 @@ validated. The full record is the
   Three other functions read the pair — `WinHvpOnMirroringNotification`,
   `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
   say they serve other message types, but their objects were not identified, so a dispatch consulting
-  one of those instead is **narrowed, not eliminated**. **The `.pdata` hole is closed**, not merely
-  noted — `.pdata` claims no leaf functions, so the tool now decodes the executable bytes it leaves
-  out (9,599 here, 9,558 of them padding, five gap runs); and **`rbp` is no longer assumed to be a
+  one of those instead is **narrowed, not eliminated**. **The `.pdata` hole is narrowed, and the gap
+  decoding was wrong twice before it was right** (re-derived 2026-09-30): `.pdata` claims no leaf
+  functions, so the tool decodes the executable bytes it leaves out — **9,599 here, 9,569 of them
+  `0xCC`/`0x00`, five spans holding anything else, 0 bytes capstone refused**. Decoding a span as one
+  stream loses an island after an odd-length `0x00` run (`00 00` is a two-byte `add byte ptr [rax],
+  al`); splitting it at *every* `0xCC`/`0x00` byte — the fix for that, and what this entry recorded —
+  cuts instructions apart instead, because **a single zero byte is not padding** and almost every
+  RIP-relative load carries one in its high displacement byte. A 12-byte leaf loading the array
+  anchor and reading `+0x10` reported **zero** reaching regions under that reading. The tool now
+  decodes each span from its own start *and* from every island start, unioning by `(address, size)` —
+  a lower bound with possible phantoms, so it widens the reaching set and never narrows it. **The
+  sibling instrument already did exactly that** — `vid_field_census.py` decodes "from every plausible
+  start … and take[s] the union" because "no single pass licenses a negative here" — while this entry
+  claimed the gaps were decoded *"as `vid_field_census.py` does"*; naming the right sibling is not
+  copying its method. And **`rbp` is no longer assumed to be a
   frame pointer**, being suppressed only where the function's `UNWIND_INFO` names it as the frame
   register — 16 such operands exist image-wide and none is in a reaching region. **The answer did not
-  move** through either: 28 regions and 42 accesses before and after. **The reaching set is still a lower bound**:
+  move** through any of the three: 28 regions and 42 accesses throughout — which is why the gap scan
+  needed its own test rather than agreement on the real image, since `winhvr.sys` reports 28 and 42
+  under all three readings. **The reaching set is still a lower bound**:
   a function handed the partition object as an *argument* calls neither anchor and is absent from the
-  28 even if it reads the pair, which no amount of the above accounts for. The tool ships without a self-test, which
-  S5p's instrument has and which review holed twice; treat its function set as a reading.
+  28 even if it reads the pair, which no amount of the above accounts for. The tool now has
+  `--self-test`, **12/12**, pinning both defects with the broken reading asserted to fail and two
+  negative controls; mutation-verified at 10/12 and 9/12. Treat its function set as a reading.
 - **What it does to S5j's two explanations, and to the build.** S5k killed *nothing was bound*;
   step 2 confirmed Vid bound at runtime for both partitions. Arm 1 bears against the second, *the
-  handler received it and retained it*: the bound routine is **not called**, so the hold is not
-  something a receiver retains after receiving — it happens before the root's intercept dispatch
-  runs. The likeliest remaining account is an **inference, not a measurement**: S5k's "half of the
-  arming sequence" may be not merely the per-vector flag but the delivery plumbing itself — the port
-  and SINT whose API `winhvr.sys` exports — without which the hypervisor has the intercept armed and
-  nowhere to post. **So the receiver is not a routine to chain.** Chaining installs and restores
-  cleanly and receives nothing; what is missing is a delivery path, and the only known way to
-  establish one is S5m's registration, which S5n and S5o showed needs a partition handle a running VM
-  will not give up. **Arm 1 closes the route this gate was built on and returns the question to
-  ownership** — step 8. Full record in the
+  handler received it and retained it*: the routine chained into `[partition+0x10]` is **not
+  called**, so the hold is not something *that routine* retains. **Corrected 2026-09-30 — this entry
+  and the doc both said "it happens before the root's intercept dispatch runs", and that does not
+  follow.** This host runs the **root** scheduler (Hyper-V-Hypervisor event ID 2 reports `0x4` on each
+  of the three most recent boots, latest 2026-09-29 17:58:30, read 2026-09-30) and `Vid.sys`
+  `10.0.26100.9278` has **two further paths into `VidInterceptPreprocess` that never read the
+  partition callback**: `VidXSchedulerpVpRun` (`+0x2CB80`) calls `[_imp_WinHvRunVpDispatchLoop]` at
+  `+0x2CC09` and `VidInterceptPreprocess` **directly** at `+0x2CC2A`, and
+  `VidXSchedulerVpThreadStartRoutine` (`+0x2D900`) does the same at `+0x2DAA8` and **`+0x2DAC8`**;
+  both test the returned reason and load the message at `[VP+0x8D8]`. So `forwarded = 0` is
+  consistent with VID having received the intercept through its dispatch loop, and S5j's second
+  explanation is **narrowed to the chained slot, not eliminated**. S5k had flagged this fork
+  (`VidDeviceExtension+0x288` bit `0x40`) and scoped its finding to the bit-clear path; S5q did not
+  carry that forward. Two accounts now survive, both inferences: **delivery happened and VID took the
+  unregistered-vector branch** (now the better supported, since its paths are measured), or the
+  arming sequence is incomplete — S5k's "half of the arming sequence" being the port and SINT
+  plumbing `winhvr.sys` exports rather than a per-vector flag. **What arm 1 does establish is that the
+  receiver is not a routine to chain**: chaining installs and restores cleanly and receives nothing.
+  What it does **not** establish is that no delivery path exists, so it leaves the delivery question
+  open rather than answered against, and step 8 is where the *chaining* failure points rather than
+  where the evidence forces the build. **The successor is step 9 below, not step 8.** Full record in the
   [S5q arm 1 result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
 ### Out of scope, with the reason rather than as a list
@@ -3935,7 +3974,11 @@ validated. The full record is the
       next step "the only route". S5n declined to attempt it for a good reason (`vmwp.exe` runs
       protected, and taking a handle out of it is an attack on the platform rather than an
       experiment on it), and *declining to attempt* is not *excluding*. It stays here until it is
-      one or the other.
+      one or the other. **And it is not hypothetical — 2026-09-30**: LiveCloudKd's own live-debugging
+      procedure states it duplicates handles from `vmwp.exe`, so the third-party route that claims
+      Secure Kernel breakpoints is *this step*, reached by doing the thing S5n declined. That makes
+      the LiveCloudKd package a scope decision rather than a compatibility one, and it means closing
+      this step either way also settles what to say about that tool.
    8. **The fallback S5q's host-bugcheck stop selects, and a decision rather than an arm.**
       The VMM-of-our-own question: own the
       partition from creation, where `VidPartitionCreate` admits any name for an administrator and
@@ -3943,16 +3986,35 @@ validated. The full record is the
       lacked for the admission path — but only for writes a decoded-operand census can see, and
       only alongside step 7 still being open, so this is the route with **no known obstacle**
       rather than the only one. Still a reason to **cost** the rig rather than start building it.
+   9. **Measure delivery at the convergence point, which is what S5q's zero could not.** Added
+      2026-09-30 with the correction above. All three known callers of `VidInterceptPreprocess`
+      converge on it, and only one of them reads `[partition+0x10]`, so **arrivals counted at
+      `VidInterceptPreprocess` itself answer delivery whichever path carried the message** where a
+      counter on the chained slot is blind to two of three. **Closes when** a raise under a standing
+      raw install is correlated with an arrival there, *with a positive control* — a raise under a
+      Vid-installed intercept, which must arrive — and with the backed-out arm interleaved rather
+      than run as a clean batch afterwards. A zero on its own repeats arm 0's uninterpretable
+      reading. **Open, and its feasibility is the first question, not the measurement**: this is the
+      *root* partition's `Vid.sys`, so how it can be instrumented on this bench — and whether that
+      is a patch, a breakpoint on a host kernel this bench cannot freeze, or neither — is
+      unestablished. Cost that before scheduling the arm. **Ahead of steps 7 and 8 in the order**,
+      because it can move the delivery question without owning a partition or taking a handle out of
+      a protected process.
 
    **The list above is the *ownership* route, and S5q goes around it rather than continuing it.**
    Every step in it exists because the exported user-mode receiver needs a partition handle.
    `WinHvSetInterceptRoutine` needs none — it is a `winhvr.sys` kernel export keyed by partition id
    — so with the standing constraint lifted for disposable guests the active work is **S5q**, and
    steps 6 to 8 are what matters only if S5q's stop conditions fire. Step 7 stays open on its own
-   terms; step 8 is the fallback the host-bugcheck condition selects. **This is the second time
+   terms; step 8 is the fallback the host-bugcheck condition selects. **Step 9 is now ahead of
+   both**, and it is there because arm 1's conclusion was narrowed: the delivery question is open
+   rather than answered against, so the cheapest thing that can move it comes before the routes that
+   need ownership or a duplicated handle. **This is the second time
    this plan has kept walking a route after a cheaper one opened beside it** — S5m already deleted
    the driver S5k specified — and the cause both times was a schedule written against the obstacle
-   in front of it rather than against the question.
+   in front of it rather than against the question. **This correction is a third instance of the same
+   cause**, caught by re-reading rather than by an arm: the conclusion was written against the
+   instrument in front of it rather than against every path into the receiver.
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from
