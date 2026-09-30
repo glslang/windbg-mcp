@@ -19,7 +19,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is a distinction a draft lost twice. The
   discriminator is on the **exit** side and Hyper-V publishes it per VM and per VP.
   `Total Messages/sec` reads **0** idle, **0** under guest churn, **0** with the raiser storming
-  `#BP`s at ~234,000 hypervisor intercepts a second *unarmed* — and **53,263** with the intercept
+  `#BP`s at ~234,000 hypervisor intercepts a second *unarmed*, **0** with the vector armed and no
+  raiser — and **~65,700 across both VPs** with the intercept
   standing, sustained for 16 s while the raiser completes **zero** rounds. A pending intercept
   re-processed on the root side produces no hypervisor message at all, so those are **new
   deliveries**: the faulting instruction is re-executed tens of thousands of times a second with
@@ -44,7 +45,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   do not exclude another armed-only source. What carries it is those rates plus the controlled
   comparison plus the VP markers' event-level naming of type `0x80010003`, vector `3` and the
   enclave `Rip` — and the stated assumption that nothing else in this guest raises `#BP` at a
-  measurable rate, which four unarmed phases support and do not prove.
+  measurable rate — which now rests on a control that could have broken it, the vector **armed
+  with the raiser absent**, reading zero on both VPs. The other four controls all ran with no
+  intercept installed, so an unrelated `#BP` source would have been invisible to them; review
+  round 4 named that and the control shares the armed phase's own install.
 - **Item 103 step 6's two blocked arms both run, and the VPs turn out to be resumed.** They had been
   held by the standing constraint on installing a vector on a child and by root kernel-memory
   access; the first lifted for guests this bench owns and the second is what S5q's read IOCTL
@@ -56,21 +60,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read S5k has wanted since it was written and which S5m could only half-answer, because
   registering to ask whether the slot is claimed *claims* it. It narrows S5j's retained explanation
   without closing it: a claimant would have had to claim and release inside one 2-second gap and
-  coincide with the raise. **The loop arm ran and did not answer its question**: `handled = 0` at
+  coincide with the raise. **The loop arm ran and did not answer its question, which the counters
+  in the entry above later did**: `handled = 0` at
   all twelve samples shows the guest's `__except` never ran, which one trap held for the window
   gives too, and the frozen-or-slowed run's **20 fresh stamps** are twenty calls to
   `VidInterceptPreprocess` rather than twenty executions of the instruction — one pending
-  intercept re-preprocessed gives the same series. S5k's re-entry inference stands as an
-  inference; closing it needs a count tied to new hypervisor deliveries or retired guest
-  instructions. **And a third reading came free**: per-VP
+  intercept re-preprocessed gives the same series. S5k's re-entry inference stood as an
+  inference at this arm, needing a count tied to new hypervisor deliveries or retired guest
+  instructions — **and the loop-question entry above is that count**, so this arm's
+  *did not answer* is superseded there rather than still open. **And a third reading came free**: per-VP
   `HvRegisterInterceptSuspend` is **transient** — seen on both VPs at different instants, and `0` at
   every sample of a control that raised **1.87 million** `#BP`s with no intercept standing — while
   both VPs keep accumulating `VpRuntime` and the **raiser** completes no rounds. **The VPs are being
   resumed**, which removes the necessary-condition objection review round 3 on #428 raised against
   the ping-pong reading of the two-VP markers — and removing an objection to one explanation is not
-  evidence for it over another, so that question stays open: nothing here correlates the single
-  raising thread with either VP, and one pending intercept being re-preprocessed remains equally
-  consistent. What *performs* the resumption, and which VP the thread is on, are both unmeasured.
+  evidence for it over another, so that question stayed open **at this arm**: nothing here
+  correlates the single raising thread with either VP, and one pending intercept being
+  re-preprocessed remains equally consistent. **The loop-question entry above supplies that
+  correlation** and is where the two-VP status now reads. What *performs* the resumption is
+  still unmeasured.
   One reading withdrawn because the control killed it: `RIP`
   `…4001C` appears on intercept-suspended VPs **and on running ones in the control**, so it is a
   common parked kernel address and not a signature of the trap.
