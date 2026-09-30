@@ -25,8 +25,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deliveries**: the faulting instruction is re-executed tens of thousands of times a second with
   nothing retiring it. S5k's inference holds and step 6's arm 2 is answered.
   **A finding fell out of the control, with a matched VTL0 arm**: normalised per round, a VTL0
-  `#BP` costs **~0.0013** hypervisor exits and a VTL1 one **~1.3**, same guest and binary and
-  counter with only the VTL differing, and the round-rate gap in that run is **9.5×** against the
+  `#BP` costs **0.0023** hypervisor exits and a VTL1 one **2.08** — both from *both* VPs' excess
+  over their own idle means and from the raiser's own clock, a draft having divided VP 1's rate
+  alone by a mis-taken window — same guest and binary and counter with only the VTL differing,
+  and the round-rate gap in that run is **9.46×** against the
   recorded 9.7 µs / 0.85 µs. That is a difference in kind and **not** a decomposition of the
   timing, which a draft claimed. The first attempt at that control was worthless and looked fine —
   the VTL0 raiser finished its rounds in 1.7 s, before the first sample — so round counts are per
