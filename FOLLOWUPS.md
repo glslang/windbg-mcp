@@ -4061,10 +4061,13 @@ validated. The full record is the
       — see the receiver-arm section — and the route is closed from user mode: the IOCTL is issued
       directly for a lossless `NTSTATUS`, and on both workers three handles return
       `STATUS_NOT_IMPLEMENTED` and the fourth `STATUS_ACCESS_DENIED`. Nothing was mutated — the
-      poisoned output survived every arm, so no slot was ever claimed. Why it refuses is a limit,
-      not a finding: every wider duplicate is refused by `DuplicateHandle` itself, so the driver's
-      ownership check and the driver wanting write access predict the same result. LiveCloudKd's
-      procedure therefore needs more than duplication, measured.**
+      poisoned output survived every arm, so no slot was ever claimed. **Why it refuses is now
+      read out of `Vid.sys` rather than inferred**: `VidIoControlPreProcess` compares
+      `PsGetCurrentProcess()` against the owning process at `[partition+0x3780]` and returns
+      `ACCESS_DENIED` before any dispatch, exempting only control codes `0x2210ef` and `0x2211e3`.
+      So it is a process-identity gate, no handle could pass it, and the receiver
+      (`VidHandlerpExceptionRegisterEntry`) has no access check at all. LiveCloudKd's driver stops
+      being a guess: kernel code can make `PsGetCurrentProcess()` match; duplication cannot.**
       **Inheritance of a VID handle a worker still holds is excluded** on object identity —
       no child holds any of the workers' four current VID file objects. **Not excluded**: one
       inherited and since closed in the parent, which a snapshot cannot see. The children's own
