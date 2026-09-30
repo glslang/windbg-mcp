@@ -4039,7 +4039,7 @@ validated. The full record is the
       image rather than a proof that every invocation goes through preprocess, so the read's
       coverage rests on it **plus** the arm's positive control, which demonstrates the path instead
       of inferring it. Built
-      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 15/15 and
+      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 17/17 and
       mutation-verified, because a reachability *negative* over an image is the one
       claim a byte scan cannot make: a branch encodes a displacement, not an address, and the
       address appears in immediates that transfer control nowhere. **Cost**: one bounded kernel-read
@@ -4056,8 +4056,13 @@ validated. The full record is the
       `[P+0xB68]` pointing at a table of mostly `0xFF`. Two limits carry into the arm's design
       rather than being retired by it: the read is **last-arrival state, not a count**, so the
       positive control has to show the markers are still there when sampled or its own negative
-      means nothing; and the unclaimed branch returns `0` and stores no marker, so
-      `[P+0xB68][3]` remains the only thing that can name which branch ran.
+      means nothing; and nothing durable records *which* branch `VidHandleExceptionIntercept` took,
+      so `[P+0xB68][3]` names it only if the slot did not move between the handler consulting the
+      table and the sample. A same-request read narrows that window and does not close it, and the
+      remedy that would — recording the value in the delivery path — is the patch route this gate
+      declined, so the arm **checks** the assumption (sample either side of the raise, a change
+      spoils the branch reading) rather than making it. The arms-1-versus-2 split is therefore
+      narrowed rather than decided; delivery itself rests on the VP markers alone and is unaffected.
 
    **The list above is the *ownership* route, and S5q goes around it rather than continuing it.**
    Every step in it exists because the exported user-mode receiver needs a partition handle.

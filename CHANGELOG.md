@@ -42,8 +42,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   gap bytes skipped in silence, which is the one way a negative here can be badly wrong. Scanning
   code sections for stored addresses closes the other: an indirect call through a RIP-relative slot
   names the slot, so a dispatch table in `.text` was invisible to the decoder *and* to the byte
-  scan at once. `--self-test` **15/15, mutation-verified on eight edits**, every one applied and
-  every one caught — and two of those earn a note. The byte-scan case's first version passed under
+  scan at once. And a byte capstone refuses no longer ends a `.pdata` function's decode: it steps
+  over it, labels everything past the stop as possibly mis-framed and prints the refused count —
+  without which a single byte of inline data would leave every later call in that function
+  unexamined while the range still counted as claimed, so the gap detector would not pick it up
+  either. Both images read here report **0 decode stops and 0 refused bytes**, which is what makes
+  their negatives readings of the whole image. `--self-test` **17/17, mutation-verified on ten
+  edits**, every one applied and every one caught — and two of those earn a note. The byte-scan
+  case's first version passed under
   the very mutation it existed for, because the immediate it used was a neighbouring number rather
   than the target's address; and `report` is now rendered into a sink for every case, because the
   counts come from `scan` and the printing path was otherwise never executed — which is exactly

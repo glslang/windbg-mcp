@@ -5452,10 +5452,12 @@ an inter-procedural pointer, a bulk copy spanning the field, and another image e
 
 **Nothing in this image names `VidHandleExceptionIntercept` except the `lea` that stores it.** It has
 **one** reference: the `lea` at `VidInterceptPreprocess+0x1e0` that puts it in `V+0x158`. Nothing
-else names it, in `.pdata`-claimed code or in the 4,352 candidate starts across the ten non-padding
+else names it, across 1,988 `.pdata` functions and the 4,352 candidate starts in the ten non-padding
 gap runs, and no section — including the executable ones — holds its address in either searched
 encoding beyond its own `RUNTIME_FUNCTION` and its `GFIDS` entry, neither of which transfers control
-anywhere.
+anywhere. **`0` functions had a decode stop and `0` bytes were refused**, which is the number that
+decides whether the rest of that sentence is a reading of the image or of the part of it the
+decoder got through — `Vid.sys` has no such byte, so there is nothing to allow for here.
 
 **That is the measurement, and it is not the same sentence as "every invocation goes through
 preprocess" — an earlier version of this paragraph wrote the second.** `pe_xref.py` says so about
@@ -5482,10 +5484,19 @@ other three. That is the whole reason it is better than the counter step 9 origi
   (a raise under a Vid-installed intercept, which must arrive) has to demonstrate that the markers
   are still there when sampled, or a negative from it means nothing. Arm 0's zero is the standing
   warning.
-- **It cannot separate arms 1 and 2 by itself.** The unclaimed branch of
-  `VidHandleExceptionIntercept` (`+0x100`) returns `0` and leaves no per-VP marker, and the claimed
-  branch's difference is a return value its callers test and do not store. The contemporaneous
-  `[P+0xB68][3]` read is not a nicety here; it is the only thing that names the branch.
+- **It cannot separate arms 1 and 2, and neither can the table read on its own.** The unclaimed
+  branch of `VidHandleExceptionIntercept` (`+0x100`) returns `0` and leaves no per-VP marker, and
+  the claimed branch's difference is a return value its callers test and do not store — so nothing
+  durable records *which* branch ran. `[P+0xB68][3]` is sampled **after** the handler consulted the
+  table, and any VID client can claim or release a vector in between, so it names the branch only
+  under the assumption that the slot did not move. **Review round 2 called that out and it is
+  right**: a same-request read narrows the window, it does not close it, and the version of this
+  section before it said otherwise. The arm's answer is to **check the assumption rather than make
+  it** — sample the table on both sides of the raise with the same call, and treat any change as
+  spoiling the branch reading for that arm — because the alternative the finding names, recording
+  the value in the delivery path, means instrumenting the handler, which is the patch route this
+  gate declined. So the arms-1-versus-2 split stays **narrowed, not decided**. Step 9's own
+  question is untouched by this: *delivered versus not* rests on the VP markers alone.
 - **Non-Exo only**, as S5o's reading was: `VidExoVpInterceptIsrCallback` is a separate ISR and this
   gate did not read it.
 - **One image.** A write into the VP structure from `winhvr.sys` or anywhere else is invisible to a

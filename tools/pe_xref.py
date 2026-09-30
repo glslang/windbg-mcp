@@ -56,12 +56,24 @@ that were each one omission from it:
 4. **Bytes present at run time but not in the file** -- a section whose
    `SizeOfRawData` is shorter than its virtual size has an uninitialised tail
    that is not read here.
-5. **Anything in another image.** This reads one file.
+5. **Anything in another image.** This reads one file, so a caller in a
+   different module is invisible -- and where the target is *exported*, that is
+   not hypothetical. An `.edata` hit is therefore labelled as what it is rather
+   than filed with the structural rows that transfer control nowhere.
+6. **Framing after a decode stop.** A refused byte no longer ends the function
+   (see `decode_function`), but resynchronising one byte later can mis-frame
+   what follows, so hits past a stop are labelled and the refused-byte count is
+   printed. Zero refusals is the only reading that needs no allowance.
 
 Items 1 and 5 are the ones that actually bite. What used to be on this list and
-is not any more: sections were selected by NAME, so an executable section called
-anything unexpected had its gap bytes skipped in silence -- now they are selected
-by `IMAGE_SCN_MEM_EXECUTE`, which is the property the question is about.
+is not any more, each because a review round named it: sections were selected by
+NAME, so an executable section called anything unexpected had its gap bytes
+skipped in silence -- now `IMAGE_SCN_MEM_EXECUTE`, which is the property the
+question is about. Stored addresses were searched only outside code sections,
+which hid a dispatch table in `.text` from the byte scan at the same time as the
+decoder could not recover it. And one refused byte ended the decode of a
+`.pdata` function, leaving every later call in it unexamined while the range
+still counted as claimed, so the gap detector did not pick it up either.
 
 So "0 references" means "no instruction in this image names it, and no section of
 it holds its address in either of the two searched forms" -- which is what a
@@ -104,6 +116,14 @@ PADDING = (0x00, 0xCC)
 STRUCTURAL = {
     ".pdata": "  -- its own RUNTIME_FUNCTION, not a dispatch table",
     "GFIDS": "  -- the CFG indirect-call target list, not a dispatch table",
+    # Not in the same class as the two above, and labelled apart on purpose: an
+    # export entry is not a dispatch table either, but it IS a way another
+    # image reaches this function, which is the one thing a single-file scan
+    # can never see. Saying "not a dispatch table" here would file a real
+    # reachability fact under the heading of the two that transfer control
+    # nowhere.
+    ".edata": "  -- its export-directory entry: reachable from ANOTHER image, "
+              "which this scan does not read",
 }
 
 
@@ -258,16 +278,55 @@ def targets_of(insn, image_base: int) -> list[int]:
     return out
 
 
+def decode_function(md, blob: bytes, base: int):
+    """Decode one `.pdata` range whole, resuming one byte past anything
+    capstone refuses. Yields `(insn, after_stop)`, and reports how many bytes
+    were refused.
+
+    Without the resume a single undecodable byte -- inline data, a byte from a
+    build this decoder does not model -- ends the decode, and because the whole
+    `.pdata` range counts as claimed, the gap detector does not pick the
+    remainder up either. Every later `call` in that function then goes
+    unexamined and the tool reports the clean zero it exists to avoid. Named by
+    review round 2 on #425; `vid_field_census.py` counts those bytes and stops,
+    which is the weaker half of the same answer.
+
+    `after_stop` is set for everything decoded past the first refusal, because
+    resynchronising one byte later can mis-frame what follows. A hit there is
+    real bytes read at a possibly wrong boundary -- the same caveat a gap hit
+    carries, and it is labelled the same way rather than being counted as an
+    exact attribution.
+    """
+    off, refused, after_stop = 0, 0, False
+    while off < len(blob):
+        consumed = 0
+        for insn in md.disasm(blob[off:], base + off):
+            consumed += insn.size
+            yield insn, after_stop
+        if consumed >= len(blob) - off:
+            break
+        off += consumed + 1  # step over the byte capstone would not take
+        refused += 1
+        after_stop = True
+    yield None, refused
+
+
 def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref], dict]:
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = True
 
     refs: list[Ref] = []
+    refused_bytes = 0
+    functions_with_a_stop = 0
     for beg, end in img.pdata:
         blob = img.read(beg, end - beg)
         if not blob:
             continue
-        for insn in md.disasm(blob, img.image_base + beg):
+        for insn, flag in decode_function(md, blob, img.image_base + beg):
+            if insn is None:
+                refused_bytes += flag
+                functions_with_a_stop += int(bool(flag))
+                break
             for t in targets_of(insn, img.image_base):
                 if t in wanted:
                     rva = insn.address - img.image_base
@@ -275,9 +334,10 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
                     # a function with chained unwind info has several entries,
                     # and naming the entry start reports an offset into an
                     # offset. The entry is printed beside it.
+                    note = "  [after a decode stop -- framing may be off]" if flag else ""
                     refs.append(
                         Ref(rva, insn.mnemonic, f"{insn.mnemonic} {insn.op_str}", t,
-                            f"{name_for(rva, syms)}  [.pdata entry 0x{beg:x}]", True)
+                            f"{name_for(rva, syms)}  [.pdata entry 0x{beg:x}]{note}", True)
                     )
 
     runs = gap_runs(img)
@@ -330,6 +390,8 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
         "gap_runs": len(runs),
         "gap_starts": starts,
         "data": data_hits,
+        "refused_bytes": refused_bytes,
+        "functions_with_a_stop": functions_with_a_stop,
     }
 
 
@@ -359,8 +421,11 @@ def report(refs: list[Ref], extra: dict, wanted: set[int], syms: dict[int, str])
         else:
             print("  stored VA/RVA: none in any section")
     print(
-        f"{extra['functions']} .pdata functions; {extra['gap_starts']} candidate "
-        f"starts in {extra['gap_runs']} non-padding gap run(s)"
+        f"{extra['functions']} .pdata functions "
+        f"({extra['functions_with_a_stop']} with a decode stop, "
+        f"{extra['refused_bytes']} byte(s) refused and stepped over); "
+        f"{extra['gap_starts']} candidate starts in "
+        f"{extra['gap_runs']} non-padding gap run(s)"
     )
 
 
@@ -388,20 +453,22 @@ def _img(text: bytes, base: int = 0x140000000, claim=None, data: bytes = b"",
     return img
 
 
-TOTAL = 15
+TOTAL = 17
 
 # Mutation-verified, so the cases below share one denominator and none of them
 # is passing for a reason unrelated to the rule it names. Backing each of these
 # out of the code above, every one applied and every one was caught:
 #
-#   gap union -> a single start                      13/15
-#   decode window shrunk below one instruction       11/15
-#   sections selected by name again                  14/15
-#   the data scan skips executable sections again    13/15
-#   every immediate counts as a branch target        14/15
-#   gap hits attributed as `.pdata` hits             11/15
-#   padding-only runs kept as runs                   14/15
-#   `--targets` reads a bare value as hex            14/15
+#   gap union -> a single start                      15/17
+#   decode window shrunk below one instruction       13/17
+#   sections selected by name again                  16/17
+#   the data scan skips executable sections again    15/17
+#   every immediate counts as a branch target        16/17
+#   gap hits attributed as `.pdata` hits             13/17
+#   padding-only runs kept as runs                   16/17
+#   no resume after a refused byte                   16/17
+#   refused bytes not counted                        16/17
+#   `--targets` reads a bare value as hex            16/17
 #
 # Two of those earn the comment. The immediate case's FIRST version used
 # `mov eax,0x40001000`, whose immediate is a *neighbouring* number rather than
@@ -415,7 +482,8 @@ TOTAL = 15
 def self_test() -> int:
     failures = 0
 
-    def case(label, img, wanted, want_exact, want_gap, want_data, want_runs=None):
+    def case(label, img, wanted, want_exact, want_gap, want_data, want_runs=None,
+             want_refused=None):
         nonlocal failures
         refs, extra = scan(img, wanted, {})
         # Render every case through `report` as well, into nothing. The counts
@@ -432,8 +500,12 @@ def self_test() -> int:
         if want_runs is not None:
             got += (extra["gap_runs"],)
             want += (want_runs,)
+        if want_refused is not None:
+            got += (extra["refused_bytes"],)
+            want += (want_refused,)
         ok = got == want
-        shape = "exact/gap/data" + ("/runs" if want_runs is not None else "")
+        shape = ("exact/gap/data" + ("/runs" if want_runs is not None else "")
+                 + ("/refused" if want_refused is not None else ""))
         print(f"  {'ok  ' if ok else 'FAIL'} {label}: "
               f"{'/'.join(str(g) for g in got)} {shape} "
               f"(wanted {'/'.join(str(w) for w in want)})")
@@ -517,6 +589,22 @@ def self_test() -> int:
     stray = b"\x90" * 5 + b"\x00" + b"\xe8\xf5\xff\xff\xff"
     case("a gap reference reachable only from a later start",
          _img(stray, claim=[(0x1000, 0x1005)]), {0x1000}, 0, 1, 0)
+
+    # A byte capstone refuses, inside a `.pdata` range, with a real call after
+    # it. `0x06` is `push es` -- valid in 32-bit, refused in 64. Without the
+    # resume the decode ends there, and because the whole range counts as
+    # claimed the gap detector does not pick the remainder up either, so the
+    # call after it vanishes and the tool reports its clean zero. The refused
+    # byte is counted as well, because a reader cannot tell a sound negative
+    # from a truncated one unless the number is on the page.
+    stopped = b"\x90" * 5 + b"\x06" + b"\xe8\xf5\xff\xff\xff"
+    case("a call after an undecodable byte is still found",
+         _img(stopped), {0x1000}, 1, 0, 0, want_refused=1)
+
+    # The control for it: the same shape without the refused byte reports zero
+    # refusals, so the count above is about the byte and not about the harness.
+    case("a clean function reports no refusals",
+         _img(b"\x90" * 6 + b"\xe8\xf5\xff\xff\xff"), {0x1000}, 1, 0, 0, want_refused=0)
 
     # An unrelated target is not reported for any of the shapes above, which is
     # what makes the zeros elsewhere mean something.
