@@ -4148,8 +4148,7 @@ validated. The full record is the
       vectors 3 and 4 — **false**, and review caught it: S5i read a per-partition allowed-vector
       mask at `+0x6124` with an unconditional *exemption* for 3 and 4, and `#BR` already installed
       through the mask. The vector-0 install was then tried and **succeeded**, which adds a vector
-      to what this child's mask is known to admit. **And the freeze is now measured, which also
-      explains the two VPs.** Reading the guest's progress counter WHILE the intercept stands — the
+      to what this child's mask is known to admit. **And the freeze is now measured.** Reading the guest's progress counter WHILE the intercept stands — the
       side of the release S5h's retracted "advancing" reading got wrong — gives `handled = 0` at
       ten samples over 30 s, against **2,282** the moment teardown releases it, reproducing S5h's
       artefact one line below the correct reading. Interceptions kept arriving throughout: 20 new
