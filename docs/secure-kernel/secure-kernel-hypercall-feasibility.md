@@ -5214,46 +5214,61 @@ the partition object as an *argument*, or obtains it from a helper other than
 `WinHvpReferencePartition`, calls neither anchor and is absent from the 28 even if it reads the pair.
 Closing that needs provenance carried across calls and returns, which the tool does not do — so
 "functions that can hold a partition object" means "functions that obtain one by the two routes it
-looks for". **The `.pdata` hole is narrowed, and it took three readings to get the decoding right**:
-`.pdata` claims no leaf functions, so a leaf loading the array would have been invisible, and the
-tool decodes the executable bytes `.pdata` leaves out as `vid_field_census.py` does — **9,599
-unclaimed bytes here, 9,569 of them `0xCC`/`0x00`, five spans holding anything else**, with **0
-bytes capstone refused** (re-derived 2026-09-30 against the same `winhvr.sys`). A gap carries no
-unwind record, so nothing in the image says where an instruction in it begins, and **each of the
-first two readings lost real leaf code**:
+looks for". **The `.pdata` hole is narrowed, and the gap scan was wrong three times before it was
+right**: `.pdata` claims no leaf functions, so a leaf loading the array would have been invisible, and
+the tool decodes the executable bytes `.pdata` leaves out as `vid_field_census.py` does — **9,599
+unclaimed bytes here, 9,569 of them `0xCC`/`0x00`, five spans holding anything else, decoded as six
+islands**, with **0 distinct bytes capstone refused** (re-derived 2026-09-30 against the same
+`winhvr.sys`). A gap carries no unwind record, so nothing in the image says where an instruction in it
+begins nor where one leaf ends, and each of the first three readings was wrong about one of those:
 
-- Decoding a span as one stream loses an island after an **odd-length run of `0x00`**, because
+- **Decoding a span as one stream** loses an island after an **odd-length run of `0x00`**, because
   `00 00` decodes as a two-byte `add byte ptr [rax], al` — so the odd byte shifts everything after
   it. (`0xCC` is one byte and keeps alignment, which is why the defect needs a zero run.)
-- Splitting the span at **every** `0xCC`/`0x00` byte — the fix for the first, and what this section
+- **Splitting the span at every `0xCC`/`0x00` byte** — the fix for the first, and what this section
   originally recorded — cuts instructions apart instead. **A single zero byte is not padding**:
   a 12-byte leaf that loads the array anchor and reads `+0x10` encodes as
   `48 8B 05 D9 1F 00 00 / 48 8B 40 10 / C3`, and almost every RIP-relative load in a driver carries
   a zero in its high displacement byte, so the split lands inside the one instruction that makes the
-  region reaching. That leaf is now a regression case and it reported **zero** reaching regions.
+  region reaching. That leaf is a regression case now and it reported **zero** reaching regions.
+- **Decoding each span as one region** — the fix for the second — restored the instructions and lost
+  the *provenance*, which review caught. One region per span puts every island's operands in one
+  body, so `field_hits` attributes one leaf's `+0x10`/`+0x18` access to a **different** leaf that
+  loaded the anchor: an anchor-loading leaf, padding, and an unrelated field-reading leaf read as one
+  reaching function with two accesses. That inflates exactly the figure this census exists to
+  license.
 
-What the tool does instead is decode each span from its own start **and** from every island start in
-it, unioning by `(address, size)`. That union is a lower bound with possible phantoms — a misaligned
-start decodes bytes that are not instructions — so it can only widen the reaching set, never narrow
-it, which is why the two sites that carry the finding are read back as disassembly by hand.
+What the tool does now separates the two questions. The padding test is applied **where an
+instruction begins** rather than to every byte: each island is decoded from its own start, an
+instruction may swallow whatever `0xCC`/`0x00` bytes its own encoding contains, and the island ends
+when the next *instruction boundary* lands on padding. So a zero inside a displacement is not a
+boundary and a real padding run is — and each island stays **its own region**, so an anchor load and
+a field access are correlated only inside one leaf. Islands can overlap, because a zero inside a
+displacement also makes the byte after it a candidate start; the overlapping candidates are kept
+rather than pruned, since pruning could drop a real leaf that a misaligned neighbour had run over.
+That leaves the region set a lower bound with possible phantoms — a misaligned start decodes bytes
+that are not instructions — so it can only widen the reaching set, never narrow it, which is why the
+two sites that carry the finding are read back as disassembly by hand.
 
-**The sibling instrument already did it this way, and that is the tell worth keeping.**
+**The sibling instrument had the decoding right and the same provenance question open.**
 `vid_field_census.py` decodes each gap "from every plausible start … and take[s] the union", on the
-stated ground that "no single pass licenses a negative here" — and the paragraph above claimed this
-tool decoded the gaps *"as `vid_field_census.py` does"* while doing something else in both readings.
-Naming the right sibling is not copying its method: the claim of equivalence was in the prose from the
-start and neither reading matched it.
+stated ground that "no single pass licenses a negative here" — and this section claimed the gaps were
+decoded *"as `vid_field_census.py` does"* while doing something else in the first two readings, which
+is the tell worth keeping: naming the right sibling is not copying its method. It reports a *field*
+census rather than a per-function one, so the attribution defect above does not arise there in the
+same form; whether its own union can cross a leaf boundary is **not examined here**.
 
 **And `rbp` is no longer assumed to be a frame pointer**: in optimized
 x64 it is an ordinary callee-saved register unless the function's `UNWIND_INFO` names it as the
 frame register, so it is suppressed only where that record says so — 16 `+0x10`/`+0x18` operands
 across the image are based in `rbp`, and none of them falls in a reaching region. **The answer did
-not move** through any of the three: 28 reaching regions and 42 accesses throughout — which is
+not move** through any of the four: 28 reaching regions and 42 accesses throughout — which is
 exactly why the gap scan needed a test of its own rather than agreement on the real image, since a
-run on `winhvr.sys` reports 28 and 42 under all three readings and so cannot detect the defect.
-`--self-test` now carries both, **12/12**, each pinned with the broken reading asserted to fail and
-with two negative controls; verified by mutation, the one-stream reading scoring 10/12 and the
-split-at-every-padding-byte reading 9/12.
+run on `winhvr.sys` reports 28 and 42 under **every** reading above, including the one that
+misattributes, because no gap island in this image reaches at all. `--self-test` now carries all
+three defects, **21/21**, each pinned with the broken reading asserted to fail and with two negative
+controls; mutation-verified, the one-stream reading scoring 10/12 when it was written, and against
+the current cases the span-wide region scoring **17/21** and a summed refusal count **20/21**.
 
 #### What this does to S5j's two explanations
 
@@ -5291,28 +5306,42 @@ finding to the bit-clear path. S5q did not carry that scoping forward, which is 
 mode as the `CLAUDE.md` restructure's: the qualifier is in the paragraph above and gets dropped by
 the sentence that concludes it.
 
-**Two accounts survive, both inferences rather than measurements, and the dispatch-loop paths
-reorder them.**
+**What survives is one undecided fork with three arms, all inferences rather than measurements, and
+the dispatch-loop paths widen it rather than narrowing it to one.** `forwarded = 0` says our chained
+routine was not called; each arm below produces that.
 
-1. **The message was delivered and VID took the unregistered-vector branch.** S5k found that
-   `VidHandlerpExceptionRegisterEntry` claims its slot in `[partition+0xB68]` and *then* calls
-   `WinHvInstallIntercept`, so a raw install leaves the per-vector slot unclaimed. With the two
-   direct calls above, the message can reach `VidInterceptPreprocess` without the callback, hit that
-   gate, and be held — which accounts for S5h's signature **and** for `forwarded = 0` together.
-   This is now the **better-supported** of the two, because the paths carrying it are measured while
-   the alternative's mechanism is not.
-2. **Nothing was delivered, because the arming sequence is incomplete.** The missing half may be not
-   a per-vector flag but the establishment of delivery itself — the port and SINT plumbing whose API
+1. **Delivered, and the per-vector slot was unclaimed** — so VID took the unregistered-vector branch
+   and held the trap. S5k found that `VidHandlerpExceptionRegisterEntry` claims its slot in
+   `[partition+0xB68]` and *then* calls `WinHvInstallIntercept`, so **a raw install neither claims the
+   per-vector slot nor establishes its state**; it only means *we* did not claim it.
+2. **Delivered, and the slot was already claimed by another VID client** — so the handler took the
+   *enqueue* branch and the message went to that client. This is S5j's received-and-retained reading,
+   and [the section on whether the slot was claimed](#was-the-slot-claimed-not-read-and-the-probes-own-removals-make-s5hs-controls-silent-on-it)
+   already records that it is live: `[partition+0xB68][3]` **was never read**, and S5l showed a
+   client's claim can survive a probe removal that cleared the hypervisor bit, after which "S5h's
+   next raw install re-sets the bit, and the message enqueues to that client."
+3. **Not delivered, because the arming sequence is incomplete.** The missing half may be not a
+   per-vector flag but the establishment of delivery itself — the port and SINT plumbing whose API
    `winhvr.sys` exports (`WinHvAllocatePartitionSintIndex`, `WinHvCreatePort`, `WinHvConnectPort`) —
    without which the hypervisor has the intercept armed and nowhere to post.
 
-**Neither is decided by counting forwards through the partition callback, and that is the instrument
+**What the two paths measure is that arms 1 and 2 exist, not which arm ran.** They are the route by
+which a delivered message reaches preprocessing without touching `[partition+0x10]`, and both
+delivery arms use them — so the measurement bears on *delivered versus not*, and says nothing about
+the branch VID then took. An earlier version of this section named arm 1 as "the better supported,
+because the paths carrying it are measured", which reads a shared mechanism as evidence for one of
+the two things sharing it.
+
+**No arm is decided by counting forwards through the partition callback, and that is the instrument
 lesson.** All three known callers converge on `VidInterceptPreprocess`, so **the convergence point is
-the instrument site**: arrivals counted there answer delivery whichever path carried the message,
-where a counter on the chained slot cannot see two of the three. That is also the positive control
-this gate lacked — a zero from an instrument two of three paths bypass is uninterpretable in exactly
-the way arm 0's zero was. Whether the root partition's `Vid.sys` can be instrumented that way on this
-bench is a separate question and is **not established here**; `FOLLOWUPS.md` item 103 carries it.
+the instrument site**: arrivals counted there separate arm 3 from arms 1–2 whichever path carried the
+message, where a counter on the chained slot cannot see two of the three. That is also the positive
+control this gate lacked — a zero from an instrument two of three paths bypass is uninterpretable in
+exactly the way arm 0's zero was. **Separating arms 1 and 2 needs a second reading in the same arm**,
+the contemporaneous `[partition+0xB68][3]` the section above specifies, because the slot is mutable
+and a read taken afterwards reports afterwards. Whether the root partition's `Vid.sys` can be
+instrumented that way on this bench is a separate question and is **not established here**;
+`FOLLOWUPS.md` item 103 carries both.
 
 #### What it means for the build
 

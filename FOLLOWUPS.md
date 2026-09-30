@@ -3825,29 +3825,37 @@ validated. The full record is the
   `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
   say they serve other message types, but their objects were not identified, so a dispatch consulting
   one of those instead is **narrowed, not eliminated**. **The `.pdata` hole is narrowed, and the gap
-  decoding was wrong twice before it was right** (re-derived 2026-09-30): `.pdata` claims no leaf
+  scan was wrong three times before it was right** (re-derived 2026-09-30): `.pdata` claims no leaf
   functions, so the tool decodes the executable bytes it leaves out — **9,599 here, 9,569 of them
-  `0xCC`/`0x00`, five spans holding anything else, 0 bytes capstone refused**. Decoding a span as one
+  `0xCC`/`0x00`, five spans holding anything else, decoded as six islands, 0 distinct bytes capstone
+  refused**. (1) Decoding a span as one
   stream loses an island after an odd-length `0x00` run (`00 00` is a two-byte `add byte ptr [rax],
-  al`); splitting it at *every* `0xCC`/`0x00` byte — the fix for that, and what this entry recorded —
-  cuts instructions apart instead, because **a single zero byte is not padding** and almost every
-  RIP-relative load carries one in its high displacement byte. A 12-byte leaf loading the array
-  anchor and reading `+0x10` reported **zero** reaching regions under that reading. The tool now
-  decodes each span from its own start *and* from every island start, unioning by `(address, size)` —
-  a lower bound with possible phantoms, so it widens the reaching set and never narrows it. **The
-  sibling instrument already did exactly that** — `vid_field_census.py` decodes "from every plausible
+  al`). (2) Splitting it at *every* `0xCC`/`0x00` byte — the fix for that, and what this entry
+  recorded — cuts instructions apart instead, because **a single zero byte is not padding** and almost
+  every RIP-relative load carries one in its high displacement byte; a 12-byte leaf loading the array
+  anchor and reading `+0x10` reported **zero** reaching regions under it. (3) Decoding each span as
+  one *region* — the fix for that, and what review caught — restored the instructions and lost the
+  provenance: one body per span let `field_hits` attribute one leaf's `+0x10`/`+0x18` access to a
+  **different** leaf that loaded the anchor, inflating the very figure this census licenses. The rule
+  now is to apply the padding test **where an instruction begins**: each island decoded from its own
+  start, instructions swallowing interior `0xCC`/`0x00` bytes of their own encoding, the island ending
+  where the next *instruction boundary* lands on padding — and each island its **own region**, so
+  correlation cannot cross a leaf. Overlapping candidates are kept rather than pruned, leaving a lower
+  bound with possible phantoms. **The
+  sibling instrument had the decoding right** — `vid_field_census.py` decodes "from every plausible
   start … and take[s] the union" because "no single pass licenses a negative here" — while this entry
   claimed the gaps were decoded *"as `vid_field_census.py` does"*; naming the right sibling is not
   copying its method. And **`rbp` is no longer assumed to be a
   frame pointer**, being suppressed only where the function's `UNWIND_INFO` names it as the frame
   register — 16 such operands exist image-wide and none is in a reaching region. **The answer did not
-  move** through any of the three: 28 regions and 42 accesses throughout — which is why the gap scan
+  move** through any of the four: 28 regions and 42 accesses throughout — which is why the gap scan
   needed its own test rather than agreement on the real image, since `winhvr.sys` reports 28 and 42
-  under all three readings. **The reaching set is still a lower bound**:
+  under **every** reading above, no gap island in it reaching at all. **The reaching set is still a lower bound**:
   a function handed the partition object as an *argument* calls neither anchor and is absent from the
   28 even if it reads the pair, which no amount of the above accounts for. The tool now has
-  `--self-test`, **12/12**, pinning both defects with the broken reading asserted to fail and two
-  negative controls; mutation-verified at 10/12 and 9/12. Treat its function set as a reading.
+  `--self-test`, **21/21**, pinning all three defects with the broken reading asserted to fail and two
+  negative controls; mutation-verified — the span-wide region scores 17/21 and a summed refusal count
+  20/21. Treat its function set as a reading.
 - **What it does to S5j's two explanations, and to the build.** S5k killed *nothing was bound*;
   step 2 confirmed Vid bound at runtime for both partitions. Arm 1 bears against the second, *the
   handler received it and retained it*: the routine chained into `[partition+0x10]` is **not
@@ -3863,10 +3871,18 @@ validated. The full record is the
   consistent with VID having received the intercept through its dispatch loop, and S5j's second
   explanation is **narrowed to the chained slot, not eliminated**. S5k had flagged this fork
   (`VidDeviceExtension+0x288` bit `0x40`) and scoped its finding to the bit-clear path; S5q did not
-  carry that forward. Two accounts now survive, both inferences: **delivery happened and VID took the
-  unregistered-vector branch** (now the better supported, since its paths are measured), or the
-  arming sequence is incomplete — S5k's "half of the arming sequence" being the port and SINT
-  plumbing `winhvr.sys` exports rather than a per-vector flag. **What arm 1 does establish is that the
+  carry that forward. **Three arms now survive, all inferences, and the two paths widen the fork
+  rather than picking an arm**: (1) delivered with the per-vector slot unclaimed, so VID took the
+  unregistered-vector branch — a raw install neither claims that slot **nor establishes its state**;
+  (2) delivered with the slot already claimed by another VID client, so the handler *enqueued* to it,
+  which is S5j's received-and-retained reading and stays live because `[partition+0xB68][3]` **was
+  never read** and S5l showed a claim survives a probe removal; or (3) not delivered, S5k's "half of
+  the arming sequence" being the port and SINT plumbing `winhvr.sys` exports rather than a per-vector
+  flag. Both delivery arms travel the same two paths, so the measurement bears on *delivered versus
+  not* and not on the branch — an earlier version of this entry called arm 1 "the better supported,
+  since its paths are measured", which reads a shared mechanism as evidence for one of the things
+  sharing it. Arrivals at the convergence point separate (3) from (1)–(2); only a contemporaneous slot
+  read in the same arm separates (1) from (2). **What arm 1 does establish is that the
   receiver is not a routine to chain**: chaining installs and restores cleanly and receives nothing.
   What it does **not** establish is that no delivery path exists, so it leaves the delivery question
   open rather than answered against, and step 8 is where the *chaining* failure points rather than
@@ -3994,7 +4010,12 @@ validated. The full record is the
       raw install is correlated with an arrival there, *with a positive control* — a raise under a
       Vid-installed intercept, which must arrive — and with the backed-out arm interleaved rather
       than run as a clean batch afterwards. A zero on its own repeats arm 0's uninterpretable
-      reading. **Open, and its feasibility is the first question, not the measurement**: this is the
+      reading. **And it must carry the `[partition+0xB68][3]` read in the same arm**, because an
+      arrival count separates *not delivered* from *delivered* and cannot separate the unclaimed-slot
+      branch from an enqueue to a pre-existing claimant — the slot is mutable, so a read taken
+      afterwards reports afterwards. That read is the one the
+      "was the slot claimed?" section has been asking for since S5k; this step is where it belongs
+      rather than as an arm of its own. **Open, and its feasibility is the first question, not the measurement**: this is the
       *root* partition's `Vid.sys`, so how it can be instrumented on this bench — and whether that
       is a patch, a breakpoint on a host kernel this bench cannot freeze, or neither — is
       unestablished. Cost that before scheduling the arm. **Ahead of steps 7 and 8 in the order**,
