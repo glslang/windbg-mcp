@@ -2768,7 +2768,7 @@ The VBS guest is **not** as it was found, and a later gate reading it needs to k
   **`0xFFFFF80679FB0035`**. The self-map index was not re-read and is unknown rather than assumed to
   have moved.
 
-### S5h result, 2026-09-28: a VTL1-raised exception is held and handed back, and which VTL takes it is not settled
+### S5h result, 2026-09-28: a VTL1-raised exception is held and handed back, and which VTL takes it is not settled — settled later by step 9's VTL1 arm
 
 **A parent-installed exception intercept stops a `#BP` raised in VTL1 user mode from ever reaching
 the guest, and hands it back intact when the intercept comes down** — no guest-side cooperation, no
@@ -2925,6 +2925,15 @@ to Secure Kernel's own code, which handles its exceptions in VTL1 without one. *
 it** is the route S5b named and this gate skipped: a static read of `hvix64.exe`'s intercept dispatch
 for a check on the active VTL, two attempts having failed on that image before Ghidra was on this
 bench — or delivery metadata from an actual receiver, which is the other next gate.
+
+> **The second of those was taken and it settled it.**
+> [Step 9's VTL1 arm](#step-9-the-vtl1-arm-2026-09-30-a-vtl1-bp-reaches-vid-and-the-message-names-the-enclaves-own-instruction)
+> read the intercept message instead of halting the VP, and the message's `Rip` is the **enclave's**
+> `int3` — the instruction this table's VTL1 column shows, matched to the low 16 bits on a different
+> boot. An intercept fired on a VTL0 excursion would name the VTL0 instruction, because that is the
+> state the VP was in when it was intercepted. So the trap is taken at the VTL1 raise, and the
+> excursion this section was right not to dismiss is excluded. The scope limit below is untouched:
+> VTL1 user mode is still not Secure Kernel.
 
 On halts where the VP was not running the raiser, both reads return Secure Kernel's parked address,
 which is why the table says where the raiser was *caught* rather than what every read returned.
@@ -5839,3 +5848,97 @@ reported **0 intercepts still standing** every time, and the combined arm's `unc
 running. Guest responsive afterwards with 105 processes; both guests up 3h26m with unbroken uptime;
 host uptime continuous; **no bug check since boot**. Nothing was written to a partition object; the
 combined arm chained and unchained the callback, which arm 0 had already characterised.
+
+### Step 9, the VTL1 arm, 2026-09-30: a VTL1 `#BP` reaches VID, and the message names the enclave's own instruction
+
+**A `#BP` raised in VTL1 user mode reaches `Vid!VidInterceptPreprocess`, and the intercept message's
+`Rip` is the enclave instruction that raised it.** That second half is what S5h's register halts
+could not give, and it bears directly on the fork S5h left open.
+
+Same instrument as the VTL0 arm, same partition, same session. The raiser is `spin_host.exe BP1` —
+S5h's own VTL1 arm, raising inside a VBS enclave — run synchronously at 2,000 rounds while the
+markers are sampled alongside, so the raiser's own report comes back with them.
+
+| arm | markers | raiser |
+|---|---|---|
+| VTL1, no intercept | **none** | finished, 2,000/2,000 handled, **7.63 µs** each |
+| **VTL1, intercept standing** | **both VPs**, `0x80010003` / vector `3` / reason `2` | **did not finish** in 40 s |
+| VTL0, intercept standing (comparison) | both VPs, same markers | did not finish |
+| VTL1, no intercept (interleaved) | **none** | finished, 2,000/2,000 handled, **7.49 µs** each |
+
+**"Did not finish" is the whole of what the raiser column measures, and it is deliberately not
+called "slowed but advancing".** A draft of this section said the VTL1 arm was slowed rather than
+frozen and that each raise was being handed back — which is precisely the reading S5h **retracted**:
+its 1,902 / 6,396 / 15,076 / 18,486 counts were all written by the monitor's *final* sample, after
+teardown had removed the intercept and the raiser had finished. This arm measured no progress at
+all. It measured that 2,000 rounds costing 15 s unarmed did not complete in 40 s armed, which a
+freeze on the first raise produces just as well as a slowdown. Both VPs carrying the *same* `Rip` is
+consistent with one held raise rather than a stream of them.
+
+#### The `Rip` is the enclave's instruction, and it agrees with S5h across gates
+
+| | message `Rip` | the raiser said |
+|---|---|---|
+| VTL1 arm | **`0x00000243071E500D`** | `RaiseBp at 00000243071E5130 -- raising 2000 x #BP IN VTL1` |
+| VTL0 arm | **`0x00007FF7600B748D`** | (held before it reported) |
+
+The VTL1 `Rip` sits `0x123` bytes from the enclave routine the raiser named **in that same run** —
+the `int3` inside it. So the intercept is keyed to the VTL1 instruction rather than to anything that
+runs after it.
+
+**And it matches S5h's halts, which is a cross-instrument, cross-gate corroboration neither gate
+could give alone.** S5h halted the VP and read `RIP` directly:
+
+| | S5h's halted `RIP` | this arm's message `Rip` |
+|---|---|---|
+| VTL1 | `0x000001D1009E500D` | `0x00000243071E500D` |
+| VTL0 | `0x00007FF7D5AF748D` | `0x00007FF7600B748D` |
+
+Different boots and different ASLR bases, identical low 16 bits in both arms — the same instruction
+in the same image. A VP halt and an intercept message, taken a day apart by different mechanisms,
+name the same two instructions.
+
+#### What this does to S5h's open fork, and what it does not
+
+S5h could not say whether the hypervisor takes the VTL1 trap **in VTL1** or whether the enclave's
+dispatch makes a **VTL0 excursion** that a VTL0-scoped intercept catches; its halts were consistent
+with both, because a VTL1 exception reflected into VTL0 leaves the VTL1 register set saved at the
+faulting instruction while VTL0 sits in kernel code.
+
+**The message discriminates where the halts could not.** It reports the faulting instruction as the
+enclave's `int3` in VTL1 user mode — not VTL0 kernel code handling a reflection. An intercept that
+fired on a VTL0 excursion would name the VTL0 instruction, because that is the state the VP was in
+when it was intercepted. So the intercept is taken at the VTL1 raise.
+
+**What it does not do is make that a claim about Secure Kernel.** This is VTL1 **user** mode, inside
+an enclave we built. Secure Kernel is VTL1 *kernel* mode and handles its own exceptions there; the
+scope limit stands exactly as S5i left it. What the fork's closure removes is the *reason to doubt*
+that a VTL1 intercept is a VTL1 intercept — it does not extend the result upward.
+
+#### `ExecutionState`, reported raw because the layout was not verified
+
+| arm | `ExecutionState` | bits set |
+|---|---|---|
+| VTL0 | `0x001F` | 0,1,2,3,4 |
+| VTL1 | `0x0097` | 0,1,2,4,**7** |
+
+**Two bits differ, not one**, and saying so is the point: **bit 7** is set only in the VTL1 arm, and
+**bit 3** is set only in the VTL0 arm. Both arms read `Cpl = 3` in bits 0–1, which is user mode and
+is right for both. TLFS places an **active-VTL** field at bits 7–10 of
+`HV_X64_VP_EXECUTION_STATE`, and bit 7 set exactly in the VTL1 arm is what that would look like —
+but **this gate did not verify that layout against this build**, and bit 3 (`Cr0Am` in the same
+layout) differing is a reminder that not every bit of the delta is about the VTL.
+
+**The check that would settle it was not runnable**, and that is the reason rather than an omission:
+varying the *vector* while holding the VTL would separate a VTL field from an exception-specific
+one, and the hypervisor accepts exception intercepts only for vectors **3** (`#BP`) and **4**
+(`#OF`) — `spin_host` has no `#OF` mode. Building one is the cheap way to close it. Until then the
+`Rip` carries the VTL conclusion and `ExecutionState` corroborates it without being relied on.
+
+#### Bench state
+
+Intercept installed twice and removed in the phase after each; teardown reported **0 standing**.
+Raiser killed after every arm, none left running. Guest responsive with 105 processes and **`LsaIso`
+still alive** — checked because this arm raises exceptions inside VTL1 — both guests up 4h03m with
+unbroken uptime, host uptime continuous, **no bug check since boot**. Nothing written to a partition
+object, nothing chained.
