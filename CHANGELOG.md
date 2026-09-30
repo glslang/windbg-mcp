@@ -19,17 +19,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   which is a distinction a draft lost twice. The
   discriminator is on the **exit** side and Hyper-V publishes it per VM and per VP.
   `Total Messages/sec` reads **0** idle, **0** under guest churn, **0** with the raiser storming
-  `#BP`s at ~234,000 hypervisor intercepts a second *unarmed*, **0** with the vector armed and no
-  raiser — and **~65,700 across both VPs** with the intercept
+  `#BP`s at **201,956** hypervisor intercepts a second *unarmed*, **0** with the vector armed and
+  no raiser — and **65,676 across both VPs** with the intercept
   standing, sustained for 16 s while the raiser completes **zero** rounds. A pending intercept
   re-processed on the root side produces no hypervisor message at all, so those are **new
   deliveries**: the faulting instruction is re-executed tens of thousands of times a second with
   nothing retiring it. S5k's inference holds and step 6's arm 2 is answered.
-  **A finding fell out of the control, with a matched VTL0 arm**: normalised per round, a VTL0
-  `#BP` costs **0.0023** hypervisor exits and a VTL1 one **2.08** — both from *both* VPs' excess
+  **Every figure in this entry is from the one six-phase run**, earlier drafts having mixed three
+  into one table — caught by an `Other Intercepts/sec` exceeding the `Total Intercepts/sec`
+  beside it, impossible within a run. **A finding fell out of the control, with a matched VTL0
+  arm**: normalised per round, a VTL0
+  `#BP` costs **0.0017** hypervisor exits and a VTL1 one **2.09** — both from *both* VPs' excess
   over their own idle means and from the raiser's own clock, a draft having divided VP 1's rate
   alone by a mis-taken window — same guest and binary and counter with only the VTL differing,
-  and the round-rate gap in that run is **9.46×** against the
+  and the round-rate gap in that run is **9.45×** against the
   recorded 9.7 µs / 0.85 µs. That is a difference in kind and **not** a decomposition of the
   timing, which a draft claimed. The first attempt at that control was worthless and looked fine —
   the VTL0 raiser finished its rounds in 1.7 s, before the first sample — so round counts are per
