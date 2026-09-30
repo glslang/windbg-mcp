@@ -3841,7 +3841,12 @@ validated. The full record is the
   start, instructions swallowing interior `0xCC`/`0x00` bytes of their own encoding, the island ending
   where the next *instruction boundary* lands on padding — and each island its **own region**, so
   correlation cannot cross a leaf. Overlapping candidates are kept rather than pruned, leaving a lower
-  bound with possible phantoms. **The
+  bound with possible phantoms. **And the boundary rule undercounts in one measured case**: a genuine
+  `int3` at an instruction boundary inside gap code splits a real leaf, the anchor-load half reaching
+  and the field-access half not, dropping that access — the dangerous direction for a census licensing
+  a negative, so it is pinned as behaviour rather than patched. It cannot reach a `.pdata`-claimed
+  function (exact bounds, decoded whole, no padding test), and all 28 reaching regions here are
+  `.pdata` functions, so all 42 accesses come from bodies the limit does not touch. **The
   sibling instrument had the decoding right** — `vid_field_census.py` decodes "from every plausible
   start … and take[s] the union" because "no single pass licenses a negative here" — while this entry
   claimed the gaps were decoded *"as `vid_field_census.py` does"*; naming the right sibling is not
@@ -3853,10 +3858,12 @@ validated. The full record is the
   under **every** reading above, no gap island in it reaching at all. **The reaching set is still a lower bound**:
   a function handed the partition object as an *argument* calls neither anchor and is absent from the
   28 even if it reads the pair, which no amount of the above accounts for. The tool now has
-  `--self-test`, **21/21**, pinning all three defects with the broken reading asserted to fail and two
+  `--self-test`, **24/24**, pinning all three defects and the boundary rule's own limit, each with the
+  broken reading asserted to fail, plus two
   negative controls; mutation-verified against those cases so the scores share a denominator — the
-  candidate starts reduced to the span start scores 10/21, one span-wide region 17/21, and a summed
-  refusal count 20/21. Treat its function set as a reading.
+  candidate starts reduced to the span start scores 11/24, one span-wide region 20/24, and a summed
+  refusal count 23/24. Every index in it returns empty rather than raising, so a mutation reports the
+  assertions it broke instead of aborting. Treat its function set as a reading.
 - **What it does to S5j's two explanations, and to the build.** S5k killed *nothing was bound*;
   step 2 confirmed Vid bound at runtime for both partitions. Arm 1 bears against the second, *the
   handler received it and retained it*: the routine chained into `[partition+0x10]` is **not
