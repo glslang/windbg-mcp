@@ -6977,3 +6977,87 @@ Monotonic across the whole window, both guests still up afterwards, `LsaIso` ali
 no host bug check. **Mapping a slot does not destabilise the guest**, which is the other half of
 what this arm establishes — it separates the map from the arming, and it is the arming that was
 fatal.
+
+### Step 7, the consume loop, 2026-09-30: it works, it eats the owner's messages, and the guest dies — so step 8 is measured rather than inferred
+
+**The loop runs end to end.** Map, arm, consume, complete, disarm — every call `SUCCESS`, 64
+messages consumed in under 3 s, the cap rather than the deadline stopping it. **And the guest reset
+anyway, for a reason the previous arms could not have shown.**
+
+#### Two mechanical facts the arm needed first
+
+**`0x221107` is the only `METHOD_NEITHER` code of the four**, which no amount of reasoning about the
+wrapper would have surfaced:
+
+| code | | method |
+|---|---|---|
+| `0x221148` | register | `BUFFERED` |
+| `0x2211E8` | unregister | `BUFFERED` |
+| `0x221108` | slot map | `BUFFERED` |
+| **`0x221107`** | **HandleAndGetNext** | **`NEITHER`** |
+
+With `METHOD_NEITHER` the driver receives the raw pointer and probes it, and `ProbeForRead` refuses
+a kernel address — so the first attempt, passing a kernel stack buffer, returned
+`STATUS_ACCESS_VIOLATION` and consumed nothing. The input has to be allocated in the **attached**
+process's user space.
+
+**And `Flags` must be `4`.** Swept `0,1,2,3,4,7,0x10,0x100`: every value but `4` returns
+`STATUS_INVALID_PARAMETER`, and `4` returns `STATUS_SUCCESS`. Bit 2 is required and its meaning is
+unread.
+
+**That sweep cost nothing, by construction.** The completion does not need the intercept armed, so
+the driver gained a `SkipArm` mode that maps and completes without ever registering — and the
+guest's uptime was unchanged across the whole sweep. Arming is what kills a guest; separating the
+probe from the arming is what made finding `4` free rather than nine reboots.
+
+#### What it consumed is the finding
+
+| | |
+|---|---|
+| map | `SUCCESS`, slot VA `0x247A8741000` |
+| register | `SUCCESS`, handle `0x555ADB9038470F` |
+| **consumed** | **64 messages**, 0 empty polls, deadline not reached |
+| every completion | `SUCCESS` |
+| unregister | `SUCCESS` |
+| **message type, first and last** | **`0x01000010`**, payload `0x30` |
+
+**`0x01000010` is what was already sitting in that slot before anything was armed** — the slot-map
+arm read exactly that type, minutes earlier, with no intercept installed. It is **not**
+`0x80010003`, the exception-intercept type step 9 established. So the 64 messages were **not our
+`#BP` intercepts**: they were the stream the partition's owner was already being fed, and we
+completed 64 of them.
+
+**That is the contention, measured.** Not "a second completer might race the first" — we took 64
+messages out of `vmwp`'s stream, acknowledged them, and the guest was reset inside ten seconds.
+
+#### Why this makes step 8 the route, on evidence rather than on cost
+
+The chain is now closed by measurement at every link:
+
+1. **The gate admits exactly one process per partition** — `PsGetCurrentProcess()` against
+   `[partition+0x3780]`, decompiled and confirmed by direct read.
+2. On a Hyper-V-managed VM that process is `vmwp`, for the life of the VM.
+3. **Satisfying the gate therefore means *being* `vmwp`** — using its handle, its file object, and
+   so its client state and its slot.
+4. **Consuming from that slot takes the owner's messages** — 64 of them, typed, counted.
+5. **The guest does not survive it.**
+
+So a usable receive loop needs a partition on which we are the only client, which is what step 8's
+"own the partition from creation" is. **That was an inference this morning and is a measurement
+now**, and it is the justification step 8's own costing could not supply.
+
+#### What this does *not* establish
+
+**That our own intercept was ever delivered.** No `0x80010003` was seen. The slot was saturated with
+the owner's traffic — 64 messages and not one empty poll — so an exception message could have
+arrived and been indistinguishable from the flood, or never arrived at all. The registration
+succeeded; what it delivered is unmeasured.
+
+**And the reset's cause is now over-determined rather than pinned.** Two candidates both fit every
+run: arming without consuming our own intercepts, and consuming the owner's. The runs cannot
+separate them, because on this partition doing the second is the only way to attempt the first.
+
+**Two incidental readings**, from the VP sweep: the guest has exactly **two** VPs — `vp` 0 and 1 map,
+`vp` 2 and 3 return `INVALID_PARAMETER` — which agrees with the two-VP result the loop question
+reached from the hypervisor's counters; and **VP 1's slot carries a different type** (`0x01000004`)
+from VP 0's, so the stream is per-VP rather than one queue.

@@ -9,6 +9,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Item 103's consume loop runs, eats the partition owner's messages, and resets the guest — so
+  step 8 is now the route on measurement rather than inference.** Two mechanical facts first:
+  `0x221107` is the **only `METHOD_NEITHER`** code of the four in use, so its input must be
+  allocated in the *attached* process's user space — a kernel buffer draws
+  `STATUS_ACCESS_VIOLATION` and consumes nothing — and its `Flags` must be **`4`**, every other
+  value of `0,1,2,3,4,7,0x10,0x100` returning `STATUS_INVALID_PARAMETER`. Both were found by a
+  `SkipArm` probe mode that maps and completes **without arming**, which left the guest's uptime
+  unchanged across the whole sweep: arming is what kills a guest, so separating the probe from it
+  made the sweep free. Armed and consuming, the loop then works end to end — map `SUCCESS`,
+  register `SUCCESS`, **64 messages consumed, every completion `SUCCESS`**, unregister `SUCCESS`.
+  **But every message was type `0x01000010`** — exactly what the slot already held *before*
+  anything was armed, and **not** the `0x80010003` of an exception intercept — so those were the
+  **owner's** messages, 64 of `vmwp`'s, acknowledged by us, and **the guest reset inside ten
+  seconds**. That closes the chain by measurement at every link: the gate admits one process per
+  partition, on a Hyper-V VM that is `vmwp`, satisfying it means *being* `vmwp` and sharing its
+  client state and slot, consuming from that slot takes the owner's traffic, and the guest does not
+  survive it. **A usable receive loop therefore needs a partition with one client**, which is step
+  8's own-from-creation rig — the justification its costing could not supply. **Not established**:
+  that our own intercept was ever delivered (no `0x80010003` seen, the slot saturated at 64 messages
+  with zero empty polls), and the reset is now **over-determined** between arming and stealing
+  rather than pinned, because on this partition the second is the only way to attempt the first.
+  Incidentally, the VP sweep gives the guest exactly **two** VPs (`vp` 2–3 refuse), agreeing with the
+  loop question's counter result, and VP 1's slot carries a different type (`0x01000004`).
 - **Item 103 step 7's `VidMessageSlot*` half: the map runs through the gate and the guest survives;
   the completion is not runnable on a live VM.** Decoded first, and the decode decided how much to
   run: `VidMessageSlotMap` is IOCTL **`0x221108`** (in 4 B `{u32 Vp}`, out 8 B — a VA **in the

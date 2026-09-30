@@ -4085,6 +4085,18 @@ validated. The full record is the
       and `vmwp` is already the consumer on these VPs, so a second completer races it. That needs a
       partition with one client — **a concrete reason for step 8's rig**. Also: the map is one-way,
       there being no `VidMessageSlotUnmap`.
+      **THE CONSUME LOOP RAN TOO, and it makes step 8 the route on evidence rather than cost.**
+      `0x221107` is the only `METHOD_NEITHER` code of the four (its input must be USER memory) and
+      `Flags` must be **4**; found by a `SkipArm` probe mode that maps and completes without
+      arming, so the sweep cost no guest. Armed and consuming: **64 messages, every completion
+      `SUCCESS`** — but all of type `0x01000010`, the type already in the slot before anything was
+      armed, **not** the `0x80010003` of an exception intercept. So we consumed **the owner's**
+      stream, 64 of `vmwp`'s messages, and **the guest reset inside ten seconds**. The gate admits
+      one process per partition, on a Hyper-V VM that is `vmwp`, so satisfying it means *being*
+      `vmwp` and sharing its slot — **a usable receive loop needs a partition with one client,
+      which is step 8**. Not established: that our own intercept was ever delivered (no
+      `0x80010003` seen, and the slot was saturated), and the reset is now over-determined between
+      arming and stealing rather than pinned.
       **Inheritance of a VID handle a worker still holds is excluded** on object identity —
       no child holds any of the workers' four current VID file objects. **Not excluded**: one
       inherited and since closed in the parent, which a snapshot cannot see. The children's own
