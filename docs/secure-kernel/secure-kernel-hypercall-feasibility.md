@@ -5317,7 +5317,11 @@ the sentence that concludes it.
 
 **What survives is one undecided fork with three arms, all inferences rather than measurements, and
 the dispatch-loop paths widen it rather than narrowing it to one.** `forwarded = 0` says our chained
-routine was not called; each arm below produces that.
+routine was not called; each arm below produces that. **Arm 3 was later eliminated by measurement —
+[the step 9 arm](#step-9-the-arm-2026-09-30-the-message-is-delivered-and-s5qs-third-arm-is-out) read
+the message arriving at `VidInterceptPreprocess` — so what stands from here is arms 1 and 2, and the
+fork below is kept as written because the reasoning that narrowed it is what the arm was built
+from.**
 
 1. **Delivered, and the per-vector slot was unclaimed** — so VID took the unregistered-vector branch
    and held the trap. S5k found that `VidHandlerpExceptionRegisterEntry` claims its slot in
@@ -5365,6 +5369,13 @@ was built on and leaves the delivery question **open rather than answered agains
 route (item 103 step 8) is where the *chaining* failure points, not somewhere the evidence forces the
 build to go. The cheaper successor is the convergence-point measurement above, and it is ahead of any
 ownership work in the order item 103 records.
+
+**And that successor answered it: the message IS delivered.** The step 9 arm read `0x80010003` with
+vector `3` arriving at `VidInterceptPreprocess` on both VPs, so `forwarded = 0` here was the chained
+slot being bypassed and not the absence of a message — the correction above, that two dispatch-loop
+paths never read `[partition+0x10]`, is now the measured explanation rather than one of two. The
+downward re-scope this paragraph records stands for the *chaining route*; the delivery question it
+left open is closed in the affirmative.
 
 ### Step 9 feasibility, 2026-09-30: the convergence point records its own arrivals, so the instrument is a read
 
@@ -5677,3 +5688,109 @@ It does not raise anything, so no exception intercept has been observed and the 
 is exactly where the feasibility gate left it. What it retires is the *risk* in the arm rather than
 the arm: the walk is confirmed, the guards are exercised, and the markers are known to carry live
 state rather than zeros — which is what would have made a first arm's reading uninterpretable.
+
+### Step 9, the arm, 2026-09-30: the message IS delivered, and S5q's third arm is out
+
+**A `#BP` raised in a guest under a standing raw `HvCallInstallIntercept` reaches the root's
+`Vid!VidInterceptPreprocess`.** It copies the message, stamps the VP and selects
+`VidHandleExceptionIntercept` — measured on both VPs of partition `0x3`, with the interleaved
+backed-out arms on either side of it showing the markers do not read that way without the intercept.
+**S5q arm 1's third explanation — *not delivered, because the arming sequence is incomplete* — is
+eliminated.**
+
+The arm is `s9_arm.py`: baseline read, substituted positive control, backed-out raise, armed raise,
+removal plus the slot filter, backed-out raise again. Partition `0x3`, vector `0x03`, intercept type
+3 / `AccessType` 4, raiser `spin_host.exe BP0` detached in the guest — S5h's own VTL0 raiser.
+
+#### What the armed arm read
+
+| | VP 0 | VP 1 |
+|---|---|---|
+| `[V+0x30]` message type | `0x80010003` `X64ExceptionIntercept` | the same |
+| `[V+0x68]` vector | `0x03` | `0x03` |
+| `[V+0x158]` handler | `Vid+0x11690` `VidHandleExceptionIntercept` | the same |
+| `[V+0x200]` reason | `2` | `2` |
+| `[V+0x208]` stamp | `101861812014`, baseline `101834039874` (**+27,772,140**) | `101860931227`, baseline `101828671226` (**+32,260,001**) |
+| raiser held | yes — S5h's signature | |
+
+All four markers are what the feasibility gate's static read of the jump table at `Vid+0x3D137`
+predicted for `0x80010003`, and the stamps are measured against a baseline taken **immediately
+before** the raise rather than against the start of the run.
+
+**The message decodes as itself**, which is the part no offset arithmetic could fake:
+
+```text
+03 00 01 80  F0 00 00 00  03 00 00 00 00 00 00 00   MessageType 0x80010003, PayloadSize 0xF0,
+                                                    Sender = partition 3
+00 00 00 00  01 02 1F 00  ...                       VpIndex 0, InstructionLength 1 (int3 is one
+                                                    byte), InterceptAccessType 2, ExecutionState
+                                                    0x001F
+```
+
+and VP 1's copy carries `VpIndex` **1** where VP 0's carries **0** — so the message's own view of
+which processor raised agrees with which slot of the array it was read from. `PayloadSize` `0xF0`
+plus the 16-byte header is the 256 bytes an `HV_MESSAGE` is.
+
+#### The controls, and the one that had to be substituted
+
+| arm | raiser held | exception markers newer than its own baseline |
+|---|---|---|
+| positive control — ordinary guest churn | n/a | n/a; a VP's stamp **moved**, so the instrument sees a real arrival |
+| backed out, before | **no** (completes, as the null rate says it should) | **none** |
+| **armed** | **yes** | **both VPs** |
+| backed out, after | **no** | **none** |
+
+**The positive control is a substitution and this record says so.** The plan asked for a raise under
+a *VID-installed* intercept, which must be delivered. That is not runnable here: installing through
+VID needs a partition handle, the create path refuses a second open (S5n), and the branch behind the
+refusal is an ownership handoff (S5o) — the whole reason the ownership route exists. What was run
+instead is ordinary intercept traffic, which tests the property the control was for, *the instrument
+detects a real arrival at the convergence point*, and not the one
+[the scoping table](#what-this-instrument-reports-stated-once) already says no control can test:
+that a raw-installed delivery shares VID's own route. Here that limit costs nothing, because the
+result is a **positive**, and the table's first row is the strong direction.
+
+#### The first run reported a confound that was not one, and the cause was in this arm's own code
+
+Run 1 called the result CONFOUNDED: the second backed-out arm showed an exception marker. It was
+**stale**. That VP had taken an exception intercept during the armed arm and then gone idle, so its
+markers still read `0x80010003` — with a stamp byte-identical to the previous phase's read, which is
+visible in the output and was the tell. The hit test compared type and vector and **ignored the
+timestamp**, which is precisely the defect review round 3 filed against this plan, reproduced in the
+code written to honour it. The rule now requires a stamp later than that arm's own baseline; run 2
+is the numbers above, and the second backed-out arm reports none.
+
+Worth keeping rather than tidying away: the interleaved backed-out arm *after* an armed one is the
+one case that walks into staleness, and interleaving is what the plan asked for. The two
+requirements interact, and only running them together showed it.
+
+#### What this settles, and what it does not
+
+- **Delivery is established.** The hypervisor posts the exception-intercept message to the root and
+  VID preprocesses it. Arm 3 is out.
+- **`forwarded = 0` in S5q arm 1 was not the absence of delivery.** The correction that section took
+  in review — that `VidXSchedulerpVpRun` and `VidXSchedulerVpThreadStartRoutine` call
+  `VidInterceptPreprocess` directly and never read `[partition+0x10]` — is now the *measured*
+  explanation rather than a live possibility. Chaining the partition callback was blind to the path
+  that carried the message.
+- **S5j's second reading is now the shape.** VID received the message and did not complete it: the
+  trap stayed held with the raiser alive while the markers showed the arrival. "Nothing was bound"
+  died at S5k; "received and retained" is what is left, and it is measured rather than inferred.
+- **Which branch the handler took is still not decided.** `[P+0xB68][3]` read `0xFF` before the
+  install and `0xFF` after the removal, which is consistent with arm 1 — the unclaimed-vector branch
+  that holds the trap — and the trap staying held while nothing completed it corroborates that. It
+  is not decided, for the reason the design section gives: a claim-and-restore between two samples
+  reads as unchanged, so sampling cannot name the branch at any cadence.
+- **This was a VTL0 raise.** S5h measured a VTL1 *user-mode* raise being held and S5i read the
+  parent's mask being seeded into every enabled VTL, but this arm did not read the markers for a
+  VTL1 raise. That is the cheap next arm rather than something this one covered.
+- **The Secure Kernel scope limit stands exactly as S5i left it.** VTL1 user mode is not Secure
+  Kernel, which is VTL1 *kernel* mode. Nothing here moves that.
+
+#### Bench state
+
+Driver started, arm run twice, driver stopped. Intercept installed once per armed arm and removed in
+the phase that follows it; teardown reported **0 intercepts still standing** on both runs. The
+raiser was killed after every arm and none was left running. Guest responsive afterwards with 105
+processes; both guests up 2h50m with unbroken uptime; host uptime continuous; **no bug check since
+boot**. Nothing was written to a partition object and nothing was chained.
