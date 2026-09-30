@@ -3532,8 +3532,8 @@ validated. The full record is the
   not reach it. Only if arm 0 is stable does the exception handling go in. **If arm 0 bugchecks the
   host, the in-kernel receiver is retired** — the same stop condition as below, reached for a
   tenth of the cost. It used to add *and step 8's own-partition build is selected*; step 8 has
-  since been costed and its decision is **not** to build, so a host bugcheck retires the receiver
-  and leaves this line with no selected successor.
+  since been costed and the costing **did not settle** the build, so a host bugcheck retires the
+  receiver and leaves this line pointed at a route whose cost is still unbounded.
 
   **Pass:** a `#BP` raised in VTL1 user mode is delivered to **our** callback, its context is
   readable, and `WinHvCompleteIntercept` resumes the raiser. Nothing in S5 has met this; S5h
@@ -4056,8 +4056,9 @@ validated. The full record is the
       undocumented VID surface and private COM contracts. What it does **not** establish is the
       cost — a first draft decided *do not build* on a buffer size read as a field count and a
       module list read as code to be rewritten, and review rejected both. **Two named probes would
-      decide it**, neither run: a census of `Vid.sys`'s `0x2211A0` handler for the fields it
-      validates, and an activation probe on one of the device-model CLSIDs. **No call was made**,
+      narrow it and neither settles it**, both unrun: a census of `Vid.sys`'s `0x2211A0` handler for
+      the fields it validates — one call of about a dozen — and an activation probe on one of the 24
+      device-model CLSIDs, which are registered rather than shown to activate. **No call was made**,
       so *no known obstacle* still rests on S5o, S5p and S5n's control of the first step only.
       Figures, decoded gates, the three tiers and both retractions are in the **Step 8** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
