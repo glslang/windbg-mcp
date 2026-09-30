@@ -5773,9 +5773,14 @@ requirements interact, and only running them together showed it.
   `VidInterceptPreprocess` directly and never read `[partition+0x10]` — is now the *measured*
   explanation rather than a live possibility. Chaining the partition callback was blind to the path
   that carried the message.
-- **S5j's second reading is now the shape.** VID received the message and did not complete it: the
-  trap stayed held with the raiser alive while the markers showed the arrival. "Nothing was bound"
-  died at S5k; "received and retained" is what is left, and it is measured rather than inferred.
+- **What is measured is reception at *preprocess*, and nothing about retention.** VID received the
+  message and the trap stayed held with the raiser alive — but "held" is produced by **both**
+  branches of `VidHandleExceptionIntercept`: the unclaimed-vector branch returns `0` and holds, and
+  an enqueue to a claimant that never completes holds too. So "nothing was bound" is what died at
+  S5k, and what this arm adds is *the message reaches preprocess and the handler is selected*.
+  Calling that S5j's **received-and-retained** reading — which an earlier version of this bullet
+  did — reads a branch out of an observation that does not distinguish the branches, and it
+  contradicts the bullet immediately below it.
 - **Which branch the handler took is still not decided.** `[P+0xB68][3]` read `0xFF` before the
   install and `0xFF` after the removal, which is consistent with arm 1 — the unclaimed-vector branch
   that holds the trap — and the trap staying held while nothing completed it corroborates that. It
