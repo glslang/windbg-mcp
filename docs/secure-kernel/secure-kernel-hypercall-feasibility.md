@@ -6498,10 +6498,24 @@ sweep):
 | refused | 133 | 134 |
 | **handles to the VID device** | **4** | **4** |
 
-The 133 refusals are not a hiding place: all fail `ERROR_NOT_SUPPORTED`, and resolving their
-`ObjectTypeIndex` against the host's 73-entry type table gives exactly `EtwRegistration` (120) and
-`PcwObject` (13) — non-duplicable by type, not by permission. The mapping is cross-checked on types
-this process named directly: `File` 42, `Event` 21, `Thread` 9, `Section` 49.
+**The refusals are not a hiding place, in either worker** — a draft gave one breakdown, worker 1's,
+under a table reporting two different refusal counts, which left worker 2's 134 unaccounted for and
+its "four VID handles" unsupported:
+
+| refused, by `ObjectTypeIndex` | worker 1 | worker 2 |
+|---|---|---|
+| `EtwRegistration` (56) | 120 | 121 |
+| `PcwObject` (60) | 13 | 13 |
+| **anything of type `File` (42)** | **0** | **0** |
+
+All fail `ERROR_NOT_SUPPORTED` and are non-duplicable *by type* rather than by permission, and
+neither worker hides a `File` object among them — which is what makes four an exhaustive count of
+each worker's VID handles rather than a floor. The index mapping is cross-checked on types this
+process named directly: `File` 42, `Event` 21, `Thread` 9, `Section` 49.
+
+**A handle table is live, and these counts drift.** The inventory above was 518/517 handles; the
+confirming run that produced this breakdown read 514/513, with the refusals at 133/134 and the VID
+count at 4/4 both times. Each row is a reading at an instant, not a constant.
 
 **The VID device is `\Device\00000006`, and a name search is exactly how to miss it.** A draft of
 this section searched the 33 named File handles for the string *"Vid"*, found none, and concluded
@@ -6591,8 +6605,13 @@ small: a slot that turns out unclaimed would be claimed by us, on somebody's run
 the next arm for step 7, named with the right hazard, and it is a call to make rather than a thing
 to run in passing.
 
-**The inheritance half is nearly closed by size**: each worker has **one** handle marked
-`OBJ_INHERIT` out of 518, and its children are `vmmem` and `vmsp.exe`.
+**The inheritance half closes on identity, not on size.** A draft argued it from the count alone —
+one `OBJ_INHERIT` handle per worker — which settles nothing without knowing *which* handle it is:
+were it one of the four VID handles, inheritance would be the live route rather than the
+nearly-closed one. It is not. In both workers the single inheritable handle is an **unnamed
+`Event`** (`0x3AC` and `0x2E8`, type index 21, access `0x001F0003`), and the VID handles carry no
+`OBJ_INHERIT`. The children are `vmmem` and `vmsp.exe`; which handle either actually inherited is
+not established here, and does not need to be, because the only inheritable one is not a partition.
 
 **LiveCloudKd is narrowed only as far as the handles go.** This line's record says its procedure
 duplicates handles from `vmwp.exe`; the handles exist and are takeable, so the procedure is

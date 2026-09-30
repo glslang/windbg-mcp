@@ -14,8 +14,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   positive controls (`csrss` 0x61, `lsass` 0x41, `MsMpEng` 0x31) with a poisoned output buffer,
   **`vmwp.exe` reads 0x00 — not protected** — and `PROCESS_ALL_ACCESS` succeeds from an elevated
   admin, so that ground is not there. Each worker holds **four** handles to the VID device and
-  **all four duplicate out** with an ordinary `DuplicateHandle` (385 of 518 handles duplicated;
-  the 133 refusals resolve by object-type index to `EtwRegistration` and `PcwObject`).
+  **all four duplicate out** with an ordinary `DuplicateHandle`; the refusals resolve by
+  object-type index to `EtwRegistration` and `PcwObject` **in both workers** (120+13 and 121+13),
+  with **no `File` object among them**, which is what makes four exhaustive rather than a floor.
+  **Inheritance closes on identity**: the one `OBJ_INHERIT` handle per worker is an unnamed
+  `Event`, not a VID handle.
   `VidGetHvPartitionId` through all **eight** then returns `ERROR_INVALID_FUNCTION` on six and
   **`ERROR_ACCESS_DENIED`** on two — the same 3-and-1 split in each worker independently — against
   `ERROR_INVALID_HANDLE` for a non-VID control, so they reach `Vid.sys` and are turned away. **A draft of this nearly shipped the opposite**: it
