@@ -5484,6 +5484,18 @@ other three. That is the whole reason it is better than the counter step 9 origi
   (a raise under a Vid-installed intercept, which must arrive) has to demonstrate that the markers
   are still there when sampled, or a negative from it means nothing. Arm 0's zero is the standing
   warning.
+- **And a post-raise sample alone cannot tell a new arrival from an old one.** If that VP's
+  *previous* last arrival was also a `#BP` exception intercept, all four markers already read as a
+  delivery before the raise, and an arm in which nothing was delivered looks identical to one in
+  which something was. The positive control does not cover this: it shows that a delivered trap
+  populates and retains the fields, which is persistence and not novelty. **So the arm takes a
+  pre-raise snapshot and accepts delivery only where `V+0x208` has moved.** That works because the
+  timestamp is a `KeQueryPerformanceCounter` value written **unconditionally and before the type
+  dispatch** — it is the version stamp of the whole marker set, which is why it matters that it is
+  on the straight line rather than on a branch. It is also the same extra call the branch check
+  above already needs, so the cost is nothing. Named by review round 3, and it is this record's own
+  recurring defect from the other side: a reading that does not move is not evidence, and a
+  baseline that already holds the value you are looking for hides the one thing you are measuring.
 - **It cannot separate arms 1 and 2, and neither can the table read on its own.** The unclaimed
   branch of `VidHandleExceptionIntercept` (`+0x100`) returns `0` and leaves no per-VP marker, and
   the claimed branch's difference is a return value its callers test and do not store — so nothing
@@ -5534,3 +5546,17 @@ already-recorded runtime pair. The arm's first act is the runtime confirmation t
 give: `[V+0] == P` for each VP, a plausible `[P+0xAA8]`, and `[P+0xB68]` pointing at a table that is
 mostly `0xFF`. Until that runs, "the instrument is a read" is a design backed by a static reading,
 which is what the step asked to be costed and not yet a measurement.
+
+**The shape the arm has to take, which three review rounds settled and which is cheaper than any of
+them sounded.** One IOCTL, called three times per raise — **before**, **during the hold** and
+**after** — each call returning the VP markers and `[P+0xB68][3]` together:
+
+| read | what it is for |
+|---|---|
+| before | the baseline. Delivery is `V+0x208` **moving**, never its value, because a previous `#BP` on that VP leaves the markers already reading as one |
+| during | the measurement, taken while the trap is held and the VP is therefore not overwriting its own markers |
+| after | the spoiler check. If `[P+0xB68][3]` moved across the raise, the branch reading for that arm is discarded — the table is sampled after the handler consulted it and cannot name a branch on its own |
+
+with the backed-out arm **interleaved** rather than run as a clean batch, and the positive control —
+a raise under a Vid-installed intercept, which must be delivered — in the same session. None of that
+is machinery: it is the same call three times.

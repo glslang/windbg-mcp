@@ -4039,7 +4039,7 @@ validated. The full record is the
       image rather than a proof that every invocation goes through preprocess, so the read's
       coverage rests on it **plus** the arm's positive control, which demonstrates the path instead
       of inferring it. Built
-      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 17/17 and
+      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 20/20 and
       mutation-verified, because a reachability *negative* over an image is the one
       claim a byte scan cannot make: a branch encodes a displacement, not an address, and the
       address appears in immediates that transfer control nowhere. **Cost**: one bounded kernel-read
@@ -4053,7 +4053,13 @@ validated. The full record is the
       **Still open, and what it now needs.** Nothing ran live: the IOCTL does not exist, and the
       walk above is a static reading plus S5q step 2's recorded pair. The arm's first act is the
       runtime confirmation this gate cannot give — `[VP+0] == P`, a plausible `[P+0xAA8]`, and
-      `[P+0xB68]` pointing at a table of mostly `0xFF`. Two limits carry into the arm's design
+      `[P+0xB68]` pointing at a table of mostly `0xFF`. **The arm's shape, settled across three
+      review rounds and cheaper than any of them sounded: one IOCTL called three times per raise —
+      before, during the hold, and after.** Delivery is `V+0x208` **moving**, never its value,
+      because a previous `#BP` on that VP leaves all four markers already reading as a delivery and
+      a post-raise sample cannot tell that from a new arrival; the timestamp works as the version
+      stamp precisely because preprocess writes it unconditionally and before the type dispatch.
+      The third read is the spoiler check on `[P+0xB68][3]`. Two limits carry into that design
       rather than being retired by it: the read is **last-arrival state, not a count**, so the
       positive control has to show the markers are still there when sampled or its own negative
       means nothing; and nothing durable records *which* branch `VidHandleExceptionIntercept` took,

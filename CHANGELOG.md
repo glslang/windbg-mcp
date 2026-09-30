@@ -47,9 +47,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without which a single byte of inline data would leave every later call in that function
   unexamined while the range still counted as claimed, so the gap detector would not pick it up
   either. Both images read here report **0 decode stops and 0 refused bytes**, which is what makes
-  their negatives readings of the whole image. `--self-test` **17/17, mutation-verified on ten
-  edits**, every one applied and every one caught — and two of those earn a note. The byte-scan
-  case's first version passed under
+  their negatives readings of the whole image. The PE headers are scanned as a region of their own
+  and `AddressOfEntryPoint` is reported by name, because a driver's `DriverEntry` has **no caller
+  in its own image**: `Vid.sys`'s own entry point draws zero code references and one loader route,
+  which is what the earlier version would have printed as a clean negative. `--self-test` **20/20,
+  mutation-verified on twelve edits**, every one applied and every one caught — and two of those
+  earn a note. The byte-scan case's first version passed under
   the very mutation it existed for, because the immediate it used was a neighbouring number rather
   than the target's address; and `report` is now rendered into a sink for every case, because the
   counts come from `scan` and the printing path was otherwise never executed — which is exactly
