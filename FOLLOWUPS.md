@@ -4015,10 +4015,13 @@ validated. The full record is the
       gap and coincide with the raise. **The loop arm ran without answering its question**, and a
       later arm answered it: `handled = 0` shows only that the guest's `__except` never ran, and
       the 20 fresh stamps are twenty calls to `VidInterceptPreprocess` rather than twenty
-      executions — but **the hypervisor's own per-VP `Total Messages/sec` settles it** (see *the loop
+      executions — but **the hypervisor's own per-VP `Total Messages/sec` supports re-entry over
+      re-preprocessing, under the stated assumption** (see *the loop
       question* below): tens of thousands of deliveries a second armed against **zero** in five
       control phases — one of them the vector armed with the raiser absent, the only arm that
-      could have shown an unrelated `#BP` source — so S5k's re-entry inference holds. **And a
+      could have shown an unrelated `#BP` source. The rates are **aggregate** and name no vector
+      or `RIP`, so they do not bind an individual delivery to the enclave instruction: S5k's
+      re-entry inference is **supported**, not proven. **And a
       third reading came free**: per-VP
       `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at different instants and `0`
       at every sample of a control that raised **1.87 million** `#BP`s with no intercept standing,
