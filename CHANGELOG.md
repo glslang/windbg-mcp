@@ -20,8 +20,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not a field count, and reading the whole function shows `vid.dll` interprets **two** fields of
   it, both for length; and its 19 modules / ~9.9 MB of `vmwp.exe` device model are **COM in-proc
   servers with 24 registered CLSIDs**, so that is where the implementation lives rather than a
-  bound on code to rewrite. Two probes would decide it, neither run: a census of `Vid.sys`'s
-  `0x2211A0` handler, and an activation probe on one of those CLSIDs. Static throughout, and
+  bound on code to rewrite — though nothing here activated one, so they are **registered**, which
+  names the mechanism rather than proving it works. Two probes would **narrow** it, neither run
+  and neither sufficient: a census of `Vid.sys`'s `0x2211A0` handler, and an activation probe on
+  one of those CLSIDs. Static throughout, and
   **no call was made**. Full record, including both retractions, in the **Step 8** section of
   [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 - **The hold is a loop — supported, on Hyper-V's per-VP `Total Messages/sec` — and its sibling
@@ -374,8 +376,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   untouched. **S5 does not pass**: the refusal is understood by cause rather than by match, and the
   route behind it empties the room it opens — with the writer census, not the VMM-of-our-own
   question, as the next cheap thing that could change either reading. **Both have since run**: the
-  census as S5p, and the VMM-of-our-own question as step 8's costing, which decides against the
-  build.
+  census as S5p, and the VMM-of-our-own question as step 8's costing — which did not settle the
+  build either way.
 - **Two gate sections still carried a "what to run next" list, and both had gone stale.** The class
   fix recorded against the previous round — one ordered plan in `FOLLOWUPS.md`, result sections
   stating what they leave *open* rather than what to run — was applied to two of the four sections

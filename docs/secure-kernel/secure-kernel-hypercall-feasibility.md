@@ -5402,7 +5402,7 @@ was built on and leaves the delivery question **open rather than answered agains
 route (item 103 step 8) is where the *chaining* failure points, not somewhere the evidence forces the
 build to go. The cheaper successor is the convergence-point measurement above, and it is ahead of any
 ownership work in the order item 103 records. **Both have since run**: that measurement as step 9,
-and the ownership work as step 8's costing, which decides against the build.
+and the ownership work as step 8's costing — which did not settle the build either way.
 
 **And that successor answered it: the message IS delivered.** The step 9 arm read `0x80010003` with
 vector `3` arriving at `VidInterceptPreprocess` on both VPs, so `forwarded = 0` here was the chained
@@ -6322,7 +6322,7 @@ name and it is stripped before anything is printed, this record being public.
 It recommended *do not build* on a 52 KB buffer read as a field count and a 9.9 MB module list read
 as code to be rewritten; review rejected both and both are retracted below. What survives is a
 solid negative — **there is no documented route** — a decoded entry point, and two named probes
-that would decide it.
+that would narrow it without settling it.
 
 Everything here is **static**: PE import and export tables, and `vid.dll` decoded in DbgEng with no
 target attached, which is the same instrument S5o used and needs no host reboot. No partition was
@@ -6415,9 +6415,11 @@ the opposite, in fact:
 | exports of `vmchipset`, `vmuidevices`, `vmsynthstor`, `VmSynthNic`, `vmbusvdev`, `vmtpm`, `vmdynmem` | `DllGetClassObject`, `DllCanUnloadNow`, `DllRegisterServer`, `DllUnregisterServer` — **and nothing else** |
 | in-proc CLSIDs registered on this host and backed by those seven | **24** |
 
-They are **COM in-proc servers, registered and activatable**. So 9.9 MB is where the implementation
-lives, not a bound on code anyone must rewrite, and reuse is the likelier path rather than an
-excluded one. What is genuinely unknown is the part a module list cannot show: these objects
+They are **COM in-proc servers, and they are registered** — which names the intended mechanism and
+is not the same as saying one can be created. Nothing here activated anything: a class factory
+can refuse, a dependency can be missing, and process context can decide it. What the registration
+does establish is that 9.9 MB is where the implementation lives rather than a bound on code
+anyone must rewrite, and that reuse is not excluded — not that it works. What is genuinely unknown is the part a module list cannot show: these objects
 implement **private, undocumented interfaces**, and whether they can be driven without context
 `vmwp.exe` supplies — a partition object, a VMBus channel manager — is unmeasured. That is reversing
 of a different kind, not obviously cheaper than rewriting and not obviously dearer.
@@ -6440,10 +6442,13 @@ here says the rig *is* affordable either.
 - **The capability is present on that surface** — `VidVsmEnableVpVtl` and the `VidMessageSlot*`
   receive path — so the route is not blocked by a missing primitive.
 
-**What would decide it**, each cheap relative to the build and neither run here: a census of
-`Vid.sys`'s `0x2211A0` handler for the fields it actually validates, which turns tier A's cost from
-a guess into a count; and an activation probe on one of the 24 CLSIDs, to see whether a device model
-object can be created and driven outside `vmwp.exe` at all, which is what tier B turns on.
+**What would narrow it** — each cheap relative to the build, neither run here, and neither
+sufficient to decide it. A census of `Vid.sys`'s `0x2211A0` handler for the fields it actually
+validates turns *one* call's cost from a guess into a count, and tier A is about a dozen calls
+whose other field counts stay unmeasured. An activation probe on one of the 24 CLSIDs says
+whether a single device-model object can be created outside `vmwp.exe`, and tier B needs the
+rest of them created *and driven* through interfaces this record has not read. So they remove
+the next obstacle each, and a decision needs more than the next obstacle.
 
 **And what stays unmeasured regardless.** No call was made, so *"the create path has no known
 obstacle"* still rests on S5o's static read, S5p's census of located writes, and S5n's control that
