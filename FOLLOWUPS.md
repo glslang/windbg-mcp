@@ -4048,7 +4048,8 @@ validated. The full record is the
       `ERROR_INVALID_FUNCTION` on six and **`ERROR_ACCESS_DENIED`** on two — the same 3-and-1 split
       in each worker independently — against `ERROR_INVALID_HANDLE` for a non-VID control, so they
       reach `Vid.sys` and are turned away. **Not established**: that the route reaches the exported
-      receiver, which nothing here tests. A draft inferred that read-only duplicated access is
+      receiver, which *this* arm does not test — the receiver arm below does. A draft inferred
+      that read-only duplicated access is
       insufficient; **withdrawn — wrong axis, and S5m already said so**: the receiver is IOCTL
       `0x221148` with `FILE_ANY_ACCESS`, and what gates it is *holding a partition handle*, not an
       access mask. Testing it means invoking `VidRegisterExceptionHandler`, and a draft justified
@@ -4056,8 +4057,15 @@ validated. The full record is the
       `STATUS_VID_DUPLICATE_HANDLER` before touching the hypervisor rather than displacing anyone;
       the documented hazard is collision with a **raw** `WinHvInstallIntercept` installer, which
       the duplicate check cannot see. So the test is more available than claimed and still a
-      decision: an unclaimed slot would be claimed by us on a running VM. **That is step 7's next
-      arm.** **Inheritance of a VID handle a worker still holds is excluded** on object identity —
+      decision: an unclaimed slot would be claimed by us on a running VM. **THAT ARM HAS SINCE RUN
+      — see the receiver-arm section — and the route is closed from user mode: the IOCTL is issued
+      directly for a lossless `NTSTATUS`, and on both workers three handles return
+      `STATUS_NOT_IMPLEMENTED` and the fourth `STATUS_ACCESS_DENIED`. Nothing was mutated — the
+      poisoned output survived every arm, so no slot was ever claimed. Why it refuses is a limit,
+      not a finding: every wider duplicate is refused by `DuplicateHandle` itself, so the driver's
+      ownership check and the driver wanting write access predict the same result. LiveCloudKd's
+      procedure therefore needs more than duplication, measured.**
+      **Inheritance of a VID handle a worker still holds is excluded** on object identity —
       no child holds any of the workers' four current VID file objects. **Not excluded**: one
       inherited and since closed in the parent, which a snapshot cannot see. The children's own
       single `File` object is **unidentified** (duplication refused three ways, sole holder, module

@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Item 103 step 7's deciding arm is run, and the route is closed from user mode: duplication is
+  possible and insufficient.** The named next arm — invoke the receiver through a duplicated handle
+  rather than infer from a neighbouring call — was invoked on **both** workers, with the IOCTL
+  issued directly rather than through `VidRegisterExceptionHandler`, because the wrapper runs its
+  `NTSTATUS` through `RtlNtStatusToDosError` and that would collapse
+  `STATUS_VID_DUPLICATE_HANDLER` — the one result meaning the handle *reached* the receiver. Three
+  handles per worker return `STATUS_NOT_IMPLEMENTED` (the shared file object is not a partition) and
+  the fourth **`STATUS_ACCESS_DENIED`**, against `STATUS_OBJECT_TYPE_MISMATCH` for a non-VID
+  control — the same 3-and-1 split as `VidGetHvPartitionId`, on the same two file objects, in each
+  worker independently. **Nothing was mutated**: the 8-byte output was poisoned and survived every
+  arm, so no registration handed back a handle, no slot was claimed, and the rollback had nothing to
+  release — a stronger statement than a rollback that ran. **Why it refuses is a limit, not a
+  finding**: the control code is `FILE_ANY_ACCESS` so the I/O manager gates nothing, but every
+  wider duplicate is refused by `DuplicateHandle` itself, so the driver's ownership check and the
+  driver checking the mask predict the same observation, and an earlier round of this work asserted
+  the mask reading and had to withdraw it. **LiveCloudKd's procedure needs more than duplication**,
+  now measured rather than guessed; a kernel driver would bypass both gates and remains the
+  candidate, its source still unread. Both guests responsive across both arms, no bug check.
 - **Item 103 step 7 is attempted: the handle is takeable, and the first read through it is
   refused.** S5n declined handle duplication because `vmwp.exe` runs protected; measured against
   positive controls (`csrss` 0x61, `lsass` 0x41, `MsMpEng` 0x31) with a poisoned output buffer,
@@ -39,7 +57,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   but `Vid.sys` is PnP root-enumerated, so
   `\GLOBAL??\ROOT#VID#0000#{7896e901-…}` resolves to **`\Device\00000006`**, and this record
   already wrote the prefix as the device interface path. **Not established**: that the route
-  reaches the receiver, which nothing here tests. A draft inferred that read-only duplicated
+  reaches the receiver, which *this* arm does not test — the receiver arm above does, and closes
+  it. A draft inferred that read-only duplicated
   access is insufficient; **withdrawn as the wrong axis, and S5m had already written the answer** —
   the receiver is IOCTL `0x221148` with `FILE_ANY_ACCESS`, gated on *holding a partition handle*,
   not on an access mask. Invoking it means `VidRegisterExceptionHandler`, and a draft justified
@@ -47,7 +66,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `STATUS_VID_DUPLICATE_HANDLER` **before** touching the hypervisor rather than displacing a
   handler, and the documented hazard is collision with a **raw** installer the duplicate check
   cannot see. The test is therefore more available than claimed and still a decision — an unclaimed
-  slot would be claimed by us on a running VM — and it is step 7's next arm. Controls, errors and
+  slot would be claimed by us on a running VM — and it was step 7's next arm, **since run: see the
+  receiver-arm entry above**. Controls, errors and
   limits in the **Step 7** section of
   [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 - **Item 103 step 8 is costed, and the costing does not yield the decision — which a first draft

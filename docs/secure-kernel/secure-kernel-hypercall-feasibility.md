@@ -6601,9 +6601,10 @@ installer per vector per partition at a time**.
 probe.** This line's raw installs have all been inside the nested lab guest, not against these host
 partitions, so the collision case is not *known* to apply here — though by the record's own
 argument nothing can confirm that, the bitmask having no owner field. What remains is real and
-small: a slot that turns out unclaimed would be claimed by us, on somebody's running VM. That is
-the next arm for step 7, named with the right hazard, and it is a call to make rather than a thing
-to run in passing.
+small: a slot that turns out unclaimed would be claimed by us, on somebody's running VM. That was
+the next arm for step 7, named with the right hazard rather than skipped behind a wrong one —
+**and it has since been run: the receiver-arm section below answers it, and no slot was claimed
+because no registration ever succeeded.**
 
 **The inheritance half closes on object identity, and two weaker arguments for it were wrong.**
 The first argued from the count alone — one `OBJ_INHERIT` handle per worker — which settles nothing
@@ -6702,3 +6703,79 @@ tool, not its source**, which has not been read here.
 **Configuration limits.** One host, one build, two VMs, neither shielded, client Hyper-V rather than
 Server, elevated administrator rather than SYSTEM, and `DUPLICATE_SAME_ACCESS` throughout. Every row
 above could differ on any of those.
+
+### Step 7, the receiver arm, 2026-09-30: the route does not reach the receiver, and nothing was mutated
+
+**The deciding test is run, and handle duplication alone does not get in.** The section above left
+this as the named next arm: invoke the receiver through a duplicated handle rather than infer from a
+neighbouring call. Invoked, on **both** workers, and `Vid.sys` refuses every handle at the
+receiver's own control code.
+
+**The wrapper was not used, deliberately.** `VidRegisterExceptionHandler` runs its `NTSTATUS`
+through `RtlNtStatusToDosError` before `SetLastError`, which would collapse
+`STATUS_VID_DUPLICATE_HANDLER` (`0xC0370001`) — the one outcome most worth telling apart, because it
+would mean the handle *reached* the receiver — into an ordinary Win32 code. So the IOCTL is issued
+directly with the layout decoded from that wrapper, which is the same operation with a lossless
+result:
+
+| | |
+|---|---|
+| register | IOCTL **`0x221148`**, in 16 B `{ u8 Vector; u8 pad[3]; u32 Parameter; u64 Context; }`, out 8 B |
+| unregister | IOCTL **`0x2211E8`**, in 8 B `{ u64 Handle; }`, out 0 |
+| wrapper signature | `BOOL VidRegisterExceptionHandler(HANDLE partition, UCHAR vector, ULONG parameter, ULONGLONG context, PVOID out8)` |
+
+#### The result, both workers independently
+
+| handle | NTSTATUS | reading |
+|---|---|---|
+| control — this process's own handle | `0xC0000024` `OBJECT_TYPE_MISMATCH` | not a File object at all |
+| worker 1 `0x278`, `0x2C0`, `0x2EC` · worker 2 `0x2A8`, `0x2D0`, `0x300` | `0xC0000002` `NOT_IMPLEMENTED` | this control code is not implemented for that object — the shared file object is not a partition |
+| worker 1 `0x2C8` · worker 2 `0x2D8` | **`0xC0000022` `ACCESS_DENIED`** | the separate file object reaches the dispatcher and is refused |
+
+The 3-and-1 split falls on exactly the two file objects the pointer comparison found, in both
+workers, and matches `VidGetHvPartitionId`'s `INVALID_FUNCTION`/`ACCESS_DENIED` split from the same
+handles. The control fails *differently* again, and at the object-type layer rather than the driver.
+
+**Nothing was mutated, and the evidence is stronger than a clean rollback would be.** The 8-byte
+output was poisoned with `0xAA` on every arm and **the poison survived every one** — so no
+registration ever handed back a handle, no slot was claimed, and the rollback in the `finally` had
+nothing to release and correctly did not run. A rollback that ran and succeeded would have left the
+weaker claim that a mutation was undone; this says there was none. Both guests stayed responsive
+across both arms, `LsaIso` alive on the VBS one, uptime continuous at 10h57m, no bug check since
+boot.
+
+#### Why it is refused is *not* separable here, and that is a limit rather than a finding
+
+`ACCESS_DENIED` has two live explanations and this instrument cannot split them:
+
+- the driver's **own ownership check** — step 4's territory, where `VidPartitionAttach` makes the
+  opener the owning process and we are not it;
+- the driver checking for an access right the duplicate does not carry.
+
+The control code is `FILE_ANY_ACCESS`, which settles that the **I/O manager** performs no access
+check — but not that the *driver* ignores the mask. The obvious discriminator is to duplicate with
+more access and retry, and **that is refused one step earlier**: against the same source handle,
+`DUPLICATE_SAME_ACCESS` succeeds at `0x00120089` while `+FILE_WRITE_DATA`, `0x0012019F`,
+`FILE_ALL_ACCESS` and `GENERIC_ALL` are each refused by `DuplicateHandle` itself with
+`ERROR_ACCESS_DENIED`. The object's security descriptor will not grant a wider handle, so both
+explanations predict precisely what is observed. **Stated as a limit** — an earlier round of this
+work asserted the access-mask reading and had to withdraw it, and asserting the ownership reading
+now would be the same mistake in the other direction.
+
+#### What this settles
+
+**Step 7's route is closed from user mode by duplication alone**, measured rather than inferred: a
+handle taken out of an unprotected `vmwp.exe` with the access that handle carries is refused by
+`Vid.sys` at the receiver. The two halves now read as — duplication **possible** and **insufficient**,
+inheritance **excluded** for any handle a worker still holds.
+
+**And LiveCloudKd's procedure needs more than this record's summary of it describes.** Duplicating a
+handle from `vmwp.exe` is *not sufficient* on 26100 — that is now a measurement. What supplies the
+rest is not established here; a kernel driver would bypass both the security descriptor that blocked
+the wider duplicate and any user-mode ownership check, which makes it the candidate rather than the
+answer. Its source still has not been read.
+
+**Run by** [`s7_receiver_arm.ps1`](https://github.com/glslang/windbg-mcp) on the bench rig (not in
+this repository), whose header carries the safety envelope: vector **3** only — `#PF` or `#GP` would
+queue messages nobody drains — one VM per invocation so the other stays untouched, rollback in a
+`finally`, poisoned output, and the negative control first.
