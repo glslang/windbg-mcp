@@ -6622,7 +6622,7 @@ than a name re-derived on each side:
 | worker 1 VID handles (4) | `…AD30DF0` ×3, `…AD34E00` |
 | worker 2 VID handles (4) | `…AD31A70` ×3, `…AD32EC0` |
 | `vmsp.exe` children, their **only** File handle | `…AD457A0`, `…AD39900` |
-| `vmmem` children | no handle-table entries |
+| `vmmem` children | **no handles at all** — `HandleCount` 0, minimal process |
 
 **No VID object appears in any child.** The children's single File handle carries access
 `0x00100020`, the same as each worker's own `\Device\HarddiskVolume4\Windows\System32` handle —
@@ -6635,10 +6635,29 @@ object return `ERROR_INVALID_FUNCTION`, the odd one out returns `ERROR_ACCESS_DE
 workers. It is the strongest support yet for the candidate reading that one of these is the raw
 device and the other is not, and it still does not name which is a partition.
 
-**One instrument disagreement, recorded rather than resolved.** The per-process enumeration earlier
-reported 53 handles for each `vmmem`; the system-wide table shows **no** entries for those pids.
-The system table needs no `OpenProcess` and is the one relied on here, but the two readings
-disagree and this record should not pretend otherwise.
+**The `vmmem` row needed resolving before it could carry any conclusion, and review was right to
+say so.** An empty result from an enumeration that might simply have failed cannot establish that a
+process holds no VID object — and the per-process instrument had earlier reported **53** handles for
+each `vmmem` against the system table's none. Recording the disagreement, as a draft did, is not the
+same as settling it.
+
+**Settled, and the fault was in this record's own instrument.** Re-run with the output buffer
+**poisoned with `0xAA`**, `NtQueryInformationProcess(ProcessHandleInformation)` against `vmmem`
+returns `STATUS_SUCCESS` with `retLen` 16 and **the poison intact** — it reports success and writes
+nothing. The earlier code broke out of its growth loop on `status == 0` and read the count from an
+`AllocHGlobal` buffer nobody had initialised, so "53" was a stale value left by the previous
+iteration, which was `vmsp`'s genuine 53. Two independent readings agree that the real answer is
+zero: the perf-counter `HandleCount` for both `vmmem` processes is **0**, and each has 5 threads and
+no command line — a minimal process, which is what `vmmem` is.
+
+So the system table's empty result is **correct rather than incomplete**, and inheritance closes for
+the `vmmem` children on stronger ground than for `vmsp`: they hold no handles at all. The scope of
+the artifact is this one call — `vmsp` (53), `vmms` (64 File) and `vmcompute` (8 File) all returned
+real buffers, and the workers' own counts came through the growth loop on
+`STATUS_INFO_LENGTH_MISMATCH`.
+
+**Third time in this section that poisoning a buffer was the difference between an answer and a
+plausible number**, after the protection query and the partition-id out-parameter.
 
 **LiveCloudKd is narrowed only as far as the handles go.** This line's record says its procedure
 duplicates handles from `vmwp.exe`; the handles exist and are takeable, so the procedure is
