@@ -4091,8 +4091,11 @@ validated. The full record is the
       signature — and the interleaved backed-out arms on **both** sides show no exception markers
       and a raiser that completes. **So S5q arm 1's third explanation, *not delivered because the
       arming sequence is incomplete*, is eliminated, and `forwarded = 0` there was the chained slot
-      being bypassed rather than nothing arriving.** S5j's second reading — received and retained —
-      is now measured rather than inferred.
+      being bypassed rather than nothing arriving.** What is measured is reception **at preprocess**
+      and nothing about retention: "held" is produced by *both* branches of
+      `VidHandleExceptionIntercept`, so calling this S5j's received-and-retained reading — as an
+      earlier version of this paragraph did — reads a branch out of an observation that does not
+      distinguish the branches, and contradicts the next paragraph.
 
       **What the arm did NOT settle.** Which branch `VidHandleExceptionIntercept` took:
       `[P+0xB68][3]` read `0xFF` before the install and `0xFF` after the removal, consistent with

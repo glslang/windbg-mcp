@@ -21,8 +21,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **interleaved** backed-out arms on both sides show no exception markers and a raiser that
   completes. So `forwarded = 0` in S5q arm 1 was the chained slot being bypassed rather than nothing
   arriving, and the correction that section took in review — two dispatch-loop paths never read
-  `[partition+0x10]` — is now the measured explanation rather than one of two. S5j's
-  received-and-retained reading is measured rather than inferred. **Not settled**: which branch the
+  `[partition+0x10]` — is now the measured explanation rather than one of two. What is measured is
+  reception **at preprocess** and nothing about retention: a held trap is produced by *both*
+  branches of `VidHandleExceptionIntercept`. **Not settled**: which branch the
   handler took (`[P+0xB68][3]` read `0xFF` on both sides, consistent with the unclaimed-vector arm
   and corroborated by the trap staying held, but a claim-and-restore between samples reads as
   unchanged); and the raise was in **VTL0**, so a VTL1 raise is the next arm rather than something
