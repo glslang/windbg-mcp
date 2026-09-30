@@ -4039,7 +4039,7 @@ validated. The full record is the
       image rather than a proof that every invocation goes through preprocess, so the read's
       coverage rests on it **plus** the arm's positive control, which demonstrates the path instead
       of inferring it. Built
-      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 24/24 and
+      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 26/26 and
       mutation-verified, because a reachability *negative* over an image is the one
       claim a byte scan cannot make: a branch encodes a displacement, not an address, and the
       address appears in immediates that transfer control nowhere. **Cost**: one bounded kernel-read

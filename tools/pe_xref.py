@@ -17,16 +17,25 @@ displacements and in data that is not a pointer, so a search for them reports
 sites that cannot transfer control anywhere. `tools/vid_field_census.py` records
 the same two failures for a struct field and this is the call-target form of it.
 
-**What is decoded, and what that licenses.** A `.pdata` entry is a function with
-exact bounds, so a reference found inside one is attributed to it by name. The
-executable bytes `.pdata` does not claim carry no boundary information at all --
-no unwind record says where an instruction begins -- so a gap run is decoded as
-a DETECTOR: the union over every start in the run, which maximises what is found
-and claims nothing about which function found it. Gap hits are reported
-separately and labelled, because a misaligned start decodes bytes that are not
-instructions and can manufacture a reference that is not there. That direction
-is the safe one for a negative: the union can only widen the set, so an empty
-gap section is a measurement rather than an artefact of one reading.
+**Two readings, and what each one licenses.** A `.pdata` entry is a function
+with exact bounds, so a LINEAR SWEEP of it attributes what it finds to that
+function by name. That sweep is one framing of the bytes and is not coverage of
+them: a function that jumps over inline data desynchronises it with nothing
+rejected -- `EB 01 B8 E8 F8 FF FF FF C3` sweeps as `jmp` / `mov
+eax,0xfffff8e8` / `inc ebx` and refuses no byte, while the `call` at offset 3,
+which is the `jmp`'s own destination, is never decoded.
+
+So a DETECTOR runs beside it over **every executable byte**, claimed or not:
+one instruction from every start, the union of which can only widen what is
+found. Its hits are reported apart and labelled, because a misaligned start
+decodes bytes that are not instructions and can manufacture a reference that is
+not there -- and because nothing in a detection says which function it belongs
+to. The two are kept apart rather than merged, or a phantom would be laundered
+into an exact attribution. The one thing dropped is a detection that overlaps a
+swept hit AND names the same target -- `48 8d 05 ...` read again at +1 as
+`8d 05 ...` -- which cannot lose a transfer, since both framings name the same
+RVA and a reachability question does not care which is the true one. Those are
+counted and the count is printed.
 
 **Two data encodings are searched as well**, in EVERY section including the
 executable ones and in the PE headers, because a function reached from a table
@@ -72,7 +81,10 @@ that were each one omission from it:
 6. **Framing after a decode stop.** A refused byte no longer ends the function
    (see `decode_function`), but resynchronising one byte later can mis-frame
    what follows, so hits past a stop are labelled and the refused-byte count is
-   printed. Zero refusals is the only reading that needs no allowance.
+   printed. **That count is about rejection, not coverage** -- a desynchronised
+   sweep refuses nothing at all, which is why the detector covers every
+   executable byte and why an earlier version of this file was wrong to read
+   `0 refused` as "the whole range was examined".
 
 Items 1 and 5 are the ones that actually bite. What used to be on this list and
 is not any more, each because a review round named it: sections were selected by
@@ -181,8 +193,9 @@ class Ref:
     mnemonic: str
     text: str
     target: int
-    where: str  # a `.pdata` function name, or "" for a gap hit
-    exact: bool  # True for a `.pdata` attribution, False for a gap detection
+    where: str  # a `.pdata` function name, or "" for a detection
+    exact: bool  # True for a linear-sweep attribution, False for a detection
+    size: int = 0  # the decoded instruction's length, for the re-framing rule
 
 
 def load(path: str) -> Image:
@@ -373,12 +386,42 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
                     note = "  [after a decode stop -- framing may be off]" if flag else ""
                     refs.append(
                         Ref(rva, insn.mnemonic, f"{insn.mnemonic} {insn.op_str}", t,
-                            f"{name_for(rva, syms)}  [.pdata entry 0x{beg:x}]{note}", True)
+                            f"{name_for(rva, syms)}  [.pdata entry 0x{beg:x}]{note}", True,
+                            insn.size)
                     )
 
-    runs = gap_runs(img)
+    # The candidate-start detector runs over EVERY executable byte, not only
+    # the ones `.pdata` does not claim. The linear sweep above is a single
+    # framing of a function, and a function that jumps over inline data leaves
+    # it decoding the wrong bytes with nothing rejected: `EB 01 B8 E8 F8 FF FF
+    # FF C3` sweeps as `jmp` / `mov eax,0xfffff8e8` / `inc ebx` and reports ZERO
+    # refusals, while the real `call` at offset 3 -- the `jmp`'s own
+    # destination -- is never decoded. So "0 bytes refused" is a statement
+    # about what the decoder rejected and NOT about coverage, and the version
+    # of this tool that said otherwise was wrong. Review round 5 on #425.
+    #
+    # The two readings are kept apart rather than merged: a hit the linear
+    # sweep found is attributed to its function by name, and a hit only the
+    # detector found is reported as a detection with its framing unknown,
+    # exactly as a gap hit is. Anything else would launder a phantom from a
+    # misaligned start into an exact attribution.
+    # Extents of the instructions the linear sweep already reported, so a
+    # detection that is the SAME instruction re-framed from a shifted start --
+    # `48 8d 05 ...` read again at +1 as `8d 05 ...`, same displacement, same
+    # destination -- is not printed as a second route. The rule is narrow on
+    # purpose: it drops a detection only where it overlaps a hit AND names the
+    # same target, so it cannot lose a real transfer. Which framing is the true
+    # one does not matter to a reachability question when both name the same
+    # RVA. Re-framings are counted and the count is printed, because a
+    # suppression nobody can see is indistinguishable from a bug.
+    exact_at = {r.rva for r in refs}
+    exact_spans = [(r.rva, r.size, r.target) for r in refs]
+    reframed = 0
+    runs = gap_runs(img)  # reported on its own, and a subset of the cover below
+    cover = [(s.va, s.va + min(s.vsize, s.rawsize)) for s in img.sections if s.executable]
     starts = 0
-    for beg, end in runs:
+    seen_detected: set[int] = set()
+    for beg, end in cover:
         blob = img.read(beg, end - beg)
         if not blob:
             continue
@@ -393,12 +436,20 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
             # quadratic version on `Vid.sys` and `winhvr.sys` before the change
             # was kept, not reasoned about alone.
             for insn in md.disasm(blob[k : k + 15], img.image_base + beg + k, count=1):
+                rva = insn.address - img.image_base
+                if rva in exact_at or rva in seen_detected:
+                    continue
                 for t in targets_of(insn, img.image_base):
-                    if t in wanted:
-                        refs.append(
-                            Ref(insn.address - img.image_base, insn.mnemonic,
-                                f"{insn.mnemonic} {insn.op_str}", t, "", False)
-                        )
+                    if t not in wanted:
+                        continue
+                    if any(a <= rva < a + n and tgt == t for a, n, tgt in exact_spans):
+                        reframed += 1
+                        continue
+                    seen_detected.add(rva)
+                    refs.append(
+                        Ref(rva, insn.mnemonic,
+                            f"{insn.mnemonic} {insn.op_str}", t, "", False, insn.size)
+                    )
 
     # Every section, including the executable ones. Suppressing those was
     # wrong in the direction that matters here: an indirect call through a
@@ -439,6 +490,7 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
         "gap_starts": starts,
         "data": data_hits,
         "refused_bytes": refused_bytes,
+        "reframed": reframed,
         "functions_with_a_stop": functions_with_a_stop,
     }
 
@@ -454,8 +506,8 @@ def report(refs: list[Ref], extra: dict, wanted: set[int], syms: dict[int, str])
             print(f"  0x{r.rva:06x}  {r.where}   {r.text}")
         if gaps:
             for r in gaps:
-                print(f"  0x{r.rva:06x}  [OUTSIDE .pdata -- boundaries unknown, "
-                      f"read this span by hand]   {r.text}")
+                print(f"  0x{r.rva:06x}  [candidate-start detector only -- framing "
+                      f"unknown, read this span by hand]   {r.text}")
         else:
             print("  gap runs: none reaches it")
         rows = [d for d in extra["data"] if d[3] == w]
@@ -476,8 +528,9 @@ def report(refs: list[Ref], extra: dict, wanted: set[int], syms: dict[int, str])
         f"{extra['functions']} .pdata functions "
         f"({extra['functions_with_a_stop']} with a decode stop, "
         f"{extra['refused_bytes']} byte(s) refused and stepped over); "
-        f"{extra['gap_starts']} candidate starts in "
-        f"{extra['gap_runs']} non-padding gap run(s)"
+        f"{extra['gap_starts']} candidate starts over every executable byte "
+        f"({extra['gap_runs']} non-padding gap run(s) among them), "
+        f"{extra['reframed']} re-framing(s) of a swept hit dropped"
     )
 
 
@@ -519,25 +572,27 @@ def _img(text: bytes, base: int = 0x140000000, claim=None, data: bytes = b"",
     return img
 
 
-TOTAL = 24
+TOTAL = 26
 
 # Mutation-verified, so the cases below share one denominator and none of them
 # is passing for a reason unrelated to the rule it names. Backing each of these
 # out of the code above, every one applied and every one was caught:
 #
-#   gap union -> a single start                      22/24
-#   decode window shrunk below one instruction       20/24
-#   sections selected by name again                  23/24
-#   the data scan skips executable sections again    22/24
-#   the PE headers region dropped                    23/24
-#   the entry point not reported                     23/24
-#   every immediate counts as a branch target        23/24
-#   gap hits attributed as `.pdata` hits             20/24
-#   padding-only runs kept as runs                   23/24
-#   no resume after a refused byte                   23/24
-#   refused bytes not counted                        23/24
-#   any PE32+ machine accepted                       21/24
-#   `--targets` reads a bare value as hex            23/24
+#   gap union -> a single start                      20/26
+#   decode window shrunk below one instruction       20/26
+#   sections selected by name again                  25/26
+#   the data scan skips executable sections again    24/26
+#   the PE headers region dropped                    25/26
+#   the entry point not reported                     25/26
+#   every immediate counts as a branch target        25/26
+#   detections attributed as swept hits              20/26
+#   padding-only runs kept as runs                   25/26
+#   no resume after a refused byte                   25/26
+#   refused bytes not counted                        25/26
+#   the detector covers only the `.pdata` gaps       24/26
+#   the re-framing rule drops a real detection       25/26
+#   any PE32+ machine accepted                       23/26
+#   `--targets` reads a bare value as hex            25/26
 #
 # Two of those earn the comment. The immediate case's FIRST version used
 # `mov eax,0x40001000`, whose immediate is a *neighbouring* number rather than
@@ -674,6 +729,29 @@ def self_test() -> int:
     # refusals, so the count above is about the byte and not about the harness.
     case("a clean function reports no refusals",
          _img(b"\x90" * 6 + b"\xe8\xf5\xff\xff\xff"), {0x1000}, 1, 0, 0, want_refused=0)
+
+    # A function that jumps over inline data, which desynchronises the linear
+    # sweep with NOTHING rejected. These are review round 5's own bytes:
+    # `jmp +1` steps over `B8`, so the real instruction at offset 3 is a
+    # `call`, while the sweep reads `jmp` / `mov eax,0xfffff8e8` / `inc ebx`
+    # and reports zero refusals. Only the candidate-start detector finds the
+    # call, which is why it now runs over every executable byte rather than
+    # only over what `.pdata` does not claim -- and why "0 bytes refused" is a
+    # statement about rejection and not about coverage.
+    desync = b"\xeb\x01\xb8\xe8\xf8\xff\xff\xff\xc3"
+    case("a call the linear sweep decodes straight through",
+         _img(desync), {0x1000}, 0, 1, 0, want_refused=0)
+
+    # The same shape with a plain call in front of it, so the image has BOTH an
+    # exact hit and a genuine detection elsewhere. That is what pins the
+    # re-framing rule from the other side: it must drop only a detection that
+    # overlaps a swept hit AND names the same target, so a detection at an
+    # unrelated address has to survive. Without this case, widening that rule
+    # to drop everything scores a clean sheet, because no other case has the
+    # two together -- which is exactly what the first mutation run showed.
+    both = b"\xe8\xfb\xff\xff\xff" + b"\xeb\x01\xb8" + b"\xe8\xf3\xff\xff\xff" + b"\xc3"
+    case("a detection away from a swept hit is not dropped as a re-framing",
+         _img(both), {0x1000}, 1, 1, 0)
 
     # The loader's own route in. `AddressOfEntryPoint` is in the optional
     # header, which is not a section, so a loop over sections never reads it --

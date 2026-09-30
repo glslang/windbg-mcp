@@ -5452,12 +5452,23 @@ an inter-procedural pointer, a bulk copy spanning the field, and another image e
 
 **Nothing in this image names `VidHandleExceptionIntercept` except the `lea` that stores it.** It has
 **one** reference: the `lea` at `VidInterceptPreprocess+0x1e0` that puts it in `V+0x158`. Nothing
-else names it, across 1,988 `.pdata` functions and the 4,352 candidate starts in the ten non-padding
-gap runs, and no section — including the executable ones — holds its address in either searched
-encoding beyond its own `RUNTIME_FUNCTION` and its `GFIDS` entry, neither of which transfers control
-anywhere. **`0` functions had a decode stop and `0` bytes were refused**, which is the number that
-decides whether the rest of that sentence is a reading of the image or of the part of it the
-decoder got through — `Vid.sys` has no such byte, so there is nothing to allow for here.
+else names it, across 1,988 `.pdata` functions swept linearly **and 652,268 candidate starts
+covering every executable byte in the image**, and no section — including the executable ones —
+holds its address in either searched encoding beyond its own `RUNTIME_FUNCTION` and its `GFIDS`
+entry, neither of which transfers control anywhere. One detection was dropped as a re-framing of the
+`lea` itself (`48 8d 05 …` read again at `+1` as `8d 05 …`, same target), and it is counted in the
+output rather than filtered away.
+
+**The candidate-start figure is doing the work in that sentence, and an earlier version of it leaned
+on the wrong number.** It said `0` functions had a decode stop and `0` bytes were refused and called
+that the measure of whether the scan read the whole image. It is not: a linear sweep that jumps over
+inline data desynchronises and refuses *nothing*, so a zero there is a statement about what the
+decoder rejected and says nothing about coverage. Review round 5 supplied the counterexample —
+`EB 01 B8 E8 F8 FF FF FF C3`, where the `jmp`'s own destination is a `call` the sweep reads straight
+through — and it reproduces on this bench. The decoder now runs the candidate-start detector over
+every executable byte rather than only over what `.pdata` leaves unclaimed, and on `Vid.sys` that
+wider pass finds **no route the sweep missed**, which is the reading the earlier sentence was
+claiming without having taken it.
 
 **That is the measurement, and it is not the same sentence as "every invocation goes through
 preprocess" — an earlier version of this paragraph wrote the second.** `pe_xref.py` says so about
