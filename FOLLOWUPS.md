@@ -4141,13 +4141,17 @@ validated. The full record is the
       name the VTL0 instruction instead, so the excursion S5h could not dismiss is excluded and the
       trap is taken at the VTL1 raise. **It agrees with S5h across gates**: both arms' message
       `Rip`s match S5h's halted `RIP`s in their low 16 bits (`500D`, `748D`) on a different boot.
-      `ExecutionState` is `0x0097` against VTL0's `0x001F` — reported raw, because **two** bits
-      differ (bit 7 only in VTL1, bit 3 `Cr0Am` only in VTL0), the layout was not verified against
-      this build, and the vector could not be varied to separate a VTL field from an
-      exception-specific one: the hypervisor takes exception intercepts only for vectors 3 and 4 and
-      the raiser has no `#OF` mode. Building one is the cheap way to close that. **The raiser column
+      **`ExecutionState` bits 7-10 track the VTL, measured across two vectors**: `0x0097` in VTL1
+      and `0x001F` in VTL0 for **both** `#BP` (vector 3) and `#DE` (vector 0), which separates *the
+      active VTL* from *something about `#BP` in an enclave* the way one vector could not. A draft
+      said that check was not runnable because the hypervisor takes exception intercepts only for
+      vectors 3 and 4 — **false**, and review caught it: S5i read a per-partition allowed-vector
+      mask at `+0x6124` with an unconditional *exemption* for 3 and 4, and `#BR` already installed
+      through the mask. The vector-0 install was then tried and **succeeded**, which adds a vector
+      to what this child's mask is known to admit. **The raiser column
       says "did not finish" and nothing more** — a draft said "slowed but advancing", which is the
-      reading S5h retracted once its counts turned out to be the monitor's post-teardown sample.
+      reading S5h retracted once its counts turned out to be the monitor's post-teardown sample, and
+      it also wrote the unarmed loop's **15.3 ms** as "15 s", three orders out.
       Scope unchanged: VTL1 user mode is not Secure Kernel.
 
       **One defect worth keeping, because it was this plan's own warning landing in this plan's own
