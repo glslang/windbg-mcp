@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Item 103 step 6's two blocked arms both run, and the VPs turn out to be resumed.** They had been
+  held by the standing constraint on installing a vector on a child and by root kernel-memory
+  access; the first lifted for guests this bench owns and the second is what S5q's read IOCTL
+  supplies. Everything here is a **pure read** apart from the intercept install. **The slot read**:
+  `[P+0xB68]` is `FF FF FF FF FF FF FF FF` at **all twelve** samples across 24 s of a standing
+  intercept, plus before the install and after the removal — the contemporaneous, **non-mutating**
+  read S5k has wanted since it was written and which S5m could only half-answer, because
+  registering to ask whether the slot is claimed *claims* it. It narrows S5j's retained explanation
+  without closing it: a claimant would have had to claim and release inside one 2-second gap and
+  coincide with the raise. **The loop**: `handled = 0` at all twelve samples while the raiser's own
+  clock ran to `ms=31609`, so S5k's inference that the faulting instruction is re-entered is
+  measured rather than inferred. **And the reading that matters most came free**: per-VP
+  `HvRegisterInterceptSuspend` is **transient** — seen on both VPs at different instants, and `0` at
+  every sample of a control that raised **1.87 million** `#BP`s with no intercept standing — while
+  both VPs keep accumulating `VpRuntime` and the guest retires nothing. **The VPs are being
+  resumed**, which falsifies the premise review round 3 on #428 used to refuse the ping-pong reading
+  of the two-VP markers, and puts that reading back as the supported one. What *performs* the
+  resumption is still unmeasured. One reading withdrawn because the control killed it: `RIP`
+  `…4001C` appears on intercept-suspended VPs **and on running ones in the control**, so it is a
+  common parked kernel address and not a signature of the trap.
 - **A VTL1 `#BP` reaches VID too, and the message names the enclave's own instruction — which
   settles the fork S5h left open.** Same instrument as the VTL0 arm, same partition, same session,
   with `spin_host.exe BP1` raising inside a VBS enclave: both VPs read `0x80010003` / vector `3` /
