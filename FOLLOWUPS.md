@@ -2002,12 +2002,13 @@ overstated the first two into blockers and got the third wrong.**
   (S5) is not. **S5h has since measured a catch for VTL1 *user* mode** — a parent-installed exception
   intercept holds a `#BP` raised there and hands it back on removal, and **S5i has since read the
   hypervisor and found that intercept applied at every enabled VTL by design**. **Step 9's arm has
-  since measured that the root DOES receive the resulting stop** — a `#BP` raised under a standing
-  raw intercept arrives at `Vid!VidInterceptPreprocess`, which copies the message, stamps the VP and
-  selects `VidHandleExceptionIntercept`. So the *catch* half has a receiver. What is still untested
-  is whether the same holds for a raise in **VTL1** (step 9's arm raised in VTL0) and whether any of
-  it reaches Secure Kernel's own code — the second remains an architectural inference after S5i
-  rather than an open mechanism, because VTL1 user mode is not VTL1 kernel mode.
+  since measured that the root receives a stop raised in VTL0** — a `#BP` raised there under a
+  standing raw intercept arrives at `Vid!VidInterceptPreprocess`, which copies the message, stamps
+  the VP and selects `VidHandleExceptionIntercept`. So a receiver exists **for the VTL0 stop**, and
+  that is the whole of what is measured: the *catch* half is not closed generally, because the stop
+  S5h held was a **VTL1** raise and step 9's arm did not read the markers for one. Whether any of it
+  reaches Secure Kernel's own code remains an architectural inference after S5i rather than an open
+  mechanism, because VTL1 user mode is not VTL1 kernel mode.
 
 ### S0 — the gate that decides how much setup a user needs — **RUN 2026-09-26, PASS**
 
@@ -3798,8 +3799,11 @@ validated. The full record is the
   would each have been a host bug check, and both were live before this run. Full record in the
   [S5q arm 0 result](docs/secure-kernel/secure-kernel-hypercall-feasibility.md) section.
 
-- **S5q arm 1 — RUN 2026-09-29: the trap is held and the partition's routine is never called, so the
-  message is not delivered.** Partition `0x3` with our routine chained into its slot,
+- **S5q arm 1 — RUN 2026-09-29: the trap is held and the partition's routine is never called —
+  which is the chained callback, not delivery.** (This bullet said *"so the message is not
+  delivered"*; step 9's arm measured the message arriving at `VidInterceptPreprocess` by a path that
+  never reads that slot, so the result stands for the callback and never stood for delivery.)
+  Partition `0x3` with our routine chained into its slot,
   `HvCallInstallIntercept` type 3 / access 4 / vector `0x03`, and `spin_host.exe BP0` — S5h's own
   VTL0 raiser — launched detached. The install succeeded, the **raiser was held** at all ten
   2-second samples across 20 s (against **878 µs** to finish all 1000 rounds with no intercept

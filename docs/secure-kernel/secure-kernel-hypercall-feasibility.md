@@ -5146,11 +5146,21 @@ anything else, because there is no way to refuse an unload and an image that goe
 Hyper-V still points into it bug checks the host on the next intercept — long after the run looked
 clean.
 
-### S5q arm 1, 2026-09-29: the trap is held and the partition's routine is never called, so the message is not delivered
+### S5q arm 1, 2026-09-29: the trap is held and the partition's routine is never called — which is the chained callback, not delivery
 
 **A `#BP` raised in a child with a parent-installed intercept is held by the hypervisor, and the
 routine registered for that partition is not invoked.** Arm 0 could not test dispatch because nothing
-was dispatched; arm 1 supplies the traffic, and what it finds is that the traffic does not arrive.
+was dispatched; arm 1 supplies the traffic, and what it finds is that the traffic does not reach the
+routine chained into `[partition+0x10]`.
+
+> **This heading and this paragraph said *"so the message is not delivered"* and *"the traffic does
+> not arrive"*, and both were wrong.** Review narrowed the conclusion within this gate — two
+> dispatch-loop paths never read that slot — and
+> [the step 9 arm](#step-9-the-arm-2026-09-30-the-message-is-delivered-and-s5qs-third-arm-is-out)
+> then measured the message arriving at `Vid!VidInterceptPreprocess`. The result below stands for
+> the **chained callback**; it never stood for delivery. Left corrected in place rather than
+> rewritten, because a reader navigating by heading was getting the opposite answer before reaching
+> the correction two screens down.
 
 #### The arm
 
