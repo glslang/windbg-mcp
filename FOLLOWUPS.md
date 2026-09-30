@@ -4130,9 +4130,12 @@ validated. The full record is the
       only running them together showed it.
 
       Bench: intercept installed once per armed arm and removed in the phase after it, teardown
-      reporting **0 standing** on both runs, raiser killed after every arm, driver stopped, guest
-      responsive with 105 processes, both guests up 2h50m unbroken, host uptime continuous, no bug
-      check since boot. Nothing written to a partition object, nothing chained. Full record in the
+      reporting **0 standing** every time across three unchained runs and two combined ones, raiser
+      killed after every arm, driver stopped between rebuilds, guest responsive with 105 processes,
+      both guests up **3h26m** unbroken, host uptime continuous, no bug check since boot. Nothing
+      written to a partition object; the **combined** arm chained and unchained the callback — which
+      arm 0 had already characterised — and its `unchain` returned `SUCCESS` with the saved pair
+      restored. Full record in the
       **step 9, the arm** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
