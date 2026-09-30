@@ -4153,13 +4153,15 @@ validated. The full record is the
       side of the release S5h's retracted "advancing" reading got wrong — gives `handled = 0` at
       ten samples over 30 s, against **2,282** the moment teardown releases it, reproducing S5h's
       artefact one line below the correct reading. Interceptions kept arriving throughout: 20 new
-      stamps on both VPs at **one** `Rip`, with nothing retiring — a re-delivery loop. And the two
-      VPs are one thread ping-ponging between the guest's vCPUs, which the markers being
-      last-arrival state makes indistinguishable from two events until you look at *which* VP is
-      newer: it alternates, and the two stamps stay within ~10 ms. A draft called the two VPs
-      "consistent with one held raise", which review correctly refused — the raise loop is one
-      thread, so a frozen thread cannot reach a second VP. It also wrote the unarmed loop's
-      **15.3 ms** as "15 s", three orders out.
+      stamps on both VPs at **one** `Rip`, with nothing retiring — a re-delivery loop. **Where the
+      second VP's events come from is UNRESOLVED**, and two drafts got it wrong in turn: the first
+      called the two VPs "consistent with one held raise", which review refused because the raise
+      loop is one thread; the second called it that thread ping-ponging between vCPUs, which review
+      refused again because migrating needs the VP resumed and `WinHvCompleteIntercept` — the thing
+      that resumes an intercepted VP — is exactly what nothing is calling. Settling it means
+      measuring the delivery mechanism, which is an arm. Nothing else rests on it: delivery, the
+      `Rip`, the `ExecutionState` 2×2 and the freeze are each measured independently. The first
+      draft also wrote the unarmed loop's **15.3 ms** as "15 s", three orders out.
       Scope unchanged: VTL1 user mode is not Secure Kernel.
 
       **One defect worth keeping, because it was this plan's own warning landing in this plan's own

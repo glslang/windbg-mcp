@@ -36,12 +36,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   wrong: `handled = 0` at ten samples over 30 s, against **2,282** the moment teardown releases it,
   reproducing S5h's artefact one line below the correct reading. **Interceptions kept arriving
   throughout** — 20 new stamps on both VPs at **one** `Rip` with nothing retiring, a re-delivery
-  loop. And the two VPs are **one thread ping-ponging** between the guest's vCPUs, which
-  last-arrival markers make indistinguishable from two events until you look at *which* VP is newer:
-  it alternates, and the two stamps stay within ~10 ms. A draft had called the two VPs "consistent
-  with one held raise", which review correctly refused — the raise loop is one thread, so a frozen
-  thread cannot reach a second VP — and had written the unarmed loop's **15.3 ms** as "15 s", three
-  orders out. Scope unchanged: VTL1 **user** mode is not Secure Kernel. Bench intact — 0 intercepts
+  loop. **Where the second VP's events come from is left UNRESOLVED**, after two drafts got it wrong
+  in turn: the first called the two VPs "consistent with one held raise", which review refused
+  because the raise loop is one thread; the second called it that thread ping-ponging between
+  vCPUs, which review refused again because migrating needs the VP resumed and
+  `WinHvCompleteIntercept` — the thing that resumes an intercepted VP — is exactly what nothing is
+  calling. Settling it means measuring the delivery mechanism, which is an arm rather than a
+  paragraph, and nothing else rests on it. The first draft also wrote the unarmed loop's **15.3 ms**
+  as "15 s", three orders out. Scope unchanged: VTL1 **user** mode is not Secure Kernel. Bench intact — 0 intercepts
   standing at teardown on all three runs, `LsaIso` alive, both guests up **4h29m**, no bug check
   since boot.
 - **The message IS delivered: item 103 step 9's arm, and S5q's third explanation is eliminated.** A

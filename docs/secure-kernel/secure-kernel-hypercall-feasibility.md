@@ -5976,13 +5976,32 @@ reading — the counter only moves once the intercept is released.
 VPs, at one instruction, while nothing retired. That is a re-delivery loop — the intercept fires,
 VID preprocesses it, nothing completes it, and it fires again.
 
-**Which makes the two-VP reading a property of the instrument plus the guest scheduler, and the data
-says so.** The markers are last-arrival state, so a thread re-dispatched between the guest's two
-vCPUs leaves each VP's slot holding its most recent visit — both reading the same `Rip` without two
-simultaneous events. The tell is *which* VP is newer: it alternates, VP 0 leading at t = 9, 15 and
-27 s and VP 1 at the other seven, with the two stamps always within ~10 ms of each other. A single
-held thread pinned to one VP would leave the other's slot stale and falling further behind; it does
-not.
+**Where the second VP's events come from is UNRESOLVED, and a draft of this paragraph resolved it
+wrongly.** That draft said the markers being last-arrival state made this one thread re-dispatched
+between the guest's two vCPUs, each slot holding its most recent visit — and offered as the tell
+that *which* VP is newer alternates, VP 0 leading at t = 9, 15 and 27 s and VP 1 at the other seven,
+with the two stamps always within ~10 ms. **The alternation is real and the explanation does not
+follow from it**: a thread can only migrate between vCPUs if its VP is resumed, resuming an
+intercepted VP is what `WinHvCompleteIntercept` does, and the paragraph above this one says nothing
+completes these. The story contradicts the zero-progress measurement it was written to explain.
+
+What is measured, and all that is:
+
+- the raiser retires nothing for 30 s;
+- new arrivals land on **both** VP slots throughout, 20 of them;
+- every arrival names **one** `Rip`;
+- each slot's message carries **its own** `VpIndex`;
+- which slot is newer alternates, and the two stay within ~10 ms.
+
+Two readings survive that and neither is established. Repeated preprocessing of one pending
+intercept could refresh root-side markers without the guest thread moving at all — which does not by
+itself account for two distinct `VpIndex` values. Or both guest VPs are somehow in it, which the
+single-threaded raise loop does not account for. **Settling it means measuring the delivery
+mechanism** — whether anything calls `WinHvCompleteIntercept` while these arrive, and what the
+guest VPs' run state is — and that is an arm, not a paragraph.
+
+**Nothing else here rests on it.** Delivery, the `Rip` identifying the enclave instruction, the
+`ExecutionState` 2×2 and the freeze are each measured independently of why the second slot moves.
 
 One observation about the rig rather than the target, recorded so nobody reads it as a
 contradiction: `spin_host`'s banner prints *"RaiseBp at …"* in `DE` mode too — it is hard-coded.
