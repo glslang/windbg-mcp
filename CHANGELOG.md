@@ -21,15 +21,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   fired on an excursion would name the VTL0 one. **And it agrees with S5h across gates**: both arms'
   message `Rip`s match S5h's halted `RIP`s in their low 16 bits — `500D` and `748D` — on different
   boots with different ASLR bases, a VP halt and an intercept message naming the same two
-  instructions. `ExecutionState` reads `0x0097` in VTL1 against `0x001F` in VTL0; **two** bits
-  differ, bit 7 set only in VTL1 and bit 3 (`Cr0Am`) only in VTL0, and it is reported raw because
-  this gate did not verify the field layout and could not vary the vector to separate a VTL field
-  from an exception-specific one — the hypervisor accepts exception intercepts only for vectors 3
-  and 4 and the raiser has no `#OF` mode. **The raiser column says "did not finish" and nothing
+  instructions. **`ExecutionState` bits 7–10 track the VTL, measured across two vectors**: `0x0097`
+  in VTL1 and `0x001F` in VTL0 for **both** `#BP` (vector 3) and `#DE` (vector 0), which separates
+  *the active VTL* from *something about `#BP` raised in an enclave* the way one vector could not —
+  an identification from behaviour rather than from a header. Bit 3 (`Cr0Am`) tracks it too, so the
+  delta is two bits and neither is about the exception, and the `Rip` moves with the *vector* in the
+  same runs. A draft said that check was unrunnable because the hypervisor accepts exception
+  intercepts only for vectors 3 and 4; that is **false** — S5i read a per-partition allowed-vector
+  mask at `+0x6124` with an unconditional *exemption* for 3 and 4, `#BR` had already installed
+  through the mask, and the vector-0 install was then tried and **succeeded**, adding a vector to
+  what this child's mask is known to admit. **The raiser column says "did not finish" and nothing
   more**: a draft said "slowed but advancing", which is exactly the reading S5h retracted after its
   counts turned out to be the monitor's post-teardown sample, and this arm measured no progress at
-  all. Scope unchanged: VTL1 **user** mode is not Secure Kernel. Bench intact — 0 intercepts
-  standing at teardown, `LsaIso` alive, both guests up 4h03m, no bug check since boot.
+  all — only that a loop costing **15.3 ms** of raiser time unarmed did not complete in a 40-second
+  window armed, which that same draft wrote as "15 s", three orders out. Scope unchanged: VTL1
+  **user** mode is not Secure Kernel. Bench intact — 0 intercepts standing at teardown on both
+  runs, `LsaIso` alive, both guests up **4h16m**, no bug check since boot.
 - **The message IS delivered: item 103 step 9's arm, and S5q's third explanation is eliminated.** A
   `#BP` raised in a guest under a standing raw `HvCallInstallIntercept` reaches the root's
   `Vid!VidInterceptPreprocess`, which copies the message, stamps the VP and selects

@@ -5871,9 +5871,15 @@ called "slowed but advancing".** A draft of this section said the VTL1 arm was s
 frozen and that each raise was being handed back — which is precisely the reading S5h **retracted**:
 its 1,902 / 6,396 / 15,076 / 18,486 counts were all written by the monitor's *final* sample, after
 teardown had removed the intercept and the raiser had finished. This arm measured no progress at
-all. It measured that 2,000 rounds costing 15 s unarmed did not complete in 40 s armed, which a
-freeze on the first raise produces just as well as a slowdown. Both VPs carrying the *same* `Rip` is
-consistent with one held raise rather than a stream of them.
+all. What it measured is that a loop costing **15.3 ms** of raiser time unarmed — `us=15257` over
+2,000 rounds — did not complete inside a 40-second window armed, which a freeze on the first raise
+produces just as well as a slowdown. Both VPs carrying the *same* `Rip` is consistent with one held
+raise rather than a stream of them.
+
+Those two numbers are not a clean ratio and are not offered as one: the 15.3 ms is the raiser's own
+loop time and the 40 s is wall clock on a PowerShell Direct call, most of which is the call. A draft
+here wrote the loop cost as "15 s", three orders out, which would have made the effect look 1,000×
+smaller than it is.
 
 #### The `Rip` is the enclave's instruction, and it agrees with S5h across gates
 
@@ -5915,30 +5921,45 @@ an enclave we built. Secure Kernel is VTL1 *kernel* mode and handles its own exc
 scope limit stands exactly as S5i left it. What the fork's closure removes is the *reason to doubt*
 that a VTL1 intercept is a VTL1 intercept — it does not extend the result upward.
 
-#### `ExecutionState`, reported raw because the layout was not verified
+#### `ExecutionState` bits 7–10 track the VTL, measured across two vectors
 
-| arm | `ExecutionState` | bits set |
+| `ExecutionState` | `#BP`, vector `3` | `#DE`, vector `0` |
 |---|---|---|
-| VTL0 | `0x001F` | 0,1,2,3,4 |
-| VTL1 | `0x0097` | 0,1,2,4,**7** |
+| **VTL1** | `0x0097` | `0x0097` |
+| **VTL0** | `0x001F` | `0x001F` |
 
-**Two bits differ, not one**, and saying so is the point: **bit 7** is set only in the VTL1 arm, and
-**bit 3** is set only in the VTL0 arm. Both arms read `Cpl = 3` in bits 0–1, which is user mode and
-is right for both. TLFS places an **active-VTL** field at bits 7–10 of
-`HV_X64_VP_EXECUTION_STATE`, and bit 7 set exactly in the VTL1 arm is what that would look like —
-but **this gate did not verify that layout against this build**, and bit 3 (`Cr0Am` in the same
-layout) differing is a reminder that not every bit of the delta is about the VTL.
+**Identical within each VTL and different across them, for two unrelated exception vectors.** Bits
+7–10 read **1** in the VTL1 arms and **0** in the VTL0 arms. That is an identification of the field
+from behaviour rather than a reading of a header: one vector could not separate *"this is the
+active VTL"* from *"this is something about `#BP` raised in an enclave"*, and two can. TLFS places
+an active-VTL field exactly there, which the measurement now agrees with instead of resting on.
 
-**The check that would settle it was not runnable**, and that is the reason rather than an omission:
-varying the *vector* while holding the VTL would separate a VTL field from an exception-specific
-one, and the hypervisor accepts exception intercepts only for vectors **3** (`#BP`) and **4**
-(`#OF`) — `spin_host` has no `#OF` mode. Building one is the cheap way to close it. Until then the
-`Rip` carries the VTL conclusion and `ExecutionState` corroborates it without being relied on.
+Bit **3** (`Cr0Am` in the same layout) is also set only in the VTL0 arms, and it tracks the VTL the
+same way — so the delta between `0x1F` and `0x97` is two bits, not one, and neither of them is
+about the exception.
+
+The `Rip` moves with the *vector* in the same runs, which is the other half of the same check:
+`#DE` faults at `…5022` in VTL1 and `…74A2` in VTL0, against `#BP`'s `…500D` and `…748D` — a
+different instruction per exception kind, in the same image per VTL.
+
+**A draft of this section said the check was not runnable, and the reason it gave was false.** It
+claimed the hypervisor accepts exception intercepts only for vectors 3 and 4. What S5i actually
+read is a per-partition allowed-vector mask at `+0x6124` **with an unconditional exemption** for 3
+and 4 at VTL 0 — and S5b's and S5h's `#BR` (vector `5`) installs already succeeded *through the
+mask*. Review caught the claim; the install for vector `0` was then tried and **succeeded**
+(`SUCCESS`, removed `SUCCESS`), which both disproves the claim and adds a vector to what this
+child's mask is known to admit. The real limit was never the hypervisor — it is which accepted
+exceptions `spin_host` can raise, and it happened to have one.
+
+One observation about the rig rather than the target, recorded so nobody reads it as a
+contradiction: `spin_host`'s banner prints *"RaiseBp at …"* in `DE` mode too — it is hard-coded.
+The message's `vector` field reads `0x00`, the intercept standing was for vector `0`, and the `Rip`
+differs from the `#BP` arm's, so the raise really was a `#DE`; the banner is mislabelled.
 
 #### Bench state
 
-Intercept installed twice and removed in the phase after each; teardown reported **0 standing**.
-Raiser killed after every arm, none left running. Guest responsive with 105 processes and **`LsaIso`
-still alive** — checked because this arm raises exceptions inside VTL1 — both guests up 4h03m with
-unbroken uptime, host uptime continuous, **no bug check since boot**. Nothing written to a partition
-object, nothing chained.
+Across the VTL1 arm and the vector 2×2: intercepts installed three times and removed in the phase
+after each; teardown reported **0 standing** both runs. Raiser killed after every arm, none left
+running. Guest responsive with 105 processes and **`LsaIso` still alive** — checked because these
+arms raise exceptions inside VTL1 — both guests up **4h16m** with unbroken uptime, host uptime
+continuous, **no bug check since boot**. Nothing written to a partition object, nothing chained.
