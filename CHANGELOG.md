@@ -29,7 +29,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   validated at all, since no run has got past the state check to present one — and reaching it may
   not need step 8's rig, because `WinHvEnablePartitionVtl` has no user-mode export but the driver
   can call it directly, and H3 already established the parent relationship suffices for the
-  hypervisor to hand over a child's VTL1 registers.
+  hypervisor to hand over a child's VTL1 registers. **Tested, and it cannot**:
+  `WinHvEnablePartitionVtl` on the non-VBS guest returns `STATUS_HV_INVALID_PARAMETER`
+  (`0xC0350005`) **invariantly** across `flags` of 0–7, `0x100`, `0x101` and both VTL 1 and 2, while
+  the **same call on the VBS guest's partition answers differently** (`INVALID_VTL_STATE`) — a
+  discriminating control, so the parameters reach the hypervisor and the refusal is about *that
+  partition*. It mirrors `Vid.sys`'s own check, which refuses `STATUS_NOT_SUPPORTED` unless
+  `[partition+0x10]` carries `0x10`, a **partition capability fixed at creation**. So **VTL cannot
+  be retrofitted onto a partition not created for it**, and the VBS guest has no usable window
+  because both levels are already enabled. **This prices the route rather than blocking it**: our
+  own code at VTL1 kernel privilege needs a partition created VSM-capable, its partition VTL
+  enabled, then the VP enabled with our context — **step 8's tier A plus configuration, and
+  emphatically not tier B or C.** The 19-module, ~10 MB device-and-firmware cliff is the price of
+  booting *Windows* in the partition; running our own code there needs no guest OS, no firmware and
+  no vTPM. A much smaller project than "write a VMM", producing the one thing the enclave rig cannot
+  give at any price. Every arm was refused before it could act and both guests ran monotonically
+  throughout.
 - **Item 103's consume loop runs, eats the partition owner's messages, and resets the guest — so
   step 8 is now the route on measurement rather than inference.** Two mechanical facts first:
   `0x221107` is the **only `METHOD_NEITHER`** code of the four in use, so its input must be
