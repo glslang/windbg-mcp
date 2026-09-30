@@ -6605,13 +6605,40 @@ small: a slot that turns out unclaimed would be claimed by us, on somebody's run
 the next arm for step 7, named with the right hazard, and it is a call to make rather than a thing
 to run in passing.
 
-**The inheritance half closes on identity, not on size.** A draft argued it from the count alone —
-one `OBJ_INHERIT` handle per worker — which settles nothing without knowing *which* handle it is:
-were it one of the four VID handles, inheritance would be the live route rather than the
-nearly-closed one. It is not. In both workers the single inheritable handle is an **unnamed
-`Event`** (`0x3AC` and `0x2E8`, type index 21, access `0x001F0003`), and the VID handles carry no
-`OBJ_INHERIT`. The children are `vmmem` and `vmsp.exe`; which handle either actually inherited is
-not established here, and does not need to be, because the only inheritable one is not a partition.
+**The inheritance half closes on object identity, and two weaker arguments for it were wrong.**
+The first argued from the count alone — one `OBJ_INHERIT` handle per worker — which settles nothing
+without knowing *which* handle. The second named that handle (an unnamed `Event` in both workers,
+`0x3AC` and `0x2E8`, access `0x001F0003`) and still did not close it, because it is a snapshot of
+the **parents'** current flags: a handle marked inheritable for child creation and cleared
+afterwards leaves the child holding its copy while the parent's table shows nothing. Review made
+that point and it is right.
+
+**What closes it is the children's own tables, compared by object pointer.**
+`SystemExtendedHandleInformation` carries the object address, so the comparison is identity rather
+than a name re-derived on each side:
+
+| | object(s) |
+|---|---|
+| worker 1 VID handles (4) | `…AD30DF0` ×3, `…AD34E00` |
+| worker 2 VID handles (4) | `…AD31A70` ×3, `…AD32EC0` |
+| `vmsp.exe` children, their **only** File handle | `…AD457A0`, `…AD39900` |
+| `vmmem` children | no handle-table entries |
+
+**No VID object appears in any child.** The children's single File handle carries access
+`0x00100020`, the same as each worker's own `\Device\HarddiskVolume4\Windows\System32` handle —
+an image or directory handle, not a partition.
+
+**And the object pointers say something the names could not: the four VID handles are two
+objects.** Three handles in each worker share one file object and the fourth is a second, separate
+open of the same device. That maps **exactly** onto the error split above — the three sharing an
+object return `ERROR_INVALID_FUNCTION`, the odd one out returns `ERROR_ACCESS_DENIED`, in both
+workers. It is the strongest support yet for the candidate reading that one of these is the raw
+device and the other is not, and it still does not name which is a partition.
+
+**One instrument disagreement, recorded rather than resolved.** The per-process enumeration earlier
+reported 53 handles for each `vmmem`; the system-wide table shows **no** entries for those pids.
+The system table needs no `OpenProcess` and is the one relied on here, but the two readings
+disagree and this record should not pretend otherwise.
 
 **LiveCloudKd is narrowed only as far as the handles go.** This line's record says its procedure
 duplicates handles from `vmwp.exe`; the handles exist and are takeable, so the procedure is

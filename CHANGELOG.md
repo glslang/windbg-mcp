@@ -17,8 +17,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **all four duplicate out** with an ordinary `DuplicateHandle`; the refusals resolve by
   object-type index to `EtwRegistration` and `PcwObject` **in both workers** (120+13 and 121+13),
   with **no `File` object among them**, which is what makes four exhaustive rather than a floor.
-  **Inheritance closes on identity**: the one `OBJ_INHERIT` handle per worker is an unnamed
-  `Event`, not a VID handle.
+  **Inheritance is closed by object identity**: the children's own handle tables, compared by
+  object pointer, hold **no** VID object — two weaker arguments for this (a bare count, then the
+  parents' current `OBJ_INHERIT` flags) were both insufficient, the second because a flag cleared
+  after child creation leaves the child's copy invisible in the parent. The same comparison shows
+  the four VID handles are **two** file objects, three sharing one and one separate, mapping
+  exactly onto the `INVALID_FUNCTION`/`ACCESS_DENIED` split.
   `VidGetHvPartitionId` through all **eight** then returns `ERROR_INVALID_FUNCTION` on six and
   **`ERROR_ACCESS_DENIED`** on two — the same 3-and-1 split in each worker independently — against
   `ERROR_INVALID_HANDLE` for a non-VID control, so they reach `Vid.sys` and are turned away. **A draft of this nearly shipped the opposite**: it
