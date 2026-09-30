@@ -4057,7 +4057,8 @@ validated. The full record is the
       the documented hazard is collision with a **raw** `WinHvInstallIntercept` installer, which
       the duplicate check cannot see. So the test is more available than claimed and still a
       decision: an unclaimed slot would be claimed by us on a running VM. **That is step 7's next
-      arm.** Inheritance carries **one** `OBJ_INHERIT` handle out of 518.
+      arm.** **Inheritance closes on identity**: the single `OBJ_INHERIT` handle in each worker
+      is an unnamed `Event`, not one of the four VID handles.
       **LiveCloudKd narrowed only as far as the handles**: they exist and are takeable, so its
       procedure is plausible rather than describing an older Windows — any further inference goes
       with the access-bit one, read off our summary of the tool, not its source. Full record, with
