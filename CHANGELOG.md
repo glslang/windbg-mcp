@@ -19,24 +19,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   other, readable from the partition context gate S5q already reads live — `[P+0xAB0] +
   VpIndex*0x980`, checked against the back-pointer at `[VP+0]` that `VidHandleExceptionIntercept`
   itself relies on — and `[P+0xB68]`, the per-vector claim table the step also requires, hangs off
-  the same object, so the two readings the arm has to take together cost one IOCTL rather than two
-  mechanisms. **Sound because of two censuses, not because the code looks that way**: `[VP+0x208]`
-  has one writer whose base carries this structure's fingerprint and **0 address-taken** sites in
-  the image, and `VidHandleExceptionIntercept` has **exactly one reference anywhere in `Vid.sys`**
-  — the `lea` inside `VidInterceptPreprocess` — so the markers sit on every path into VID's
-  exception handling rather than on one of them. That also retires the worry the step was written
-  around: the read is inside the callee, so it does not depend on having enumerated the callers.
+  the same object, so the two readings the arm has to take together cost one request rather than
+  two mechanisms — one *request*, not one instant, since an IOCTL reading several fields is not an
+  atomic snapshot of them. **Sound because of two censuses, not because the code looks that way**:
+  `[VP+0x208]` has one writer whose base carries this structure's fingerprint and **0
+  address-taken** sites in the image, and `VidHandleExceptionIntercept` has **exactly one reference
+  anywhere in `Vid.sys`** — the `lea` inside `VidInterceptPreprocess`. That is a statement about
+  what is visible in one image, not a proof that every invocation goes through preprocess, and the
+  read's coverage rests on it *plus* the arm's positive control, which demonstrates the path rather
+  than inferring it. The read being inside the callee also retires the worry the step was written
+  around: it does not depend on having enumerated the callers.
   **New instrument**: `tools/pe_xref.py`, which answers *what can reach this RVA* by decoding
   rather than searching — a branch encodes a displacement that depends on where it sits, so there
   is no byte pattern to find, and the bytes of a function's address appear in immediates that
   transfer control nowhere. It attributes hits inside `.pdata` entries by name, decodes the
   executable bytes `.pdata` does not claim as a **detector** over every candidate start (reported
-  apart and labelled, because a gap carries no boundary information), and searches data sections
+  apart and labelled, because a gap carries no boundary information), and searches **every** section
   for the two encodings a dispatch table uses, labelling the image's own `RUNTIME_FUNCTION` and
-  `GFIDS` rows as the structure they are rather than filtering them out of sight. `--self-test`
-  13/13, **mutation-verified on five edits** — and the first version of its byte-scan case passed
-  under the mutation it existed for, because the immediate it used was a neighbouring number rather
-  than the target's address. **Costed against the alternatives**: the patch route fits mechanically
+  `GFIDS` rows as the structure they are rather than filtering them out of sight. Which sections
+  hold code is read from `IMAGE_SCN_MEM_EXECUTE` and not from a name list — `Vid.sys` alone ships
+  five executable sections beside `.text`, and a name the list had not heard of would have had its
+  gap bytes skipped in silence, which is the one way a negative here can be badly wrong. Scanning
+  code sections for stored addresses closes the other: an indirect call through a RIP-relative slot
+  names the slot, so a dispatch table in `.text` was invisible to the decoder *and* to the byte
+  scan at once. `--self-test` **15/15, mutation-verified on eight edits**, every one applied and
+  every one caught — and two of those earn a note. The byte-scan case's first version passed under
+  the very mutation it existed for, because the immediate it used was a neighbouring number rather
+  than the target's address; and `report` is now rendered into a sink for every case, because the
+  counts come from `scan` and the printing path was otherwise never executed — which is exactly
+  where the first version of this round's own fix crashed, on a tuple that had grown a field, with
+  15/15 still on the screen. The linear decode replaced a quadratic one and was kept on a
+  **differential** against the version it replaced rather than on the argument for it: identical
+  references for nine targets in `Vid.sys` and five in `winhvr.sys`, **49.5 s down to 1.8 s**.
+  **Costed against the alternatives**: the patch route fits mechanically
   (a 5-byte first instruction an `E9 rel32` replaces on an instruction boundary, ten bytes of
   padding ahead of it, `rel32` in range) but buys a PatchGuard exposure this gate did not measure,
   whose failure arrives later and names nothing; the host-breakpoint route needs a boot-config

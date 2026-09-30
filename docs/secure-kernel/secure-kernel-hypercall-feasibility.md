@@ -5430,7 +5430,12 @@ Every link is read out of this image, and the last one is self-checking:
 
 `[P+0xB68]` — the per-vector byte table S5k found, `0xFF` for an unclaimed vector — hangs off the
 **same** `P`, which is what makes step 9's *"in the same arm"* free rather than a second mechanism:
-one IOCTL, one instant. The claiming client is `[P+0xB58] + index * 0xB0`, the stride
+**one request, not one instant.** A single IOCTL reading several fields is not an atomic snapshot of
+them — the claim table is writable by any VID client while the read is in progress, so the values
+come back from the same *call* and not from the same moment. What that buys is still the thing step
+9 asked for, because the alternative it replaces is a read taken in a later call, minutes after the
+arm; what it does not buy is atomicity, and the first version of this section claimed it. The
+claiming client is `[P+0xB58] + index * 0xB0`, the stride
 `VidHandlerpExceptionRegisterEntry` divides by when it stores the index.
 
 #### Why a read is sound here, and the two censuses that say so
@@ -5445,12 +5450,23 @@ count: there is no `lea` of that field for a write to travel through, which is t
 tool found for `[p+0x3060]` in S5p. The residuals `vid_field_census.py` records stand unchanged —
 an inter-procedural pointer, a bulk copy spanning the field, and another image entirely.
 
-**`VidHandleExceptionIntercept` cannot run without those markers being written first.** It has
-**one** reference in the whole image: the `lea` at `VidInterceptPreprocess+0x1e0` that puts it in
-`V+0x158`. Nothing else names it, in `.pdata`-claimed code or in the 4,352 candidate starts across
-the ten non-padding gap runs, and no data section holds its address beyond its own
-`RUNTIME_FUNCTION` and its `GFIDS` entry — neither of which transfers control anywhere. So the read
-is not sampling one path into VID's exception handling; it is on all of them.
+**Nothing in this image names `VidHandleExceptionIntercept` except the `lea` that stores it.** It has
+**one** reference: the `lea` at `VidInterceptPreprocess+0x1e0` that puts it in `V+0x158`. Nothing
+else names it, in `.pdata`-claimed code or in the 4,352 candidate starts across the ten non-padding
+gap runs, and no section — including the executable ones — holds its address in either searched
+encoding beyond its own `RUNTIME_FUNCTION` and its `GFIDS` entry, neither of which transfers control
+anywhere.
+
+**That is the measurement, and it is not the same sentence as "every invocation goes through
+preprocess" — an earlier version of this paragraph wrote the second.** `pe_xref.py` says so about
+itself: its result is a lower bound for reachability, and it does not see a target assembled over
+two instructions, arriving as an argument, read from a table in a third encoding, or living in
+another image. So what the scan licenses is *no other route is visible in `Vid.sys`*, and the read's
+coverage rests on that plus the arm's own **positive control** — a raise under a Vid-installed
+intercept, which must be delivered. If those markers carry it, the path is demonstrated rather than
+inferred, and if they do not, the instrument has failed its control and its negative is worth
+nothing either way. That is the right place for the weight: a static scan cannot close the set, and
+the control does not need it to.
 
 `VidInterceptPreprocess` itself has exactly **three** direct callers, the three this plan names
 (`VidInterceptIsrCallback+0x35`, `VidXSchedulerpVpRun+0xaa`, `VidXSchedulerVpThreadStartRoutine+0x1c8`),

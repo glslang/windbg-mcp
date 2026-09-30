@@ -4030,13 +4030,17 @@ validated. The full record is the
       `Vid!VidHandleExceptionIntercept`, `2`). The VP is reached from the context S5q step 2
       already reads live — `[P+0xAB0] + VpIndex*0x980`, validated by `[VP+0] == P`, which
       `VidHandleExceptionIntercept` itself relies on — and `[P+0xB68]` hangs off the **same** `P`,
-      so *"in the same arm"* costs nothing extra: one IOCTL, one instant. Sound because
+      so *"in the same arm"* costs nothing extra: one request — **not** one instant, since a
+      single IOCTL reading several fields is not an atomic snapshot and the claim table is
+      writable by any VID client while it runs. Sound because
       `[VP+0x208]` has one writer with this structure's fingerprint and **0 address-taken** sites
       across `Vid.sys`, and because `VidHandleExceptionIntercept` has **exactly one reference in
-      the whole image** — the `lea` inside `VidInterceptPreprocess` — so the markers are on every
-      path into VID's exception handling rather than on one. Built
-      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 13/13 and
-      mutation-verified on five edits, because a reachability *negative* over an image is the one
+      the whole image** — the `lea` inside `VidInterceptPreprocess`. That is what is visible in one
+      image rather than a proof that every invocation goes through preprocess, so the read's
+      coverage rests on it **plus** the arm's positive control, which demonstrates the path instead
+      of inferring it. Built
+      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 15/15 and
+      mutation-verified, because a reachability *negative* over an image is the one
       claim a byte scan cannot make: a branch encodes a displacement, not an address, and the
       address appears in immediates that transfer control nowhere. **Cost**: one bounded kernel-read
       IOCTL in `h3probe.sys` and a client script, against a patch route that fits mechanically
