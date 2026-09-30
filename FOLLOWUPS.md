@@ -4007,15 +4007,18 @@ validated. The full record is the
       **BOTH RUN 2026-09-30, in one window, with a control.** The constraint lifted for guests the
       bench owns on 2026-09-29 and S5q's kernel-read IOCTL supplied the rest.
       **The slot read**: `[P+0xB68]` reads `FF FF FF FF FF FF FF FF` at **all twelve** samples
-      across 24 s of a standing intercept, plus before the install and after the removal — the
+      at every sample across 24 s of a standing intercept, plus before the install and after the
+      removal — not "throughout", since sampling cannot see a claim-and-release inside a gap — the
       contemporaneous, **non-mutating** read S5k has wanted since it was written, and which S5m
       could only half-answer because registering *claims* the slot. It narrows S5j's retained
       explanation without closing it: a claimant would have had to claim and release inside one 2 s
-      gap and coincide with the raise. **The loop**: `handled = 0` at all twelve samples while the
-      raiser's own clock ran to `ms=31609` — which shows the guest's `__except` never ran and **not**
-      that the instruction is re-entered, since one trap held for the window gives the same zero;
-      the re-entry evidence is the frozen-or-slowed run's **20 fresh arrivals**. **And a third
-      reading came free**: per-VP
+      gap and coincide with the raise. **The loop arm ran and did NOT answer its question**:
+      `handled = 0` at all twelve samples shows the guest's `__except` never ran, which one trap
+      held for the window gives too; and the frozen-or-slowed run's **20 fresh stamps** are twenty
+      calls to `VidInterceptPreprocess`, not twenty executions of the instruction, since one
+      pending intercept re-preprocessed gives the same series. S5k's re-entry inference stands as
+      an inference; closing it needs a count tied to new hypervisor deliveries or retired guest
+      instructions. **And a third reading came free**: per-VP
       `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at different instants and `0`
       at every sample of a control that raised **1.87 million** `#BP`s with no intercept standing,
       while both VPs keep accumulating `VpRuntime`. **The VPs are being resumed**, which removes the
@@ -4170,7 +4173,9 @@ validated. The full record is the
       side of the release S5h's retracted "advancing" reading got wrong — gives `handled = 0` at
       ten samples over 30 s, against **2,282** the moment teardown releases it, reproducing S5h's
       artefact one line below the correct reading. Interceptions kept arriving throughout: 20 new
-      stamps on both VPs at **one** `Rip`, with nothing retiring — a re-delivery loop. **Where the
+      stamps on both VPs at **one** `Rip`, with nothing retiring — twenty calls to
+      `VidInterceptPreprocess`, which is not the same as twenty executions of the instruction.
+      **Where the
       second VP's events come from is UNRESOLVED.** Step 6's arms later measured the guest VPs' run
       state and found `InterceptSuspend` **transient** with both VPs accumulating runtime, so the
       VPs **are** resumed and round 3's necessary-condition objection to migration is removed — but

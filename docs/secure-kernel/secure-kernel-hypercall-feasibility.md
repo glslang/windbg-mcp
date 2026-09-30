@@ -3695,7 +3695,7 @@ review findings against lists a later gate had already invalidated.
   takes it rather than about S5h. **S5m answers half of this and leaves half open**: a registration
   reports whether the slot is claimed *at that call*, but it also *claims* it, so it cannot observe
   what an unregistered vector meets. That still wants a contemporaneous, non-mutating read.
-  **Run 2026-09-30** as [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-and-the-vps-are-being-resumed): `0xFF` at twelve samples across a standing intercept.
+  **Run 2026-09-30** as [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-one-answers-and-the-vps-turn-out-to-be-resumed): `0xFF` at twelve samples across a standing intercept.
 - **Whether the hold is a loop**, per the inference above, since a loop and a held trap want
   different things from a debugger design.
 - **Answered while this gate was in review**: `hvix64.exe`'s type-3 *removal* path, read as S5l —
@@ -4039,7 +4039,7 @@ meet"* — because **registering claims the slot**, so a `#BP` raised afterwards
 *registered* path and the drop is no longer what is being observed. Nor does a reading taken now
 say what the slot held during S5h; the byte is mutable, as S5k recorded. Observing the drop still
 wants a contemporaneous, **non-mutating** read inside a replicated arm, which is the kernel-memory
-access this bench does not have. **It has it since S5q, and the read is done** — [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-and-the-vps-are-being-resumed).
+access this bench does not have. **It has it since S5q, and the read is done** — [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-one-answers-and-the-vps-turn-out-to-be-resumed).
 
 So the registration is the better *next* move — it settles the current state and, on success, hands
 over a receiver, which is S5's pass condition rather than its diagnosis — and it is not a
@@ -4509,7 +4509,7 @@ admission that preserves the receive path has been found*, not *none exists*.
   cross-reference rather than a byte scan — and it is desk work on an image this gate already has
   open. The other is live confirmation on a running guest's partition.
 - **The two arms blocked by the standing constraint** — both **RUN 2026-09-30**, see
-  [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-and-the-vps-are-being-resumed) — the replicated slot read and whether the
+  [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-one-answers-and-the-vps-turn-out-to-be-resumed) — the replicated slot read and whether the
   hold is a loop — which this gate does not touch and does not unblock.
 - **Whether a guest's partition is ever momentarily in the admitting state** — answerable only with
   live kernel visibility. On the located path it would be worth little, since that state is entered
@@ -4695,7 +4695,7 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
 - **Which of the two fields a running guest actually refuses on**, which this gate cannot say and
   an earlier draft of it assumed. It wants a live partition object.
 - **The two arms blocked by the standing constraint**, untouched here and both **run later**, as
-  [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-and-the-vps-are-being-resumed).
+  [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-one-answers-and-the-vps-turn-out-to-be-resumed).
 
 ### S5s result, 2026-09-29: the active CLSID refuses live Hyper-V debugging in this build, and the passive one is an inspector that resolves Secure Kernel
 
@@ -5355,7 +5355,7 @@ from.**
    *enqueue* branch and the message went to that client. This is S5j's received-and-retained reading,
    and [the section on whether the slot was claimed](#was-the-slot-claimed-not-read-and-the-probes-own-removals-make-s5hs-controls-silent-on-it)
    already records that it is live: `[partition+0xB68][3]` **was never read** *(it has been since —
-   [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-and-the-vps-are-being-resumed) — and reads `0xFF` throughout a hold,
+   [step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-one-answers-and-the-vps-turn-out-to-be-resumed) — and reads `0xFF` at every sample of a hold,
    which narrows this arm without closing it)*, and S5l showed a
    client's claim can survive a probe removal that cleared the hypervisor bit, after which "S5h's
    next raw install re-sets the bit, and the message enqueues to that client."
@@ -5978,8 +5978,10 @@ counts.
 reading — the counter only moves once the intercept is released.
 
 **Interceptions nonetheless kept arriving the whole time**: 20 new stamps across 10 samples, both
-VPs, at one instruction, while nothing retired. That is a re-delivery loop — the intercept fires,
-VID preprocesses it, nothing completes it, and it fires again.
+VPs, at one instruction, while nothing retired. That is **twenty calls to
+`VidInterceptPreprocess`** and it is deliberately not called a re-delivery loop, which a draft of
+this sentence did: repeated *preprocessing* is what was measured, and one pending intercept
+re-preprocessed produces the same series as the instruction being re-executed twenty times.
 
 **Where the second VP's events come from is UNRESOLVED, and a draft of this paragraph resolved it
 wrongly.** That draft said the markers being last-arrival state made this one thread re-dispatched
@@ -6006,7 +6008,7 @@ mechanism** — whether anything calls `WinHvCompleteIntercept` while these arri
 guest VPs' run state is — and that is an arm, not a paragraph.
 
 > **Half of that arm ran, and it removed an objection without answering the question.**
-> [Step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-and-the-vps-are-being-resumed) read
+> [Step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-one-answers-and-the-vps-turn-out-to-be-resumed) read
 > the guest VPs' run state: `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at
 > different instants and `0` in a control that raised 1.87 M `#BP`s with no intercept, while both
 > VPs accumulate `VpRuntime` throughout. So the VPs **are** resumed, and *"a thread cannot migrate
@@ -6031,12 +6033,13 @@ alive** — checked because these arms raise exceptions inside VTL1 — both gue
 unbroken uptime, host uptime continuous, **no bug check since boot**. Nothing written to a partition
 object, nothing chained.
 
-### Step 6's two blocked arms, 2026-09-30: both run, and the VPs are being resumed
+### Step 6's two blocked arms, 2026-09-30: both run, one answers, and the VPs turn out to be resumed
 
 **Step 6's two arms were blocked on a standing constraint and on root kernel-memory access. Both
 lifted, and both arms are now run in one window** — the slot read that S5k has wanted since it was
-written, and whether the hold is a loop — **with a control**, and the third reading settles what
-the VTL1 arm's review round 3 left open by falsifying that round's premise.
+written, and whether the hold is a loop — **with a control**. One of them answers its question,
+one ran and did not, and a third reading removes an objection the VTL1 arm's review round 3 raised
+without settling what that round left open.
 
 Every reading here is a **pure read** apart from the intercept install itself. Nothing is written to
 a partition object, no suspend register is touched, and nothing is chained.
@@ -6049,26 +6052,32 @@ it also **claims** it, so it cannot observe what an *unregistered* vector meets.
 reads the byte without touching it.
 
 **`FF FF FF FF FF FF FF FF` at all twelve samples across 24 s of a standing intercept**, and before
-the install and after the removal. Vector 3 unclaimed throughout.
+the install and after the removal. Vector 3 unclaimed **at every sample** — not "throughout", which
+a draft said and the next paragraph contradicts.
 
 That **narrows** S5j's retained explanation and does not close it: a claimant would have had to
 claim *and* release entirely inside one 2-second gap and coincide with the raise. Sampling cannot
 see a claim-and-restore at any cadence, which is the limit
 [the design section](#what-this-instrument-reports-stated-once) already records.
 
-#### Arm 2 — the guest handler never runs, and the loop evidence is the other arm's
+#### Arm 2 — ran, and its question is still open
 
 `handled = 0` at all twelve samples while the raiser's own clock ran to `ms=31609`. **That shows
 the guest's `__except` never ran, and nothing more** — a *single* trap held for the whole window
-produces the same zero. A draft of this section called it the loop measured, which it is not:
-distinguishing re-entry from one held trap needs a count of arrivals or of retired instructions,
-and this arm reports neither.
+produces the same zero.
 
-**The loop evidence is the frozen-or-slowed run's**, where the markers were sampled for novelty:
-**20 fresh arrivals across 10 samples**, both VPs, at one `Rip`, with nothing retiring. That is
-re-entry. S5k's inference — *"nothing on the drop path injects the exception or advances `RIP`, so
-the faulting instruction is presumably re-entered"* — is carried by those arrivals, and this arm's
-`handled = 0` corroborates the half of it about the guest handler.
+**Nor does the frozen-or-slowed run's arrival series close it**, and two drafts of this section
+said it did — first from this arm's zero, then by moving the claim to that one. Those **20 fresh
+stamps across 10 samples** establish twenty calls to `VidInterceptPreprocess`. They do not establish
+twenty *executions of the faulting instruction*, because the alternative this record keeps beside
+them — one pending intercept re-preprocessed, refreshing root-side markers with the guest never
+resuming it — produces the same series. The two readings are not separated by anything measured so
+far.
+
+**So S5k's question stands as S5k left it.** Its inference — *"nothing on the drop path injects the
+exception or advances `RIP`, so the faulting instruction is presumably re-entered"* — remains an
+inference. What would settle it is a count tied to **new hypervisor deliveries** or to **retired
+guest instructions**, and neither arm reports one. The arm ran; it did not answer.
 
 #### Arm 3 — the VPs are resumed, which removes an objection without settling the question
 
