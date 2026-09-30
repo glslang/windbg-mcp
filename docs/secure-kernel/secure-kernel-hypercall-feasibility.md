@@ -7097,8 +7097,18 @@ appeared as `WinHvInstallIntercept`'s first argument in `VidHandlerpExceptionReg
 
 The only unmeasured gate left is the hypervisor's, so the probe driver calls
 `winhvr!WinHvEnableVpVtl` **directly**, which needs no partition of our own. VP 0, target VTL 1,
-and an **all-zero context** — chosen because `CR0`/`CR3`/segments are then invalid, so acceptance
-could not also mean arbitrary code had started running, while a refusal still discriminates.
+and an **all-zero context**.
+
+**A draft called that a safety measure and it is not one.** The reasoning was that invalid
+`CR0`/`CR3`/segments mean acceptance could not also mean code had begun running. That does not
+follow, and review said so: on a partition whose ordering gate *passes*, `WinHvEnableVpVtl` may
+enable the VTL and try to start it at the context supplied, so an invalid context is a fault or a
+reset rather than a polite refusal — this structure's whole purpose is to name **where execution
+begins**. **It was harmless on these two partitions because the state gate refused first**, which
+is a property of their state and not of the context. A future probe against a partition whose state
+gate passes must assume the context will be *used*. What zero does buy is **discrimination**, not
+safety: a refusal naming the context would say the hypervisor validates it, and a refusal about VTL
+state says the gate is elsewhere.
 
 Both partitions were probed, which makes them **self-identifying**:
 
@@ -7164,14 +7174,28 @@ they malformed, both partitions would reject them alike. And on the control gues
 **invariant**: `flags` of `0,1,2,3,4,5,6,7,0x100,0x101` and `TargetVtl` of both 1 and 2 all return
 the same `INVALID_PARAMETER`.
 
-**That is a sound negative** — a control that discriminates plus an invariance sweep — and it matches
-`Vid.sys`'s own mirror of the same fact: `VsmmVsmpEnablePartitionVtl` refuses with
-`STATUS_NOT_SUPPORTED` unless `[partition+0x10]` carries `0x10` for VTL1, a **partition capability**
-fixed at creation. The hypervisor enforces it as a parameter error.
+**That much is a sound negative** — a control that discriminates plus an invariance sweep — and it
+matches `Vid.sys`'s own gate: `VsmmVsmpEnablePartitionVtl` refuses `STATUS_NOT_SUPPORTED` unless
+`[partition+0x10]` carries `0x10` for VTL1.
 
-**So VTL cannot be retrofitted onto a partition that was not created for it**, and the VBS guest's
-partition is no use either: VTL1 is already enabled there at both levels, leaving no window to
-insert an entry context of our own.
+**A draft then called that bit "fixed at creation", which nothing here measured.** Review's point,
+and it is right: the observations show these running partitions refuse the call and that VID reads a
+capability bit, not that the bit cannot be *written*. What has been checked since is one candidate,
+the one that finding named — `VsmmVsmSetPartitionConfig` (`VidVsmSetPartitionConfig`, IOCTL
+`0x221208`) writes `[partition+0x30f0]`, the **enabled-VTL bitmask**, and `[partition+0x30f4]`, and
+the per-VTL info behind `VsmmVsmpGetPartitionVtlInfo`. **It does not touch `[partition+0x10]`.**
+Worth noting for its own sake: it writes VID's enabled-VTL *bookkeeping* directly, without a
+hypercall, so that path can desynchronise VID from the hypervisor rather than enable anything.
+
+**Where `[partition+0x10]`'s `0x10` is written is still untraced.** A name-filtered scan of
+decompiled VSM functions turned up no writer, and that is not evidence — it is the same weak
+instrument that made a handle search read as "no VID handle" earlier in this line. The instrument
+for it exists:
+[`tools/vid_field_census.py`](../../tools/vid_field_census.py), built for exactly this against
+`[p+0x3060]` and `[p+0x3079]`. **Until that census runs, "VTL cannot be retrofitted" is an
+inference and the claim that step 8 is *required* rests on it.** What is measured is narrower: on
+this build, these two partitions cannot have partition VTL enabled by this call, and the VBS guest
+has no usable window because both levels are already enabled there.
 
 #### What this prices
 

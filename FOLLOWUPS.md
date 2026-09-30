@@ -4345,6 +4345,58 @@ validated. The full record is the
    cause**, caught by re-reading rather than by an arm: the conclusion was written against the
    instrument in front of it rather than against every path into the receiver.
 
+   **The route to Secure Kernel VTL1 kernel mode, ordered 2026-09-30 — written against the
+   question rather than the obstacle, which is what the paragraph above says this plan keeps
+   failing to do.** The goal is DbgEng inspecting `securekernel` in VTL1 kernel mode. The plan that
+   owns it is [`docs/secure-kernel/exdi-stub-plan.md`](docs/secure-kernel/exdi-stub-plan.md), whose
+   premise is that SK ships the metadata a debugger keys off (`KdDebuggerDataBlock`: `KDBG`, size
+   `0x3A8`, `SkLoadedModuleList`, `SkeProcessorBlock`, the `Skmm*` bounds, the PTE swizzle bit) and
+   **no transport** — and that EXDI closes exactly that split by serving registers and memory from
+   outside the target.
+
+   **All three of that stub's inputs are already measured**, which is the thing this item's own
+   ordering has been obscuring:
+
+   | what EXDI needs | state |
+   |---|---|
+   | VTL1 **registers** | **H3, PASS** — the hypervisor grants a parent a child's VTL1 registers, with a VTL0 control that discriminated |
+   | VTL1 **memory** | **H4** — `HvCallReadGpa` withholds VTL1 pages as `HV_STATUS_SUCCESS` + zeros + `ReadIntercept`, **but an independent oracle read the same ranges from the root** by direct mapping, and SK's **PML4** was identified from the VTL1 `CR3` |
+   | **kernel awareness** | **E1, answered 2026-09-22** — how DbgEng locates the kernel over EXDI |
+
+   **So the critical path is E3 then E4**, E2 being unrunnable on this bench because Hyper-V owns
+   the box and a VMware guest under WHP loses its VBS — which is why this item exists at all: serve
+   EXDI from the **root** rather than from a third-party gdbstub.
+
+   **And steps 6–9 and everything today are a different axis.** The ownership gate, the receiver,
+   the consume loop and the VTL1 entry-context arms are about **control** — stopping a VP, arming
+   breakpoints. An EXDI stub wants that for breakpoints and stepping; it does not need it to *read*
+   Secure Kernel. That work is E3's second half rather than the path to the goal.
+
+   Cheapest first, and the first three are static or nearly so:
+
+   1. **Census the writers of `[partition+0x10]`** with
+      [`tools/vid_field_census.py`](tools/vid_field_census.py), the instrument this line already
+      built for `[p+0x3060]`/`[p+0x3079]`. It decides whether step 8 is *required*, which is
+      currently an inference — see the Step 7 sections.
+   2. **Decompile `VidHandleExceptionIntercept`'s branch.** Parked as "not answerable by sampling",
+      which is not the same as unanswerable: Ghidra is on this bench and settled three other
+      questions on 2026-09-30 that had been recorded as limits.
+   3. **Separate the reset's two causes** — a sustained `SkipArm` consume-only run. At most one
+      guest reboot, and it says whether *be `vmwp` and read* is safe as a standing capability,
+      which the observation half of E3 would rest on.
+   4. **E3 — the root-served EXDI stub**, over the register and memory reads above. This is the
+      gate that reaches the goal.
+   5. **E4 — windbg-mcp integration.** `sk_modules`, `sk_symbol` and `sk_read_memory` are already
+      on the tool surface and would then have something under them.
+   6. **The ownership route (step 8) only if breakpoints or stepping are wanted**, since inspection
+      does not need it.
+
+   **A separate goal, not on this route**: running *our own* code in VTL1 kernel mode. Measured
+   2026-09-30 to be cheaper than this item's costing implied — tier A plus a VSM config, no guest
+   OS and no device model — and it answers questions about the hypervisor's VTL semantics rather
+   than about Microsoft's Secure Kernel. Worth keeping distinct so neither borrows the other's
+   justification.
+
    The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide
