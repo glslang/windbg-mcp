@@ -6624,7 +6624,7 @@ than a name re-derived on each side:
 | `vmsp.exe` children, their **only** File handle | `…AD457A0`, `…AD39900` — *unidentified* |
 | `vmmem` children | **no handles at all** — `HandleCount` 0, minimal process |
 
-**No child holds any parent VID object, and that is what the inheritance question asks.**
+**No child holds any VID object the parent still has.**
 Inheritance hands a child a *copy* of the parent's handle, which is a second reference to the **same
 object** — so a child holding none of the workers' four VID file objects did not inherit a VID
 handle. That much is settled by identity rather than by name.
@@ -6638,11 +6638,28 @@ pointers finds **exactly one holder each**, the owning `vmsp` itself, so it cann
 second holder; and `vmsp`'s module list is unavailable, so even the circumstantial question of
 whether it loads `vid.dll` is unanswered.
 
-**That gap does not reach the inheritance conclusion.** Were the child's object a VID file, it would
-be `vmsp`'s **own open** rather than something inherited — a separate route that meets the create
-path's admission check step 4 is about, not this step's duplication-and-inheritance question. So:
-inheritance of a VID handle is **excluded on object identity**, and whether `vmsp` independently
-holds a VID file is **unestablished and out of this step's scope**.
+**A draft argued the gap away and could not.** It said that were the child's object a VID file it
+would have to be `vmsp`'s *own open*, so the unidentified object was out of scope. That does not
+follow, and review supplied the counter-case: if a worker marked a VID handle inheritable, created
+`vmsp`, and then **closed its own copy**, the child would hold a genuinely inherited VID file object
+matching none of the parent's four *current* ones. A snapshot of the parent cannot see a handle the
+parent no longer has.
+
+**So the claim is narrower than two drafts made it.** What the object-pointer comparison excludes is
+inheritance of any VID handle a worker **still holds** — which is a real result, and the one the
+comparison can carry. What it does not exclude is a VID handle inherited and since closed in the
+parent. On this bench that is unfalsifiable by the instruments used: the child's object cannot be
+named (duplication refused three ways, sole holder, module list unavailable), so there is no way to
+ask what it is.
+
+*Circumstantially* each child holds exactly **one** File handle, so an inherited VID object would
+have to be it, leaving `vmsp` with no image-file handle — unusual for a process. That is offered as
+circumstance and is **not** load-bearing; this section has already had two inferences from
+plausibility corrected, and a third would be the same mistake.
+
+**What would close it**: naming the child's file or device, which is not available from here, or
+capturing handle lifetimes **across a child creation** — which means starting a VM under
+observation, a new arm rather than a further reading of this one.
 
 **And the object pointers say something the names could not: the four VID handles are two
 objects.** Three handles in each worker share one file object and the fourth is a second, separate
