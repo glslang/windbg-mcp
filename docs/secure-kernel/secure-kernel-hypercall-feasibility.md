@@ -4239,9 +4239,10 @@ image and a PDB.
   — and that last group is the interesting part, because VSM configuration is what a VTL1 target
   needs. **That is a different and much larger rig than anything this plan has built**, and it
   should be costed as its own decision rather than slipped in as the next step. **It was, on
-  2026-09-30 — the Step 8 section — and the decision is not to build it: the tier that reaches a
-  VTL1 target needs a Windows guest booting with VBS inside it, which is the device and firmware
-  model reproduced rather than called.** It is *the clearest*
+  2026-09-30 — the Step 8 section — and the costing did not settle it: what it established is that
+  no *documented* API reaches VTL, so the rig rests on the undocumented VID surface and private
+  COM contracts. A draft of that section decided against the build on two numbers that bounded
+  nothing; both are retracted there.** It is *the clearest*
   rather than *the only* route: **two** cheaper ones this gate could not reach — varying the caller
   upward, and locating the failing check — come before it in item 103's plan. A third, a stopped VM,
   was proposed and dropped because it moves two candidate causes together; the plan records why.
@@ -4314,7 +4315,7 @@ image and a PDB.
   which is the same kernel visibility this gate does not have.
 - **Owning the partition rather than opening one** — the VMM-of-our-own question, which is a rig to
   cost rather than an arm to run, and which `FOLLOWUPS.md` item 103 orders against everything else.
-  **Costed 2026-09-30 in the Step 8 section: the decision is not to build it.**
+  **costed 2026-09-30 in the Step 8 section, which found no documented route and did **not** settle the build**.
 
 ## Explicitly out of scope
 
@@ -4506,9 +4507,8 @@ admission that preserves the receive path has been found*, not *none exists*.
 
 - **Whether owning the partition from creation reaches S5's pass condition** — the VMM-of-our-own
   question, unchanged by this gate except that it is now the route with no known obstacle rather
-  than the clearest of several. It is a rig to cost, not an arm to run. **Costed 2026-09-30 in the
-  Step 8 section, which decides against building it — and which leaves this pass condition
-  unreached rather than reached.**
+  than the clearest of several. It is a rig to cost, not an arm to run. **costed 2026-09-30 in the Step 8 section, which found no documented route and did **not** settle the build**,
+  so this pass condition stays unreached and its cost stays unbounded.
 - **A writer census for `[p+0x3060]` and `[p+0x3079]`**, which is the cheaper of the two things
   that would decide whether the previous bullet is the *only* route. It wants a way to tell
   partition objects from the other `Vid` structures sharing those displacements — a type-aware
@@ -4690,12 +4690,12 @@ which is why it demands a persisted, detached partition and why it re-owns rathe
 
 #### What this gate leaves open
 
-- **The VMM-of-our-own question** — **since costed, see Step 8, and decided against** — which this
-  gate strengthens the case for without making it the
+- **The VMM-of-our-own question** — **since costed, see Step 8, which did not settle it** — which
+  this gate strengthens the case for without making it the
   only route: what it supplies is evidence where S5o had assumption, and two things still stand
   beside it — the residuals above, and **handle duplication or inheritance**, which S5n declined to
   attempt rather than excluded and which reaches the receiver without passing the create path at
-  all. Still a rig to cost — **costed 2026-09-30 in the Step 8 section, decided against**.
+  all. Still a rig to cost — **costed 2026-09-30 in the Step 8 section, which found no documented route and did **not** settle the build**.
 - **What persistence state `2` is**, if anyone needs to know whether a guest's partition can be
   driven into it deliberately. Note what that would mean: persisting a running guest's partition,
   which is a disruptive operation on somebody else's VM, not an observation.
@@ -6314,13 +6314,15 @@ Raisers killed after every phase. Guest responsive, `LsaIso` alive, both guests 
 unbroken, host uptime continuous, **no bug check since boot**. The counter paths carry the host
 name and it is stripped before anything is printed, this record being public.
 
-### Step 8, 2026-09-30: costing the VMM-of-our-own rig — three tiers, and the one the S5 line needs is writing a VMM
+### Step 8, 2026-09-30: costing the VMM-of-our-own rig — no documented route, and two numbers that bounded nothing
 
 **Step 8 asked for a decision, not an arm**: own the partition from creation, where the whole
 `vid.dll` sequence is reachable by construction, and *cost* that rig rather than start building it.
-The costing is below and the recommendation is **do not build it** — not because the route is
-blocked, but because the tier that would serve this line costs a virtual machine monitor, while the
-tier that is cheap answers a mechanism question this line does not need answered.
+**The costing does not yield the decision, and a first draft of this section claimed one anyway.**
+It recommended *do not build* on a 52 KB buffer read as a field count and a 9.9 MB module list read
+as code to be rewritten; review rejected both and both are retracted below. What survives is a
+solid negative — **there is no documented route** — a decoded entry point, and two named probes
+that would decide it.
 
 Everything here is **static**: PE import and export tables, and `vid.dll` decoded in DbgEng with no
 target attached, which is the same instrument S5o used and needs no host reboot. No partition was
@@ -6376,38 +6378,74 @@ is the disposition S5n exercised from the other side. Then `VidDllPartitionTrack
 
 **`VidpSetupPartition`'s IOCTL input buffer is `0xCAE0` bytes — 51,936 — as its floor**, taken from
 `mov ebx,0CAE0h` at `vid+0x1eba0`, and grown when `config[+0xCAD8] * 16 + config[+0xCADC]` exceeds
-it (`vid+0x1eba9`–`0x1ebb4`). That is the single most useful number in this costing: **creating one
-partition means populating a ~52 KB undocumented structure correctly**, and it is the *first* of
-roughly a dozen such calls.
+it (`vid+0x1eba9`–`0x1ebb4`). The call is `NtDeviceIoControlFile` with control code **`0x2211A0`**
+(`vid+0x1ec1d`), issued asynchronously against an event and waited on when it returns
+`STATUS_PENDING`.
+
+**A first draft used that 51,936 as a complexity proxy — *"creating one partition means populating a
+~52 KB undocumented structure correctly"* — and review was right to reject it.** A buffer's extent
+is not a count of fields anyone must understand: it may be mostly zero, reserved, or forwarded
+without interpretation. Reading the whole function settles which, for the user-mode side at least:
+**`vid.dll` interprets exactly two fields of it**, `[+0xCAD8]` and `[+0xCADC]`, and both only to
+compute the length. Everything else is handed to the driver as an opaque block. So the number bounds
+what must be *allocated*, and says nothing about what must be *filled*.
+
+**The count that would matter is on the driver side, and it is unmeasured.** What validates this
+structure is `Vid.sys`'s handler for `0x2211A0`, and a decoded-operand census of that handler's
+reads is exactly what [`tools/vid_field_census.py`](../../tools/vid_field_census.py) was built to
+do — it is an arm, though, not a costing, and it was not run here.
 
 #### Three tiers
 
 | tier | what it is | what it needs beyond the tier above | what it buys this line |
 |---|---|---|---|
-| **A** | a partition we own, running a few bytes of our own guest code, whose `#BP` we receive through `VidMessageSlotMap` | ~12 undocumented calls, one ~52 KB struct, guest code we write | proves user-mode ownership and receipt end to end |
+| **A** | a partition we own, running a few bytes of our own guest code, whose `#BP` we receive through `VidMessageSlotMap` | ~12 undocumented calls; per-call field counts unmeasured | proves user-mode ownership and receipt end to end |
 | **B** | a real OS booting in it | the device and firmware model | a guest, and nothing about VTL on its own |
 | **C** | **Secure Kernel in it** | VBS enablement on top of B | what the S5 line actually wants |
 
-**Tier B is the cliff, and it is measurable.** A live `vmwp.exe` on this host has **19 VM-specific
-modules loaded, about 9.9 MB**, of which `vmchipset.dll` alone is 1,184 KB — and the set includes
-`vmtpm.dll` and `vmhgs.dll`, which are there because a VBS guest wants a vTPM and attested launch.
-Booting Windows with VBS inside a partition we made means reproducing that, not calling it: those
-modules are loaded *by* the worker process, so an owner that is not `vmwp.exe` gets none of them.
+**A first draft called tier B a cliff on the strength of a module list, and that was wrong too.** A
+live `vmwp.exe` on this host loads **19 VM-specific modules, about 9.9 MB**, `vmchipset.dll` alone
+1,184 KB, the set including `vmtpm.dll` and `vmhgs.dll` — there because a VBS guest wants a vTPM and
+attested launch. The draft read that as *"an owner that is not `vmwp.exe` must reproduce them"*.
+Review asked what established they could not simply be used, and the answer is that nothing did —
+the opposite, in fact:
 
-#### The decision, and what it rests on
+| | |
+|---|---|
+| exports of `vmchipset`, `vmuidevices`, `vmsynthstor`, `VmSynthNic`, `vmbusvdev`, `vmtpm`, `vmdynmem` | `DllGetClassObject`, `DllCanUnloadNow`, `DllRegisterServer`, `DllUnregisterServer` — **and nothing else** |
+| in-proc CLSIDs registered on this host and backed by those seven | **24** |
 
-**Do not build the rig.** Tier C is writing a VMM in order to debug a VMM, and the estimate for it
-is not a number this costing can give beyond "the device model is ~10 MB of shipping code across 19
-modules". Tier A is genuinely bounded — a dozen calls and a 52 KB struct, which is reversing work
-rather than research — but it establishes *ownership and receipt*, and this line already knows from
-step 9 that the message is delivered and from step 4 that the obstacle on an existing partition is
-the owner's detach dismantling the VPs. Tier A would confirm a mechanism and leave the Secure Kernel
-question exactly where it is.
+They are **COM in-proc servers, registered and activatable**. So 9.9 MB is where the implementation
+lives, not a bound on code anyone must rewrite, and reuse is the likelier path rather than an
+excluded one. What is genuinely unknown is the part a module list cannot show: these objects
+implement **private, undocumented interfaces**, and whether they can be driven without context
+`vmwp.exe` supplies — a partition object, a VMBus channel manager — is unmeasured. That is reversing
+of a different kind, not obviously cheaper than rewriting and not obviously dearer.
 
-**What this costing does not establish.** No call was made, so *"the create path has no known
-obstacle"* still rests on S5o's static read and S5p's census of located writes, plus S5n's control
-that a well-formed unused name opens — which is a measurement of the **first** step only. The
-~52 KB `VidpSetupPartition` IOCTL is untested, and a rejection there would be invisible to
-everything above. Testing it means filling that structure, which is most of tier A's cost, so there
-is no cheap probe that settles the route before paying for it. That asymmetry is itself a reason not
-to start.
+#### The decision, and the retraction it went through
+
+**This costing does not support a build/no-build decision, and a first draft claimed one anyway.**
+It said *do not build*, on two numbers that turned out to bound nothing: a 52 KB buffer read as a
+field count, and a 9.9 MB module list read as code to be rewritten. Both were rejected on review and
+both are corrected above. Removing them leaves the decision unmade rather than reversed — nothing
+here says the rig *is* affordable either.
+
+**What the costing does establish, and it is worth having:**
+
+- **There is no documented route.** `WinHvPlatform.dll` cannot reach VTL, so a rig rests entirely on
+  the undocumented VID surface plus private COM contracts. That fact needs no estimate to be useful
+  and is the one solid result here.
+- **The entry point is decoded**: three parameters, four gates, the create/open-existing boolean, and
+  control code `0x2211A0` with its length arithmetic.
+- **The capability is present on that surface** — `VidVsmEnableVpVtl` and the `VidMessageSlot*`
+  receive path — so the route is not blocked by a missing primitive.
+
+**What would decide it**, each cheap relative to the build and neither run here: a census of
+`Vid.sys`'s `0x2211A0` handler for the fields it actually validates, which turns tier A's cost from
+a guess into a count; and an activation probe on one of the 24 CLSIDs, to see whether a device model
+object can be created and driven outside `vmwp.exe` at all, which is what tier B turns on.
+
+**And what stays unmeasured regardless.** No call was made, so *"the create path has no known
+obstacle"* still rests on S5o's static read, S5p's census of located writes, and S5n's control that
+a well-formed unused name opens — **the first step only**. A rejection at `0x2211A0` would be
+invisible to everything above it.

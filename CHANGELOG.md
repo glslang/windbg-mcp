@@ -9,18 +9,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Item 103 step 8 is costed, and the decision is not to build the rig.** Owning a Hyper-V
-  partition from creation is reachable, and the tier that would serve the Secure Kernel line
-  means booting Windows with VBS inside a partition we made — reproducing the device and
-  firmware model rather than calling it. Three figures carry it: the **documented** partition
-  API (`WinHvPlatform.dll`) has **66 exports and none naming VTL, VSM or secure**, so there is
-  no shortcut off the undocumented surface; `VidpSetupPartition`'s IOCTL input is **51,936
-  bytes** minimum, which is what one of roughly a dozen undocumented calls costs to fill; and a
-  live `vmwp.exe` carries **19 VM-specific modules, ~9.9 MB**, which an owner that is not
-  `vmwp.exe` gets none of. Static throughout — PE tables and `vid.dll` decoded in DbgEng with
-  no target, the instrument S5o used — and **no call was made**, so the route's admission past
-  its first step is still unmeasured, and the untested gate is most of the cheap tier's own
-  cost. Decoded gates, the three tiers and what each buys are in the **Step 8** section of
+- **Item 103 step 8 is costed, and the costing does not yield the decision — which a first draft
+  of it claimed anyway.** The solid result is a negative: the **documented** partition API
+  (`WinHvPlatform.dll`) has **66 exports and none naming VTL, VSM or secure**, so a rig rests
+  entirely on the undocumented VID surface and private COM contracts. The entry point is decoded
+  — `VidCreatePartition`'s three parameters and four gates, the create/open-existing boolean, and
+  `VidpSetupPartition`'s `NtDeviceIoControlFile` control code **`0x2211A0`** with its length
+  arithmetic — and the capability is present there (`VidVsmEnableVpVtl`, `VidMessageSlot*`).
+  **Both numbers the draft decided on are retracted**: its 51,936-byte IOCTL buffer is an extent,
+  not a field count, and reading the whole function shows `vid.dll` interprets **two** fields of
+  it, both for length; and its 19 modules / ~9.9 MB of `vmwp.exe` device model are **COM in-proc
+  servers with 24 registered CLSIDs**, so that is where the implementation lives rather than a
+  bound on code to rewrite. Two probes would decide it, neither run: a census of `Vid.sys`'s
+  `0x2211A0` handler, and an activation probe on one of those CLSIDs. Static throughout, and
+  **no call was made**. Full record, including both retractions, in the **Step 8** section of
   [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 - **The hold is a loop — supported, on Hyper-V's per-VP `Total Messages/sec` — and its sibling
   `Other Intercepts/sec` correlates the raising thread with both VPs.** They are two counters,
@@ -399,8 +401,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the virtual processors* operation, not a second client joining; it was not called. **S5's
   obstacle has changed shape** — the mechanism exists and is exported, and what blocks it is a
   refused open — with two arms left before the VMM-of-our-own question, which is a rig
-  rather than an arm. **That rig is now costed — see the step 8 entry above — and the decision is
-  not to build it.**
+  rather than an arm. **That rig is now costed — see the step 8 entry above — and the costing did
+  not settle the build: it found no documented route, and two numbers a draft decided on are
+  retracted.**
 - **The receiver is a user-mode export, and there is no driver left to write.** Gate S5m, the IOCTL
   read S5k named, against `Vid.sys`, `vid.dll` and `WinHvPlatform.dll`. The control code is
   `0x221148` — read from the dispatcher's compare chain, with a `0x10`-byte input carrying the
