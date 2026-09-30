@@ -6088,7 +6088,7 @@ inference. What would settle it is a count tied to **new hypervisor deliveries**
 guest instructions**, and neither arm reports one. The arm ran; it did not answer.
 
 > **[The loop question](#the-loop-question-2026-09-30-measured-on-the-hypervisors-own-per-vp-counters) took the first of those and it is a loop**:
-> the hypervisor delivers ~65,700 messages a second for the whole armed window, against **zero**
+> the hypervisor delivers **65,676** messages a second for the whole armed window, against **zero**
 > in five control phases including two unarmed `#BP` storms and one armed with no raiser at all. S5k's
 > inference holds.
 
@@ -6156,7 +6156,7 @@ killed, none left running. Guest responsive with 106 processes and `LsaIso` aliv
 
 ### The loop question, 2026-09-30: measured on the hypervisor's own per-VP counters
 
-**The hold is a loop. The hypervisor delivers ~65,700 messages a second across the two VPs for
+**The hold is a loop. The hypervisor delivers **65,676** messages a second across the two VPs for
 the whole armed window
 while the raiser completes zero rounds**, and the same counter reads **exactly zero** in every other
 phase — including one in which the raiser storms `#BP`s with no intercept installed. S5k's inference
@@ -6183,16 +6183,21 @@ Host-side reads. No guest interaction, no driver call, nothing written.
 
 #### Six phases, because a counter that cannot move looks like one that did not
 
-| phase | rounds retired in the window | `Total Intercepts/sec` VP 0 / VP 1 | `Total Messages/sec` VP 0 / VP 1 |
-|---|---|---|---|
-| idle | — | 307 / 128 | **0 / 0** |
-| guest churn | — | 293 / 104 | **0 / 0** |
-| **VTL0 raiser, no intercept** | **13.6 M** | 985→563 / ~2,250 | **0 / 0** |
-| **VTL1 raiser, no intercept** | **1.43 M** | ~17,000 / **~234,000** | **0 / 0** |
-| **`#BP` intercept, no raiser** | — | 262 / 102 | **0 / 0** |
-| **VTL1 raiser + `#BP` intercept** | **0** | ~13,500 / **~55,400** | **12,465 / 53,263** |
+**Every figure below is from one run** — the six-phase one, sample means per phase, VP 0 / VP 1.
+Earlier drafts of this section mixed three runs into one table, which review round 5 caught by
+noticing an `Other Intercepts/sec` larger than the `Total Intercepts/sec` beside it — impossible
+within a run and unremarkable across two.
 
-`Other Intercepts/sec` tracks `Total Messages/sec` closely in every row.
+| phase | samples | rounds retired | `Total Intercepts/sec` | `Total Messages/sec` | `Other Intercepts/sec` |
+|---|---|---|---|---|---|
+| idle | 3 | — | 933 / 169 | **0 / 0** | 0 / 0 |
+| guest churn | 3 | — | 277 / 102 | **0 / 0** | 0 / 0 |
+| **VTL0 raiser, no intercept** | 4 | **13,600,634** | 857 / 2,210 | **0 / 0** | 0 / 0 |
+| **VTL1 raiser, no intercept** | 4 | **1,441,021** | 51,824 / **201,956** | **0 / 0** | 0 / 0 |
+| **`#BP` intercept, no raiser** | 4 | — | 262 / 102 | **0 / 0** | 0 / 0 |
+| **VTL1 raiser + `#BP` intercept** | 8 | **0** | 7,156 / **61,709** | **6,308 / 59,368** | 6,308 / 59,368 |
+
+`Other Intercepts/sec` equals `Total Messages/sec` to the count in every row of this run.
 
 **A pending intercept re-processed on the root side produces no hypervisor message at all.** Tens of
 thousands a second, sustained for 16 s, against **zero** in five control phases — including two in
@@ -6219,9 +6224,9 @@ an armed-only intercept source other than ours is narrowed rather than excluded.
 
 #### The trap that got run 1's verdict backwards
 
-`Total Intercepts/sec` is **lower** armed (~55,400) than unarmed (~234,000), and the first run's
+`Total Intercepts/sec` is **lower** armed (61,709 on VP 1) than unarmed (201,956), and the first run's
 verdict compared against it and concluded *"not re-entry"*. The armed arm takes *fewer* exits and
-turns **most** of them into messages — ~65,700 of ~68,900 a second across both VPs, about 95%, and
+turns **most** of them into messages — 65,676 of 68,865 a second across both VPs, **95.4%**, and
 the record above says these aggregate rates do not establish one message per intercept, so not
 *all* — while the unarmed one takes more and messages nobody. Reading the
 wrong counter inverted the answer.
@@ -6231,19 +6236,26 @@ run:
 
 | unarmed raiser | rounds | over | rounds/sec | intercepts/sec **both VPs, over idle** | **exits per round** |
 |---|---|---|---|---|---|
-| VTL0 | 13,568,371 | 11.88 s | 1.14 M | ~2,675 | **0.0023** |
-| VTL1 | 1,431,883 | 11.86 s | 121 k | ~250,885 | **2.08** |
+| VTL0 | 13,600,634 | 11.89 s | 1.14 M | 1,965 | **0.0017** |
+| VTL1 | 1,441,021 | 11.91 s | 121 k | 252,678 | **2.09** |
 
 **A VTL0 `#BP` costs essentially no hypervisor exit; a VTL1 one costs about two.** Same guest,
 same binary, same counter, only the VTL differing — and the round-rate gap in that same run is
-**9.46×**,
+**9.45×**,
 against the 9.7 µs / 0.85 µs this record carries elsewhere.
 
-Both columns are computed from **both VPs' excess over their own idle means** (239 and 95 a
+Both columns are computed from **both VPs' excess over this run's own idle means** (933 and 169 a
 second) and from the raiser's own clock rather than the sample spacing. A draft divided VP 1's
 rate alone by a mis-taken window and got 0.0013 and 1.3 — an undercount, since VP 0 also carries
-~16,800 a second during the VTL1 arm against a 239 idle, and this section's own conclusion is
+51,824 a second during the VTL1 arm against a 933 idle, and this section's own conclusion is
 that the raising thread runs on both.
+
+**The VTL0 row is at the noise floor and should be read as such.** This run's idle VP 0 mean is
+933 over three samples against a VTL0-arm 857, so that VP contributes −**76** to the excess and
+the whole 1,965 comes from VP 1. The figure is *not* a measurement of a small positive cost; it
+is a bound saying the cost is under the drift of a three-sample baseline. What carries the
+comparison is the **three orders of magnitude** between the columns, which no plausible baseline
+error touches.
 
 **That is a measured difference in kind, not a decomposition of the timing**, and a draft called it
 *"the mechanism behind the 11× cost"*, which it is not: nothing here apportions 9.7 µs between the
@@ -6259,7 +6271,7 @@ assumed. The same defect had already been fixed once, in step 6's `InterceptSusp
 #### And `Other Intercepts/sec` correlates the raising thread with both VPs
 
 `Other Intercepts/sec` is **zero on both VPs in all five control phases** and nonzero on **both**
-armed — VP 1 at ~62,750 and VP 0 at ~3,008, varying sample to sample between 0 and 23,037. A message
+armed — VP 1 at 59,368 and VP 0 at 6,308 as phase means. A message
 in that bucket is generated by an intercept, and an intercept is generated by an instruction
 executing **on that VP**. So the trapping instruction executes on both VPs.
 
