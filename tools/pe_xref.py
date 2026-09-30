@@ -28,30 +28,53 @@ instructions and can manufacture a reference that is not there. That direction
 is the safe one for a negative: the union can only widen the set, so an empty
 gap section is a measurement rather than an artefact of one reading.
 
-**Two data encodings are searched as well**, because a function reached from a
-table is reached without any instruction naming it: the 8-byte image-based VA (a
-function pointer, which carries a base relocation) and the 4-byte RVA (the form
+**Two data encodings are searched as well**, in EVERY section including the
+executable ones, because a function reached from a table is reached without any
+instruction naming it: the 8-byte image-based VA (a function pointer, which
+carries a base relocation) and the 4-byte RVA (the form
 `Vid!VidInterceptPreprocess`'s own type switch uses -- `mov eax,[rdx+rax*4+X];
 add rax,rdx; jmp rax`). Both are byte searches and are reported as such: they
-are here to keep a negative honest, not to attribute anything.
+are here to keep a negative honest, not to attribute anything. A hit in a code
+section is labelled rather than suppressed, because those bytes may be a table
+entry or may be an instruction and only reading the span settles it -- and
+suppressing them, which the first version of this did, blinded BOTH halves at
+once for a dispatch table living in `.text`: an indirect call through a
+RIP-relative slot names the slot, so the decoder cannot recover the target
+either.
 
-**What it does not see**, and why the count is a lower bound for reachability
-even though it is exact for the encodings above:
+**What it does not see.** This list is the whole of it, enumerated in one pass
+rather than a line at a time, because review round 1 on #425 filed four findings
+that were each one omission from it:
 
-- a target computed at run time from something other than a table entry this
-  finds -- an address assembled in two steps, or arriving as an argument;
-- a reference inside a gap run that no candidate start decodes as one
-  instruction, which the union makes unlikely rather than impossible;
-- anything in another image entirely. This reads one file.
+1. **A target computed at run time** -- an address assembled over two
+   instructions, arriving as an argument, or read from a table in any encoding
+   other than the two above.
+2. **A branch into the middle of the target.** RVAs are matched exactly, so
+   `call target+0x10` is not reported for `target`.
+3. **A gap-run instruction no candidate start decodes as one instruction.** The
+   union over starts makes this unlikely rather than impossible.
+4. **Bytes present at run time but not in the file** -- a section whose
+   `SizeOfRawData` is shorter than its virtual size has an uninitialised tail
+   that is not read here.
+5. **Anything in another image.** This reads one file.
 
-So "0 references" means "no instruction in this image names it and no table in
-it holds it in either of the two forms searched", which is what a reachability
-claim scoped to one image can be, and not more.
+Items 1 and 5 are the ones that actually bite. What used to be on this list and
+is not any more: sections were selected by NAME, so an executable section called
+anything unexpected had its gap bytes skipped in silence -- now they are selected
+by `IMAGE_SCN_MEM_EXECUTE`, which is the property the question is about.
+
+So "0 references" means "no instruction in this image names it, and no section of
+it holds its address in either of the two searched forms" -- which is what a
+reachability claim scoped to one file can be, and is NOT "nothing else calls it".
+A reader turning this into a statement about reachability has to say which of the
+five above they ruled out by other means.
 """
 
 from __future__ import annotations
 
 import argparse
+import contextlib
+import io
 import struct
 import sys
 from dataclasses import dataclass, field
@@ -63,9 +86,13 @@ except ImportError:  # pragma: no cover - reported, not raised
     capstone = None
     x86 = None
 
-# Sections whose bytes are code. The data scan skips these so that a `call`'s
-# encoded displacement can never be mistaken for a stored pointer.
-CODE_SECTIONS = (".text", "NONPAGED", "PAGE", "PAGED", "INIT", "fothk")
+# Which sections hold code is read from each section's own characteristics, not
+# from its name. A name list is a hand-maintained inventory of an open set --
+# `Vid.sys` alone ships `NONPAGED`, `PAGE`, `PAGED`, `INIT` and `fothk` beside
+# `.text` -- and the first image with a name not on it would have its gap bytes
+# skipped in silence, which turns this tool's whole output into a negative taken
+# without looking. Review round 1 on #425 named that from both bots.
+IMAGE_SCN_MEM_EXECUTE = 0x20000000
 
 PADDING = (0x00, 0xCC)
 
@@ -87,6 +114,11 @@ class Section:
     vsize: int
     raw: int
     rawsize: int
+    characteristics: int = 0
+
+    @property
+    def executable(self) -> bool:
+        return bool(self.characteristics & IMAGE_SCN_MEM_EXECUTE)
 
 
 @dataclass
@@ -142,7 +174,8 @@ def load(path: str) -> Image:
         base = sec_off + i * 40
         name = data[base : base + 8].rstrip(b"\0").decode("latin-1")
         vsize, va, rawsize, raw = struct.unpack_from("<IIII", data, base + 8)
-        sections.append(Section(name, va, vsize, raw, rawsize))
+        (chars,) = struct.unpack_from("<I", data, base + 36)
+        sections.append(Section(name, va, vsize, raw, rawsize, chars))
 
     img = Image(data, sections, image_base)
     if exc_rva and exc_size:
@@ -187,7 +220,7 @@ def gap_runs(img: Image) -> list[tuple[int, int]]:
     runs dropped. A run's boundaries are known; nothing inside it is."""
     runs: list[tuple[int, int]] = []
     for s in img.sections:
-        if s.name not in CODE_SECTIONS:
+        if not s.executable:
             continue
         end = min(s.vsize, s.rawsize)
         marks = bytearray(end)
@@ -249,18 +282,21 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
 
     runs = gap_runs(img)
     starts = 0
-    seen: set[tuple[int, int]] = set()
     for beg, end in runs:
         blob = img.read(beg, end - beg)
         if not blob:
             continue
         for k in range(len(blob)):
             starts += 1
-            for insn in md.disasm(blob[k:], img.image_base + beg + k):
-                key = (insn.address, insn.size)
-                if key in seen:
-                    continue
-                seen.add(key)
+            # ONE instruction, from a window of the longest an x86-64
+            # instruction can be. That is the same union as decoding to the end
+            # of the run from every start, because any instruction such a pass
+            # would reach begins at an offset that is itself a start -- and it
+            # is linear rather than quadratic, which is what a run of tens of
+            # thousands of bytes needs. Verified as a differential against the
+            # quadratic version on `Vid.sys` and `winhvr.sys` before the change
+            # was kept, not reasoned about alone.
+            for insn in md.disasm(blob[k : k + 15], img.image_base + beg + k, count=1):
                 for t in targets_of(insn, img.image_base):
                     if t in wanted:
                         refs.append(
@@ -268,11 +304,17 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
                                 f"{insn.mnemonic} {insn.op_str}", t, "", False)
                         )
 
+    # Every section, including the executable ones. Suppressing those was
+    # wrong in the direction that matters here: an indirect call through a
+    # RIP-relative slot names the *slot*, so `targets_of` cannot recover the
+    # function, and a dispatch table sitting in a code section would have been
+    # invisible to both halves of this tool at once. Code hits are labelled as
+    # possibly instruction bytes rather than hidden -- a four-byte pattern in a
+    # megabyte of code is often just code, and saying so is the reader's job to
+    # finish, not this tool's to pre-empt.
     data_hits = []
     for w in sorted(wanted):
         for s in img.sections:
-            if s.name in CODE_SECTIONS:
-                continue
             blob = img.data[s.raw : s.raw + s.rawsize]
             for pat, kind in (
                 ((img.image_base + w).to_bytes(8, "little"), "VA (8 bytes)"),
@@ -280,7 +322,7 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
             ):
                 i = blob.find(pat)
                 while i != -1:
-                    data_hits.append((s.name, s.va + i, kind, w))
+                    data_hits.append((s.name, s.va + i, kind, w, s.executable))
                     i = blob.find(pat, i + 1)
 
     return refs, {
@@ -308,44 +350,66 @@ def report(refs: list[Ref], extra: dict, wanted: set[int], syms: dict[int, str])
             print("  gap runs: none reaches it")
         rows = [d for d in extra["data"] if d[3] == w]
         if rows:
-            for name, rva, kind, _ in rows:
-                print(f"  data: {name} rva 0x{rva:x} holds its {kind}{STRUCTURAL.get(name, '')}")
+            for name, rva, kind, _w, is_exec in rows:
+                note = STRUCTURAL.get(name, "")
+                if not note and is_exec:
+                    note = ("  -- in an executable section: these bytes may be a "
+                            "table entry or may be an instruction; read the span")
+                print(f"  stored: {name} rva 0x{rva:x} holds its {kind}{note}")
         else:
-            print("  data sections: no stored VA or RVA")
+            print("  stored VA/RVA: none in any section")
     print(
         f"{extra['functions']} .pdata functions; {extra['gap_starts']} candidate "
         f"starts in {extra['gap_runs']} non-padding gap run(s)"
     )
 
 
-def _img(text: bytes, base: int = 0x140000000, claim=None, data: bytes = b"") -> Image:
-    """A synthetic image: one code section at rva 0x1000, one data section at
-    0x8000, and whatever `.pdata` claims (by default the whole code section)."""
+def parse_targets(spec: str) -> set[int]:
+    """`0x`-prefixed is hex, bare is decimal -- `int(x, 0)`, the same rule
+    `vid_field_census.py --fields` uses, so the two tools do not read the same
+    string two ways. The first version of this took a bare value as hex while
+    its own `--help` said "hex or decimal", which makes a wrong destination look
+    like a clean negative."""
+    return {int(t, 0) for t in spec.split(",") if t.strip()}
+
+
+def _img(text: bytes, base: int = 0x140000000, claim=None, data: bytes = b"",
+         code_name: str = ".text") -> Image:
+    """A synthetic image: one executable section at rva 0x1000, one read-only
+    data section at 0x8000, and whatever `.pdata` claims (by default the whole
+    code section). `code_name` exists so a case can give the code section a
+    name no list would guess."""
     secs = [
-        Section(".text", 0x1000, len(text), 0x400, len(text)),
-        Section(".rdata", 0x8000, len(data), 0x400 + len(text), len(data)),
+        Section(code_name, 0x1000, len(text), 0x400, len(text), IMAGE_SCN_MEM_EXECUTE),
+        Section(".rdata", 0x8000, len(data), 0x400 + len(text), len(data), 0x40000040),
     ]
     img = Image(b"\0" * 0x400 + text + data, secs, base)
     img.pdata = [(0x1000, 0x1000 + len(text))] if claim is None else list(claim)
     return img
 
 
-TOTAL = 13
+TOTAL = 15
 
 # Mutation-verified, so the cases below share one denominator and none of them
 # is passing for a reason unrelated to the rule it names. Backing each of these
-# out of the code above:
+# out of the code above, every one applied and every one was caught:
 #
-#   gap union -> a single start                      12/13
-#   the data scan no longer skips code sections      11/13
-#   every immediate counts as a branch target        12/13
-#   gap hits attributed as `.pdata` hits             10/13
-#   padding-only runs kept as runs                   12/13
+#   gap union -> a single start                      13/15
+#   decode window shrunk below one instruction       11/15
+#   sections selected by name again                  14/15
+#   the data scan skips executable sections again    13/15
+#   every immediate counts as a branch target        14/15
+#   gap hits attributed as `.pdata` hits             11/15
+#   padding-only runs kept as runs                   14/15
+#   `--targets` reads a bare value as hex            14/15
 #
-# The third is the one that earns the comment: the first version of that case
-# used `mov eax,0x40001000`, whose immediate is a *neighbouring* number rather
-# than the target's VA, so it scored 13/13 under the very mutation it existed
-# for. A case that cannot fail is not pinning anything.
+# Two of those earn the comment. The immediate case's FIRST version used
+# `mov eax,0x40001000`, whose immediate is a *neighbouring* number rather than
+# the target's VA, so it scored a clean sheet under the very mutation it existed
+# for -- a case that cannot fail is pinning nothing. And `report` is rendered
+# into a sink for every case above, because the counts come from `scan` and
+# without that the printing path was never run by the self-test: the round-1 fix
+# crashed there, on a tuple that had grown a field, while still reporting 15/15.
 
 
 def self_test() -> int:
@@ -354,6 +418,13 @@ def self_test() -> int:
     def case(label, img, wanted, want_exact, want_gap, want_data, want_runs=None):
         nonlocal failures
         refs, extra = scan(img, wanted, {})
+        # Render every case through `report` as well, into nothing. The counts
+        # below are computed from `scan`, so without this the printing path is
+        # never executed by the self-test -- and it was exactly there that the
+        # first version of the round-1 fix crashed, on a tuple that had grown a
+        # field, with 15/15 still reported.
+        with contextlib.redirect_stdout(io.StringIO()):
+            report(refs, extra, wanted, {})
         got = (len([r for r in refs if r.exact]),
                len([r for r in refs if not r.exact]),
                len(extra["data"]))
@@ -386,9 +457,12 @@ def self_test() -> int:
     # `movabs rax,0x140001000` -- 48 b8 00 10 00 40 01 00 00 00.  The immediate
     # is the VA and not some neighbouring number, or the case would pass under
     # a reading that counts every immediate: mutation-checked, and the first
-    # version of it (`mov eax,0x40001000`) did exactly that.
-    case("an immediate holding the address is not a reference",
-         _img(b"\x48\xb8\x00\x10\x00\x40\x01\x00\x00\x00"), {0x1000}, 0, 0, 0)
+    # version of it (`mov eax,0x40001000`) did exactly that.  It draws one
+    # *stored* hit, because the byte scan sees the same eight bytes and says so
+    # rather than deciding for the reader -- that is the shape of every
+    # code-section stored hit and the reason they are labelled.
+    case("an immediate is not a reference, and is reported as bytes",
+         _img(b"\x48\xb8\x00\x10\x00\x40\x01\x00\x00\x00"), {0x1000}, 0, 0, 1)
 
     # A reference the relative encoding hides from any byte search: the same
     # destination from two call sites encodes two different displacements.
@@ -421,10 +495,19 @@ def self_test() -> int:
     case("a stored RVA in a data section is reported",
          _img(b"\x90" * 8, data=(0x1000).to_bytes(4, "little")), {0x1000}, 0, 0, 1)
 
-    # The data scan must not read code bytes, or every `call` displacement that
-    # happens to spell an RVA becomes a phantom table entry.
-    case("code bytes are not scanned as data",
-         _img(b"\x90" * 4 + (0x1000).to_bytes(4, "little")), {0x1000}, 0, 0, 0)
+    # A dispatch table inside a code section is the case the first version of
+    # this tool could not see at all: an indirect call through a RIP-relative
+    # slot names the slot, so the code scan cannot recover the target, and
+    # suppressing code sections in the byte scan hid the table as well. Both
+    # halves blind at once is the one way a negative here can be badly wrong.
+    case("a stored RVA in an executable section is reported",
+         _img(b"\x90" * 4 + (0x1000).to_bytes(4, "little")), {0x1000}, 0, 0, 1)
+
+    # Section *names* are an open set -- `Vid.sys` ships five beside `.text` --
+    # so a gap in a section this tool has never heard of must still be decoded.
+    case("an executable section with an unknown name is still scanned",
+         _img(call_back, claim=[(0x1000, 0x1005)], code_name="WHOKNOWS"),
+         {0x1000}, 0, 1, 0, want_runs=1)
 
     # A gap run whose only decode as one instruction needs a start the naive
     # reading would not pick: the run begins with a stray byte, so a single
@@ -438,6 +521,16 @@ def self_test() -> int:
     # An unrelated target is not reported for any of the shapes above, which is
     # what makes the zeros elsewhere mean something.
     case("an unrelated RVA draws nothing", _img(call_back), {0x2000}, 0, 0, 0)
+
+    # `--targets` reads the same way `vid_field_census.py --fields` does, which
+    # is what its own `--help` says: bare is decimal, `0x` is hex. Taking a
+    # bare value as hex scans a destination the caller did not name and reports
+    # the clean negative that follows.
+    decimal, hexed = parse_targets("4096"), parse_targets("0x4096")
+    ok = decimal == {0x1000} and hexed == {0x4096}
+    print(f"  {'ok  ' if ok else 'FAIL'} --targets: 4096 -> "
+          f"{[hex(g) for g in decimal]}, 0x4096 -> {[hex(g) for g in hexed]}")
+    failures += int(not ok)
 
     print(f"{'PASS' if not failures else 'FAIL'}: "
           f"{TOTAL - failures}/{TOTAL} cases")
@@ -463,8 +556,7 @@ def main(argv: list[str]) -> int:
 
     img = load(args.image)
     syms = load_symbols(args.symbols, img.image_base) if args.symbols else {}
-    wanted = {int(t, 0) if t.lower().startswith("0x") else int(t, 16)
-              for t in args.targets.split(",")}
+    wanted = parse_targets(args.targets)
     refs, extra = scan(img, wanted, syms)
     report(refs, extra, wanted, syms)
     return 0
