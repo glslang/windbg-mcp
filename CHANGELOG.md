@@ -14,15 +14,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   access; the first lifted for guests this bench owns and the second is what S5q's read IOCTL
   supplies. Everything here is a **pure read** apart from the intercept install. **The slot read**:
   `[P+0xB68]` is `FF FF FF FF FF FF FF FF` at **all twelve** samples across 24 s of a standing
-  intercept, plus before the install and after the removal — the contemporaneous, **non-mutating**
+  intercept, plus before the install and after the removal — unclaimed *at every sample*, not
+  "throughout", since sampling cannot see a claim-and-release inside a gap. It is the
+  contemporaneous, **non-mutating**
   read S5k has wanted since it was written and which S5m could only half-answer, because
   registering to ask whether the slot is claimed *claims* it. It narrows S5j's retained explanation
   without closing it: a claimant would have had to claim and release inside one 2-second gap and
-  coincide with the raise. **The guest handler**: `handled = 0` at all twelve samples while the
-  raiser's own clock ran to `ms=31609` — which shows the guest's `__except` never ran and **not**
-  that the instruction is re-entered, since one trap held for the window gives the same zero; the
-  re-entry evidence is the frozen-or-slowed run's **20 fresh arrivals**, and a draft here conflated
-  the two. **And a third reading came free**: per-VP
+  coincide with the raise. **The loop arm ran and did not answer its question**: `handled = 0` at
+  all twelve samples shows the guest's `__except` never ran, which one trap held for the window
+  gives too, and the frozen-or-slowed run's **20 fresh stamps** are twenty calls to
+  `VidInterceptPreprocess` rather than twenty executions of the instruction — one pending
+  intercept re-preprocessed gives the same series. S5k's re-entry inference stands as an
+  inference; closing it needs a count tied to new hypervisor deliveries or retired guest
+  instructions. **And a third reading came free**: per-VP
   `HvRegisterInterceptSuspend` is **transient** — seen on both VPs at different instants, and `0` at
   every sample of a control that raised **1.87 million** `#BP`s with no intercept standing — while
   both VPs keep accumulating `VpRuntime` and the guest retires nothing. **The VPs are being
