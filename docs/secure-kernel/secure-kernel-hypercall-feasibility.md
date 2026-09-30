@@ -5267,8 +5267,12 @@ exactly why the gap scan needed a test of its own rather than agreement on the r
 run on `winhvr.sys` reports 28 and 42 under **every** reading above, including the one that
 misattributes, because no gap island in this image reaches at all. `--self-test` now carries all
 three defects, **21/21**, each pinned with the broken reading asserted to fail and with two negative
-controls; mutation-verified, the one-stream reading scoring 10/12 when it was written, and against
-the current cases the span-wide region scoring **17/21** and a summed refusal count **20/21**.
+controls. **Mutation-verified against those same cases**, so the three scores share a denominator:
+reducing the candidate starts to the span start alone scores **10/21**, one span-wide region
+**17/21**, and a summed rather than unioned refusal count **20/21** — the last failing with *got 2,
+wanted 1*, which is the reviewer's own case. A mutation that empties the reaching set reports those
+as failures rather than aborting the run, which an earlier version of the helper did by indexing an
+empty list and hiding every case after it.
 
 #### What this does to S5j's two explanations
 

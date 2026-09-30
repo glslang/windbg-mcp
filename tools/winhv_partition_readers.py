@@ -409,6 +409,17 @@ def _reaching_on(data, md, arr_rva):
     return reaching, accesses, from_gap, ends
 
 
+def _only(reaching):
+    """The single reaching region's start, or None.
+
+    Returns rather than raises, because a mutation that empties `reaching`
+    should make the case that depends on it report FAIL -- an IndexError aborts
+    the run and hides every case after it, which is the opposite of what a
+    mutation check needs to read.
+    """
+    return sorted(reaching)[0] if len(reaching) == 1 else None
+
+
 def self_test():
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = True
@@ -476,7 +487,7 @@ def self_test():
     check("only the anchor-loading leaf reaches", len(reaching), 1)
     check("the unrelated leaf's +0x18 is NOT attributed to it", accesses, 1)
     check("the reaching island starts at the leaf, not at the span",
-          sorted(reaching)[0] if reaching else None, leaf_at)
+          _only(reaching), leaf_at)
     check("and its decode ends at the leaf's own end",
           ends.get(leaf_at), leaf_at + len(leaf))
     check("the unrelated leaf is a region of its own, and not reaching",
@@ -499,7 +510,7 @@ def self_test():
     check("a leaf in a gap reaches, end to end", len(reaching), 1)
     check("and its +0x10 read is reported", accesses, 1)
     check("as a gap island rather than a .pdata function",
-          sorted(reaching)[0] in from_gap, True)
+          _only(reaching) in from_gap, True)
 
     # --- controls: the assertions above must be able to fail ---------------
     blind, blind_n, _, _ = _reaching_on(bare, md, ANCHOR_VA + 8)
