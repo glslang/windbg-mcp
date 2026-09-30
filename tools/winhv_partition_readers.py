@@ -32,6 +32,12 @@ reaching set even when it reads the callback pair. Closing that needs provenance
 propagated across calls and returns, which this does not do. Read
 "functions that can hold a partition object" as "functions that can obtain one
 by the two routes this looks for".
+
+`--self-test` exercises the gap decoding against images built here, including
+the two readings of a `.pdata` gap that each lost real leaf code. Run it after
+any change to `decode_union` or `gap_decode_starts`; a run against a real image
+cannot detect a gap-scan regression, because the answer on `winhvr.sys` does not
+move through either defect.
 """
 import argparse
 import struct
@@ -80,6 +86,57 @@ def decode_all(md, code, base):
     return out, skipped
 
 
+def gap_decode_starts(blob):
+    """Offsets in a `.pdata` gap worth decoding from, and the padding count.
+
+    The starts are the span's own start and the first byte of every non-padding
+    island in it. Padding is counted for the report only -- it is NOT used to
+    cut the span up, for the reason in `decode_union`.
+    """
+    starts, pad = [0], 0
+    for i, b in enumerate(blob):
+        if b in (0xCC, 0x00):
+            pad += 1
+        elif i and blob[i - 1] in (0xCC, 0x00):
+            starts.append(i)
+    return starts, pad
+
+
+def decode_union(md, code, base, starts):
+    """Decode from several candidate offsets and union what they find.
+
+    A `.pdata` gap carries no unwind record, so nothing in the image says where
+    an instruction in it begins. Two single-alignment readings were tried here
+    and **each one lost real leaf code**:
+
+    - Decoding the span as one stream loses an island after an odd-length run of
+      `0x00`, because `00 00` decodes as a two-byte `add byte ptr [rax], al` --
+      so a zero run of odd length shifts every instruction after it by one and
+      the island is read as garbage. (`0xCC` is one byte and keeps alignment,
+      which is why the defect needs a zero run to show up.)
+    - Splitting the span at every `0xCC`/`0x00` byte cuts instructions apart. A
+      single zero byte is not padding: almost every RIP-relative load in a
+      driver carries one in its high displacement byte, so the split lands
+      inside the very instruction the scan exists to find.
+
+    Decoding from each candidate start across the whole remaining span and
+    unioning by `(address, size)` is subject to neither. The union is a lower
+    bound with possible phantoms rather than an enumeration -- a misaligned
+    start decodes bytes that are not instructions -- so it can only widen the
+    reaching set, never narrow it, and the sites that matter are read back as
+    disassembly by hand rather than trusted from the count.
+    """
+    seen, skipped = {}, 0
+    for s in sorted(set(starts)):
+        if s >= len(code):
+            continue
+        got, miss = decode_all(md, code[s:], base + s)
+        skipped += miss
+        for i in got:
+            seen.setdefault((i.address, i.size), i)
+    return [seen[k] for k in sorted(seen)], skipped
+
+
 def rva_to_off(secs, rva):
     for s in secs:
         if s["va"] <= rva < s["va"] + max(s["vs"], s["rs"]):
@@ -122,44 +179,26 @@ def frame_register(data, secs, unwind_rva):
     return data[off + 3] & 0x0F
 
 
-def main():
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--image", required=True)
-    ap.add_argument("--ref-partition-rva", required=True,
-                    help="RVA of WinHvpReferencePartition, from the PDB")
-    ap.add_argument("--partition-array-rva", required=True,
-                    help="RVA of the WinHvpPartitionArray cell, from the PDB")
-    ap.add_argument("--fields", default="0x10,0x18",
-                    help="displacements to report inside the reaching functions")
-    a = ap.parse_args()
+def regions_of(data, secs, funcs):
+    """Every region to decode: each `.pdata` function, plus each executable span
+    `.pdata` does not claim. A region is (start, end, is_gap, frame_reg,
+    decode_starts); `decode_starts` are relative to `start`.
 
-    ref_rva = int(a.ref_partition_rva, 0)
-    arr_rva = int(a.partition_array_rva, 0)
-    fields = [int(x, 0) for x in a.fields.split(",")]
-
-    data = open(a.image, "rb").read()
-    _, secs = sections(data)
-    funcs = pdata_functions(data, secs)
-    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
-    md.detail = True
-
-    # `.pdata` is exact for the functions it claims and does not claim leaf
-    # functions, so a leaf that loads the array or reads the pair would be
-    # invisible to a scan that stopped here. `vid_field_census.py` decodes the
-    # executable bytes `.pdata` leaves out, and so does this: the gap runs are
-    # scanned as regions of their own, padding skipped.
-    regions = [(s, e, False, frame_register(data, secs, u)) for s, e, u in funcs]
+    `.pdata` is exact for the functions it claims and does not claim leaf
+    functions, so a leaf that loads the array or reads the pair would be
+    invisible to a scan that stopped at the table. `vid_field_census.py` decodes
+    the executable bytes `.pdata` leaves out, and so does this.
+    """
+    out = [(s, e, False, frame_register(data, secs, u), (0,)) for s, e, u in funcs]
     claimed = sorted((s, e) for s, e, _ in funcs)
-    gap_bytes = pad_bytes = 0
-    gap_runs = 0
+    gap_bytes = pad_bytes = gap_spans = 0
     for sec in secs:
         if not sec["exec"]:
             continue
-        at, end_rva = sec["va"], sec["va"] + min(sec["vs"] or sec["rs"], sec["rs"])
+        at = sec["va"]
+        end_rva = sec["va"] + min(sec["vs"] or sec["rs"], sec["rs"])
         covered = [(s, e) for s, e in claimed if e > at and s < end_rva]
-        cursor = at
-        holes = []
+        cursor, holes = at, []
         for s, e in covered:
             if s > cursor:
                 holes.append((cursor, s))
@@ -172,39 +211,26 @@ def main():
                 continue
             blob = data[off:off + (he - hs)]
             gap_bytes += len(blob)
-            # Split at EVERY padding run, not just the outer edges: one span can
-            # hold several leaf-code islands separated by 0xCC/0x00, and
-            # decoding the whole span as one stream misaligns across the padding
-            # and loses the later islands.
-            i = 0
-            while i < len(blob):
-                if blob[i] in (0xCC, 0x00):
-                    pad_bytes += 1
-                    i += 1
-                    continue
-                j = i
-                while j < len(blob) and blob[j] not in (0xCC, 0x00):
-                    j += 1
-                gap_runs += 1
-                # A gap run has no unwind record, so nothing licenses treating
-                # its `rbp` as a frame pointer: keep those operands.
-                regions.append((hs + i, hs + j, True, 0))
-                i = j
-    print("executable bytes .pdata does not claim: %d (%d of them 0xCC/0x00 padding); "
-          "%d gap run(s) held anything else, each split at padding and scanned as its own region"
-          % (gap_bytes, pad_bytes, gap_runs))
+            starts, pad = gap_decode_starts(blob)
+            pad_bytes += pad
+            if pad == len(blob):
+                continue                 # padding only, nothing to decode
+            gap_spans += 1
+            # A gap span has no unwind record, so nothing licenses treating its
+            # `rbp` as a frame pointer: keep those operands.
+            out.append((hs, he, True, 0, tuple(starts)))
+    return out, gap_bytes, pad_bytes, gap_spans
 
-    reaching = {}   # region start -> set of reasons
-    bodies = {}
-    from_gap = set()
-    framereg = {}
-    undecoded = 0
-    for start, end, is_gap, fr in regions:
+
+def analyse(data, secs, md, regions, ref_rva, arr_rva):
+    """For each region, whether it can hold a partition object and why."""
+    reaching, bodies, framereg, from_gap, undecoded = {}, {}, {}, set(), 0
+    for start, end, is_gap, fr, starts in regions:
         off = rva_to_off(secs, start)
         if off is None:
             continue
         code = data[off:off + (end - start)]
-        ins, skipped = decode_all(md, code, start)
+        ins, skipped = decode_union(md, code, start, starts)
         undecoded += skipped
         bodies[start] = ins
         framereg[start] = fr
@@ -222,15 +248,242 @@ def main():
                         why.add("loads WinHvpPartitionArray")
         if why:
             reaching[start] = why
+    return reaching, bodies, framereg, from_gap, undecoded
+
+
+def field_hits(bodies, framereg, start, fields):
+    """Non-stack accesses to `fields` inside one region, capstone-classified."""
+    hits = []
+    for i in bodies[start]:
+        for op in i.operands:
+            if op.type != capstone.x86.X86_OP_MEM:
+                continue
+            # Stack frames are not partition objects, and rsp-relative traffic
+            # at these offsets is spill noise that swamps the answer. `rbp` is
+            # NOT stack traffic by default: in optimized x64 it is an ordinary
+            # callee-saved register unless the function's UNWIND_INFO names it
+            # as the frame register, so it is suppressed only when that record
+            # says so and is otherwise reported and tagged for classification
+            # by hand.
+            if op.mem.base in (capstone.x86.X86_REG_RIP,
+                               capstone.x86.X86_REG_RSP):
+                continue
+            if (op.mem.base == capstone.x86.X86_REG_RBP
+                    and framereg.get(start) == RBP_ENCODING):
+                continue
+            if op.mem.disp not in fields:
+                continue
+            # capstone's own classification, not a guess from the mnemonic.
+            rw = ""
+            if op.access & capstone.CS_AC_WRITE:
+                rw += "W"
+            if op.access & capstone.CS_AC_READ:
+                rw += "R"
+            tag = ""
+            if op.mem.base == capstone.x86.X86_REG_RBP:
+                tag = "  <== rbp base, not this function's frame register"
+            hits.append((i.address, rw or "?", i.mnemonic, i.op_str + tag))
+    return hits
+
+
+# --------------------------------------------------------------------------
+# Self-test. The images below are built here, because the gap-scan defects it
+# pins are invisible on `winhvr.sys`: the answer there is 28 reaching regions
+# and 42 accesses under both of the readings `decode_union` replaced.
+# --------------------------------------------------------------------------
+
+def _leaf(at, anchor):
+    """A 12-byte leaf that loads the partition-array anchor and reads +0x10:
+
+        mov rax, [rip+disp32]   ; disp32 reaches `anchor`
+        mov rax, [rax+0x10]
+        ret
+
+    `disp32` carries zero bytes for any anchor inside the first 16 MiB of the
+    image, which is what the split-at-every-zero reading cut in half.
+    """
+    disp = anchor - (at + 7)
+    return (bytes([0x48, 0x8B, 0x05]) + struct.pack("<i", disp)
+            + bytes([0x48, 0x8B, 0x40, 0x10])
+            + bytes([0xC3]))
+
+
+TEXT_VA, TEXT_RAW, TEXT_SZ = 0x1000, 0x400, 0x200
+PDATA_VA, PDATA_RAW = 0x2000, 0x600
+ANCHOR_VA = 0x3000
+
+
+def _synthetic_image(text):
+    """A minimal PE32+ whose `.text` holds `text` and whose `.pdata` claims only
+    a one-byte stub at the section start -- so everything after it is a gap."""
+    body = bytearray(text)
+    body += bytes([0xCC]) * (TEXT_SZ - len(body))
+    pdata = struct.pack("<III", TEXT_VA, TEXT_VA + 1, 0)
+    opt = bytearray(240)
+    struct.pack_into("<H", opt, 0, 0x20B)                 # PE32+
+    struct.pack_into("<Q", opt, 24, 0x140000000)          # ImageBase
+    secs = b""
+    for name, va, vs, raw, rs, ch in (
+            (b".text", TEXT_VA, TEXT_SZ, TEXT_RAW, TEXT_SZ, 0x60000020),
+            (b".pdata", PDATA_VA, len(pdata), PDATA_RAW, len(pdata), 0x40000040)):
+        secs += name.ljust(8, bytes(1)) + struct.pack("<IIII", vs, va, rs, raw)
+        secs += struct.pack("<IIHH", 0, 0, 0, 0) + struct.pack("<I", ch)
+    pe = 0x80
+    img = bytearray(0x800)
+    img[0:2] = b"MZ"
+    struct.pack_into("<I", img, 0x3C, pe)
+    img[pe:pe + 4] = b"PE" + bytes(2)
+    struct.pack_into("<HHIIIHH", img, pe + 4, 0x8664, 2, 0, 0, 0, len(opt), 0x22)
+    img[pe + 24:pe + 24 + len(opt)] = opt
+    img[pe + 24 + len(opt):pe + 24 + len(opt) + len(secs)] = secs
+    img[TEXT_RAW:TEXT_RAW + len(body)] = body
+    img[PDATA_RAW:PDATA_RAW + len(pdata)] = pdata
+    return bytes(img)
+
+
+def _reaching_on(data, md, arr_rva):
+    _, secs = sections(data)
+    funcs = pdata_functions(data, secs)
+    regions, _, _, _ = regions_of(data, secs, funcs)
+    reaching, bodies, framereg, from_gap, _ = analyse(data, secs, md, regions,
+                                                     TEXT_VA, arr_rva)
+    accesses = sum(len(field_hits(bodies, framereg, s, [0x10, 0x18]))
+                   for s in reaching)
+    spans = {s: e for s, e, is_gap, _, _ in regions if is_gap}
+    return reaching, accesses, from_gap, spans
+
+
+def self_test():
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md.detail = True
+    results = []
+
+    def check(name, got, want):
+        results.append((name, got == want, got, want))
+
+    # --- the encoding the regression turned on -----------------------------
+    leaf_at = 0x1020
+    leaf = _leaf(leaf_at, ANCHOR_VA)
+    check("leaf is 12 bytes", len(leaf), 12)
+    check("its displacement carries zero bytes", leaf.count(0), 2)
+
+    # --- defect A: split at every 0x00/0xCC cut the leaf in half -----------
+    # Pin the cause, not just the cure: the cut start set must NOT be what we
+    # decode from, and the union must find the anchor load.
+    cut = decode_union(md, leaf[:leaf.index(bytes([0])[0])], leaf_at, (0,))[0]
+    check("a span cut at the first zero byte loses the anchor load",
+          any(i.mnemonic == "mov" and "rip" in i.op_str for i in cut), False)
+    ins, _ = decode_union(md, leaf, leaf_at, gap_decode_starts(leaf)[0])
+    check("the union decodes the anchor load",
+          [(i.mnemonic, i.op_str) for i in ins][0],
+          ("mov", "rax, qword ptr [rip + 0x1fd9]"))
+
+    # --- defect B: one stream lost an island after an odd zero run ---------
+    # Three 0x00 bytes: `00 00` is a two-byte `add byte ptr [rax], al`, so the
+    # third shifts the island after it. Pin that the one-stream reading misses
+    # island two and the union finds it.
+    second_at = leaf_at + len(leaf) + 3
+    span = leaf + bytes(3) + _leaf(second_at, ANCHOR_VA)
+    one_stream, _ = decode_union(md, span, leaf_at, (0,))
+    starts, _ = gap_decode_starts(span)
+    unioned, _ = decode_union(md, span, leaf_at, starts)
+
+    def anchor_loads(ins_list):
+        n = 0
+        for i in ins_list:
+            for op in i.operands:
+                if (op.type == capstone.x86.X86_OP_MEM
+                        and op.mem.base == capstone.x86.X86_REG_RIP
+                        and i.address + i.size + op.mem.disp == ANCHOR_VA):
+                    n += 1
+        return n
+
+    check("island start after the zero run is a decode start",
+          second_at - leaf_at in starts, True)
+    check("one stream finds only the first island's anchor load",
+          anchor_loads(one_stream), 1)
+    check("the union finds both", anchor_loads(unioned), 2)
+
+    # --- end to end, through the CLI's own path ---------------------------
+    img = _synthetic_image(bytes([0xCC]) * (leaf_at - TEXT_VA) + leaf)
+    reaching, accesses, from_gap, spans = _reaching_on(img, md, ANCHOR_VA)
+    check("a leaf in a gap reaches, end to end", len(reaching), 1)
+    check("and its +0x10 read is reported", accesses, 1)
+    # The region is the whole gap span, not the island inside it -- so pin that
+    # it is a gap span CONTAINING the leaf rather than an RVA equal to it, which
+    # was the per-island shape this replaced.
+    got = sorted(reaching)[0] if reaching else None
+    check("the reaching region is a gap span holding the leaf",
+          got in from_gap and got <= leaf_at < spans.get(got, 0), True)
+
+    # --- control: the assertions above must be able to fail ---------------
+    blind, blind_n, _, _ = _reaching_on(img, md, ANCHOR_VA + 8)
+    check("an anchor the image does not load reaches nothing",
+          (len(blind), blind_n), (0, 0))
+    empty, empty_n, _, _ = _reaching_on(_synthetic_image(bytes([0xCC]) * 32), md,
+                                        ANCHOR_VA)
+    check("an image with no leaf reaches nothing", (len(empty), empty_n), (0, 0))
+
+    ok = sum(1 for _, good, _, _ in results if good)
+    for name, good, got, want in results:
+        print("  %-4s %s" % ("PASS" if good else "FAIL", name))
+        if not good:
+            print("         got %r, wanted %r" % (got, want))
+    print("self-test: %d/%d" % (ok, len(results)))
+    return ok == len(results)
+
+
+def main():
+    ap = argparse.ArgumentParser(description=__doc__,
+                                 formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--image")
+    ap.add_argument("--ref-partition-rva",
+                    help="RVA of WinHvpReferencePartition, from the PDB")
+    ap.add_argument("--partition-array-rva",
+                    help="RVA of the WinHvpPartitionArray cell, from the PDB")
+    ap.add_argument("--fields", default="0x10,0x18",
+                    help="displacements to report inside the reaching functions")
+    ap.add_argument("--self-test", action="store_true",
+                    help="run the gap-decoding regression cases and exit")
+    a = ap.parse_args()
+
+    if a.self_test:
+        sys.exit(0 if self_test() else 1)
+    if not (a.image and a.ref_partition_rva and a.partition_array_rva):
+        ap.error("--image, --ref-partition-rva and --partition-array-rva are "
+                 "required without --self-test")
+
+    ref_rva = int(a.ref_partition_rva, 0)
+    arr_rva = int(a.partition_array_rva, 0)
+    fields = [int(x, 0) for x in a.fields.split(",")]
+
+    data = open(a.image, "rb").read()
+    _, secs = sections(data)
+    funcs = pdata_functions(data, secs)
+    md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
+    md.detail = True
+
+    regions, gap_bytes, pad_bytes, gap_spans = regions_of(data, secs, funcs)
+    print("executable bytes .pdata does not claim: %d (%d of them 0xCC/0x00 "
+          "padding); %d span(s) held anything else, each decoded from its own "
+          "start and from every island start in it" % (gap_bytes, pad_bytes, gap_spans))
+
+    reaching, bodies, framereg, from_gap, undecoded = analyse(
+        data, secs, md, regions, ref_rva, arr_rva)
 
     print("image                : %s" % a.image)
     print(".pdata functions     : %d" % len(funcs))
-    print("regions scanned      : %d (.pdata functions plus decoded gap runs)" % len(bodies))
+    print("regions scanned      : %d (.pdata functions plus decoded gap spans)" % len(bodies))
     print("bytes capstone refused, skipped and resumed past: %d" % undecoded)
     print("regions that can hold a partition object: %d" % len(reaching))
     print()
+    spans = {s: e for s, e, is_gap, _, _ in regions if is_gap}
     for start in sorted(reaching):
-        tag = " [gap run, not a .pdata function]" if start in from_gap else ""
+        # A gap region is a SPAN, so print its range: its start is where
+        # `.pdata` stopped claiming, not a function entry, and reading it as one
+        # is how a span start gets quoted as a routine's RVA.
+        tag = ("  [gap span +0x%06X..+0x%06X, not a .pdata function]"
+               % (start, spans[start])) if start in from_gap else ""
         print("  +0x%06X  (%s)%s" % (start, ", ".join(sorted(reaching[start])), tag))
     print()
 
@@ -238,36 +491,7 @@ def main():
           ", ".join("+0x%X" % f for f in fields))
     total = 0
     for start in sorted(reaching):
-        hits = []
-        for i in bodies[start]:
-            for op in i.operands:
-                if op.type != capstone.x86.X86_OP_MEM:
-                    continue
-                # Stack frames are not partition objects, and rsp-relative
-                # traffic at these offsets is spill noise that swamps the
-                # answer. `rbp` is NOT stack traffic by default: in optimized
-                # x64 it is an ordinary callee-saved register unless the
-                # function's UNWIND_INFO names it as the frame register, so it
-                # is suppressed only when that record says so and is otherwise
-                # reported and tagged for classification by hand.
-                if op.mem.base in (capstone.x86.X86_REG_RIP,
-                                   capstone.x86.X86_REG_RSP):
-                    continue
-                if (op.mem.base == capstone.x86.X86_REG_RBP
-                        and framereg.get(start) == RBP_ENCODING):
-                    continue
-                if op.mem.disp not in fields:
-                    continue
-                # capstone's own classification, not a guess from the mnemonic.
-                rw = ""
-                if op.access & capstone.CS_AC_WRITE:
-                    rw += "W"
-                if op.access & capstone.CS_AC_READ:
-                    rw += "R"
-                tag = ""
-                if op.mem.base == capstone.x86.X86_REG_RBP:
-                    tag = "  <== rbp base, not this function's frame register"
-                hits.append((i.address, rw or "?", i.mnemonic, i.op_str + tag))
+        hits = field_hits(bodies, framereg, start, fields)
         if not hits:
             continue
         print("  function +0x%06X" % start)

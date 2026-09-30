@@ -346,8 +346,22 @@ it.
 #### What the oracle actually is, read from its own release
 
 Inspected statically 2026-09-25 from release `v3.3.2.20260720` (zip sha256 `c8dff9409ad896ec…`);
-nothing was registered or run. The article's naming is stale: the server is **`ExdiHvSrv.dll`**, not
-`ExdiKdSample.dll`.
+nothing was registered or run. In **this** release the server is **`ExdiHvSrv.dll`**, and the
+`v2.8.4.20241221` release notes say *"EXDI plugin renamed to ExdiHvSrv.dll"* — **without naming what
+it was renamed from** (checked 2026-09-30; those notes do not mention `ExdiKdSample` at all).
+
+**So "the article's naming is stale" was never licensed, and that is what this paragraph said until
+2026-09-30 — and what S5s was then read against.** The maintainer's
+[live-debugging procedure](https://github.com/gerhart01/LiveCloudKd/blob/master/ExdiKdSample/LiveDebugging.md)
+links a **separate release asset** — `LiveCloudKd.EXDI.debugger.v1.0.20251103.zip`, tag
+`v1.0.20251103`, confirmed present in the repository's release list 2026-09-30 — and says to register
+`ExdiKdSample.dll` with `regsvr32.exe /i`. That asset **post-dates** the rename by eleven months, so
+treating its DLL as an older spelling of this one was an inference from two filenames, not a reading
+of either release. **Nothing here has read its contents**: whether the DLL inside it differs from
+`ExdiHvSrv.dll` is open, and it is a download away. Two consequences, both recorded in
+the [S5s result](secure-kernel-hypercall-feasibility.md): S5s's refusal is a negative about the main
+release line only, and that procedure's route into VTL1 is **handle duplication from `vmwp.exe`**,
+which is `FOLLOWUPS.md` item 103 step 7 — declined on scope grounds, not open on technical ones.
 
 **It registers exactly as `ExdiGdbSrv.dll` does, so E0's activation stall is a shared risk rather
 than a separate problem.** Identical export set — `DllRegisterServer`, `DllUnregisterServer`,
@@ -494,8 +508,11 @@ shipped artifact depends on it.
 activation stalling on this bench — registration writes an `AppID` with an empty `DllSurrogate`,
 hosting the server in `dllhost.exe`, and a bare `CreateInstance` blocked past 17 s having launched
 no surrogate. Whether `ExdiKdSample.dll` registers the same way is not established and is cheap to
-read off its registration; if it does, that stall is a prerequisite for both and is better found
-before a lab is built around either.
+read off its registration — it ships in `LiveCloudKd.EXDI.debugger.v1.0.20251103.zip`, a separate
+release asset from the one S5s read, so this is a download rather than a re-read of what is already
+here. If it does, that stall is a prerequisite for both and is better found
+before a lab is built around either. **Reading its registration is cheap; running it is the scope
+decision above**, since its own procedure reaches VTL1 by duplicating handles out of `vmwp.exe`.
 
 Same rig, VBS/HVCI enabled in the guest.
 
