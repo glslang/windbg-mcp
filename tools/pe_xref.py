@@ -60,7 +60,12 @@ that were each one omission from it:
 4. **Bytes present at run time but not in the file** -- a section whose
    `SizeOfRawData` is shorter than its virtual size has an uninitialised tail
    that is not read here.
-5. **Anything in another image.** This reads one file, so a caller in a
+5. **Anything in another image.** This reads one file, and only an **x64** one:
+   PE32+ is not a machine, so an ARM64 image is refused rather than walked as
+   if its exception directory were an array of x64 `RUNTIME_FUNCTION`s. Read
+   `arm64\\breakin.exe` without that check and it reports nine invented
+   functions, all nine with a decode stop and 3,300 refused bytes -- a
+   confident answer about nothing. A caller in a
    different module is invisible -- and where the target is *exported*, that is
    not hypothetical. An `.edata` hit is therefore labelled as what it is rather
    than filed with the structural rows that transfer control nowhere.
@@ -112,6 +117,7 @@ except ImportError:  # pragma: no cover - reported, not raised
 # skipped in silence, which turns this tool's whole output into a negative taken
 # without looking. Review round 1 on #425 named that from both bots.
 IMAGE_SCN_MEM_EXECUTE = 0x20000000
+IMAGE_FILE_MACHINE_AMD64 = 0x8664
 
 PADDING = (0x00, 0xCC)
 
@@ -181,19 +187,37 @@ class Ref:
 
 def load(path: str) -> Image:
     with open(path, "rb") as fh:
-        data = fh.read()
+        return load_bytes(fh.read())
+
+
+def load_bytes(data: bytes) -> Image:
     if data[:2] != b"MZ":
         raise ValueError("not a PE image")
     e_lfanew = struct.unpack_from("<I", data, 0x3C)[0]
     if data[e_lfanew : e_lfanew + 4] != b"PE\0\0":
         raise ValueError("no PE signature")
     coff = e_lfanew + 4
+    (machine,) = struct.unpack_from("<H", data, coff)
     (nsec,) = struct.unpack_from("<H", data, coff + 2)
     (opt_size,) = struct.unpack_from("<H", data, coff + 16)
     opt = coff + 20
     (magic,) = struct.unpack_from("<H", data, opt)
     if magic != 0x20B:
-        raise ValueError("only PE32+ (x64) images are supported")
+        raise ValueError("only PE32+ images are supported")
+    # PE32+ is not x64. ARM64 carries the same optional-header magic, its
+    # exception directory is NOT an array of 12-byte x64 RUNTIME_FUNCTIONs, and
+    # nothing downstream would notice: the `.pdata` walk would invent ranges,
+    # the x86-64 decoder would disassemble ARM64 instructions, and the tool
+    # would print a clean zero. That is the exact failure it exists to prevent,
+    # so it refuses by machine rather than trusting the magic -- and this
+    # repo's own bench guest is ARM64, so such a file is not hypothetical here.
+    # Review round 4 on #425.
+    if machine != IMAGE_FILE_MACHINE_AMD64:
+        raise ValueError(
+            f"machine 0x{machine:04x} is not x64 (0x{IMAGE_FILE_MACHINE_AMD64:04x}): "
+            "this reads x64 .pdata and decodes x86-64, so it would answer with a "
+            "zero that means nothing"
+        )
     (image_base,) = struct.unpack_from("<Q", data, opt + 24)
     exc_rva, exc_size = struct.unpack_from("<II", data, opt + 112 + 3 * 8)
     (entry_point,) = struct.unpack_from("<I", data, opt + 16)
@@ -466,6 +490,18 @@ def parse_targets(spec: str) -> set[int]:
     return {int(t, 0) for t in spec.split(",") if t.strip()}
 
 
+def _pe(machine: int, magic: int = 0x20B) -> bytes:
+    """The smallest byte string `load_bytes` will walk as far as the machine
+    check: a DOS stub pointing at a PE signature, a COFF header carrying
+    `machine` and no sections, and an optional header of the given magic."""
+    e_lfanew = 0x40
+    head = bytearray(b"MZ" + b"\0" * (e_lfanew - 2))
+    struct.pack_into("<I", head, 0x3C, e_lfanew)
+    coff = struct.pack("<HHIIIHH", machine, 0, 0, 0, 0, 0xF0, 0x22)
+    opt = struct.pack("<H", magic) + b"\0" * 0xEE
+    return bytes(head) + b"PE\0\0" + coff + opt
+
+
 def _img(text: bytes, base: int = 0x140000000, claim=None, data: bytes = b"",
          code_name: str = ".text", entry_point: int = 0, headers: bytes = b"") -> Image:
     """A synthetic image: `headers` at rva 0, one executable section at rva
@@ -483,24 +519,25 @@ def _img(text: bytes, base: int = 0x140000000, claim=None, data: bytes = b"",
     return img
 
 
-TOTAL = 20
+TOTAL = 24
 
 # Mutation-verified, so the cases below share one denominator and none of them
 # is passing for a reason unrelated to the rule it names. Backing each of these
 # out of the code above, every one applied and every one was caught:
 #
-#   gap union -> a single start                      18/20
-#   decode window shrunk below one instruction       16/20
-#   sections selected by name again                  19/20
-#   the data scan skips executable sections again    18/20
-#   the PE headers region dropped                    19/20
-#   the entry point not reported                     19/20
-#   every immediate counts as a branch target        19/20
-#   gap hits attributed as `.pdata` hits             16/20
-#   padding-only runs kept as runs                   19/20
-#   no resume after a refused byte                   19/20
-#   refused bytes not counted                        19/20
-#   `--targets` reads a bare value as hex            19/20
+#   gap union -> a single start                      22/24
+#   decode window shrunk below one instruction       20/24
+#   sections selected by name again                  23/24
+#   the data scan skips executable sections again    22/24
+#   the PE headers region dropped                    23/24
+#   the entry point not reported                     23/24
+#   every immediate counts as a branch target        23/24
+#   gap hits attributed as `.pdata` hits             20/24
+#   padding-only runs kept as runs                   23/24
+#   no resume after a refused byte                   23/24
+#   refused bytes not counted                        23/24
+#   any PE32+ machine accepted                       21/24
+#   `--targets` reads a bare value as hex            23/24
 #
 # Two of those earn the comment. The immediate case's FIRST version used
 # `mov eax,0x40001000`, whose immediate is a *neighbouring* number rather than
@@ -660,6 +697,25 @@ def self_test() -> int:
     # is what its own `--help` says: bare is decimal, `0x` is hex. Taking a
     # bare value as hex scans a destination the caller did not name and reports
     # the clean negative that follows.
+    # An ARM64 image carries the same PE32+ magic as an x64 one, and every
+    # stage after `load` would go on to produce a confident zero from it: the
+    # `.pdata` walk reading 12-byte x64 records out of a different format, and
+    # an x86-64 decoder disassembling ARM64. The refusal is by MACHINE, and
+    # `_pe(...)` is the smallest header that reaches the check.
+    for machine, want_ok in ((IMAGE_FILE_MACHINE_AMD64, True), (0xAA64, False),
+                             (0x01C4, False), (0x014C, False)):
+        try:
+            load_bytes(_pe(machine))
+            got_ok = True
+            why = ""
+        except ValueError as exc:
+            got_ok = False
+            why = f" ({exc})"
+        ok = got_ok == want_ok
+        print(f"  {'ok  ' if ok else 'FAIL'} machine 0x{machine:04x} is "
+              f"{'accepted' if got_ok else 'refused'}{why[:60]}")
+        failures += int(not ok)
+
     decimal, hexed = parse_targets("4096"), parse_targets("0x4096")
     ok = decimal == {0x1000} and hexed == {0x4096}
     print(f"  {'ok  ' if ok else 'FAIL'} --targets: 4096 -> "
