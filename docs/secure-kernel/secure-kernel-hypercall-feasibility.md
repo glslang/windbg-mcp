@@ -5866,20 +5866,14 @@ markers are sampled alongside, so the raiser's own report comes back with them.
 | VTL0, intercept standing (comparison) | both VPs, same markers | did not finish |
 | VTL1, no intercept (interleaved) | **none** | finished, 2,000/2,000 handled, **7.49 µs** each |
 
-**"Did not finish" is the whole of what the raiser column measures, and it is deliberately not
-called "slowed but advancing".** A draft of this section said the VTL1 arm was slowed rather than
-frozen and that each raise was being handed back — which is precisely the reading S5h **retracted**:
-its 1,902 / 6,396 / 15,076 / 18,486 counts were all written by the monitor's *final* sample, after
-teardown had removed the intercept and the raiser had finished. This arm measured no progress at
-all. What it measured is that a loop costing **15.3 ms** of raiser time unarmed — `us=15257` over
-2,000 rounds — did not complete inside a 40-second window armed, which a freeze on the first raise
-produces just as well as a slowdown. Both VPs carrying the *same* `Rip` is consistent with one held
-raise rather than a stream of them.
+**"Did not finish" is all this arm's raiser column measures** — a loop costing **15.3 ms** of raiser
+time unarmed (`us=15257` over 2,000 rounds) that did not complete inside a 40-second window armed. A
+freeze on the first raise produces that and so does a large slowdown, and the two numbers are not a
+clean ratio: the 15.3 ms is the raiser's own loop time and the 40 s is wall clock on a PowerShell
+Direct call, most of which is the call. (A draft wrote the loop cost as "15 s", three orders out.)
 
-Those two numbers are not a clean ratio and are not offered as one: the 15.3 ms is the raiser's own
-loop time and the 40 s is wall clock on a PowerShell Direct call, most of which is the call. A draft
-here wrote the loop cost as "15 s", three orders out, which would have made the effect look 1,000×
-smaller than it is.
+**Which of the two it is was then measured, and it is a freeze** — see the next section, which also
+retires the claim this paragraph originally made about the two VPs.
 
 #### The `Rip` is the enclave's instruction, and it agrees with S5h across gates
 
@@ -5951,6 +5945,45 @@ mask*. Review caught the claim; the install for vector `0` was then tried and **
 child's mask is known to admit. The real limit was never the hypervisor — it is which accepted
 exceptions `spin_host` can raise, and it happened to have one.
 
+#### Frozen, not slowed — and the two VPs are one thread ping-ponging
+
+The VTL1 arm read a fresh exception-intercept message on **both** VPs, each carrying its own
+`VpIndex`, at one `Rip`. It called that *"consistent with one held raise"*. **Review was right that
+it is not**: `spin_host`'s raise loop is one thread (`for r in rounds { __try { __debugbreak(); } }`
+plus a monitor thread that only writes a file), so a thread frozen on its first raise cannot execute
+that instruction on a second VP. Two VPs reporting it are two interception events and needed
+explaining rather than glossing.
+
+So it was measured — the progress counter read **while the intercept stands**, at ten instants over
+30 s, with the markers read at the same instants. S5h's *"advancing"* reading was retracted because
+its counts came from the monitor's sample *after* teardown; this reads the side of the release that
+counts.
+
+| | |
+|---|---|
+| `handled`, ten samples over 30 s | **`0` at every one**, while `ms=` advanced 3,484 → 41,062 |
+| `handled` **after** teardown | **2,282** |
+| distinct `(VP, stamp)` pairs | **20** — every sample on both VPs was a new arrival |
+| distinct `Rip` | **one**, `0x000001A6C9DE500D` |
+| `(VP slot, VpIndex)` | exactly `(0, 0)` and `(1, 1)` |
+| `spin_host` threads | 2 throughout |
+
+**The raiser made no progress at all**, so *"did not finish"* is a freeze. And the post-teardown
+`handled=2282` in the same run reproduces the artefact S5h retracted, one line below the correct
+reading — the counter only moves once the intercept is released.
+
+**Interceptions nonetheless kept arriving the whole time**: 20 new stamps across 10 samples, both
+VPs, at one instruction, while nothing retired. That is a re-delivery loop — the intercept fires,
+VID preprocesses it, nothing completes it, and it fires again.
+
+**Which makes the two-VP reading a property of the instrument plus the guest scheduler, and the data
+says so.** The markers are last-arrival state, so a thread re-dispatched between the guest's two
+vCPUs leaves each VP's slot holding its most recent visit — both reading the same `Rip` without two
+simultaneous events. The tell is *which* VP is newer: it alternates, VP 0 leading at t = 9, 15 and
+27 s and VP 1 at the other seven, with the two stamps always within ~10 ms of each other. A single
+held thread pinned to one VP would leave the other's slot stale and falling further behind; it does
+not.
+
 One observation about the rig rather than the target, recorded so nobody reads it as a
 contradiction: `spin_host`'s banner prints *"RaiseBp at …"* in `DE` mode too — it is hard-coded.
 The message's `vector` field reads `0x00`, the intercept standing was for vector `0`, and the `Rip`
@@ -5958,8 +5991,9 @@ differs from the `#BP` arm's, so the raise really was a `#DE`; the banner is mis
 
 #### Bench state
 
-Across the VTL1 arm and the vector 2×2: intercepts installed three times and removed in the phase
-after each; teardown reported **0 standing** both runs. Raiser killed after every arm, none left
-running. Guest responsive with 105 processes and **`LsaIso` still alive** — checked because these
-arms raise exceptions inside VTL1 — both guests up **4h16m** with unbroken uptime, host uptime
-continuous, **no bug check since boot**. Nothing written to a partition object, nothing chained.
+Across the VTL1 arm, the vector 2×2 and the frozen-or-slowed run: intercepts installed four times
+and removed in the phase after each; teardown reported **0 standing** on all three runs. Raiser
+killed after every arm, none left running. Guest responsive with 106 processes and **`LsaIso` still
+alive** — checked because these arms raise exceptions inside VTL1 — both guests up **4h29m** with
+unbroken uptime, host uptime continuous, **no bug check since boot**. Nothing written to a partition
+object, nothing chained.

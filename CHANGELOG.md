@@ -31,12 +31,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   mask at `+0x6124` with an unconditional *exemption* for 3 and 4, `#BR` had already installed
   through the mask, and the vector-0 install was then tried and **succeeded**, adding a vector to
   what this child's mask is known to admit. **The raiser column says "did not finish" and nothing
-  more**: a draft said "slowed but advancing", which is exactly the reading S5h retracted after its
-  counts turned out to be the monitor's post-teardown sample, and this arm measured no progress at
-  all — only that a loop costing **15.3 ms** of raiser time unarmed did not complete in a 40-second
-  window armed, which that same draft wrote as "15 s", three orders out. Scope unchanged: VTL1
-  **user** mode is not Secure Kernel. Bench intact — 0 intercepts standing at teardown on both
-  runs, `LsaIso` alive, both guests up **4h16m**, no bug check since boot.
+  more**, so the freeze was measured separately — the guest's progress counter read **while the
+  intercept stands**, which is the side of the release S5h's retracted "advancing" reading got
+  wrong: `handled = 0` at ten samples over 30 s, against **2,282** the moment teardown releases it,
+  reproducing S5h's artefact one line below the correct reading. **Interceptions kept arriving
+  throughout** — 20 new stamps on both VPs at **one** `Rip` with nothing retiring, a re-delivery
+  loop. And the two VPs are **one thread ping-ponging** between the guest's vCPUs, which
+  last-arrival markers make indistinguishable from two events until you look at *which* VP is newer:
+  it alternates, and the two stamps stay within ~10 ms. A draft had called the two VPs "consistent
+  with one held raise", which review correctly refused — the raise loop is one thread, so a frozen
+  thread cannot reach a second VP — and had written the unarmed loop's **15.3 ms** as "15 s", three
+  orders out. Scope unchanged: VTL1 **user** mode is not Secure Kernel. Bench intact — 0 intercepts
+  standing at teardown on all three runs, `LsaIso` alive, both guests up **4h29m**, no bug check
+  since boot.
 - **The message IS delivered: item 103 step 9's arm, and S5q's third explanation is eliminated.** A
   `#BP` raised in a guest under a standing raw `HvCallInstallIntercept` reaches the root's
   `Vid!VidInterceptPreprocess`, which copies the message, stamps the VP and selects
