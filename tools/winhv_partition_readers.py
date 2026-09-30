@@ -33,9 +33,20 @@ propagated across calls and returns, which this does not do. Read
 "functions that can hold a partition object" as "functions that can obtain one
 by the two routes this looks for".
 
+One more limit, which is the boundary rule's own and is measured rather than
+assumed: a genuine `int3` at an instruction boundary inside gap code ends the
+island there, so a real leaf containing one is split in two -- the half holding
+the anchor load reaches and the half holding the field access does not, and that
+access is **dropped**. That undercounts, which is the direction that matters for a
+census meant to license a negative. It does not reach `.pdata`-claimed functions,
+which have exact bounds, are decoded whole, and never see this rule -- and on
+`winhvr.sys` every reaching region is one of those, so the exposure there is
+hypothetical rather than current.
+
 `--self-test` exercises the gap decoding against images built here: the two
-readings of a `.pdata` gap that each lost real leaf code, and the span-wide region
-that attributed one leaf's field access to another leaf's anchor load. Run it
+readings of a `.pdata` gap that each lost real leaf code, the span-wide region
+that attributed one leaf's field access to another leaf's anchor load, and the
+truncation just described, pinned as behaviour. Run it
 after any change to `decode_island`, `gap_decode_starts` or `regions_of`; a run
 against a real image cannot detect any of those, because the answer on
 `winhvr.sys` does not move through them.
@@ -410,14 +421,22 @@ def _reaching_on(data, md, arr_rva):
 
 
 def _only(reaching):
-    """The single reaching region's start, or None.
-
-    Returns rather than raises, because a mutation that empties `reaching`
-    should make the case that depends on it report FAIL -- an IndexError aborts
-    the run and hides every case after it, which is the opposite of what a
-    mutation check needs to read.
-    """
+    """The single reaching region's start, or None. See `_nth` for why."""
     return sorted(reaching)[0] if len(reaching) == 1 else None
+
+
+def _nth(seq, i):
+    """`seq[i]`, or an empty list when it is not there.
+
+    **Every index in this self-test goes through `_only` or `_nth`**, because a
+    mutation that empties a result must make the case depending on it report
+    FAIL: a bare `seq[i]` raises `IndexError`, which aborts the run and hides
+    every case after it -- so the mutation reads as a crash rather than as the
+    specific assertions it broke. That happened twice here, the second time in a
+    case added one commit after the first was fixed, which is why this is a
+    helper rather than a guard written per site.
+    """
+    return seq[i] if i < len(seq) else []
 
 
 def self_test():
@@ -503,6 +522,26 @@ def self_test():
                  for r in ov_starts if ov[r] not in (0xCC, 0x00)]
     check("two islands each refuse the same byte", [len(x) for x in per_chain], [1, 1])
     check("and it is reported once", len(set(a for x in per_chain for a in x)), 1)
+
+    # --- the boundary rule's own limit, recorded rather than fixed ----------
+    # A GENUINE `int3` at an instruction boundary inside gap code ends the island
+    # there, so a real leaf containing one is split: the half with the anchor load
+    # reaches, the half with the field access does not, and the access is
+    # DROPPED. That is an undercount, which is the direction that matters for a
+    # census meant to license a negative -- so it is pinned as behaviour, with
+    # the prose in the docs saying so, rather than papered over. It does not
+    # touch `.pdata`-claimed functions: those have exact bounds, are decoded
+    # whole, and never see this rule.
+    split = (leaf[:7] + bytes([0xCC]) + leaf[7:])
+    sp_starts, _ = gap_decode_starts(split)
+    halves = [decode_island(md, split, leaf_at, r)[0]
+              for r in sp_starts if split[r] not in (0xCC, 0x00)]
+    check("an int3 inside gap code splits the leaf in two",
+          [len(h) for h in halves], [1, 2])
+    check("the anchor load is still found", anchor_loads(_nth(halves, 0)), 1)
+    check("but the +0x10 read lands in the other half, so it is undercounted",
+          (any("0x10" in i.op_str for i in _nth(halves, 0)),
+           any("0x10" in i.op_str for i in _nth(halves, 1))), (False, True))
 
     # --- end to end on the bare leaf --------------------------------------
     bare = _synthetic_image(bytes([0xCC]) * (leaf_at - TEXT_VA) + leaf)

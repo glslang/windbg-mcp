@@ -5250,6 +5250,17 @@ That leaves the region set a lower bound with possible phantoms — a misaligned
 that are not instructions — so it can only widen the reaching set, never narrow it, which is why the
 two sites that carry the finding are read back as disassembly by hand.
 
+**The boundary rule has a limit of its own, in the direction that matters, and it is measured rather
+than assumed.** A *genuine* `int3` at an instruction boundary inside gap code ends the island there,
+so a real leaf containing one is split in two: the half holding the anchor load reaches, the half
+holding the `+0x10` read does not, and **that access is dropped**. For a census whose purpose is to
+license a negative — that nothing else reads the pair — an undercount is the dangerous direction, so
+it is pinned as behaviour in `--self-test` and stated here rather than papered over with a heuristic.
+What bounds the exposure is that the rule never touches a `.pdata`-claimed function: those have exact
+bounds, are decoded whole, and skip the padding test entirely — and **on `winhvr.sys` all 28 reaching
+regions are `.pdata` functions**, so every one of the 42 accesses comes from a body this limit cannot
+reach. It is a hypothetical for this image and a real one for any image with a reaching gap leaf.
+
 **The sibling instrument had the decoding right and the same provenance question open.**
 `vid_field_census.py` decodes each gap "from every plausible start … and take[s] the union", on the
 stated ground that "no single pass licenses a negative here" — and this section claimed the gaps were
@@ -5266,13 +5277,14 @@ not move** through any of the four: 28 reaching regions and 42 accesses througho
 exactly why the gap scan needed a test of its own rather than agreement on the real image, since a
 run on `winhvr.sys` reports 28 and 42 under **every** reading above, including the one that
 misattributes, because no gap island in this image reaches at all. `--self-test` now carries all
-three defects, **21/21**, each pinned with the broken reading asserted to fail and with two negative
-controls. **Mutation-verified against those same cases**, so the three scores share a denominator:
-reducing the candidate starts to the span start alone scores **10/21**, one span-wide region
-**17/21**, and a summed rather than unioned refusal count **20/21** — the last failing with *got 2,
-wanted 1*, which is the reviewer's own case. A mutation that empties the reaching set reports those
-as failures rather than aborting the run, which an earlier version of the helper did by indexing an
-empty list and hiding every case after it.
+three defects and its own remaining limit, **24/24**, each pinned with the broken reading asserted to
+fail and with two negative controls. **Mutation-verified against those same cases**, so the three
+scores share a denominator: reducing the candidate starts to the span start alone scores **11/24**,
+one span-wide region **20/24**, and a summed rather than unioned refusal count **23/24** — the last
+failing with *got 2, wanted 1*, which is the reviewer's own case. Every index in the self-test goes
+through a helper that returns empty rather than raising, because a mutation emptying a result must
+show up as the assertions it broke: a bare index aborts the run and hides every case after it, which
+happened twice here — the second time in a case added one commit after the first was fixed.
 
 #### What this does to S5j's two explanations
 
