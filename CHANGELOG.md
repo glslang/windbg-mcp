@@ -9,8 +9,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **The hold is a loop, measured on Hyper-V's own per-VP message counter — and the same counter
-  correlates the raising thread with both VPs.** Under *both* surviving readings **the raiser**
+- **The hold is a loop, measured on Hyper-V's per-VP `Total Messages/sec` — and its sibling
+  `Other Intercepts/sec` correlates the raising thread with both VPs.** They are two counters,
+  not one: the first carries the loop evidence and the second the per-VP correlation, and this
+  record says elsewhere that their tracking each other does not prove one message per intercept.
+ Under *both* surviving readings **the raiser**
   makes no progress, because nothing advances `RIP` past the faulting instruction either way, so
   no counter the raiser keeps could discriminate them — *the guest* meanwhile executes throughout,
   which is a distinction a draft lost twice. The

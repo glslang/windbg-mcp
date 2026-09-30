@@ -6016,7 +6016,7 @@ guest VPs' run state is — and that is an arm, not a paragraph.
 > *in*: nothing correlates the single raising thread with either VP, so re-preprocessing of one
 > pending intercept remains equally consistent. **Both readings above stand exactly as written.**
 >
-> **The correlation arrived with [the loop question](#the-loop-question-2026-09-30-measured-on-the-hypervisors-own-message-counter).**
+> **The correlation arrived with [the loop question](#the-loop-question-2026-09-30-measured-on-the-hypervisors-own-per-vp-counters).**
 > `Other Intercepts/sec` — the bucket the exception intercept lands in — is **zero on both VPs in
 > every unarmed phase** and nonzero on **both** VPs armed. That counter moves because an instruction
 > trapped *on that VP*, so the raiser's own exception is landing on both, which re-preprocessing of
@@ -6087,7 +6087,7 @@ exception or advances `RIP`, so the faulting instruction is presumably re-entere
 inference. What would settle it is a count tied to **new hypervisor deliveries** or to **retired
 guest instructions**, and neither arm reports one. The arm ran; it did not answer.
 
-> **[The loop question](#the-loop-question-2026-09-30-measured-on-the-hypervisors-own-message-counter) took the first of those and it is a loop**:
+> **[The loop question](#the-loop-question-2026-09-30-measured-on-the-hypervisors-own-per-vp-counters) took the first of those and it is a loop**:
 > the hypervisor delivers ~63,000 messages a second for the whole armed window, against **zero**
 > in three control phases including an unarmed `#BP` storm. S5k's inference holds.
 
@@ -6153,7 +6153,7 @@ One install, removed in the same run's `finally`; teardown reported **0 standing
 killed, none left running. Guest responsive with 106 processes and `LsaIso` alive, both guests up
 **5h25m** unbroken, host uptime continuous, **no bug check since boot**.
 
-### The loop question, 2026-09-30: measured on the hypervisor's own message counter
+### The loop question, 2026-09-30: measured on the hypervisor's own per-VP counters
 
 **The hold is a loop. The hypervisor delivers ~63,000 messages a second for the whole armed window
 while the raiser completes zero rounds**, and the same counter reads **exactly zero** in every other
@@ -6235,7 +6235,7 @@ four readings of a guest with nothing running. Round counts are per mode now (30
 the progress line is printed for both arms so the rounds retired are on the page rather than
 assumed. The same defect had already been fixed once, in step 6's `InterceptSuspend` control.
 
-#### And it correlates the raising thread with both VPs
+#### And `Other Intercepts/sec` correlates the raising thread with both VPs
 
 `Other Intercepts/sec` is **zero on both VPs in all three unarmed phases** and nonzero on **both**
 armed — VP 1 at ~62,750 and VP 0 at ~3,008, varying sample to sample between 0 and 23,037. A message
