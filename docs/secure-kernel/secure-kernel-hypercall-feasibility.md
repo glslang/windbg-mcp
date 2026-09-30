@@ -5350,7 +5350,9 @@ exactly the way arm 0's zero was. **Separating arms 1 and 2 needs a second readi
 the contemporaneous `[partition+0xB68][3]` the section above specifies, because the slot is mutable
 and a read taken afterwards reports afterwards. Whether the root partition's `Vid.sys` can be
 instrumented that way on this bench is a separate question and is **not established here**;
-`FOLLOWUPS.md` item 103 carries both.
+`FOLLOWUPS.md` item 103 carries both. **Costed below** — and the answer changes the instrument
+rather than the site: `VidInterceptPreprocess` stores its arrival in the VP before it branches, so
+the measurement is a read of that state and not a counter inside a patched function.
 
 #### What it means for the build
 
@@ -5363,3 +5365,145 @@ was built on and leaves the delivery question **open rather than answered agains
 route (item 103 step 8) is where the *chaining* failure points, not somewhere the evidence forces the
 build to go. The cheaper successor is the convergence-point measurement above, and it is ahead of any
 ownership work in the order item 103 records.
+
+### Step 9 feasibility, 2026-09-30: the convergence point records its own arrivals, so the instrument is a read
+
+**Neither of the two routes the step named.** Item 103 step 9 asks how the **root** partition's
+`Vid.sys` can be instrumented to count arrivals at `VidInterceptPreprocess`, and offers *"a patch, a
+breakpoint on a host kernel this bench cannot freeze, or neither"*. It is the third.
+`VidInterceptPreprocess` **stores what it received into the per-VP structure before it branches on
+anything**, so an arrival is readable as data: no byte of `Vid.sys` is modified, nothing is chained
+into a pointer Hyper-V holds, and the host is never stopped. **Nothing here ran live.** This is the
+costing the step asks for and the arm is still to be built — the runtime confirmation is its first
+act, not this gate's.
+
+**What answered, and how.** `Vid.sys` `10.0.26100.9278`, SHA-256 `6611BCD7…B06697` — the same image
+S5q arm 1 read, re-derived from the running host today — opened as a DbgEng image target at
+`0x140000000` with its public PDB, the way S5o read the create path. Two decoding instruments over
+the same file: [`tools/vid_field_census.py`](../../tools/vid_field_census.py) for who else writes
+the fields the read would trust, and [`tools/pe_xref.py`](../../tools/pe_xref.py), new here, for
+what else can reach the handler they select.
+
+#### The entry block is unconditional, and it leaves the message behind
+
+`VidInterceptPreprocess(V, Message)` runs straight from its first instruction to `+0x4f` with no
+branch in it. Everything in the first four rows therefore happens on **every** call, whatever the
+message is and whichever of the three callers made it:
+
+| at | instruction | what it leaves in `V` |
+|---|---|---|
+| `+0x14` | `lock bts dword ptr [V+0x130],0` | bit 0 of `V+0x130` set |
+| `+0x22` | `mov dword ptr [V+0x23C],esi` (`esi` = 0) | `V+0x23C` cleared |
+| `+0x30`…`+0x38` | `memcpy(V+0x30, Message, byte [Message+4] + 0x10)` | the whole `HV_MESSAGE` at `V+0x30` — header and payload, sized from its own `PayloadSize` |
+| `+0x3f`, `+0x4f` | `KeQueryPerformanceCounter()` → `mov qword ptr [V+0x208],rax` | an arrival timestamp |
+| `+0x86`, `+0x96` | `mov [V+0x158],rax` / `mov [V+0x200],esi` | the handler this message type selects, and its reason index |
+
+The last row is the common tail of the type switch rather than the straight line, reached for every
+type the switch recognises. An **exception intercept** reaches it through the jump table at
+`Vid+0x3D137` index 1 (`0x80010003 + 0x7FFEFFFE`), so a delivered `#BP` leaves four values that name
+each other:
+
+| field | value for a delivered exception intercept |
+|---|---|
+| `V+0x30` | `0x80010003` — `HvMessageTypeX64ExceptionIntercept` |
+| `V+0x68` | the vector, `3` for `#BP` (`VidHandleExceptionIntercept` reads it from exactly there) |
+| `V+0x158` | `Vid!VidHandleExceptionIntercept`, RVA `0x11690` |
+| `V+0x200` | `2` |
+
+#### Reaching `V` from what S5q already reads at run time
+
+Every link is read out of this image, and the last one is self-checking:
+
+1. S5q step 2 already reads, live, the `Routine`/`Context` pair Hyper-V holds per partition —
+   `Vid!VidInterceptIsrCallback` and `0xFFFF818A46DF5000` for partition `0x3`.
+2. That context is the **VID partition object** `P`. `VidPartitionIoctlSetup+0x1566` loads
+   `VidInterceptIsrCallback`, picks between it and `VidExoVpInterceptIsrCallback` with
+   `bt rdx,0Fh` + `cmovae`, and passes it with `r15` to `WinHvCreatePartitionEx` — and the same
+   `r15` receives the VP-array pointer at `+0x218f` and `+0x2477`. The routine and the array are
+   registered off one register in one function, which is what makes them one object.
+3. `VidVpLookup` (RVA `0xac540`) spells the array out: VP count at `[P+0xAA8]`, refused above
+   `0x800`, and `V = [P+0xAB0] + VpIndex * 0x980`. `VidInterceptIsrCallback+0x24` computes the same
+   thing inline from `[Message+0x10]`.
+4. **`V+0` is a back-pointer to `P`** — `VidHandleExceptionIntercept` opens with `mov rcx,[rcx]` and
+   then locks `[P+8]`. So a reader validates its own arithmetic rather than trusting it: if
+   `[V+0] != P`, the walk is wrong and the read is refused.
+
+`[P+0xB68]` — the per-vector byte table S5k found, `0xFF` for an unclaimed vector — hangs off the
+**same** `P`, which is what makes step 9's *"in the same arm"* free rather than a second mechanism:
+one IOCTL, one instant. The claiming client is `[P+0xB58] + index * 0xB0`, the stride
+`VidHandlerpExceptionRegisterEntry` divides by when it stores the index.
+
+#### Why a read is sound here, and the two censuses that say so
+
+**`V+0x208` has one writer that can be this structure's.** A census of the displacement across
+`Vid.sys` finds **28 accesses, 9 writing, 0 address-taken**. Eight of the nine writes are other
+objects, identified by what else their base register reaches: a dispatch-interface object
+(`+0x210`/`+0x220`, three sites), a PIO file object, an Slp request, a crypt workspace and one
+`rsp`-based stack local. The ninth is `VidInterceptPreprocess+0x4f`, whose base also reaches
+`0x18, 0x29, 0x2C, 0x30, 0x130, 0x23C` — the VP. **Zero address-taken** matters as much as the
+count: there is no `lea` of that field for a write to travel through, which is the hole the same
+tool found for `[p+0x3060]` in S5p. The residuals `vid_field_census.py` records stand unchanged —
+an inter-procedural pointer, a bulk copy spanning the field, and another image entirely.
+
+**`VidHandleExceptionIntercept` cannot run without those markers being written first.** It has
+**one** reference in the whole image: the `lea` at `VidInterceptPreprocess+0x1e0` that puts it in
+`V+0x158`. Nothing else names it, in `.pdata`-claimed code or in the 4,352 candidate starts across
+the ten non-padding gap runs, and no data section holds its address beyond its own
+`RUNTIME_FUNCTION` and its `GFIDS` entry — neither of which transfers control anywhere. So the read
+is not sampling one path into VID's exception handling; it is on all of them.
+
+`VidInterceptPreprocess` itself has exactly **three** direct callers, the three this plan names
+(`VidInterceptIsrCallback+0x35`, `VidXSchedulerpVpRun+0xaa`, `VidXSchedulerVpThreadStartRoutine+0x1c8`),
+which closes the "known callers" lower bound for direct calls in this image. **The instrument does
+not depend on that** — it reads what the callee stores, so a fourth caller would be counted like the
+other three. That is the whole reason it is better than the counter step 9 originally specified.
+
+#### What the read cannot do
+
+- **It is last-arrival state, not a counter.** A second intercept on the same VP overwrites every
+  field above. The arm's design leans on the VP being stopped while the trap is held, which is
+  S5h's measured signature and **not** something this read establishes — so the positive control
+  (a raise under a Vid-installed intercept, which must arrive) has to demonstrate that the markers
+  are still there when sampled, or a negative from it means nothing. Arm 0's zero is the standing
+  warning.
+- **It cannot separate arms 1 and 2 by itself.** The unclaimed branch of
+  `VidHandleExceptionIntercept` (`+0x100`) returns `0` and leaves no per-VP marker, and the claimed
+  branch's difference is a return value its callers test and do not store. The contemporaneous
+  `[P+0xB68][3]` read is not a nicety here; it is the only thing that names the branch.
+- **Non-Exo only**, as S5o's reading was: `VidExoVpInterceptIsrCallback` is a separate ISR and this
+  gate did not read it.
+- **One image.** A write into the VP structure from `winhvr.sys` or anywhere else is invisible to a
+  census of `Vid.sys`.
+
+#### The three routes, costed
+
+| route | what it costs on this bench | verdict |
+|---|---|---|
+| **read** the per-VP markers | one bounded kernel-read IOCTL in `h3probe.sys`, shaped like `IOCTL_H3_WHVPART` minus its hard-coded RVA, with `[V+0] == P` as its own validity check, plus a client script. No reboot, no host code modified, both guests keep running, and the `[P+0xB68][3]` read comes in the same call | **this one** |
+| **patch** `VidInterceptPreprocess` | the shape fits: a 16-byte-aligned entry, a first instruction of exactly 5 bytes that an `E9 rel32` replaces on an instruction boundary, 10 bytes of `0xCC` ahead of it, and `.text` non-paged `Execute Read`; the two images sat `0x284D7730` apart at S5q arm 0, so a `rel32` reaches. Against that: making `.text` writable, cross-modifying-code serialisation across CPUs, unwind info that stops describing the first instruction, and **PatchGuard, whose coverage of `Vid.sys` this gate did not establish** — a `CRITICAL_STRUCTURE_CORRUPTION` arrives minutes or hours later, takes the host and both guests, and names nothing | not worth paying for an answer a read gives |
+| **breakpoint** on the host kernel | `debug` is not configured on this host — measured today, `bcdedit /enum {current}` prints `testsigning` and `hypervisorlaunchtype` and no debug line — so it costs a boot-config change and a reboot, which drops both guests, and every break freezes the host including whatever drives the arm. Local kernel debugging is read-only by this repo's own record ([`docs/driver-ioctl-walkthrough.md`](../driver-ioctl-walkthrough.md)), so it cannot count arrivals whatever enabling it costs | dominated — more expensive than the read and strictly weaker |
+
+One thing was noticed and deliberately not chased: `Vid.sys` carries an `fothk` section, which is
+Windows' own hot-patch thunk area, and the image's extended DLL characteristics say **CET
+compatible**. Whether that mechanism can be driven for a bench instrument was **not read**, and it
+is recorded as unread rather than dismissed.
+
+#### Bench state this gate read, and changed nothing of
+
+| | |
+|---|---|
+| host | `10.0.26300`, UBR `9457`; `ntoskrnl 10.0.26100.9457` |
+| `Vid.sys` | `10.0.26100.9278`, SHA-256 `6611BCD7…B06697` — the image S5q arm 1 read |
+| `winhvr.sys` | `10.0.26100.8972`, SHA-256 `7D407FC4…` |
+| code integrity | `CodeIntegrityOptions 0x282203`, unchanged from S5q step 2: CI on, test-signing on, **`HVCI_KMCI_ENABLED` clear**, `HVCI_IUM_ENABLED` set; `Win32_DeviceGuard.SecurityServicesRunning` empty |
+| boot | `testsigning Yes`, `hypervisorlaunchtype Auto`, no `debug` |
+| guests | both running |
+| `h3probe` | service installed, **stopped**. Nothing was loaded, started or written |
+
+#### What is still not done
+
+The IOCTL does not exist, and the chain above is read out of one image plus S5q step 2's
+already-recorded runtime pair. The arm's first act is the runtime confirmation this gate cannot
+give: `[V+0] == P` for each VP, a plausible `[P+0xAA8]`, and `[P+0xB68]` pointing at a table that is
+mostly `0xFF`. Until that runs, "the instrument is a read" is a design backed by a static reading,
+which is what the step asked to be costed and not yet a measurement.

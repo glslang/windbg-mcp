@@ -4015,12 +4015,45 @@ validated. The full record is the
       branch from an enqueue to a pre-existing claimant — the slot is mutable, so a read taken
       afterwards reports afterwards. That read is the one the
       "was the slot claimed?" section has been asking for since S5k; this step is where it belongs
-      rather than as an arm of its own. **Open, and its feasibility is the first question, not the measurement**: this is the
-      *root* partition's `Vid.sys`, so how it can be instrumented on this bench — and whether that
-      is a patch, a breakpoint on a host kernel this bench cannot freeze, or neither — is
-      unestablished. Cost that before scheduling the arm. **Ahead of steps 7 and 8 in the order**,
+      rather than as an arm of its own. **Ahead of steps 7 and 8 in the order**,
       because it can move the delivery question without owning a partition or taking a handle out of
       a protected process.
+
+      **Feasibility answered 2026-09-30, and it is the third branch: neither a patch nor a
+      breakpoint, but a read.** The step asked how the root's `Vid.sys` can be instrumented at all
+      and said to cost that first; the answer is that it does not need to be, because
+      `VidInterceptPreprocess` **stores what it received before it branches on anything**. Its
+      entry block runs straight to `+0x4f` with no branch: it copies the whole `HV_MESSAGE` to
+      `[VP+0x30]` and timestamps `[VP+0x208]`, and the type switch then leaves the chosen handler
+      at `[VP+0x158]` and its reason index at `[VP+0x200]` — so a delivered `#BP` is four values
+      naming each other (`0x80010003`, vector `3` at `[VP+0x68]`,
+      `Vid!VidHandleExceptionIntercept`, `2`). The VP is reached from the context S5q step 2
+      already reads live — `[P+0xAB0] + VpIndex*0x980`, validated by `[VP+0] == P`, which
+      `VidHandleExceptionIntercept` itself relies on — and `[P+0xB68]` hangs off the **same** `P`,
+      so *"in the same arm"* costs nothing extra: one IOCTL, one instant. Sound because
+      `[VP+0x208]` has one writer with this structure's fingerprint and **0 address-taken** sites
+      across `Vid.sys`, and because `VidHandleExceptionIntercept` has **exactly one reference in
+      the whole image** — the `lea` inside `VidInterceptPreprocess` — so the markers are on every
+      path into VID's exception handling rather than on one. Built
+      [`tools/pe_xref.py`](tools/pe_xref.py) for that second reading, `--self-test` 13/13 and
+      mutation-verified on five edits, because a reachability *negative* over an image is the one
+      claim a byte scan cannot make: a branch encodes a displacement, not an address, and the
+      address appears in immediates that transfer control nowhere. **Cost**: one bounded kernel-read
+      IOCTL in `h3probe.sys` and a client script, against a patch route that fits mechanically
+      (5-byte first instruction, 10 bytes of padding, `rel32` in range) but buys a **PatchGuard**
+      exposure this gate did not measure, and a host-breakpoint route that needs a reboot this bench
+      has not configured (`debug` is off) and is read-only when it arrives. The full record, with
+      every offset and both censuses, is the **step 9 feasibility** section of
+      [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
+
+      **Still open, and what it now needs.** Nothing ran live: the IOCTL does not exist, and the
+      walk above is a static reading plus S5q step 2's recorded pair. The arm's first act is the
+      runtime confirmation this gate cannot give — `[VP+0] == P`, a plausible `[P+0xAA8]`, and
+      `[P+0xB68]` pointing at a table of mostly `0xFF`. Two limits carry into the arm's design
+      rather than being retired by it: the read is **last-arrival state, not a count**, so the
+      positive control has to show the markers are still there when sampled or its own negative
+      means nothing; and the unclaimed branch returns `0` and stores no marker, so
+      `[P+0xB68][3]` remains the only thing that can name which branch ran.
 
    **The list above is the *ownership* route, and S5q goes around it rather than continuing it.**
    Every step in it exists because the exported user-mode receiver needs a partition handle.

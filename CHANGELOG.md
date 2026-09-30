@@ -9,6 +9,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The convergence point records its own arrivals, so the instrument is a read.** Item 103 step 9
+  asked how the **root** partition's `Vid.sys` could be instrumented — *"a patch, a breakpoint on a
+  host kernel this bench cannot freeze, or neither"* — and said to cost that before scheduling the
+  arm. It is the third, and the reason is in the function: `VidInterceptPreprocess` runs straight
+  from its entry to `+0x4f` with no branch, copying the whole `HV_MESSAGE` to `[VP+0x30]` and
+  timestamping `[VP+0x208]`, and the type switch then leaves the selected handler at `[VP+0x158]`
+  and its reason index at `[VP+0x200]`. A delivered `#BP` is therefore four values that name each
+  other, readable from the partition context gate S5q already reads live — `[P+0xAB0] +
+  VpIndex*0x980`, checked against the back-pointer at `[VP+0]` that `VidHandleExceptionIntercept`
+  itself relies on — and `[P+0xB68]`, the per-vector claim table the step also requires, hangs off
+  the same object, so the two readings the arm has to take together cost one IOCTL rather than two
+  mechanisms. **Sound because of two censuses, not because the code looks that way**: `[VP+0x208]`
+  has one writer whose base carries this structure's fingerprint and **0 address-taken** sites in
+  the image, and `VidHandleExceptionIntercept` has **exactly one reference anywhere in `Vid.sys`**
+  — the `lea` inside `VidInterceptPreprocess` — so the markers sit on every path into VID's
+  exception handling rather than on one of them. That also retires the worry the step was written
+  around: the read is inside the callee, so it does not depend on having enumerated the callers.
+  **New instrument**: `tools/pe_xref.py`, which answers *what can reach this RVA* by decoding
+  rather than searching — a branch encodes a displacement that depends on where it sits, so there
+  is no byte pattern to find, and the bytes of a function's address appear in immediates that
+  transfer control nowhere. It attributes hits inside `.pdata` entries by name, decodes the
+  executable bytes `.pdata` does not claim as a **detector** over every candidate start (reported
+  apart and labelled, because a gap carries no boundary information), and searches data sections
+  for the two encodings a dispatch table uses, labelling the image's own `RUNTIME_FUNCTION` and
+  `GFIDS` rows as the structure they are rather than filtering them out of sight. `--self-test`
+  13/13, **mutation-verified on five edits** — and the first version of its byte-scan case passed
+  under the mutation it existed for, because the immediate it used was a neighbouring number rather
+  than the target's address. **Costed against the alternatives**: the patch route fits mechanically
+  (a 5-byte first instruction an `E9 rel32` replaces on an instruction boundary, ten bytes of
+  padding ahead of it, `rel32` in range) but buys a PatchGuard exposure this gate did not measure,
+  whose failure arrives later and names nothing; the host-breakpoint route needs a boot-config
+  change this bench has not made and is read-only when it arrives. **Nothing ran live** — the
+  IOCTL does not exist, and the arm's first act is the runtime confirmation a static reading
+  cannot give.
 - **The writer census, and a retracted claim comes back as a measurement.** Gate S5p, answering the
   step review added to the plan when it refused S5o's overreach. `[partition+0x3079]` — one of the
   two fields the VID create path tests before handing a second process a partition handle — has
