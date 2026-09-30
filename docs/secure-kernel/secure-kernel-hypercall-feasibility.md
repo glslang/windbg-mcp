@@ -5593,3 +5593,87 @@ them sounded.** One IOCTL, called three times per raise — **before**, **during
 with the backed-out arm **interleaved** rather than run as a clean batch, and the positive control —
 a raise under a Vid-installed intercept, which must be delivered — in the same session. None of that
 is machinery: it is the same call three times.
+
+### Step 9 steps 1 and 2, 2026-09-30: the walk holds at run time, and the markers reproduce the jump table
+
+**The read is built and run, and every link the feasibility gate derived statically survives
+contact — with two of them confirmed by something other than themselves.** Nothing was raised, no
+intercept was installed and nothing was written anywhere, so this is the confirmation that gate
+could not give and **not** the arm.
+
+`h3probe.sys` gains `IOCTL_H3_VIDVP` (`0x80A`), which takes a **partition id** — never a pointer —
+and returns the per-VP markers together with `[P+0xB68][0..7]`. Three things keep it from being an
+arbitrary kernel read, which in the root is a host bug check rather than a guest one:
+
+1. **The object walked is one Hyper-V itself holds.** The partition context is resolved through
+   `H3ReadPair`, under the same `WinHvpPartitionArrayLock` and behind the same `winhvr.sys` build
+   check S5q step 2 established, so a caller cannot hand the driver a pointer to dereference.
+2. **The registered routine must land inside the loaded `Vid.sys`.** If it does not, the context is
+   not a VID partition object and none of these offsets mean anything; the read is refused with
+   `STATUS_OBJECT_TYPE_MISMATCH` rather than attempted.
+3. **Every dereference goes through `H3SafeRead`** — kernel-canonical address, `MmIsAddressValid`
+   per page, `__try`/`__except`, `APC_LEVEL` or below. None of that makes the read *safe*; what it
+   does is turn the likely failures into a reported status instead of a bug check.
+
+And the walk validates itself: `[V+0x00]` is the back-pointer `VidHandleExceptionIntercept` loads
+on its own first instruction, so a VP whose back-pointer is not the partition we started from is
+marked invalid and its markers are not believed. The offsets are guarded by a `Vid.sys` build check
+of the **loaded** image — `TimeDateStamp` `0xE1E29EBE`, `SizeOfImage` `0xDC000` — reported either
+way, so a caller on another build gets a refusal rather than a plausible answer.
+
+#### What it read, on both partitions
+
+| | partition `0x2` | partition `0x3` |
+|---|---|---|
+| routine Hyper-V holds | `Vid+0x4170` (`VidInterceptIsrCallback`) | the same |
+| `[P+0xAA8]` VP count | **2** | **2** |
+| `[P+0xAB0]` VP array | `0xFFFFD5064C3BD000` | `0xFFFFD5064CE9A000` |
+| VP 1 at array + `0x980` | yes | yes |
+| `[V+0x00]` back-pointer | equals `P` on both VPs | equals `P` on both VPs |
+| `[P+0xB68]` vectors 0–7 | `FF FF FF FF FF FF FF FF` | `FF FF FF FF FF FF FF FF` |
+
+**`[P+0xB68][3]` is `0xFF` — unclaimed.** That byte is the one S5k named and
+[the "was the slot claimed?" section](#was-the-slot-claimed-not-read-and-the-probes-own-removals-make-s5hs-controls-silent-on-it)
+has been asking for since; this is the first time it has been read at all. It is a reading **with no
+intercept installed**, so it says the table reads and looks like a table, and nothing yet about what
+the slot holds during an arm.
+
+#### The part that is worth more than the back-pointer check
+
+**The markers reproduce the type switch, live, on two message types and two partitions.** The
+feasibility gate read the jump table at `Vid+0x3D137` and the `lea`/`mov esi` pairs it dispatches
+to; the live markers agree with that reading without being told:
+
+| `[V+0x30]` message type | `[V+0x158]` handler | `[V+0x200]` reason | predicted by the static read? |
+|---|---|---|---|
+| `0x80000000` `UnmappedGpa` (both VPs of `0x2`, VP 0 of `0x3`) | `Vid+0x26040` `VsmmHandleMemoryIntercept` | `7` | yes — `mov esi,7` beside that `lea` |
+| `0x80010000` `X64IoPortIntercept` (VP 1 of `0x3`) | `Vid+0x3460` `VidHandleIoPortIntercept` | `5` | yes — `mov esi,5` beside that `lea` |
+
+That is a differential between a static reading of the image and a live reading of the structure it
+writes, and the two agree on every field. It is the thing a back-pointer check cannot give: the
+back-pointer says *we are walking the right object*, and this says *the object holds what
+`VidInterceptPreprocess` was read to put there*.
+
+**Two further corroborations, both from outside the instrument.** `[P+0xAA8]` read `2` for each
+partition and Hyper-V's own management view reports **2 vCPUs** for each guest — an oracle that has
+nothing to do with these offsets. And the copied message's own header carries its sender: `02 00 00
+00` at message + 8 on partition `0x2`, `03 00 00 00` on partition `0x3`, matching the partition ids
+the walk started from.
+
+**One thing the output makes obvious and this record should not leave implicit**: `[V+0x68]` is the
+exception vector **only** for message type `0x80010003`. On the IO-port message it read `0x71`,
+which is ordinary payload at that offset. Read the type first; the vector field is meaningless
+without it.
+
+#### Bench state
+
+Driver started, four VPs read across two partitions, driver stopped. Host uptime continuous at
+2h31m with no reboot, **no bug check since boot**, and both guests still running with unbroken
+uptime. Nothing was written, no intercept was installed, and no chain slot was touched.
+
+#### What this does not do
+
+It does not raise anything, so no exception intercept has been observed and the delivery question
+is exactly where the feasibility gate left it. What it retires is the *risk* in the arm rather than
+the arm: the walk is confirmed, the guards are exercised, and the markers are known to carry live
+state rather than zeros — which is what would have made a first arm's reading uninterpretable.
