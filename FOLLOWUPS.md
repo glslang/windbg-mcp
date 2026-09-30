@@ -3555,7 +3555,8 @@ validated. The full record is the
 
   **Stop conditions.** A **host** bugcheck retires the in-kernel receiver — the callback runs in
   the root's dispatch path, so a fault there takes the bench rather than a guest. It no longer
-  *selects* step 8's own-partition build: step 8 is costed and the decision is not to build.
+  *selects* step 8's own-partition build: step 8 is costed, and the costing did not settle the
+  build either way.
   **That, and not the displacement, is the hazard this gate carries**;
   the displacement is bounded to one child and is what the lift above accepts. A guest that wedges
   only with the chain installed stops the gate until the chain is fixed. **Teardown order is part
@@ -4050,15 +4051,15 @@ validated. The full record is the
       the LiveCloudKd package a scope decision rather than a compatibility one, and it means closing
       this step either way also settles what to say about that tool.
    8. ~~**The fallback S5q's host-bugcheck stop selects, and a decision rather than an arm.**~~
-      **COSTED 2026-09-30 — decision: do not build the rig.** The tier that would serve this line
-      requires booting Windows with VBS inside a partition we made, which means reproducing the
-      device and firmware model rather than calling it; the cheap tier establishes ownership and
-      receipt and leaves the Secure Kernel question where it is. The documented partition API
-      cannot reach VTL, so there is no shortcut off the undocumented surface. **No call was made**,
-      so *no known obstacle* still rests on S5o's static read, S5p's census and S5n's control of
-      the first step only — and the one untested gate is most of the cheap tier's own cost, so
-      nothing settles the route before paying for it. Figures, decoded gates and the three tiers
-      are in the **Step 8** section of
+      **COSTED 2026-09-30 — and the costing did not yield the decision.** What it establishes is a
+      negative: the documented partition API cannot reach VTL, so the rig rests entirely on the
+      undocumented VID surface and private COM contracts. What it does **not** establish is the
+      cost — a first draft decided *do not build* on a buffer size read as a field count and a
+      module list read as code to be rewritten, and review rejected both. **Two named probes would
+      decide it**, neither run: a census of `Vid.sys`'s `0x2211A0` handler for the fields it
+      validates, and an activation probe on one of the device-model CLSIDs. **No call was made**,
+      so *no known obstacle* still rests on S5o, S5p and S5n's control of the first step only.
+      Figures, decoded gates, the three tiers and both retractions are in the **Step 8** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
    9. ~~**Measure delivery at the convergence point, which is what S5q's zero could not.**~~
       **RUN 2026-09-30, and the message IS delivered** — feasibility, the read, and the arm, all
@@ -4255,8 +4256,8 @@ validated. The full record is the
    `WinHvSetInterceptRoutine` needs none — it is a `winhvr.sys` kernel export keyed by partition id
    — so with the standing constraint lifted for disposable guests the active work is **S5q**, and
    steps 6 to 8 are what matters only if S5q's stop conditions fire. Step 7 stays open on its own
-   terms; step 8 was the fallback the host-bugcheck condition selected, and is now **costed, with
-   the decision not to build**, so that condition selects nothing. **Step 9 went ahead of both
+   terms; step 8 was the fallback the host-bugcheck condition selected, and is now **costed
+   without a decision**, so that condition selects a route whose cost is still unbounded. **Step 9 went ahead of both
    and is now RUN** — it was put there because arm 1's conclusion was narrowed from *answered
    against* to *open*, and putting the cheapest thing that could move it before the routes needing
    ownership or a duplicated handle is what got the question answered: the message is delivered.
