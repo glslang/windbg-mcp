@@ -3836,7 +3836,8 @@ validated. The full record is the
   neighbours, leaving two leaves emitted back to back collapsed. Adding `ret` as a second boundary
   would split a real two-return function instead, then `jmp` and `int 29h` in turn — a predicate per
   round. **So boundaries are not inferred at all.** A `.pdata` entry is a function (exact bounds,
-  decoded whole), and **that is where 28 and 42 come from** — all 28 checked to be `.pdata` functions.
+  decoded whole), and **that is where 28 and 42 come from** — and nowhere else by construction, since
+  `analyse` iterates the `.pdata` table only and a gap span is never keyed into the reaching set.
   A gap span is a *detector*: the union over its candidate starts, reported in its own section,
   **excluded from both counts**, labelled *boundaries unknown*. Here that section prints **"none: no
   span reaches an anchor or touches `+0x10`, `+0x18`"** — the negative stated as a measurement rather
