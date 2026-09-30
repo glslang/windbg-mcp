@@ -4059,16 +4059,18 @@ validated. The full record is the
       because a previous `#BP` on that VP leaves all four markers already reading as a delivery and
       a post-raise sample cannot tell that from a new arrival; the timestamp works as the version
       stamp precisely because preprocess writes it unconditionally and before the type dispatch.
-      The third read is the spoiler check on `[P+0xB68][3]`. Two limits carry into that design
-      rather than being retired by it: the read is **last-arrival state, not a count**, so the
-      positive control has to show the markers are still there when sampled or its own negative
-      means nothing; and nothing durable records *which* branch `VidHandleExceptionIntercept` took,
-      so `[P+0xB68][3]` names it only if the slot did not move between the handler consulting the
-      table and the sample. A same-request read narrows that window and does not close it, and the
-      remedy that would — recording the value in the delivery path — is the patch route this gate
-      declined, so the arm **checks** the assumption (sample either side of the raise, a change
-      spoils the branch reading) rather than making it. The arms-1-versus-2 split is therefore
-      narrowed rather than decided; delivery itself rests on the VP markers alone and is unaffected.
+      The third read is a spoiler *filter* on `[P+0xB68][3]`. **Three limits carry into that design
+      rather than being retired by it**, and the doc states them once rather than per paragraph,
+      because three review rounds landed on one sentence that kept reclaiming coverage. First, the
+      read is **last-arrival state, not a count**, so the positive control has to show the markers
+      are still there when sampled. Second, that control shows the *instrument* works and **not**
+      that a raw-installed delivery shares VID's own route, so a raw-arm negative means *no arrival
+      was observed at the convergence point* and not *not delivered*. Third, nothing durable
+      records which branch `VidHandleExceptionIntercept` took, and sampling cannot supply it at any
+      cadence — a claim-and-restore between two samples reads as unchanged — so **arms 1 and 2 are
+      not separable by this instrument at all**, and the remedies that would separate them are
+      stabilising the table or instrumenting the handler, which is the patch route this gate
+      declined. Delivery itself rests on the VP markers alone and is unaffected by the third.
 
    **The list above is the *ownership* route, and S5q goes around it rather than continuing it.**
    Every step in it exists because the exported user-mode receiver needs a partition handle.
