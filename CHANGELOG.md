@@ -9,8 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **Item 103 step 7's deciding arm is run, and the route is closed from user mode: duplication is
-  possible and insufficient.** The named next arm — invoke the receiver through a duplicated handle
+- **Item 103 step 7's route WORKS from kernel mode, and using it hard-reset both lab guests.** Two
+  results, and the second is not a footnote. `h3probe` gained `IOCTL_H3_VIDREG`, which attaches to
+  the owning process with `KeStackAttachProcess` — the gate reads `PsGetCurrentProcess()`, so that
+  is precisely what it wants — and, before issuing anything, resolves the handle to its file
+  object and **reads `[partition+0x3780]` back: it holds the attached `EPROCESS` on both workers**,
+  confirming the decompiled gate by direct measurement. The same control code `0x221148`, the same
+  16-byte input, the same handle value that returned `ACCESS_DENIED` from user mode, then returns
+  **`STATUS_SUCCESS`** with a registration handle, and the unregister succeeds. **The only
+  difference between the refused and accepted calls is which process
+  `PsGetCurrentProcess()` returns** — as controlled as a pair gets. So duplication gets the handle
+  and only kernel mode can be the process the gate wants. **And each arm hard-reset the guest it
+  touched** — `Kernel-Power` 41, **no** guest bug-check record, so a partition reset rather than a
+  crash from inside — seconds after that arm's own health check had reported the guest responsive.
+  Candidate mechanism, offered as that: the registration arms vector 3 with no message slot mapped
+  or drained, and the **variable** delay (~1–2 s on one guest, ~20–30 s on the other) is what
+  waiting for the next `#BP` looks like. **The rule this changes**: pairing an install with its
+  removal is necessary and **not sufficient**, because the arming does the damage — map and drain
+  the slot first or expect to lose the guest. Also: a post-arm liveness probe measures nothing on
+  this path. Host untouched, both guests back up, `LsaIso` alive on the VBS one.
+- **Item 103 step 7's deciding arm is run, and the route is closed from *user mode*: duplication
+  is possible and insufficient.** (**It is open from kernel mode** — see the entry above, which
+  passes the gate by attaching to the owner.) The named next arm — invoke the receiver through a duplicated handle
   rather than infer from a neighbouring call — was invoked on **both** workers, with the IOCTL
   issued directly rather than through `VidRegisterExceptionHandler`, because the wrapper runs its
   `NTSTATUS` through `RtlNtStatusToDosError` and that would collapse

@@ -6810,7 +6810,8 @@ the negative result means nothing.
 
 **Step 7's route is closed from user mode by duplication alone**, measured rather than inferred: a
 handle taken out of an unprotected `vmwp.exe` with the access that handle carries is refused by
-`Vid.sys` at the receiver. The two halves now read as — duplication **possible** and **insufficient**,
+`Vid.sys` at the receiver. **From kernel mode it is open** — the gate-arm section below passes the
+same call by attaching to the owning process, so *user mode* is the scope of this sentence. The two halves now read as — duplication **possible** and **insufficient**,
 inheritance **excluded** for any handle a worker still holds.
 
 **And LiveCloudKd's procedure needs more than this record's summary of it describes.** Duplicating a
@@ -6823,3 +6824,79 @@ answer. Its source still has not been read.
 this repository), whose header carries the safety envelope: vector **3** only — `#PF` or `#GP` would
 queue messages nobody drains — one VM per invocation so the other stays untouched, rollback in a
 `finally`, poisoned output, and the negative control first.
+
+### Step 7, the gate arm, 2026-09-30: the route works from kernel mode — and using it reset both guests
+
+**Two results, and the second is not a footnote.** Satisfying the process-identity gate from kernel
+mode makes the receiver accept a registration, which answers step 7. It also hard-reset both lab
+guests, seconds after each arm had reported the guest healthy. The capability and the collateral are
+one finding and this section reports them together.
+
+#### The gate is confirmed by reading it back, not just by passing it
+
+`h3probe`'s `IOCTL_H3_VIDREG` attaches to the owning process with `KeStackAttachProcess` — which
+updates what `PsGetCurrentProcess()` returns, and is therefore exactly what the gate reads — and
+**before** issuing anything it resolves the handle to its file object, takes `FsContext & ~3` as the
+partition, and reads `[partition+0x3780]` back:
+
+| worker | handle | `[partition+0x3780]` | attached `EPROCESS` | matched |
+|---|---|---|---|---|
+| pid 5928 (`Lab Guest Control`) | `0x2D8` | `0xFFFFD5064DC21080` | `0xFFFFD5064DC21080` | **yes** |
+| pid 5508 (`Lab Guest Hyper-V`) | `0x2C8` | `0xFFFFD5064DA9F080` | `0xFFFFD5064DA9F080` | **yes** |
+| both | the other three each | *not a partition* — `FsContext` read refused | — | — |
+
+So the field the decompiler pointed at does hold the owning process, and the three handles sharing
+one file object are confirmed again as the raw device rather than a partition.
+
+#### And the receiver accepts it
+
+| | user mode (`s7_receiver_arm.ps1`) | kernel mode, attached (`s7_gate_arm.ps1`) |
+|---|---|---|
+| the partition handle | `0xC0000022` `ACCESS_DENIED` | **`0x00000000` SUCCESS**, handle returned |
+| the other three | `0xC0000002` `NOT_IMPLEMENTED` | `0xC0000002` `NOT_IMPLEMENTED` |
+| unregister | not run — nothing returned | **`0x00000000` SUCCESS** |
+
+**This is as controlled as a pair gets**: the same handle value, the same control code `0x221148`,
+the same 16-byte input, the same 8-byte poisoned output — and the only difference is which process
+`PsGetCurrentProcess()` returns. That flips `ACCESS_DENIED` to `SUCCESS`. The returned registration
+handles were `0x510B0F4341910F` and `0x5117988A6EA70F`, the poison replaced in both, and both
+unregistered cleanly.
+
+**So step 7's route works, and it needs kernel mode.** Duplication gets the handle; only kernel code
+can be the process the gate wants. That is the whole of what user mode was missing, established by
+the difference rather than argued from the code.
+
+#### It reset both guests, and the pairing did not prevent it
+
+Each arm's own health check passed — *"responsive, procs=102"*, `LsaIso` alive — and then the guest
+it had touched went down:
+
+| | arm ran | guest reset | delay |
+|---|---|---|---|
+| `Lab Guest Control` | uptime read 11:42:56 | **19:56:48** | ~20–30 s |
+| `Lab Guest Hyper-V` | uptime read 11:43:23 | **19:57:13** | ~1–2 s |
+
+**What kind of failure it was**: `Kernel-Power` **41** in each guest, **no `1001` bug-check record**,
+and *"successfully booted an operating system"* on the host afterwards. So the partition was
+**hard-reset**, not crashed from inside — the guest OS never got to write a bug check. The host was
+untouched: no host bug check, uptime continuous, and both guests came back with `LsaIso` alive on
+the VBS one.
+
+**The candidate mechanism, offered as that and not as a finding.** The registration points a client
+entry at vector 3, and nothing in this arm ever mapped or drained a message slot for it — the
+`VidMessageSlot*` half was not called. So the first `#BP` the guest raises after the arm has an
+intercept installed and no consumer. The **variable delay** is what fits that: ~1–2 s on one guest
+and ~20–30 s on the other is what waiting for the next `#BP` looks like, where a fixed cost of the
+IOCTL itself would not vary. Untested, and testing it means mapping the slot first.
+
+**The operational rule this changes.** This line's standing advice is to pair an install with its
+removal in a `finally`, and this arm did exactly that — register, unregister, both `SUCCESS`, both
+inside microseconds. **Pairing is necessary and not sufficient**: the damage is done by the *arming*,
+not by leaving it armed, so an unregister that succeeds does not undo it. Anything that registers an
+exception handler on a live partition must map and drain the message slot **first**, or expect to
+lose the guest.
+
+**And a warning about the health check.** Both arms asked the guest whether it was well, got a
+straight answer, and the guest was gone seconds later. A post-arm liveness probe on this path
+measures nothing — the consequence waits for the guest's next exception. Read the uptime *later*, or
+watch the host's `Hyper-V-Worker-Admin` log rather than asking the patient.
