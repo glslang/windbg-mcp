@@ -54,14 +54,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whose COFF `Machine` is not AMD64 rather than trusting the PE32+ magic, which ARM64 shares: read
   this host's own `arm64\breakin.exe` without that check and it reports **nine invented functions,
   all nine with a decode stop and 3,300 refused bytes** — a confident answer about nothing, on a
-  bench whose guest is ARM64. `--self-test` **24/24,
-  mutation-verified on thirteen edits**, every one applied and every one caught — and two of those
+  bench whose guest is ARM64. And the candidate-start detector runs over **every executable byte**
+  rather than only over what `.pdata` leaves unclaimed, because a linear sweep is one framing of a
+  function and not coverage of it: `EB 01 B8 E8 F8 FF FF FF C3` sweeps as `jmp` / `mov
+  eax,0xfffff8e8` / `inc ebx` and refuses **no byte**, while the `call` at offset 3 — the `jmp`'s
+  own destination — is never decoded. So "0 refused" is about rejection and not about coverage, and
+  the sentence that read it as coverage is corrected. On `Vid.sys` the wider pass is 652,268
+  candidate starts and finds no route the sweep missed, with one re-framing of a swept hit dropped
+  and counted. `--self-test` **26/26,
+  mutation-verified on fifteen edits**, every one applied and every one caught — and three of those
   earn a note. The byte-scan case's first version passed under
   the very mutation it existed for, because the immediate it used was a neighbouring number rather
   than the target's address; and `report` is now rendered into a sink for every case, because the
   counts come from `scan` and the printing path was otherwise never executed — which is exactly
   where the first version of this round's own fix crashed, on a tuple that had grown a field, with
-  15/15 still on the screen. The linear decode replaced a quadratic one and was kept on a
+  15/15 still on the screen. The third: widening the re-framing rule to drop *every* detection
+  scored a clean sheet, because no case held an exact hit and a real detection at the same time —
+  the control that pins it from the other side was written only after the mutation run said so. The
+  linear decode replaced a quadratic one and was kept on a
   **differential** against the version it replaced rather than on the argument for it: identical
   references for nine targets in `Vid.sys` and five in `winhvr.sys`, **49.5 s down to 1.8 s**.
   **Costed against the alternatives**: the patch route fits mechanically
