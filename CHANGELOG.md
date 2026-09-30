@@ -22,7 +22,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   parents' current `OBJ_INHERIT` flags) were both insufficient, the second because a flag cleared
   after child creation leaves the child's copy invisible in the parent. The same comparison shows
   the four VID handles are **two** file objects, three sharing one and one separate, mapping
-  exactly onto the `INVALID_FUNCTION`/`ACCESS_DENIED` split.
+  exactly onto the `INVALID_FUNCTION`/`ACCESS_DENIED` split. **And an instrument fault of our own
+  is fixed rather than recorded**: an earlier reading of 53 handles for each `vmmem` was a stale
+  uninitialised buffer — the call returns `STATUS_SUCCESS` and writes nothing — where the truth is
+  zero, corroborated by a perf-counter `HandleCount` of 0. Poisoning the buffer is what found it,
+  for the third time in this work.
   `VidGetHvPartitionId` through all **eight** then returns `ERROR_INVALID_FUNCTION` on six and
   **`ERROR_ACCESS_DENIED`** on two — the same 3-and-1 split in each worker independently — against
   `ERROR_INVALID_HANDLE` for a non-VID control, so they reach `Vid.sys` and are turned away. **A draft of this nearly shipped the opposite**: it
