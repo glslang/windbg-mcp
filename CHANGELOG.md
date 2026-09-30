@@ -9,6 +9,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Item 103 step 8 is costed, and the decision is not to build the rig.** Owning a Hyper-V
+  partition from creation is reachable, and the tier that would serve the Secure Kernel line
+  means booting Windows with VBS inside a partition we made — reproducing the device and
+  firmware model rather than calling it. Three figures carry it: the **documented** partition
+  API (`WinHvPlatform.dll`) has **66 exports and none naming VTL, VSM or secure**, so there is
+  no shortcut off the undocumented surface; `VidpSetupPartition`'s IOCTL input is **51,936
+  bytes** minimum, which is what one of roughly a dozen undocumented calls costs to fill; and a
+  live `vmwp.exe` carries **19 VM-specific modules, ~9.9 MB**, which an owner that is not
+  `vmwp.exe` gets none of. Static throughout — PE tables and `vid.dll` decoded in DbgEng with
+  no target, the instrument S5o used — and **no call was made**, so the route's admission past
+  its first step is still unmeasured, and the untested gate is most of the cheap tier's own
+  cost. Decoded gates, the three tiers and what each buys are in the **Step 8** section of
+  [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 - **The hold is a loop — supported, on Hyper-V's per-VP `Total Messages/sec` — and its sibling
   `Other Intercepts/sec` correlates the raising thread with both VPs.** They are two counters,
   not one: the first carries the loop evidence and the second the per-VP correlation, and this
@@ -358,7 +371,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   Neither state value is decoded, one build was read, and Exo partitions and handle duplication are
   untouched. **S5 does not pass**: the refusal is understood by cause rather than by match, and the
   route behind it empties the room it opens — with the writer census, not the VMM-of-our-own
-  question, as the next cheap thing that could change either reading.
+  question, as the next cheap thing that could change either reading. **Both have since run**: the
+  census as S5p, and the VMM-of-our-own question as step 8's costing, which decides against the
+  build.
 - **Two gate sections still carried a "what to run next" list, and both had gone stale.** The class
   fix recorded against the previous round — one ordered plan in `FOLLOWUPS.md`, result sections
   stating what they leave *open* rather than what to run — was applied to two of the four sections
@@ -384,7 +399,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the virtual processors* operation, not a second client joining; it was not called. **S5's
   obstacle has changed shape** — the mechanism exists and is exported, and what blocks it is a
   refused open — with two arms left before the VMM-of-our-own question, which is a rig
-  rather than an arm.
+  rather than an arm. **That rig is now costed — see the step 8 entry above — and the decision is
+  not to build it.**
 - **The receiver is a user-mode export, and there is no driver left to write.** Gate S5m, the IOCTL
   read S5k named, against `Vid.sys`, `vid.dll` and `WinHvPlatform.dll`. The control code is
   `0x221148` — read from the dispatcher's compare chain, with a `0x10`-byte input carrying the

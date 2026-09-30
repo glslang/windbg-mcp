@@ -3530,8 +3530,10 @@ validated. The full record is the
   nothing is dispatched. What it does test is real, and it
   is also the only arm that can be run without installing a vector, so the standing constraint does
   not reach it. Only if arm 0 is stable does the exception handling go in. **If arm 0 bugchecks the
-  host, the in-kernel receiver is retired and step 8's own-partition build is selected** — the same
-  stop condition as below, reached for a tenth of the cost.
+  host, the in-kernel receiver is retired** — the same stop condition as below, reached for a
+  tenth of the cost. It used to add *and step 8's own-partition build is selected*; step 8 has
+  since been costed and its decision is **not** to build, so a host bugcheck retires the receiver
+  and leaves this line with no selected successor.
 
   **Pass:** a `#BP` raised in VTL1 user mode is delivered to **our** callback, its context is
   readable, and `WinHvCompleteIntercept` resumes the raiser. Nothing in S5 has met this; S5h
@@ -3551,9 +3553,10 @@ validated. The full record is the
     enclave completes a full `L<n>` cycle. A wedged guest means the chain is wrong, and every
     reading downstream of it is measuring that instead.
 
-  **Stop conditions.** A **host** bugcheck retires the in-kernel receiver and selects step 8's
-  own-partition build — the callback runs in the root's dispatch path, so a fault there takes the
-  bench rather than a guest. **That, and not the displacement, is the hazard this gate carries**;
+  **Stop conditions.** A **host** bugcheck retires the in-kernel receiver — the callback runs in
+  the root's dispatch path, so a fault there takes the bench rather than a guest. It no longer
+  *selects* step 8's own-partition build: step 8 is costed and the decision is not to build.
+  **That, and not the displacement, is the hazard this gate carries**;
   the displacement is bounded to one child and is what the lift above accepts. A guest that wedges
   only with the chain installed stops the gate until the chain is fixed. **Teardown order is part
   of the gate**: remove the hypervisor intercept bit **first**, then restore the saved routine, and
@@ -4046,13 +4049,17 @@ validated. The full record is the
       Secure Kernel breakpoints is *this step*, reached by doing the thing S5n declined. That makes
       the LiveCloudKd package a scope decision rather than a compatibility one, and it means closing
       this step either way also settles what to say about that tool.
-   8. **The fallback S5q's host-bugcheck stop selects, and a decision rather than an arm.**
-      The VMM-of-our-own question: own the
-      partition from creation, where `VidPartitionCreate` admits any name for an administrator and
-      the whole `vid.dll` sequence is then reachable by construction. S5p measured the warrant S5o
-      lacked for the admission path — but only for writes a decoded-operand census can see, and
-      only alongside step 7 still being open, so this is the route with **no known obstacle**
-      rather than the only one. Still a reason to **cost** the rig rather than start building it.
+   8. ~~**The fallback S5q's host-bugcheck stop selects, and a decision rather than an arm.**~~
+      **COSTED 2026-09-30 — decision: do not build the rig.** The tier that would serve this line
+      requires booting Windows with VBS inside a partition we made, which means reproducing the
+      device and firmware model rather than calling it; the cheap tier establishes ownership and
+      receipt and leaves the Secure Kernel question where it is. The documented partition API
+      cannot reach VTL, so there is no shortcut off the undocumented surface. **No call was made**,
+      so *no known obstacle* still rests on S5o's static read, S5p's census and S5n's control of
+      the first step only — and the one untested gate is most of the cheap tier's own cost, so
+      nothing settles the route before paying for it. Figures, decoded gates and the three tiers
+      are in the **Step 8** section of
+      [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
    9. ~~**Measure delivery at the convergence point, which is what S5q's zero could not.**~~
       **RUN 2026-09-30, and the message IS delivered** — feasibility, the read, and the arm, all
       three; the result is below and the reasoning is kept because the next arm (a VTL1 raise) is
@@ -4248,7 +4255,8 @@ validated. The full record is the
    `WinHvSetInterceptRoutine` needs none — it is a `winhvr.sys` kernel export keyed by partition id
    — so with the standing constraint lifted for disposable guests the active work is **S5q**, and
    steps 6 to 8 are what matters only if S5q's stop conditions fire. Step 7 stays open on its own
-   terms; step 8 is the fallback the host-bugcheck condition selects. **Step 9 went ahead of both
+   terms; step 8 was the fallback the host-bugcheck condition selected, and is now **costed, with
+   the decision not to build**, so that condition selects nothing. **Step 9 went ahead of both
    and is now RUN** — it was put there because arm 1's conclusion was narrowed from *answered
    against* to *open*, and putting the cheapest thing that could move it before the routes needing
    ownership or a duplicated handle is what got the question answered: the message is delivered.
