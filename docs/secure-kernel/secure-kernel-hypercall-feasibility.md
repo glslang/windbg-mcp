@@ -5245,13 +5245,21 @@ a lower bound with possible phantoms — a misaligned start decodes bytes that a
 it can only widen what is found, and the two sites carrying the finding are read back as disassembly
 by hand.
 
-**The sibling instrument had the decoding right and the same provenance question open.**
+**The sibling instrument had it right from the start, and the tool has now converged on it.**
 `vid_field_census.py` decodes each gap "from every plausible start … and take[s] the union", on the
-stated ground that "no single pass licenses a negative here" — and this section claimed the gaps were
-decoded *"as `vid_field_census.py` does"* while doing something else in the first two readings, which
-is the tell worth keeping: naming the right sibling is not copying its method. It reports a *field*
-census rather than a per-function one, so the attribution defect above does not arise there in the
-same form; whether its own union can cross a leaf boundary is **not examined here**.
+stated ground that "no single pass licenses a negative here" — which is exactly where this one has
+ended up after four wrong turns, while its own prose claimed all along that the gaps were decoded
+*"as `vid_field_census.py` does"*. Readings one, two and four each decoded differently; only the third
+matched, and that one's defect was attribution rather than decoding. **Naming the right sibling is not
+copying its method**, and the claim of equivalence sat in this section for three commits before one of
+them was true.
+
+**Checked rather than assumed, since the same defect would matter there**: it labels each gap hit with
+a `func_rva` of the *span* start and a `func_name` looked up from it — a lossy label — but marks the
+text `[OUTSIDE .pdata]`, and it has **no anchor correlation at all**, being a census of every access to
+a displacement rather than of functions that can hold a partition object. So the misattribution above
+cannot arise there: there is no anchor load for a field access to be credited to. Nothing in that tool
+was changed here.
 
 **And `rbp` is no longer assumed to be a frame pointer**: in optimized
 x64 it is an ordinary callee-saved register unless the function's `UNWIND_INFO` names it as the

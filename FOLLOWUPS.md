@@ -3844,9 +3844,12 @@ validated. The full record is the
   frame pointer**, being suppressed only where the function's `UNWIND_INFO` names it as the frame
   register — 16 such operands exist image-wide and none is in a reaching function. **The answer did not
   move** through any of the five: 28 and 42 throughout, under every broken reading too, which is why
-  the gap scan needed its own test. **The reaching set is still a lower bound**:
-  28 even if it reads the pair, which no amount of the above accounts for. The tool now has
-  `--self-test`, **24/24** — detection under each alignment hazard, no-attribution in both the padded
+  the gap scan needed its own test. **The reaching set is still a lower bound**: a function handed the
+  partition object as an *argument*, or getting one from a helper other than
+  `WinHvpReferencePartition`, calls neither anchor and is absent from the 28 even if it reads the
+  pair — and none of the gap work above touches that, because it is a provenance limit rather than a
+  coverage one. Closing it needs provenance carried across calls and returns, which the tool does not
+  do. **The tool now has `--self-test`, 24/24** — detection under each alignment hazard, no-attribution in both the padded
   and unpadded shapes, a byte refused twice counted once, and a `.pdata`-claimed function as the
   control that attribution still happens where bounds are exact; mutation-verified so the scores share
   a denominator — attributing gap spans as functions scores 20/24, a single start 15/24, a summed

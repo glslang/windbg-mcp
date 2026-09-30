@@ -47,9 +47,9 @@ alignment hazard, the no-attribution rule in both the padded and the unpadded
 shape, a byte refused by two overlapping starts counted once, and a
 `.pdata`-claimed function as the control that attribution still happens where the
 bounds are exact. Run it after any change to `decode_span`, `gap_decode_starts`,
-`regions_of` or `analyse_gaps`; a run against a real image cannot detect any of
-them, because the answer on
-`winhvr.sys` does not move through them.
+`regions_of` or `analyse_gaps`. A run against a real image cannot stand in for it:
+`winhvr.sys` reports the same 28 functions and 42 accesses under every one of the
+four broken readings, so only a constructed image can tell them apart.
 """
 import argparse
 import struct
