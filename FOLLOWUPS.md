@@ -3426,7 +3426,8 @@ validated. The full record is the
   **whether the hold is a loop**, since nothing on the drop path injects the exception or advances
   `RIP`, so the faulting instruction is presumably re-entered, an inference S5k did not measure —
   are **both blocked by the standing constraint below**, and the replicated arm additionally needs
-  root kernel-memory access this bench does not have.
+  root kernel-memory access this bench does not have. **Both ran on 2026-09-30** once the
+  constraint lifted and S5q's IOCTL supplied the kernel read — see step 6 below.
 
   **Standing constraint, from S5l: no arm may install an exception vector on a child until the
   teardown hazard has a remedy.** The pair is unremediable here — per S5l a pre-read is a
@@ -4002,11 +4003,24 @@ validated. The full record is the
       functions absent from `.pdata`, and addresses formed in two steps — and both are closed or
       measured, with neither changing the result. **Residuals**: an inter-procedural pointer, a
       bulk copy spanning the field, and `[p+0x3060]`'s writers being bounded rather than closed.
-   6. **The two blocked arms** — the replicated slot read, and whether the hold is a loop — were
-      held by the standing constraint above, which lifted for guests the bench owns on
-      2026-09-29, and the first also by root kernel-memory access, which S5q's kernel-read IOCTL
-      supplies. Both are runnable under S5q rather than blocked, and a delivered message answers
-      the second outright.
+   6. ~~**The two blocked arms** — the replicated slot read, and whether the hold is a loop.~~
+      **BOTH RUN 2026-09-30, in one window, with a control.** The constraint lifted for guests the
+      bench owns on 2026-09-29 and S5q's kernel-read IOCTL supplied the rest.
+      **The slot read**: `[P+0xB68]` reads `FF FF FF FF FF FF FF FF` at **all twelve** samples
+      across 24 s of a standing intercept, plus before the install and after the removal — the
+      contemporaneous, **non-mutating** read S5k has wanted since it was written, and which S5m
+      could only half-answer because registering *claims* the slot. It narrows S5j's retained
+      explanation without closing it: a claimant would have had to claim and release inside one 2 s
+      gap and coincide with the raise. **The loop**: `handled = 0` at all twelve samples while the
+      raiser's own clock ran to `ms=31609`, so S5k's inference that the faulting instruction is
+      re-entered is measured. **And a third reading came free and matters more**: per-VP
+      `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at different instants and `0`
+      at every sample of a control that raised **1.87 million** `#BP`s with no intercept standing,
+      while both VPs keep accumulating `VpRuntime`. **The VPs are being resumed** — which falsifies
+      the premise review round 3 on #428 used to refuse the ping-pong reading of the two-VP markers.
+      What performs the resumption is still unmeasured. Full record in the **step 6's two blocked
+      arms** section of
+      [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
    7. **Handle duplication and inheritance, which S5n excluded rather than closed and which this
       plan twice wrote out of existence.** A process that duplicates or inherits a handle
       `vmwp.exe` already holds reaches the exported receiver **without** passing the create path's
@@ -4153,11 +4167,15 @@ validated. The full record is the
       ten samples over 30 s, against **2,282** the moment teardown releases it, reproducing S5h's
       artefact one line below the correct reading. Interceptions kept arriving throughout: 20 new
       stamps on both VPs at **one** `Rip`, with nothing retiring — a re-delivery loop. **Where the
-      second VP's events come from is UNRESOLVED**, and two drafts got it wrong in turn: the first
+      second VP's events come from was UNRESOLVED** — until step 6's arms measured the guest VPs'
+      run state a run later and found `InterceptSuspend` **transient** with both VPs accumulating
+      runtime, which falsifies the premise round 3 used and puts the ping-pong reading back as the
+      supported one (what performs the resumption is still unmeasured). Two drafts got it wrong in
+      turn before that: the first
       called the two VPs "consistent with one held raise", which review refused because the raise
       loop is one thread; the second called it that thread ping-ponging between vCPUs, which review
       refused again because migrating needs the VP resumed and `WinHvCompleteIntercept` — the thing
-      that resumes an intercepted VP — is exactly what nothing is calling. Settling it means
+      that resumes an intercepted VP — is exactly what nothing is *observed* calling. Settling it meant
       measuring the delivery mechanism, which is an arm. Nothing else rests on it: delivery, the
       `Rip`, the `ExecutionState` 2×2 and the freeze are each measured independently. The first
       draft also wrote the unarmed loop's **15.3 ms** as "15 s", three orders out.
