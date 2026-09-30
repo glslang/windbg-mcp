@@ -50,8 +50,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   their negatives readings of the whole image. The PE headers are scanned as a region of their own
   and `AddressOfEntryPoint` is reported by name, because a driver's `DriverEntry` has **no caller
   in its own image**: `Vid.sys`'s own entry point draws zero code references and one loader route,
-  which is what the earlier version would have printed as a clean negative. `--self-test` **20/20,
-  mutation-verified on twelve edits**, every one applied and every one caught — and two of those
+  which is what the earlier version would have printed as a clean negative. And it refuses an image
+  whose COFF `Machine` is not AMD64 rather than trusting the PE32+ magic, which ARM64 shares: read
+  this host's own `arm64\breakin.exe` without that check and it reports **nine invented functions,
+  all nine with a decode stop and 3,300 refused bytes** — a confident answer about nothing, on a
+  bench whose guest is ARM64. `--self-test` **24/24,
+  mutation-verified on thirteen edits**, every one applied and every one caught — and two of those
   earn a note. The byte-scan case's first version passed under
   the very mutation it existed for, because the immediate it used was a neighbouring number rather
   than the target's address; and `report` is now rendered into a sink for every case, because the
