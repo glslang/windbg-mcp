@@ -33,9 +33,14 @@ not there -- and because nothing in a detection says which function it belongs
 to. The two are kept apart rather than merged, or a phantom would be laundered
 into an exact attribution. The one thing dropped is a detection that overlaps a
 swept hit AND names the same target -- `48 8d 05 ...` read again at +1 as
-`8d 05 ...` -- which cannot lose a transfer, since both framings name the same
-RVA and a reachability question does not care which is the true one. Those are
-counted and the count is printed.
+`8d 05 ...` -- which cannot remove an RVA from the answer, since both framings
+name the same one. Those are counted and the count is printed.
+
+**So this answers "which RVAs are named", not "how many instructions name
+one".** A shifted start that a branch really does enter would be a distinct
+instruction rather than a re-framing, and it is dropped anyway because the
+target is already in the set. Read a count of references as a count of
+*routes found*, never as a census of call sites.
 
 **Two data encodings are searched as well**, in EVERY section including the
 executable ones and in the PE headers, because a function reached from a table
@@ -418,14 +423,23 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
     # exactly as a gap hit is. Anything else would launder a phantom from a
     # misaligned start into an exact attribution.
     # Extents of the instructions the linear sweep already reported, so a
-    # detection that is the SAME instruction re-framed from a shifted start --
-    # `48 8d 05 ...` read again at +1 as `8d 05 ...`, same displacement, same
-    # destination -- is not printed as a second route. The rule is narrow on
-    # purpose: it drops a detection only where it overlaps a hit AND names the
-    # same target, so it cannot lose a real transfer. Which framing is the true
-    # one does not matter to a reachability question when both name the same
-    # RVA. Re-framings are counted and the count is printed, because a
-    # suppression nobody can see is indistinguishable from a bug.
+    # detection that overlaps one AND names the same target -- `48 8d 05 ...`
+    # read again at +1 as `8d 05 ...`, same displacement, same destination --
+    # is not printed as a second route. Counted, and the count is printed,
+    # because a suppression nobody can see is indistinguishable from a bug.
+    #
+    # WHAT THIS RULE IS A CLAIM ABOUT, because review round 6 filed against it
+    # and the distinction is the answer: it is sound for *which RVAs are named*
+    # and NOT for *how many instructions name one*. The reviewer is right that
+    # overlap plus an identical target does not prove the shifted decode is
+    # merely a re-framing -- a branch landing at +1 would make it a genuine,
+    # distinct instruction. It would still name the same RVA, so the set this
+    # tool reports is unchanged and no route is lost; what is lost is a site
+    # count, which is not the question here and is stated as not being it.
+    # Establishing that the shifted start is unreachable would need the
+    # reachability analysis this decoder deliberately does not do, and paying
+    # for it in output noise on every future scan buys nothing the conclusions
+    # rest on. So: fact taken, remedy declined, limit written down.
     exact_at = {r.rva for r in refs if r.exact}
     exact_spans = [(r.rva, r.size, r.target) for r in refs if r.exact]
     detected_at = {(r.rva, r.target) for r in refs if not r.exact}
