@@ -6156,12 +6156,15 @@ killed, none left running. Guest responsive with 106 processes and `LsaIso` aliv
 
 ### The loop question, 2026-09-30: measured on the hypervisor's own per-VP counters
 
-**The hold is a loop. The hypervisor delivers **65,676** messages a second across the two VPs for
-the whole armed window
-while the raiser completes zero rounds**, and the same counter reads **exactly zero** in every other
-phase — including one in which the raiser storms `#BP`s with no intercept installed. S5k's inference
-holds, step 6's arm 2 is answered, and the counter that answers it is one nothing in this line had
-read.
+**The hold is a loop — supported, not proven, and by a wide margin.** The hypervisor delivers
+**65,676** messages a second across the two VPs for the whole armed window while the raiser
+completes **zero** rounds, and the same counter reads **exactly zero** in all five control
+phases — two of them with the raiser storming `#BP`s and no intercept installed, one with the
+intercept standing and no raiser. S5k's inference holds under the assumption stated below, step
+6's arm 2 is answered, and the counter that answers it is one nothing in this line had read.
+*Supported* rather than *proven* because these are **aggregate rates**: they carry no vector and
+no `RIP`, so no individual delivery is bound to the enclave instruction — the limit is set out
+in full two sub-sections down.
 
 #### Why nothing the raiser can count could have done it
 
@@ -6234,28 +6237,35 @@ wrong counter inverted the answer.
 **And the second half is a finding, now with a matched VTL0 control.** Normalised per round, in one
 run:
 
-| unarmed raiser | rounds | over | rounds/sec | intercepts/sec **both VPs, over idle** | **exits per round** |
+| unarmed raiser | rounds | over | rounds/sec | **all** exits/sec, both VPs | **exits per round** |
 |---|---|---|---|---|---|
-| VTL0 | 13,600,634 | 11.89 s | 1.14 M | 1,965 | **0.0017** |
-| VTL1 | 1,441,021 | 11.91 s | 121 k | 252,678 | **2.09** |
+| VTL0 | 13,600,634 | 11.89 s | 1.14 M | 3,067 | **≤ 0.0027** |
+| VTL1 | 1,441,021 | 11.91 s | 121 k | 253,780 | **≥ 2.078** |
 
-**A VTL0 `#BP` costs essentially no hypervisor exit; a VTL1 one costs about two.** Same guest,
-same binary, same counter, only the VTL differing — and the round-rate gap in that same run is
-**9.45×**,
-against the 9.7 µs / 0.85 µs this record carries elsewhere.
+**A VTL0 `#BP` costs at most 0.0027 hypervisor exits; a VTL1 one costs at least 2.078.** Same
+guest, same binary, same counter, only the VTL differing — and the round-rate gap in that same
+run is **9.45×**, against the 9.7 µs / 0.85 µs this record carries elsewhere.
 
-Both columns are computed from **both VPs' excess over this run's own idle means** (933 and 169 a
-second) and from the raiser's own clock rather than the sample spacing. A draft divided VP 1's
-rate alone by a mis-taken window and got 0.0013 and 1.3 — an undercount, since VP 0 also carries
-51,824 a second during the VTL1 arm against a 933 idle, and this section's own conclusion is
-that the raising thread runs on both.
+**They are bounds, and neither needs a baseline subtracted on the side that matters.** A draft
+subtracted this run's idle means from each arm and reported 0.0017 and 2.09 as point estimates,
+which review round 6 rejected and was right to: the idle phase is **three samples reading 558,
+2,389 and 360** both-VP exits a second, the VTL0 arm's VP 0 mean falls *below* its idle mean, and
+a negative background drift can cancel a positive `#BP` contribution just as easily as reveal
+one. "Under the drift" is not an upper bound on anything.
 
-**The VTL0 row is at the noise floor and should be read as such.** This run's idle VP 0 mean is
-933 over three samples against a VTL0-arm 857, so that VP contributes −**76** to the excess and
-the whole 1,965 comes from VP 1. The figure is *not* a measurement of a small positive cost; it
-is a bound saying the cost is under the drift of a three-sample baseline. What carries the
-comparison is the **three orders of magnitude** between the columns, which no plausible baseline
-error touches.
+So the columns above subtract nothing on the VTL0 side. **3,067 is every exit that occurred on
+either VP during that arm**, background included, so `0.0027` per round cannot be exceeded
+whatever the background was doing — an arm cannot be charged more exits than happened. The VTL1
+row is the mirror image: all 253,780 exits **minus the largest both-VP total seen in any
+raiser-absent phase of this run** (2,389 a second, the outlying idle sample), which is the
+conservative direction for a floor.
+
+**The ratio of those two bounds is 775×, and it is itself a bound rather than an estimate.** That
+is what carries the comparison; the point estimates it replaces were never what the data
+supported. A draft also divided VP 1's rate alone by a mis-taken window and got 0.0013 and 1.3,
+an undercount, since VP 0 carries 51,824 a second during the VTL1 arm and this section's own
+conclusion is that the raising thread runs on both — which is why both columns are both-VP
+totals.
 
 **That is a measured difference in kind, not a decomposition of the timing**, and a draft called it
 *"the mechanism behind the 11× cost"*, which it is not: nothing here apportions 9.7 µs between the
