@@ -53,8 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   over it, labels everything past the stop as possibly mis-framed and prints the refused count —
   without which a single byte of inline data would leave every later call in that function
   unexamined while the range still counted as claimed, so the gap detector would not pick it up
-  either. Both images read here report **0 decode stops and 0 refused bytes**, which is what makes
-  their negatives readings of the whole image. The PE headers are scanned as a region of their own
+  either. Both images read here report **0 decode stops and 0 refused bytes** — a diagnostic, and
+  *not* the reason their negatives are sound: a sweep that consumes inline data at the wrong
+  framing refuses nothing at all, so what widens coverage is the candidate-start pass over every
+  executable byte, below. The PE headers are scanned as a region of their own
   and `AddressOfEntryPoint` is reported by name, because a driver's `DriverEntry` has **no caller
   in its own image**: `Vid.sys`'s own entry point draws zero code references and one loader route,
   which is what the earlier version would have printed as a clean negative. And it refuses an image
