@@ -29,7 +29,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   instructions. **And a third reading came free**: per-VP
   `HvRegisterInterceptSuspend` is **transient** — seen on both VPs at different instants, and `0` at
   every sample of a control that raised **1.87 million** `#BP`s with no intercept standing — while
-  both VPs keep accumulating `VpRuntime` and the guest retires nothing. **The VPs are being
+  both VPs keep accumulating `VpRuntime` and the **raiser** completes no rounds. **The VPs are being
   resumed**, which removes the necessary-condition objection review round 3 on #428 raised against
   the ping-pong reading of the two-VP markers — and removing an objection to one explanation is not
   evidence for it over another, so that question stays open: nothing here correlates the single

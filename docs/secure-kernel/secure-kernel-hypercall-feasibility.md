@@ -5978,7 +5978,7 @@ counts.
 reading — the counter only moves once the intercept is released.
 
 **Interceptions nonetheless kept arriving the whole time**: 20 new stamps across 10 samples, both
-VPs, at one instruction, while nothing retired. That is **twenty calls to
+VPs, at one instruction, while the raiser completed no rounds. That is **twenty calls to
 `VidInterceptPreprocess`** and it is deliberately not called a re-delivery loop, which a draft of
 this sentence did: repeated *preprocessing* is what was measured, and one pending intercept
 re-preprocessed produces the same series as the instruction being re-executed twenty times.
@@ -6098,7 +6098,9 @@ unarmed raiser retired 1.87 million `#BP`s across those six samples — raising 
 ~150 k/s — and `InterceptSuspend` never left `0`. So the transient `1`s in the armed arm are ours.
 
 **`InterceptSuspend` is transient, not sticky, and both VPs keep accumulating runtime throughout.**
-The VPs are therefore being resumed, repeatedly, while the guest retires nothing.
+The VPs are therefore being resumed, repeatedly, while the **raiser** completes no rounds — not
+while *the guest* retires nothing, which a draft said and the runtime readings below contradict:
+both VPs are executing guest code, background threads included.
 
 **What that does, exactly.** Round 3's objection was a *necessary condition*: a thread cannot be
 scheduled on the other vCPU unless its VP is resumed. That condition is now measured to hold, so
@@ -6116,8 +6118,8 @@ the caller is a hypothesis this arm does not test.
 **And the armed arm's VPs are emphatically executing, not parked.** S5c's suspend calibration is
 the scale to read this against: a genuinely suspended VP accumulated **430 / 1,032 / 495** units
 over 2000 ms there, and an *idle* unsuspended one **53,293–84,075**. VP 1 armed accumulates
-**~15,000,000** per 2 s — four orders above a parked VP and two above an idle one — while the guest
-retires nothing.
+**~15,000,000** per 2 s — four orders above a parked VP and two above an idle one — while the
+raiser completes no rounds.
 
 **The drop from the control's ~22 M to the armed ~15 M is left unattributed.** A draft explained it
 as each iteration costing an exit and root-side processing, which this arm cannot support: the two
