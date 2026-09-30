@@ -3561,8 +3561,12 @@ validated. The full record is the
   which branch S5h met. **It would not**: this arm *replaces* Vid's routine, so our receiver is
   reached before Vid's slot check ever runs, and delivery looks identical whether Vid would have
   dropped the message or retained it. Recovering that branch needs Vid's decision instrumented
-  while it happens, or S5h reproduced with the slot recorded — neither of which this is. **Arm 1
-  then made the question moot from the other side**: nothing was delivered at all.
+  while it happens, or S5h reproduced with the slot recorded — neither of which this is. **A draft
+  here then said arm 1 made the question moot from the other side, "nothing was delivered at all".
+  That is disproven**: step 9's combined arm reads the message arriving at
+  `VidInterceptPreprocess` with the chain standing and `forwarded = 0`, so what arm 1 saw nothing
+  of was the **chained callback**. The branch question is not moot — it is open, and open for the
+  reason this paragraph gives rather than for want of a message.
 
 - **S5r — WRITTEN BEFORE THE RUN, 2026-09-29: reproduce the published IUM-debugging patch from the
   root, with no outer hypervisor.** Quarkslab's
@@ -3827,7 +3831,9 @@ validated. The full record is the
   establish that `WinHvpOnInterception` did not run, and the readings it leaves open — an argument-
   passed holder, a helper this does not follow — are exactly the ones that would let it run and
   consult something else. **That the message was never delivered is an inference from the zero, not
-  a measurement of the delivery path**, and the path itself is unresolved.
+  a measurement of the delivery path**, and the path itself is unresolved. **Step 9's combined arm
+  has since disproven that inference by measurement** — same slot chained, same intercept, message
+  arriving at `VidInterceptPreprocess` with `forwarded` still `0`. The hedge was right to be one.
 - **The limit, stated rather than glossed.** The census is function-scoped, not provenance-scoped.
   Three other functions read the pair — `WinHvpOnMirroringNotification`,
   `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
@@ -3880,7 +3886,9 @@ validated. The full record is the
   explanation is **narrowed to the chained slot, not eliminated**. S5k had flagged this fork
   (`VidDeviceExtension+0x288` bit `0x40`) and scoped its finding to the bit-clear path; S5q did not
   carry that forward. **Three arms now survive, all inferences, and the two paths widen the fork
-  rather than picking an arm**: (1) delivered with the per-vector slot unclaimed, so VID took the
+  rather than picking an arm** — *(3) was later eliminated by step 9's arm, which read the message
+  arriving; the fork is kept as written because it is what that arm was built from)*: (1) delivered
+  with the per-vector slot unclaimed, so VID took the
   unregistered-vector branch — a raw install neither claims that slot **nor establishes its state**;
   (2) delivered with the slot already claimed by another VID client, so the handler *enqueued* to it,
   which is S5j's received-and-retained reading and stays live because `[partition+0xB68][3]` **was

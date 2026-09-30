@@ -5210,7 +5210,9 @@ bound over two anchors, so it cannot establish that `WinHvpOnInterception` did n
 argument-passed holder or a helper it does not follow would let it run and consult something this
 never looked at. **That the message was never delivered is therefore an inference from the zero,
 not a measurement of the delivery path.** The path is unresolved; what is closed is the route that
-chains this slot.
+chains this slot. **And that inference has since been disproven by measurement**: step 9's combined
+arm chains this same slot, installs the same intercept and reads the message arriving at
+`VidInterceptPreprocess` with `forwarded` still `0`. The hedge was right to be a hedge.
 
 **The limit of that, stated rather than glossed.** The census is function-scoped, not
 provenance-scoped: it proves those two sites touch a partition object because their base registers
