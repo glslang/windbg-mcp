@@ -4058,7 +4058,8 @@ validated. The full record is the
       the documented hazard is collision with a **raw** `WinHvInstallIntercept` installer, which
       the duplicate check cannot see. So the test is more available than claimed and still a
       decision: an unclaimed slot would be claimed by us on a running VM. **THAT ARM HAS SINCE RUN
-      — see the receiver-arm section — and the route is closed from user mode: the IOCTL is issued
+      — see the receiver-arm section — and the route is closed from *user mode* (**it is open from
+      kernel mode**, see the gate arm): the IOCTL is issued
       directly for a lossless `NTSTATUS`, and on both workers three handles return
       `STATUS_NOT_IMPLEMENTED` and the fourth `STATUS_ACCESS_DENIED`. Nothing was mutated — the
       poisoned output survived every arm, so no slot was ever claimed. **Why it refuses is now
@@ -4068,6 +4069,14 @@ validated. The full record is the
       So it is a process-identity gate, no handle could pass it, and the receiver
       (`VidHandlerpExceptionRegisterEntry`) has no access check at all. LiveCloudKd's driver stops
       being a guess: kernel code can make `PsGetCurrentProcess()` match; duplication cannot.**
+      **AND THAT IS NOW RUN — the route works.** `h3probe`'s `IOCTL_H3_VIDREG` attaches to the
+      owner, reads `[partition+0x3780]` back (it holds the attached `EPROCESS` on both workers) and
+      issues the same `0x221148`: **`SUCCESS`**, a registration handle returned, unregister
+      `SUCCESS`. Same handle, same code, same buffers as the refused user-mode call — only the
+      calling process differs. **It also hard-reset both guests** (`Kernel-Power` 41, no guest bug
+      check) seconds after each arm's health check passed, because nothing mapped or drained the
+      message slot: **pairing register with unregister is necessary and not sufficient**, the arming
+      does the damage. Host untouched, both guests back with `LsaIso` alive.
       **Inheritance of a VID handle a worker still holds is excluded** on object identity —
       no child holds any of the workers' four current VID file objects. **Not excluded**: one
       inherited and since closed in the parent, which a snapshot cannot see. The children's own
