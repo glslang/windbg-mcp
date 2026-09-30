@@ -5214,52 +5214,36 @@ the partition object as an *argument*, or obtains it from a helper other than
 `WinHvpReferencePartition`, calls neither anchor and is absent from the 28 even if it reads the pair.
 Closing that needs provenance carried across calls and returns, which the tool does not do — so
 "functions that can hold a partition object" means "functions that obtain one by the two routes it
-looks for". **The `.pdata` hole is narrowed, and the gap scan was wrong three times before it was
-right**: `.pdata` claims no leaf functions, so a leaf loading the array would have been invisible, and
-the tool decodes the executable bytes `.pdata` leaves out as `vid_field_census.py` does — **9,599
-unclaimed bytes here, 9,569 of them `0xCC`/`0x00`, five spans holding anything else, decoded as six
-islands**, with **0 distinct bytes capstone refused** (re-derived 2026-09-30 against the same
-`winhvr.sys`). A gap carries no unwind record, so nothing in the image says where an instruction in it
-begins nor where one leaf ends, and each of the first three readings was wrong about one of those:
+looks for". **The `.pdata` hole is narrowed, and what closed it was giving up on a question the image
+cannot answer.** `.pdata` claims no leaf functions, so a leaf loading the array would have been
+invisible, and the tool decodes the executable bytes the table leaves out — **9,599 unclaimed bytes
+here, 9,569 of them `0xCC`/`0x00`, five spans holding anything else, 0 distinct bytes refused**
+(re-derived 2026-09-30 against the same `winhvr.sys`). A gap carries no unwind record, so nothing in
+it says where an instruction begins, where one leaf ends, or where the next starts — and **four
+attempts to infer that were each wrong in a different direction**:
 
-- **Decoding a span as one stream** loses an island after an **odd-length run of `0x00`**, because
-  `00 00` decodes as a two-byte `add byte ptr [rax], al` — so the odd byte shifts everything after
-  it. (`0xCC` is one byte and keeps alignment, which is why the defect needs a zero run.)
-- **Splitting the span at every `0xCC`/`0x00` byte** — the fix for the first, and what this section
-  originally recorded — cuts instructions apart instead. **A single zero byte is not padding**:
-  a 12-byte leaf that loads the array anchor and reads `+0x10` encodes as
-  `48 8B 05 D9 1F 00 00 / 48 8B 40 10 / C3`, and almost every RIP-relative load in a driver carries
-  a zero in its high displacement byte, so the split lands inside the one instruction that makes the
-  region reaching. That leaf is a regression case now and it reported **zero** reaching regions.
-- **Decoding each span as one region** — the fix for the second — restored the instructions and lost
-  the *provenance*, which review caught. One region per span puts every island's operands in one
-  body, so `field_hits` attributes one leaf's `+0x10`/`+0x18` access to a **different** leaf that
-  loaded the anchor: an anchor-loading leaf, padding, and an unrelated field-reading leaf read as one
-  reaching function with two accesses. That inflates exactly the figure this census exists to
-  license.
+| reading | what it lost |
+|---|---|
+| one stream from the span start | an island after an **odd-length `0x00` run** — `00 00` is a two-byte `add byte ptr [rax], al`, so the odd byte shifts everything after it |
+| split at **every** `0xCC`/`0x00` byte | cut instructions apart — **a single zero byte is not padding**, and `48 8B 05 D9 1F 00 00` is the commonest shape there is |
+| one region per span | *provenance*: a field access in one leaf credited to another leaf's anchor load |
+| island ends at padding on an instruction boundary | the **unpadded** case: two leaves emitted back to back have no padding between them, so they still collapsed |
 
-What the tool does now separates the two questions. The padding test is applied **where an
-instruction begins** rather than to every byte: each island is decoded from its own start, an
-instruction may swallow whatever `0xCC`/`0x00` bytes its own encoding contains, and the island ends
-when the next *instruction boundary* lands on padding. So a zero inside a displacement is not a
-boundary and a real padding run is — and each island stays **its own region**, so an anchor load and
-a field access are correlated only inside one leaf. Islands can overlap, because a zero inside a
-displacement also makes the byte after it a candidate start; the overlapping candidates are kept
-rather than pruned, since pruning could drop a real leaf that a misaligned neighbour had run over.
-That leaves the region set a lower bound with possible phantoms — a misaligned start decodes bytes
-that are not instructions — so it can only widen the reaching set, never narrow it, which is why the
-two sites that carry the finding are read back as disassembly by hand.
-
-**The boundary rule has a limit of its own, in the direction that matters, and it is measured rather
-than assumed.** A *genuine* `int3` at an instruction boundary inside gap code ends the island there,
-so a real leaf containing one is split in two: the half holding the anchor load reaches, the half
-holding the `+0x10` read does not, and **that access is dropped**. For a census whose purpose is to
-license a negative — that nothing else reads the pair — an undercount is the dangerous direction, so
-it is pinned as behaviour in `--self-test` and stated here rather than papered over with a heuristic.
-What bounds the exposure is that the rule never touches a `.pdata`-claimed function: those have exact
-bounds, are decoded whole, and skip the padding test entirely — and **on `winhvr.sys` all 28 reaching
-regions are `.pdata` functions**, so every one of the 42 accesses comes from a body this limit cannot
-reach. It is a hypothetical for this image and a real one for any image with a reaching gap leaf.
+Adding `ret` as a second boundary would have split a real function with two return paths instead, and
+then `jmp`, `int 29h` and the rest in turn — a predicate per round, which is the shape of a fix that
+never lands. **So boundaries are no longer inferred at all, and the two questions are answered by two
+different mechanisms.** A `.pdata` entry *is* a function — exact bounds, decoded whole, no padding
+test — so an anchor load and a field access inside one are genuinely the same function's, and **that
+is where the 28 and the 42 come from**; all 28 reaching regions are `.pdata` functions, checked rather
+than assumed. A gap span is decoded as a *detector*: the union over its candidate starts, which
+maximises what is found (a leaf after a `ret` is still reached from the previous start) and claims
+nothing about grouping. Gap findings are reported in a section of their own, **excluded from both
+counts**, each labelled *boundaries unknown — read this span by hand*. On this image that section
+prints **"none: no span reaches an anchor or touches `+0x10`, `+0x18`"**, which is the negative the
+census needs stated as a measurement rather than inferred from an empty list. The region set is still
+a lower bound with possible phantoms — a misaligned start decodes bytes that are not instructions — so
+it can only widen what is found, and the two sites carrying the finding are read back as disassembly
+by hand.
 
 **The sibling instrument had the decoding right and the same provenance question open.**
 `vid_field_census.py` decodes each gap "from every plausible start … and take[s] the union", on the
@@ -5273,18 +5257,17 @@ same form; whether its own union can cross a leaf boundary is **not examined her
 x64 it is an ordinary callee-saved register unless the function's `UNWIND_INFO` names it as the
 frame register, so it is suppressed only where that record says so — 16 `+0x10`/`+0x18` operands
 across the image are based in `rbp`, and none of them falls in a reaching region. **The answer did
-not move** through any of the four: 28 reaching regions and 42 accesses throughout — which is
-exactly why the gap scan needed a test of its own rather than agreement on the real image, since a
-run on `winhvr.sys` reports 28 and 42 under **every** reading above, including the one that
-misattributes, because no gap island in this image reaches at all. `--self-test` now carries all
-three defects and its own remaining limit, **24/24**, each pinned with the broken reading asserted to
-fail and with two negative controls. **Mutation-verified against those same cases**, so the three
-scores share a denominator: reducing the candidate starts to the span start alone scores **11/24**,
-one span-wide region **20/24**, and a summed rather than unioned refusal count **23/24** — the last
-failing with *got 2, wanted 1*, which is the reviewer's own case. Every index in the self-test goes
-through a helper that returns empty rather than raising, because a mutation emptying a result must
-show up as the assertions it broke: a bare index aborts the run and hides every case after it, which
-happened twice here — the second time in a case added one commit after the first was fixed.
+not move** through any of the five: 28 and 42 throughout — which is exactly why the gap scan needed a
+test of its own rather than agreement on the real image, since a run on `winhvr.sys` reports 28 and 42
+under **every** reading above, including all four broken ones, because no gap span in this image
+reaches at all. `--self-test` carries the lot, **24/24**: detection under each alignment hazard, the
+no-attribution rule in **both** the padded and unpadded shapes, a refused byte reached twice counted
+once, and a `.pdata`-claimed function as the control that attribution still happens where bounds are
+exact. **Mutation-verified on those cases**, so the scores share a denominator: attributing gap spans
+as functions scores **20/24**, dropping the union to a single start **15/24**, and a summed rather than
+unioned refusal count **23/24**. Every index in the self-test returns empty rather than raising, so a
+mutation shows up as the assertions it broke — a bare index aborts the run and hides every case after
+it, which happened twice here, the second time in a case added one commit after the first was fixed.
 
 #### What this does to S5j's two explanations
 
