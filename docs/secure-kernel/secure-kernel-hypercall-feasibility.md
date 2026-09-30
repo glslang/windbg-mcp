@@ -6113,9 +6113,18 @@ another.
 is actually on across iterations, and what performs the resumption. `WinHvCompleteIntercept` being
 the caller is a hypothesis this arm does not test.
 
-**And the armed arm burns CPU rather than parking**: VP 1 accumulates ~15 M units per 2 s while
-retiring zero rounds, against ~22 M while retiring 1.87 million. Lower, because each iteration now
-costs an exit and root-side processing — not zero, which is what a parked VP would give.
+**And the armed arm's VPs are emphatically executing, not parked.** S5c's suspend calibration is
+the scale to read this against: a genuinely suspended VP accumulated **430 / 1,032 / 495** units
+over 2000 ms there, and an *idle* unsuspended one **53,293–84,075**. VP 1 armed accumulates
+**~15,000,000** per 2 s — four orders above a parked VP and two above an idle one — while the guest
+retires nothing.
+
+**The drop from the control's ~22 M to the armed ~15 M is left unattributed.** A draft explained it
+as each iteration costing an exit and root-side processing, which this arm cannot support: the two
+windows differ in scheduling and background guest load as well, nothing isolates exit processing,
+and "each iteration" presupposes the iterations that arm 2 above says are unresolved. What the
+number is used for is the comparison against the parked scale, and that comparison does not need
+the drop explained.
 
 #### One reading withdrawn, because the control killed it
 
