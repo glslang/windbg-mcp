@@ -20,13 +20,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   control — the same 3-and-1 split as `VidGetHvPartitionId`, on the same two file objects, in each
   worker independently. **Nothing was mutated**: the 8-byte output was poisoned and survived every
   arm, so no registration handed back a handle, no slot was claimed, and the rollback had nothing to
-  release — a stronger statement than a rollback that ran. **Why it refuses is a limit, not a
-  finding**: the control code is `FILE_ANY_ACCESS` so the I/O manager gates nothing, but every
-  wider duplicate is refused by `DuplicateHandle` itself, so the driver's ownership check and the
-  driver checking the mask predict the same observation, and an earlier round of this work asserted
-  the mask reading and had to withdraw it. **LiveCloudKd's procedure needs more than duplication**,
-  now measured rather than guessed; a kernel driver would bypass both gates and remains the
-  candidate, its source still unread. Both guests responsive across both arms, no bug check.
+  release — a stronger statement than a rollback that ran. **And why it refuses is read out of the
+  driver, not inferred**: a draft recorded it as an unresolvable limit, which it was only
+  dynamically — from outside, the driver's ownership check and the driver wanting an access right
+  predict the same result, because the security descriptor refuses a wider duplicate. Decompiled
+  (Ghidra headless, cached PDB), `VidIoControlPreProcess` compares **`PsGetCurrentProcess()`
+  against the owning process at `[partition+0x3780]`** and returns `ACCESS_DENIED` **before any
+  dispatch**, exempting only control codes `0x2210ef` and `0x2211e3` — both new to this record, and
+  the only two a non-owner may call. The driver's own ETW name for the check is
+  **`VidIoControlPartitionIsAllowed`**. So it is a process-identity gate: **no handle could have
+  passed it**, the escalation experiment was aimed at the wrong thing, and the receiver
+  `VidHandlerpExceptionRegisterEntry` has **no access check at all** — its only refusal is
+  `STATUS_VID_DUPLICATE_HANDLER`. It is also the check that consumes what S5o found
+  `VidPartitionAttach` writing. **LiveCloudKd's driver stops being a guess**: kernel code can make
+  `PsGetCurrentProcess()` match and handle manipulation never can, though its source is still
+  unread. Both guests responsive across both arms, no bug check.
 - **Item 103 step 7 is attempted: the handle is takeable, and the first read through it is
   refused.** S5n declined handle duplication because `vmwp.exe` runs protected; measured against
   positive controls (`csrss` 0x61, `lsass` 0x41, `MsMpEng` 0x31) with a poisoned output buffer,

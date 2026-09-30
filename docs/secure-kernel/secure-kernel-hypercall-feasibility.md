@@ -6744,23 +6744,67 @@ weaker claim that a mutation was undone; this says there was none. Both guests s
 across both arms, `LsaIso` alive on the VBS one, uptime continuous at 10h57m, no bug check since
 boot.
 
-#### Why it is refused is *not* separable here, and that is a limit rather than a finding
+#### Why it is refused: read out of the handler, not inferred
 
-`ACCESS_DENIED` has two live explanations and this instrument cannot split them:
+**A draft of this section recorded the reason as unresolvable, and it was only unresolvable
+dynamically.** `ACCESS_DENIED` had two live explanations — the driver's own ownership check, or the
+driver wanting an access right the duplicate lacks — and the obvious discriminator, a wider
+duplicate, is refused a step earlier: against the same source handle `DUPLICATE_SAME_ACCESS`
+succeeds at `0x00120089` while `+FILE_WRITE_DATA`, `0x0012019F`, `FILE_ALL_ACCESS` and
+`GENERIC_ALL` are each refused by `DuplicateHandle` itself. The object's security descriptor will
+not grant a wider handle, so from outside both explanations predict what is observed.
 
-- the driver's **own ownership check** — step 4's territory, where `VidPartitionAttach` makes the
-  opener the owning process and we are not it;
-- the driver checking for an access right the duplicate does not carry.
+**Decompiling the driver settles it in one line.** `Vid.sys` `10.0.26100.9278` through Ghidra
+headless with the cached PDB — `VidIoControlPreProcess` (rva `0x2e600`), immediately after an ETW
+event the driver names **`VidIoControlPartitionIsAllowed`**, from
+`onecore\vm\vid\sys\driver\vidiocontrol.c`:
 
-The control code is `FILE_ANY_ACCESS`, which settles that the **I/O manager** performs no access
-check — but not that the *driver* ignores the mask. The obvious discriminator is to duplicate with
-more access and retry, and **that is refused one step earlier**: against the same source handle,
-`DUPLICATE_SAME_ACCESS` succeeds at `0x00120089` while `+FILE_WRITE_DATA`, `0x0012019F`,
-`FILE_ALL_ACCESS` and `GENERIC_ALL` are each refused by `DuplicateHandle` itself with
-`ERROR_ACCESS_DENIED`. The object's security descriptor will not grant a wider handle, so both
-explanations predict precisely what is observed. **Stated as a limit** — an earlier round of this
-work asserted the access-mask reading and had to withdraw it, and asserting the ownership reading
-now would be the same mistake in the other direction.
+```c
+uVar7 = PsGetCurrentProcess();
+if (((puVar10[0x6f0] != uVar7) && (uVar2 != 0x2210ef)) && (uVar2 != 0x2211e3)) {
+    iVar6 = -0x3fffffde;                        /* 0xC0000022 STATUS_ACCESS_DENIED */
+    goto out;
+}
+if (((uint)puVar10[2] >> 0xf & 1) == 0)         /* non-Exo */
+    VidIoControlPartition(puVar10, ...);
+else
+    VidExoIoControlPartition(puVar10, ...);     /* Exo */
+```
+
+`puVar10` is the partition (the file object's `FsContext`, masked `& ~3` — the low bits are flags),
+and it is a `ULONGLONG*`, so `[0x6f0]` is **byte offset `0x3780`**. So:
+
+**The gate is `PsGetCurrentProcess()` against the owning process stored at `[partition+0x3780]`, and
+it is checked before any dispatch at all.** Not an access mask, not a handle property, not anything
+in the receiver: a process-identity comparison in the pre-process step, which is why it refuses
+before `VidIoControlPartition`'s compare chain and long before
+`VidHandlerpExceptionRegisterEntry` — a function that, decompiled, contains **no access check of
+any kind**, its only refusal being `STATUS_VID_DUPLICATE_HANDLER` on a claimed slot.
+
+**Three consequences.**
+
+- **No handle could have passed it.** The escalation experiment was not merely blocked by a security
+  descriptor — it was aimed at the wrong thing, since the check never looks at the handle. That is
+  worth more than the limit it replaces: the limit said *we cannot tell*, this says *the question
+  was mis-posed*.
+- **This is the check that consumes what step 4 found.** S5o read `VidPartitionAttach` as making the
+  opener the partition's owning process; `[partition+0x3780]` is where that lands and this is what
+  reads it back.
+- **Two control codes are exempt, and they are new to this record**: `0x2210ef` and `0x2211e3`, both
+  `FILE_ANY_ACCESS` `METHOD_NEITHER`, functions `0x43B` and `0x478`. A non-owner may call **those
+  two and nothing else**. What they do is unread.
+
+**And LiveCloudKd's driver stops being a guess.** A process-identity gate is exactly the kind a
+kernel driver satisfies and a user-mode duplicate cannot — running in, or attaching to, the owning
+process makes `PsGetCurrentProcess()` match, and no handle manipulation ever will. That is a
+mechanism rather than the hand-wave this record carried a round ago. Its source still has not been
+read, so what that tool *does* remains its own claim.
+
+**One caution about the method.** A scan for the control codes as instruction immediates found
+**neither** `0x221148` nor `0x2211E8` anywhere in `Vid.sys`, while the decompiler shows codes like
+`0x22111c` compared as constants — so the dispatch reaches them through arithmetic or a table and an
+immediate scan reads as absence. Another instance of a name search not being a mechanism search;
+the negative result means nothing.
 
 #### What this settles
 
