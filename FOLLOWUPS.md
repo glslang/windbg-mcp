@@ -4023,8 +4023,10 @@ validated. The full record is the
       while both VPs keep accumulating `VpRuntime`. **The VPs are being resumed**, which removes the
       necessary-condition objection review round 3 on #428 raised against the ping-pong reading —
       and removing an objection to one explanation is not evidence for it over another, so the
-      two-VP question stays open. What performs the resumption, and which VP the raiser's thread is
-      on, are both unmeasured. Full record in the **step 6's two blocked
+      two-VP question stayed open at this arm. **It was answered by the loop question below**,
+      which supplied the missing correlation: `Other Intercepts/sec` is zero on both VPs unarmed
+      and nonzero on **both** armed, and that counter moves because an instruction trapped on that
+      VP. What performs the resumption is still unmeasured. Full record in the **step 6's two blocked
       arms** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
    7. **Handle duplication and inheritance, which S5n excluded rather than closed and which this

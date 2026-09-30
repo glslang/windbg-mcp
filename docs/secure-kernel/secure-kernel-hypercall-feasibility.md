@@ -6161,12 +6161,15 @@ phase — including one in which the raiser storms `#BP`s with no intercept inst
 holds, step 6's arm 2 is answered, and the counter that answers it is one nothing in this line had
 read.
 
-#### Why no guest-side reading could have done it
+#### Why nothing the raiser can count could have done it
 
-Under **both** surviving readings the guest makes no progress: nothing advances `RIP` past the
+Under **both** surviving readings **the raiser** makes no progress: nothing advances `RIP` past the
 faulting instruction whether it is re-executed or whether one pending intercept is re-processed on
-the root side. So `handled = 0` never could discriminate, and neither could anything else inside the
-guest. The discriminator has to be on the **exit** side, and Hyper-V publishes it per VM and per VP:
+the root side. So `handled = 0` never could discriminate, and neither could any other counter the
+raiser keeps. (*The guest* is a different subject and does make progress — both VPs execute
+throughout, background threads included — which is the distinction step 6's review round 4
+corrected and a draft of this section reintroduced.) The discriminator has to be on the **exit**
+side, and Hyper-V publishes it per VM and per VP:
 
 ```text
 \Hyper-V Hypervisor Virtual Processor(<vm>:Hv VP <n>)\Total Intercepts/sec
@@ -6176,34 +6179,61 @@ guest. The discriminator has to be on the **exit** side, and Hyper-V publishes i
 
 Host-side reads. No guest interaction, no driver call, nothing written.
 
-#### Four phases, because a counter that cannot move looks like one that did not
+#### Five phases, because a counter that cannot move looks like one that did not
 
-| phase | `Total Intercepts/sec` VP 0 / VP 1 | `Total Messages/sec` VP 0 / VP 1 |
-|---|---|---|
-| idle | 221 / 98 | **0 / 0** |
-| guest churn | 257 / 96 | **0 / 0** |
-| **raiser, no intercept** | **32,440 / 219,391** | **0 / 0** |
-| **raiser + `#BP` intercept** | 3,674 / **65,156** | **3,008 / 62,750** |
+| phase | rounds retired in the window | `Total Intercepts/sec` VP 0 / VP 1 | `Total Messages/sec` VP 0 / VP 1 |
+|---|---|---|---|
+| idle | — | 307 / 128 | **0 / 0** |
+| guest churn | — | 293 / 104 | **0 / 0** |
+| **VTL0 raiser, no intercept** | **13.6 M** | 985→563 / ~2,250 | **0 / 0** |
+| **VTL1 raiser, no intercept** | **1.43 M** | ~17,000 / **~234,000** | **0 / 0** |
+| **VTL1 raiser + `#BP` intercept** | **0** | ~13,500 / **~55,400** | **12,465 / 53,263** |
 
-`Other Intercepts/sec` tracks `Total Messages/sec` to within a few counts in every row, so the
-exception intercept lands in that bucket and each one produces exactly one message.
+`Other Intercepts/sec` tracks `Total Messages/sec` closely in every row.
 
-**A pending intercept re-processed on the root side produces no hypervisor message at all.** 62,750
-a second, sustained for 16 s, against zero in three control phases, are **new deliveries** — the
-faulting instruction being re-executed and re-trapped tens of thousands of times a second with
-nothing ever retiring it.
+**A pending intercept re-processed on the root side produces no hypervisor message at all.** Tens of
+thousands a second, sustained for 16 s, against **zero** in four control phases — including two in
+which the raiser is storming `#BP`s — are **new deliveries**.
+
+**What the counters do and do not say, because they are aggregate rates.** They carry no vector and
+no `RIP`, so they do not attribute any individual sample to our `#BP` at the enclave address, and
+they do not prove a one-message-per-intercept relationship from `Other Intercepts/sec` and
+`Total Messages/sec` merely tracking. Review made that point and it is right. What ties them to our
+raise is the **controlled comparison** — the bucket is flat zero across idle, churn and *both*
+unarmed raisers, and moves only when the intercept is installed with nothing else changed — plus
+the separate **event-level** evidence from the VP markers, which name message type `0x80010003`,
+vector `3` and the enclave `Rip`. Together those support re-entry; neither on its own would, and
+an armed-only intercept source other than ours is narrowed rather than excluded.
 
 #### The trap that got run 1's verdict backwards
 
-`Total Intercepts/sec` is **lower** armed (65,156) than unarmed (219,391), and the first run's
-verdict compared against it and concluded *"not re-entry"*. That is wrong twice over, and the second
-half is a finding in its own right: **an unarmed VTL1 `#BP` costs a hypervisor round trip anyway** —
-219,391 intercepts a second with **zero** messages, for a raiser retiring 1.87 M rounds. A VTL1
-exception exits to the hypervisor whether or not anyone intercepts it, which is the mechanism behind
-the 11× cost over a VTL0 exception this record already carries, now visible on the exit counter.
+`Total Intercepts/sec` is **lower** armed (~55,400) than unarmed (~234,000), and the first run's
+verdict compared against it and concluded *"not re-entry"*. The armed arm takes *fewer* exits and
+turns *all* of them into messages, while the unarmed one takes more and messages nobody. Reading the
+wrong counter inverted the answer.
 
-So the armed arm takes *fewer* exits and turns *all* of them into messages, while the unarmed one
-takes more and messages nobody. Reading the wrong counter inverted the answer.
+**And the second half is a finding, now with a matched VTL0 control.** Normalised per round, in one
+run:
+
+| unarmed raiser | rounds in 8 s | rounds/sec | intercepts/sec, VP 1 | **intercepts per round** |
+|---|---|---|---|---|
+| VTL0 | 13,568,371 | 1.70 M | ~2,250 | **~0.0013** |
+| VTL1 | 1,431,883 | 179 k | ~234,000 | **~1.3** |
+
+**A VTL0 `#BP` costs essentially no hypervisor exit; a VTL1 one costs about 1.3.** Same guest, same
+binary, same counter, only the VTL differing — and the round-rate gap in that same run is **9.5×**,
+against the 9.7 µs / 0.85 µs this record carries elsewhere.
+
+**That is a measured difference in kind, not a decomposition of the timing**, and a draft called it
+*"the mechanism behind the 11× cost"*, which it is not: nothing here apportions 9.7 µs between the
+exit and anything else. What it establishes is that the VTL1 exception takes a hypervisor round trip
+per raise and the VTL0 one does not, which is where such a gap would come from.
+
+**The first attempt at this control was worthless and looked fine.** At 0.85 µs a round the VTL0
+raiser finished its 2,000,000 rounds in 1.7 s — before the first sample — so its flat counters were
+four readings of a guest with nothing running. Round counts are per mode now (30 M for VTL0), and
+the progress line is printed for both arms so the rounds retired are on the page rather than
+assumed. The same defect had already been fixed once, in step 6's `InterceptSuspend` control.
 
 #### And it correlates the raising thread with both VPs
 
@@ -6218,14 +6248,17 @@ raiser's own exception* landing on both. The alternative it was weighed against 
 intercept re-preprocessed with the thread never moving — does not produce per-VP hypervisor
 intercepts on a VP the thread is not on.
 
-**The assumption this rests on, stated rather than buried**: that nothing else in this guest raises
-`#BP` at a measurable rate. The three unarmed phases support it — `Other Intercepts/sec` is zero in
-all of them, including one with the guest churning — but they do not prove it for the armed window,
-and a second `#BP` source there would be indistinguishable.
+**Two things this rests on, stated rather than buried.** That nothing else in this guest raises
+`#BP` at a measurable rate — which the four unarmed phases support, `Other Intercepts/sec` being
+zero in all of them including two with a raiser storming `#BP`s, but which they do not prove for the
+armed window. And that the counter's armed-only movement on VP 0 is our exception rather than some
+other armed-only source, which is the same aggregate-rate limit as above: the counters name no
+vector. What makes migration the supported reading rather than a proven one is those two together
+with the markers naming vector `3` at the enclave `Rip` on VP 0's own slot.
 
 #### Bench state
 
-Two runs, one install each, removed in the `finally`; teardown reported **0 standing** both times.
-Raisers killed after every phase. Guest responsive with 106 processes and `LsaIso` alive, both guests
-up **6h35m** unbroken, host uptime continuous, **no bug check since boot**. The counter paths carry
-the host name and it is stripped before anything is printed, this record being public.
+Four runs, one install each, removed in the `finally`; teardown reported **0 standing** every time.
+Raisers killed after every phase. Guest responsive, `LsaIso` alive, both guests up **6h35m+**
+unbroken, host uptime continuous, **no bug check since boot**. The counter paths carry the host
+name and it is stripped before anything is printed, this record being public.

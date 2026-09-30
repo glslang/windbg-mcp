@@ -10,27 +10,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **The hold is a loop, measured on Hyper-V's own per-VP message counter — and the same counter
-  correlates the raising thread with both VPs.** Under *both* surviving readings the guest makes no
-  progress, because nothing advances `RIP` past the faulting instruction either way, so no
-  guest-side reading could ever have discriminated them and `handled = 0` never could. The
+  correlates the raising thread with both VPs.** Under *both* surviving readings **the raiser**
+  makes no progress, because nothing advances `RIP` past the faulting instruction either way, so
+  no counter the raiser keeps could discriminate them — *the guest* meanwhile executes throughout,
+  which is a distinction a draft lost twice. The
   discriminator is on the **exit** side and Hyper-V publishes it per VM and per VP.
   `Total Messages/sec` reads **0** idle, **0** under guest churn, **0** with the raiser storming
-  `#BP`s at 219,391 hypervisor intercepts a second *unarmed* — and **62,750** with the intercept
+  `#BP`s at ~234,000 hypervisor intercepts a second *unarmed* — and **53,263** with the intercept
   standing, sustained for 16 s while the raiser completes **zero** rounds. A pending intercept
   re-processed on the root side produces no hypervisor message at all, so those are **new
   deliveries**: the faulting instruction is re-executed tens of thousands of times a second with
   nothing retiring it. S5k's inference holds and step 6's arm 2 is answered.
-  **A finding fell out of the control**: an unarmed VTL1 `#BP` costs a hypervisor round trip anyway
-  — 219 k intercepts/sec with **zero** messages — which is the mechanism behind the 11× cost over a
-  VTL0 exception this record already carried, now visible on the exit counter. It is also what got
+  **A finding fell out of the control, with a matched VTL0 arm**: normalised per round, a VTL0
+  `#BP` costs **~0.0013** hypervisor exits and a VTL1 one **~1.3**, same guest and binary and
+  counter with only the VTL differing, and the round-rate gap in that run is **9.5×** against the
+  recorded 9.7 µs / 0.85 µs. That is a difference in kind and **not** a decomposition of the
+  timing, which a draft claimed. The first attempt at that control was worthless and looked fine —
+  the VTL0 raiser finished its rounds in 1.7 s, before the first sample — so round counts are per
+  mode now and both arms print the rounds they retired. It is also what got
   the first run's verdict backwards: `Total Intercepts/sec` is *lower* armed (65 k) than unarmed
   (219 k), and comparing against it read "fewer exits" as "no new exits". **And the two-VP question
   is answered too**: `Other Intercepts/sec` — the bucket the exception lands in — is zero on both
-  VPs in all three unarmed phases and nonzero on **both** armed, and that counter moves because an
-  instruction trapped *on that VP*. Re-preprocessing of a pending message cannot produce per-VP
-  hypervisor intercepts on a VP the thread is not on, so the thread executes on both. Stated
-  assumption: nothing else in this guest raises `#BP` at a measurable rate, which the three unarmed
-  phases support and do not prove.
+  VPs in all **four** unarmed phases and nonzero on **both** armed, and that counter moves because
+  an instruction trapped *on that VP*. Re-preprocessing of a pending message cannot produce
+  per-VP hypervisor intercepts on a VP the thread is not on, so migration is the supported
+  reading. **Supported rather than proven**, and the limit is the counters': they are aggregate
+  rates carrying no vector and no `RIP`, so they attribute no individual sample to our `#BP` and
+  do not exclude another armed-only source. What carries it is those rates plus the controlled
+  comparison plus the VP markers' event-level naming of type `0x80010003`, vector `3` and the
+  enclave `Rip` — and the stated assumption that nothing else in this guest raises `#BP` at a
+  measurable rate, which four unarmed phases support and do not prove.
 - **Item 103 step 6's two blocked arms both run, and the VPs turn out to be resumed.** They had been
   held by the standing constraint on installing a vector on a child and by root kernel-memory
   access; the first lifted for guests this bench owns and the second is what S5q's read IOCTL
