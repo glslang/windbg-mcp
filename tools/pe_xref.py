@@ -383,11 +383,23 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
                     # a function with chained unwind info has several entries,
                     # and naming the entry start reports an offset into an
                     # offset. The entry is printed beside it.
-                    note = "  [after a decode stop -- framing may be off]" if flag else ""
+                    #
+                    # A reference found AFTER a decode stop is not an exact
+                    # attribution and must not be recorded as one, however
+                    # loudly its text says so. `decode_function` resynchronises
+                    # one byte past a refusal and its framing from there is a
+                    # guess -- and worse, an exact ref seeds the suppression
+                    # set below, so calling it exact would silence the detector
+                    # at the one address whose framing is in doubt. It is
+                    # recorded as a detection, with the function it fell in
+                    # kept in the text because that much is known.
+                    # Review round 6 on #425.
+                    where = f"{name_for(rva, syms)}  [.pdata entry 0x{beg:x}]"
+                    if flag:
+                        where += "  [after a decode stop -- framing unknown]"
                     refs.append(
                         Ref(rva, insn.mnemonic, f"{insn.mnemonic} {insn.op_str}", t,
-                            f"{name_for(rva, syms)}  [.pdata entry 0x{beg:x}]{note}", True,
-                            insn.size)
+                            where, not flag, insn.size)
                     )
 
     # The candidate-start detector runs over EVERY executable byte, not only
@@ -414,8 +426,9 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
     # one does not matter to a reachability question when both name the same
     # RVA. Re-framings are counted and the count is printed, because a
     # suppression nobody can see is indistinguishable from a bug.
-    exact_at = {r.rva for r in refs}
-    exact_spans = [(r.rva, r.size, r.target) for r in refs]
+    exact_at = {r.rva for r in refs if r.exact}
+    exact_spans = [(r.rva, r.size, r.target) for r in refs if r.exact]
+    detected_at = {(r.rva, r.target) for r in refs if not r.exact}
     reframed = 0
     runs = gap_runs(img)  # reported on its own, and a subset of the cover below
     cover = [(s.va, s.va + min(s.vsize, s.rawsize)) for s in img.sections if s.executable]
@@ -440,7 +453,7 @@ def scan(img: Image, wanted: set[int], syms: dict[int, str]) -> tuple[list[Ref],
                 if rva in exact_at or rva in seen_detected:
                     continue
                 for t in targets_of(insn, img.image_base):
-                    if t not in wanted:
+                    if t not in wanted or (rva, t) in detected_at:
                         continue
                     if any(a <= rva < a + n and tgt == t for a, n, tgt in exact_spans):
                         reframed += 1
@@ -499,17 +512,24 @@ def report(refs: list[Ref], extra: dict, wanted: set[int], syms: dict[int, str])
     for w in sorted(wanted):
         mine = [r for r in refs if r.target == w]
         exact = [r for r in mine if r.exact]
-        gaps = [r for r in mine if not r.exact]
-        print(f"=== 0x{w:x} {name_for(w, syms)}: {len(exact)} in .pdata code, "
-              f"{len(gaps)} in gap runs")
+        # NOT "gap hits": the detector covers every executable byte now, so a
+        # detection can and does fall inside a claimed `.pdata` function -- the
+        # desynchronised-sweep case is exactly that, and calling it a gap hit
+        # sends a reader looking for a gap that does not exist. What the two
+        # buckets separate is how well the framing is known, which is the only
+        # thing that was ever true of them. Review round 6 on #425.
+        detected = [r for r in mine if not r.exact]
+        print(f"=== 0x{w:x} {name_for(w, syms)}: {len(exact)} swept from .pdata, "
+              f"{len(detected)} candidate-start detection(s)")
         for r in exact:
             print(f"  0x{r.rva:06x}  {r.where}   {r.text}")
-        if gaps:
-            for r in gaps:
-                print(f"  0x{r.rva:06x}  [candidate-start detector only -- framing "
-                      f"unknown, read this span by hand]   {r.text}")
+        if detected:
+            for r in detected:
+                where = r.where or "outside any .pdata entry"
+                print(f"  0x{r.rva:06x}  [detection -- framing unknown, read this span "
+                      f"by hand; {where}]   {r.text}")
         else:
-            print("  gap runs: none reaches it")
+            print("  candidate-start detector: nothing the sweep did not already have")
         rows = [d for d in extra["data"] if d[3] == w]
         if rows:
             for name, rva, kind, _w, is_exec in rows:
@@ -586,6 +606,7 @@ TOTAL = 26
 #   the entry point not reported                     25/26
 #   every immediate counts as a branch target        25/26
 #   detections attributed as swept hits              20/26
+#   a post-stop reference called exact               25/26
 #   padding-only runs kept as runs                   25/26
 #   no resume after a refused byte                   25/26
 #   refused bytes not counted                        25/26
@@ -628,7 +649,7 @@ def self_test() -> int:
             got += (extra["refused_bytes"],)
             want += (want_refused,)
         ok = got == want
-        shape = ("exact/gap/data" + ("/runs" if want_runs is not None else "")
+        shape = ("swept/detected/stored" + ("/runs" if want_runs is not None else "")
                  + ("/refused" if want_refused is not None else ""))
         print(f"  {'ok  ' if ok else 'FAIL'} {label}: "
               f"{'/'.join(str(g) for g in got)} {shape} "
@@ -721,9 +742,15 @@ def self_test() -> int:
     # call after it vanishes and the tool reports its clean zero. The refused
     # byte is counted as well, because a reader cannot tell a sound negative
     # from a truncated one unless the number is on the page.
+    # It is a DETECTION and not a swept attribution, because the resume's
+    # framing is a guess -- and because an exact ref seeds the suppression set
+    # the detector consults, so classifying it exact would silence the detector
+    # at the one address whose framing is in doubt. This case required an exact
+    # hit until review round 6 pointed out that the code contradicted
+    # `decode_function`'s own contract.
     stopped = b"\x90" * 5 + b"\x06" + b"\xe8\xf5\xff\xff\xff"
-    case("a call after an undecodable byte is still found",
-         _img(stopped), {0x1000}, 1, 0, 0, want_refused=1)
+    case("a call after an undecodable byte is found, as a detection",
+         _img(stopped), {0x1000}, 0, 1, 0, want_refused=1)
 
     # The control for it: the same shape without the refused byte reports zero
     # refusals, so the count above is about the byte and not about the harness.

@@ -26,9 +26,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   address-taken** sites in the image, and `VidHandleExceptionIntercept` has **exactly one reference
   anywhere in `Vid.sys`** — the `lea` inside `VidInterceptPreprocess`. That is a statement about
   what is visible in one image, not a proof that every invocation goes through preprocess, and the
-  read's coverage rests on it *plus* the arm's positive control, which demonstrates the path rather
-  than inferring it. The read being inside the callee also retires the worry the step was written
-  around: it does not depend on having enumerated the callers.
+  instrument reports one thing — *an arrival was or was not observed at `VidInterceptPreprocess` for
+  this VP* — and the record now scopes that **once**, in a table of what each inference rests on,
+  rather than re-hedging it per paragraph: three review rounds landed on one sentence because every
+  rewrite reclaimed coverage from a new angle. A positive is strong; a negative means "not observed
+  at the convergence point" and **not** "not delivered", and the positive control shows the
+  *instrument* works rather than that a raw-installed delivery shares VID's own route. The read
+  being inside the callee retires the worry the step was written around: it does not depend on
+  having enumerated the callers. Arms 1 and 2 are **not** separable by it — a claim-and-restore of
+  `[P+0xB68][3]` between two samples reads as unchanged, so sampling cannot name the branch at any
+  cadence, and the remedies that would are the patch route this gate declined.
   **New instrument**: `tools/pe_xref.py`, which answers *what can reach this RVA* by decoding
   rather than searching — a branch encodes a displacement that depends on where it sits, so there
   is no byte pattern to find, and the bytes of a function's address appear in immediates that
@@ -61,8 +68,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   own destination — is never decoded. So "0 refused" is about rejection and not about coverage, and
   the sentence that read it as coverage is corrected. On `Vid.sys` the wider pass is 652,268
   candidate starts and finds no route the sweep missed, with one re-framing of a swept hit dropped
-  and counted. `--self-test` **26/26,
-  mutation-verified on fifteen edits**, every one applied and every one caught — and three of those
+  and counted. A reference found *after* a decode stop is a **detection** rather than a swept
+  attribution — resynchronising one byte past a refusal is a guess, and calling it exact also seeded
+  the suppression set the detector consults, silencing it at the one address whose framing was in
+  doubt — and a detection is no longer labelled a "gap hit", because the detector covers claimed
+  bytes too and sending a reader to look for a gap that does not exist is worse than saying nothing.
+  `--self-test` **26/26,
+  mutation-verified on sixteen edits**, every one applied and every one caught — and three of those
   earn a note. The byte-scan case's first version passed under
   the very mutation it existed for, because the immediate it used was a neighbouring number rather
   than the target's address; and `report` is now rendered into a sink for every case, because the

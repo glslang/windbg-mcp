@@ -5470,16 +5470,28 @@ every executable byte rather than only over what `.pdata` leaves unclaimed, and 
 wider pass finds **no route the sweep missed**, which is the reading the earlier sentence was
 claiming without having taken it.
 
-**That is the measurement, and it is not the same sentence as "every invocation goes through
-preprocess" — an earlier version of this paragraph wrote the second.** `pe_xref.py` says so about
-itself: its result is a lower bound for reachability, and it does not see a target assembled over
-two instructions, arriving as an argument, read from a table in a third encoding, or living in
-another image. So what the scan licenses is *no other route is visible in `Vid.sys`*, and the read's
-coverage rests on that plus the arm's own **positive control** — a raise under a Vid-installed
-intercept, which must be delivered. If those markers carry it, the path is demonstrated rather than
-inferred, and if they do not, the instrument has failed its control and its negative is worth
-nothing either way. That is the right place for the weight: a static scan cannot close the set, and
-the control does not need it to.
+#### What this instrument reports, stated once
+
+**Three review rounds landed on one sentence in this section, each time because it was trying to
+claim *coverage*, and each rewrite claimed it again from a new angle.** The rewrites were the
+problem rather than the wordings: the instrument does not measure coverage and no amount of static
+scanning will make it. So the claim is scoped once, here, and every conclusion below is read
+against this table rather than re-hedged in its own paragraph.
+
+**What the IOCTL reports is exactly one thing:** *an arrival was, or was not, observed at
+`VidInterceptPreprocess` for this VP between the before and during samples.* Everything else is an
+inference from it:
+
+| inference | what it rests on | what breaks it |
+|---|---|---|
+| a *positive* — the markers moved and carry `0x80010003` / vector 3 — means **the message was delivered and VID preprocessed it** | the marker writes are on preprocess's straight line; `V+0x208` moving is novelty rather than a stale value | nothing this gate found. A positive is the strong direction |
+| a *negative* means **no arrival was observed at the convergence point** | the same | it does **not** mean "not delivered". A delivery reaching VID by a route the scan cannot see — a target assembled over two instructions, arriving as an argument, read from a table in a third encoding, or living in another image — would leave these markers untouched |
+| the **positive control** (a raise under a Vid-installed intercept) shows **the instrument works** | the control is delivered through VID's own registration path | it does **not** show that a *raw*-installed delivery shares that route, so it cannot convert the negative above into "not delivered". Review round 6, and the version of this paragraph before it said otherwise |
+| which branch `VidHandleExceptionIntercept` took | `[P+0xB68][3]` | sampling, at any cadence — see below |
+
+So a raw-arm negative is **inconclusive about delivery** and conclusive only about the convergence
+point. That is weaker than this section claimed twice and it is what the evidence supports; closing
+the gap needs the raw path itself shown to reach preprocessing, which nothing static can do.
 
 `VidInterceptPreprocess` itself has exactly **three** direct callers, the three this plan names
 (`VidInterceptIsrCallback+0x35`, `VidXSchedulerpVpRun+0xaa`, `VidXSchedulerVpThreadStartRoutine+0x1c8`),
@@ -5514,12 +5526,18 @@ other three. That is the whole reason it is better than the counter step 9 origi
   table, and any VID client can claim or release a vector in between, so it names the branch only
   under the assumption that the slot did not move. **Review round 2 called that out and it is
   right**: a same-request read narrows the window, it does not close it, and the version of this
-  section before it said otherwise. The arm's answer is to **check the assumption rather than make
-  it** — sample the table on both sides of the raise with the same call, and treat any change as
-  spoiling the branch reading for that arm — because the alternative the finding names, recording
-  the value in the delivery path, means instrumenting the handler, which is the patch route this
-  gate declined. So the arms-1-versus-2 split stays **narrowed, not decided**. Step 9's own
-  question is untouched by this: *delivered versus not* rests on the VP markers alone.
+  section before it said otherwise. The arm samples the table on both sides of the raise and treats
+  a change as spoiling the branch reading — **and round 6 then showed that even that is only a
+  filter, not a check.** A client that claims vector 3 during the raise and restores it before the
+  after-sample leaves both samples equal while the handler consulted the transient value: an ABA,
+  invisible to sampling at any cadence. So the two-sided read catches the non-transient case and
+  nothing else, and **the branch attribution is conditional, permanently, on this route.** The only
+  things that would settle it are stabilising the table across delivery or recording the value where
+  the handler reads it — the second is instrumenting the handler, which is the patch route this
+  gate costed and declined, and the first is a mechanism this gate is not going to build to answer
+  a question it is not being asked. **Arms 1 and 2 are therefore not separable by this instrument.**
+  Step 9's own question is untouched: *delivered versus not* rests on the VP markers alone, and the
+  table read is a corroborating reading that is allowed to come back inconclusive.
 - **Non-Exo only**, as S5o's reading was: `VidExoVpInterceptIsrCallback` is a separate ISR and this
   gate did not read it.
 - **One image.** A write into the VP structure from `winhvr.sys` or anywhere else is invisible to a
@@ -5566,7 +5584,7 @@ them sounded.** One IOCTL, called three times per raise — **before**, **during
 |---|---|
 | before | the baseline. Delivery is `V+0x208` **moving**, never its value, because a previous `#BP` on that VP leaves the markers already reading as one |
 | during | the measurement, taken while the trap is held and the VP is therefore not overwriting its own markers |
-| after | the spoiler check. If `[P+0xB68][3]` moved across the raise, the branch reading for that arm is discarded — the table is sampled after the handler consulted it and cannot name a branch on its own |
+| after | the spoiler filter. If `[P+0xB68][3]` moved across the raise, the branch reading for that arm is discarded. It is a filter and not a check: a claim-and-restore between the samples is invisible to it, so the branch attribution stays conditional whatever it says |
 
 with the backed-out arm **interleaved** rather than run as a clean batch, and the positive control —
 a raise under a Vid-installed intercept, which must be delivered — in the same session. None of that
