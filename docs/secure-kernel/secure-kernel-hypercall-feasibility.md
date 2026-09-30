@@ -5778,11 +5778,29 @@ requirements interact, and only running them together showed it.
 
 - **Delivery is established.** The hypervisor posts the exception-intercept message to the root and
   VID preprocesses it. Arm 3 is out.
-- **`forwarded = 0` in S5q arm 1 was not the absence of delivery.** The correction that section took
-  in review — that `VidXSchedulerpVpRun` and `VidXSchedulerVpThreadStartRoutine` call
-  `VidInterceptPreprocess` directly and never read `[partition+0x10]` — is now the *measured*
-  explanation rather than a live possibility. Chaining the partition callback was blind to the path
-  that carried the message.
+- **`forwarded = 0` in S5q arm 1 was not the absence of delivery — and that is now one run rather
+  than an inference across two.** The arm above ran with **nothing chained** and S5q arm 1 ran with
+  a chain and no marker reads, so pairing them was a comparison of two configurations. Review round
+  3 on [#427](https://github.com/glslang/windbg-mcp/pull/427) said so and offered the better
+  remedy, which was taken: a **combined arm** chains the partition callback, installs the intercept
+  and reads the markers and `forwarded` **at the same samples**. With the chain standing,
+  `forwarded = 0` while both VPs read `0x80010003` / vector `3` / `Vid+0x11690` / reason `2`, at
+  stamps roughly **1.08 × 10⁹** ticks past baselines taken *after* the chain was installed. So the
+  correction that section took in review — `VidXSchedulerpVpRun` and
+  `VidXSchedulerVpThreadStartRoutine` call `VidInterceptPreprocess` directly and never read
+  `[partition+0x10]` — is measured in the configuration that produced the zero. Chaining the
+  partition callback was blind to the path that carried the message.
+
+  **The combined arm's first run was vacuous, and the guard is what caught it.** While chained, the
+  pair Hyper-V holds is *ours* — `H3ChainedRoutine` plus a chain slot in the probe's own image — so
+  `IOCTL_H3_VIDVP` resolved that, found the routine outside `Vid.sys` and refused with
+  `STATUS_OBJECT_TYPE_MISMATCH`, exactly as designed. The client then printed *"no arrival
+  observed"* from the zeroed output buffer, because it read the fields without checking the status.
+  Two fixes, and the second is the one that generalises: the driver now takes the **saved** pair
+  out of its own chain record when it has chained that partition, and the client raises on a
+  refusal instead of returning zeros that read as a measurement. The arm also now asserts
+  *positively* that the saved pair was used, that the walked object is the saved context and that
+  VPs came back — because the failure looked like data.
 - **What is measured is reception at *preprocess*, and nothing about retention.** VID received the
   message and the trap stayed held with the raiser alive — but "held" is produced by **both**
   branches of `VidHandleExceptionIntercept`: the unclaimed-vector branch returns `0` and holds, and
@@ -5802,10 +5820,20 @@ requirements interact, and only running them together showed it.
 - **The Secure Kernel scope limit stands exactly as S5i left it.** VTL1 user mode is not Secure
   Kernel, which is VTL1 *kernel* mode. Nothing here moves that.
 
+#### The staleness rule earning itself on real data
+
+The combined arm's baseline already read `0x80010003` on both VPs — left standing by the previous
+arm, because the markers are last-arrival state and those VPs had been idle since. The hit rule
+took the samples at `+1.08 × 10⁹` ticks and not the baseline, which is the round-3 fix working on
+exactly the input it was written for. Without it this arm would have reported a hit before the
+intercept was installed.
+
 #### Bench state
 
-Driver started, arm run twice, driver stopped. Intercept installed once per armed arm and removed in
-the phase that follows it; teardown reported **0 intercepts still standing** on both runs. The
-raiser was killed after every arm and none was left running. Guest responsive afterwards with 105
-processes; both guests up 2h50m with unbroken uptime; host uptime continuous; **no bug check since
-boot**. Nothing was written to a partition object and nothing was chained.
+Driver started, the unchained arm run three times and the combined arm twice, driver stopped between
+rebuilds. Intercept installed once per armed arm and removed in the phase that follows it; teardown
+reported **0 intercepts still standing** every time, and the combined arm's `unchain` returned
+`SUCCESS` with the saved pair restored. The raiser was killed after every arm and none was left
+running. Guest responsive afterwards with 105 processes; both guests up 3h26m with unbroken uptime;
+host uptime continuous; **no bug check since boot**. Nothing was written to a partition object; the
+combined arm chained and unchained the callback, which arm 0 had already characterised.

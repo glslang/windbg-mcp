@@ -4095,7 +4095,17 @@ validated. The full record is the
       signature — and the interleaved backed-out arms on **both** sides show no exception markers
       and a raiser that completes. **So S5q arm 1's third explanation, *not delivered because the
       arming sequence is incomplete*, is eliminated, and `forwarded = 0` there was the chained slot
-      being bypassed rather than nothing arriving.** What is measured is reception **at preprocess**
+      being bypassed rather than nothing arriving — and that is now ONE run, not an inference across
+      two.** A **combined arm** chains the callback, installs the intercept and reads the markers
+      and `forwarded` at the same samples: with the chain standing, `forwarded = 0` while both VPs
+      read `0x80010003` / vector `3` / `Vid+0x11690` / reason `2` at stamps ~**1.08 × 10⁹** ticks
+      past baselines taken *after* chaining. Review round 3 on #427 asked for exactly that rather
+      than accepting the cross-run pairing. **Its own first run was vacuous and the driver's guard
+      caught it**: while chained the pair Hyper-V holds is *ours*, so the read was refused with
+      `OBJECT_TYPE_MISMATCH` — and the client reported "no arrival observed" from the zeroed buffer
+      because it never checked the status. The driver now takes the saved pair from its own chain
+      record, the client raises on a refusal, and the arm asserts positively that the saved pair was
+      used. What is measured is reception **at preprocess**
       and nothing about retention: "held" is produced by *both* branches of
       `VidHandleExceptionIntercept`, so calling this S5j's received-and-retained reading — as an
       earlier version of this paragraph did — reads a branch out of an observation that does not
