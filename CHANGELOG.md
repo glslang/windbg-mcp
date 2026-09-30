@@ -9,6 +9,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Item 103 step 7's `VidMessageSlot*` half: the map runs through the gate and the guest survives;
+  the completion is not runnable on a live VM.** Decoded first, and the decode decided how much to
+  run: `VidMessageSlotMap` is IOCTL **`0x221108`** (in 4 B `{u32 Vp}`, out 8 B — a VA **in the
+  calling process**), `VidMessageSlotHandleAndGetNext` is **`0x221107`** (in 8 B `{u32 Vp; u32
+  Flags}`, out 0), and the message is read from the mapped VA rather than returned. **Only the map
+  was run.** The second call is the *completion* — its name is literal, and it is how `Vid.sys`
+  reaches `WinHvCompleteIntercept`, which it imports from `winhvr.sys` — and **`vmwp` is already
+  the consumer on these VPs**, so a second completer races it on a VM somebody is using. That needs
+  a partition with one client, which makes it **a concrete reason for step 8's rig** rather than the
+  general one its costing could not settle. The map **succeeded on exactly the handle whose
+  `[partition+0x3780]` matched** and on no other — a **third** independent confirmation of the gate,
+  after `VidGetHvPartitionId` and the register — returning slot VA `0x2059A811000`, whose first 64
+  bytes parse as an `HV_MESSAGE_HEADER` with `MessageType` `0x01000010` and `PayloadSize` `0x30`;
+  **not a type this record has named**, and left unread. **The guest survived**, and the watch was
+  built to notice if it had not: uptime sampled every 10 s for a minute, monotonic throughout,
+  because the previous arm's liveness probe answered cheerfully seconds before the guest went.
+  **Mapping does not destabilise the guest — the arming did.** One cost: the map is one-way, there
+  being no `VidMessageSlotUnmap`, so a slot mapped while attached stays mapped in `vmwp`.
 - **Item 103 step 7's route WORKS from kernel mode, and using it hard-reset both lab guests.** Two
   results, and the second is not a footnote. `h3probe` gained `IOCTL_H3_VIDREG`, which attaches to
   the owning process with `KeStackAttachProcess` — the gate reads `PsGetCurrentProcess()`, so that

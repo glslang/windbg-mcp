@@ -4077,6 +4077,14 @@ validated. The full record is the
       check) seconds after each arm's health check passed, because nothing mapped or drained the
       message slot: **pairing register with unregister is necessary and not sufficient**, the arming
       does the damage. Host untouched, both guests back with `LsaIso` alive.
+      **The `VidMessageSlot*` half, same day**: `VidMessageSlotMap` is IOCTL `0x221108` (in 4, out
+      8 — a VA in the *calling* process) and `VidMessageSlotHandleAndGetNext` is `0x221107`
+      (in 8, out 0). **The map runs and the guest survives** — SUCCESS on the matched handle only,
+      slot VA read back with a live `HV_MESSAGE` header, uptime monotonic across a 60 s watch. **The
+      completion is deliberately not run**: it is how `Vid.sys` reaches `WinHvCompleteIntercept`,
+      and `vmwp` is already the consumer on these VPs, so a second completer races it. That needs a
+      partition with one client — **a concrete reason for step 8's rig**. Also: the map is one-way,
+      there being no `VidMessageSlotUnmap`.
       **Inheritance of a VID handle a worker still holds is excluded** on object identity —
       no child holds any of the workers' four current VID file objects. **Not excluded**: one
       inherited and since closed in the parent, which a snapshot cannot see. The children's own

@@ -6900,3 +6900,80 @@ lose the guest.
 straight answer, and the guest was gone seconds later. A post-arm liveness probe on this path
 measures nothing — the consequence waits for the guest's next exception. Read the uptime *later*, or
 watch the host's `Hyper-V-Worker-Admin` log rather than asking the patient.
+
+### Step 7, the message-slot half, 2026-09-30: the map works through the gate; the completion is not runnable on a live VM
+
+**Decoded first, and the decode is what decided how much of it to run.** Both calls, out of
+`vid.dll` `10.0.26100.8457`:
+
+| | control code | input | output |
+|---|---|---|---|
+| `VidMessageSlotMap(part, out, vp)` | **`0x221108`** | 4 B `{u32 VpIndex}` | 8 B — a **VA in the calling process** |
+| `VidMessageSlotHandleAndGetNext(part, vp, flags, evt)` | **`0x221107`** | 8 B `{u32 VpIndex; u32 Flags}` | none |
+
+The map's `out` struct is `{PVOID SlotVa; ULONG VpIndex;}` — the wrapper writes the returned
+pointer to `[rsi]` and echoes the VP index to `[rsi+8]`. The message itself is **not** returned by
+either IOCTL: it is read from the mapped VA.
+
+#### Only the map was run, and that is a decision rather than an omission
+
+`VidMessageSlotHandleAndGetNext` is the **completion**: its name is literal — handle the current
+message, then get the next — and it is how `Vid.sys` reaches `WinHvCompleteIntercept`, which it
+imports from `winhvr.sys`. That is the call whose absence wedged the guests in the arm above.
+
+It was still not run, for a reason the gate arm did not have: **`vmwp.exe` is already the consumer
+on these VPs.** A second completer races the first — stealing a completion, or completing an
+intercept the real consumer is mid-handling — against a VM somebody is using. Two guests have
+already been reset on this bench by arming without a consumer; racing the consumer is not the next
+thing to try on a live one. It belongs on a partition with **one** client, which is step 8's
+territory, and that is now a concrete reason for that rig rather than the general one that costing
+could not settle.
+
+**And the map is one-way.** `vid.dll` exports no `VidMessageSlotUnmap` — the slot-related exports
+are exactly `VidMessageSlotMap` and `VidMessageSlotHandleAndGetNext`. A slot mapped while attached
+stays mapped in `vmwp`'s address space for that process's lifetime. That is the cost this arm paid,
+and why it maps one VP rather than sweeping them.
+
+#### The result
+
+`h3probe`'s `IOCTL_H3_VIDSLOT`, attached to the owner as before, VP 0, against `Lab Guest Control`:
+
+| handle | owner matched | `0x221108` |
+|---|---|---|
+| `0x290`, `0x2C8`, `0x2F8` | no — not a partition | `0xC0000002` `NOT_IMPLEMENTED` |
+| **`0x2D0`** | **yes** | **`0x00000000` SUCCESS**, slot VA `0x2059A811000` |
+
+Read back through the VA while still attached:
+
+```text
++00  10 00 00 01 30 00 00 00 00 00 00 00 00 00 00 00
++10  00 00 00 00 00 00 00 00 00 00 00 00 00 00 00 00
++20  1C 00 2C 00 04 01 00 00 01 3B CF 74 34 41 23 C1
++30  00 30 FC F7 00 00 00 00 ED B2 B4 75 04 F8 FF FF
+```
+
+Parsed as an `HV_MESSAGE_HEADER`: `MessageType` **`0x01000010`**, `PayloadSize` **`0x30`**, flags 0.
+**Not a message type this record has named** — step 9's exception intercepts are `0x80010003`, and
+the hypervisor's own intercept messages carry bit 31 — so either `Vid`'s slot has framing of its own
+or this is a synthetic message the line has not met. **Unread**, and stated as unread.
+
+**A third independent confirmation of the gate falls out**: the map succeeded on exactly the handle
+whose `[partition+0x3780]` matched the attached process, and on no other. That agrees with
+`VidGetHvPartitionId`, with the register arm, and now with the slot map — three different control
+codes, same split.
+
+#### The guest survived, and this time the watch was built to notice if it had not
+
+The previous arm's health check asked the guest whether it was well, got a straight answer, and the
+guest was gone seconds later. So this arm does not ask: it samples **uptime** every 10 s for a
+minute and flags any value lower than the one taken before the call.
+
+```text
+t+10s uptime=00:11:28   t+20s 00:11:38   t+30s 00:11:48
+t+40s 00:11:58          t+50s 00:12:08   t+60s 00:12:18
+```
+
+Monotonic across the whole window, both guests still up afterwards, `LsaIso` alive on the VBS one,
+no host bug check. **Mapping a slot does not destabilise the guest**, which is the other half of
+what this arm establishes — it separates the map from the arming, and it is the arming that was
+fatal.
