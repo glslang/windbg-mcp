@@ -9,6 +9,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Item 103 carries an ordered route to the actual goal, and two of today's claims are narrowed to
+  what was measured.** The route, in `FOLLOWUPS.md` item 103 so it lives in **one** place: DbgEng
+  inspecting `securekernel` is what `docs/secure-kernel/exdi-stub-plan.md` owns, and **all three of
+  that stub's inputs are already measured** — VTL1 **registers** by H3, VTL1 **memory** by H4 plus
+  the direct-mapping oracle that read the same ranges the hypercall withheld (with SK's **PML4**
+  identified from the VTL1 `CR3`), and **kernel awareness** by E1. So the critical path is **E3 then
+  E4**, E2 being unrunnable on this bench, and **steps 6–9 plus everything measured today are a
+  different axis** — control rather than inspection, which an EXDI stub wants for breakpoints and
+  not for reading. **Two corrections from review.** The all-zero VTL1 entry context was called a
+  safety measure and is **not** one: on a partition whose ordering gate passes, the call may enable
+  the VTL and start it at the context given, so an invalid one is a fault or a reset — it was
+  harmless here only because the state gate refused first, which is a property of those partitions.
+  And *"the VSM capability bit is fixed at creation"* was an inference, not a measurement: the one
+  candidate review named has since been read — `VsmmVsmSetPartitionConfig` writes
+  `[partition+0x30f0]`, `[partition+0x30f4]` and the per-VTL info, and **does not touch
+  `[partition+0x10]`**, incidentally writing VID's enabled-VTL bookkeeping with no hypercall at all
+  — but **where that bit is written is still untraced**, a name-filtered scan finding nothing being
+  the same weak instrument that earlier read as *"no VID handle"*. Until
+  `tools/vid_field_census.py` runs against it, "VTL cannot be retrofitted" is an inference and the
+  claim that step 8 is *required* rests on it.
 - **The hypervisor's gate on a VTL1 entry context is VTL *state*, not the context and not policy —
   so running our own code in VTL1 kernel mode is not blocked where it was assumed to be.** A VBS
   enclave is VTL1 *user* mode; a partition whose VTL1 we enable with an entry context of our
@@ -18,7 +38,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `HV_INITIAL_VP_CONTEXT`), and `Vid.sys`'s handler, decompiled, checks **only the buffer length**
   before handing the caller's context straight to `WinHvEnableVpVtl`. So the probe driver called
   that wrapper **directly**, needing no partition of its own, with VP 0, target VTL 1 and an
-  **all-zero context** — chosen so acceptance could not also mean code had begun executing.
+  **all-zero context** — chosen for **discrimination, not safety**: a later round established that
+  on a partition whose ordering gate passes the context may be *used*, so zero is a fault or a reset
+  there rather than a refusal, and it was harmless here only because the state gate refused first.
   Both partitions were probed and **identified themselves by their own VTL state**:
   `STATUS_HV_VTL_ALREADY_ENABLED` (`0xC0350086`) for the VBS guest and
   `STATUS_HV_INVALID_VTL_STATE` (`0xC0350051`) for the one with `MaximumVtl=0`. **Neither refusal
@@ -35,9 +57,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the **same call on the VBS guest's partition answers differently** (`INVALID_VTL_STATE`) — a
   discriminating control, so the parameters reach the hypervisor and the refusal is about *that
   partition*. It mirrors `Vid.sys`'s own check, which refuses `STATUS_NOT_SUPPORTED` unless
-  `[partition+0x10]` carries `0x10`, a **partition capability fixed at creation**. So **VTL cannot
-  be retrofitted onto a partition not created for it**, and the VBS guest has no usable window
-  because both levels are already enabled. **This prices the route rather than blocking it**: our
+  `[partition+0x10]` carries `0x10`. **Calling that bit "fixed at creation" was an inference and is
+  withdrawn** — see the entry above: `VsmmVsmSetPartitionConfig` has since been read and does not
+  write it, but where it *is* written remains untraced, so "VTL cannot be retrofitted" is not
+  measured. What is: these two partitions cannot have partition VTL enabled by this call, and the
+  VBS guest has no usable window because both levels are already enabled. **This prices the route rather than blocking it**: our
   own code at VTL1 kernel privilege needs a partition created VSM-capable, its partition VTL
   enabled, then the VP enabled with our context — **step 8's tier A plus configuration, and
   emphatically not tier B or C.** The 19-module, ~10 MB device-and-firmware cliff is the price of
