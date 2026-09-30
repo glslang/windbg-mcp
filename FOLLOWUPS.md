@@ -4051,9 +4051,13 @@ validated. The full record is the
       receiver, which nothing here tests. A draft inferred that read-only duplicated access is
       insufficient; **withdrawn — wrong axis, and S5m already said so**: the receiver is IOCTL
       `0x221148` with `FILE_ANY_ACCESS`, and what gates it is *holding a partition handle*, not an
-      access mask. Testing it means invoking `VidRegisterExceptionHandler`, which per S5m *claims*
-      the slot it asks about, so against a live VM that is an arm with a hazard, not a probe, and
-      it was deliberately not run. Inheritance carries **one** `OBJ_INHERIT` handle out of 518.
+      access mask. Testing it means invoking `VidRegisterExceptionHandler`, and a draft justified
+      skipping that with the wrong hazard — the call **refuses** a claimed slot with
+      `STATUS_VID_DUPLICATE_HANDLER` before touching the hypervisor rather than displacing anyone;
+      the documented hazard is collision with a **raw** `WinHvInstallIntercept` installer, which
+      the duplicate check cannot see. So the test is more available than claimed and still a
+      decision: an unclaimed slot would be claimed by us on a running VM. **That is step 7's next
+      arm.** Inheritance carries **one** `OBJ_INHERIT` handle out of 518.
       **LiveCloudKd narrowed only as far as the handles**: they exist and are takeable, so its
       procedure is plausible rather than describing an older Windows — any further inference goes
       with the access-bit one, read off our summary of the tool, not its source. Full record, with
