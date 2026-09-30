@@ -7142,3 +7142,54 @@ internally — but the probe driver can call it directly, exactly as it just cal
 guest, then a VTL1-capable partition is reachable **without owning one from creation**. H3 already
 established the parent relationship is enough for the hypervisor to hand over a child's VTL1
 registers, so the premise is not far-fetched. Untested, and the obvious next arm.
+
+#### The ordering gate cannot be satisfied on an existing partition, 2026-09-30
+
+**So the route needs step 8 after all — but for a much narrower reason than the costing gave, and
+one that removes the costing's own cliff.**
+
+Reaching the context check needs a partition with VTL1 enabled at partition level and not yet on the
+VP. `WinHvEnablePartitionVtl` has no user-mode export, so the driver calls it directly. On the
+control guest — no VBS, `MaximumVtl=0` — it refuses:
+
+| | |
+|---|---|
+| `WinHvEnablePartitionVtl(0x8, VTL 1, flags 0)` | `0xC0350005` **`STATUS_HV_INVALID_PARAMETER`** |
+| the VP enable, retried immediately after | `0xC0350051` `STATUS_HV_INVALID_VTL_STATE`, unchanged |
+
+**A discriminating control says the parameters are not the problem.** The same call, same flags, on
+the **VBS** guest's partition answers **differently** — `STATUS_HV_INVALID_VTL_STATE` rather than
+`INVALID_PARAMETER` — so the arguments do reach the hypervisor and are evaluated per partition. Were
+they malformed, both partitions would reject them alike. And on the control guest the refusal is
+**invariant**: `flags` of `0,1,2,3,4,5,6,7,0x100,0x101` and `TargetVtl` of both 1 and 2 all return
+the same `INVALID_PARAMETER`.
+
+**That is a sound negative** — a control that discriminates plus an invariance sweep — and it matches
+`Vid.sys`'s own mirror of the same fact: `VsmmVsmpEnablePartitionVtl` refuses with
+`STATUS_NOT_SUPPORTED` unless `[partition+0x10]` carries `0x10` for VTL1, a **partition capability**
+fixed at creation. The hypervisor enforces it as a parameter error.
+
+**So VTL cannot be retrofitted onto a partition that was not created for it**, and the VBS guest's
+partition is no use either: VTL1 is already enabled there at both levels, leaving no window to
+insert an entry context of our own.
+
+#### What this prices
+
+The route to running our own code in VTL1 kernel mode is:
+
+1. create a partition — step 8's tier A, about a dozen undocumented calls and one ~52 KB struct;
+2. give it VSM capability at creation, so the `0x10` bit is set;
+3. enable partition VTL1 — the call above, which then has a partition that can accept it;
+4. enable VP VTL1 with our own 224-byte context, which **nothing so far validates**.
+
+**And it does not need tier B or C.** The costing's cliff — 19 modules and ~10 MB of device and
+firmware model — is the price of booting *Windows* in the partition. Running our own code at VTL1
+kernel privilege needs no guest OS, no firmware, no vTPM: a partition, a VSM config, and an entry
+point. That is tier A plus configuration, and tier A was the bounded tier.
+
+**Which makes this a different and much smaller project than "write a VMM"** — and the thing it
+would produce is a VTL1 **kernel-mode** execution environment, which the enclave rig cannot give at
+any price. It is still not Microsoft's Secure Kernel; it is that position, occupied by us.
+
+**Non-destructive throughout.** Every arm in this section was refused before it could act, and both
+guests ran monotonically across all of them.

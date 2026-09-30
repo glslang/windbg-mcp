@@ -2014,9 +2014,13 @@ overstated the first two into blockers and got the third wrong.**
   length, and the hypervisor refuses on VTL **state** (`STATUS_HV_VTL_ALREADY_ENABLED` /
   `STATUS_HV_INVALID_VTL_STATE`) rather than on the context, with no policy or measurement gate
   seen. That would run **our** code at VTL1 kernel privilege, not Microsoft's Secure Kernel. Next
-  arm: `WinHvEnablePartitionVtl` directly, which has no user-mode export but which the probe
-  driver can reach — and if the root may enable partition VTL1 on an existing child, this needs no
-  partition of our own. See the **VTL1 kernel mode** section of
+  arm: **run, and the answer is no** — `WinHvEnablePartitionVtl` on the non-VBS guest returns
+  `STATUS_HV_INVALID_PARAMETER` invariantly across ten flags values and both VTLs, while the same
+  call on the VBS guest's partition answers differently, so the refusal is about that partition and
+  mirrors VID's own `[partition+0x10] & 0x10` **creation-time capability** check. **VTL cannot be
+  retrofitted**, so this needs step 8 — but only **tier A plus a VSM config**, not tier B or C: the
+  ~10 MB device-model cliff is the price of booting *Windows*, and running our own code at VTL1
+  kernel privilege needs no guest OS at all. See the **VTL1 kernel mode** section of
   [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
 ### S0 — the gate that decides how much setup a user needs — **RUN 2026-09-26, PASS**
