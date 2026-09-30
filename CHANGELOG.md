@@ -37,8 +37,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   line**: run 1 called the arm confounded because the interleaved backed-out arm *after* the armed
   one showed a **stale** marker — the hit test compared type and vector and ignored the timestamp,
   which is exactly the defect review round 3 had filed against this plan, reproduced in the code
-  written to honour it. Bench intact: teardown reported 0 intercepts standing on both runs, raiser
-  killed after every arm, both guests up 2h50m unbroken, no bug check since boot.
+  written to honour it. Bench intact: teardown reported 0 intercepts standing every time, raiser
+  killed after every arm across three unchained runs and two combined ones, the combined arm's
+  `unchain` returning `SUCCESS` with the saved pair restored, both guests up **3h26m** unbroken, no
+  bug check since boot.
 - **The step 9 read is built, and the walk holds at run time.** Steps 1–2 of item 103 step 9:
   `h3probe.sys` gains `IOCTL_H3_VIDVP`, which takes a partition **id** rather than a pointer,
   resolves the VID partition object through Hyper-V's own locked table, refuses unless the
