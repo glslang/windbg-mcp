@@ -5945,7 +5945,7 @@ mask*. Review caught the claim; the install for vector `0` was then tried and **
 child's mask is known to admit. The real limit was never the hypervisor — it is which accepted
 exceptions `spin_host` can raise, and it happened to have one.
 
-#### Frozen, not slowed — and the two VPs are one thread ping-ponging
+#### Frozen, not slowed — and the second VP's events are unexplained
 
 The VTL1 arm read a fresh exception-intercept message on **both** VPs, each carrying its own
 `VpIndex`, at one `Rip`. It called that *"consistent with one held raise"*. **Review was right that
