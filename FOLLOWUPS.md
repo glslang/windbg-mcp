@@ -3156,7 +3156,12 @@ validated. The full record is the
   read for a check on the active VTL. **Run as S5i on 2026-09-29, and it found one**: the check is
   at install time rather than in delivery, and it sets the VTL to 0 for any child while seeding that
   slot into every VTL's effective mask — so the intercept does cover VTL1 and the retraction above
-  stands as a statement about the halt evidence, not about the conclusion.
+  stands as a statement about the halt evidence, not about the conclusion. **And the other route
+  S5h named — *delivery metadata from an actual receiver* — was taken by step 9's VTL1 arm on
+  2026-09-30 and settles it**: the intercept message's `Rip` is the **enclave's** `int3`, matching
+  this halt table's VTL1 value in its low 16 bits on a different boot. An intercept fired on a VTL0
+  excursion would name the VTL0 instruction, so the excursion is excluded and the trap is taken at
+  the VTL1 raise.
 - **The first four runs read the VTL1 arm as *advancing* and that is retracted.** The counts
   reported — 1,902, 6,396, 15,076, 18,486 — were all written by the monitor's final sample, *after*
   teardown removed the intercept and the raiser finished, and one of them became a "405x slower but
@@ -4123,9 +4128,27 @@ validated. The full record is the
       `[P+0xB68][3]` read `0xFF` before the install and `0xFF` after the removal, consistent with
       arm 1 and corroborated by the trap staying held while nothing completed it, but not decided —
       a claim-and-restore between samples reads as unchanged. And the raise was in **VTL0**, as
-      S5q arm 1's was; reading the markers for a **VTL1** raise is the cheap next arm rather than
+      S5q arm 1's was; reading the markers for a **VTL1** raise was the cheap next arm rather than
       something this one covered. The Secure Kernel scope limit stands exactly as S5i left it:
       VTL1 user mode is not VTL1 kernel mode.
+
+      **The VTL1 arm is RUN, 2026-09-30, and it reaches VID too — and it settles S5h's fork.**
+      `spin_host.exe BP1` raising inside the VBS enclave, same instrument and partition: both VPs
+      read `0x80010003` / vector `3` / reason `2`, with the interleaved backed-out VTL1 arms on
+      either side reading nothing and completing 2,000 rounds at **7.63** and **7.49 µs** each.
+      **The message's `Rip` is the enclave's `int3`** — `0x00000243071E500D`, `0x123` bytes from the
+      routine the raiser named in that same run — and an intercept fired on a VTL0 excursion would
+      name the VTL0 instruction instead, so the excursion S5h could not dismiss is excluded and the
+      trap is taken at the VTL1 raise. **It agrees with S5h across gates**: both arms' message
+      `Rip`s match S5h's halted `RIP`s in their low 16 bits (`500D`, `748D`) on a different boot.
+      `ExecutionState` is `0x0097` against VTL0's `0x001F` — reported raw, because **two** bits
+      differ (bit 7 only in VTL1, bit 3 `Cr0Am` only in VTL0), the layout was not verified against
+      this build, and the vector could not be varied to separate a VTL field from an
+      exception-specific one: the hypervisor takes exception intercepts only for vectors 3 and 4 and
+      the raiser has no `#OF` mode. Building one is the cheap way to close that. **The raiser column
+      says "did not finish" and nothing more** — a draft said "slowed but advancing", which is the
+      reading S5h retracted once its counts turned out to be the monitor's post-teardown sample.
+      Scope unchanged: VTL1 user mode is not Secure Kernel.
 
       **One defect worth keeping, because it was this plan's own warning landing in this plan's own
       code.** Run 1 reported the arm CONFOUNDED: the second backed-out arm showed an exception

@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **A VTL1 `#BP` reaches VID too, and the message names the enclave's own instruction — which
+  settles the fork S5h left open.** Same instrument as the VTL0 arm, same partition, same session,
+  with `spin_host.exe BP1` raising inside a VBS enclave: both VPs read `0x80010003` / vector `3` /
+  reason `2`, and the interleaved backed-out VTL1 arms on either side read nothing while completing
+  2,000 rounds at **7.63** and **7.49 µs** each. **The intercept message's `Rip` is the enclave's
+  `int3`** — `0x00000243071E500D`, `0x123` bytes from the routine the raiser named in that same run.
+  S5h could not say whether the hypervisor takes the VTL1 trap in VTL1 or whether the enclave's
+  dispatch makes a VTL0 excursion a VTL0-scoped intercept catches, because its register halts were
+  consistent with both; a message reporting the **VTL1** instruction is not, because an intercept
+  fired on an excursion would name the VTL0 one. **And it agrees with S5h across gates**: both arms'
+  message `Rip`s match S5h's halted `RIP`s in their low 16 bits — `500D` and `748D` — on different
+  boots with different ASLR bases, a VP halt and an intercept message naming the same two
+  instructions. `ExecutionState` reads `0x0097` in VTL1 against `0x001F` in VTL0; **two** bits
+  differ, bit 7 set only in VTL1 and bit 3 (`Cr0Am`) only in VTL0, and it is reported raw because
+  this gate did not verify the field layout and could not vary the vector to separate a VTL field
+  from an exception-specific one — the hypervisor accepts exception intercepts only for vectors 3
+  and 4 and the raiser has no `#OF` mode. **The raiser column says "did not finish" and nothing
+  more**: a draft said "slowed but advancing", which is exactly the reading S5h retracted after its
+  counts turned out to be the monitor's post-teardown sample, and this arm measured no progress at
+  all. Scope unchanged: VTL1 **user** mode is not Secure Kernel. Bench intact — 0 intercepts
+  standing at teardown, `LsaIso` alive, both guests up 4h03m, no bug check since boot.
 - **The message IS delivered: item 103 step 9's arm, and S5q's third explanation is eliminated.** A
   `#BP` raised in a guest under a standing raw `HvCallInstallIntercept` reaches the root's
   `Vid!VidInterceptPreprocess`, which copies the message, stamps the VP and selects
@@ -32,8 +53,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   *both* branches of `VidHandleExceptionIntercept`. **Not settled**: which branch the
   handler took (`[P+0xB68][3]` read `0xFF` on both sides, consistent with the unclaimed-vector arm
   and corroborated by the trap staying held, but a claim-and-restore between samples reads as
-  unchanged); and the raise was in **VTL0**, so a VTL1 raise is the next arm rather than something
-  this one covered. The Secure Kernel scope limit stands as S5i left it. **And one defect worth the
+  unchanged); and the raise was in **VTL0**, so a VTL1 raise was the next arm rather than something
+  this one covered — **run, and it is the entry above**. The Secure Kernel scope limit stands as S5i
+  left it. **And one defect worth the
   line**: run 1 called the arm confounded because the interleaved backed-out arm *after* the armed
   one showed a **stale** marker — the hit test compared type and vector and ignored the timestamp,
   which is exactly the defect review round 3 had filed against this plan, reproduced in the code
