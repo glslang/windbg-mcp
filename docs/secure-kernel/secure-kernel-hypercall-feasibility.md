@@ -6567,11 +6567,29 @@ than a partition, and `ERROR_ACCESS_DENIED` on the remaining two with the driver
 a partition it does not consider ours — which is step 4's territory, where `VidPartitionAttach`
 makes the opener the owning process. Both readings are untested.
 
-**Testing the receiver means invoking it, and that is an arm with a hazard rather than a probe.**
-The operation is `VidRegisterExceptionHandler`, and S5m's own result is that registering to ask
-whether the slot is claimed *claims* it — so running it against a live lab VM's partition would
-displace that VM's handler rather than observe it. It was deliberately not run here, and step 6's
-slot read exists precisely because this question needed a non-mutating instrument.
+**Testing the receiver means invoking `VidRegisterExceptionHandler`, and a draft justified not
+doing so with a hazard that is not the one this record documents.** It said the call would
+*displace* the VM's handler. It would not: S5l's decode has
+`VidHandlerpExceptionRegisterEntry` refusing a **claimed** slot with `0xC0370001`
+`STATUS_VID_DUPLICATE_HANDLER` **before touching the hypervisor**, so against a party that
+registered through Vid it refuses rather than displaces — and where the slot is unclaimed there is
+no VM handler to displace in the first place. The draft had borrowed step 6's rationale, which is
+about a *probe that claims an unclaimed slot*, and applied it to a different call.
+
+**The documented hazard is the other one**, and it is narrower: the duplicate check consults
+`[partition+0xB68]`, which sees only parties that registered *through Vid*. A raw
+`WinHvInstallIntercept` installer leaves the slot at `0xFF`, so a Vid registration succeeds beside
+it and `VidUnregisterHandler` later clears the shared, unrefcounted hypervisor bit out from under
+them — with no owner field to consult and no check that closes it. The record's rule is **one
+installer per vector per partition at a time**.
+
+**So the test is more available than the draft claimed, and it is still a decision rather than a
+probe.** This line's raw installs have all been inside the nested lab guest, not against these host
+partitions, so the collision case is not *known* to apply here — though by the record's own
+argument nothing can confirm that, the bitmask having no owner field. What remains is real and
+small: a slot that turns out unclaimed would be claimed by us, on somebody's running VM. That is
+the next arm for step 7, named with the right hazard, and it is a call to make rather than a thing
+to run in passing.
 
 **The inheritance half is nearly closed by size**: each worker has **one** handle marked
 `OBJ_INHERIT` out of 518, and its children are `vmmem` and `vmsp.exe`.

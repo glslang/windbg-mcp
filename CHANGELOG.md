@@ -26,9 +26,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaches the receiver, which nothing here tests. A draft inferred that read-only duplicated
   access is insufficient; **withdrawn as the wrong axis, and S5m had already written the answer** —
   the receiver is IOCTL `0x221148` with `FILE_ANY_ACCESS`, gated on *holding a partition handle*,
-  not on an access mask. Invoking it means `VidRegisterExceptionHandler`, which per S5m claims the
-  slot it asks about, so it is an arm with a hazard rather than a probe and was not run. Controls,
-  errors and limits in the **Step 7** section of
+  not on an access mask. Invoking it means `VidRegisterExceptionHandler`, and a draft justified
+  skipping that with the wrong hazard: the call **refuses** a claimed slot with
+  `STATUS_VID_DUPLICATE_HANDLER` **before** touching the hypervisor rather than displacing a
+  handler, and the documented hazard is collision with a **raw** installer the duplicate check
+  cannot see. The test is therefore more available than claimed and still a decision — an unclaimed
+  slot would be claimed by us on a running VM — and it is step 7's next arm. Controls, errors and
+  limits in the **Step 7** section of
   [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 - **Item 103 step 8 is costed, and the costing does not yield the decision — which a first draft
   of it claimed anyway.** The solid result is a negative: the **documented** partition API
