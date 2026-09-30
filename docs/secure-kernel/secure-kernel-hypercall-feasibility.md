@@ -5450,8 +5450,12 @@ count: there is no `lea` of that field for a write to travel through, which is t
 tool found for `[p+0x3060]` in S5p. The residuals `vid_field_census.py` records stand unchanged —
 an inter-procedural pointer, a bulk copy spanning the field, and another image entirely.
 
-**Nothing in this image names `VidHandleExceptionIntercept` except the `lea` that stores it.** It has
-**one** reference: the `lea` at `VidInterceptPreprocess+0x1e0` that puts it in `V+0x158`. Nothing
+**Nothing in this image names `VidHandleExceptionIntercept` except the `lea` that stores it.** One
+route reaches it: the `lea` at `VidInterceptPreprocess+0x1e0` that puts it in `V+0x158`. *Route*
+rather than *site* — `pe_xref.py` answers which RVAs are named and not how many instructions name
+one, so a shifted start that a branch really did enter would be counted here as the same route
+because it names the same RVA. That distinction cannot hide a second destination, which is what this
+paragraph turns on. Nothing
 else names it, across 1,988 `.pdata` functions swept linearly **and 652,268 candidate starts
 covering every executable byte in the image**, and no section — including the executable ones —
 holds its address in either searched encoding beyond its own `RUNTIME_FUNCTION` and its `GFIDS`
