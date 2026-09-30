@@ -9,6 +9,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The hypervisor's gate on a VTL1 entry context is VTL *state*, not the context and not policy —
+  so running our own code in VTL1 kernel mode is not blocked where it was assumed to be.** A VBS
+  enclave is VTL1 *user* mode; a partition whose VTL1 we enable with an entry context of our
+  choosing would put our code at VTL1 kernel privilege instead. **VID imposes nothing on that
+  context**: `VidVsmEnableVpVtl` sends IOCTL **`0x221214`**, `METHOD_BUFFERED`, `0xE8` bytes
+  (`{ULONG VpIndex; UCHAR TargetVtl; pad; UCHAR Context[0xE0]}` — 224 bytes, the size shape of
+  `HV_INITIAL_VP_CONTEXT`), and `Vid.sys`'s handler, decompiled, checks **only the buffer length**
+  before handing the caller's context straight to `WinHvEnableVpVtl`. So the probe driver called
+  that wrapper **directly**, needing no partition of its own, with VP 0, target VTL 1 and an
+  **all-zero context** — chosen so acceptance could not also mean code had begun executing.
+  Both partitions were probed and **identified themselves by their own VTL state**:
+  `STATUS_HV_VTL_ALREADY_ENABLED` (`0xC0350086`) for the VBS guest and
+  `STATUS_HV_INVALID_VTL_STATE` (`0xC0350051`) for the one with `MaximumVtl=0`. **Neither refusal
+  names the context** — no `INVALID_PARAMETER`, no `ACCESS_DENIED`, no measurement or policy — the
+  hypervisor checks VTL state and returns before examining the 224 bytes. **Non-destructive**: both
+  guests ran monotonically through a 60 s uptime watch. Partition ids had **moved** since H3 read
+  `0x2`/`0x3`, so they were enumerated rather than recalled. **Still open**: whether the context is
+  validated at all, since no run has got past the state check to present one — and reaching it may
+  not need step 8's rig, because `WinHvEnablePartitionVtl` has no user-mode export but the driver
+  can call it directly, and H3 already established the parent relationship suffices for the
+  hypervisor to hand over a child's VTL1 registers.
 - **Item 103's consume loop runs, eats the partition owner's messages, and resets the guest — so
   step 8 is now the route on measurement rather than inference.** Two mechanical facts first:
   `0x221107` is the **only `METHOD_NEITHER`** code of the four in use, so its input must be

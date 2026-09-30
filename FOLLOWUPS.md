@@ -2009,6 +2009,15 @@ overstated the first two into blockers and got the third wrong.**
   S5h held was a **VTL1** raise and step 9's arm did not read the markers for one. Whether any of it
   reaches Secure Kernel's own code remains an architectural inference after S5i rather than an open
   mechanism, because VTL1 user mode is not VTL1 kernel mode.
+  **A route to VTL1 KERNEL mode is now open at the hypervisor, measured 2026-09-30**: enabling VTL1
+  on a VP takes a caller-supplied 224-byte entry context, `Vid.sys` validates only the buffer
+  length, and the hypervisor refuses on VTL **state** (`STATUS_HV_VTL_ALREADY_ENABLED` /
+  `STATUS_HV_INVALID_VTL_STATE`) rather than on the context, with no policy or measurement gate
+  seen. That would run **our** code at VTL1 kernel privilege, not Microsoft's Secure Kernel. Next
+  arm: `WinHvEnablePartitionVtl` directly, which has no user-mode export but which the probe
+  driver can reach — and if the root may enable partition VTL1 on an existing child, this needs no
+  partition of our own. See the **VTL1 kernel mode** section of
+  [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
 ### S0 — the gate that decides how much setup a user needs — **RUN 2026-09-26, PASS**
 

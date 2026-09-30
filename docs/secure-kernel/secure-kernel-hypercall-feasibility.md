@@ -7061,3 +7061,84 @@ separate them, because on this partition doing the second is the only way to att
 `vp` 2 and 3 return `INVALID_PARAMETER` — which agrees with the two-VP result the loop question
 reached from the hypervisor's counters; and **VP 1's slot carries a different type** (`0x01000004`)
 from VP 0's, so the stream is per-VP rather than one queue.
+
+### VTL1 kernel mode, 2026-09-30: the hypervisor's gate on an entry context is VTL *state*, not the context and not policy
+
+**The question**, raised against the enclave rig's limit: a VBS enclave is VTL1 *user* mode, so it
+cannot answer anything about VTL1 kernel mode — but a partition we own could enable VTL1 on its own
+VPs with an entry context of our choosing, which would put **our** code at VTL1 kernel privilege.
+Not the Secure Kernel, but the Secure Kernel's position. What stops it?
+
+**Nothing in VID.** `vid.dll!VidVsmEnableVpVtl` sends IOCTL **`0x221214`**, `METHOD_BUFFERED`,
+`0xE8` bytes — `{ ULONG VpIndex; UCHAR TargetVtl; pad; UCHAR Context[0xE0] }` — copying the
+caller's 224 bytes in verbatim after a `memset`, and `Vid.sys`'s handler, decompiled, is this
+entire thing:
+
+```c
+if (param_8 != 0x221214) goto LAB_140033e36;
+if (param_5 < 0xe8) {
+    return 0xc0000023;                       /* BUFFER_TOO_SMALL -- the only check */
+}
+uVar3 = WinHvEnableVpVtl(param_1[0x51],      /* [partition+0x288], the HV partition id */
+                         (int)*param_4,      /* VpIndex   (input +0) */
+                         CONCAT71(uVar11, *(undefined1 *)((longlong)param_4 + 4)),  /* TargetVtl (+4) */
+                         param_4 + 1);       /* the caller's context, untouched (+8) */
+```
+
+A length check, then straight through. **224 bytes is the size shape of
+`HV_INITIAL_VP_CONTEXT`** — `Rip`, `Rsp`, `Rflags`, the segment registers with full descriptors,
+`GDTR`/`IDTR`, `CR0`/`CR3`/`CR4`, `EFER`. So the interface exists to let a caller *name* where the
+target VTL begins executing, and VID imposes nothing on what it names.
+
+**`[partition+0x288]` is confirmed as the HV partition id from a second call site**, having already
+appeared as `WinHvInstallIntercept`'s first argument in `VidHandlerpExceptionRegisterEntry`.
+
+#### Reaching the hypervisor directly
+
+The only unmeasured gate left is the hypervisor's, so the probe driver calls
+`winhvr!WinHvEnableVpVtl` **directly**, which needs no partition of our own. VP 0, target VTL 1,
+and an **all-zero context** — chosen because `CR0`/`CR3`/segments are then invalid, so acceptance
+could not also mean arbitrary code had started running, while a refusal still discriminates.
+
+Both partitions were probed, which makes them **self-identifying**:
+
+| partition | status | `ntstatus.h` |
+|---|---|---|
+| `0x5` | `0xC0350086` | **`STATUS_HV_VTL_ALREADY_ENABLED`** — *"The VTL specified for the operation is already in an enabled state."* |
+| `0x8` | `0xC0350051` | **`STATUS_HV_INVALID_VTL_STATE`** — *"The supplied virtual trust level is not in the correct state to perform the requested operation."* |
+
+So `0x5` is the VBS guest, whose VP 0 already has VTL1, and `0x8` is the guest with
+`MaximumVtl=0`. **The partition ids had moved** — H3 read `0x2` and `0x3` on 2026-09-26 and these
+are `0x5` and `0x8`, because the guests have rebooted since; they were enumerated rather than
+recalled.
+
+#### What the two codes settle
+
+**Both refusals are about VTL *state*, and neither is about the context.** Not
+`INVALID_PARAMETER`, not `ACCESS_DENIED`, nothing naming a measurement or a policy. The hypervisor
+checks whether the target VTL is in the right state and returns **before it examines the 224
+bytes**. On this evidence there is no context-validation gate and no attestation gate in the way —
+there is an **ordering** gate: partition-level VTL1 must be enabled, and VP-level VTL1 must not
+already be.
+
+**That is a permissive answer to a question the costing could not price**, and it is measured rather
+than reasoned: the route to running our own code in VTL1 kernel mode is not blocked by the
+hypervisor refusing to be told where VTL1 starts.
+
+**Non-destructive, unusually for this line.** Both guests ran monotonically through a 60 s uptime
+watch and were untouched — the zero context was refused before anything could act on it, which is
+what choosing it was for.
+
+#### What is still open, and the cheaper route it suggests
+
+**Whether the context is validated at all** is unmeasured, because no run has yet got past the state
+check to present one. Reaching it needs a partition whose VTL1 is enabled at partition level but not
+yet on the VP.
+
+**And that may not need step 8's rig.** `WinHvEnablePartitionVtl` has **no user-mode export** —
+`vid.dll` ships `VidDisablePartitionVtl` and no enable, so partition-level VTL1 is turned on
+internally — but the probe driver can call it directly, exactly as it just called
+`WinHvEnableVpVtl`. If the **root**, as a child's parent, may enable partition VTL1 on an existing
+guest, then a VTL1-capable partition is reachable **without owning one from creation**. H3 already
+established the parent relationship is enough for the hypervisor to hand over a child's VTL1
+registers, so the premise is not far-fetched. Untested, and the obvious next arm.
