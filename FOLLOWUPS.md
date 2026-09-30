@@ -4053,10 +4053,31 @@ validated. The full record is the
       every offset and both censuses, is the **step 9 feasibility** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 
-      **Still open, and what it now needs.** Nothing ran live: the IOCTL does not exist, and the
-      walk above is a static reading plus S5q step 2's recorded pair. The arm's first act is the
-      runtime confirmation this gate cannot give — `[VP+0] == P`, a plausible `[P+0xAA8]`, and
-      `[P+0xB68]` pointing at a table of mostly `0xFF`. **The arm's shape, settled across three
+      **Steps 1 and 2 are RUN, 2026-09-30: the read is built and the walk holds at run time.**
+      `IOCTL_H3_VIDVP` (`0x80A`) takes a partition **id**, resolves the context through
+      `H3ReadPair` under Hyper-V's own lock, refuses unless the registered routine lands inside the
+      loaded `Vid.sys`, and reads everything through a canonical-address + `MmIsAddressValid` +
+      SEH helper. On both lab partitions: `[V+0] == P` for all four VPs, `[P+0xAA8]` = 2 against
+      Hyper-V's own report of **2 vCPUs** per guest, and `[P+0xB68]` reading `FF FF FF FF FF FF FF
+      FF` — so **`[P+0xB68][3]` is `0xFF`, unclaimed**, which S5k asked for and nobody had ever
+      read. **The strongest reading is a differential**: the live markers reproduce the type switch
+      the feasibility gate read out of `Vid+0x3D137`, on two message types and two partitions —
+      `0x80000000` → `VsmmHandleMemoryIntercept` / reason `7`, `0x80010000` →
+      `VidHandleIoPortIntercept` / reason `5`, both predicted by the `lea`/`mov esi` pairs beside
+      the jump table. Bench untouched: nothing written, no intercept installed, driver stopped
+      after, host uptime continuous, no bug check, both guests up throughout. One caveat the output
+      made plain: `[V+0x68]` is the exception vector **only** for message type `0x80010003` — on
+      the IO-port message it read `0x71`, which is payload.
+
+      **Still open, and what it now needs.** Nothing has been *raised*, so no exception intercept
+      has been observed and the delivery question is exactly where the feasibility gate left it.
+      What steps 1–2 retired is the risk in the arm rather than the arm: the walk is confirmed, the
+      guards are exercised, and the markers are known to carry live state rather than zeros — which
+      is what would have made a first arm's reading uninterpretable. The remaining act is the arm
+      itself — the raise, the three reads around it, the interleaved backed-out arm and the
+      positive control. (The three checks this paragraph used to name as the arm's first act —
+      `[VP+0] == P`, a plausible `[P+0xAA8]`, and `[P+0xB68]` pointing at a table of mostly
+      `0xFF` — are the ones steps 1–2 just ran, and all three passed.) **The arm's shape, settled across three
       review rounds and cheaper than any of them sounded: one IOCTL called three times per raise —
       before, during the hold, and after.** Delivery is `V+0x208` **moving**, never its value,
       because a previous `#BP` on that VP leaves all four markers already reading as a delivery and

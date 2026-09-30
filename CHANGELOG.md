@@ -9,6 +9,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The step 9 read is built, and the walk holds at run time.** Steps 1–2 of item 103 step 9:
+  `h3probe.sys` gains `IOCTL_H3_VIDVP`, which takes a partition **id** rather than a pointer,
+  resolves the VID partition object through Hyper-V's own locked table, refuses unless the
+  registered routine lands inside the loaded `Vid.sys`, and reads every field through a
+  kernel-canonical + `MmIsAddressValid` + SEH helper at `APC_LEVEL` or below. Nothing is written
+  anywhere and no intercept is installed. On both lab partitions the static walk survives contact:
+  `[V+0x00]` equals the partition for all four VPs, `[P+0xAA8]` reads **2** against Hyper-V's own
+  report of 2 vCPUs per guest — an oracle with nothing to do with these offsets — and `[P+0xB68]`
+  reads `FF` across vectors 0–7, so **`[P+0xB68][3]` is unclaimed**, the byte S5k named and nobody
+  had read. **The reading worth more than the back-pointer check is a differential**: the live
+  markers reproduce the type switch read statically out of `Vid+0x3D137`, on two message types and
+  two partitions — `0x80000000` → `VsmmHandleMemoryIntercept` with reason `7`, `0x80010000` →
+  `VidHandleIoPortIntercept` with reason `5`, each matching the `lea`/`mov esi` pair beside the
+  jump table. The copied message's own sender field carries the partition id as a third
+  corroboration. One caveat the output made plain and the record now states: `[V+0x68]` is the
+  exception vector **only** for message type `0x80010003`; on the IO-port message it is payload.
+  Bench untouched — driver stopped after, host uptime continuous, no bug check, both guests up
+  throughout. **Nothing was raised**, so the delivery question is where the feasibility gate left
+  it; what this retires is the risk in the arm, not the arm.
 - **The convergence point records its own arrivals, so the instrument is a read.** Item 103 step 9
   asked how the **root** partition's `Vid.sys` could be instrumented — *"a patch, a breakpoint on a
   host kernel this bench cannot freeze, or neither"* — and said to cost that before scheduling the
