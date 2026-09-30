@@ -5234,8 +5234,10 @@ then `jmp`, `int 29h` and the rest in turn — a predicate per round, which is t
 never lands. **So boundaries are no longer inferred at all, and the two questions are answered by two
 different mechanisms.** A `.pdata` entry *is* a function — exact bounds, decoded whole, no padding
 test — so an anchor load and a field access inside one are genuinely the same function's, and **that
-is where the 28 and the 42 come from**; all 28 reaching regions are `.pdata` functions, checked rather
-than assumed. A gap span is decoded as a *detector*: the union over its candidate starts, which
+is where the 28 and the 42 come from** — and they can come from nowhere else, because a gap span is
+never keyed into the reaching set at all: `analyse` iterates the `.pdata` table and nothing but it.
+That is a property of the code rather than a reading of this image, which is stronger than the
+"checked, not assumed" an earlier version of this sentence claimed. A gap span is decoded as a *detector*: the union over its candidate starts, which
 maximises what is found (a leaf after a `ret` is still reached from the previous start) and claims
 nothing about grouping. Gap findings are reported in a section of their own, **excluded from both
 counts**, each labelled *boundaries unknown — read this span by hand*. On this image that section
