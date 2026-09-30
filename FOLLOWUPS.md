@@ -4016,8 +4016,10 @@ validated. The full record is the
       later arm answered it: `handled = 0` shows only that the guest's `__except` never ran, and
       the 20 fresh stamps are twenty calls to `VidInterceptPreprocess` rather than twenty
       executions — but **the hypervisor's own per-VP `Total Messages/sec` settles it** (see *the loop
-      question* below): tens of thousands of deliveries a second armed against **zero** in four
-      control phases, so S5k's re-entry inference holds. **And a third reading came free**: per-VP
+      question* below): tens of thousands of deliveries a second armed against **zero** in five
+      control phases — one of them the vector armed with the raiser absent, the only arm that
+      could have shown an unrelated `#BP` source — so S5k's re-entry inference holds. **And a
+      third reading came free**: per-VP
       `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at different instants and `0`
       at every sample of a control that raised **1.87 million** `#BP`s with no intercept standing,
       while both VPs keep accumulating `VpRuntime`. **The VPs are being resumed**, which removes the
