@@ -3824,44 +3824,32 @@ validated. The full record is the
   Three other functions read the pair — `WinHvpOnMirroringNotification`,
   `WinHvpSendRestartNotificationToAllPartitions`, `WinHvIssueSnpPspGuestRequest` — and their names
   say they serve other message types, but their objects were not identified, so a dispatch consulting
-  one of those instead is **narrowed, not eliminated**. **The `.pdata` hole is narrowed, and the gap
-  scan was wrong three times before it was right** (re-derived 2026-09-30): `.pdata` claims no leaf
-  functions, so the tool decodes the executable bytes it leaves out — **9,599 here, 9,569 of them
-  `0xCC`/`0x00`, five spans holding anything else, decoded as six islands, 0 distinct bytes capstone
-  refused**. (1) Decoding a span as one
-  stream loses an island after an odd-length `0x00` run (`00 00` is a two-byte `add byte ptr [rax],
-  al`). (2) Splitting it at *every* `0xCC`/`0x00` byte — the fix for that, and what this entry
-  recorded — cuts instructions apart instead, because **a single zero byte is not padding** and almost
-  every RIP-relative load carries one in its high displacement byte; a 12-byte leaf loading the array
-  anchor and reading `+0x10` reported **zero** reaching regions under it. (3) Decoding each span as
-  one *region* — the fix for that, and what review caught — restored the instructions and lost the
-  provenance: one body per span let `field_hits` attribute one leaf's `+0x10`/`+0x18` access to a
-  **different** leaf that loaded the anchor, inflating the very figure this census licenses. The rule
-  now is to apply the padding test **where an instruction begins**: each island decoded from its own
-  start, instructions swallowing interior `0xCC`/`0x00` bytes of their own encoding, the island ending
-  where the next *instruction boundary* lands on padding — and each island its **own region**, so
-  correlation cannot cross a leaf. Overlapping candidates are kept rather than pruned, leaving a lower
-  bound with possible phantoms. **And the boundary rule undercounts in one measured case**: a genuine
-  `int3` at an instruction boundary inside gap code splits a real leaf, the anchor-load half reaching
-  and the field-access half not, dropping that access — the dangerous direction for a census licensing
-  a negative, so it is pinned as behaviour rather than patched. It cannot reach a `.pdata`-claimed
-  function (exact bounds, decoded whole, no padding test), and all 28 reaching regions here are
-  `.pdata` functions, so all 42 accesses come from bodies the limit does not touch. **The
-  sibling instrument had the decoding right** — `vid_field_census.py` decodes "from every plausible
-  start … and take[s] the union" because "no single pass licenses a negative here" — while this entry
-  claimed the gaps were decoded *"as `vid_field_census.py` does"*; naming the right sibling is not
-  copying its method. And **`rbp` is no longer assumed to be a
+  one of those instead is **narrowed, not eliminated**. **The `.pdata` hole is narrowed, and what
+  closed it was giving up on a question the image cannot answer** (re-derived 2026-09-30): `.pdata`
+  claims no leaf functions, so the tool decodes the bytes the table leaves out — **9,599 here, 9,569
+  of them `0xCC`/`0x00`, five spans holding anything else, 0 distinct bytes refused**. A gap has no
+  unwind record, and four attempts to infer where a leaf begins or ends were each wrong differently:
+  one stream from the span start loses an island after an odd-length `0x00` run (`00 00` is a two-byte
+  `add byte ptr [rax], al`); splitting at *every* `0xCC`/`0x00` byte cuts instructions apart, since **a
+  single zero byte is not padding**; one region per span loses provenance, crediting one leaf's field
+  access to another leaf's anchor load; and ending an island at padding fixed that only for *padded*
+  neighbours, leaving two leaves emitted back to back collapsed. Adding `ret` as a second boundary
+  would split a real two-return function instead, then `jmp` and `int 29h` in turn — a predicate per
+  round. **So boundaries are not inferred at all.** A `.pdata` entry is a function (exact bounds,
+  decoded whole), and **that is where 28 and 42 come from** — all 28 checked to be `.pdata` functions.
+  A gap span is a *detector*: the union over its candidate starts, reported in its own section,
+  **excluded from both counts**, labelled *boundaries unknown*. Here that section prints **"none: no
+  span reaches an anchor or touches `+0x10`, `+0x18`"** — the negative stated as a measurement rather
+  than inferred from an empty list. And **`rbp` is no longer assumed to be a
   frame pointer**, being suppressed only where the function's `UNWIND_INFO` names it as the frame
-  register — 16 such operands exist image-wide and none is in a reaching region. **The answer did not
-  move** through any of the four: 28 regions and 42 accesses throughout — which is why the gap scan
-  needed its own test rather than agreement on the real image, since `winhvr.sys` reports 28 and 42
-  under **every** reading above, no gap island in it reaching at all. **The reaching set is still a lower bound**:
-  a function handed the partition object as an *argument* calls neither anchor and is absent from the
+  register — 16 such operands exist image-wide and none is in a reaching function. **The answer did not
+  move** through any of the five: 28 and 42 throughout, under every broken reading too, which is why
+  the gap scan needed its own test. **The reaching set is still a lower bound**:
   28 even if it reads the pair, which no amount of the above accounts for. The tool now has
-  `--self-test`, **24/24**, pinning all three defects and the boundary rule's own limit, each with the
-  broken reading asserted to fail, plus two
-  negative controls; mutation-verified against those cases so the scores share a denominator — the
-  candidate starts reduced to the span start scores 11/24, one span-wide region 20/24, and a summed
+  `--self-test`, **24/24** — detection under each alignment hazard, no-attribution in both the padded
+  and unpadded shapes, a byte refused twice counted once, and a `.pdata`-claimed function as the
+  control that attribution still happens where bounds are exact; mutation-verified so the scores share
+  a denominator — attributing gap spans as functions scores 20/24, a single start 15/24, a summed
   refusal count 23/24. Every index in it returns empty rather than raising, so a mutation reports the
   assertions it broke instead of aborting. Treat its function set as a reading.
 - **What it does to S5j's two explanations, and to the build.** S5k killed *nothing was bound*;
