@@ -33,11 +33,12 @@ propagated across calls and returns, which this does not do. Read
 "functions that can hold a partition object" as "functions that can obtain one
 by the two routes this looks for".
 
-`--self-test` exercises the gap decoding against images built here, including
-the two readings of a `.pdata` gap that each lost real leaf code. Run it after
-any change to `decode_union` or `gap_decode_starts`; a run against a real image
-cannot detect a gap-scan regression, because the answer on `winhvr.sys` does not
-move through either defect.
+`--self-test` exercises the gap decoding against images built here: the two
+readings of a `.pdata` gap that each lost real leaf code, and the span-wide region
+that attributed one leaf's field access to another leaf's anchor load. Run it
+after any change to `decode_island`, `gap_decode_starts` or `regions_of`; a run
+against a real image cannot detect any of those, because the answer on
+`winhvr.sys` does not move through them.
 """
 import argparse
 import struct
@@ -71,27 +72,29 @@ def decode_all(md, code, base):
     `md.disasm` STOPS at the first undecodable byte and reports no error, so a
     single bad byte silently hides every instruction after it in that range --
     which in a `.pdata` gap means hiding exactly the leaf code the gap scan
-    exists to find. Returns the instructions and the count of bytes skipped, so
-    "scanned" is reported with what it could not read.
+    exists to find. Returns the instructions and the ADDRESSES it could not read,
+    so that "scanned" is reported with what it could not read and so that a byte
+    refused by two overlapping decode attempts is counted once.
     """
-    out, skipped, at = [], 0, 0
+    out, refused, at = [], [], 0
     while at < len(code):
         got = list(md.disasm(code[at:], base + at))
         if not got:
+            refused.append(base + at)
             at += 1
-            skipped += 1
             continue
         out.extend(got)
         at = (got[-1].address + got[-1].size) - base
-    return out, skipped
+    return out, refused
 
 
 def gap_decode_starts(blob):
     """Offsets in a `.pdata` gap worth decoding from, and the padding count.
 
     The starts are the span's own start and the first byte of every non-padding
-    island in it. Padding is counted for the report only -- it is NOT used to
-    cut the span up, for the reason in `decode_union`.
+    island in it. Padding is counted for the report only -- it is NOT used to cut
+    an instruction in half, for the reason in `decode_island`, which applies the
+    padding test at instruction boundaries instead.
     """
     starts, pad = [0], 0
     for i, b in enumerate(blob):
@@ -102,16 +105,16 @@ def gap_decode_starts(blob):
     return starts, pad
 
 
-def decode_union(md, code, base, starts):
-    """Decode from several candidate offsets and union what they find.
+def decode_island(md, blob, base, start):
+    """Decode ONE island of a `.pdata` gap, and say where it ended.
 
-    A `.pdata` gap carries no unwind record, so nothing in the image says where
-    an instruction in it begins. Two single-alignment readings were tried here
-    and **each one lost real leaf code**:
+    A gap carries no unwind record, so nothing in the image says where an
+    instruction in it begins, nor where one leaf ends and the next starts. Three
+    readings were tried here and the first two each lost real leaf code:
 
-    - Decoding the span as one stream loses an island after an odd-length run of
-      `0x00`, because `00 00` decodes as a two-byte `add byte ptr [rax], al` --
-      so a zero run of odd length shifts every instruction after it by one and
+    - Decoding a whole span as one stream loses an island after an odd-length
+      run of `0x00`, because `00 00` decodes as a two-byte
+      `add byte ptr [rax], al` -- so the odd byte shifts everything after it and
       the island is read as garbage. (`0xCC` is one byte and keeps alignment,
       which is why the defect needs a zero run to show up.)
     - Splitting the span at every `0xCC`/`0x00` byte cuts instructions apart. A
@@ -119,22 +122,35 @@ def decode_union(md, code, base, starts):
       driver carries one in its high displacement byte, so the split lands
       inside the very instruction the scan exists to find.
 
-    Decoding from each candidate start across the whole remaining span and
-    unioning by `(address, size)` is subject to neither. The union is a lower
-    bound with possible phantoms rather than an enumeration -- a misaligned
-    start decodes bytes that are not instructions -- so it can only widen the
-    reaching set, never narrow it, and the sites that matter are read back as
-    disassembly by hand rather than trusted from the count.
+    The rule subject to neither is to apply the padding test **where an
+    instruction begins** rather than to every byte: decode linearly from
+    `start`, let an instruction swallow whatever interior `0xCC`/`0x00` bytes its
+    own encoding contains, and stop when the next *instruction boundary* lands on
+    padding. A zero inside a displacement is then not a boundary, and a genuine
+    padding run between two leaves is.
+
+    Stopping there is also what keeps **provenance** per leaf. A span-wide region
+    would let `field_hits` attribute one island's `+0x10` read to a *different*
+    island that loaded the anchor -- an anchor-loading leaf, padding, then an
+    unrelated field-reading leaf, reported as one reaching function. The islands
+    are decoded separately so that correlation cannot cross a real boundary.
+
+    Returns (instructions, end_offset, refused_addresses). The refusals are
+    addresses rather than a count because callers decode islands that can
+    overlap, and a count would add the same byte up once per attempt.
     """
-    seen, skipped = {}, 0
-    for s in sorted(set(starts)):
-        if s >= len(code):
+    ins, refused, p = [], [], start
+    while p < len(blob):
+        if blob[p] in (0xCC, 0x00):
+            break                    # instruction boundary on padding: island over
+        got = next(md.disasm(blob[p:], base + p, count=1), None)
+        if got is None:
+            refused.append(base + p)
+            p += 1
             continue
-        got, miss = decode_all(md, code[s:], base + s)
-        skipped += miss
-        for i in got:
-            seen.setdefault((i.address, i.size), i)
-    return [seen[k] for k in sorted(seen)], skipped
+        ins.append(got)
+        p += got.size
+    return ins, p, refused
 
 
 def rva_to_off(secs, rva):
@@ -180,18 +196,29 @@ def frame_register(data, secs, unwind_rva):
 
 
 def regions_of(data, secs, funcs):
-    """Every region to decode: each `.pdata` function, plus each executable span
-    `.pdata` does not claim. A region is (start, end, is_gap, frame_reg,
-    decode_starts); `decode_starts` are relative to `start`.
+    """Every region to decode: each `.pdata` function, and each ISLAND of each
+    executable span `.pdata` does not claim. A region is
+    (start, limit, is_gap, frame_reg) -- `limit` bounds the decode, and a gap
+    island's decode stops earlier, wherever `decode_island` finds its boundary.
 
     `.pdata` is exact for the functions it claims and does not claim leaf
     functions, so a leaf that loads the array or reads the pair would be
     invisible to a scan that stopped at the table. `vid_field_census.py` decodes
     the executable bytes `.pdata` leaves out, and so does this.
+
+    **One region per island, not per span.** A span-wide region would make
+    `field_hits` attribute one leaf's `+0x10` read to a different leaf that
+    loaded the anchor, since both would sit in the same body -- so an
+    anchor-loading leaf, padding, and an unrelated field-reading leaf would read
+    as one reaching function. Islands can overlap (a zero inside a displacement
+    puts a candidate start mid-instruction), and overlapping candidates are kept
+    rather than pruned: a pruned start could drop a real leaf that a misaligned
+    neighbour's decode had run over, and a spurious island is either not reaching
+    -- contributing nothing -- or reaching and hand-read.
     """
-    out = [(s, e, False, frame_register(data, secs, u), (0,)) for s, e, u in funcs]
+    out = [(s, e, False, frame_register(data, secs, u)) for s, e, u in funcs]
     claimed = sorted((s, e) for s, e, _ in funcs)
-    gap_bytes = pad_bytes = gap_spans = 0
+    gap_bytes = pad_bytes = gap_spans = gap_islands = 0
     for sec in secs:
         if not sec["exec"]:
             continue
@@ -216,22 +243,40 @@ def regions_of(data, secs, funcs):
             if pad == len(blob):
                 continue                 # padding only, nothing to decode
             gap_spans += 1
-            # A gap span has no unwind record, so nothing licenses treating its
-            # `rbp` as a frame pointer: keep those operands.
-            out.append((hs, he, True, 0, tuple(starts)))
-    return out, gap_bytes, pad_bytes, gap_spans
+            for rel in starts:
+                if rel >= len(blob) or blob[rel] in (0xCC, 0x00):
+                    continue             # a start that is itself padding decodes nothing
+                gap_islands += 1
+                # A gap island has no unwind record, so nothing licenses treating
+                # its `rbp` as a frame pointer: keep those operands.
+                out.append((hs + rel, he, True, 0))
+    return out, gap_bytes, pad_bytes, gap_spans, gap_islands
 
 
 def analyse(data, secs, md, regions, ref_rva, arr_rva):
-    """For each region, whether it can hold a partition object and why."""
-    reaching, bodies, framereg, from_gap, undecoded = {}, {}, {}, set(), 0
-    for start, end, is_gap, fr, starts in regions:
+    """For each region, whether it can hold a partition object and why.
+
+    Each region is decoded on its own, so `bodies` never mixes two islands --
+    which is what keeps `field_hits` from correlating one leaf's field access
+    with another leaf's anchor load.
+    """
+    reaching, bodies, framereg, from_gap, ends = {}, {}, {}, set(), {}
+    refused = set()
+    for start, limit, is_gap, fr in regions:
         off = rva_to_off(secs, start)
         if off is None:
             continue
-        code = data[off:off + (end - start)]
-        ins, skipped = decode_union(md, code, start, starts)
-        undecoded += skipped
+        code = data[off:off + (limit - start)]
+        if is_gap:
+            ins, stopped, miss = decode_island(md, code, start, 0)
+            refused.update(miss)
+            ends[start] = start + stopped
+        else:
+            # `.pdata` gives exact bounds, so decode the whole body; a zero byte
+            # inside a claimed function is not a boundary and there is nothing to
+            # infer about where it ends.
+            ins, miss = decode_all(md, code, start)
+            refused.update(miss)
         bodies[start] = ins
         framereg[start] = fr
         if is_gap:
@@ -248,7 +293,7 @@ def analyse(data, secs, md, regions, ref_rva, arr_rva):
                         why.add("loads WinHvpPartitionArray")
         if why:
             reaching[start] = why
-    return reaching, bodies, framereg, from_gap, undecoded
+    return reaching, bodies, framereg, from_gap, len(refused), ends
 
 
 def field_hits(bodies, framereg, start, fields):
@@ -287,9 +332,9 @@ def field_hits(bodies, framereg, start, fields):
 
 
 # --------------------------------------------------------------------------
-# Self-test. The images below are built here, because the gap-scan defects it
-# pins are invisible on `winhvr.sys`: the answer there is 28 reaching regions
-# and 42 accesses under both of the readings `decode_union` replaced.
+# Self-test. The images below are built here, because every defect it pins is
+# invisible on `winhvr.sys`: the answer there is 28 reaching regions and 42
+# accesses under all three gap readings AND under the span-wide attribution.
 # --------------------------------------------------------------------------
 
 def _leaf(at, anchor):
@@ -306,6 +351,18 @@ def _leaf(at, anchor):
     return (bytes([0x48, 0x8B, 0x05]) + struct.pack("<i", disp)
             + bytes([0x48, 0x8B, 0x40, 0x10])
             + bytes([0xC3]))
+
+
+def _field_leaf():
+    """A 5-byte leaf that reads `+0x18` off a register and loads NO anchor:
+
+        mov rax, [rcx+0x18]
+        ret
+
+    Used to pin that its access is not attributed to a neighbouring leaf that
+    did load the anchor. No zero bytes, so it is not itself a defect-A case.
+    """
+    return bytes([0x48, 0x8B, 0x41, 0x18, 0xC3])
 
 
 TEXT_VA, TEXT_RAW, TEXT_SZ = 0x1000, 0x400, 0x200
@@ -344,13 +401,12 @@ def _synthetic_image(text):
 def _reaching_on(data, md, arr_rva):
     _, secs = sections(data)
     funcs = pdata_functions(data, secs)
-    regions, _, _, _ = regions_of(data, secs, funcs)
-    reaching, bodies, framereg, from_gap, _ = analyse(data, secs, md, regions,
-                                                     TEXT_VA, arr_rva)
+    regions, _, _, _, _ = regions_of(data, secs, funcs)
+    reaching, bodies, framereg, from_gap, _, ends = analyse(
+        data, secs, md, regions, TEXT_VA, arr_rva)
     accesses = sum(len(field_hits(bodies, framereg, s, [0x10, 0x18]))
                    for s in reaching)
-    spans = {s: e for s, e, is_gap, _, _ in regions if is_gap}
-    return reaching, accesses, from_gap, spans
+    return reaching, accesses, from_gap, ends
 
 
 def self_test():
@@ -360,33 +416,6 @@ def self_test():
 
     def check(name, got, want):
         results.append((name, got == want, got, want))
-
-    # --- the encoding the regression turned on -----------------------------
-    leaf_at = 0x1020
-    leaf = _leaf(leaf_at, ANCHOR_VA)
-    check("leaf is 12 bytes", len(leaf), 12)
-    check("its displacement carries zero bytes", leaf.count(0), 2)
-
-    # --- defect A: split at every 0x00/0xCC cut the leaf in half -----------
-    # Pin the cause, not just the cure: the cut start set must NOT be what we
-    # decode from, and the union must find the anchor load.
-    cut = decode_union(md, leaf[:leaf.index(bytes([0])[0])], leaf_at, (0,))[0]
-    check("a span cut at the first zero byte loses the anchor load",
-          any(i.mnemonic == "mov" and "rip" in i.op_str for i in cut), False)
-    ins, _ = decode_union(md, leaf, leaf_at, gap_decode_starts(leaf)[0])
-    check("the union decodes the anchor load",
-          [(i.mnemonic, i.op_str) for i in ins][0],
-          ("mov", "rax, qword ptr [rip + 0x1fd9]"))
-
-    # --- defect B: one stream lost an island after an odd zero run ---------
-    # Three 0x00 bytes: `00 00` is a two-byte `add byte ptr [rax], al`, so the
-    # third shifts the island after it. Pin that the one-stream reading misses
-    # island two and the union finds it.
-    second_at = leaf_at + len(leaf) + 3
-    span = leaf + bytes(3) + _leaf(second_at, ANCHOR_VA)
-    one_stream, _ = decode_union(md, span, leaf_at, (0,))
-    starts, _ = gap_decode_starts(span)
-    unioned, _ = decode_union(md, span, leaf_at, starts)
 
     def anchor_loads(ins_list):
         n = 0
@@ -398,26 +427,82 @@ def self_test():
                     n += 1
         return n
 
-    check("island start after the zero run is a decode start",
-          second_at - leaf_at in starts, True)
+    # --- the encoding every one of these turns on --------------------------
+    leaf_at = 0x1020
+    leaf = _leaf(leaf_at, ANCHOR_VA)
+    check("leaf is 12 bytes", len(leaf), 12)
+    check("its displacement carries zero bytes", leaf.count(0), 2)
+
+    # --- defect A: splitting at every 0x00/0xCC cut the leaf in half --------
+    # Pin the cause as well as the cure: a span cut at the first zero byte
+    # cannot yield the anchor load, and the boundary rule must.
+    cut, _, _ = decode_island(md, leaf[:leaf.index(0)], leaf_at, 0)
+    check("a span cut at the first zero byte loses the anchor load",
+          anchor_loads(cut), 0)
+    ins, stopped, _ = decode_island(md, leaf, leaf_at, 0)
+    check("the boundary rule decodes the anchor load",
+          (ins[0].mnemonic, ins[0].op_str),
+          ("mov", "rax, qword ptr [rip + 0x1fd9]"))
+    check("and swallows the zero bytes inside its displacement", stopped, 12)
+
+    # --- defect B: one stream lost an island after an odd zero run ----------
+    # Three 0x00 bytes: `00 00` is a two-byte `add byte ptr [rax], al`, so the
+    # third shifts the island after it out of alignment.
+    second_at = leaf_at + len(leaf) + 3
+    span = leaf + bytes(3) + _leaf(second_at, ANCHOR_VA)
+    one_stream, _ = decode_all(md, span, leaf_at)
+    starts, _ = gap_decode_starts(span)
     check("one stream finds only the first island's anchor load",
           anchor_loads(one_stream), 1)
-    check("the union finds both", anchor_loads(unioned), 2)
+    check("island start after the zero run is a decode start",
+          second_at - leaf_at in starts, True)
+    per_island = []
+    for rel in starts:
+        if span[rel] in (0xCC, 0x00):
+            continue
+        per_island += decode_island(md, span, leaf_at, rel)[0]
+    check("decoding each island finds both", anchor_loads(per_island), 2)
+    check("and the first island stops at the zero run",
+          decode_island(md, span, leaf_at, 0)[1], 12)
 
-    # --- end to end, through the CLI's own path ---------------------------
-    img = _synthetic_image(bytes([0xCC]) * (leaf_at - TEXT_VA) + leaf)
-    reaching, accesses, from_gap, spans = _reaching_on(img, md, ANCHOR_VA)
+    # --- defect C: a span-wide region correlated across two leaves ----------
+    # An anchor-loading leaf, padding, then an UNRELATED field-reading leaf.
+    # With one region per span the second leaf's +0x18 read was attributed to
+    # the first leaf's anchor load, inventing a partition-field hit.
+    other_at = leaf_at + len(leaf) + 4
+    img = _synthetic_image(bytes([0xCC]) * (leaf_at - TEXT_VA)
+                           + leaf + bytes([0xCC]) * 4 + _field_leaf())
+    reaching, accesses, from_gap, ends = _reaching_on(img, md, ANCHOR_VA)
+    check("only the anchor-loading leaf reaches", len(reaching), 1)
+    check("the unrelated leaf's +0x18 is NOT attributed to it", accesses, 1)
+    check("the reaching island starts at the leaf, not at the span",
+          sorted(reaching)[0] if reaching else None, leaf_at)
+    check("and its decode ends at the leaf's own end",
+          ends.get(leaf_at), leaf_at + len(leaf))
+    check("the unrelated leaf is a region of its own, and not reaching",
+          other_at in from_gap and other_at not in reaching, True)
+
+    # --- a refused byte reached by two overlapping islands is counted once --
+    # The zero bytes in the displacement make leaf_at+7 a candidate start, so
+    # two islands both run onto the trailing lone 0x0F. Summing per-island
+    # counts reported it twice.
+    ov = leaf[:7] + bytes([0x0F])
+    ov_starts, _ = gap_decode_starts(ov)
+    per_chain = [decode_island(md, ov, leaf_at, r)[2]
+                 for r in ov_starts if ov[r] not in (0xCC, 0x00)]
+    check("two islands each refuse the same byte", [len(x) for x in per_chain], [1, 1])
+    check("and it is reported once", len(set(a for x in per_chain for a in x)), 1)
+
+    # --- end to end on the bare leaf --------------------------------------
+    bare = _synthetic_image(bytes([0xCC]) * (leaf_at - TEXT_VA) + leaf)
+    reaching, accesses, from_gap, _ = _reaching_on(bare, md, ANCHOR_VA)
     check("a leaf in a gap reaches, end to end", len(reaching), 1)
     check("and its +0x10 read is reported", accesses, 1)
-    # The region is the whole gap span, not the island inside it -- so pin that
-    # it is a gap span CONTAINING the leaf rather than an RVA equal to it, which
-    # was the per-island shape this replaced.
-    got = sorted(reaching)[0] if reaching else None
-    check("the reaching region is a gap span holding the leaf",
-          got in from_gap and got <= leaf_at < spans.get(got, 0), True)
+    check("as a gap island rather than a .pdata function",
+          sorted(reaching)[0] in from_gap, True)
 
-    # --- control: the assertions above must be able to fail ---------------
-    blind, blind_n, _, _ = _reaching_on(img, md, ANCHOR_VA + 8)
+    # --- controls: the assertions above must be able to fail ---------------
+    blind, blind_n, _, _ = _reaching_on(bare, md, ANCHOR_VA + 8)
     check("an anchor the image does not load reaches nothing",
           (len(blind), blind_n), (0, 0))
     empty, empty_n, _, _ = _reaching_on(_synthetic_image(bytes([0xCC]) * 32), md,
@@ -463,27 +548,27 @@ def main():
     md = capstone.Cs(capstone.CS_ARCH_X86, capstone.CS_MODE_64)
     md.detail = True
 
-    regions, gap_bytes, pad_bytes, gap_spans = regions_of(data, secs, funcs)
+    regions, gap_bytes, pad_bytes, gap_spans, gap_islands = regions_of(data, secs, funcs)
     print("executable bytes .pdata does not claim: %d (%d of them 0xCC/0x00 "
-          "padding); %d span(s) held anything else, each decoded from its own "
-          "start and from every island start in it" % (gap_bytes, pad_bytes, gap_spans))
+          "padding); %d span(s) held anything else, decoded as %d island(s), each "
+          "from its own start and each bounded at an instruction boundary that "
+          "lands on padding" % (gap_bytes, pad_bytes, gap_spans, gap_islands))
 
-    reaching, bodies, framereg, from_gap, undecoded = analyse(
+    reaching, bodies, framereg, from_gap, undecoded, ends = analyse(
         data, secs, md, regions, ref_rva, arr_rva)
 
     print("image                : %s" % a.image)
     print(".pdata functions     : %d" % len(funcs))
-    print("regions scanned      : %d (.pdata functions plus decoded gap spans)" % len(bodies))
-    print("bytes capstone refused, skipped and resumed past: %d" % undecoded)
+    print("regions scanned      : %d (.pdata functions plus decoded gap islands)" % len(bodies))
+    print("distinct bytes capstone refused, skipped and resumed past: %d" % undecoded)
     print("regions that can hold a partition object: %d" % len(reaching))
     print()
-    spans = {s: e for s, e, is_gap, _, _ in regions if is_gap}
     for start in sorted(reaching):
-        # A gap region is a SPAN, so print its range: its start is where
-        # `.pdata` stopped claiming, not a function entry, and reading it as one
-        # is how a span start gets quoted as a routine's RVA.
-        tag = ("  [gap span +0x%06X..+0x%06X, not a .pdata function]"
-               % (start, spans[start])) if start in from_gap else ""
+        # A gap region is an ISLAND, so print where its decode actually ended:
+        # its start is a candidate entry rather than a `.pdata` function entry,
+        # and reading it as one is how a gap RVA gets quoted as a routine's.
+        tag = ("  [gap island +0x%06X..+0x%06X, not a .pdata function]"
+               % (start, ends[start])) if start in from_gap else ""
         print("  +0x%06X  (%s)%s" % (start, ", ".join(sorted(reaching[start])), tag))
     print()
 
