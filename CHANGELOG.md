@@ -9,6 +9,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The hold is a loop, measured on Hyper-V's own per-VP message counter — and the same counter
+  correlates the raising thread with both VPs.** Under *both* surviving readings the guest makes no
+  progress, because nothing advances `RIP` past the faulting instruction either way, so no
+  guest-side reading could ever have discriminated them and `handled = 0` never could. The
+  discriminator is on the **exit** side and Hyper-V publishes it per VM and per VP.
+  `Total Messages/sec` reads **0** idle, **0** under guest churn, **0** with the raiser storming
+  `#BP`s at 219,391 hypervisor intercepts a second *unarmed* — and **62,750** with the intercept
+  standing, sustained for 16 s while the raiser completes **zero** rounds. A pending intercept
+  re-processed on the root side produces no hypervisor message at all, so those are **new
+  deliveries**: the faulting instruction is re-executed tens of thousands of times a second with
+  nothing retiring it. S5k's inference holds and step 6's arm 2 is answered.
+  **A finding fell out of the control**: an unarmed VTL1 `#BP` costs a hypervisor round trip anyway
+  — 219 k intercepts/sec with **zero** messages — which is the mechanism behind the 11× cost over a
+  VTL0 exception this record already carried, now visible on the exit counter. It is also what got
+  the first run's verdict backwards: `Total Intercepts/sec` is *lower* armed (65 k) than unarmed
+  (219 k), and comparing against it read "fewer exits" as "no new exits". **And the two-VP question
+  is answered too**: `Other Intercepts/sec` — the bucket the exception lands in — is zero on both
+  VPs in all three unarmed phases and nonzero on **both** armed, and that counter moves because an
+  instruction trapped *on that VP*. Re-preprocessing of a pending message cannot produce per-VP
+  hypervisor intercepts on a VP the thread is not on, so the thread executes on both. Stated
+  assumption: nothing else in this guest raises `#BP` at a measurable rate, which the three unarmed
+  phases support and do not prove.
 - **Item 103 step 6's two blocked arms both run, and the VPs turn out to be resumed.** They had been
   held by the standing constraint on installing a vector on a child and by root kernel-memory
   access; the first lifted for guests this bench owns and the second is what S5q's read IOCTL

@@ -4012,13 +4012,12 @@ validated. The full record is the
       contemporaneous, **non-mutating** read S5k has wanted since it was written, and which S5m
       could only half-answer because registering *claims* the slot. It narrows S5j's retained
       explanation without closing it: a claimant would have had to claim and release inside one 2 s
-      gap and coincide with the raise. **The loop arm ran and did NOT answer its question**:
-      `handled = 0` at all twelve samples shows the guest's `__except` never ran, which one trap
-      held for the window gives too; and the frozen-or-slowed run's **20 fresh stamps** are twenty
-      calls to `VidInterceptPreprocess`, not twenty executions of the instruction, since one
-      pending intercept re-preprocessed gives the same series. S5k's re-entry inference stands as
-      an inference; closing it needs a count tied to new hypervisor deliveries or retired guest
-      instructions. **And a third reading came free**: per-VP
+      gap and coincide with the raise. **The loop arm ran without answering its question**, and a
+      later arm answered it: `handled = 0` shows only that the guest's `__except` never ran, and
+      the 20 fresh stamps are twenty calls to `VidInterceptPreprocess` rather than twenty
+      executions — but **the hypervisor's own message counter settles it** (see *the loop
+      question* below): ~63,000 deliveries a second armed against **zero** in three control
+      phases, so S5k's re-entry inference holds. **And a third reading came free**: per-VP
       `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at different instants and `0`
       at every sample of a control that raised **1.87 million** `#BP`s with no intercept standing,
       while both VPs keep accumulating `VpRuntime`. **The VPs are being resumed**, which removes the
@@ -4176,11 +4175,16 @@ validated. The full record is the
       stamps on both VPs at **one** `Rip`, with nothing retiring — twenty calls to
       `VidInterceptPreprocess`, which is not the same as twenty executions of the instruction.
       **Where the
-      second VP's events come from is UNRESOLVED.** Step 6's arms later measured the guest VPs' run
+      second VP's events come from was unresolved for two more arms.** Step 6's arms measured the
+      guest VPs' run
       state and found `InterceptSuspend` **transient** with both VPs accumulating runtime, so the
       VPs **are** resumed and round 3's necessary-condition objection to migration is removed — but
       nothing correlates the single raising thread with either VP, so that does not choose between
-      migration and one pending intercept being re-preprocessed. Two drafts got it wrong in
+      migration and one pending intercept being re-preprocessed — **and the loop question then
+      supplied that correlation**: `Other Intercepts/sec`, the bucket the exception lands in, is
+      zero on both VPs unarmed and nonzero on **both** armed, and that counter moves because an
+      instruction trapped on that VP. Migration is the supported reading, on the stated
+      assumption that nothing else in the guest raises `#BP`. Two drafts got it wrong in
       turn before that: the first
       called the two VPs "consistent with one held raise", which review refused because the raise
       loop is one thread; the second called it that thread ping-ponging between vCPUs, which review

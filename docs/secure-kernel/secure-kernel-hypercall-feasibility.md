@@ -5950,7 +5950,7 @@ mask*. Review caught the claim; the install for vector `0` was then tried and **
 child's mask is known to admit. The real limit was never the hypervisor — it is which accepted
 exceptions `spin_host` can raise, and it happened to have one.
 
-#### Frozen, not slowed — and the second VP's events, still unresolved
+#### Frozen, not slowed — and the second VP's events, answered two arms later
 
 The VTL1 arm read a fresh exception-intercept message on **both** VPs, each carrying its own
 `VpIndex`, at one `Rip`. It called that *"consistent with one held raise"*. **Review was right that
@@ -6015,6 +6015,14 @@ guest VPs' run state is — and that is an arm, not a paragraph.
 > without the VP being resumed"* no longer rules migration out. It does not rule the alternative
 > *in*: nothing correlates the single raising thread with either VP, so re-preprocessing of one
 > pending intercept remains equally consistent. **Both readings above stand exactly as written.**
+>
+> **The correlation arrived with [the loop question](#the-loop-question-2026-09-30-measured-on-the-hypervisors-own-message-counter).**
+> `Other Intercepts/sec` — the bucket the exception intercept lands in — is **zero on both VPs in
+> every unarmed phase** and nonzero on **both** VPs armed. That counter moves because an instruction
+> trapped *on that VP*, so the raiser's own exception is landing on both, which re-preprocessing of
+> a pending message on the root side cannot produce. The first of the two readings above is the one
+> supported; the second is not, subject to the stated assumption that nothing else in this guest
+> raises `#BP` at a measurable rate.
 
 **Nothing else here rests on it.** Delivery, the `Rip` identifying the enclave instruction, the
 `ExecutionState` 2×2 and the freeze are each measured independently of why the second slot moves.
@@ -6060,7 +6068,7 @@ claim *and* release entirely inside one 2-second gap and coincide with the raise
 see a claim-and-restore at any cadence, which is the limit
 [the design section](#what-this-instrument-reports-stated-once) already records.
 
-#### Arm 2 — ran, and its question is still open
+#### Arm 2 — ran without answering, and a later arm answered it
 
 `handled = 0` at all twelve samples while the raiser's own clock ran to `ms=31609`. **That shows
 the guest's `__except` never ran, and nothing more** — a *single* trap held for the whole window
@@ -6074,10 +6082,14 @@ them — one pending intercept re-preprocessed, refreshing root-side markers wit
 resuming it — produces the same series. The two readings are not separated by anything measured so
 far.
 
-**So S5k's question stands as S5k left it.** Its inference — *"nothing on the drop path injects the
+**So this arm leaves S5k's question where S5k left it.** Its inference — *"nothing on the drop path injects the
 exception or advances `RIP`, so the faulting instruction is presumably re-entered"* — remains an
 inference. What would settle it is a count tied to **new hypervisor deliveries** or to **retired
 guest instructions**, and neither arm reports one. The arm ran; it did not answer.
+
+> **[The loop question](#the-loop-question-2026-09-30-measured-on-the-hypervisors-own-message-counter) took the first of those and it is a loop**:
+> the hypervisor delivers ~63,000 messages a second for the whole armed window, against **zero**
+> in three control phases including an unarmed `#BP` storm. S5k's inference holds.
 
 #### Arm 3 — the VPs are resumed, which removes an objection without settling the question
 
@@ -6140,3 +6152,80 @@ address and not a signature of the trap. Nothing is inferred from it.
 One install, removed in the same run's `finally`; teardown reported **0 standing**. Both raisers
 killed, none left running. Guest responsive with 106 processes and `LsaIso` alive, both guests up
 **5h25m** unbroken, host uptime continuous, **no bug check since boot**.
+
+### The loop question, 2026-09-30: measured on the hypervisor's own message counter
+
+**The hold is a loop. The hypervisor delivers ~63,000 messages a second for the whole armed window
+while the raiser completes zero rounds**, and the same counter reads **exactly zero** in every other
+phase — including one in which the raiser storms `#BP`s with no intercept installed. S5k's inference
+holds, step 6's arm 2 is answered, and the counter that answers it is one nothing in this line had
+read.
+
+#### Why no guest-side reading could have done it
+
+Under **both** surviving readings the guest makes no progress: nothing advances `RIP` past the
+faulting instruction whether it is re-executed or whether one pending intercept is re-processed on
+the root side. So `handled = 0` never could discriminate, and neither could anything else inside the
+guest. The discriminator has to be on the **exit** side, and Hyper-V publishes it per VM and per VP:
+
+```text
+\Hyper-V Hypervisor Virtual Processor(<vm>:Hv VP <n>)\Total Intercepts/sec
+                                                     \Total Messages/sec
+                                                     \Other Intercepts/sec
+```
+
+Host-side reads. No guest interaction, no driver call, nothing written.
+
+#### Four phases, because a counter that cannot move looks like one that did not
+
+| phase | `Total Intercepts/sec` VP 0 / VP 1 | `Total Messages/sec` VP 0 / VP 1 |
+|---|---|---|
+| idle | 221 / 98 | **0 / 0** |
+| guest churn | 257 / 96 | **0 / 0** |
+| **raiser, no intercept** | **32,440 / 219,391** | **0 / 0** |
+| **raiser + `#BP` intercept** | 3,674 / **65,156** | **3,008 / 62,750** |
+
+`Other Intercepts/sec` tracks `Total Messages/sec` to within a few counts in every row, so the
+exception intercept lands in that bucket and each one produces exactly one message.
+
+**A pending intercept re-processed on the root side produces no hypervisor message at all.** 62,750
+a second, sustained for 16 s, against zero in three control phases, are **new deliveries** — the
+faulting instruction being re-executed and re-trapped tens of thousands of times a second with
+nothing ever retiring it.
+
+#### The trap that got run 1's verdict backwards
+
+`Total Intercepts/sec` is **lower** armed (65,156) than unarmed (219,391), and the first run's
+verdict compared against it and concluded *"not re-entry"*. That is wrong twice over, and the second
+half is a finding in its own right: **an unarmed VTL1 `#BP` costs a hypervisor round trip anyway** —
+219,391 intercepts a second with **zero** messages, for a raiser retiring 1.87 M rounds. A VTL1
+exception exits to the hypervisor whether or not anyone intercepts it, which is the mechanism behind
+the 11× cost over a VTL0 exception this record already carries, now visible on the exit counter.
+
+So the armed arm takes *fewer* exits and turns *all* of them into messages, while the unarmed one
+takes more and messages nobody. Reading the wrong counter inverted the answer.
+
+#### And it correlates the raising thread with both VPs
+
+`Other Intercepts/sec` is **zero on both VPs in all three unarmed phases** and nonzero on **both**
+armed — VP 1 at ~62,750 and VP 0 at ~3,008, varying sample to sample between 0 and 23,037. A message
+in that bucket is generated by an intercept, and an intercept is generated by an instruction
+executing **on that VP**. So the trapping instruction executes on both VPs.
+
+That is the correlation [the two-VP question](#frozen-not-slowed--and-the-second-vps-events-answered-two-arms-later)
+has been missing since it was raised: not *"both VPs execute"*, which was never in doubt, but *the
+raiser's own exception* landing on both. The alternative it was weighed against — one pending
+intercept re-preprocessed with the thread never moving — does not produce per-VP hypervisor
+intercepts on a VP the thread is not on.
+
+**The assumption this rests on, stated rather than buried**: that nothing else in this guest raises
+`#BP` at a measurable rate. The three unarmed phases support it — `Other Intercepts/sec` is zero in
+all of them, including one with the guest churning — but they do not prove it for the armed window,
+and a second `#BP` source there would be indistinguishable.
+
+#### Bench state
+
+Two runs, one install each, removed in the `finally`; teardown reported **0 standing** both times.
+Raisers killed after every phase. Guest responsive with 106 processes and `LsaIso` alive, both guests
+up **6h35m** unbroken, host uptime continuous, **no bug check since boot**. The counter paths carry
+the host name and it is stripped before anything is printed, this record being public.
