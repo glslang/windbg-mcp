@@ -4044,16 +4044,19 @@ validated. The full record is the
       `vmwp.exe` is **not** protected (0x00, measured against positive controls with a poisoned
       buffer) and `PROCESS_ALL_ACCESS` succeeds from an elevated admin. Each worker holds **four**
       handles to the VID device, and all four duplicate out with an ordinary `DuplicateHandle`. But
-      `VidGetHvPartitionId` through them returns `ERROR_INVALID_FUNCTION` on three and
-      **`ERROR_ACCESS_DENIED`** on one, against `ERROR_INVALID_HANDLE` for a non-VID control — so
-      they reach `Vid.sys` and are turned away. **Not established**: that the route reaches the
-      exported receiver. Every duplicate was `DUPLICATE_SAME_ACCESS`, carrying the source's
-      read-only `0x00120089`; whether a larger requested access is granted, and which of the four
-      is the partition rather than the raw device, are unmeasured, and the lone `ACCESS_DENIED` is
-      where a next arm starts. Inheritance carries **one** `OBJ_INHERIT` handle out of 518.
-      **LiveCloudKd narrowed**: the handles exist and are takeable, so its procedure is plausible
-      rather than describing an older Windows, and the refusals suggest read-only duplicated access
-      is not sufficient alone — read off our summary of the tool, not its source. Full record, with
+      `VidGetHvPartitionId` through all **eight** (four per worker, both reported) returns
+      `ERROR_INVALID_FUNCTION` on six and **`ERROR_ACCESS_DENIED`** on two — the same 3-and-1 split
+      in each worker independently — against `ERROR_INVALID_HANDLE` for a non-VID control, so they
+      reach `Vid.sys` and are turned away. **Not established**: that the route reaches the exported
+      receiver, which nothing here tests. A draft inferred that read-only duplicated access is
+      insufficient; **withdrawn — wrong axis, and S5m already said so**: the receiver is IOCTL
+      `0x221148` with `FILE_ANY_ACCESS`, and what gates it is *holding a partition handle*, not an
+      access mask. Testing it means invoking `VidRegisterExceptionHandler`, which per S5m *claims*
+      the slot it asks about, so against a live VM that is an arm with a hazard, not a probe, and
+      it was deliberately not run. Inheritance carries **one** `OBJ_INHERIT` handle out of 518.
+      **LiveCloudKd narrowed only as far as the handles**: they exist and are takeable, so its
+      procedure is plausible rather than describing an older Windows — any further inference goes
+      with the access-bit one, read off our summary of the tool, not its source. Full record, with
       the controls and the near-miss that a name search caused, in the **Step 7** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
    8. ~~**The fallback S5q's host-bugcheck stop selects, and a decision rather than an arm.**~~
