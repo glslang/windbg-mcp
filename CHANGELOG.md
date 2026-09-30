@@ -17,8 +17,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **all four duplicate out** with an ordinary `DuplicateHandle`; the refusals resolve by
   object-type index to `EtwRegistration` and `PcwObject` **in both workers** (120+13 and 121+13),
   with **no `File` object among them**, which is what makes four exhaustive rather than a floor.
-  **Inheritance is closed by object identity**: the children's own handle tables, compared by
-  object pointer, hold **no** VID object — two weaker arguments for this (a bare count, then the
+  **Inheritance is excluded on object identity**: inheritance hands a child a second reference to
+  the *same* object, and the children's own tables, compared by object pointer, hold **none** of the
+  workers' VID objects (their own single `File` object is unidentified — duplication refused three
+  ways, sole holder — which does not reach the conclusion, since its being a VID file would make it
+  `vmsp`'s own open rather than an inheritance) — two weaker arguments for this (a bare count, then the
   parents' current `OBJ_INHERIT` flags) were both insufficient, the second because a flag cleared
   after child creation leaves the child's copy invisible in the parent. The same comparison shows
   the four VID handles are **two** file objects, three sharing one and one separate, mapping

@@ -6621,12 +6621,28 @@ than a name re-derived on each side:
 |---|---|
 | worker 1 VID handles (4) | `…AD30DF0` ×3, `…AD34E00` |
 | worker 2 VID handles (4) | `…AD31A70` ×3, `…AD32EC0` |
-| `vmsp.exe` children, their **only** File handle | `…AD457A0`, `…AD39900` |
+| `vmsp.exe` children, their **only** File handle | `…AD457A0`, `…AD39900` — *unidentified* |
 | `vmmem` children | **no handles at all** — `HandleCount` 0, minimal process |
 
-**No VID object appears in any child.** The children's single File handle carries access
-`0x00100020`, the same as each worker's own `\Device\HarddiskVolume4\Windows\System32` handle —
-an image or directory handle, not a partition.
+**No child holds any parent VID object, and that is what the inheritance question asks.**
+Inheritance hands a child a *copy* of the parent's handle, which is a second reference to the **same
+object** — so a child holding none of the workers' four VID file objects did not inherit a VID
+handle. That much is settled by identity rather than by name.
+
+**What the child's own File object is, this record cannot say, and a draft said it anyway.** It
+called it *"an image or directory handle"* because its access mask (`0x00100020`) matches each
+worker's `System32` handle — and an access mask is not an identity, as review pointed out. Naming it
+is not available from here: duplication is refused `ERROR_ACCESS_DENIED` for `DUPLICATE_SAME_ACCESS`,
+for an explicit `READ_CONTROL` and for `SYNCHRONIZE`; a system-wide search for those two object
+pointers finds **exactly one holder each**, the owning `vmsp` itself, so it cannot be named from a
+second holder; and `vmsp`'s module list is unavailable, so even the circumstantial question of
+whether it loads `vid.dll` is unanswered.
+
+**That gap does not reach the inheritance conclusion.** Were the child's object a VID file, it would
+be `vmsp`'s **own open** rather than something inherited — a separate route that meets the create
+path's admission check step 4 is about, not this step's duplication-and-inheritance question. So:
+inheritance of a VID handle is **excluded on object identity**, and whether `vmsp` independently
+holds a VID file is **unestablished and out of this step's scope**.
 
 **And the object pointers say something the names could not: the four VID handles are two
 objects.** Three handles in each worker share one file object and the fourth is a second, separate

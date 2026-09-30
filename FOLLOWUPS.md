@@ -4057,9 +4057,11 @@ validated. The full record is the
       the documented hazard is collision with a **raw** `WinHvInstallIntercept` installer, which
       the duplicate check cannot see. So the test is more available than claimed and still a
       decision: an unclaimed slot would be claimed by us on a running VM. **That is step 7's next
-      arm.** **Inheritance is closed by object identity** — the children's own handle tables hold
-      no VID object, compared by object pointer rather than by name, and their only `File` handle
-      is an image handle. The same comparison shows the four VID handles are **two** file objects,
+      arm.** **Inheritance is excluded on object identity** — inheritance hands a child a second
+      reference to the *same* object, and no child holds any of the workers' four VID file objects.
+      Their own single `File` object is **unidentified** (duplication refused three ways, sole
+      holder, module list unavailable), which does not reach the conclusion: were it a VID file it
+      would be `vmsp`'s own open, which is step 4's admission question rather than this one. The same comparison shows the four VID handles are **two** file objects,
       three sharing one and one separate, which maps exactly onto the error split.
       **LiveCloudKd narrowed only as far as the handles**: they exist and are takeable, so its
       procedure is plausible rather than describing an older Windows — any further inference goes
