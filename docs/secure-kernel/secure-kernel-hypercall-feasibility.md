@@ -6454,3 +6454,111 @@ the next obstacle each, and a decision needs more than the next obstacle.
 obstacle"* still rests on S5o's static read, S5p's census of located writes, and S5n's control that
 a well-formed unused name opens — **the first step only**. A rejection at `0x2211A0` would be
 invisible to everything above it.
+
+### Step 7, 2026-09-30: attempted — the handle is takeable, the reason it was declined does not hold, and the first read through it is refused
+
+**Step 7 had to become *attempted* or *excluded*, and it is now attempted with a partial answer.**
+S5n declined it because `vmwp.exe` runs protected, so taking a handle out of it would be an attack on
+the platform rather than an experiment on it. On this host **that premise is false**: the worker is
+an ordinary process, its VID handles duplicate into an unprivileged-by-comparison elevated process,
+and nothing below defeats a protection because there is none in the way. What the duplicated handle
+*grants*, though, is a different question, and the first read through it comes back refused.
+
+Host: Windows 11 26100, client Hyper-V, two lab VMs, both `TpmEnabled` and **not** shielded.
+Elevated administrator throughout, never SYSTEM.
+
+#### The protection premise, with positive controls
+
+`NtQueryInformationProcess(ProcessProtectionInformation)`, output buffer **poisoned with `0xAA`** so
+a call that writes nothing cannot read as `0x00`:
+
+| process | `PS_PROTECTION` |
+|---|---|
+| `csrss`, `services`, `wininit`, `smss` | **0x61** — WinTcb-Light |
+| `lsass` | **0x41** — Lsa-Light |
+| `MsMpEng` | **0x31** — Antimalware-Light |
+| **`vmwp`** (both), `vmms`, `vmcompute`, `vmsp`, `vmmem` | **0x00 — not protected** |
+
+The controls carry this, not the result: an unprotected process and a broken query both read `0x00`.
+`OpenProcess(PROCESS_ALL_ACCESS)` against either worker succeeds, and the workers run as
+`NT VIRTUAL MACHINE\<vm guid>`.
+
+**So S5n's reason for declining does not hold here.** It may hold on a shielded VM or a Server SKU —
+configurations this bench does not have, and the likely subject of that sentence.
+
+#### The handles are there, and they duplicate
+
+Per-process enumeration (`NtQueryInformationProcess(ProcessHandleInformation)`, not a system-wide
+sweep):
+
+| | worker 1 | worker 2 |
+|---|---|---|
+| handles | 518 | 517 |
+| **duplicated into this process** | **385** | 383 |
+| refused | 133 | 134 |
+| **handles to the VID device** | **4** | **4** |
+
+The 133 refusals are not a hiding place: all fail `ERROR_NOT_SUPPORTED`, and resolving their
+`ObjectTypeIndex` against the host's 73-entry type table gives exactly `EtwRegistration` (120) and
+`PcwObject` (13) — non-duplicable by type, not by permission. The mapping is cross-checked on types
+this process named directly: `File` 42, `Event` 21, `Thread` 9, `Section` 49.
+
+**The VID device is `\Device\00000006`, and a name search is exactly how to miss it.** A draft of
+this section searched the 33 named File handles for the string *"Vid"*, found none, and concluded
+*"there is nothing to duplicate"* — a clean, wrong, and very nearly committed result. `Vid.sys` is
+PnP root-enumerated, so its device object carries a numeric name, and the link resolves it:
+
+```text
+\GLOBAL??\ROOT#VID#0000#{7896e901-fe60-446e-828d-d65920654a23}  ->  \Device\00000006
+\GLOBAL??\VidExo                                                ->  \Device\VidExo
+```
+
+Both workers hold **four** handles to `\Device\00000006`, access `0x00120089` — which matches the
+`CreateFileW(..., GENERIC_READ, FILE_SHARE_READ, ..., OPEN_EXISTING, ...)` this record already
+transcribed for `VidpCreateVidObject`. **And this record already said so**: the S5m gate writes the
+prefix as *"the device interface path for `GUID_DEVICEINTERFACE_VID` (or `\\?\VidExo` for Exo)"*,
+and an earlier section notes both are present in `\GLOBAL??`. The draft ran a string scan over the
+image instead of reading the two sentences that named the mechanism.
+
+#### What the handle grants: refused, and the errors say where
+
+`VidGetHvPartitionId` through each duplicated handle, out-parameter poisoned, with a **negative
+control** — the same call on this process's own handle, which is not a VID object:
+
+| handle | result |
+|---|---|
+| control, own process handle | `ERROR_INVALID_HANDLE` (6), poison intact |
+| 3 of the 4 VID handles | `ERROR_INVALID_FUNCTION` (1), poison intact |
+| 1 of the 4 VID handles | **`ERROR_ACCESS_DENIED`** (5), poison intact |
+
+**The control earns its place**: it fails with a *different* error, at the API layer, while the
+duplicated handles fail with driver responses. So the duplicated handles do reach `Vid.sys` and are
+turned away there — three as an unsupported operation on that object, one on access. The poison
+survives every arm, so nothing wrote a partition id.
+
+#### What this closes, and what it does not
+
+**The duplication half is possible and cheap, and it is not a platform attack on this
+configuration.** An elevated administrator can take VID handles out of an unprotected `vmwp.exe`
+with an ordinary `DuplicateHandle`. That is the half S5n declined, and the ground it declined on is
+not there.
+
+**It does not follow that the route reaches the exported receiver**, and this record should not say
+it does. Every handle here was duplicated `DUPLICATE_SAME_ACCESS`, carrying the source's read-only
+`0x00120089`; whether a larger requested access is granted, and whether one of these four is the
+partition rather than the raw device, are both unmeasured. `ERROR_ACCESS_DENIED` on exactly one
+handle is the interesting thread and is where a next arm would start.
+
+**The inheritance half is nearly closed by size**: each worker has **one** handle marked
+`OBJ_INHERIT` out of 518, and its children are `vmmem` and `vmsp.exe`.
+
+**LiveCloudKd is narrowed and still not settled.** This line's record says its procedure duplicates
+handles from `vmwp.exe`; the handles exist and are takeable, so the procedure is plausible on its
+face rather than describing an older Windows. What the refusals above suggest is that read-only
+duplicated access is not sufficient by itself — which is consistent with that tool shipping a
+driver. **Read off this record's summary of the tool, not its source**, which has not been read
+here.
+
+**Configuration limits.** One host, one build, two VMs, neither shielded, client Hyper-V rather than
+Server, elevated administrator rather than SYSTEM, and `DUPLICATE_SAME_ACCESS` throughout. Every row
+above could differ on any of those.

@@ -9,6 +9,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Item 103 step 7 is attempted: the handle is takeable, and the first read through it is
+  refused.** S5n declined handle duplication because `vmwp.exe` runs protected; measured against
+  positive controls (`csrss` 0x61, `lsass` 0x41, `MsMpEng` 0x31) with a poisoned output buffer,
+  **`vmwp.exe` reads 0x00 — not protected** — and `PROCESS_ALL_ACCESS` succeeds from an elevated
+  admin, so that ground is not there. Each worker holds **four** handles to the VID device and
+  **all four duplicate out** with an ordinary `DuplicateHandle` (385 of 518 handles duplicated;
+  the 133 refusals resolve by object-type index to `EtwRegistration` and `PcwObject`).
+  `VidGetHvPartitionId` through them then returns `ERROR_INVALID_FUNCTION` on three and
+  **`ERROR_ACCESS_DENIED`** on one, against `ERROR_INVALID_HANDLE` for a non-VID control — they
+  reach `Vid.sys` and are turned away. **A draft of this nearly shipped the opposite**: it
+  searched handle names for *"Vid"*, found none, and concluded there was nothing to duplicate —
+  but `Vid.sys` is PnP root-enumerated, so
+  `\GLOBAL??\ROOT#VID#0000#{7896e901-…}` resolves to **`\Device\00000006`**, and this record
+  already wrote the prefix as the device interface path. **Not established**: that the route
+  reaches the receiver — every duplicate was `DUPLICATE_SAME_ACCESS` carrying read-only
+  `0x00120089`. Controls, errors and limits in the **Step 7** section of
+  [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
 - **Item 103 step 8 is costed, and the costing does not yield the decision — which a first draft
   of it claimed anyway.** The solid result is a negative: the **documented** partition API
   (`WinHvPlatform.dll`) has **66 exports and none naming VTL, VSM or secure**, so a rig rests

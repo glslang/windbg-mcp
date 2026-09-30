@@ -4038,18 +4038,24 @@ validated. The full record is the
       VP. What performs the resumption is still unmeasured. Full record in the **step 6's two blocked
       arms** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
-   7. **Handle duplication and inheritance, which S5n excluded rather than closed and which this
-      plan twice wrote out of existence.** A process that duplicates or inherits a handle
-      `vmwp.exe` already holds reaches the exported receiver **without** passing the create path's
-      admission check and without owning the partition — so no amount of writer census makes the
-      next step "the only route". S5n declined to attempt it for a good reason (`vmwp.exe` runs
-      protected, and taking a handle out of it is an attack on the platform rather than an
-      experiment on it), and *declining to attempt* is not *excluding*. It stays here until it is
-      one or the other. **And it is not hypothetical — 2026-09-30**: LiveCloudKd's own live-debugging
-      procedure states it duplicates handles from `vmwp.exe`, so the third-party route that claims
-      Secure Kernel breakpoints is *this step*, reached by doing the thing S5n declined. That makes
-      the LiveCloudKd package a scope decision rather than a compatibility one, and it means closing
-      this step either way also settles what to say about that tool.
+   7. ~~**Handle duplication and inheritance, which S5n excluded rather than closed and which this
+      plan twice wrote out of existence.**~~ **ATTEMPTED 2026-09-30 — the handle is takeable, and
+      the first read through it is refused.** S5n's reason for declining does not hold here:
+      `vmwp.exe` is **not** protected (0x00, measured against positive controls with a poisoned
+      buffer) and `PROCESS_ALL_ACCESS` succeeds from an elevated admin. Each worker holds **four**
+      handles to the VID device, and all four duplicate out with an ordinary `DuplicateHandle`. But
+      `VidGetHvPartitionId` through them returns `ERROR_INVALID_FUNCTION` on three and
+      **`ERROR_ACCESS_DENIED`** on one, against `ERROR_INVALID_HANDLE` for a non-VID control — so
+      they reach `Vid.sys` and are turned away. **Not established**: that the route reaches the
+      exported receiver. Every duplicate was `DUPLICATE_SAME_ACCESS`, carrying the source's
+      read-only `0x00120089`; whether a larger requested access is granted, and which of the four
+      is the partition rather than the raw device, are unmeasured, and the lone `ACCESS_DENIED` is
+      where a next arm starts. Inheritance carries **one** `OBJ_INHERIT` handle out of 518.
+      **LiveCloudKd narrowed**: the handles exist and are takeable, so its procedure is plausible
+      rather than describing an older Windows, and the refusals suggest read-only duplicated access
+      is not sufficient alone — read off our summary of the tool, not its source. Full record, with
+      the controls and the near-miss that a name search caused, in the **Step 7** section of
+      [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
    8. ~~**The fallback S5q's host-bugcheck stop selects, and a decision rather than an arm.**~~
       **COSTED 2026-09-30 — and the costing did not yield the decision.** What it establishes is a
       negative: the documented partition API cannot reach VTL, so the rig rests entirely on the
