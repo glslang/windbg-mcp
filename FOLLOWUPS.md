@@ -4015,7 +4015,7 @@ validated. The full record is the
       gap and coincide with the raise. **The loop arm ran without answering its question**, and a
       later arm answered it: `handled = 0` shows only that the guest's `__except` never ran, and
       the 20 fresh stamps are twenty calls to `VidInterceptPreprocess` rather than twenty
-      executions — but **the hypervisor's own message counter settles it** (see *the loop
+      executions — but **the hypervisor's own per-VP `Total Messages/sec` settles it** (see *the loop
       question* below): ~63,000 deliveries a second armed against **zero** in three control
       phases, so S5k's re-entry inference holds. **And a third reading came free**: per-VP
       `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at different instants and `0`
