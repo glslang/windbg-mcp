@@ -18,15 +18,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   read S5k has wanted since it was written and which S5m could only half-answer, because
   registering to ask whether the slot is claimed *claims* it. It narrows S5j's retained explanation
   without closing it: a claimant would have had to claim and release inside one 2-second gap and
-  coincide with the raise. **The loop**: `handled = 0` at all twelve samples while the raiser's own
-  clock ran to `ms=31609`, so S5k's inference that the faulting instruction is re-entered is
-  measured rather than inferred. **And the reading that matters most came free**: per-VP
+  coincide with the raise. **The guest handler**: `handled = 0` at all twelve samples while the
+  raiser's own clock ran to `ms=31609` — which shows the guest's `__except` never ran and **not**
+  that the instruction is re-entered, since one trap held for the window gives the same zero; the
+  re-entry evidence is the frozen-or-slowed run's **20 fresh arrivals**, and a draft here conflated
+  the two. **And a third reading came free**: per-VP
   `HvRegisterInterceptSuspend` is **transient** — seen on both VPs at different instants, and `0` at
   every sample of a control that raised **1.87 million** `#BP`s with no intercept standing — while
   both VPs keep accumulating `VpRuntime` and the guest retires nothing. **The VPs are being
-  resumed**, which falsifies the premise review round 3 on #428 used to refuse the ping-pong reading
-  of the two-VP markers, and puts that reading back as the supported one. What *performs* the
-  resumption is still unmeasured. One reading withdrawn because the control killed it: `RIP`
+  resumed**, which removes the necessary-condition objection review round 3 on #428 raised against
+  the ping-pong reading of the two-VP markers — and removing an objection to one explanation is not
+  evidence for it over another, so that question stays open: nothing here correlates the single
+  raising thread with either VP, and one pending intercept being re-preprocessed remains equally
+  consistent. What *performs* the resumption, and which VP the thread is on, are both unmeasured.
+  One reading withdrawn because the control killed it: `RIP`
   `…4001C` appears on intercept-suspended VPs **and on running ones in the control**, so it is a
   common parked kernel address and not a signature of the trap.
 - **A VTL1 `#BP` reaches VID too, and the message names the enclave's own instruction — which

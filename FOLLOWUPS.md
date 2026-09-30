@@ -4012,13 +4012,17 @@ validated. The full record is the
       could only half-answer because registering *claims* the slot. It narrows S5j's retained
       explanation without closing it: a claimant would have had to claim and release inside one 2 s
       gap and coincide with the raise. **The loop**: `handled = 0` at all twelve samples while the
-      raiser's own clock ran to `ms=31609`, so S5k's inference that the faulting instruction is
-      re-entered is measured. **And a third reading came free and matters more**: per-VP
+      raiser's own clock ran to `ms=31609` — which shows the guest's `__except` never ran and **not**
+      that the instruction is re-entered, since one trap held for the window gives the same zero;
+      the re-entry evidence is the frozen-or-slowed run's **20 fresh arrivals**. **And a third
+      reading came free**: per-VP
       `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at different instants and `0`
       at every sample of a control that raised **1.87 million** `#BP`s with no intercept standing,
-      while both VPs keep accumulating `VpRuntime`. **The VPs are being resumed** — which falsifies
-      the premise review round 3 on #428 used to refuse the ping-pong reading of the two-VP markers.
-      What performs the resumption is still unmeasured. Full record in the **step 6's two blocked
+      while both VPs keep accumulating `VpRuntime`. **The VPs are being resumed**, which removes the
+      necessary-condition objection review round 3 on #428 raised against the ping-pong reading —
+      and removing an objection to one explanation is not evidence for it over another, so the
+      two-VP question stays open. What performs the resumption, and which VP the raiser's thread is
+      on, are both unmeasured. Full record in the **step 6's two blocked
       arms** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
    7. **Handle duplication and inheritance, which S5n excluded rather than closed and which this
@@ -4167,10 +4171,11 @@ validated. The full record is the
       ten samples over 30 s, against **2,282** the moment teardown releases it, reproducing S5h's
       artefact one line below the correct reading. Interceptions kept arriving throughout: 20 new
       stamps on both VPs at **one** `Rip`, with nothing retiring — a re-delivery loop. **Where the
-      second VP's events come from was UNRESOLVED** — until step 6's arms measured the guest VPs'
-      run state a run later and found `InterceptSuspend` **transient** with both VPs accumulating
-      runtime, which falsifies the premise round 3 used and puts the ping-pong reading back as the
-      supported one (what performs the resumption is still unmeasured). Two drafts got it wrong in
+      second VP's events come from is UNRESOLVED.** Step 6's arms later measured the guest VPs' run
+      state and found `InterceptSuspend` **transient** with both VPs accumulating runtime, so the
+      VPs **are** resumed and round 3's necessary-condition objection to migration is removed — but
+      nothing correlates the single raising thread with either VP, so that does not choose between
+      migration and one pending intercept being re-preprocessed. Two drafts got it wrong in
       turn before that: the first
       called the two VPs "consistent with one held raise", which review refused because the raise
       loop is one thread; the second called it that thread ping-ponging between vCPUs, which review

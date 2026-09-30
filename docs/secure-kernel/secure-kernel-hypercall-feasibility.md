@@ -5950,7 +5950,7 @@ mask*. Review caught the claim; the install for vector `0` was then tried and **
 child's mask is known to admit. The real limit was never the hypervisor — it is which accepted
 exceptions `spin_host` can raise, and it happened to have one.
 
-#### Frozen, not slowed — and the second VP's events, explained a run later
+#### Frozen, not slowed — and the second VP's events, still unresolved
 
 The VTL1 arm read a fresh exception-intercept message on **both** VPs, each carrying its own
 `VpIndex`, at one `Rip`. It called that *"consistent with one held raise"*. **Review was right that
@@ -5981,9 +5981,8 @@ reading — the counter only moves once the intercept is released.
 VPs, at one instruction, while nothing retired. That is a re-delivery loop — the intercept fires,
 VID preprocesses it, nothing completes it, and it fires again.
 
-**Where the second VP's events come from was unresolved when this arm ran, and a draft of this
-paragraph resolved it wrongly** — the blockquote below is what settled it, a run later. That draft
-said the markers being last-arrival state made this one thread re-dispatched
+**Where the second VP's events come from is UNRESOLVED, and a draft of this paragraph resolved it
+wrongly.** That draft said the markers being last-arrival state made this one thread re-dispatched
 between the guest's two vCPUs, each slot holding its most recent visit — and offered as the tell
 that *which* VP is newer alternates, VP 0 leading at t = 9, 15 and 27 s and VP 1 at the other seven,
 with the two stamps always within ~10 ms. **The alternation is real and the explanation does not
@@ -6006,14 +6005,14 @@ single-threaded raise loop does not account for. **Settling it means measuring t
 mechanism** — whether anything calls `WinHvCompleteIntercept` while these arrive, and what the
 guest VPs' run state is — and that is an arm, not a paragraph.
 
-> **That arm ran, and the premise this paragraph rests on did not survive it.**
+> **Half of that arm ran, and it removed an objection without answering the question.**
 > [Step 6's arms](#step-6s-two-blocked-arms-2026-09-30-both-run-and-the-vps-are-being-resumed) read
 > the guest VPs' run state: `HvRegisterInterceptSuspend` is **transient**, seen on both VPs at
 > different instants and `0` in a control that raised 1.87 M `#BP`s with no intercept, while both
-> VPs accumulate `VpRuntime` throughout. **The VPs are being resumed**, so *"a thread cannot migrate
-> without the VP being resumed"* no longer blocks the reading it was raised against — the retracted
-> explanation is back to being the supported one, without this section asserting it, because what
-> performs the resumption is still unmeasured.
+> VPs accumulate `VpRuntime` throughout. So the VPs **are** resumed, and *"a thread cannot migrate
+> without the VP being resumed"* no longer rules migration out. It does not rule the alternative
+> *in*: nothing correlates the single raising thread with either VP, so re-preprocessing of one
+> pending intercept remains equally consistent. **Both readings above stand exactly as written.**
 
 **Nothing else here rests on it.** Delivery, the `Rip` identifying the enclave instruction, the
 `ExecutionState` 2×2 and the freeze are each measured independently of why the second slot moves.
@@ -6057,13 +6056,21 @@ claim *and* release entirely inside one 2-second gap and coincide with the raise
 see a claim-and-restore at any cadence, which is the limit
 [the design section](#what-this-instrument-reports-stated-once) already records.
 
-#### Arm 2 — the hold is a loop, measured
+#### Arm 2 — the guest handler never runs, and the loop evidence is the other arm's
 
-`handled = 0` at all twelve samples while the raiser's own clock ran to `ms=31609`. S5k inferred
-this — *"nothing on the drop path injects the exception or advances `RIP`, so the faulting
-instruction is presumably re-entered"* — and marked it unmeasured. It is measured now.
+`handled = 0` at all twelve samples while the raiser's own clock ran to `ms=31609`. **That shows
+the guest's `__except` never ran, and nothing more** — a *single* trap held for the whole window
+produces the same zero. A draft of this section called it the loop measured, which it is not:
+distinguishing re-entry from one held trap needs a count of arrivals or of retired instructions,
+and this arm reports neither.
 
-#### Arm 3 — the VPs are resumed, which falsifies review round 3's premise
+**The loop evidence is the frozen-or-slowed run's**, where the markers were sampled for novelty:
+**20 fresh arrivals across 10 samples**, both VPs, at one `Rip`, with nothing retiring. That is
+re-entry. S5k's inference — *"nothing on the drop path injects the exception or advances `RIP`, so
+the faulting instruction is presumably re-entered"* — is carried by those arrivals, and this arm's
+`handled = 0` corroborates the half of it about the guest handler.
+
+#### Arm 3 — the VPs are resumed, which removes an objection without settling the question
 
 The VTL1 arm read a fresh message on both VP slots and twice explained it wrongly; review round 3
 refused the second explanation on the ground that a thread cannot migrate between vCPUs unless its
@@ -6082,14 +6089,20 @@ unarmed raiser retired 1.87 million `#BP`s across those six samples — raising 
 ~150 k/s — and `InterceptSuspend` never left `0`. So the transient `1`s in the armed arm are ours.
 
 **`InterceptSuspend` is transient, not sticky, and both VPs keep accumulating runtime throughout.**
-The VPs are therefore being resumed, repeatedly, while the guest retires nothing — which is what a
-re-entering loop looks like from the hypervisor's side, and which removes the objection to a thread
-being scheduled on either vCPU between iterations. Round 3 was right on what was then measured and
-the premise did not survive being measured.
+The VPs are therefore being resumed, repeatedly, while the guest retires nothing.
 
-**What is still not measured is *what* resumes them.** That resumption happens is now a reading;
-which code performs it is not, and `WinHvCompleteIntercept` being the caller is a hypothesis this
-arm does not test.
+**What that does, exactly.** Round 3's objection was a *necessary condition*: a thread cannot be
+scheduled on the other vCPU unless its VP is resumed. That condition is now measured to hold, so
+the objection is removed. **It does not make the ping-pong reading supported**, and a draft of this
+section said it did. Both VPs executing between samples is equally consistent with the alternative
+the VTL1 arm records beside it — one pending intercept re-preprocessed, refreshing root-side
+markers with the raising thread never moving — because nothing here correlates the *single raising
+thread* with either VP. Removing an objection to one explanation is not evidence for it over
+another.
+
+**Two things are still unmeasured, and they are what would settle it**: which VP the raiser's thread
+is actually on across iterations, and what performs the resumption. `WinHvCompleteIntercept` being
+the caller is a hypothesis this arm does not test.
 
 **And the armed arm burns CPU rather than parking**: VP 1 accumulates ~15 M units per 2 s while
 retiring zero rounds, against ~22 M while retiring 1.87 million. Lower, because each iteration now
