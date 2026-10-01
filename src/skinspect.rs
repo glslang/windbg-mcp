@@ -484,7 +484,7 @@ pub(crate) fn run(args: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn refusal(why: &NotWalkable) -> String {
+pub(crate) fn refusal(why: &NotWalkable) -> String {
     match why {
         NotWalkable::SwitchRefused(detail) => detail.clone(),
         NotWalkable::VtlNotEnabled => {
@@ -528,7 +528,7 @@ fn report_capture(capture: &Capture) {
     }
 }
 
-fn report_landmarks(landmarks: &Landmarks) {
+pub(crate) fn report_landmarks(landmarks: &Landmarks) {
     let walk = &landmarks.walk;
     println!(
         "\nroot       {:#X} (read from the capture, never remembered)",

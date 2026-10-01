@@ -31,6 +31,7 @@ mod hazards;
 mod ioctl;
 mod kdconn;
 mod listen;
+mod livesrc;
 mod logbridge;
 mod progress;
 mod proto;
@@ -125,6 +126,15 @@ fn main() -> Result<()> {
     if let Some(at) = args.iter().position(|arg| arg == cast::RENDER_FLAG) {
         // Before the runtime: this reads a file and writes a file, and neither wants one.
         return render_cast(&args[at + 1..]);
+    }
+    if let Some(at) = args.iter().position(|arg| arg == livesrc::LIVE_FLAG) {
+        // The same shape as `--sk-inspect` and the same reason, with the byte source being a
+        // transport the OPERATOR supplies rather than a capture file (`FOLLOWUPS.md` item 103).
+        // It is a role rather than an MCP tool deliberately: a live source is not a fixed
+        // snapshot, which is the premise `open_sk_capture`'s decode-on-open rests on, so putting
+        // one behind that opener would quietly change what a session's figures mean. What that
+        // costs the session model is measured in item 103 rather than assumed here.
+        return livesrc::run(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == skinspect::INSPECT_FLAG) {
         // The same shape and the same reason: it reads a Hyper-V capture and writes a report,
