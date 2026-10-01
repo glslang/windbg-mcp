@@ -4394,8 +4394,18 @@ validated. The full record is the
    **A separate goal, not on this route**: running *our own* code in VTL1 kernel mode. Measured
    2026-09-30 to be cheaper than this item's costing implied — tier A plus a VSM config, no guest
    OS and no device model — and it answers questions about the hypervisor's VTL semantics rather
-   than about Microsoft's Secure Kernel. Worth keeping distinct so neither borrows the other's
-   justification.
+   than about Microsoft's Secure Kernel. **Implemented and passed live on 2026-10-01 as the
+   guarded owner-partition probe in
+   [`tools/vtl1_control_probe.c`](tools/vtl1_control_probe.c).** It builds a one-VP long-mode
+   image, targets fixed vector `0x20` at VTL1, and accepts only its marked vector-3 VID message
+   while the intercept holds the VP. The decisive memory contract is paired: memory-block flags
+   `0x9` make the VA backing VSM-capable, and GPA-range flag `0x8` applies the configured VTL
+   protections. With that pair, the high-integrity run stopped at VTL1 GPA `0x10008`, verified the
+   VTL1 execution witness, held the owned intercept for 266 ms, completed it with flags 2, stopped
+   the VP and deleted the disposable partition, exiting zero. The `/W4 /WX` build and offline
+   layout/message self-test also pass. Build, sequence, exact guarded versions and pass condition
+   are in
+   [`docs/secure-kernel/vtl1-control-probe.md`](docs/secure-kernel/vtl1-control-probe.md).
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from

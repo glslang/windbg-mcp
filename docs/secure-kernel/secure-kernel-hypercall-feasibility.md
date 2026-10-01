@@ -7215,5 +7215,55 @@ point. That is tier A plus configuration, and tier A was the bounded tier.
 would produce is a VTL1 **kernel-mode** execution environment, which the enclave rig cannot give at
 any price. It is still not Microsoft's Secure Kernel; it is that position, occupied by us.
 
-**Non-destructive throughout.** Every arm in this section was refused before it could act, and both
-guests ran monotonically across all of them.
+#### The tier-A controlled-stop probe is implemented, 2026-10-01
+
+The two static gates that the costing left open are now closed for the guarded
+`vid.dll 10.0.26100.5074` / `Vid.sys 10.0.26100.9278` pair.
+`tools/vid_field_census.py --self-test` passes 15/15, and the setup handler's
+actual writer path shows that the minimal `0xCAE0` setup used by the probe gives
+the partition the VSM capabilities needed by `VsmmVsmIoctlSetPartitionConfig`.
+The setup buffer is mostly zero: version `0x600`, one processor, one NUMA node,
+and the VSM policy bits clear are the fields this path needs.
+
+The remaining current-build wrappers and their driver consumers were decoded
+before use. In particular: partition VTL1 is enabled by the 24-byte VSM config;
+the VP-enable context is the SDK's 224-byte `WHV_INITIAL_VP_CONTEXT`, while the
+ordinary VP start uses flags zero and no context; `VidRegisterExceptionHandler`
+takes the partition, vector, flags and marker, with no output handle; the mapped
+exception is VID type `0x01000002` with a 16-byte payload; and
+`VidAssertVirtualProcessorInterrupt`'s fifth parameter is the one-byte target
+VTL passed to `WinHvAssertVirtualInterrupt`. That last fact provides the
+first-entry mechanism the earlier plan lacked: start VTL0, assert fixed vector
+`0x20` targeted at VTL1, and let VTL1's IDT gate reach the selected `int3`.
+
+The live failure that remained after the control path was correct was the GPA
+range's VSM contract. A VA-backed memory block with only flag `0x8` and an
+ordinary GPA range let the secure interrupt enter VTL1: its RIP became the
+handler entry and explicit suspend cleared, but no instruction retired.
+`VsmmVaGpaRangepCreate` showed the pair that VSM memory needs: memory-block
+flags `0x9` (VA-backed plus VSM-capable) and GPA-range flag `0x8` (apply default
+VTL protections). With both set, the driver maps with read included and applies
+the partition's configured VTL protections.
+
+[`tools/vtl1_control_probe.c`](../../tools/vtl1_control_probe.c) implements the
+whole owned-partition sequence and an unconditional unwind. Its guest image is
+long mode at CPL0 with a 2 MiB identity mapping, GDT, TSS, IDT and separate
+stacks. It accepts only the message carrying its registration marker, VP 0 and
+vector 3; it never completes an unexpected message. The exact build and run
+contract is in
+[`vtl1-control-probe.md`](vtl1-control-probe.md).
+
+**Live result, 2026-10-01:** the high-integrity `--controlled-stop` run exited
+zero. It created disposable partition `0x43`, accepted the marked vector-3
+message at VTL1 GPA `0x10008`, verified the VTL1 execution witness, held the
+pending intercept for 266 ms, completed it with flags 2, stopped the VP and
+deleted the partition. The partition ID is ephemeral; the marked message,
+measured hold, successful completion and cleanup
+are the evidence. The `/W4 /WX` build and offline ABI, image and message
+self-test pass on the same source. A medium-integrity `--create-only` run still
+reaches the expected device-ACL refusal before partition creation.
+
+**The managed guests were not used by the successful arm.** Every earlier arm
+against those guests was refused before it could act, and both ran
+monotonically across them. The successful stop used only the disposable
+partition created by the probe and deleted it afterward.
