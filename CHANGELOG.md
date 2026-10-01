@@ -21,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a GPA range that applies default VTL protections. The `/W4 /WX` build and self-test also pass.
   The runbook and evidence are in
   [`docs/secure-kernel/vtl1-control-probe.md`](docs/secure-kernel/vtl1-control-probe.md).
+  The probe now also has a guarded `--securekernel-breakpoint` mode. It maps the matching shipping
+  `securekernel.exe` at its preferred VA, calls `DbgBreakPointWithStatus` from a VTL1 CPL0 interrupt
+  trampoline, validates the pending stop's VTL, CPL and `RIP`, and re-enters the VID dispatch loop
+  after completion. The live run held the image-backed stop for 250 ms, retired the real
+  `int3; ret`, observed the handler's post-return witness, and deleted the owned partition. This is
+  an image-backed execution proof; it does not claim a normally initialized Windows/VBS runtime.
 - **Item 103 carries an ordered route to the actual goal, and two of today's claims are narrowed to
   what was measured.** The route, in `FOLLOWUPS.md` item 103 so it lives in **one** place: DbgEng
   inspecting `securekernel` is what `docs/secure-kernel/exdi-stub-plan.md` owns, and **all three of

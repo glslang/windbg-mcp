@@ -4407,6 +4407,16 @@ validated. The full record is the
    are in
    [`docs/secure-kernel/vtl1-control-probe.md`](docs/secure-kernel/vtl1-control-probe.md).
 
+   **The minimum real-image follow-on also passes.** `--securekernel-breakpoint` guards and maps the
+   matching shipping `securekernel.exe`, calls its symbol-derived `DbgBreakPointWithStatus` at
+   `0x14001fa70` from the owned VTL1 CPL0 interrupt handler, and accepts the stop only after the
+   pending state reports VTL1, CPL0 and the selected `RIP`. Completing the exception advances to
+   the stub's `ret`; a second owned `GET_NEXT` resumes dispatch, after which the handler records its
+   post-return witness and returns through `iretq`. The 250 ms live hold, completion, return and
+   partition deletion all passed. This establishes resumable execution of guarded Secure Kernel
+   image code without claiming that the Windows Secure Kernel runtime was initialized; the minimum
+   Windows/VBS boot remains the route to that stronger result.
+
    The other candidate was **answered by S5c**: the
    suspend register is writable from
    the parent and halts the VP, VTL1 state is readable across the halt, and the halt is VP-wide

@@ -6,9 +6,11 @@ starts one VP in VTL0, enters VTL1 through a fixed interrupt targeted at VTL1,
 and holds the VP when a selected VTL1 `int3` raises `#BP`.
 
 This is a VTL1 **kernel-mode** test. The VBS enclave work already exercises
-VTL1 user mode. The probe does not boot Windows and it is not Secure Kernel; it
-occupies the same trust level and privilege level with a tiny long-mode image
-whose entire state is controlled by the probe.
+VTL1 user mode. The default mode uses a tiny long-mode image whose entire state
+is controlled by the probe. A second, image-backed mode maps the guarded inbox
+`securekernel.exe` at its preferred virtual base and calls that image's
+`DbgBreakPointWithStatus` stub. It demonstrates controlled execution of real
+Secure Kernel code without booting or initializing Windows Secure Kernel.
 
 OpenVMM is not part of this path. OpenVMM is a host user-mode VMM, which does
 not constrain the guest's CPL, but adopting it would add another VMM stack
@@ -32,9 +34,14 @@ decoded:
 |---|---:|---:|
 | `C:\Windows\System32\vid.dll` | `10.0.26100.5074` | 263,552 bytes |
 | `C:\Windows\System32\drivers\Vid.sys` | `10.0.26100.9278` | 910,816 bytes |
+| `C:\Windows\System32\securekernel.exe` | `10.0.26100.9457` | 1,385,944 bytes |
 
 The displayed product version of `vid.dll` differs from its fixed file
-version. The guard reads `VS_FIXEDFILEINFO`.
+version. The guard reads `VS_FIXEDFILEINFO`. The Secure Kernel mode additionally
+requires the matching `securekernel.pdb` identity
+`C2C0D1A6-2E32-69F4-0C69-EA44FDB230C4`, image base `0x140000000`, image size
+`0x175000`, and `cc c3` bytes at the symbol-derived
+`DbgBreakPointWithStatus` RVA `0x1FA70`.
 
 ## Build and offline verification
 
@@ -76,7 +83,7 @@ The sequence is:
 2. Enable partition VTL1 with a 24-byte VSM configuration. MBEC is disabled;
    VTL1's default protection allows read, write, kernel execute, and user
    execute.
-3. Create a 1 MiB VSM-capable, VA-backed memory block and a GPA range with the
+3. Create a 2 MiB VSM-capable, VA-backed memory block and a GPA range with the
    apply-VTL-protections flag. That pairing is required: an ordinary range is
    mapped without the read permission needed by this long-mode image. Map the
    block, copy the image, write it through VID, verify a page by reading it
@@ -102,6 +109,37 @@ The success line names the hypervisor partition ID, VTL, VP, vector, and
 selected instruction GPA. It proves the controlled stop only when the whole
 run exits zero. A timeout, a different message, or any failed VID call fails
 the gate.
+
+## Secure Kernel image breakpoint
+
+Run the image-backed mode from the same elevated prompt:
+
+```powershell
+.\target\vtl1-control-probe\vtl1_control_probe.exe `
+    --securekernel-breakpoint --timeout-ms 10000 --hold-ms 250
+```
+
+`--image PATH` may select an identical guarded copy; it cannot bypass the
+version, size, PE, PDB, or instruction checks. The mode maps the PE sections
+into owned guest memory, aliases them at the image's preferred virtual base,
+and installs a small VTL1 CPL0 interrupt trampoline. The trampoline calls
+`securekernel!DbgBreakPointWithStatus` as an ordinary function. The stop is
+accepted only when the pending VTL1 state is CPL0 and its `RIP` is the selected
+`int3` (or the architectural following byte). The probe reads the state and
+the mapped `cc c3` bytes again after the hold and requires both snapshots to
+agree before completion.
+
+Completing a VID message does not itself re-enter the VP dispatch loop. The
+probe therefore issues a second `GET_NEXT`, waits for the real stub's `ret` to
+return to the trampoline, requires a post-return witness, and cancels that
+owned wait before teardown. A zero exit proves stop, hold, exception
+completion, function return, interrupt-frame return, and partition deletion.
+
+This is the minimal Secure Kernel demonstration: the executed breakpoint byte
+comes from the guarded shipping image and runs at its symbol-resolved preferred
+VA in VTL1 CPL0. It does not claim that Secure Kernel initialized its normal
+Windows runtime, module lists, policy, or devices. Reproducing the same result
+inside an initialized VBS boot remains a larger VM boot and ownership task.
 
 ## ABI derivation
 
@@ -144,3 +182,17 @@ The partition ID is ephemeral. The evidence is the zero exit together with the
 marked VTL1 vector-3 message, the measured hold, successful completion, and
 owned-partition deletion. The native `/W4 /WX` build and offline self-test pass
 on the same source.
+
+The Secure Kernel image-backed mode passed on the same host:
+
+```text
+loaded guarded Secure Kernel image: C:\WINDOWS\system32\securekernel.exe base=0x140000000 size=0x175000 DbgBreakPointWithStatus=0x14001fa70
+owner partition 0x48 created
+pending breakpoint state: vtl=1 cpl=0 rip=0x14001fa70 rsp=0x1cffd0
+controlled Secure Kernel stop: partition=0x48 vtl=1 cpl=0 vp=0 vector=3 image_rip=0x14001fa70
+pending breakpoint state: vtl=1 cpl=0 rip=0x14001fa70 rsp=0x1cffd0
+held pending intercept for 250 ms
+completed the owned VTL1 breakpoint intercept
+Secure Kernel breakpoint returned and VTL1 resumed through the interrupt frame
+deleted owner partition
+```
