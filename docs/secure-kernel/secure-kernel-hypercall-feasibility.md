@@ -4978,6 +4978,97 @@ Restored and verified byte-for-byte; `LsaIso` alive; both guests running continu
 host not rebooted. Checkpoint `pre-S5r-patch` (2026-09-29 18:31) was taken before the write and was not
 needed — it can be deleted once nobody wants the rollback. `SdkWriteVirtualMemory` was not used again.
 
+### S5t result, 2026-10-01: the published IUM capability is now reproduced in full except single-stepping — a breakpoint we planted fired in a trustlet, and registers read and wrote
+
+**S5r replicated the *access* and stopped there; this closes the three claims it left.** S5r's own
+bound was that the `EXCEPTION_BREAKPOINT` it caught was the break Windows **injects** on attach, so
+breakpoint *setting* at a chosen address, register read and register write were all unexercised.
+All three now run, against the same trustlet, on the same gate, under the same A-B-A discipline.
+
+#### What was run
+
+The gate is the one S5r located — `securekernel.exe+0x1434E`, the `jne` guarding the call to
+`SkpsEnableDebugging` inside `IumInvokeSecureService` — patched `0x75`→`0xEB` and restored
+afterwards, each write verified by read-back. The instruments are **operator-supplied and outside
+this repository**, on the same footing as the driver the first constraint says this repo does not
+distribute: a host-side driver and a guest-side debugger in the `h3probe` bench, run over
+PowerShell Direct into the VBS guest. Nothing here ships them, and the figures below are the
+result rather than a pointer to a file a reader has.
+
+**The patch is in memory, by guest-physical address, and the on-disk image is untouched.** The
+target GPA is derived per run by walking Secure Kernel's own page tables from
+`InfoHvddGetCr3Securekernel` (`translate(sk_cr3, gate_va)`), and the write is one byte through
+`SdkWritePhysicalMemory(handle, gpa, 1, …, WriteInterfaceHvmmDrvInternal)` — hvlib's hvmm driver
+interface — read back immediately. Nothing writes `securekernel.exe` on the guest's volume, and the
+run is its own proof of that in both directions: restoring **one in-memory byte** closed the gate
+again with **no reboot**, which a disk patch could not do, and a disk patch would have left the
+loaded image unchanged, so Arm B could not have passed.
+
+**Physical rather than virtual is forced, not chosen.** `SdkWriteVirtualMemory` segfaults on a VTL1
+virtual address on this build while `SdkReadVirtualMemory` at the *same* address returns correct
+bytes — the virtual read path handles the Secure Kernel context and the virtual write path does not.
+S4 established the physical route lands on VTL1 pages. Why the virtual write path does not is still
+unread.
+
+**The partition is selected on Secure Kernel *presence*, not on a remembered id**, and that is a
+correction this run had to make before anything else: `s5r_patch.py` carried
+`TARGET_PARTITION_ID = 3` from S5r and the ids had turned over — the VBS guest is now **5** and the
+twin **8**, so the script failed with *"partition 3 not found"*. It now picks the partition whose
+`InfoSecureKernelBase` is non-zero and prints the rejected one, which is the same control H4 used.
+
+| | this run |
+|---|---|
+| partition selected / rejected | **5** (`InfoSecureKernelBase 0xFFFFF8042466A000`) / **8** (`0x0`, no VTL1) |
+| SK base, SK `CR3` | `0xFFFFF8042466A000`, `0x1201000` |
+| gate VA → GPA | `0xFFFFF8042467E34E` → `0xCE534E` (48 live bytes matched against the dumped image, gate byte masked) |
+| trustlet | `LsaIso.exe`, pid **924** |
+| trustlet `ntdll` base | `0x7FF8880E0000` |
+
+#### The four operations, and which of the published claims each settles
+
+| | result |
+|---|---|
+| **attach** (S5r's result, re-run) | `DebugActiveProcess` → `True`; `CREATE_PROCESS_DEBUG_EVENT` with `hProcess 0x8D8`; the injected break at `0x7FF888203AB0` on tid **2920** |
+| **read** trustlet code | `ReadProcessMemory` → `True`. The whole PE export directory was walked *in the trustlet's own memory* to resolve `ntdll!DbgUiRemoteBreakin` = `0x7FF888215B90`, so the read is exercised at more than one byte; original byte there `0x48` |
+| **WRITE** trustlet code | `VirtualProtectEx` → `True`, old protection `0x20` (`PAGE_EXECUTE_READ`); `WriteProcessMemory` of one `0xCC` → `True`, 1 byte written, **read back `0xCC`**. *This is the permission nothing had tested, and it is granted.* |
+| **register read** | `GetThreadContext` → `True`, `RIP` = `0x7FF888203AB1` — one past the injected `int 3` at `…3AB0`, which is what an `int 3` leaves |
+| **register write / redirect** | `SetThreadContext` with `RIP` = `0x7FF888215B90` → `True` |
+| **our breakpoint fires** | `EXCEPTION_BREAKPOINT` `0x80000003` at **`0x7FF888215B90`** on tid 2920 — `ExceptionAddress` equals the address we chose, and `GetThreadContext` at the hit reads `RIP` = `0x7FF888215B91`, exactly address + 1 |
+| **put back** | byte restored and read back `0x48`; `RIP` restored to `0x7FF888203AB1`; `DebugActiveProcessStop` → `True`; trustlet alive |
+
+**A-B-A, because a one-sided run here is indistinguishable from a trustlet that was debuggable
+anyway**, and because the attach gate and the memory-write permission are different questions that
+could have moved independently:
+
+| arm | gate byte | result |
+|---|---|---|
+| **A**, before | `0x75` | `DebugActiveProcess` → `False`, `ERROR_ACCESS_DENIED (5)` |
+| **B**, patched | `0xEB` | every row of the table above |
+| **C**, after restore | `0x75` | `DebugActiveProcess` → `False`, `ERROR_ACCESS_DENIED (5)` |
+
+#### What this does not establish
+
+- **Single-stepping was not exercised.** The published claim is *"breakpoints, single-stepping and
+  register access"*. The redirect above is a `SetThreadContext` write to `RIP`, which is register
+  *write*, **not** a trap-flag single step: no `EFLAGS.TF` was set and no `EXCEPTION_SINGLE_STEP`
+  (`0x80000004`) was observed. That is the one clause of the published capability still unrun, and
+  it is cheap — set `TF` through the same `SetThreadContext` and continue.
+- **VTL1 *user* mode only.** This is a trustlet. Nothing here touches `securekernel.exe`'s own
+  execution, which is item 110.
+- **One build, one trustlet, one gate byte.** As with S5r, nothing here is a property of VBS.
+- **Read the `ERR=` fields with care.** `ERR=203` appears after two *successful* calls, because
+  Windows does not clear the thread's last error on success and the probe prints it unconditionally.
+  The `ok=True` and the read-backs are the result; those `ERR` values are stale and mean nothing.
+
+#### Bench state
+
+Gate verified `0x75` by an independent `s5r_patch.py read` after the run. Guest uptime **monotonic**
+at `1.00:21:18` with no reboot, `LsaIso` still pid 924 with its one thread and 59 handles, and
+`Secure System` running. The host-side driver restores the gate in a `finally` block, which is why
+the restore survived the `hvlib` unload segfault that ends every run of these probes — that segfault
+is on process exit, *after* the write and its read-back, and it truncated the driver's own Arm C, so
+Arm C was re-run on its own.
+
 ### S5q steps 1 and 2, 2026-09-29: the receiver's imports resolve, and the table it must chain into is read
 
 **Two read-only steps of the S5q build, run before anything executes in Hyper-V's dispatch path.**

@@ -100,6 +100,27 @@ the same chain drifting 0x10 on 26100, which is all that is left of item 99 now 
 item 100 is the target's paged pool being trimmed out from under a KD link, with nothing in the
 walker to fix, and is measured and declined; item 101 is a real placement defect in readable
 memory.
+And item 110 from the 2026-10-01 VTL1 controlled-stop probe (item 103's control axis): stopping and
+resuming real `securekernel.exe` image code on a partition we own does not reach an *initialized*
+Secure Kernel, and the route that would needs the experiment to own a Windows/VBS boot — filed as a
+decision with its falsification first, because its one unvalidated step is likely to close it.
+**Item 103's capture route is built and verified, and the item stays open** (status re-stated
+2026-10-01). It ships Secure Kernel modules, symbols and memory off a Hyper-V checkpoint with **no
+driver and no debuggee** — DbgEng appears only as an image-symbol server, gate S2's own finding, and
+never in the path of a read — re-verified end to end that day against a VBS guest, a VBS-off control
+and a third boot. **What keeps it open is that part of its goal is closing the remaining gaps, and
+several of the attempts its plan names have not been made**: a `RawSource` against the
+operator-supplied live transport (the seam is built and the constraint — no driver from this repo,
+the operator supplies it, the rest is drivable — was agreed long ago, so this is an implementation
+nobody has written, not a question); **single-stepping** in a trustlet, which is all that is left of
+the published IUM capability after S5t planted a `0xCC` at a chosen address in `LsaIso.exe` and saw
+it fire there, with register read and write both answering — no `EFLAGS.TF` was set and no
+`EXCEPTION_SINGLE_STEP` seen; and the unexplained `SdkWriteVirtualMemory` segfault on a VTL1
+virtual address. EXDI stays out for the reason E2 recorded — it needs a **completely different type
+of lab**, a host whose hypervisor slot is free — and the *Out of scope* line parking H5a stands. Two
+drafts of that entry's status got this wrong and are recorded in it: one closed the item on the
+strength of the four tools, and one recast the operator-supplied transport as a refusal, inverting a
+decision the entry had already taken in favour.
 Each item notes its repo, why it was deferred, and where it picks up. See
 [`DECISIONS.md`](./DECISIONS.md) for the design rationale (D1–D5) items 2–6 extend, and its
 2026-08-02 entries for the bounded-command coverage review that produced item 13, now in
@@ -1965,6 +1986,171 @@ measured this.
 2026-09-26. H0–H4 passed: a root partition can read a VBS guest's VTL1 and `securekernel.exe`,
 `KdDebuggerDataBlock` and `SkLoadedModuleList` were all located and identified. H5a — driving
 DbgEng through EXDI — is parked behind a two-part reversal condition, so this is the route.
+
+### Status 2026-10-01 — the capture route is built and verified; the item stays **open** on attempts not yet made
+
+**What landed.** Gates S0–S4 are run; S1–S3 are built and shipped as four tools —
+`open_sk_capture`, `sk_modules`, `sk_symbol`, `sk_read_memory` — behind an opt-in capture tier.
+Secure Kernel modules, symbols and memory are readable from a Hyper-V checkpoint with **no driver
+and no debuggee**, DbgEng appearing only as gate S2's image-symbol server and never in the path of a
+read.
+
+**Why that does not close the item.** Part of what this item is for is closing the *remaining* gaps,
+and several of the attempts its own plan names **have not been made**. A shipped deliverable does
+not close them and does not make them refusable: each is a run somebody has yet to do, and the
+unmade-attempt list at the end of this section is the current state of it. A draft of this section
+closed the item on the strength of the four tools and recast the remainder as two refusals — wrongly
+on both counts, and the specific errors are recorded there rather than deleted, because the second
+one inverted a decision this entry had already taken in favour.
+
+**Re-verified end to end on 2026-10-01 through the registered stdio server**, against three
+checkpoints on this bench rather than against this entry's own figures:
+
+- **Positive arm**, the pinned VBS+HVCI checkpoint: VTL1 root `0x107593000` read *from the capture*,
+  self-map at [309], 29 present entries, a complete walk over 4,545 distinct pages from 179 table
+  reads, 1 of 7 PE headers matching `C:\Windows\System32\securekernel.exe` (10.0.26100.9457,
+  1,385,944 bytes), `KdDebuggerDataBlock` at `0xfffff8070eedc5e0` `Size` `0x3a0`,
+  `SkLoadedModuleList` at `0xfffff8070eed0770` with 6 entries, the structural cross-check agreeing
+  with the block over 1,249 pages, and 18,253 reads of which 0 failed and 0 were refused.
+  `sk_modules` named all six VTL1 modules — `securekernel.exe`, `skci.dll`, `symcryptk.dll`,
+  `cng.sys`, `vmsvc.dll`, `vmsvcext.sys` — and `sk_read_memory` returned the `MZ` header at the SK
+  base with its GPA beside it.
+- **Control arm**, the VBS-off twin: partition VTLs `0x1`, `ForceActiveVirtualTrustLevel(vp0, vtl1)`
+  refused as `0xC0370509`, and the session reports that limitation instead of answering — so the
+  positive arm is *discriminated* rather than merely obtained.
+- **Symbols**, on a third checkpoint of the VBS guest: PDB `C2C0D1A62E3269F40C69EA44FDB230C4` age 1
+  loaded against the image at preferred base `0x140000000`, with both landmarks agreeing with the
+  decode in both directions — `KdDebuggerDataBlock` RVA `0x1335e0` and `SkLoadedModuleList` RVA
+  `0x127770`, each also named by the engine. The four type probes still answer 0 of 4, which is
+  gate S2's measured finding about a public PDB rather than a regression.
+- **Green the same day**: 1,101 unit tests and 130 `mcp_smoke` tests, with
+  `cargo clippy --all-targets -- -D warnings` clean, plus both opt-in Secure Kernel gates —
+  `sksym` 7/7 with the engine beside the test binary, and
+  `a_secure_kernel_capture_opens_as_a_session_and_answers_about_its_vtl1` against a real `.vmrs` in
+  16.67s.
+
+**That third checkpoint re-broke the landmark S0 warned about, in a sharper form.** It carries root
+`0x1201000` — the same *value* S0's first capture had — with self-map index **434** against S0's
+**388**, and `securekernel.exe` at GPA `0x0000000000cd1000` against S0's `0x00cd0000`. A differing
+layout means a different boot, so the `CR3` **value** recurs across boots while the address space
+behind it does not: matching on that value alone would have read as the same capture. S0 established
+that the root is not reboot-stable; this adds that it is not even *distinguishing*, which is why
+reading it from the capture every time is the contract rather than a precaution.
+
+#### The operator-supplied transport is a setup step, and the live source behind it is simply unattempted
+
+**This is the item's own first constraint and it is not in question.** The repo distributes **no
+driver**; the operator supplies the transport; and once it is in place *the rest is drivable from
+it*. That is an install step and a security-posture note to write down, exactly as the live-kernel
+tier needs KDNET wiring and a local profile and the engine bundle needs a one-time copy. **A draft of
+this section recast that constraint as a refusal — "declined on cost-to-audience", then "declined on
+the transport's scope" — and both were wrong**: nobody proposed this repo ship a driver, so no
+decision about shipping one was ever open, and the `vmwp.exe` handle-duplication decline dragged in to
+support it is S5n's scope call about reaching a partition we do **not** own, which is a different
+route from the one this constraint describes.
+
+**The code is already built for it, which is why this is an attempt rather than a design question.**
+S1's decode layer takes the byte source as a parameter: [`sk::RawSource`](src/sk.rs) (`src/sk.rs:312`)
+is three methods — `shape()` for what the source knows about the processor, `max_read()` for its
+transfer width, and `read_chunk()` returning `Result<(), ReadFailure>` — `savedstate` implements it
+for a capture, and the trait's own doc says in terms that *"a future driver-backed live source joins
+here and changes nothing above it"*. The seam was built knowing the live source's shape: `max_read()`
+exists because `HvCallReadGpa` moves at most 16 bytes, and **`ReadFailure::Refused` exists *for* the
+live case**, because H4 measured that call answering `HV_STATUS_SUCCESS` with zeros and a per-access
+`ReadIntercept`.
+
+**So what is unattempted is an implementation.** No `RawSource` has been written against an
+operator-supplied transport, so `ReadFailure::Refused` has never been produced by a real source — it
+is fixture-only — and the two consequences S3 named are untested: the session stops being a fixed
+snapshot, which is the premise `open_sk_capture`'s decode-on-open rests on, and `sk_read_memory`
+acquires a target that can change between two reads.
+
+**And live VTL1 access is not hypothetical — two gates reached it on 2026-09-29**, which is what makes
+the remaining work an implementation rather than a question:
+
+- **S5s** — LiveCloudKd's **passive** EXDI CLSID `{53838F70-0936-44A9-AB4E-ABB568401508}` is a working
+  live *inspector*. `db 0xFFFFF80629B4A000 L10` reads `4d 5a 90 00 …` (`MZ`) on the VBS guest and all
+  zeros on the VBS-off twin at the same address; `.reload /f securekernel.exe=…` gives `securekernel`
+  with **PDB symbols** over `0xFFFFF80629B4A000`–`0xFFFFF80629CBF000`; `.writemem` took the whole
+  1,527,808-byte image out of live VTL1. No driver and no test-signing. It has **no execution
+  control** — `IeXdiControlComponentFunctions` is `0x80004002`.
+- **S5r** — a live VTL1 **user-mode stop and resume**. After one byte at `securekernel.exe+0x1434E`
+  (`0x75`→`0xEB`, the `jne` guarding `SkpsEnableDebugging` inside `IumInvokeSecureService`),
+  `DebugActiveProcess` against the trustlet `LsaIso.exe` (pid 928) returned `True`, delivered
+  `CREATE_PROCESS_DEBUG_EVENT`, five module loads and then `EXCEPTION_BREAKPOINT` `0x80000003` at
+  `0x7FFE381E3AB0` on tid 4432 — an `int 3` executed in VTL1 user mode, caught in VTL0 and continued
+  with `DBG_CONTINUE`; detached cleanly, trustlet alive. **A-B-A**: `ERROR_ACCESS_DENIED (5)` before
+  the patch and again after the restore, which is what makes the middle arm a result.
+
+#### EXDI stays out, and the reason is the lab rather than a judgement made here
+
+**A custom EXDI setup is out of the question because it rests on a completely different type of
+lab.** That is E2's recorded stop condition rather than a new decision: a host whose hypervisor slot
+is already taken leaves no backend that both exposes a gdbstub *and* can host a VBS guest, so the
+nested-SLAT assumption never gets tested — *"the answer is a second host rather than a redesign"*.
+This bench is that host: Hyper-V owns the box, and a VMware guest under WHP loses its VBS. So the
+*Out of scope* line below — *"H5a / EXDI: parked with its two-part reversal condition recorded. Not
+re-litigated here"* — stands exactly as written, and this section adds no analysis to it.
+
+**One correction worth keeping, because it is what went wrong.** An ordered EXDI route had
+accumulated inside this entry, with a late section restating the item's goal as *"DbgEng inspecting
+`securekernel`"* — contradicting this entry's own title and the *Out of scope* line. The cause was
+that H5a's three inputs each got measured while H5b was being built (H3 for VTL1 registers, H4 for
+VTL1 memory, E1 for how DbgEng locates a kernel over EXDI), and that was read as the parking
+decision lapsing. **It is not**: H5a's two-part reversal condition is about the lab, and measuring
+the inputs is not it. The design detail stays in
+[`docs/secure-kernel/exdi-stub-plan.md`](docs/secure-kernel/exdi-stub-plan.md) as a plan.
+
+#### The attempts not yet made — what keeps this item open
+
+In rough order of cost, and none of them refused:
+
+1. **A `RawSource` against an operator-supplied live transport**, and with it the first real
+   `ReadFailure::Refused`, plus whatever the two S3 consequences cost the session model.
+2. ~~**The three operations the IUM write-up claims *on top of* attach.**~~ **RUN 2026-10-01 as S5t,
+   and all three pass except single-stepping.** S5r had replicated only the *access*; what it left
+   unexercised were breakpoints at a chosen address, register read and register write. On the same
+   gate (`securekernel.exe+0x1434E`, patched in **memory** by guest-physical write and restored),
+   against `LsaIso.exe` pid 924 on the VBS guest, under A-B-A control:
+   `ReadProcessMemory` walked the **trustlet's own** PE export directory to resolve
+   `ntdll!DbgUiRemoteBreakin` = `0x7FF888215B90`; `VirtualProtectEx` reported old protection `0x20`
+   and `WriteProcessMemory` planted one `0xCC` there, **read back `0xCC`** — the permission nothing
+   had tested; `GetThreadContext` read `RIP` = `0x7FF888203AB1`; `SetThreadContext` redirected it to
+   the planted address; and the next event was `EXCEPTION_BREAKPOINT` `0x80000003` at
+   **`0x7FF888215B90`** — *our* address — with `RIP` = `0x7FF888215B91`, exactly address + 1. Byte
+   and `RIP` restored and verified, detached, trustlet alive, guest uptime monotonic. Arms A and C
+   with the gate closed both gave `ERROR_ACCESS_DENIED (5)`. **What is still unrun is one clause:**
+   *single-stepping*. The redirect is a register **write**, not a trap-flag step — no `EFLAGS.TF`
+   was set and no `EXCEPTION_SINGLE_STEP` (`0x80000004`) was observed — and that is the last piece
+   of the published capability. It is cheap: set `TF` through the same `SetThreadContext`. Full
+   figures in the **S5t result** section of
+   [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md);
+   instruments are **operator-supplied and outside this repository**, like the driver — a host-side
+   driver and a guest-side debugger in the `h3probe` bench, which this repo neither ships nor tracks.
+3. **The write-path hazard S5r hit, unexplained.** `SdkWriteVirtualMemory` segfaults on a VTL1
+   virtual address while `SdkReadVirtualMemory` at the *same* address returns correct bytes. The
+   physical route was used instead; why the virtual write path does not handle the Secure Kernel
+   context is unread.
+4. **`sk_symbol`'s qualified-name wart**, below: measured, cheap, and not fixed.
+5. **Four arms that are this item's, not item 110's** — a draft moved them there as "control-axis"
+   and that was wrong, since closing the remaining gaps is part of what this item is for. They are
+   written out in the route section below: the **`CoCreateInstance` probe** on one of the 24
+   device-model CLSIDs (**no call has ever been made**; item 110's arm 3 depends on the answer but
+   does not own the probe), the **`[partition+0x10]` writer census**, the
+   **`VidHandleExceptionIntercept` branch decompile**, and **separating the reset's two causes**.
+   Item 110 keeps only what needs an owned Windows/VBS boot, plus the VTL1 state write with a
+   message pending.
+
+**One wart found while verifying, recorded rather than fixed.** `sk_symbol`'s `name` is documented
+unqualified, the module being applied here — so a *qualified*
+`securekernel!SkdInitDebuggerDataBlock` is resolved anyway by a lenient engine and reported as
+`securekernel!securekernel!SkdInitDebuggerDataBlock`: the right address with a doubled rendering.
+The identifier fields (`address`, `rva`, `engine_address`) are byte-identical to the unqualified
+call, so nothing downstream is wrong; what is wrong is the one field a caller would quote back. It
+is the family item 107 is about — a surface accepting what its contract excludes and answering
+`status: ok` — and the remedy is not simply "strip the qualifier", because a *foreign* one such as
+`skci!Foo` should be refused rather than doubled, and which of those two this tool owes is a
+judgement nothing here has made.
 
 **One setup constraint, one open question, and two capabilities — an earlier draft of this item
 overstated the first two into blockers and got the third wrong.**
@@ -4071,7 +4257,8 @@ validated. The full record is the
       the documented hazard is collision with a **raw** `WinHvInstallIntercept` installer, which
       the duplicate check cannot see. So the test is more available than claimed and still a
       decision: an unclaimed slot would be claimed by us on a running VM. **THAT ARM HAS SINCE RUN
-      — see the receiver-arm section — and the route is closed from *user mode* (**it is open from
+      — see the receiver-arm section — and the route is closed from *user mode* **against a
+      partition another process owns** (**it is open from
       kernel mode**, see the gate arm): the IOCTL is issued
       directly for a lossless `NTSTATUS`, and on both workers three handles return
       `STATUS_NOT_IMPLEMENTED` and the fourth `STATUS_ACCESS_DENIED`. Nothing was mutated — the
@@ -4117,6 +4304,14 @@ validated. The full record is the
       list unavailable), so that case is unfalsifiable here; closing it needs handle lifetimes
       captured across a child creation, which is a new arm. The same comparison shows the four VID handles are **two** file objects,
       three sharing one and one separate, which maps exactly onto the error split.
+      **The gate also admits a third caller, and it is the cheap one: whoever created the
+      partition.** `PsGetCurrentProcess()` matches `[partition+0x3780]` by construction for the
+      process that called `VidCreatePartition`, so on a partition of our own the whole receive path
+      runs from **user mode** with no driver — `VidMessageSlotMap`,
+      `VidRegisterExceptionHandler`, `VidMessageSlotHandleAndGetNext` and the completion, all
+      `SUCCESS` at high integrity, which the 2026-10-01 owner-partition probe runs in both of its modes. So *user
+      mode is closed* is about **another owner's** partition, and kernel mode is what a **managed**
+      VM costs rather than what the receive path costs. The owned case is **item 110**.
       **LiveCloudKd narrowed only as far as the handles**: they exist and are takeable, so its
       procedure is plausible rather than describing an older Windows — any further inference goes
       with the access-bit one, read off our summary of the tool, not its source. Full record, with
@@ -4134,6 +4329,12 @@ validated. The full record is the
       so *no known obstacle* still rests on S5o, S5p and S5n's control of the first step only.
       Figures, decoded gates, the three tiers and both retractions are in the **Step 8** section of
       [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md).
+      **The costing has since split, 2026-10-01.** The VID/VSM half of the rig — create a
+      partition, configure VTL1, enter it, register a handler, map the slot, receive and complete —
+      is **built and passed** at the tier A this step predicted, as the owner-partition probe. What
+      is still unpaid is the guest OS and the device model, and that half is no longer this step:
+      it is **item 110**, filed so it carries its own falsification and stop condition rather than
+      sitting here as an uncosted fallback.
    9. ~~**Measure delivery at the convergence point, which is what S5q's zero could not.**~~
       **RUN 2026-09-30, and the message IS delivered** — feasibility, the read, and the arm, all
       three; the result is below and the reasoning is kept because the next arm (a VTL1 raise) is
@@ -4363,39 +4564,67 @@ validated. The full record is the
    | VTL1 **memory** | **H4** — `HvCallReadGpa` withholds VTL1 pages as `HV_STATUS_SUCCESS` + zeros + `ReadIntercept`, **but an independent oracle read the same ranges from the root** by direct mapping, and SK's **PML4** was identified from the VTL1 `CR3` |
    | **kernel awareness** | **E1, answered 2026-09-22** — how DbgEng locates the kernel over EXDI |
 
-   **So the critical path is E3 then E4**, E2 being unrunnable on this bench because Hyper-V owns
-   the box and a VMware guest under WHP loses its VBS — which is why this item exists at all: serve
-   EXDI from the **root** rather than from a third-party gdbstub.
+   **So the critical path is E3 then E4** — **for an EXDI stub, which this item does not build and
+   which needs a different lab** (qualified 2026-10-01; the sentence stood here unqualified while this
+   entry's own *Out of scope* parked H5a, which is the contradiction the status section at the top
+   resolves). E2 is unrunnable on this bench because Hyper-V owns the box and a VMware guest under WHP
+   loses its VBS — which is why that stub would have to serve EXDI from the **root** rather than from
+   a third-party gdbstub, and why the honest answer is a second host.
 
    **And steps 6–9 and everything today are a different axis.** The ownership gate, the receiver,
    the consume loop and the VTL1 entry-context arms are about **control** — stopping a VP, arming
    breakpoints. An EXDI stub wants that for breakpoints and stepping; it does not need it to *read*
    Secure Kernel. That work is E3's second half rather than the path to the goal.
 
-   Cheapest first, and the first three are static or nearly so:
+   **Three terminal results, and the ordered route that used to sit here reached only the first of
+   them** (2026-10-01). A **capture-served inspector** of Secure Kernel — modules, symbols, memory,
+   with no debuggee in the path and DbgEng present only as gate S2's image-symbol server — is what
+   shipped, and the live source behind the same four tools is the attempt still to be made. A
+   **DbgEng-served inspector** over EXDI is **out on the lab**, with H5a's own reversal condition
+   unchanged. A **debugger** of an initialized
+   Secure Kernel — breakpoints and stepping inside a running `securekernel.exe` — is **item 110**,
+   which needs the experiment to own the boot. **The three cheap static arms this list opened with
+   stay here, on this item.** A draft moved them to 110 on the grounds that they are control-axis
+   questions; that was wrong, because this item's goal includes closing the remaining gaps and these
+   are three of them:
 
    1. **Census the writers of `[partition+0x10]`** with
-      [`tools/vid_field_census.py`](tools/vid_field_census.py), the instrument this line already
-      built for `[p+0x3060]`/`[p+0x3079]`. It decides whether step 8 is *required*, which is
-      currently an inference — see the Step 7 sections.
+      [`tools/vid_field_census.py`](tools/vid_field_census.py), the instrument this line built for
+      `[p+0x3060]`/`[p+0x3079]`. **Narrowed when the owner-partition probe passed**: it no longer
+      bears on whether a receive loop can be owned at all, because that probe owns one. What is left
+      is chaining on a **managed** VM — the only case needing `[partition+0x10]` to be
+      retrofittable.
    2. **Decompile `VidHandleExceptionIntercept`'s branch.** Parked as "not answerable by sampling",
       which is not the same as unanswerable: Ghidra is on this bench and settled three other
-      questions on 2026-09-30 that had been recorded as limits.
-   3. **Separate the reset's two causes** — a sustained `SkipArm` consume-only run. At most one
-      guest reboot, and it says whether *be `vmwp` and read* is safe as a standing capability,
-      which the observation half of E3 would rest on.
-   4. **E3 — the root-served EXDI stub**, over the register and memory reads above. This is the
-      gate that reaches the goal.
-   5. **E4 — windbg-mcp integration.** `sk_modules`, `sk_symbol` and `sk_read_memory` are already
-      on the tool surface and would then have something under them.
-   6. **The ownership route (step 8) only if breakpoints or stepping are wanted**, since inspection
-      does not need it.
+      questions on 2026-09-30 that had been recorded as limits. It is the one route to *which
+      branch* a delivered message took, which sampling cannot supply at any cadence.
+   3. **Separate the reset's two causes** — a sustained `SkipArm` consume-only run, at most one guest
+      reboot — which says whether *be `vmwp` and read* is safe as a standing capability. The
+      correction recorded against this one is that H3 reads VTL1 registers with
+      `HvCallGetVpRegisters` keyed by **partition id** and H4's oracle reads VTL1 memory by direct
+      mapping, so *neither takes a VID handle or the attach* and observation never rested on it; the
+      arm is about the **control** half. On its **own** partition the probe arms, maps, drains and
+      completes with the guest monotonic, so *arming* is survivable and the managed-VM reset points
+      at the 64 stolen messages — still an inference across two different partitions, which is why
+      the arm stands.
 
-   **A separate goal, not on this route**: running *our own* code in VTL1 kernel mode. Measured
-   2026-09-30 to be cheaper than this item's costing implied — tier A plus a VSM config, no guest
-   OS and no device model — and it answers questions about the hypervisor's VTL semantics rather
-   than about Microsoft's Secure Kernel. **Implemented and passed live on 2026-10-01 as the
-   guarded owner-partition probe in
+   **The `CoCreateInstance` probe on one of the 24 device-model CLSIDs is also this item's**, filed
+   under step 8 above, where it is recorded as *"registered rather than shown to activate. No call
+   was made."* Item 110's arm 3 depends on its answer but does not own it.
+
+   **Restating this item's status retracted no measurement; what it retracted is a goal restated in a
+   late section.** So everything that follows is still the record — read the control-axis material
+   below as **item 110's** subject, and the EXDI material above as a design held behind E2's lab
+   condition rather than as a schedule.
+
+   **The control axis, off this route and not off Secure Kernel.** This paragraph was headed *"a
+   separate goal… answers questions about the hypervisor's VTL semantics rather than about
+   Microsoft's Secure Kernel"*, written before the results under it and **wrong as of the
+   image-backed follow-on**, which stops and resumes real `securekernel.exe` code. What is true is
+   narrower: these results are off the **inspection** route this item is about, and they are the
+   strongest thing measured on the control axis. Both were cheaper than this item's costing implied
+   — tier A plus a VSM config, no guest OS and no device model. **Implemented and passed live on
+   2026-10-01 as the guarded owner-partition probe in
    [`tools/vtl1_control_probe.c`](tools/vtl1_control_probe.c).** It builds a one-VP long-mode
    image, targets fixed vector `0x20` at VTL1, and accepts only its marked vector-3 VID message
    while the intercept holds the VP. The decisive memory contract is paired: memory-block flags
@@ -4415,7 +4644,17 @@ validated. The full record is the
    post-return witness and returns through `iretq`. The 250 ms live hold, completion, return and
    partition deletion all passed. This establishes resumable execution of guarded Secure Kernel
    image code without claiming that the Windows Secure Kernel runtime was initialized; the minimum
-   Windows/VBS boot remains the route to that stronger result.
+   Windows/VBS boot remains the route to that stronger result, and it is **item 110**.
+
+   **Two limits worth stating where the result is, rather than only in item 110.** The guarded image
+   is the **host's** `securekernel.exe` — `%SystemRoot%\System32\securekernel.exe` by default — so
+   what is pinned is privilege, stop ownership and resumability, and **not** a guest build's
+   provenance. And the state primitive is half exercised: the probe reads VTL-selected state
+   through `HV_INPUT_VTL_EXPLICIT` at both VTL0 and VTL1
+   ([`tools/vtl1_control_probe.c:1073`](tools/vtl1_control_probe.c) and `:1114`) and writes VTL0
+   state before the VP starts (`:1331`), so the selector and VTL semantics **are** decoded; what is
+   unrun is a **write at VTL1 while a message is pending**, which is item 110's cheapest arm and
+   the one that would keep a real Secure Kernel stop from ever patching an instruction.
 
    The other candidate was **answered by S5c**: the
    suspend register is writable from
@@ -4792,3 +5031,130 @@ are all there and are the parts that took the review rounds to get right.
 **Why it is worth doing beyond this gate:** it works with **no debuggee** against an image target,
 so `securekernel.exe`, `winhvr.sys`, `Vid.sys` and any driver answer offline — which is the mode
 most of item 103's static work has actually run in.
+
+## 110. [windbg-mcp] A stop inside an *initialized* Secure Kernel — filed as a decision, not a schedule
+
+**Repo:** `windbg-mcp`. **Origin:** item 103's control axis, 2026-10-01, after the owner-partition
+probe passed and then its `--securekernel-breakpoint` mode stopped and resumed real
+`securekernel.exe` code at VTL1 CPL0 and released the VP cleanly.
+
+**The whole of what this item owns is the word *initialized*.** That result maps a guarded PE and
+calls into it. It boots no Secure Kernel, initializes no Secure Kernel runtime, and its guard reads
+the **host's** image — `%SystemRoot%\System32\securekernel.exe` by default, build 26100 revision
+9457, 1,385,944 bytes, PDB `C2C0D1A6-2E32-69F4-0C69-EA44FDB230C4` age 1, mapped at `0x140000000`
+with the `cc c3` of `DbgBreakPointWithStatus` required at RVA `0x1FA70` — not a guest's. So what it
+pins is privilege, stop ownership and resumability, and **not** that any of it holds for a Secure
+Kernel that actually booted.
+
+**Why this is not item 103, in either of that item's senses.** Item 103 *inspects* `securekernel` —
+registers, memory, modules, symbols — and it ships that off a capture with no driver and no debuggee;
+its EXDI route to the same answer is held behind E2's lab condition. All three of that held
+route's inputs are measured: H3 reads a child's VTL1 registers with `HvCallGetVpRegisters` from a
+root driver keyed by **partition id**, H4's oracle reads VTL1 memory by direct mapping, and E1
+settled how DbgEng locates a kernel over EXDI. **None of those takes a VID partition handle, a
+message completion or a boot**, which is why inspection never needed this item. This item is
+*stopping* an
+initialized Secure Kernel. A **resumable** stop takes all three — a managed VM's VID completion
+stream belongs to `vmwp.exe`, the gate at `[partition+0x3780]` admits exactly one process, and the
+way to be that process on a VM Hyper-V runs tears down the receive path on the way in. A
+**non-resumable** one takes none of them, which is what makes arm 2 below cheap and what stops it
+from being this item's pass.
+
+**Filed as a decision because the expensive route rests on one unvalidated step**, and this plan's
+own recorded failure is a schedule written against the obstacle in front of it. The arms are ordered
+to collect what does not depend on that step, and then to falsify it before anything is built on it.
+
+1. **The redirect primitive, on the tiny image — cheapest, and blocked on nothing.**
+   `VidSetVirtualProcessorStateEx` at **VTL1 while a message is pending**. The selector and VTL
+   semantics are already decoded and exercised: the probe reads VTL-selected state through
+   `HV_INPUT_VTL_EXPLICIT` at VTL0 and VTL1 ([`tools/vtl1_control_probe.c:1073`](tools/vtl1_control_probe.c)
+   and `:1114`) and writes VTL0 state before the VP starts (`:1331`). **Closes when** a saved VTL1
+   `RIP` is redirected to the image's own `int3`, the marked message is held, the saved `RIP` is
+   restored *while it is pending*, the completion does not advance the restored state, and the
+   original loop resumes. **Worth more than it costs**: if it passes, a stop in a real Secure Kernel
+   never has to patch a live Secure Kernel instruction, and an initialized one hands you the
+   address to redirect *to*: `SkdInitDebuggerDataBlock` stores `&DbgBreakPointWithStatus` into
+   `KdDebuggerDataBlock+0x20`, which is measured rather than assumed — `lea rax,[…!DbgBreakPointWithStatus]`
+   at `securekernel+0xAC210` followed by the store, in
+   [`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`](docs/samples/secure-kernel-debugger-investigation/26100.9457.txt),
+   and present on 28000.2952 and 29617.1000 at their own RVAs. **If it fails**, retire
+   redirection and keep the restorable software breakpoint, whose completion semantics then need
+   proving separately.
+2. **A one-shot observation of an initialized Secure Kernel — the only cheap thing that touches
+   one, 2–5 days.** A disposable checkpointed VBS guest; resolve the live Secure Kernel base from
+   the VTL1 `CR3`; halt every VP; install the parent vector-3 intercept; save and patch one byte to
+   `0xCC`; resume only for an explicit trigger; accept the observation **only** when the convergence
+   record names vector 3, active VTL 1 and the selected Secure Kernel `RIP`; collect VTL1 registers
+   and memory while halted; restore the byte and the intercept state; revert the checkpoint.
+   **The instrument largely exists** — `h3probe`, the `VidInterceptPreprocess` marker read and a raw
+   `HvCallInstallIntercept`, all run on 2026-09-30, including a VTL1 raise whose message `Rip` was
+   the enclave's own `int3` and whose `ExecutionState` bits 7–10 read `0x0097` against VTL0's
+   `0x001F`. **It cannot claim a resumable stop**: there is no owned completion on that route, and
+   restoring the patched byte does not erase an exception already raised. So it is evidence for the
+   mechanism reaching Secure Kernel code, never this item's pass. **Costs** at most the guest, by
+   design — which is why it takes a disposable one.
+3. **The falsification that decides whether arm 4 exists at all.** Can **one** in-box Hyper-V device
+   be *initialized* by a host that is not `vmwp`/VMMS? **Corrected 2026-10-01: there is no activation
+   result, because no activation was ever attempted.** This line read *"the device classes **activate**
+   out of process, which proves a registered class factory"*, which states a measurement that does not
+   exist — the step-8 costing says in terms *"Nothing here activated anything"*, and item 103's step 7
+   records the probe as unrun: *"an activation probe on one of the 24 device-model CLSIDs, which are
+   registered rather than shown to activate. **No call was made**."* What **is** measured is only
+   registration: the seven device DLLs (`vmchipset`, `vmuidevices`, `vmsynthstor`, `VmSynthNic`,
+   `vmbusvdev`, `vmtpm`, `vmdynmem`) export `DllGetClassObject`, `DllCanUnloadNow`,
+   `DllRegisterServer`, `DllUnregisterServer` **and nothing else**, and **24 in-proc CLSIDs** on this
+   host are backed by them. The private plan states the inference conditionally and correctly — class
+   activation returning `S_OK` for `IID_IUnknown` *would* prove a registered class factory and nothing
+   about `IVirtualDevice::Initialize` succeeding outside `vmwp`/VMMS — and that conditional is what got
+   flattened into a result here. **So this arm is now two steps, and the first is cheap — and that
+   first step is item 103's probe, not this item's**: actually
+   `CoCreateInstance` one of the 24 and record the `HRESULT`, then ask whether `Initialize` can be
+   driven without the context `vmwp.exe` supplies (a partition object, a VMBus channel manager).
+   **Stop condition**: a required service exists only in VMMS or in managed-VM state and cannot be
+   constructed locally — in which case this item closes at *measured and declined* for the owned-boot
+   route, and allow 3–5 days for a spike that connects one OpenVMM-derived device to the direct-VID
+   owner before any port is costed. **Expect the stop to fire** — a judgement from there being no
+   activation evidence at all, which is weaker still than the "weak evidence" this line used to claim.
+   The arm is days; everything in 4 is contingent on it.
+4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
+   experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
+   the minimum in-box device graph; firmware and one synthetic disk off an immutable
+   copy-on-write child; a **VTL0 control boot before the VBS one**, so a firmware or storage failure
+   cannot be read as a VSM launch failure; the tiny-image completion reproduced through the new
+   owner's seam *before* Secure Kernel is the first test of it; and only then a stop inside the
+   running `securekernel.exe` — vector 3 at the selected instruction, active VTL 1, saved state
+   CPL0, held while registers and memory are read twice and agree, state and any patched byte
+   restored and verified before release, the exception completed without being exposed to Secure
+   Kernel, every intercept removed, and guest uptime monotonic afterwards. Ranges as costed:
+   **4–8 engineering weeks** to a first repeatable initialized boot, **6–12** through the stop and
+   release. Addresses come from the **current** VTL1 `CR3` and symbols every run, and the image
+   identity is checked against the **guest** build rather than the host device build — the limit
+   above is exactly what that guards against.
+5. **The `windbg-mcp` half is item 103's, not a second surface.** `sk_modules`, `sk_symbol` and
+   `sk_read_memory` already exist and are served from a capture, behind the `sk::RawSource` seam
+   (`src/sk.rs:312`). A **typed live source** is the cheaper first backend and is item 103's own
+   remaining attempt — unwritten rather than refused — while **EXDI needs a different lab** (E2). So
+   if this item's work ever needs a live backend, it is that seam being implemented, and it should
+   land behind it once, in a dedicated worker process — never in the supervisor, and never with
+   private VID ABI in a DbgEng worker.
+
+**The honest summary, because a cost table invites the opposite reading.** A **resumable** stop
+inside a normally initialized Microsoft Secure Kernel is not reachable on this bench without owning
+the boot, and owning the boot is unvalidated at precisely one step. A **non-resumable observation**
+of one is reachable for days of work. And **inspection** needs neither: item 103 ships it off a
+capture today. **Arms 1 and 2 are worth running whatever arm 3 says**, which is why they are first
+rather than sequenced behind it.
+
+**Safety rules that are not negotiable per arm.** Never enumerate or open an existing VM from the
+owner-partition probe. Use only flattened clones, fresh copy-on-write children and fresh owned
+partitions. Halt every VP before changing VTL1 code or page-table-derived mappings. Verify every
+write by readback and restore it on an unconditional unwind path. Refuse an unexpected message
+rather than completing traffic the experiment cannot identify as its own — the 2026-09-30 consume
+loop drained 64 of its owner's messages and the guest reset inside ten seconds, with arming and
+stealing **not** separated as the cause, which is what makes it a rule rather than a diagnosis.
+Bound every wait and hold, record exact binary identities, and fail closed on a build mismatch.
+
+The gated route in full — its bench facts, device-contract recovery and binary inventory — is the
+private plan at `target/private/vtl1-kernel-controlled-stop-plan.md`. It is deliberately untracked,
+and the guest configuration, disk lineage and host component detail stay there rather than in this
+public repository.

@@ -22,6 +22,12 @@ described stopped existing before anyone built it. It keeps its number and its e
 number was committed and cited before that happened, and because why a filed item evaporated is
 worth as much as why one landed.
 
+**A shipped capability is not by itself a closed item**, and item 103 is the worked example of
+getting that wrong: its four Secure Kernel capture tools are built, tested and verified live, and
+the item is still **open** in `FOLLOWUPS.md` because attempts its own plan names have not been made.
+What decides the move is whether anything is left to attempt, not whether something useful shipped —
+and an attempt nobody has ruled out is not refusable just because a deliverable already exists.
+
 ## Why each of these is worth reading after it landed
 
 **Item 10** (process-per-session, 2026-08-02) is here because items 8 and 9 were both written

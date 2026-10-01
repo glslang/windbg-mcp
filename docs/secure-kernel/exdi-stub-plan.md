@@ -6,6 +6,20 @@ replaces as the working detail for that phase. The measurements it rests on are 
 Nothing here is authorized by writing it down: every gate below names what it changes on a host,
 and the host changes need their own approval.
 
+**Gates E3 and E4 are not work in flight, and the blocker is the lab.** A custom EXDI setup rests on
+a **completely different type of lab** from the one this work runs on: E2's stop condition — *"a host
+whose hypervisor slot is already taken can leave no backend that both exposes a gdbstub and can host a
+VBS guest"* — is the one that actually fired, and *"the answer is a second host rather than a
+redesign"*. So `FOLLOWUPS.md` item 103 keeps H5a parked, and this file is the design that would be
+executed if a suitable host existed, not a schedule.
+
+**That all three of this stub's inputs have since been measured (H3, H4, E1) is not the condition
+that reopens H5a** — the two-part reversal condition below is, unchanged. Reading the inputs as the
+condition is what once let an ordered EXDI route accumulate inside item 103 against that item's own
+title. Secure Kernel inspection meanwhile ships there by the cheaper route — modules, symbols and
+memory off a Hyper-V checkpoint, no driver and no debuggee — and E3's *second* half, breakpoints and
+stepping, shares its hard problem with item 110.
+
 ## Why this route rather than native KDNET
 
 Measured 2026-09-22, offline, across eight `securekernel.exe` images:
@@ -557,7 +571,7 @@ Backend candidates, cheapest first, each with its unknown named:
 | Candidate | Why it is a candidate | What is unknown |
 |---|---|---|
 | Drive the working hvix64 KD session | Hypervisor KD attach already passes here, and gives machine-wide memory | KD is a debugger protocol, not an API; the pointer chains are pinned to a hypervisor build and move with it |
-| `vid.sys` / worker-process interfaces | The route LiveCloudKd demonstrates is viable | Undocumented; a large reverse-engineering effort; the technique is available even though the dependency is excluded |
+| `vid.sys` / worker-process interfaces | The route LiveCloudKd demonstrates is viable | Undocumented; a large reverse-engineering effort; the technique is available even though the dependency is excluded. **Retired for a partition the caller creates** (2026-10-01): the private ABI is decoded and the owner-partition probe drives create, VSM config, VTL1 entry, registration, slot map, receive and completion from user mode. It stands for an **existing** VM, whose completion stream `vmwp.exe` owns — see `FOLLOWUPS.md` item 110 |
 | Windows Hypervisor Platform | Documented and supported | Aimed at partitions the caller creates, so applicability to an existing VM's VTL1 is doubtful and should be checked before it is costed |
 
 Whatever supplies VTL-qualified register state needs privileged access to the target's partition.
