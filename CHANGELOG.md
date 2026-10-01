@@ -25,10 +25,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `EXCEPTION_BREAKPOINT` `0x80000003` at **`0x7FF888215B90`**, *our* address, with `RIP` =
   `0x7FF888215B91` — exactly address + 1. Byte and `RIP` restored and verified, detached, trustlet
   alive, guest uptime monotonic at 1d 00:21 with `Secure System` still running. **A-B-A**:
-  `ERROR_ACCESS_DENIED (5)` with the gate closed, before and after. **One clause is still unrun —
-  single-stepping**: the redirect is a register *write*, not a trap-flag step, so no `EFLAGS.TF` was
-  set and no `EXCEPTION_SINGLE_STEP` (`0x80000004`) observed. Still VTL1 **user** mode only, one
-  build, one trustlet; nothing here is a property of VBS. Two incidental corrections: the probe's
+  `ERROR_ACCESS_DENIED (5)` with the gate closed, before and after.
+  **A second arm the same day added single-stepping, so every clause of the published capability is
+  reproduced**: `EFLAGS.TF` armed `0x246`→`0x346`, two `EXCEPTION_SINGLE_STEP` (`0x80000004`) events
+  at `0x7FF888215B94` then `0x7FF888215B9D` — advances of 4 and 9 bytes, matching `sub rsp,0x28` and
+  `mov rax,gs:[0x60]` as read from this host's `ntdll` — with `TF` self-cleared by each trap, and
+  `EFLAGS` moving `0x246`→`0x206` across the first step, which a replayed breakpoint would not do.
+  **That arm also crashed the trustlet, and the cause is this harness rather than the technique**: it
+  restored `RIP` without `RSP` after stepping that `sub rsp,0x28`, so `DbgBreakPoint`'s `ret` popped a
+  value that was never a return address, and WER logged `IUMTrustletCrash` for `lsaiso.exe`
+  10.0.26100.9444 twice. The guest survived — uptime monotonic at 1d 00:47, `lsass` alive, `Secure
+  System` running, nothing in the System log — but `LsaIso` did not restart, so **the single-step arm
+  has no post-restore control and wants a re-run on a rebooted guest**. Three harness defects are
+  fixed rather than noted: the full 1,232-byte `CONTEXT` is now snapshotted and restored wholesale with
+  a read-back check, the original page protection is restored (the first run left the page RWX, which
+  the second saw as `OLD=0x40` where the first read `0x20`), and liveness is sampled at 1, 3 and 6
+  seconds instead of 400 ms — that early sample reported `TRUSTLET_ALIVE=True` moments before the
+  crash surfaced. Still VTL1 **user** mode only, one build, one trustlet; nothing here is a property
+  of VBS. Two incidental corrections: the probe's
   `TARGET_PARTITION_ID = 3` was stale because partition ids turn over (the VBS guest is now 5, the
   twin 8), so it selects on `InfoSecureKernelBase` being non-zero and prints the rejected partition
   as the control; and the `ERR=203` values in the probe output follow *successful* calls, Windows not
