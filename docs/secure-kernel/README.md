@@ -16,8 +16,18 @@ and S2).
 worker holds the file rather than a debuggee, and the debugger tools are refused on it because the
 engine beside it has at most `securekernel.exe` open for symbols —
 [`docs/sessions.md`](../sessions.md#secure-kernel-captures) is the caller's half. What that reaches
-is a **capture**. Everything below about the *live* route still needs the bench posture it describes,
-and no tool here drives one: a session reads a file, and a file does not execute.
+is a **capture**. No *tool* here drives a live guest: a session reads a file, and a file does not
+execute.
+
+**A live source does exist since gate S5w, as a command-line role rather than a tool.**
+`src/livesrc.rs` implements the same [`sk::RawSource`] seam over a transport the **operator**
+supplies — a child process speaking a line protocol on its stdio — and
+`windbg-mcp --sk-live --transport "<command>" --image <path>` runs gate S1's whole decode through
+it. This repository ships **no transport**: reading another partition's VTL1 live needs a kernel
+component it will not distribute, which is the same arrangement as the live-kernel tier's KDNET
+wiring. It is not a fifth tool on purpose — gate S5x measured a page of `securekernel.exe`'s
+`.data` changing inside twenty seconds, so a live source cannot keep the promise a capture
+session's decode-on-open makes.
 
 ## The answer so far
 

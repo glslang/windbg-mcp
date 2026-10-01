@@ -9,6 +9,75 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **Secure Kernel reads can now come from a *live* guest, through a transport the operator supplies —
+  and the first `ReadFailure::Refused` ever raised by a real source (gates S5w and S5x, 2026-10-01).**
+  `src/sk.rs`'s source seam said *"a future driver-backed live source joins here and changes nothing
+  above it"* and had only ever been driven by capture files. `src/livesrc.rs` is that source, and what
+  this repository gains is the **client** half of a line protocol spoken by a **child process**: it
+  ships no transport, links nothing privileged and contains no unsafe FFI, because reading another
+  partition's VTL1 live needs a kernel component this project will not distribute — the same standing
+  decision as the live-kernel tier's KDNET wiring. `windbg-mcp --sk-live --transport "<command>"
+  --image <path>` drives gate S1's whole decode through it. Measured against the running VBS lab
+  guest: root `0x1201000`, a **complete** walk of **11,819 leaf mappings over 4,229 distinct pages**,
+  `securekernel.exe` identified at `0xFFFFF8024278A000` with 4 `KDBG` hits and three other PE headers
+  rejected on `KernBase`, `KdDebuggerDataBlock` at base `+0x1335E0`, `SkLoadedModuleList` at base
+  `+0x127770`, and **six VTL1 modules** (`securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`,
+  `vmsvc.dll`, `vmsvcext.sys`) — over **12,375 reads and 50,688,000 bytes with nothing failed**.
+  A second transport drives `HvCallReadGpa` instead, at its real `max_read` of **16** — the width
+  `RawSource::max_read` exists because of — and answers
+  **`Refused { detail: "ReadIntercept(2)" }`**, so `ReadStats::refused` is above zero outside a
+  fixture for the first time and the decode declines to claim the negative: *"this run identified
+  nothing while 2 read(s) failed, so its negative has not been earned."* That is the one mistake the
+  seam was shaped to prevent — a refusal collapsing into a failure would have produced the VBS-off
+  control's answer from a VBS-on guest — now demonstrated rather than argued. **It is a command-line
+  role and deliberately not a fifth MCP tool**, because the two consequences a live source has for a
+  capture *session* are now measured instead of assumed: one of `securekernel.exe`'s 373 pages changed
+  in 20 seconds — 2 bytes, in **`.data`** — while 1,200 sampled non-image pages and every landmark
+  stayed byte-identical. So decode-on-open is unsound in principle for a live source and
+  `sk_read_memory`'s bytes are not guaranteed between two reads, while the churn is small enough to
+  say what it would cost. Fifteen unit tests pin the framing against in-memory pipes, including a
+  provider banner being skipped to a sentinel, a misspelled `SHAPE` key being refused rather than read
+  as a guest with no page-table root, and a transport announcing more bytes than were asked for.
+
+- **Retracted: `SdkWriteVirtualMemory` does not segfault on VTL1, and the fault blamed on it was an
+  8-byte struct overrun in the bench's own Python binding (gate S5u, 2026-10-01).** This project has
+  carried the claim since gate S5r that *"the virtual read path handles the Secure Kernel context and
+  the virtual write path does not"*. Both halves are wrong. Four arms — {VTL0 NT kernel, VTL1 Secure
+  Kernel} × {PE header page, executable `.text` page} — each **mutate** a byte and read it back
+  through the physical route at a GPA walked from Secure Kernel's own `CR3`, validated against the
+  virtual read first and restored through that route in a `finally`; all four land, three runs, 12 of
+  12. The VTL0 arms are the control the original lacked, and the VTL1 `.text` arm is the patched
+  gate's own page class. A null or stale partition handle — the other candidate — returns `False`
+  cleanly in both directions with no fault. The access violation that *did* end those runs comes from
+  `hvlib.py`, whose `CfgParameters` declares **12 fields and 48 bytes** where the SDK header's
+  `VM_OPERATIONS_CONFIG` has **17 and 56**: every `SdkGetDefaultConfig` through that binding writes
+  **8 bytes past a Python allocation**, and the process dies wherever the garbage collector next walks
+  it, which `python -X faulthandler` reports as `Garbage-collecting` at a different place in every
+  script. Three things recorded with it: **a `0xC0000005` exit from any of these probes says nothing
+  about what the probe was doing**, which is how the claim arose; *"every run ends in an hvlib unload
+  segfault"* is false in both directions; and five flags, `VSMScan` among them, have never been
+  settable from this bench. **Gate S5t is unaffected** — it patched physically and verified by
+  read-back — and what changes is only the reason recorded for that choice.
+
+- **The Hyper-V device model activates outside `vmwp.exe`: 20 of its 24 COM classes, for an ordinary
+  user (gate S5v, 2026-10-01).** Step 8's costing of a VID/VSM rig rested on an activation probe
+  recorded as unrun — *"registered rather than shown to activate. No call was made"* — and
+  `tools/devmodel_activation_probe.py` makes the call. The registry census reproduces exactly: 24
+  CLSIDs backed by the seven `vm*` DLLs, all `ThreadingModel=Free`.
+  `CoCreateInstance(CLSCTX_INPROC_SERVER, IID_IUnknown)` from an ordinary elevated process, one child
+  process per CLSID so a faulting device model costs one result rather than 23: **20 `S_OK`, 4
+  `CLASS_E_CLASSNOTAVAILABLE`, no faults**, with `msxml3` XMLHTTP activating as the positive control
+  and an unregistered CLSID giving `REGDB_E_CLASSNOTREG` as the negative. The 4 refusals are a
+  registration artefact rather than a policy: their backing DLL loads into the process before
+  refusing, and their GUID bytes appear in **none** of the 45 `vm*.dll`s in System32. Each object
+  refcounts `AddRef`→2, `Release`→1, `Release`→0 and answers `E_NOINTERFACE` with a nulled
+  out-pointer for an IID nothing implements, so it is live rather than merely constructed; the
+  out-pointer is poisoned with `0xAA` first, so writing nothing cannot read as writing null. **And it
+  is not admin-gated** — `BiosVdev` activates under a restricted token and again at genuine **medium**
+  integrity with no `Administrators` membership — so *process context can decide it* is answered **no**
+  for construction. It removes the next obstacle and does not establish tier B: these objects
+  implement private interfaces whose IIDs this record has never read.
+
 - **The published IUM-debugging capability is now reproduced in full except single-stepping: a
   breakpoint we planted fired inside a trustlet, and its registers read and wrote (gate S5t,
   2026-10-01).** Gate S5r had replicated only the *access*, and its own record said so — the
@@ -87,8 +156,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published route's three hypervisor levels, but exercised none of `WriteProcessMemory`,
   `GetThreadContext` or `SetThreadContext` against the trustlet, so whether VTL0 may *write* a
   trustlet's memory is still untested and is a different permission from being admitted to attach;
-  and the unexplained `SdkWriteVirtualMemory` segfault on a VTL1 virtual address where
-  `SdkReadVirtualMemory` at the same address returns correct bytes. EXDI (E3, E4) stays out on **E2's
+  and an `SdkWriteVirtualMemory` segfault on a VTL1 virtual address that was
+  recorded as unexplained and is **retracted above**: the call writes VTL1 fine. EXDI (E3, E4) stays out on **E2's
   lab condition** — a custom EXDI setup rests on a completely different type of lab, a host whose
   hypervisor slot is free, and *"the answer is a second host rather than a redesign"* — with H5a's
   two-part reversal condition unchanged and the measurement of the stub's three inputs (H3, H4, E1)

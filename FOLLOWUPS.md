@@ -109,14 +109,20 @@ decision with its falsification first, because its one unvalidated step is likel
 driver and no debuggee** — DbgEng appears only as an image-symbol server, gate S2's own finding, and
 never in the path of a read — re-verified end to end that day against a VBS guest, a VBS-off control
 and a third boot. **What keeps it open is that part of its goal is closing the remaining gaps, and
-several of the attempts its plan names have not been made**: a `RawSource` against the
-operator-supplied live transport (the seam is built and the constraint — no driver from this repo,
-the operator supplies it, the rest is drivable — was agreed long ago, so this is an implementation
-nobody has written, not a question); and the unexplained `SdkWriteVirtualMemory` segfault on a VTL1
-virtual address. **S5t is done**: every clause of the published IUM capability — breakpoints,
-single-stepping, register access — is reproduced from the Hyper-V root with no nesting, cleanly on
-a rebooted guest with the trustlet surviving and a post-restore control on the same pid, after a
-first single-step attempt crashed it through a harness defect that is now fixed and verified. EXDI stays out for the reason E2 recorded — it needs a **completely different type
+four of the attempts its plan names have still not been made**: `sk_symbol`'s qualified-name wart,
+the `[partition+0x10]` writer census, the `VidHandleExceptionIntercept` branch decompile, and
+separating the partition reset's two causes. **Four others landed on 2026-10-01**, and two of them
+came back as retractions of that entry's own claims. **S5t**: every clause of the published IUM
+capability — breakpoints, single-stepping, register access — reproduced from the Hyper-V root with
+no nesting, cleanly on a rebooted guest with the trustlet surviving and a post-restore control on
+the same pid, after a first single-step attempt crashed it through a harness defect since fixed and
+verified. **S5w/S5x**: a live `RawSource` over an operator-supplied transport walks a *running*
+guest's VTL1 end to end, and a second transport produces the first `ReadFailure::Refused` ever
+raised by a real source — with the two session-model consequences measured rather than assumed.
+**S5u** retracts this entry's `SdkWriteVirtualMemory` hazard: that call writes VTL1 fine, and the
+fault blamed on it is an 8-byte struct overrun in the bench's own Python binding. **S5v** retracts
+*no call was made* on the device model: 20 of its 24 COM classes activate outside `vmwp.exe`, at
+medium integrity. EXDI stays out for the reason E2 recorded — it needs a **completely different type
 of lab**, a host whose hypervisor slot is free — and the *Out of scope* line parking H5a stands. Two
 drafts of that entry's status got this wrong and are recorded in it: one closed the item on the
 strength of the four tools, and one recast the operator-supplied transport as a refusal, inverting a
@@ -2101,12 +2107,33 @@ decision lapsing. **It is not**: H5a's two-part reversal condition is about the 
 the inputs is not it. The design detail stays in
 [`docs/secure-kernel/exdi-stub-plan.md`](docs/secure-kernel/exdi-stub-plan.md) as a plan.
 
-#### The attempts not yet made — what keeps this item open
+#### The attempts the plan names — four were made on 2026-10-01, and four keep this item open
 
-In rough order of cost, and none of them refused:
+In rough order of cost, and none of them refused. **Still open: attempt 4 and the three arms under attempt 5.**
+Two of the four that landed came back as **retractions of this entry's own claims** rather than as
+confirmations, which is the more useful outcome and the reason the superseded wording is struck through
+rather than deleted.
 
-1. **A `RawSource` against an operator-supplied live transport**, and with it the first real
-   `ReadFailure::Refused`, plus whatever the two S3 consequences cost the session model.
+1. ~~**A `RawSource` against an operator-supplied live transport**, and with it the first real
+   `ReadFailure::Refused`, plus whatever the two S3 consequences cost the session model.~~
+   **DONE 2026-10-01 as S5w and S5x — all three halves.** `src/livesrc.rs` implements the trait over a
+   **child process speaking a line protocol on its stdio**, so what this repository gains is the
+   *client* and the operator still supplies the transport; `windbg-mcp --sk-live --transport
+   "<command>" --image <path>` drives gate S1's whole decode through it. Against the **running** VBS
+   guest it reports what a capture reports: root `0x1201000`, a complete walk of **11,819 leaf
+   mappings over 4,229 distinct pages**, `securekernel.exe` identified at `0xFFFFF8024278A000` with 4
+   `KDBG` hits and three other PE headers rejected, `KdDebuggerDataBlock` at base `+0x1335E0`,
+   `SkLoadedModuleList` at base `+0x127770`, and **six VTL1 modules** — over **12,375 reads and
+   50,688,000 bytes with nothing failed**. A second transport mode drives `HvCallReadGpa` instead, at
+   its real `max_read` of **16**, and produces **`Refused { detail: "ReadIntercept(2)" }`** — the
+   first time that variant has come from a source rather than a fixture — with `refused: 2` in
+   `ReadStats` and the decode declining to claim the negative: *"this run identified nothing while 2
+   read(s) failed, so its negative has not been earned."* **The two S3 consequences are measured
+   rather than assumed**, which is why `--sk-live` is a command-line role and **not** a fifth MCP
+   tool: one of the image's 373 pages changed in 20 seconds — 2 bytes, in **`.data`** — while 1,200
+   sampled non-image pages and every landmark were byte-identical, so decode-on-open is unsound in
+   principle for a live source and `sk_read_memory`'s bytes are not guaranteed between two reads.
+   Fifteen unit tests cover the framing against in-memory pipes.
 2. ~~**The three operations the IUM write-up claims *on top of* attach.**~~ **DONE 2026-10-01 as S5t,
    and all four pass, single-stepping included.** S5r had replicated only the *access*; what it left
    unexercised were breakpoints at a chosen address, register read and register write. On the same
@@ -2139,19 +2166,46 @@ In rough order of cost, and none of them refused:
    [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md);
    instruments are **operator-supplied and outside this repository**, like the driver — a host-side
    driver and a guest-side debugger in the `h3probe` bench, which this repo neither ships nor tracks.
-3. **The write-path hazard S5r hit, unexplained.** `SdkWriteVirtualMemory` segfaults on a VTL1
-   virtual address while `SdkReadVirtualMemory` at the *same* address returns correct bytes. The
-   physical route was used instead; why the virtual write path does not handle the Secure Kernel
-   context is unread.
+3. ~~**The write-path hazard S5r hit, unexplained.**~~ **DONE 2026-10-01 as S5u, and the answer is a
+   retraction rather than an explanation.** The claim was that `SdkWriteVirtualMemory` segfaults on a
+   VTL1 virtual address because *"the virtual read path handles the Secure Kernel context and the
+   virtual write path does not"*. **It does not segfault and it does handle it.** Four arms — {VTL0 NT
+   kernel, VTL1 Secure Kernel} × {PE header page, executable `.text` page} — each **mutate** a byte and
+   read it back through the *physical* route at a GPA walked from Secure Kernel's own `CR3` (validated
+   against the virtual read before anything is written, and restored through that route in a
+   `finally`). All four land; three runs, 12 of 12. The VTL0 arms are the control the original lacked,
+   and the VTL1 `.text` arm is the gate's own page class, so "an executable VTL1 page is refused" is
+   closed rather than assumed. A null or stale partition handle — the other candidate, since S5r ran
+   when `s5r_patch.py` still carried `TARGET_PARTITION_ID = 3` — returns `False` cleanly both
+   directions with no fault.
+   **The fault that was blamed on it is this bench's own**: `hvlib.py`'s `CfgParameters` declares
+   **12** fields and 48 bytes where `HvlibEnumPublic.h`'s `VM_OPERATIONS_CONFIG` has **17** and 56, so
+   every `SdkGetDefaultConfig` through that binding writes **8 bytes past a Python allocation**, and
+   the process dies wherever the garbage collector next walks it — `python -X faulthandler` reports it
+   as `Garbage-collecting`, in a different place in every script. Declaring all seventeen fields makes
+   it go away: the long-running transport of attempt 1 was dying inside `EnumPartitions` and now
+   serves 12,375 reads and exits zero. Three consequences recorded with it: **an exit code of
+   `0xC0000005` from any probe here says nothing about what the probe was doing**, which is exactly how
+   this claim was arrived at; *"every run ends in an hvlib unload segfault"* is wrong in both
+   directions (a single-call probe exits zero 6 of 6, and `s5r_patch.py read` was seen clean once in
+   seven); and five flags including **`VSMScan`** have never been settable from this bench. **S5t is
+   unaffected** — it patched physically and verified by read-back — and what changes is only the
+   *reason* recorded for that choice: the physical route was sound and was never forced.
 4. **`sk_symbol`'s qualified-name wart**, below: measured, cheap, and not fixed.
-5. **Four arms that are this item's, not item 110's** — a draft moved them there as "control-axis"
-   and that was wrong, since closing the remaining gaps is part of what this item is for. They are
-   written out in the route section below: the **`CoCreateInstance` probe** on one of the 24
-   device-model CLSIDs (**no call has ever been made**; item 110's arm 3 depends on the answer but
-   does not own the probe), the **`[partition+0x10]` writer census**, the
-   **`VidHandleExceptionIntercept` branch decompile**, and **separating the reset's two causes**.
-   Item 110 keeps only what needs an owned Windows/VBS boot, plus the VTL1 state write with a
-   message pending.
+5. **Three arms that are this item's, not item 110's** — a draft moved four of them there as
+   "control-axis" and that was wrong, since closing the remaining gaps is part of what this item is
+   for. The fourth, the **`CoCreateInstance` probe**, is **DONE 2026-10-01 as S5v**: 20 of the 24
+   device-model CLSIDs activate with `CLSCTX_INPROC_SERVER` and `IID_IUnknown` outside `vmwp.exe`, no
+   faults, with a positive and a negative control either side; the 4 refusals are
+   `CLASS_E_CLASSNOTAVAILABLE` from a module that **does** load first and whose image carries none of
+   their GUIDs, so they are a registration naming a module that never implemented them. Each object
+   refcounts to zero and dispatches `QueryInterface`. **And it is not admin-gated** — `BiosVdev`
+   activates at medium integrity with no `Administrators` membership — so *process context can decide
+   it* is answered **no** for construction. It removes the next obstacle and does not establish tier B:
+   the private interfaces' IIDs are still unread. The three that remain are written out in the route
+   section below: the **`[partition+0x10]` writer census**, the **`VidHandleExceptionIntercept` branch
+   decompile**, and **separating the reset's two causes**. Item 110 keeps only what needs an owned
+   Windows/VBS boot, plus the VTL1 state write with a message pending.
 
 **One wart found while verifying, recorded rather than fixed.** `sk_symbol`'s `name` is documented
 unqualified, the module being applied here — so a *qualified*
@@ -3938,8 +3992,9 @@ validated. The full record is the
   arm ties the disassembly to the observable — Win32 `5` is the mapping of the `0xC0000022` the guard
   writes — and the after arm makes the middle one a result rather than a trustlet that happened to be
   debuggable.
-- **`SdkWriteVirtualMemory` segfaults on a VTL1 address while `SdkReadVirtualMemory` at the same
-  address works**, so the write goes through S4's physical route: SK base and SK `CR3` read per run
+- **The write goes through S4's physical route** — recorded here as forced by a `SdkWriteVirtualMemory`
+  segfault, which **S5u retracts**: that call lands on VTL1, and the fault was an 8-byte struct
+  overrun in `hvlib.py` surfacing at the next garbage collection. The route taken was still this: SK base and SK `CR3` read per run
   (`0xFFFFF80629B4A000`, `0x1201000` this boot), a four-level walk to GPA **`0xCE534E`** agreeing with
   an independent `!vtop`, and the page identified by diffing **48 live bytes against the dumped image**
   with the gate byte masked. **The crash printed nothing** — Python's stdout buffer dies with the

@@ -1,0 +1,693 @@
+//! A [`sk::RawSource`] over a transport the **operator** supplies — `FOLLOWUPS.md` item 103.
+//!
+//! Gate S1 decodes a guest's VTL1 out of a byte source and gate S3 holds one open as a session, and
+//! both have only ever been driven by a Hyper-V capture. The seam was built for this:
+//! [`sk::RawSource`]'s own doc says *"a future driver-backed live source joins here and changes
+//! nothing above it"*, [`sk::RawSource::max_read`] exists because `HvCallReadGpa` moves at most
+//! sixteen bytes, and [`sk::ReadFailure::Refused`] exists **for** the live case, because H4 measured
+//! that hypercall answering `HV_STATUS_SUCCESS` with zeros and a per-access `ReadIntercept`. Until
+//! this module there was no implementation, so `Refused` had never been produced by anything but a
+//! fixture.
+//!
+//! # Why a subprocess, and why this repository ships no transport
+//!
+//! Reading another partition's VTL1 live needs something this repository will not contain. Every
+//! route measured on the bench — `hvlib.dll` with its own kernel driver, a hypercall through a
+//! test-signed driver of our own — is a component the operator installs, test-signs and accepts the
+//! posture of. That is item 103's standing decision: **the repository distributes no driver and the
+//! operator supplies the transport.** It is the same shape as the live-kernel tier, which needs
+//! KDNET wiring and a local profile, and the engine bundle, which needs a one-time copy.
+//!
+//! So the seam is a **child process speaking a line protocol on its stdio**. What ships here is the
+//! client half, which contains no privileged code, links nothing, and can be read in one sitting.
+//! The operator's half can be anything that can read their guest: on this bench it is a Python
+//! script driving `hvlib`, and a second mode of the same script driving `HvCallReadGpa` through the
+//! probe driver — which is the one that *refuses*.
+//!
+//! A DLL with an agreed export would have been the other option and is worse here: it would put
+//! unsafe FFI and a vendor ABI in this crate, and a provider that `__fastfail`s — which gate S0
+//! measured `vmsavedstatedumpprovider.dll` doing — would take the whole process down. A child
+//! process that dies costs one read and reports why.
+//!
+//! # The protocol
+//!
+//! Requests are one line of ASCII on the child's stdin. Responses are one status line on its
+//! stdout, and for a successful read exactly the requested bytes after it.
+//!
+//! **The transport opens by printing [`READY_LINE`], and everything before that is ignored.** That
+//! is not politeness about banners: a provider an operator installs prints during its own setup, and
+//! on this bench `hvlib.py` prints a partition menu with an ordinary `print()` — so the client's
+//! first read would otherwise take `[ 0 ] Lab Guest Hyper-V` as a `SHAPE` reply. The alternative was
+//! for the transport to redirect its own stdout around the provider, and that was **tried and
+//! abandoned**: duplicating the descriptor and pointing `fd 1` elsewhere crashed the Python host
+//! with an access violation inside its allocator, deterministically, every run. A sentinel costs one
+//! line and needs the provider to cooperate about nothing.
+//!
+//! Skipped lines are echoed to this process's stderr with a `transport:` prefix, because a
+//! misconfigured provider's explanation of itself is the thing an operator most needs to see.
+//!
+//! ```text
+//! <- (any number of lines the provider prints while starting)
+//! <- windbg-mcp-gpa/1
+//! -> SHAPE
+//! <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long cr0=0x80050033 cr4=0x350ef8 efer=0xd01 max_read=4096
+//! -> READ 0xCD12DF 16
+//! <- OK 16
+//! <- <16 raw bytes>
+//! -> READ 0x107593000 16
+//! <- REFUSED ReadIntercept
+//! -> READ 0xFFFFFFFFFF 16
+//! <- NOTPRESENT
+//! -> READ 0x1000 16
+//! <- ERROR the driver is not loaded
+//! ```
+//!
+//! Every field of `SHAPE` is optional but `max_read`, because [`sk::GuestShape`] is deliberately a
+//! bag of maybes: a source that cannot read `EFER` must say so rather than have the decode read a
+//! missing register as a machine not in long mode. An unknown key is **refused** rather than
+//! ignored — a transport whose `cr3` was misspelled would otherwise look like a guest with no
+//! page-table root, which is a different and much more plausible-looking result.
+//!
+//! The four status words are the four [`sk::ReadFailure`] variants, and keeping them distinct is the
+//! whole point of the trait: a source that collapsed them would produce silent zeros exactly where
+//! the protected memory is.
+
+use std::io::{BufRead, BufReader, Write};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+
+use anyhow::{Context, Result, bail};
+
+use crate::sk::{self, Gpa, GuestShape, PagingMode, ReadFailure, Reader};
+
+pub(crate) const LIVE_FLAG: &str = "--sk-live";
+
+/// The line a transport prints when its own setup is finished and stdout is the protocol's.
+pub(crate) const READY_LINE: &str = "windbg-mcp-gpa/1";
+
+/// How many lines of a transport's own output to skip before giving up on the sentinel.
+///
+/// A bound rather than reading until it appears: a transport that never prints it — the wrong
+/// program, or one writing a log to stdout — would otherwise be read until it exited or for ever,
+/// and the failure would look like a hang rather than a misconfiguration.
+const MAX_BANNER_LINES: usize = 64;
+
+/// The most a transport may declare for `max_read`.
+///
+/// Not a protocol limit but a guard on *our* allocation: `read_chunk` is handed a buffer by
+/// [`Reader`], which sizes it from this number, so a transport answering `max_read=0xFFFFFFFF`
+/// would have us allocate 4 GB before a byte was read.
+const MAX_DECLARED_READ: usize = 1 << 20;
+
+/// One request/response exchange with a transport, over anything readable and writable.
+///
+/// Generic on purpose: the framing is the part that can be wrong in ways a live guest would hide,
+/// so it is tested against in-memory pipes rather than only against the bench's own server.
+pub(crate) struct Transport<R: BufRead, W: Write> {
+    reader: R,
+    writer: W,
+    max_read: usize,
+}
+
+/// What a transport said about the processor, before it is turned into a [`GuestShape`].
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ShapeReply {
+    pub(crate) shape: GuestShape,
+    pub(crate) max_read: usize,
+}
+
+impl<R: BufRead, W: Write> Transport<R, W> {
+    pub(crate) fn new(reader: R, writer: W) -> Transport<R, W> {
+        Transport {
+            reader,
+            writer,
+            // Until `SHAPE` answers. One byte is a legal transfer width and a useless one, which is
+            // the right default for a field that must not be guessed generously.
+            max_read: 1,
+        }
+    }
+
+    /// Read past whatever the transport printed while starting, up to its sentinel.
+    ///
+    /// Returns the lines it skipped, so the caller can show them: they are the only explanation a
+    /// misconfigured provider gives.
+    pub(crate) fn await_ready(&mut self) -> Result<Vec<String>> {
+        let mut skipped = Vec::new();
+        for _ in 0..MAX_BANNER_LINES {
+            let line = self.line()?;
+            if line.trim() == READY_LINE {
+                return Ok(skipped);
+            }
+            skipped.push(line);
+        }
+        bail!(
+            "the transport printed {MAX_BANNER_LINES} lines without {READY_LINE:?}; it is probably \
+             not a transport. What it said: {skipped:?}"
+        )
+    }
+
+    /// Ask for the processor state, and remember the transfer width it declares.
+    pub(crate) fn shape(&mut self) -> Result<ShapeReply> {
+        self.writer.write_all(b"SHAPE\n")?;
+        self.writer.flush()?;
+        let line = self.line()?;
+        let reply = parse_shape(&line)?;
+        self.max_read = reply.max_read;
+        Ok(reply)
+    }
+
+    /// Fill `out` from guest physical memory, or say why not.
+    fn read_chunk(&mut self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
+        let request = format!("READ {:#X} {}\n", gpa.0, out.len());
+        self.writer
+            .write_all(request.as_bytes())
+            .and_then(|()| self.writer.flush())
+            .map_err(|e| ReadFailure::SourceError {
+                detail: format!("writing the request failed: {e}"),
+            })?;
+        let line = self.line().map_err(|e| ReadFailure::SourceError {
+            detail: format!("reading the status line failed: {e}"),
+        })?;
+        match parse_status(&line, out.len())? {
+            // A short count is not an error to report later: the trait says a short read *is* a
+            // failed read, so it is one here rather than something a caller might judge on.
+            Some(got) if got != out.len() => Err(ReadFailure::Short {
+                got,
+                want: out.len(),
+            }),
+            Some(got) => {
+                self.reader
+                    .read_exact(&mut out[..got])
+                    .map_err(|e| ReadFailure::SourceError {
+                        detail: format!(
+                            "the transport announced {got} bytes and did not send them: {e}"
+                        ),
+                    })?;
+                Ok(())
+            }
+            None => unreachable!("parse_status returns Err for every non-OK status"),
+        }
+    }
+
+    fn line(&mut self) -> Result<String> {
+        let mut line = String::new();
+        let read = self.reader.read_line(&mut line)?;
+        if read == 0 {
+            bail!("the transport closed its stdout");
+        }
+        Ok(line.trim_end_matches(['\r', '\n']).to_string())
+    }
+}
+
+/// `SHAPE cr3=0x... max_read=...` into the shape the decode takes.
+///
+/// An unknown or malformed key is an error rather than a default: see the module docs.
+pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
+    let rest = line
+        .strip_prefix("SHAPE")
+        .with_context(|| format!("expected a SHAPE reply, got {line:?}"))?;
+    let mut reply = ShapeReply::default();
+    let mut max_read = None;
+    for field in rest.split_whitespace() {
+        let (key, value) = field
+            .split_once('=')
+            .with_context(|| format!("field {field:?} is not key=value"))?;
+        match key {
+            "cr0" => reply.shape.cr0 = Some(number(key, value)?),
+            "cr3" => reply.shape.cr3 = Some(number(key, value)?),
+            "cr4" => reply.shape.cr4 = Some(number(key, value)?),
+            "efer" => reply.shape.efer = Some(number(key, value)?),
+            "max_read" => max_read = Some(number(key, value)? as usize),
+            "vtl_enabled" => {
+                reply.shape.vtl_enabled = Some(match value {
+                    "1" => true,
+                    "0" => false,
+                    other => bail!("vtl_enabled must be 0 or 1, got {other:?}"),
+                })
+            }
+            "paging" => {
+                reply.shape.paging_mode = Some(match value {
+                    "long" => PagingMode::Long,
+                    other => bail!("this decode only walks long mode; transport said {other:?}"),
+                })
+            }
+            // The transport's own way of saying the VTL could not be selected. On a VBS-off guest
+            // this *is* the result, so it travels rather than failing the run.
+            "switch_refused" => reply.shape.switch_refused = Some(value.replace('_', " ")),
+            // A register the transport was asked for and could not get. Recorded with its reason,
+            // so a report says which question went unanswered.
+            "unreadable" => {
+                let (name, why) = value.split_once(':').unwrap_or((value, "no reason given"));
+                reply.shape.unreadable.push((
+                    match name {
+                        "cr0" => "cr0",
+                        "cr3" => "cr3",
+                        "cr4" => "cr4",
+                        "efer" => "efer",
+                        other => bail!("unreadable names an unknown register {other:?}"),
+                    },
+                    why.replace('_', " "),
+                ));
+            }
+            other => bail!(
+                "unknown SHAPE field {other:?}; a misspelled key would read as a guest that \
+                 cannot answer, so it is refused instead"
+            ),
+        }
+    }
+    let max_read = max_read.context("SHAPE must declare max_read")?;
+    if max_read == 0 || max_read > MAX_DECLARED_READ {
+        bail!("max_read={max_read} is outside 1..={MAX_DECLARED_READ}");
+    }
+    reply.max_read = max_read;
+    Ok(reply)
+}
+
+/// A status line into either a byte count to read, or the failure it names.
+///
+/// `want` is only used to reject a count larger than what was asked for: a transport that announced
+/// more bytes than the buffer holds must not be allowed to decide how much is read.
+pub(crate) fn parse_status(line: &str, want: usize) -> Result<Option<usize>, ReadFailure> {
+    let (word, rest) = line.split_once(' ').unwrap_or((line, ""));
+    match word {
+        "OK" => {
+            let got: usize = rest.trim().parse().map_err(|_| ReadFailure::SourceError {
+                detail: format!("OK with an unparseable count: {line:?}"),
+            })?;
+            if got > want {
+                return Err(ReadFailure::SourceError {
+                    detail: format!("transport announced {got} bytes for a {want}-byte request"),
+                });
+            }
+            Ok(Some(got))
+        }
+        // The variant this whole module exists to be able to produce: the source was told no, per
+        // access. Bytes may well have been written into a buffer; they are not an answer.
+        "REFUSED" => Err(ReadFailure::Refused {
+            detail: if rest.trim().is_empty() {
+                "the transport refused and gave no detail".to_string()
+            } else {
+                rest.trim().to_string()
+            },
+        }),
+        "NOTPRESENT" => Err(ReadFailure::NotPresent),
+        "ERROR" => Err(ReadFailure::SourceError {
+            detail: rest.trim().to_string(),
+        }),
+        other => Err(ReadFailure::SourceError {
+            detail: format!("unknown status word {other:?} in {line:?}"),
+        }),
+    }
+}
+
+fn number(key: &str, value: &str) -> Result<u64> {
+    let parsed = match value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+    {
+        Some(hex) => u64::from_str_radix(hex, 16),
+        None => value.parse(),
+    };
+    parsed.with_context(|| format!("{key}={value:?} is not a number"))
+}
+
+/// The operator's transport, running as a child process.
+pub(crate) struct LiveSource {
+    child: Child,
+    /// `Option` so [`Drop`] can **take** it: dropping the transport closes the child's stdin, and
+    /// until that pipe closes a well-behaved transport is still waiting for a request, so a `wait()`
+    /// with it open hangs. `Drop::drop` runs before any field is dropped, so field order cannot do
+    /// this for us.
+    transport: std::cell::RefCell<Option<Transport<BufReader<ChildStdout>, ChildStdin>>>,
+    shape: GuestShape,
+    max_read: usize,
+}
+
+impl LiveSource {
+    /// Spawn `command` and complete the `SHAPE` handshake.
+    ///
+    /// The handshake is at the open rather than on first read, for the same reason
+    /// [`sk::RawSource::shape`] is documented as cheap: a transport that cannot say what processor
+    /// it is reading should fail before a decode starts walking from a root it invented.
+    pub(crate) fn spawn(command: &str) -> Result<LiveSource> {
+        let mut parts = split_command(command);
+        let program = parts
+            .first()
+            .cloned()
+            .context("the transport command line is empty")?;
+        let mut command = Command::new(&program);
+        command
+            .args(parts.split_off(1))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            // Deliberately **not** piped: a transport's diagnostics go to this process's own stderr,
+            // where an operator debugging their script can see them, and a pipe nothing drains would
+            // deadlock the child the moment it filled. The same rule
+            // `.claude/rules/powershell-scripts.md` states for driving this server from a script.
+            .stderr(Stdio::inherit());
+        let mut child = {
+            // Every process creation in this crate takes this, and a unit test enforces it. The
+            // hazard is not a race between two spawns: a worker's protocol-channel handles are
+            // marked inheritable for a window, and **any** child started during that window
+            // inherits them — a process holding a worker's message write end keeps that pipe from
+            // ever reporting EOF, so the supervisor never learns the worker exited. This role runs
+            // before the runtime and holds no session, but the flag is a property of the process
+            // rather than of the spawn that set it, so "this one cannot collide" is exactly the
+            // reasoning the guard exists to make unnecessary. Held across the creation and no
+            // longer — the transport runs for the whole decode.
+            let _guard = crate::engine::spawn_guard();
+            command
+                .spawn()
+                .with_context(|| format!("spawning the transport {program:?} failed"))?
+        };
+        let stdin = child.stdin.take().context("the child has no stdin")?;
+        let stdout = child.stdout.take().context("the child has no stdout")?;
+        let mut transport = Transport::new(BufReader::new(stdout), stdin);
+        for line in transport
+            .await_ready()
+            .context("the transport never said it was ready")?
+        {
+            eprintln!("transport: {line}");
+        }
+        let reply = transport.shape().context("the SHAPE handshake failed")?;
+        Ok(LiveSource {
+            child,
+            transport: std::cell::RefCell::new(Some(transport)),
+            shape: reply.shape,
+            max_read: reply.max_read,
+        })
+    }
+}
+
+impl Drop for LiveSource {
+    fn drop(&mut self) {
+        // Closing stdin is the transport's cue to exit, which lets an operator's script tear its own
+        // provider down in order — on this bench that means `SdkCloseAllPartitions` and a driver
+        // handle. A kill is the fallback rather than the method, because a provider killed mid-read
+        // can leave that handle open.
+        self.transport.borrow_mut().take();
+        if self.child.wait().is_err() {
+            let _ = self.child.kill();
+        }
+    }
+}
+
+impl sk::RawSource for LiveSource {
+    fn shape(&self) -> GuestShape {
+        self.shape.clone()
+    }
+
+    fn max_read(&self) -> usize {
+        self.max_read
+    }
+
+    fn read_chunk(&self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
+        match self.transport.borrow_mut().as_mut() {
+            Some(transport) => transport.read_chunk(gpa, out),
+            // Only reachable if a read were attempted during teardown. It is a source error rather
+            // than an `unwrap`, because a decode must never be able to panic on a transport's state.
+            None => Err(ReadFailure::SourceError {
+                detail: "the transport has already been closed".to_string(),
+            }),
+        }
+    }
+}
+
+/// Split a command line on whitespace, honouring double quotes.
+///
+/// Not a shell: there is no expansion, no escaping and no single-quote handling, because the string
+/// comes from an operator's own command line and a surprise expansion in *this* role would run
+/// something they did not type.
+fn split_command(command: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut current = String::new();
+    let mut quoted = false;
+    for ch in command.chars() {
+        match ch {
+            '"' => quoted = !quoted,
+            c if c.is_whitespace() && !quoted => {
+                if !current.is_empty() {
+                    out.push(std::mem::take(&mut current));
+                }
+            }
+            c => current.push(c),
+        }
+    }
+    if !current.is_empty() {
+        out.push(current);
+    }
+    out
+}
+
+/// `--sk-live`: drive gate S1's decode against an operator-supplied live transport.
+pub(crate) fn run(args: &[String]) -> Result<()> {
+    let mut transport = None;
+    let mut image = None;
+    let mut cross_check = false;
+    let mut iter = args.iter();
+    while let Some(arg) = iter.next() {
+        match arg.as_str() {
+            "--transport" => {
+                transport = Some(
+                    iter.next()
+                        .context("--transport needs a command line")?
+                        .clone(),
+                )
+            }
+            "--image" => image = Some(iter.next().context("--image needs a path")?.clone()),
+            "--cross-check" => cross_check = true,
+            other => bail!("unknown argument {other:?}\n\n{}", usage()),
+        }
+    }
+    let transport = transport.context(usage())?;
+    let image = image.context("--image is required: identification is against it")?;
+
+    let disk = sk::DiskImage::open(std::path::Path::new(&image)).map_err(|e| anyhow::anyhow!(e))?;
+    println!("build      {}", crate::BUILD_VERSION);
+    println!(
+        "image      {} ({} bytes, {} sections, timestamp {:#010X})",
+        disk.path, disk.file_size, disk.identity.sections, disk.identity.timestamp
+    );
+    println!("transport  {transport}");
+
+    let source = LiveSource::spawn(&transport)?;
+    let shape = sk::RawSource::shape(&source);
+    println!(
+        "shape      cr3={} vtl_enabled={:?} paging={:?} max_read={}",
+        shape
+            .cr3
+            .map(|v| format!("{v:#X}"))
+            .unwrap_or_else(|| "none".into()),
+        shape.vtl_enabled,
+        shape.paging_mode,
+        sk::RawSource::max_read(&source)
+    );
+    for (name, why) in &shape.unreadable {
+        println!("           {name} unreadable: {why}");
+    }
+
+    let reader = Reader::new(&source);
+    match sk::locate(&reader, &disk, cross_check) {
+        // `report_landmarks` ends with the read counts, so nothing is printed here on this arm:
+        // a second copy would be a figure that can disagree with itself.
+        Ok(landmarks) => crate::skinspect::report_landmarks(&landmarks),
+        // A refusal is an answer here exactly as it is for a capture, and on a transport that
+        // refuses VTL1 per access it is the *expected* answer — so this arm has to carry the
+        // counts itself. They are the point of the whole exercise, and the reason `ReadStats` is
+        // counted at the primitive rather than by each caller: `refused` is above zero only if a
+        // source really refused, per access, which no capture can do.
+        Err(why) => {
+            println!("\nnot walkable: {}", crate::skinspect::refusal(&why));
+            let stats = reader.stats();
+            println!(
+                "reads      {} attempted, {} failed, {} refused, {} bytes",
+                stats.attempted, stats.failed, stats.refused, stats.bytes
+            );
+        }
+    }
+    Ok(())
+}
+
+fn usage() -> String {
+    format!(
+        "usage: windbg-mcp {LIVE_FLAG} --transport \"<command line>\" --image <securekernel.exe> \
+         [--cross-check]\n\n\
+         The transport is a program the OPERATOR supplies, speaking the line protocol in \
+         src/livesrc.rs on its stdio. This repository ships none."
+    )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Cursor;
+
+    /// A canned server: the framing is what can be wrong in ways a live guest would hide, so it is
+    /// exercised against bytes rather than only against the bench.
+    fn exchange(script: &str) -> Transport<Cursor<Vec<u8>>, Vec<u8>> {
+        Transport::new(Cursor::new(script.as_bytes().to_vec()), Vec::new())
+    }
+
+    #[test]
+    fn a_shape_reply_becomes_the_shape_the_decode_takes() {
+        let reply = parse_shape(
+            "SHAPE cr0=0x80050033 cr3=0x1201000 cr4=0x350ef8 efer=0xd01 vtl_enabled=1 \
+             paging=long max_read=4096",
+        )
+        .unwrap();
+        assert_eq!(reply.max_read, 4096);
+        assert_eq!(reply.shape.cr3, Some(0x1201000));
+        assert_eq!(reply.shape.cr0, Some(0x8005_0033));
+        assert_eq!(reply.shape.vtl_enabled, Some(true));
+        assert_eq!(reply.shape.paging_mode, Some(PagingMode::Long));
+        assert!(reply.shape.unreadable.is_empty());
+    }
+
+    #[test]
+    fn a_misspelled_shape_key_is_refused_rather_than_read_as_a_guest_with_no_root() {
+        // The failure this guard exists for: `cr_3` silently ignored leaves `cr3: None`, which the
+        // decode reports as `NotWalkable::NoRoot` -- a plausible-looking result from a typo.
+        let err = parse_shape("SHAPE cr_3=0x1201000 max_read=16").unwrap_err();
+        assert!(format!("{err}").contains("unknown SHAPE field"), "{err}");
+    }
+
+    #[test]
+    fn a_shape_without_max_read_is_refused_because_the_width_must_not_be_guessed() {
+        let err = parse_shape("SHAPE cr3=0x1201000").unwrap_err();
+        assert!(format!("{err}").contains("max_read"), "{err}");
+    }
+
+    #[test]
+    fn an_absurd_max_read_is_refused_before_it_sizes_an_allocation() {
+        let err = parse_shape("SHAPE max_read=4294967295").unwrap_err();
+        assert!(format!("{err}").contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn a_register_the_transport_could_not_read_travels_with_its_reason() {
+        let reply =
+            parse_shape("SHAPE cr3=0x1201000 unreadable=efer:not_exposed max_read=16").unwrap();
+        assert_eq!(
+            reply.shape.unreadable,
+            vec![("efer", "not exposed".to_string())]
+        );
+        // And the decode must not read a missing EFER as a machine out of long mode.
+        assert_eq!(reply.shape.efer, None);
+    }
+
+    #[test]
+    fn a_refusal_becomes_the_refusal_variant_and_nothing_else() {
+        let err = parse_status("REFUSED ReadIntercept", 16).unwrap_err();
+        assert_eq!(
+            err,
+            ReadFailure::Refused {
+                detail: "ReadIntercept".into()
+            }
+        );
+    }
+
+    #[test]
+    fn the_four_status_words_map_onto_the_four_failure_variants() {
+        assert_eq!(parse_status("OK 16", 16).unwrap(), Some(16));
+        assert!(matches!(
+            parse_status("REFUSED x", 16),
+            Err(ReadFailure::Refused { .. })
+        ));
+        assert_eq!(parse_status("NOTPRESENT", 16), Err(ReadFailure::NotPresent));
+        assert!(matches!(
+            parse_status("ERROR no driver", 16),
+            Err(ReadFailure::SourceError { .. })
+        ));
+        // An unknown word is a source error rather than a panic or a silent zero fill.
+        assert!(matches!(
+            parse_status("MAYBE", 16),
+            Err(ReadFailure::SourceError { .. })
+        ));
+    }
+
+    #[test]
+    fn a_transport_that_announces_more_bytes_than_were_asked_for_is_refused() {
+        // Otherwise the transport decides how much of our buffer to fill, and a 4096-byte answer to
+        // a 16-byte request would be a write past the end of it.
+        let err = parse_status("OK 4096", 16).unwrap_err();
+        assert!(
+            matches!(&err, ReadFailure::SourceError { detail } if detail.contains("16-byte")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_short_answer_is_a_failed_read_rather_than_a_small_one() {
+        let mut transport = exchange("OK 4\nabcd");
+        let mut out = [0u8; 16];
+        let err = transport.read_chunk(Gpa(0x1000), &mut out).unwrap_err();
+        assert_eq!(err, ReadFailure::Short { got: 4, want: 16 });
+    }
+
+    #[test]
+    fn a_full_answer_lands_in_the_buffer_and_the_request_is_what_was_sent() {
+        let mut transport = exchange("OK 4\nwxyz");
+        let mut out = [0u8; 4];
+        transport.read_chunk(Gpa(0xCD12DF), &mut out).unwrap();
+        assert_eq!(&out, b"wxyz");
+        assert_eq!(
+            String::from_utf8(transport.writer.clone()).unwrap(),
+            "READ 0xCD12DF 4\n"
+        );
+    }
+
+    #[test]
+    fn a_transport_that_closes_its_stdout_is_an_error_rather_than_a_hang() {
+        let mut transport = exchange("");
+        let mut out = [0u8; 4];
+        let err = transport.read_chunk(Gpa(0x1000), &mut out).unwrap_err();
+        assert!(
+            matches!(&err, ReadFailure::SourceError { detail } if detail.contains("status line")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_transport_that_announces_bytes_and_does_not_send_them_is_an_error() {
+        let mut transport = exchange("OK 16\nshort");
+        let mut out = [0u8; 16];
+        let err = transport.read_chunk(Gpa(0x1000), &mut out).unwrap_err();
+        assert!(
+            matches!(&err, ReadFailure::SourceError { detail } if detail.contains("did not send")),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn a_providers_own_banner_is_skipped_up_to_the_sentinel_and_handed_back() {
+        // The exact failure this exists for: hvlib's partition menu read as a SHAPE reply.
+        let mut transport = exchange(
+            "[ 0 ] Lab Guest Hyper-V . (PartitionId =  5 )\nActive partitions count:  2\n\
+             windbg-mcp-gpa/1\nSHAPE cr3=0x1201000 max_read=16\n",
+        );
+        let skipped = transport.await_ready().unwrap();
+        assert_eq!(skipped.len(), 2);
+        assert!(skipped[0].contains("Lab Guest"));
+        // And the next line really is the protocol's, not the one after the banner.
+        assert_eq!(transport.shape().unwrap().shape.cr3, Some(0x1201000));
+    }
+
+    #[test]
+    fn a_transport_that_never_says_it_is_ready_fails_rather_than_reading_for_ever() {
+        let noise = "not a transport\n".repeat(MAX_BANNER_LINES + 10);
+        let err = exchange(&noise).await_ready().unwrap_err();
+        assert!(format!("{err}").contains("probably"), "{err}");
+    }
+
+    #[test]
+    fn a_quoted_path_with_spaces_stays_one_argument() {
+        assert_eq!(
+            split_command("\"C:\\Program Files\\python.exe\" server.py --mode direct"),
+            vec![
+                "C:\\Program Files\\python.exe",
+                "server.py",
+                "--mode",
+                "direct"
+            ]
+        );
+    }
+}
