@@ -36,7 +36,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   value that was never a return address, and WER logged `IUMTrustletCrash` for `lsaiso.exe`
   10.0.26100.9444 twice. The guest survived — uptime monotonic at 1d 00:47, `lsass` alive, `Secure
   System` running, nothing in the System log — but `LsaIso` did not restart, so **the single-step arm
-  has no post-restore control and wants a re-run on a rebooted guest**. Three harness defects are
+  had no post-restore control. **Re-run on a rebooted guest the same day with all three defects fixed,
+  and it is clean**: `LsaIso` pid 908, every address re-derived (Secure Kernel rebased to
+  `0xFFFFF8024278A000`, the target to `0x7FF8EC595B90`, while `InfoHvddGetCr3Securekernel` read
+  `0x1201000` for a third boot — which is why that value is not an identity), `VirtualProtectEx`
+  reading the correct original `0x20` where the leak had shown `0x40`, `RESTORE_FULL_CONTEXT` verified
+  by read-back, protection restored, the trustlet **alive at 1, 3 and 6 seconds**, Arm C refusing with
+  `ERROR_ACCESS_DENIED (5)` on that **same pid**, and **zero `IUMTrustletCrash` events since that
+  boot** — counted from `LastBootUpTime`, because a 20-minute window spans the reboot and returns the
+  previous run's crashes, which is how that check first read as a failure. Three harness defects are
   fixed rather than noted: the full 1,232-byte `CONTEXT` is now snapshotted and restored wholesale with
   a read-back check, the original page protection is restored (the first run left the page RWX, which
   the second saw as `OLD=0x40` where the first read `0x20`), and liveness is sampled at 1, 3 and 6
