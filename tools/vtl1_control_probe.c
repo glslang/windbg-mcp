@@ -2,9 +2,11 @@
  * Build-locked owner-partition probe for a VTL1 kernel controlled stop.
  *
  * The controlled-stop mode creates a disposable VID partition, installs a
- * long-mode VTL0/VTL1 image, enters VTL1 with a targeted interrupt, and waits for
- * the #BP intercept raised by its selected VTL1 instruction. It never
- * opens or attaches to a Hyper-V managed VM.
+ * long-mode VTL0/VTL1 image, enters VTL1 with a targeted interrupt, and waits
+ * for the #BP intercept raised by its selected VTL1 instruction. Its
+ * Secure-Kernel mode maps a guarded securekernel.exe and calls that image's
+ * int3;ret breakpoint stub through the same owned path. It never opens or
+ * attaches to a Hyper-V managed VM.
  *
  * VID is private and its ABI changes. The signatures and offsets below are
  * specific to the guarded inbox vid.dll/Vid.sys pair. A different build is a
@@ -17,6 +19,7 @@
 #include <objbase.h>
 
 #include <errno.h>
+#include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -35,9 +38,12 @@
 #define EXPECTED_VID_SYS_BUILD 26100u
 #define EXPECTED_VID_SYS_FIXED_REVISION 9278u
 #define EXPECTED_VID_SYS_SIZE 910816u
+#define EXPECTED_SECURE_KERNEL_BUILD 26100u
+#define EXPECTED_SECURE_KERNEL_FIXED_REVISION 9457u
+#define EXPECTED_SECURE_KERNEL_SIZE 1385944u
 #define VID_SETUP_PROCESS_LOCAL 0x02ull
 
-#define GUEST_BYTES (1u * 1024u * 1024u)
+#define GUEST_BYTES (2u * 1024u * 1024u)
 #define GUEST_PAGES (GUEST_BYTES / 4096u)
 #define PML4_GPA 0x1000ull
 #define PDPT_GPA 0x2000ull
@@ -45,12 +51,24 @@
 #define GDT_GPA 0x4000ull
 #define IDT_GPA 0x5000ull
 #define TSS_GPA 0x6000ull
+#define SECURE_KERNEL_PD_GPA 0x7000ull
+#define SECURE_KERNEL_PT_GPA 0x8000ull
 #define VTL1_CODE_GPA 0x10000ull
+#define VTL1_IDLE_GPA 0x10100ull
 #define VTL0_CODE_GPA 0x11000ull
 #define VTL1_WITNESS_GPA 0x12000ull
 #define VTL0_WITNESS_GPA 0x12001ull
-#define VTL1_STACK_GPA 0xE0000ull
-#define VTL0_STACK_GPA 0xF0000ull
+#define VTL1_RESUME_WITNESS_GPA 0x12002ull
+#define SECURE_KERNEL_IMAGE_GPA 0x20000ull
+#define VTL1_STACK_GPA 0x1D0000ull
+#define VTL0_STACK_GPA 0x1F0000ull
+
+#define SECURE_KERNEL_IMAGE_BASE 0x140000000ull
+#define SECURE_KERNEL_IMAGE_SIZE 0x175000u
+#define SECURE_KERNEL_BREAKPOINT_RVA 0x1FA70u
+#define SECURE_KERNEL_BREAKPOINT_BYTES 2u
+#define SECURE_KERNEL_PDPT_INDEX 5u
+#define SECURE_KERNEL_PDB_AGE 1u
 
 #define BREAKPOINT_VECTOR 3u
 #define VTL_ENTRY_VECTOR 0x20u
@@ -69,6 +87,7 @@
 #define MESSAGE_CONTEXT_MARKER 0x56544C3153544F50ull
 #define VTL1_WITNESS_VALUE 0xA5u
 #define VTL0_WITNESS_VALUE 0xA0u
+#define VTL1_RESUME_WITNESS_VALUE 0x5Au
 
 #define VSM_CONFIG_BYTES 24u
 #define VSM_ENABLED_VTL_SET_OFFSET 0u
@@ -224,6 +243,19 @@ typedef struct MEMORY_BLOCK_DESCRIPTOR {
     uint64_t words[14];
 } MEMORY_BLOCK_DESCRIPTOR;
 
+typedef struct SECURE_KERNEL_IMAGE {
+    uint64_t image_base;
+    uint32_t size_of_image;
+    uint32_t breakpoint_rva;
+} SECURE_KERNEL_IMAGE;
+
+typedef struct CODEVIEW_RSDS {
+    uint32_t signature;
+    GUID guid;
+    uint32_t age;
+    char pdb_name[1];
+} CODEVIEW_RSDS;
+
 #pragma pack(push, 1)
 typedef struct IDT_GATE64 {
     uint16_t offset_low;
@@ -249,6 +281,15 @@ _Static_assert(sizeof(VID_MESSAGE_SLOT_HANDLE) == 16,
 _Static_assert(sizeof(MEMORY_BLOCK_DESCRIPTOR) == 0x70,
                "guarded VID ABI requires a 0x70-byte memory descriptor");
 _Static_assert(sizeof(IDT_GATE64) == 16, "x64 IDT gate size changed");
+_Static_assert(offsetof(CODEVIEW_RSDS, pdb_name) == 24,
+               "RSDS header layout changed");
+
+static const GUID EXPECTED_SECURE_KERNEL_PDB_GUID = {
+    0xC2C0D1A6,
+    0x2E32,
+    0x69F4,
+    {0x0C, 0x69, 0xEA, 0x44, 0xFD, 0xB2, 0x30, 0xC4},
+};
 
 static void store_u16(unsigned char *buffer, size_t offset, uint16_t value)
 {
@@ -337,6 +378,281 @@ static BOOL guard_file(const wchar_t *path, DWORD expected_build,
         return FALSE;
     }
     return TRUE;
+}
+
+static BOOL range_within(size_t offset, size_t bytes, size_t total)
+{
+    return offset <= total && bytes <= total - offset;
+}
+
+static BOOL read_entire_file(const wchar_t *path, unsigned char **contents,
+                             size_t *content_bytes)
+{
+    HANDLE file = INVALID_HANDLE_VALUE;
+    LARGE_INTEGER size;
+    unsigned char *buffer = NULL;
+    DWORD read_bytes = 0;
+    DWORD error = ERROR_SUCCESS;
+
+    *contents = NULL;
+    *content_bytes = 0;
+    file = CreateFileW(path, GENERIC_READ,
+                       FILE_SHARE_READ | FILE_SHARE_DELETE, NULL,
+                       OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (file == INVALID_HANDLE_VALUE) {
+        return FALSE;
+    }
+    if (!GetFileSizeEx(file, &size) || size.QuadPart <= 0 ||
+        (uint64_t)size.QuadPart > MAXDWORD) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) {
+            error = ERROR_FILE_TOO_LARGE;
+        }
+        goto fail;
+    }
+    buffer = HeapAlloc(GetProcessHeap(), 0, (size_t)size.QuadPart);
+    if (buffer == NULL) {
+        error = ERROR_OUTOFMEMORY;
+        goto fail;
+    }
+    if (!ReadFile(file, buffer, (DWORD)size.QuadPart, &read_bytes, NULL) ||
+        read_bytes != (DWORD)size.QuadPart) {
+        error = GetLastError();
+        if (error == ERROR_SUCCESS) {
+            error = ERROR_HANDLE_EOF;
+        }
+        goto fail;
+    }
+    CloseHandle(file);
+    *contents = buffer;
+    *content_bytes = (size_t)size.QuadPart;
+    return TRUE;
+
+fail:
+    if (buffer != NULL) {
+        HeapFree(GetProcessHeap(), 0, buffer);
+    }
+    CloseHandle(file);
+    SetLastError(error);
+    return FALSE;
+}
+
+static BOOL rva_to_raw_offset(const IMAGE_NT_HEADERS64 *nt,
+                              const IMAGE_SECTION_HEADER *sections,
+                              size_t file_bytes, uint32_t rva,
+                              size_t requested_bytes, size_t *raw_offset)
+{
+    WORD index;
+
+    if (rva < nt->OptionalHeader.SizeOfHeaders &&
+        range_within((size_t)rva, requested_bytes, file_bytes)) {
+        *raw_offset = (size_t)rva;
+        return TRUE;
+    }
+    for (index = 0; index < nt->FileHeader.NumberOfSections; index++) {
+        const IMAGE_SECTION_HEADER *section = &sections[index];
+        uint64_t start = section->VirtualAddress;
+        uint64_t end = start + section->SizeOfRawData;
+        uint64_t request_start = rva;
+        uint64_t request_end = request_start + requested_bytes;
+        size_t offset;
+
+        if (request_start < start || request_end > end) {
+            continue;
+        }
+        offset = (size_t)section->PointerToRawData +
+                 (size_t)(request_start - start);
+        if (!range_within(offset, requested_bytes, file_bytes)) {
+            return FALSE;
+        }
+        *raw_offset = offset;
+        return TRUE;
+    }
+    return FALSE;
+}
+
+static BOOL verify_secure_kernel_pdb(const unsigned char *file,
+                                     size_t file_bytes,
+                                     const IMAGE_NT_HEADERS64 *nt,
+                                     const IMAGE_SECTION_HEADER *sections)
+{
+    IMAGE_DATA_DIRECTORY directory =
+        nt->OptionalHeader.DataDirectory[IMAGE_DIRECTORY_ENTRY_DEBUG];
+    size_t debug_offset;
+    size_t count;
+    size_t index;
+
+    if (directory.Size < sizeof(IMAGE_DEBUG_DIRECTORY) ||
+        directory.Size % sizeof(IMAGE_DEBUG_DIRECTORY) != 0 ||
+        !rva_to_raw_offset(nt, sections, file_bytes,
+                           directory.VirtualAddress, directory.Size,
+                           &debug_offset)) {
+        return FALSE;
+    }
+    count = directory.Size / sizeof(IMAGE_DEBUG_DIRECTORY);
+    for (index = 0; index < count; index++) {
+        const IMAGE_DEBUG_DIRECTORY *entry =
+            (const IMAGE_DEBUG_DIRECTORY *)(file + debug_offset) + index;
+        const CODEVIEW_RSDS *rsds;
+        size_t name_bytes;
+
+        if (entry->Type != IMAGE_DEBUG_TYPE_CODEVIEW ||
+            entry->SizeOfData < offsetof(CODEVIEW_RSDS, pdb_name) + 1 ||
+            !range_within(entry->PointerToRawData, entry->SizeOfData,
+                          file_bytes)) {
+            continue;
+        }
+        rsds = (const CODEVIEW_RSDS *)(file + entry->PointerToRawData);
+        name_bytes = entry->SizeOfData - offsetof(CODEVIEW_RSDS, pdb_name);
+        if (rsds->signature == 0x53445352u &&
+            IsEqualGUID(&rsds->guid, &EXPECTED_SECURE_KERNEL_PDB_GUID) &&
+            rsds->age == SECURE_KERNEL_PDB_AGE &&
+            memchr(rsds->pdb_name, '\0', name_bytes) != NULL &&
+            _stricmp(rsds->pdb_name, "securekernel.pdb") == 0) {
+            return TRUE;
+        }
+    }
+    return FALSE;
+}
+
+static BOOL load_secure_kernel_image(const wchar_t *path,
+                                     unsigned char *guest,
+                                     SECURE_KERNEL_IMAGE *loaded)
+{
+    static const unsigned char breakpoint_bytes[SECURE_KERNEL_BREAKPOINT_BYTES] = {
+        0xCC, 0xC3,
+    };
+    unsigned char *file = NULL;
+    size_t file_bytes = 0;
+    const IMAGE_DOS_HEADER *dos;
+    const IMAGE_NT_HEADERS64 *nt;
+    const IMAGE_SECTION_HEADER *sections;
+    size_t nt_offset;
+    size_t section_offset;
+    size_t breakpoint_offset;
+    uint32_t image_pages;
+    WORD index;
+    BOOL ok = FALSE;
+
+    memset(loaded, 0, sizeof(*loaded));
+    if (!guard_file(path, EXPECTED_SECURE_KERNEL_BUILD,
+                    EXPECTED_SECURE_KERNEL_FIXED_REVISION,
+                    EXPECTED_SECURE_KERNEL_SIZE) ||
+        !read_entire_file(path, &file, &file_bytes)) {
+        fwprintf(stderr, L"cannot read guarded Secure Kernel image %ls "
+                         L"(error %lu)\n",
+                 path, GetLastError());
+        goto cleanup;
+    }
+    if (!range_within(0, sizeof(*dos), file_bytes)) {
+        goto invalid;
+    }
+    dos = (const IMAGE_DOS_HEADER *)file;
+    if (dos->e_magic != IMAGE_DOS_SIGNATURE || dos->e_lfanew < 0) {
+        goto invalid;
+    }
+    nt_offset = (size_t)dos->e_lfanew;
+    if (!range_within(nt_offset, sizeof(*nt), file_bytes)) {
+        goto invalid;
+    }
+    nt = (const IMAGE_NT_HEADERS64 *)(file + nt_offset);
+    if (nt->Signature != IMAGE_NT_SIGNATURE ||
+        nt->FileHeader.Machine != IMAGE_FILE_MACHINE_AMD64 ||
+        nt->FileHeader.NumberOfSections == 0 ||
+        nt->FileHeader.SizeOfOptionalHeader !=
+            sizeof(IMAGE_OPTIONAL_HEADER64) ||
+        nt->OptionalHeader.Magic != IMAGE_NT_OPTIONAL_HDR64_MAGIC ||
+        nt->OptionalHeader.NumberOfRvaAndSizes <=
+            IMAGE_DIRECTORY_ENTRY_DEBUG ||
+        nt->OptionalHeader.ImageBase != SECURE_KERNEL_IMAGE_BASE ||
+        nt->OptionalHeader.SizeOfImage != SECURE_KERNEL_IMAGE_SIZE ||
+        nt->OptionalHeader.SectionAlignment != 0x1000u ||
+        nt->OptionalHeader.SizeOfHeaders == 0 ||
+        nt->OptionalHeader.SizeOfHeaders > file_bytes ||
+        SECURE_KERNEL_IMAGE_GPA + nt->OptionalHeader.SizeOfImage >
+            GUEST_BYTES) {
+        goto invalid;
+    }
+    section_offset = nt_offset + offsetof(IMAGE_NT_HEADERS64, OptionalHeader) +
+                     nt->FileHeader.SizeOfOptionalHeader;
+    if (!range_within(section_offset,
+                      (size_t)nt->FileHeader.NumberOfSections *
+                          sizeof(IMAGE_SECTION_HEADER),
+                      file_bytes)) {
+        goto invalid;
+    }
+    sections = (const IMAGE_SECTION_HEADER *)(file + section_offset);
+    if (!verify_secure_kernel_pdb(file, file_bytes, nt, sections) ||
+        !rva_to_raw_offset(nt, sections, file_bytes,
+                           SECURE_KERNEL_BREAKPOINT_RVA,
+                           sizeof(breakpoint_bytes), &breakpoint_offset) ||
+        memcmp(file + breakpoint_offset, breakpoint_bytes,
+               sizeof(breakpoint_bytes)) != 0) {
+        goto invalid;
+    }
+
+    memset(guest + SECURE_KERNEL_IMAGE_GPA, 0,
+           nt->OptionalHeader.SizeOfImage);
+    memcpy(guest + SECURE_KERNEL_IMAGE_GPA, file,
+           nt->OptionalHeader.SizeOfHeaders);
+    for (index = 0; index < nt->FileHeader.NumberOfSections; index++) {
+        const IMAGE_SECTION_HEADER *section = &sections[index];
+        size_t destination = SECURE_KERNEL_IMAGE_GPA +
+                             section->VirtualAddress;
+
+        if (section->SizeOfRawData == 0) {
+            continue;
+        }
+        if (!range_within(section->PointerToRawData,
+                          section->SizeOfRawData, file_bytes) ||
+            section->VirtualAddress > nt->OptionalHeader.SizeOfImage ||
+            section->SizeOfRawData >
+                nt->OptionalHeader.SizeOfImage - section->VirtualAddress ||
+            !range_within(destination, section->SizeOfRawData,
+                          GUEST_BYTES)) {
+            goto invalid;
+        }
+        memcpy(guest + destination, file + section->PointerToRawData,
+               section->SizeOfRawData);
+    }
+    if (memcmp(guest + SECURE_KERNEL_IMAGE_GPA +
+                   SECURE_KERNEL_BREAKPOINT_RVA,
+               breakpoint_bytes, sizeof(breakpoint_bytes)) != 0) {
+        goto invalid;
+    }
+
+    store_u64(guest,
+              PDPT_GPA + SECURE_KERNEL_PDPT_INDEX * sizeof(uint64_t),
+              SECURE_KERNEL_PD_GPA | 3);
+    store_u64(guest, SECURE_KERNEL_PD_GPA, SECURE_KERNEL_PT_GPA | 3);
+    image_pages =
+        (nt->OptionalHeader.SizeOfImage + 4095u) / 4096u;
+    for (index = 0; index < image_pages; index++) {
+        store_u64(guest, SECURE_KERNEL_PT_GPA +
+                             (size_t)index * sizeof(uint64_t),
+                  SECURE_KERNEL_IMAGE_GPA +
+                      (uint64_t)index * 4096u | 3);
+    }
+
+    loaded->image_base = nt->OptionalHeader.ImageBase;
+    loaded->size_of_image = nt->OptionalHeader.SizeOfImage;
+    loaded->breakpoint_rva = SECURE_KERNEL_BREAKPOINT_RVA;
+    ok = TRUE;
+    goto cleanup;
+
+invalid:
+    fwprintf(stderr,
+             L"refusing Secure Kernel image whose PE layout, PDB identity, "
+             L"or DbgBreakPointWithStatus bytes do not match the guarded "
+             L"build\n");
+    SetLastError(ERROR_REVISION_MISMATCH);
+
+cleanup:
+    if (file != NULL) {
+        SecureZeroMemory(file, file_bytes);
+        HeapFree(GetProcessHeap(), 0, file);
+    }
+    return ok;
 }
 
 static FARPROC require_export(HMODULE module, const char *name)
@@ -605,6 +921,48 @@ static void build_guest_image(unsigned char *image,
     initialize_context(vtl1, VTL1_CODE_GPA + 9, VTL1_STACK_GPA);
 }
 
+static void configure_secure_kernel_breakpoint(
+    unsigned char *image, WHV_INITIAL_VP_CONTEXT *vtl1,
+    const SECURE_KERNEL_IMAGE *secure_kernel)
+{
+    uint64_t breakpoint =
+        secure_kernel->image_base + secure_kernel->breakpoint_rva;
+
+    memset(image + VTL1_CODE_GPA, 0xCC, 0x200);
+    set_idt_gate(image, VTL_ENTRY_VECTOR, VTL1_CODE_GPA);
+
+    /*
+     * The interrupt handler calls the shipping image's cc;ret stub as an
+     * ordinary function. Completing #BP advances to ret; the handler records
+     * that return and uses iretq to restore the interrupted VTL1 context.
+     */
+    image[VTL1_CODE_GPA + 0] = 0xC6;
+    image[VTL1_CODE_GPA + 1] = 0x04;
+    image[VTL1_CODE_GPA + 2] = 0x25;
+    store_u32(image, VTL1_CODE_GPA + 3,
+              (uint32_t)VTL1_WITNESS_GPA);
+    image[VTL1_CODE_GPA + 7] = VTL1_WITNESS_VALUE;
+    image[VTL1_CODE_GPA + 8] = 0x48;
+    image[VTL1_CODE_GPA + 9] = 0xB8;
+    store_u64(image, VTL1_CODE_GPA + 10, breakpoint);
+    image[VTL1_CODE_GPA + 18] = 0xFF;
+    image[VTL1_CODE_GPA + 19] = 0xD0;
+    image[VTL1_CODE_GPA + 20] = 0xC6;
+    image[VTL1_CODE_GPA + 21] = 0x04;
+    image[VTL1_CODE_GPA + 22] = 0x25;
+    store_u32(image, VTL1_CODE_GPA + 23,
+              (uint32_t)VTL1_RESUME_WITNESS_GPA);
+    image[VTL1_CODE_GPA + 27] = VTL1_RESUME_WITNESS_VALUE;
+    image[VTL1_CODE_GPA + 28] = 0x48;
+    image[VTL1_CODE_GPA + 29] = 0xCF;
+
+    image[VTL1_IDLE_GPA + 0] = 0xFB;
+    image[VTL1_IDLE_GPA + 1] = 0xF4;
+    image[VTL1_IDLE_GPA + 2] = 0xEB;
+    image[VTL1_IDLE_GPA + 3] = 0xFD;
+    vtl1->Rip = VTL1_IDLE_GPA;
+}
+
 static uint32_t volatile_u32(const volatile unsigned char *buffer,
                              size_t offset)
 {
@@ -666,6 +1024,40 @@ static DWORD WINAPI receive_message(void *parameter)
     }
 }
 
+static HANDLE start_message_receiver(const VID_API *api, HANDLE partition,
+                                     HANDLE ready,
+                                     MESSAGE_RECEIVER *receiver)
+{
+    HANDLE thread;
+
+    memset(receiver, 0, sizeof(*receiver));
+    receiver->api = api;
+    receiver->partition = partition;
+    receiver->ready = ready;
+    ResetEvent(ready);
+    thread = CreateThread(NULL, 0, receive_message, receiver, 0, NULL);
+    if (thread == NULL) {
+        fwprintf(stderr,
+                 L"CreateThread(message receiver) failed: win32=%lu\n",
+                 GetLastError());
+        return NULL;
+    }
+    if (WaitForSingleObject(ready, 5000) != WAIT_OBJECT_0) {
+        fwprintf(stderr, L"message receiver did not become ready\n");
+        InterlockedExchange(&receiver->stop_requested, 1);
+        api->message_slot_handle_and_get_next(
+            partition, MESSAGE_SLOT, CANCEL_MESSAGE_WAIT_FLAGS, NULL);
+        WaitForSingleObject(thread, 5000);
+        CloseHandle(thread);
+        SetLastError(WAIT_TIMEOUT);
+        return NULL;
+    }
+    while (InterlockedCompareExchange(&receiver->attempts, 0, 0) == 0) {
+        Sleep(1);
+    }
+    return thread;
+}
+
 static void report_vp_state_at_vtl(const VID_API *api, HANDLE partition,
                                    uint8_t vtl)
 {
@@ -701,6 +1093,80 @@ static void report_vp_state(const VID_API *api, HANDLE partition)
 {
     report_vp_state_at_vtl(api, partition, 0);
     report_vp_state_at_vtl(api, partition, TARGET_VTL);
+}
+
+static BOOL verify_vtl1_breakpoint_state(const VID_API *api,
+                                         HANDLE partition,
+                                         uint64_t expected_rip,
+                                         uint64_t *observed_rip,
+                                         uint64_t *observed_rsp)
+{
+    const uint32_t names[] = {
+        HV_X64_REGISTER_RIP,
+        HV_X64_REGISTER_RSP,
+        HV_X64_REGISTER_CS,
+    };
+    WHV_REGISTER_VALUE values[ARRAYSIZE(names)];
+    uint64_t rip;
+
+    memset(values, 0, sizeof(values));
+    if (!api->get_virtual_processor_state_ex(
+            partition, 0, HV_INPUT_VTL_EXPLICIT(TARGET_VTL), names,
+            (uint8_t)ARRAYSIZE(names), values)) {
+        fwprintf(stderr,
+                 L"cannot read the pending VTL1 breakpoint state: "
+                 L"win32=%lu\n",
+                 GetLastError());
+        return FALSE;
+    }
+    rip = values[0].Reg64;
+    wprintf(L"pending breakpoint state: vtl=1 cpl=%u rip=0x%llx "
+            L"rsp=0x%llx\n",
+            (unsigned int)values[2].Segment.DescriptorPrivilegeLevel,
+            (unsigned long long)rip,
+            (unsigned long long)values[1].Reg64);
+    if (values[2].Segment.DescriptorPrivilegeLevel != 0 ||
+        (rip != expected_rip && rip != expected_rip + 1)) {
+        fwprintf(stderr,
+                 L"refusing breakpoint state outside the selected VTL1 "
+                 L"CPL0 instruction: expected rip 0x%llx or 0x%llx\n",
+                 (unsigned long long)expected_rip,
+                 (unsigned long long)(expected_rip + 1));
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    *observed_rip = rip;
+    *observed_rsp = values[1].Reg64;
+    return TRUE;
+}
+
+static BOOL verify_secure_kernel_breakpoint_memory(
+    const VID_API *api, HANDLE partition, uint64_t memory_block,
+    const SECURE_KERNEL_IMAGE *secure_kernel)
+{
+    static const unsigned char expected[] = {0xCC, 0xC3};
+    unsigned char page[4096];
+    uint64_t physical =
+        SECURE_KERNEL_IMAGE_GPA + secure_kernel->breakpoint_rva;
+    size_t offset = (size_t)(physical & 0xFFFu);
+
+    memset(page, 0, sizeof(page));
+    if (!api->read_memory_block_page_range(
+            partition, memory_block, physical / 4096u, 1, page,
+            sizeof(page))) {
+        fwprintf(stderr,
+                 L"Secure Kernel breakpoint readback failed: win32=%lu\n",
+                 GetLastError());
+        return FALSE;
+    }
+    if (!range_within(offset, sizeof(expected), sizeof(page)) ||
+        memcmp(page + offset, expected, sizeof(expected)) != 0) {
+        fwprintf(stderr,
+                 L"Secure Kernel breakpoint bytes changed while stopped\n");
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    return TRUE;
 }
 
 static void report_live_vp_diagnostics(const VID_API *api, HANDLE partition)
@@ -750,7 +1216,8 @@ static void cancel_message_receiver(const VID_API *api, HANDLE partition,
 static BOOL read_execution_witnesses(const VID_API *api, HANDLE partition,
                                      uint64_t memory_block,
                                      unsigned char *vtl0_witness,
-                                     unsigned char *vtl1_witness)
+                                     unsigned char *vtl1_witness,
+                                     unsigned char *resume_witness)
 {
     unsigned char page[4096];
 
@@ -764,6 +1231,9 @@ static BOOL read_execution_witnesses(const VID_API *api, HANDLE partition,
     }
     *vtl0_witness = page[VTL0_WITNESS_GPA & 0xFFF];
     *vtl1_witness = page[VTL1_WITNESS_GPA & 0xFFF];
+    if (resume_witness != NULL) {
+        *resume_witness = page[VTL1_RESUME_WITNESS_GPA & 0xFFF];
+    }
     return TRUE;
 }
 
@@ -772,12 +1242,47 @@ static void report_execution_witnesses(const VID_API *api, HANDLE partition,
 {
     unsigned char vtl0_witness = 0;
     unsigned char vtl1_witness = 0;
+    unsigned char resume_witness = 0;
 
     if (read_execution_witnesses(api, partition, memory_block,
-                                 &vtl0_witness, &vtl1_witness)) {
+                                 &vtl0_witness, &vtl1_witness,
+                                 &resume_witness)) {
         fwprintf(stderr,
-                 L"execution witnesses: vtl0=0x%02x vtl1=0x%02x\n",
-                 vtl0_witness, vtl1_witness);
+                 L"execution witnesses: vtl0=0x%02x vtl1=0x%02x "
+                 L"resume=0x%02x\n",
+                 vtl0_witness, vtl1_witness, resume_witness);
+    }
+}
+
+static BOOL wait_for_resume_witness(const VID_API *api, HANDLE partition,
+                                    uint64_t memory_block,
+                                    DWORD timeout_ms)
+{
+    ULONGLONG deadline = GetTickCount64() + timeout_ms;
+
+    for (;;) {
+        unsigned char vtl0_witness = 0;
+        unsigned char vtl1_witness = 0;
+        unsigned char resume_witness = 0;
+
+        if (!read_execution_witnesses(api, partition, memory_block,
+                                      &vtl0_witness, &vtl1_witness,
+                                      &resume_witness)) {
+            return FALSE;
+        }
+        if (resume_witness == VTL1_RESUME_WITNESS_VALUE) {
+            return TRUE;
+        }
+        if (GetTickCount64() >= deadline) {
+            fwprintf(stderr,
+                     L"timed out waiting for the VTL1 post-breakpoint "
+                     L"resume witness: vtl0=0x%02x vtl1=0x%02x "
+                     L"resume=0x%02x\n",
+                     vtl0_witness, vtl1_witness, resume_witness);
+            SetLastError(WAIT_TIMEOUT);
+            return FALSE;
+        }
+        Sleep(1);
     }
 }
 
@@ -939,7 +1444,8 @@ cleanup:
 }
 
 static int run_controlled_stop(const VID_API *api, unsigned char *setup,
-                               DWORD timeout_ms, DWORD hold_ms)
+                               DWORD timeout_ms, DWORD hold_ms,
+                               const wchar_t *secure_kernel_path)
 {
     HANDLE partition = INVALID_HANDLE_VALUE;
     unsigned char vsm_config[VSM_CONFIG_BYTES];
@@ -949,6 +1455,7 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
     VID_MESSAGE_SLOT_HANDLE slot;
     WHV_INITIAL_VP_CONTEXT vtl0;
     WHV_INITIAL_VP_CONTEXT vtl1;
+    SECURE_KERNEL_IMAGE secure_kernel;
     uint64_t partition_id = 0;
     uint64_t memory_block = 0;
     uint64_t gpa_range = UINT64_MAX;
@@ -963,12 +1470,18 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
     MESSAGE_MATCH match;
     unsigned char vtl0_witness = 0;
     unsigned char vtl1_witness = 0;
+    uint64_t breakpoint_rip = VTL1_CODE_GPA + 8;
+    uint64_t first_rip = 0;
+    uint64_t first_rsp = 0;
+    uint64_t held_rip = 0;
+    uint64_t held_rsp = 0;
     ULONGLONG stopped_at;
     int result = 1;
 
     initialize_memory_descriptor(&memory_descriptor);
     memset(&slot, 0, sizeof(slot));
     memset(&receiver, 0, sizeof(receiver));
+    memset(&secure_kernel, 0, sizeof(secure_kernel));
     guest = VirtualAlloc(NULL, GUEST_BYTES, MEM_COMMIT | MEM_RESERVE,
                          PAGE_READWRITE);
     if (guest == NULL) {
@@ -977,6 +1490,23 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
         return 1;
     }
     build_guest_image(guest, &vtl0, &vtl1);
+    if (secure_kernel_path != NULL) {
+        if (!load_secure_kernel_image(secure_kernel_path, guest,
+                                      &secure_kernel)) {
+            goto cleanup;
+        }
+        configure_secure_kernel_breakpoint(guest, &vtl1,
+                                           &secure_kernel);
+        breakpoint_rip =
+            secure_kernel.image_base + secure_kernel.breakpoint_rva;
+        wprintf(L"loaded guarded Secure Kernel image: %ls "
+                L"base=0x%llx size=0x%lx "
+                L"DbgBreakPointWithStatus=0x%llx\n",
+                secure_kernel_path,
+                (unsigned long long)secure_kernel.image_base,
+                (unsigned long)secure_kernel.size_of_image,
+                (unsigned long long)breakpoint_rip);
+    }
     initialize_vsm_config(vsm_config);
 
     partition = create_owner_partition(api, setup);
@@ -1091,24 +1621,10 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
                  GetLastError());
         goto cleanup;
     }
-    receiver.api = api;
-    receiver.partition = partition;
-    receiver.ready = receiver_ready;
-    receiver_thread = CreateThread(NULL, 0, receive_message, &receiver, 0,
-                                   NULL);
+    receiver_thread = start_message_receiver(api, partition, receiver_ready,
+                                             &receiver);
     if (receiver_thread == NULL) {
-        fwprintf(stderr,
-                 L"CreateThread(message receiver) failed: win32=%lu\n",
-                 GetLastError());
         goto cleanup;
-    }
-    if (WaitForSingleObject(receiver_ready, 5000) != WAIT_OBJECT_0) {
-        fwprintf(stderr, L"message receiver did not become ready\n");
-        SetLastError(WAIT_TIMEOUT);
-        goto cleanup;
-    }
-    while (InterlockedCompareExchange(&receiver.attempts, 0, 0) == 0) {
-        Sleep(1);
     }
 
     if (!report_call(api->assert_virtual_processor_interrupt(
@@ -1161,7 +1677,7 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
         goto cleanup;
     }
     if (!read_execution_witnesses(api, partition, memory_block,
-                                  &vtl0_witness, &vtl1_witness) ||
+                                  &vtl0_witness, &vtl1_witness, NULL) ||
         vtl1_witness != VTL1_WITNESS_VALUE) {
         fwprintf(stderr,
                  L"refusing breakpoint without the VTL1 execution witness: "
@@ -1171,14 +1687,43 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
         SetLastError(ERROR_INVALID_DATA);
         goto cleanup;
     }
+    if (!verify_vtl1_breakpoint_state(api, partition, breakpoint_rip,
+                                      &first_rip, &first_rsp) ||
+        (secure_kernel_path != NULL &&
+         !verify_secure_kernel_breakpoint_memory(
+             api, partition, memory_block, &secure_kernel))) {
+        abandon_partition = TRUE;
+        goto cleanup;
+    }
 
     stopped_at = GetTickCount64();
-    wprintf(L"controlled stop: partition=0x%llx vtl=1 vp=0 vector=3 "
-             L"instruction_gpa=0x%llx\n",
-             (unsigned long long)partition_id,
-             (unsigned long long)(VTL1_CODE_GPA + 8));
+    if (secure_kernel_path != NULL) {
+        wprintf(L"controlled Secure Kernel stop: partition=0x%llx "
+                L"vtl=1 cpl=0 vp=0 vector=3 image_rip=0x%llx\n",
+                (unsigned long long)partition_id,
+                (unsigned long long)breakpoint_rip);
+    }
+    else {
+        wprintf(L"controlled stop: partition=0x%llx vtl=1 vp=0 vector=3 "
+                L"instruction_gpa=0x%llx\n",
+                (unsigned long long)partition_id,
+                (unsigned long long)breakpoint_rip);
+    }
     if (hold_ms != 0) {
         Sleep(hold_ms);
+    }
+    if (!verify_vtl1_breakpoint_state(api, partition, breakpoint_rip,
+                                      &held_rip, &held_rsp) ||
+        held_rip != first_rip || held_rsp != first_rsp ||
+        (secure_kernel_path != NULL &&
+         !verify_secure_kernel_breakpoint_memory(
+             api, partition, memory_block, &secure_kernel))) {
+        fwprintf(stderr,
+                 L"refusing a breakpoint whose VTL1 state or selected "
+                 L"memory changed during the hold\n");
+        abandon_partition = TRUE;
+        SetLastError(ERROR_INVALID_DATA);
+        goto cleanup;
     }
     wprintf(L"held pending intercept for %llu ms\n",
             (unsigned long long)(GetTickCount64() - stopped_at));
@@ -1194,6 +1739,34 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
         goto cleanup;
     }
     wprintf(L"completed the owned VTL1 breakpoint intercept\n");
+    if (secure_kernel_path != NULL) {
+        CloseHandle(receiver_thread);
+        receiver_thread = start_message_receiver(
+            api, partition, receiver_ready, &receiver);
+        if (receiver_thread == NULL) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        if (!wait_for_resume_witness(api, partition, memory_block,
+                                     timeout_ms)) {
+            report_live_vp_diagnostics(api, partition);
+            report_vp_state(api, partition);
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        cancel_message_receiver(api, partition, &receiver,
+                                receiver_thread);
+        if (receiver.succeeded) {
+            fwprintf(stderr,
+                     L"refusing an unexpected VID message while proving "
+                     L"post-breakpoint resume\n");
+            abandon_partition = TRUE;
+            SetLastError(ERROR_INVALID_DATA);
+            goto cleanup;
+        }
+        wprintf(L"Secure Kernel breakpoint returned and VTL1 resumed "
+                L"through the interrupt frame\n");
+    }
     result = 0;
 
 cleanup:
@@ -1270,6 +1843,7 @@ static int self_test(void)
     WHV_INITIAL_VP_CONTEXT vtl0;
     WHV_INITIAL_VP_CONTEXT vtl1;
     MEMORY_BLOCK_DESCRIPTOR memory_descriptor;
+    SECURE_KERNEL_IMAGE secure_kernel;
     IDT_GATE64 gate;
     wchar_t partition_name[37];
     BOOL ok = TRUE;
@@ -1316,7 +1890,7 @@ static int self_test(void)
                           MEMORY_BLOCK_VSM_CAPABLE) &&
                      memory_descriptor.words[10] == 0 &&
                      memory_descriptor.words[11] == 0 &&
-                     GUEST_PAGES < 0x200,
+                     GUEST_PAGES == 0x200,
                  L"VSM-capable VA-backed memory block descriptor");
 
     build_guest_image(guest, &vtl0, &vtl1);
@@ -1351,6 +1925,21 @@ static int self_test(void)
                      vtl1.Cr0 == 0x80010033 &&
                      vtl1.Cr3 == PML4_GPA && vtl1.Cr4 == 0x20,
                  L"VTL1 kernel context");
+
+    secure_kernel.image_base = SECURE_KERNEL_IMAGE_BASE;
+    secure_kernel.size_of_image = SECURE_KERNEL_IMAGE_SIZE;
+    secure_kernel.breakpoint_rva = SECURE_KERNEL_BREAKPOINT_RVA;
+    configure_secure_kernel_breakpoint(guest, &vtl1, &secure_kernel);
+    ok &= expect(guest[VTL1_CODE_GPA] == 0xC6 &&
+                     load_u64(guest, VTL1_CODE_GPA + 10) ==
+                         SECURE_KERNEL_IMAGE_BASE +
+                             SECURE_KERNEL_BREAKPOINT_RVA &&
+                     guest[VTL1_CODE_GPA + 18] == 0xFF &&
+                     guest[VTL1_CODE_GPA + 19] == 0xD0 &&
+                     guest[VTL1_CODE_GPA + 28] == 0x48 &&
+                     guest[VTL1_CODE_GPA + 29] == 0xCF &&
+                     vtl1.Rip == VTL1_IDLE_GPA,
+                 L"Secure Kernel call/return trampoline");
 
     memset(message, 0, sizeof(message));
     ok &= expect(match_message(message) == MESSAGE_EMPTY,
@@ -1409,8 +1998,10 @@ static void usage(const wchar_t *program)
              L"usage:\n"
              L"  %ls --self-test\n"
              L"  %ls --create-only\n"
-             L"  %ls --controlled-stop [--timeout-ms N] [--hold-ms N]\n",
-             program, program, program);
+             L"  %ls --controlled-stop [--timeout-ms N] [--hold-ms N]\n"
+             L"  %ls --securekernel-breakpoint [--image PATH] "
+             L"[--timeout-ms N] [--hold-ms N]\n",
+             program, program, program, program);
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -1420,14 +2011,21 @@ int wmain(int argc, wchar_t **argv)
     DWORD timeout_ms = 10000;
     DWORD hold_ms = 250;
     BOOL controlled_stop = FALSE;
+    BOOL secure_kernel_breakpoint = FALSE;
+    wchar_t secure_kernel_default[MAX_PATH];
+    const wchar_t *secure_kernel_path = NULL;
     int result;
     int i;
 
     if (argc == 2 && wcscmp(argv[1], L"--self-test") == 0) {
         return self_test();
     }
-    if (argc >= 2 && wcscmp(argv[1], L"--controlled-stop") == 0) {
+    if (argc >= 2 &&
+        (wcscmp(argv[1], L"--controlled-stop") == 0 ||
+         wcscmp(argv[1], L"--securekernel-breakpoint") == 0)) {
         controlled_stop = TRUE;
+        secure_kernel_breakpoint =
+            wcscmp(argv[1], L"--securekernel-breakpoint") == 0;
         for (i = 2; i < argc; i++) {
             if (wcscmp(argv[i], L"--timeout-ms") == 0 && i + 1 < argc) {
                 if (!parse_dword(argv[++i], &timeout_ms) || timeout_ms == 0) {
@@ -1441,6 +2039,10 @@ int wmain(int argc, wchar_t **argv)
                     return 2;
                 }
             }
+            else if (secure_kernel_breakpoint &&
+                     wcscmp(argv[i], L"--image") == 0 && i + 1 < argc) {
+                secure_kernel_path = argv[++i];
+            }
             else {
                 usage(argv[0]);
                 return 2;
@@ -1450,6 +2052,22 @@ int wmain(int argc, wchar_t **argv)
     else if (argc != 2 || wcscmp(argv[1], L"--create-only") != 0) {
         usage(argv[0]);
         return 2;
+    }
+
+    if (secure_kernel_breakpoint && secure_kernel_path == NULL) {
+        wchar_t system[MAX_PATH];
+
+        if (GetSystemDirectoryW(system, ARRAYSIZE(system)) == 0 ||
+            swprintf_s(secure_kernel_default,
+                       ARRAYSIZE(secure_kernel_default),
+                       L"%ls\\securekernel.exe", system) < 0) {
+            fwprintf(stderr,
+                     L"cannot form the inbox Secure Kernel path "
+                     L"(error %lu)\n",
+                     GetLastError());
+            return 2;
+        }
+        secure_kernel_path = secure_kernel_default;
     }
 
     if (!load_vid(&api)) {
@@ -1465,7 +2083,9 @@ int wmain(int argc, wchar_t **argv)
     }
 
     if (controlled_stop) {
-        result = run_controlled_stop(&api, setup, timeout_ms, hold_ms);
+        result = run_controlled_stop(
+            &api, setup, timeout_ms, hold_ms,
+            secure_kernel_breakpoint ? secure_kernel_path : NULL);
     }
     else {
         result = run_create_only(&api, setup);
