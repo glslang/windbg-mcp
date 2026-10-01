@@ -112,11 +112,10 @@ and a third boot. **What keeps it open is that part of its goal is closing the r
 several of the attempts its plan names have not been made**: a `RawSource` against the
 operator-supplied live transport (the seam is built and the constraint — no driver from this repo,
 the operator supplies it, the rest is drivable — was agreed long ago, so this is an implementation
-nobody has written, not a question); **single-stepping** in a trustlet, which is all that is left of
-the published IUM capability after S5t planted a `0xCC` at a chosen address in `LsaIso.exe` and saw
-it fire there, with register read and write both answering — no `EFLAGS.TF` was set and no
-`EXCEPTION_SINGLE_STEP` seen; and the unexplained `SdkWriteVirtualMemory` segfault on a VTL1
-virtual address. EXDI stays out for the reason E2 recorded — it needs a **completely different type
+nobody has written, not a question); a **re-run of S5t's single-step arm with its harness fixed**,
+since that arm passed — every clause of the published IUM capability is now reproduced — but crashed
+the trustlet by restoring `RIP` without `RSP`, leaving the arm without its own post-restore
+control; and the unexplained `SdkWriteVirtualMemory` segfault on a VTL1 virtual address. EXDI stays out for the reason E2 recorded — it needs a **completely different type
 of lab**, a host whose hypervisor slot is free — and the *Out of scope* line parking H5a stands. Two
 drafts of that entry's status got this wrong and are recorded in it: one closed the item on the
 strength of the four tools, and one recast the operator-supplied transport as a refusal, inverting a
@@ -2119,10 +2118,19 @@ In rough order of cost, and none of them refused:
    the planted address; and the next event was `EXCEPTION_BREAKPOINT` `0x80000003` at
    **`0x7FF888215B90`** — *our* address — with `RIP` = `0x7FF888215B91`, exactly address + 1. Byte
    and `RIP` restored and verified, detached, trustlet alive, guest uptime monotonic. Arms A and C
-   with the gate closed both gave `ERROR_ACCESS_DENIED (5)`. **What is still unrun is one clause:**
-   *single-stepping*. The redirect is a register **write**, not a trap-flag step — no `EFLAGS.TF`
-   was set and no `EXCEPTION_SINGLE_STEP` (`0x80000004`) was observed — and that is the last piece
-   of the published capability. It is cheap: set `TF` through the same `SetThreadContext`. Full
+   with the gate closed both gave `ERROR_ACCESS_DENIED (5)`. **A second arm the same day added
+   single-stepping, so every clause of the published capability is now reproduced**: `EFLAGS.TF`
+   armed `0x246`→`0x346`, two `EXCEPTION_SINGLE_STEP` (`0x80000004`) events at `0x7FF888215B94` then
+   `0x7FF888215B9D` — advances of 4 and 9 bytes, matching `sub rsp,0x28` and `mov rax,gs:[0x60]` as
+   read from this host's `ntdll` — with `TF` self-cleared by each trap. **That arm also crashed the
+   trustlet, through a defect in the harness rather than the technique**: it restored `RIP` without
+   `RSP` after stepping that `sub rsp,0x28`, so `DbgBreakPoint`'s `ret` popped garbage and WER logged
+   `IUMTrustletCrash` for `lsaiso.exe` twice. The guest survived (uptime monotonic, `lsass` alive,
+   `Secure System` running) but `LsaIso` did not restart, so **that arm has no post-restore control
+   and wants a re-run on a rebooted guest** — which is attempt 2 as it now stands. The probe snapshots
+   and restores the whole `CONTEXT` now, puts the page protection back, and samples liveness at 1, 3
+   and 6 seconds rather than at 400 ms, which is what reported `TRUSTLET_ALIVE=True` moments before
+   the crash surfaced. Full
    figures in the **S5t result** section of
    [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md);
    instruments are **operator-supplied and outside this repository**, like the driver — a host-side

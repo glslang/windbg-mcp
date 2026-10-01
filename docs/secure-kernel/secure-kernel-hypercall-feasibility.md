@@ -4978,7 +4978,7 @@ Restored and verified byte-for-byte; `LsaIso` alive; both guests running continu
 host not rebooted. Checkpoint `pre-S5r-patch` (2026-09-29 18:31) was taken before the write and was not
 needed — it can be deleted once nobody wants the rollback. `SdkWriteVirtualMemory` was not used again.
 
-### S5t result, 2026-10-01: the published IUM capability is now reproduced in full except single-stepping — a breakpoint we planted fired in a trustlet, and registers read and wrote
+### S5t result, 2026-10-01: the published IUM capability is reproduced in full — a breakpoint we planted fired in a trustlet, its registers read and wrote, and it single-stepped twice
 
 **S5r replicated the *access* and stopped there; this closes the three claims it left.** S5r's own
 bound was that the `EXCEPTION_BREAKPOINT` it caught was the break Windows **injects** on attach, so
@@ -5046,13 +5046,65 @@ could have moved independently:
 | **B**, patched | `0xEB` | every row of the table above |
 | **C**, after restore | `0x75` | `DebugActiveProcess` → `False`, `ERROR_ACCESS_DENIED (5)` |
 
+#### The single-step arm, run second — it passes, and it killed the trustlet through a harness bug
+
+**Run 2026-10-01 in a second gate-open window, same gate, same trustlet (`LsaIso.exe` pid 924).**
+`EFLAGS.TF` is set through the same `SetThreadContext`, from `RIP` parked on the instruction at our
+chosen address *after* the `0xCC` was put back — so the step executes **real trustlet code** rather
+than our breakpoint.
+
+| | result |
+|---|---|
+| arm `TF` | `EFLAGS` `0x246` → `0x346` (bit `0x100`), `FROM_RIP` `0x7FF888215B90` |
+| **step 1** | `EXCEPTION_SINGLE_STEP` **`0x80000004`** at `0x7FF888215B94` — advanced 4 bytes; `EFLAGS` back to `0x206`, so `TF` was **self-cleared** by the trap |
+| **step 2** | `TF` re-armed; `EXCEPTION_SINGLE_STEP` at `0x7FF888215B9D` — advanced 9 bytes; `TF` self-cleared again |
+
+**The step lengths corroborate that real instructions executed.** `ntdll!DbgUiRemoteBreakin` begins
+`48 83 EC 28` (`sub rsp,0x28`, four bytes) followed by `65 48 8B 04 25 60 00 00 00`
+(`mov rax,gs:[0x60]`, nine bytes) — read from this **host's** `ntdll` 10.0.26100.9278 and therefore
+corroboration rather than the guest's own bytes. Four then nine is exactly the two deltas observed.
+`EFLAGS` also went `0x246` → `0x206` across the first step, i.e. the stepped instruction had an
+architectural effect; a replayed breakpoint would not have moved `ZF`.
+
+**So trap-flag single-stepping works in VTL1 user mode, twice in succession.** With the breakpoint
+and register results above, every clause of the published capability — *breakpoints, single-stepping
+and register access* — is now reproduced, from the Hyper-V root with no nesting.
+
+#### And then `LsaIso` crashed, which is this harness's defect and not the technique's
+
+**`IUMTrustletCrash`, `lsaiso.exe` 10.0.26100.9444, two WER events at 20:43:55 and 20:43:58.** The
+guest survived — uptime **monotonic** at `1.00:47:27`, no reboot, `lsass` alive as pid 936, `Secure
+System` running, nothing in the System log — but the trustlet did not restart, so it is gone until
+the guest reboots.
+
+**The cause is established, not guessed.** The cleanup restored `RIP` and **not `RSP`**. Step 1 was
+`sub rsp,0x28`, so by the time `RIP` was put back to `0x7FF888203AB1` — inside `DbgBreakPoint`, just
+past its `int 3` — the stack pointer was `0x28` low, and that function's `ret` popped a value that
+was never a return address. The probe reported `DETACH=True` and `TRUSTLET_ALIVE=True` immediately
+before this, because it sampled liveness **400 ms** after detaching and the crash had not surfaced
+yet; the next arm, seconds later, found no `LsaIso` at all.
+
+**Three consequences, all of them the harness's.**
+
+- **This run has no post-restore control.** Arm C answered `RESULT=NO_LSAISO` rather than the
+  `ERROR_ACCESS_DENIED (5)` it is there to produce, so the A-B-A is complete for the *breakpoint* arm
+  (first run, where Arm C did return error 5) and **incomplete for the single-step arm**. The gate
+  itself was still controlled: `0x75` before, `0xEB` during, `0xEB`→`0x75` restored and verified by an
+  independent read.
+- **A liveness sample taken at the moment of release measures nothing.** 400 ms said alive; the WER
+  events landed seconds later. The probe now samples at 1 s, 3 s and 6 s and prints each.
+- **The page protection was never put back either**, and that defect persisted *across runs*: the
+  first run read `OLD=0x20` (`PAGE_EXECUTE_READ`) and the second read `OLD=0x40`, because the first
+  had left the page RWX.
+
+**Fixed in the probe rather than noted**: the full 1,232-byte `CONTEXT` is snapshotted at the attach
+break and restored wholesale — `RSP` and the GPRs as well as `RIP` and `EFLAGS` — with the restore
+verified by a read-back; the original page protection is restored; and liveness is sampled late and
+repeatedly. **A clean re-run needs the guest rebooted** so there is a `LsaIso` to attach to, and only
+then does the single-step arm have its own control.
+
 #### What this does not establish
 
-- **Single-stepping was not exercised.** The published claim is *"breakpoints, single-stepping and
-  register access"*. The redirect above is a `SetThreadContext` write to `RIP`, which is register
-  *write*, **not** a trap-flag single step: no `EFLAGS.TF` was set and no `EXCEPTION_SINGLE_STEP`
-  (`0x80000004`) was observed. That is the one clause of the published capability still unrun, and
-  it is cheap — set `TF` through the same `SetThreadContext` and continue.
 - **VTL1 *user* mode only.** This is a trustlet. Nothing here touches `securekernel.exe`'s own
   execution, which is item 110.
 - **One build, one trustlet, one gate byte.** As with S5r, nothing here is a property of VBS.
@@ -5062,9 +5114,11 @@ could have moved independently:
 
 #### Bench state
 
-Gate verified `0x75` by an independent `s5r_patch.py read` after the run. Guest uptime **monotonic**
-at `1.00:21:18` with no reboot, `LsaIso` still pid 924 with its one thread and 59 handles, and
-`Secure System` running. The host-side driver restores the gate in a `finally` block, which is why
+Gate verified `0x75` by an independent `s5r_patch.py read` after **both** runs. Guest uptime
+**monotonic** throughout — `1.00:21:18` after the breakpoint arm, `1.00:47:27` after the
+single-step arm — with no reboot and `Secure System` running. **`LsaIso` is alive after the first
+run (pid 924, one thread, 59 handles) and gone after the second**, for the harness reason given
+above; the guest needs a reboot before this gate can be re-run. The host-side driver restores the gate in a `finally` block, which is why
 the restore survived the `hvlib` unload segfault that ends every run of these probes — that segfault
 is on process exit, *after* the write and its read-back, and it truncated the driver's own Arm C, so
 Arm C was re-run on its own.
