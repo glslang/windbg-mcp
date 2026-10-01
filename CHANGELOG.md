@@ -9,6 +9,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The VTL1 kernel-mode control plan now has a build-locked owner-partition probe.**
+  [`tools/vtl1_control_probe.c`](tools/vtl1_control_probe.c) creates only its own one-VP VID
+  partition, enables partition and VP VTL1, enters it with a VTL1-targeted fixed interrupt, and
+  holds on the selected `int3` until the exact marked exception message is completed. It includes
+  a complete unwind path, refuses mismatched inbox VID builds and unexpected messages, and has an
+  offline self-test for every private layout and the long-mode guest image. The high-integrity
+  live run stopped at the marked VTL1 vector-3 instruction and verified the execution witness. It
+  held the intercept for 266 ms, completed it, stopped the VP, deleted the disposable partition,
+  and exited zero. The required memory pairing is now explicit: a VSM-capable VA memory block and
+  a GPA range that applies default VTL protections. The `/W4 /WX` build and self-test also pass.
+  The runbook and evidence are in
+  [`docs/secure-kernel/vtl1-control-probe.md`](docs/secure-kernel/vtl1-control-probe.md).
 - **Item 103 carries an ordered route to the actual goal, and two of today's claims are narrowed to
   what was measured.** The route, in `FOLLOWUPS.md` item 103 so it lives in **one** place: DbgEng
   inspecting `securekernel` is what `docs/secure-kernel/exdi-stub-plan.md` owns, and **all three of

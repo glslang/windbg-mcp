@@ -53,6 +53,21 @@ Three traps, each of which cost a run:
 python tools/ghidra_oracle/oracle.py
 ```
 
+Three small Java scripts also support build-specific ABI work that is outside
+the IOCTL differential lane:
+
+- `ConfigurePdb.java` binds an explicitly named PDB before headless analysis.
+- `DecompileFunctions.java` writes deterministic decompilation for named
+  functions or image-relative RVAs.
+- `DecompileCallers.java` follows an internal or imported symbol through its
+  thunk and decompiles every caller. It also accepts an image-relative RVA for
+  indirect-call investigations. This is useful when an import's parameter
+  meaning has changed but its public name has not.
+
+Pass `ConfigurePdb.java` with `-preScript`, followed by one of the decompilers
+with `-postScript`. Reports and Ghidra projects are generated evidence and
+belong under `target/`, not in the repository.
+
 It captures `ioctl_map`'s answer from the checked-in dump, runs both oracles over the cached image,
 and prints a table of every code with a column per implementation. What to read:
 

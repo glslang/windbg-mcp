@@ -83,10 +83,10 @@ information**, so structure walks stay hand-decoded. **S3**, the tool surface, i
 the `securekernel` group: a capture is a session whose worker holds a file, the decode travels with
 the open, and the debugger tools are refused on it — the three questions that gate was deferred to
 answer (where the engine lives, one handle or two, and what a structure walk means with no types) are
-answered in `src/sksession.rs` and in `FOLLOWUPS.md`. What
-remains is whether VTL1 execution can be
-controlled at all (S5). Its route is decided, and the
-decision is the opposite of where this work began. Driving a live Secure Kernel target through
+answered in `src/sksession.rs` and in `FOLLOWUPS.md`. VTL1 kernel execution can now be controlled
+in a disposable owner partition: the guarded probe holds and completes its selected CPL0 `#BP`.
+What remains is reproducing that result in an initialized Secure Kernel, because a managed VM's
+VID completion stream belongs to `vmwp.exe`. Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
 and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even
 a working EXDI would supply a generic memory target rather than any SK awareness. Since the reads
@@ -112,9 +112,10 @@ refused cleanly with `ERROR_FILE_CORRUPT` — and the container-header and entro
 the input is a well-formed file with an encrypted payload. The remaining case needs no Microsoft involvement and is true today: these `.vmrs` files
 inherit `D:\`'s ACL, so any authenticated local user can read a guest's whole RAM.
 
-**Two things are open beneath that.** Whether VTL1 *execution* can be controlled at all is
-unresolved and decides inspector versus debugger — but it is now a narrower question than "the port
-is up and nothing connects to it". **Those were the same wall**, measured 2026-09-27 as gate S5a:
+**The remaining control question is Secure Kernel, not VTL1 kernel privilege in general.** The
+owner-partition probe supplies the latter; reproducing it in an initialized Secure Kernel remains
+open. The earlier question was narrower than "the port is up and nothing connects to it".
+**Those were the same wall**, measured 2026-09-27 as gate S5a:
 Secure Kernel has no hypercall or MSR route to that port. Across ten builds from 19041.207 to
 29667.1000 it never writes the three debug hypercall codes at any instruction boundary the scan
 recognises — every occurrence at one is a `cmp` — it never materialises a synthetic-debugger MSR
@@ -139,6 +140,7 @@ Read them in this order; each assumes the one before it.
 | 2 | [Secure Kernel debugging validation](secure-kernel-debugging-validation.md) | The measurement record behind everything else. NT and hypervisor debugging pass; **native SK attachment does not**. Why post-26100 `securekernel.exe` ships no KD transport, and what `SkdInitDebuggerDataBlock` does instead. The longest document here and the one to cite. |
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
 | 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, **S0**, which finds a driver-free source that carries VTL1 and its page-table root, **S1**, the decode layer over that source, **S2**, symbols against the image with no debuggee — which also settles that the public PDB has no types — and **S5a**, which joins the hypervisor's live-but-unused VTL1 debug port to Secure Kernel shipping no KD transport, and finds them to be the same wall. |
+| 5 | [VTL1 control probe runbook](vtl1-control-probe.md) | The build-locked native probe, live procedure, private ABI derivation, safety boundary and successful high-integrity result. |
 
 Two older side-investigations, kept because they are about the same binary:
 
