@@ -112,10 +112,11 @@ and a third boot. **What keeps it open is that part of its goal is closing the r
 several of the attempts its plan names have not been made**: a `RawSource` against the
 operator-supplied live transport (the seam is built and the constraint — no driver from this repo,
 the operator supplies it, the rest is drivable — was agreed long ago, so this is an implementation
-nobody has written, not a question); a **re-run of S5t's single-step arm with its harness fixed**,
-since that arm passed — every clause of the published IUM capability is now reproduced — but crashed
-the trustlet by restoring `RIP` without `RSP`, leaving the arm without its own post-restore
-control; and the unexplained `SdkWriteVirtualMemory` segfault on a VTL1 virtual address. EXDI stays out for the reason E2 recorded — it needs a **completely different type
+nobody has written, not a question); and the unexplained `SdkWriteVirtualMemory` segfault on a VTL1
+virtual address. **S5t is done**: every clause of the published IUM capability — breakpoints,
+single-stepping, register access — is reproduced from the Hyper-V root with no nesting, cleanly on
+a rebooted guest with the trustlet surviving and a post-restore control on the same pid, after a
+first single-step attempt crashed it through a harness defect that is now fixed and verified. EXDI stays out for the reason E2 recorded — it needs a **completely different type
 of lab**, a host whose hypervisor slot is free — and the *Out of scope* line parking H5a stands. Two
 drafts of that entry's status got this wrong and are recorded in it: one closed the item on the
 strength of the four tools, and one recast the operator-supplied transport as a refusal, inverting a
@@ -2106,8 +2107,8 @@ In rough order of cost, and none of them refused:
 
 1. **A `RawSource` against an operator-supplied live transport**, and with it the first real
    `ReadFailure::Refused`, plus whatever the two S3 consequences cost the session model.
-2. ~~**The three operations the IUM write-up claims *on top of* attach.**~~ **RUN 2026-10-01 as S5t,
-   and all three pass except single-stepping.** S5r had replicated only the *access*; what it left
+2. ~~**The three operations the IUM write-up claims *on top of* attach.**~~ **DONE 2026-10-01 as S5t,
+   and all four pass, single-stepping included.** S5r had replicated only the *access*; what it left
    unexercised were breakpoints at a chosen address, register read and register write. On the same
    gate (`securekernel.exe+0x1434E`, patched in **memory** by guest-physical write and restored),
    against `LsaIso.exe` pid 924 on the VBS guest, under A-B-A control:
@@ -2126,11 +2127,14 @@ In rough order of cost, and none of them refused:
    trustlet, through a defect in the harness rather than the technique**: it restored `RIP` without
    `RSP` after stepping that `sub rsp,0x28`, so `DbgBreakPoint`'s `ret` popped garbage and WER logged
    `IUMTrustletCrash` for `lsaiso.exe` twice. The guest survived (uptime monotonic, `lsass` alive,
-   `Secure System` running) but `LsaIso` did not restart, so **that arm has no post-restore control
-   and wants a re-run on a rebooted guest** — which is attempt 2 as it now stands. The probe snapshots
-   and restores the whole `CONTEXT` now, puts the page protection back, and samples liveness at 1, 3
-   and 6 seconds rather than at 400 ms, which is what reported `TRUSTLET_ALIVE=True` moments before
-   the crash surfaced. Full
+   `Secure System` running) but `LsaIso` did not restart, so that arm had no post-restore control.
+   **Re-run on a rebooted guest the same day, with all three harness defects fixed, and it is clean**
+   — `LsaIso` pid 908, every address re-derived (SK rebased to `0xFFFFF8024278A000`, the target to
+   `0x7FF8EC595B90`), `VirtualProtectEx` reading the correct original `0x20` where the leak had shown
+   `0x40`, `RESTORE_FULL_CONTEXT` verified by read-back, protection restored, the trustlet **alive at
+   1, 3 and 6 seconds**, Arm C refusing with `ERROR_ACCESS_DENIED (5)` on that **same pid**, and
+   **zero `IUMTrustletCrash` events since that boot**. So attempt 2 is **done**, and what it leaves is
+   the limit rather than a gap: VTL1 *user* mode only, one build, one trustlet. Full
    figures in the **S5t result** section of
    [`docs/secure-kernel/secure-kernel-hypercall-feasibility.md`](docs/secure-kernel/secure-kernel-hypercall-feasibility.md);
    instruments are **operator-supplied and outside this repository**, like the driver — a host-side

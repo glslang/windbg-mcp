@@ -5070,7 +5070,7 @@ architectural effect; a replayed breakpoint would not have moved `ZF`.
 and register results above, every clause of the published capability — *breakpoints, single-stepping
 and register access* — is now reproduced, from the Hyper-V root with no nesting.
 
-#### And then `LsaIso` crashed, which is this harness's defect and not the technique's
+#### The first single-step attempt crashed `LsaIso` — this harness's defect, since fixed and verified
 
 **`IUMTrustletCrash`, `lsaiso.exe` 10.0.26100.9444, two WER events at 20:43:55 and 20:43:58.** The
 guest survived — uptime **monotonic** at `1.00:47:27`, no reboot, `lsass` alive as pid 936, `Secure
@@ -5100,8 +5100,49 @@ yet; the next arm, seconds later, found no `LsaIso` at all.
 **Fixed in the probe rather than noted**: the full 1,232-byte `CONTEXT` is snapshotted at the attach
 break and restored wholesale — `RSP` and the GPRs as well as `RIP` and `EFLAGS` — with the restore
 verified by a read-back; the original page protection is restored; and liveness is sampled late and
-repeatedly. **A clean re-run needs the guest rebooted** so there is a `LsaIso` to attach to, and only
-then does the single-step arm have its own control.
+repeatedly. **All three fixes were then confirmed on a rebooted guest**, in the clean re-run below,
+which is the run to cite.
+
+#### The clean re-run, on a rebooted guest with the harness fixed — this is the result to cite
+
+**Run 2026-10-01 after the guest was restarted (boot 20:55:29), `LsaIso.exe` pid 908.** Same gate,
+same arms, one operator command (`s5r_bp_host.ps1 -Patch`, which opens the gate inside the `try` so
+the unconditional `finally` closes it on every path). Everything above passes **and the trustlet
+survives**, which the first attempt could not show.
+
+**The addresses all moved, and nothing was carried forward** — which is the source contract working
+rather than a detail: Secure Kernel rebased to `0xFFFFF8024278A000` (from `0xFFFFF8042466A000`), the
+trustlet's `ntdll` to `0x7FF8EC460000`, and the target to `0x7FF8EC595B90` (from `0x7FF888215B90`).
+`InfoHvddGetCr3Securekernel` read `0x1201000` for the **third** boot in a row while the address space
+behind it differed each time, which is why that value must never be used as an identity. The gate's
+GPA stayed `0xCE534E` and the 48-byte signature still matched the dumped image, so the page was
+identified rather than assumed.
+
+| | result |
+|---|---|
+| attach | `True`, injected break at `0x7FF8EC583AB0` on tid 5996 |
+| read | `True`, original byte `0x48`; export walk resolved `ntdll!DbgUiRemoteBreakin` |
+| **page protection** | `VirtualProtectEx` old = **`0x20`** (`PAGE_EXECUTE_READ`) — the *correct* original, where the previous run read `0x40` because the first had leaked the page as RWX |
+| write | `True`, one `0xCC`, read back `0xCC` |
+| registers | `GetThreadContext` `True`, `RIP` `0x7FF8EC583AB1`, **`CTX_SNAPSHOT=1232`** |
+| our breakpoint | `EXCEPTION_BREAKPOINT` at **`0x7FF8EC595B90`**, `RIP` = address + 1 |
+| **step 1** | `EXCEPTION_SINGLE_STEP` at `0x7FF8EC595B94` — **+4**, `TF` self-cleared |
+| **step 2** | `EXCEPTION_SINGLE_STEP` at `0x7FF8EC595B9D` — **+9**, `TF` self-cleared |
+| **full-context restore** | `RESTORE_FULL_CONTEXT=True VERIFY=True RIP_OK=True TF_CLEAR=True` — read back, not just written |
+| **protection restore** | `RESTORE_PROT=True TO=0x20` |
+| **trustlet** | alive at **1 s, 3 s and 6 s** after detach |
+| **Arm C, the control** | gate restored `0xEB`→`0x75`, then `DebugActiveProcess` on the **same pid 908** → `False`, `ERROR_ACCESS_DENIED (5)` |
+
+**So this run has the control the first single-step attempt lacked**, and on the same trustlet
+instance: `LsaIso` held **pid 908** before, during and after, so it never died and restarted. Gate
+`0x75` on an independent read afterwards, `GATE_CLOSED_AFTER_RUN=True`.
+
+**And the fix is confirmed by absence in the right place.** `IUMTrustletCrash` events **since this
+boot: 0** — counted from `LastBootUpTime` rather than from a wall-clock window, because a 20-minute
+window spans the reboot and returns the *previous* run's two crashes, which is how that check first
+read as a failure. The only System-log error since boot is a `Microsoft-Windows-TPM-WMI` 1040 at
+20:55:38, nine seconds after boot and before any of this ran. `lsass` 920 and `Secure System` both
+alive; `LsaIso` 2 threads, 59 handles.
 
 #### What this does not establish
 
@@ -5114,11 +5155,13 @@ then does the single-step arm have its own control.
 
 #### Bench state
 
-Gate verified `0x75` by an independent `s5r_patch.py read` after **both** runs. Guest uptime
-**monotonic** throughout — `1.00:21:18` after the breakpoint arm, `1.00:47:27` after the
-single-step arm — with no reboot and `Secure System` running. **`LsaIso` is alive after the first
-run (pid 924, one thread, 59 handles) and gone after the second**, for the harness reason given
-above; the guest needs a reboot before this gate can be re-run. The host-side driver restores the gate in a `finally` block, which is why
+Gate verified `0x75` by an independent `s5r_patch.py read` after **every** run, and
+`GATE_CLOSED_AFTER_RUN=True` on the driven ones. Three runs: the breakpoint arm (`LsaIso` pid 924,
+guest uptime `1.00:21:18`), the first single-step attempt (same pid, uptime `1.00:47:27`, which
+**crashed the trustlet** for the harness reason above), and after a **guest restart at 20:55:29**
+the clean re-run (pid 908, alive at 1/3/6 s, Arm C refusing on that same pid). `Secure System` and
+`lsass` alive throughout, and the host was never rebooted. The guest's `securekernel.exe` on disk
+was never written in any of them — every patch is a one-byte guest-physical memory write. The host-side driver restores the gate in a `finally` block, which is why
 the restore survived the `hvlib` unload segfault that ends every run of these probes — that segfault
 is on process exit, *after* the write and its read-back, and it truncated the driver's own Arm C, so
 Arm C was re-run on its own.
