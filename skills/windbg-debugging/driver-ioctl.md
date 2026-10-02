@@ -83,9 +83,9 @@ want only the map, or when you want the symbolic links, which the composite leav
    of its own: `Wdf01000.sys` fills all 28 slots with its own dispatcher and calls the driver's code as
    callbacks it holds, so every entry reads `Wdf01000!FxDevice::Dispatch` or
    `FxDevice::DispatchWithLock` and step 2 on one of them finds no control codes -- correctly,
-   because there are none there to find. A KMDF driver's codes are compared inside the
-   `EvtIoDeviceControl` of an I/O queue -- usually, that being one of several callback slots a
-   control code can be compared in -- which this server cannot yet resolve. `driver_surface`
+   because there are none there to find. A KMDF driver's codes are compared somewhere in its own
+   code that this server cannot yet resolve, and not necessarily in any callback the framework
+   registered -- so do not assume a slot name and go looking for it. `driver_surface`
    recognises the case and says so in a `framework` field; `driver_object` prints the debugger's
    raw table, so on that output the tell is the module name on every entry. The driver-side tell is
    an import of `WdfVersionBind` from `WdfLdr.sys`, which `driver_hazards` reports.

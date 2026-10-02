@@ -2214,24 +2214,23 @@ rather than a constant — `Wdf01000.sys` carries its own version line (1.35.261
 independent of the OS build, which is the trap to design around. Until it lands, the `framework`
 field tells a reader where *not* to look rather than where to look, and `docs/limitations.md` says so.
 
-**And "the" queue callback is not one slot, which two review rounds on the step-1 PRs spent
-themselves establishing.** Scoping step 2 against `EvtIoDeviceControl` alone would find nothing for
-every driver that does not use it. Measured on this bench and written up in `src/framework.rs`'s
-module docs: `_WDF_IO_QUEUE_CONFIG` carries **eight** callback slots, so a queue configuring no
-specific handler takes device control on `EvtIoDefault` and an internal control code has its own
-slot. A request can also reach the driver before any queue does, through registrations this build
-exports — `WdfDeviceInitSetIoInCallerContextCallback` and its class-extension twin,
-`WdfDeviceInitAssignWdmIrpPreprocessCallback`, `WdfDeviceConfigureWdmIrpDispatchCallback` — and what
-any of them does with a request is the driver's choice. `src/framework.rs`'s module docs hold the
-measurements.
+**And do not scope step 2 against a list of callbacks, which is the one thing the step-1 PRs
+established at length.** `EvtIoDeviceControl` is not where a client's control codes necessarily are;
+neither is any other slot, nor any registered callback at all — a driver using a manual queue takes
+requests out of it in a worker or timer routine that was registered as nothing. So *"walk what the
+driver registered"* is not the scope either, and no enumeration this repo writes is the scope.
+`src/framework.rs`'s module docs hold what was measured about this build, as names to look for, and
+deliberately stop there; WDF's own documentation owns the taxonomy.
 
-**So step 2 is a walk and not a lookup, and that is the one conclusion worth carrying.** It does not
-answer *which of a fixed list* a driver used: it reads what the driver registered and reports what it
-found, so the honest shape of its answer is a set of candidate sites with what was read at each
-rather than a single address. **Four review findings on the step-1 PRs went into learning that**, each
-one correcting a claim about which route is *the* route or what a route *must* do, and each correction
-becoming the next finding — against a framework this repo does not own, in prose no code depends on.
-Whoever scopes step 2 should take the walk and leave the taxonomy to WDF's documentation.
+**What that leaves is the shape of the answer, which is the conclusion worth carrying.** Step 2
+reports **candidate sites with what was read at each** rather than a single address, and it has to be
+able to say *"this driver's comparison was not located"* without that reading as "it has none".
+
+**Seven review findings across the two step-1 PRs went into that sentence**, every one of them
+correcting a claim of mine about which route is *the* route, what a route *must* do, or which list is
+complete — against a framework this repo does not own, in prose no code depends on, each correction
+becoming the next round's finding. The lesson is cheaper than the route table: a tool that cannot
+resolve a callback should not describe where the callback might be.
 
 **What step 1 measured that step 2 should start from**, stated as the reading rather than as an
 interpretation of it. Disassembled on this bench, `Wdf01000.sys 1.35.26100.3323`:
