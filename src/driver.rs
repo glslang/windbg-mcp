@@ -1316,6 +1316,41 @@ pub(crate) fn fmt_addr(a: u64) -> String {
     format!("{:08x}`{:08x}", a >> 32, a & 0xffff_ffff)
 }
 
+/// Adds the framework qualification to a rendered reachability report.
+///
+/// **A second half, because annotating one of them is annotating none of the clients.** A
+/// structured-aware client is served `structuredContent` *instead of* the text, and a text client is
+/// served the text — so `report.framework` alone left every text client an unqualified
+/// `REACHABLE`/`NOT REACHABLE` for a call graph that is the *framework's*, which is the conclusion
+/// this field exists to prevent. That is `.claude/rules/tool-surface.md`'s rule for `SUMMARY_NOTES`,
+/// and this tool was the one of the four that had it on one side only — found by review on
+/// [#437](https://github.com/glslang/windbg-mcp/pull/437) after the same test had been written for
+/// `driver_surface`.
+///
+/// **Inserted rather than passed into [`format_report`]**, which is the ordering rather than a
+/// preference: the framework is read off the module `from` was attributed to, and that attribution
+/// is what builds the answer's `images` — doing it earlier would reorder them, and the text is
+/// byte-identical to what it has always been otherwise.
+///
+/// It goes **above** the verdict for the reason every other renderer here puts its caveats above
+/// the findings: a qualification after the conclusion is one the reader reaches having already drawn
+/// it.
+pub(crate) fn qualified_with_framework(
+    rendered: String,
+    framework: Option<&structured::DriverFramework>,
+) -> String {
+    let Some(framework) = framework else {
+        return rendered;
+    };
+    // After the header line, which is the first thing printed and names the tool. A report with no
+    // newline at all cannot come from `format_report`; it is qualified at the front rather than
+    // being silently left alone.
+    match rendered.split_once('\n') {
+        Some((header, rest)) => format!("{header}\n  [!] {}\n{rest}", framework.note),
+        None => format!("  [!] {}\n{rendered}", framework.note),
+    }
+}
+
 /// Renders a [`Report`] as the tool's text output.
 pub(crate) fn format_report(r: &Report) -> String {
     let mut out = String::new();
@@ -3339,6 +3374,36 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
             !text.contains("jump-table resolver stopped"),
             "one qualification, not two: {text}"
         );
+    }
+
+    /// **The rendered half carries the framework too**, which is the half this tool had missing: a
+    /// structured-aware client is served `structuredContent` instead of the text, so a qualification
+    /// on one half reaches none of the callers served the other -- a text client got an unqualified
+    /// verdict about the *framework's* call graph. Review on #437 found it after the equivalent test
+    /// had been written for `driver_surface`, which is why it is here rather than only there.
+    #[test]
+    fn a_rendered_reachability_report_carries_the_framework_above_its_verdict() {
+        let framework = crate::framework::report(
+            crate::framework::Framework::Kmdf,
+            vec![crate::structured::FrameworkTell::FrameworkImage],
+            None,
+        );
+        let plain = "IOCTL dispatch reachability\n  from   : entry 00000001`40051c90\nVERDICT: \
+                     NOT REACHABLE\n";
+        let text = qualified_with_framework(plain.to_string(), Some(&framework));
+        let note = text.find("Wdf01000").expect("the framework is named");
+        let verdict = text.find("VERDICT").expect("the verdict is still there");
+        assert!(
+            note < verdict,
+            "the qualification arrives before the conclusion it is about:\n{text}"
+        );
+        assert!(
+            text.starts_with("IOCTL dispatch reachability\n"),
+            "and the header is still the first line:\n{text}"
+        );
+        // A walk that is not in a framework's image gains nothing at all -- the text is what it has
+        // always been, byte for byte.
+        assert_eq!(qualified_with_framework(plain.to_string(), None), plain);
     }
 
     /// **The typed answer carries the distinction, not only the text.**

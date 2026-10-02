@@ -60,7 +60,7 @@ use crate::batch::{self, BatchOp, Debuggee, Held, Ran, Sealed};
 use crate::device;
 use crate::driver::{
     fmt_addr, format_recipe, format_report, in_listing_order, listing_runs, parse_lm_base,
-    parse_windbg_addr, path_recipe, reachability, structured_report,
+    parse_windbg_addr, path_recipe, qualified_with_framework, reachability, structured_report,
 };
 use crate::fault;
 use crate::hazards;
@@ -10740,6 +10740,12 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // in. Here the root is `from`, which is absent only for a walk the caller never sees.
     report.framework =
         framework_of_code(report.from.as_ref().and_then(|from| from.module.as_deref()));
+    // **And into the text, because that is a different client.** `structuredContent` replaces the
+    // text block rather than accompanying it, so a qualification on one half reaches none of the
+    // callers served the other -- the rule `.claude/rules/tool-surface.md` states for
+    // `SUMMARY_NOTES`. The other three tools do this in their renderers; this one cannot, for the
+    // ordering reason `qualified_with_framework` gives.
+    let out = qualified_with_framework(out, report.framework.as_ref());
     Ok(Output::typed(out, report))
 }
 
