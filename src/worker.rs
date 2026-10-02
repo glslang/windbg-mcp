@@ -9844,12 +9844,9 @@ fn ioctl_map_of(
 /// and filling one field from two different questions is how it stops being one a caller can branch
 /// on.
 fn framework_of_code(module: Option<&str>) -> Option<structured::DriverFramework> {
-    let framework = crate::framework::image_is(module?)?;
-    Some(crate::framework::report(
-        framework,
-        vec![structured::FrameworkTell::FrameworkImage],
-        None,
-    ))
+    Some(crate::framework::code_report(crate::framework::image_is(
+        module?,
+    )?))
 }
 
 /// Why attribution should stop, or `None` to carry on.

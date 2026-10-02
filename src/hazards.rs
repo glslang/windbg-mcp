@@ -939,9 +939,11 @@ pub fn structured_report(
         unreadable: scan.unreadable.iter().map(scanned_range).collect(),
         other_imports: scan.other_imports,
         // The import tell, and only it: this end has read no driver object and no dispatch table, so
-        // it must not claim the second tell. `driver_surface` is where the two are composed.
+        // it must not claim the second tell, and `Table::Unread` is what says so in the note.
+        // `driver_surface` is where the two are composed, and it passes a different `Table` --
+        // having read one -- which is why that end cannot reuse this answer.
         framework: scan.framework.map(|framework| {
-            crate::framework::report(framework, vec![structured::FrameworkTell::BindImport], None)
+            crate::framework::client_report(framework, true, crate::framework::Table::Unread)
         }),
         unnamed_libraries: scan.unnamed_libraries.clone(),
         stopped: scan.halted.map(|halt| match halt {

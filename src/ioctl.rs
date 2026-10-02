@@ -13155,10 +13155,8 @@ mod tests {
             "a map of a driver's own routine gains nothing"
         );
 
-        report.framework = Some(crate::framework::report(
+        report.framework = Some(crate::framework::code_report(
             crate::framework::Framework::Kmdf,
-            vec![crate::structured::FrameworkTell::FrameworkImage],
-            None,
         ));
         let text = render(&report);
         let note = text.find("Wdf01000.sys").expect("the framework is named");
