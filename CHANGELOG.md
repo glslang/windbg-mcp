@@ -130,10 +130,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the managed one-VP Windows layout: `0xF8000000` bytes of low RAM, a 128 MiB
   PCI/MMIO hole, and 128 MiB of high RAM at `0x100000000`. Both VSM-capable
   memory blocks pass mapped-page readback and are destroyed during unwind. The
-  final three live runs used fresh partitions `0x15`–`0x17`. None of the six
-  devices implements the optional memory-info interface, so the RAM-complete
-  phase is an asserted no-op. K1.2 is closed; firmware execution, storage I/O,
-  and VP start remain open.
+  probe now follows the recovered pre-power sequence: initialize; call slots 6
+  through 8 as `StartReservingResources`, `FinishReservingResources`, and
+  `FreeReservedResources`; then tear down. The final three live runs used fresh
+  partitions `0x1A` through `0x1C`, and every resource call returned `S_OK`.
+  None of the six devices implements the optional memory-info interface, so the
+  RAM-complete phase is an asserted no-op. K1.2 is closed; firmware execution,
+  storage I/O, and VP start remain open.
 - **The owner-partition probe can redirect and restore VTL1 execution state
   while an exception message is pending (`FOLLOWUPS.md` item 110 arm 1).** The
   new `--pending-vtl1-state-write` mode receives its marked VTL1 CPL0 `#BP`,
