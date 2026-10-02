@@ -45,9 +45,12 @@ Operator and reference material: [remote listener](docs/remote-listener.md),
 [smoke test](docs/smoke-test.md), [token budget](docs/token-budget.md),
 [releasing](docs/releasing.md).
 
-Research, not shipped features: [Secure Kernel (VTL1)](docs/secure-kernel/README.md) — whether a
-debugger can reach a VBS guest's Secure Kernel, recorded gate by gate with the controls and the
-dead ends.
+**Secure Kernel (VTL1)**, where the shipped half and the research are easy to confuse: the
+**capture** tools are shipped — the `securekernel` group in the table below, with
+[`docs/sessions.md`](docs/sessions.md#secure-kernel-captures) as the caller's half. What is research
+is everything around them, [recorded gate by gate](docs/secure-kernel/README.md) with the controls
+and the dead ends — including the **live** route, which is a command-line role and needs a
+transport this repository does not ship.
 
 ## Quick start
 
