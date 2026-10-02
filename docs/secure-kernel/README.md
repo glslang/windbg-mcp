@@ -162,6 +162,7 @@ Read them in this order; each assumes the one before it.
 | 5 | [VTL1 control probe runbook](vtl1-control-probe.md) | The build-locked native probe, live procedure, private ABI derivation, safety boundary, successful high-integrity result, and guarded Secure Kernel image breakpoint/return mode. |
 | 6 | [Inbox device initialization probe](vdev-initialization-probe.md) | K1.1's guarded six-device contract and live result: guest emulation, BIOS, RTC, IOAPIC, VMBus, and SynthStor independently initialize and tear down outside `vmwp`; the build-bound JSON records every dependency and minimum configuration. |
 | 7 | [Inbox device graph probe](vdev-graph-probe.md) | K1.2's result: the six devices share one owned partition and the measured two-span 4 GiB Windows RAM map for three clean initialization, RAM-complete, reverse-teardown, memory-destruction, and partition-deletion cycles. Firmware and VP start remain open. |
+| 8 | [Diskless inbox firmware preflight](vdev-firmware-probe.md) | K1.3's result: the inbox BIOS builds five exact-readback UEFI memory regions and 19 VP0 state records, five diskless devices cold-power successfully, and the state applies cleanly in three fresh partitions. VP0 is deliberately not started; storage and the owner-side completion dispatcher remain open. |
 
 Two older side-investigations, kept because they are about the same binary:
 
