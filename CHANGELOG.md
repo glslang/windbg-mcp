@@ -94,6 +94,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminator's *condition* alone, which a `ccmp` carries, so a block ending in one left no case
   and no site; the block-boundary test caught it.
 
+### Added
+
+- **The owner-partition probe can redirect and restore VTL1 execution state
+  while an exception message is pending (`FOLLOWUPS.md` item 110 arm 1).** The
+  new `--pending-vtl1-state-write` mode receives its marked VTL1 CPL0 `#BP`,
+  writes and reads back `RIP=0x10180`, completes with instruction advance
+  cleared, and receives the next marked trap at exactly that address with the
+  same stack. It then writes the original continuation `RIP=0x10009` while the
+  second message is pending, again completes without advance, and requires the
+  original loop's resume witness. The guarded live run passed on 2026-10-02.
+  Exact-build Ghidra analysis explains the result:
+  `VidExceptionInterceptReturnCallback` calls
+  `VidInterceptAdvanceInstructionPointer` only when exchange-buffer byte
+  `+0x148` is nonzero. An initialized Secure Kernel stop can therefore redirect
+  to its published `DbgBreakPointWithStatus` address and restore the interrupted
+  `RIP` without patching Secure Kernel text.
+
 ## [0.21.0] - 2026-10-02
 
 ### Added
