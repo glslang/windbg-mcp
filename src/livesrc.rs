@@ -173,16 +173,26 @@ impl<R: BufRead, W: Write> Transport<R, W> {
 
     /// Send one request line — **the only path to the writer**, and that is the point.
     ///
-    /// Every exchange now has exactly two chokepoints, this and [`Transport::line`], and both refuse
-    /// a poisoned transport before touching its pipes. Checking in `line` alone was not enough and
-    /// the failure was worse than the one it fixed: `read_chunk` wrote its `READ` first and asked
-    /// afterwards, so a poisoned transport still had requests pushed at it. The decode continues past
-    /// failed pages, so the child kept answering into a stdout nobody drained, that pipe filled, the
-    /// child blocked writing, and this side then blocked flushing stdin — turning a framing error
-    /// into a deadlock. Raised in review on #434, against the poison guard's own introduction.
+    /// Every exchange has exactly two IO chokepoints, this and [`Transport::line`], and the rule for
+    /// both is total: *refuse a poisoned transport before touching a pipe, and poison it on any
+    /// failure.* Three review rounds on #434 arrived at it one site at a time — the guard first
+    /// checked only on the read side of an exchange that writes first, then poisoned only on the
+    /// failures after a status line had been read — so it is stated here as a contract rather than
+    /// left to be rediscovered at the next call site.
     ///
-    /// A predicate placed at one of two IO sites is a rule half-written. With the writer private to
-    /// this method, forgetting the check means not sending anything at all.
+    /// **Every error path, and why each one poisons:**
+    ///
+    /// | path | poisons | because |
+    /// |---|---|---|
+    /// | already poisoned | n/a | nothing is written; this is the refusal |
+    /// | `write_all`/`flush` fails | **yes** | the request may be half on the wire, so the child's next read is a truncated line |
+    /// | `line` read fails, or EOF, or over-long | **yes** | bytes may already be consumed, and the over-long case certainly consumed [`MAX_LINE_BYTES`] |
+    /// | `parse_status` says `REFUSED`/`NOTPRESENT` | **no** | a complete status line with no payload: the stream is still aligned, and poisoning would make one protected page kill the walk |
+    /// | `parse_status` fails otherwise, or a payload is short or unsent | **yes** | sender and reader disagree about where the next line starts |
+    ///
+    /// Only the one row that is an *answer* declines to poison, which is why it is the row with the
+    /// reason spelled out. With the writer private to this method, forgetting the check means not
+    /// sending anything at all.
     fn send(&mut self, request: &str) -> Result<()> {
         if self.poisoned {
             bail!(
@@ -190,8 +200,14 @@ impl<R: BufRead, W: Write> Transport<R, W> {
                  be sent to it"
             );
         }
+        // A partial write leaves the child reading a truncated request, so a write that fails is a
+        // framing fault like any other.
+        self.poisoned = true;
         self.writer.write_all(request.as_bytes())?;
         self.writer.flush()?;
+        // Cleared only once the whole request is on the wire. Set-then-clear rather than
+        // set-on-failure so that a `?` added to this method later cannot skip it.
+        self.poisoned = false;
         Ok(())
     }
 
@@ -261,7 +277,24 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     /// gigabyte of them would be printed as well as held.
     ///
     /// A fresh `take` per call, so the allowance is per line rather than per transport.
+    ///
+    /// **Any failure poisons the transport**, and that is total rather than a list: an `Err` from here
+    /// may have consumed part of a frame — the over-long case certainly consumed [`MAX_LINE_BYTES`] —
+    /// so the stream position is no longer known. The call sites used to decide this, which meant the
+    /// rule was as complete as whoever wrote the last one remembered it: `read_chunk` poisoned on a
+    /// bad status line and on a short payload but not on a failed *read* of the status line, so an
+    /// over-long line left the flag clear and the next request walked into the leftovers. Deciding it
+    /// here makes the caller's list unnecessary. Raised in review on #434, as the third finding on
+    /// this one rule.
     fn line(&mut self) -> Result<String> {
+        let outcome = self.read_one_line();
+        if outcome.is_err() {
+            self.poisoned = true;
+        }
+        outcome
+    }
+
+    fn read_one_line(&mut self) -> Result<String> {
         if self.poisoned {
             bail!(
                 "this transport desynchronised on an earlier framing fault, so its stream position \
@@ -798,6 +831,32 @@ mod tests {
             String::from_utf8(transport.writer.clone()).unwrap(),
             "READ 0x1000 16\n",
             "a second request reached the wire after the transport was poisoned"
+        );
+    }
+
+    #[test]
+    fn a_status_line_that_fails_to_read_poisons_the_transport_too() {
+        // The path the first two poison fixes both left open: `read_chunk` poisoned on a bad status
+        // line and on a short payload, and not on a failed *read* of the status line. An over-long
+        // line has certainly consumed MAX_LINE_BYTES, so the stream is misaligned and the next
+        // request would walk into the leftovers -- or deadlock against a child nobody is draining.
+        let flood = "z".repeat(MAX_LINE_BYTES as usize + 16) + "\nOK 4\nwxyz";
+        let mut transport = exchange(&flood);
+        let mut out = [0u8; 4];
+        let first = transport.read_chunk(Gpa(0x1000), &mut out).unwrap_err();
+        assert!(
+            matches!(&first, ReadFailure::SourceError { detail } if detail.contains("no newline")),
+            "{first:?}"
+        );
+        let second = transport.read_chunk(Gpa(0x2000), &mut out).unwrap_err();
+        assert!(
+            matches!(&second, ReadFailure::SourceError { detail } if detail.contains("desynchronised")),
+            "an over-long status line must poison: {second:?}"
+        );
+        // And no second request reached the wire, which is the half that prevents the deadlock.
+        assert_eq!(
+            String::from_utf8(transport.writer.clone()).unwrap(),
+            "READ 0x1000 4\n"
         );
     }
 
