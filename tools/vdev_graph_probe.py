@@ -4,11 +4,12 @@ This is the composition and lifecycle subgate of K1.2 from FOLLOWUPS.md item
 110.  Each child
 creates one fresh partition, activates all six devices, supplies the concrete
 VMBus, BIOS, and IOAPIC interfaces to their consumers, initializes in dependency
-order, mirrors the recovered RAM-construction-complete query loop, and tears
-down in reverse order.  The parent requires three clean runs.
+order, installs the measured fixed 4 GiB Windows RAM topology, mirrors the
+recovered RAM-construction-complete query loop, and tears down in reverse
+order.  The parent requires three clean runs.
 
-The probe intentionally does not start a VP or construct the final Windows RAM
-topology.  Those remain later K1.2 steps.
+The probe intentionally does not start a VP or execute firmware.  Those remain
+later gates.
 """
 
 from __future__ import annotations
@@ -18,6 +19,7 @@ import ctypes
 import json
 import os
 import pathlib
+import struct
 import subprocess
 import sys
 import uuid
@@ -29,6 +31,15 @@ import vdev_initialization_probe as contract
 CHILD_TIMEOUT_SECONDS = 30
 GRAPH_ORDER = ("vmbus", "ioapic", "bios", "rtc", "guest", "synthstor")
 REPETITIONS = 3
+PAGE_SIZE = 4096
+VSM_CONFIG_BYTES = 24
+MEMORY_BLOCK_VA_BACKED = 0x08
+MEMORY_BLOCK_VSM_CAPABLE = 0x01
+GPA_RANGE_APPLY_VTL_PROTECTIONS = 0x08
+RAM_SPANS = (
+    ("low", 0x000000000, 0x0F8000000),
+    ("high", 0x100000000, 0x008000000),
+)
 
 
 def emit(event: str, **fields: object) -> None:
@@ -71,6 +82,233 @@ def verify_vtable(kind: str, obj: ctypes.c_void_p) -> ctypes.POINTER(ctypes.c_vo
         )
     emit("vtable_verified", kind=kind, module=spec.module, slots_3_to_5=observed)
     return vtable
+
+
+class MemoryBlockDescriptor(ctypes.Structure):
+    _fields_ = [("words", ctypes.c_uint64 * 14)]
+
+
+class WindowsRamTopology:
+    """Install the two RAM spans measured in the one-VP managed VBS capture."""
+
+    def __init__(self, owner: contract.OwnerPartition) -> None:
+        self.owner = owner
+        self.blocks: list[int] = []
+        self.ranges: list[int] = []
+        self.mappings: list[int] = []
+
+        module = owner.module
+        self.set_vsm_config = module.VidVsmSetPartitionConfig
+        self.set_vsm_config.argtypes = [ctypes.c_void_p, wintypes.DWORD, ctypes.c_void_p]
+        self.set_vsm_config.restype = wintypes.BOOL
+        self.create_memory_block = module.VidCreateMemoryBlock
+        self.create_memory_block.argtypes = [
+            ctypes.c_void_p,
+            ctypes.POINTER(MemoryBlockDescriptor),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        self.create_memory_block.restype = wintypes.BOOL
+        self.destroy_memory_block = module.VidDestroyMemoryBlock
+        self.destroy_memory_block.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        self.destroy_memory_block.restype = wintypes.BOOL
+        self.create_gpa_range = module.VidCreateVaGpaRange
+        self.create_gpa_range.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        self.create_gpa_range.restype = wintypes.BOOL
+        self.destroy_gpa_range = module.VidDestroyGpaRange
+        self.destroy_gpa_range.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        self.destroy_gpa_range.restype = wintypes.BOOL
+        self.map_pages = module.VidMapMemoryBlockPageRange
+        self.map_pages.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            wintypes.DWORD,
+            ctypes.POINTER(ctypes.c_void_p),
+            ctypes.POINTER(ctypes.c_uint64),
+        ]
+        self.map_pages.restype = wintypes.BOOL
+        self.unmap_pages = module.VidUnmapMemoryBlockPageRange
+        self.unmap_pages.argtypes = [ctypes.c_void_p, ctypes.c_uint64]
+        self.unmap_pages.restype = wintypes.BOOL
+        self.read_pages = module.VidReadMemoryBlockPageRange
+        self.read_pages.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        self.read_pages.restype = wintypes.BOOL
+        self.setup_message_queue = module.VidSetupMessageQueue
+        self.setup_message_queue.argtypes = [ctypes.c_void_p, wintypes.DWORD]
+        self.setup_message_queue.restype = wintypes.BOOL
+        self.set_notification_queue = module.VidSetMemoryBlockNotificationQueue
+        self.set_notification_queue.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+        ]
+        self.set_notification_queue.restype = wintypes.BOOL
+
+        try:
+            self._configure_vsm()
+            self._check(
+                self.setup_message_queue(self.owner.handle, 1),
+                "VidSetupMessageQueue",
+            )
+            for index, (name, start, size) in enumerate(RAM_SPANS):
+                self._create_span(index, name, start, size)
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
+
+    @staticmethod
+    def _check(ok: int, operation: str) -> None:
+        if not ok:
+            raise ctypes.WinError(ctypes.get_last_error(), operation)
+
+    def _configure_vsm(self) -> None:
+        config = ctypes.create_string_buffer(VSM_CONFIG_BYTES)
+        struct.pack_into("<I", config, 0, 3)
+        struct.pack_into("<I", config, 4, 0)
+        struct.pack_into("<I", config, 12, 0xF)
+        self._check(
+            self.set_vsm_config(self.owner.handle, len(config), config),
+            "VidVsmSetPartitionConfig",
+        )
+        ctypes.memset(config, 0, len(config))
+        emit("vsm_configured", enabled_vtl_set=3, vtl1_default_protection=0xF)
+
+    def _create_span(self, index: int, name: str, start: int, size: int) -> None:
+        if start % PAGE_SIZE or size % PAGE_SIZE:
+            raise RuntimeError(f"unaligned RAM span {name}")
+        page_count = size // PAGE_SIZE
+        descriptor = MemoryBlockDescriptor()
+        descriptor.words[0] = page_count
+        descriptor.words[1] = page_count
+        descriptor.words[2] = MEMORY_BLOCK_VA_BACKED | MEMORY_BLOCK_VSM_CAPABLE
+        block = ctypes.c_uint64()
+        self._check(
+            self.create_memory_block(
+                self.owner.handle, ctypes.byref(descriptor), ctypes.byref(block)
+            ),
+            f"VidCreateMemoryBlock({name})",
+        )
+        self.blocks.append(block.value)
+        self._check(
+            self.set_notification_queue(self.owner.handle, block.value, 0),
+            f"VidSetMemoryBlockNotificationQueue({name})",
+        )
+
+        gpa_range = ctypes.c_uint64()
+        self._check(
+            self.create_gpa_range(
+                self.owner.handle,
+                start // PAGE_SIZE,
+                page_count,
+                block.value,
+                GPA_RANGE_APPLY_VTL_PROTECTIONS,
+                ctypes.byref(gpa_range),
+            ),
+            f"VidCreateVaGpaRange({name})",
+        )
+        self.ranges.append(gpa_range.value)
+
+        mapped = ctypes.c_void_p()
+        mapping = ctypes.c_uint64()
+        self._check(
+            self.map_pages(
+                self.owner.handle,
+                block.value,
+                0,
+                1,
+                2,
+                ctypes.byref(mapped),
+                ctypes.byref(mapping),
+            ),
+            f"VidMapMemoryBlockPageRange({name})",
+        )
+        self.mappings.append(mapping.value)
+        marker = struct.pack("<QQ", 0x4B3152414D535041, index)
+        ctypes.memmove(mapped, marker, len(marker))
+        verify = ctypes.create_string_buffer(PAGE_SIZE)
+        self._check(
+            self.read_pages(
+                self.owner.handle,
+                block.value,
+                0,
+                1,
+                verify,
+                len(verify),
+            ),
+            f"VidReadMemoryBlockPageRange({name})",
+        )
+        if verify.raw[: len(marker)] != marker:
+            raise RuntimeError(f"{name} RAM span readback changed")
+        ctypes.memset(mapped, 0, len(marker))
+        self._check(
+            self.unmap_pages(self.owner.handle, mapping.value),
+            f"VidUnmapMemoryBlockPageRange({name})",
+        )
+        self.mappings.pop()
+        emit(
+            "ram_span_created",
+            name=name,
+            start=f"0x{start:X}",
+            size=f"0x{size:X}",
+            pages=page_count,
+            block=f"0x{block.value:X}",
+            gpa_range=f"0x{gpa_range.value:X}",
+            readback=True,
+        )
+
+    def describe(self) -> dict[str, object]:
+        total = sum(size for _name, _start, size in RAM_SPANS)
+        return {
+            "source": "managed one-VP VBS checkpoint memory chunks",
+            "page_size": PAGE_SIZE,
+            "total_bytes": total,
+            "hole": {"start": "0xF8000000", "size": "0x8000000"},
+            "spans": [
+                {
+                    "name": name,
+                    "start": f"0x{start:X}",
+                    "size": f"0x{size:X}",
+                    "pages": size // PAGE_SIZE,
+                }
+                for name, start, size in RAM_SPANS
+            ],
+        }
+
+    def close(self) -> None:
+        failures = []
+        while self.mappings:
+            mapping = self.mappings.pop()
+            if not self.unmap_pages(self.owner.handle, mapping):
+                failures.append(f"unmap 0x{mapping:X}: {ctypes.get_last_error()}")
+        while self.ranges:
+            gpa_range = self.ranges.pop()
+            if not self.destroy_gpa_range(self.owner.handle, gpa_range):
+                failures.append(f"destroy range 0x{gpa_range:X}: {ctypes.get_last_error()}")
+        while self.blocks:
+            block = self.blocks.pop()
+            if not self.destroy_memory_block(self.owner.handle, block):
+                failures.append(f"destroy block 0x{block:X}: {ctypes.get_last_error()}")
+        if failures:
+            raise RuntimeError("RAM topology cleanup failed: " + "; ".join(failures))
+        emit("ram_topology_destroyed")
 
 
 def query_provided_interfaces(
@@ -162,11 +400,13 @@ def run_child(vm_id: str, iteration: int) -> int:
     initialized: list[str] = []
     services = None
     owner = None
+    topology = None
     contract.ole.CoInitializeEx(None, 0)
     try:
         identities = contract.verify_identities()
         emit("identities_verified", files=identities)
         owner = contract.OwnerPartition(vm_id)
+        topology = WindowsRamTopology(owner)
 
         for kind in GRAPH_ORDER:
             spec = contract.DEVICES[kind]
@@ -244,6 +484,9 @@ def run_child(vm_id: str, iteration: int) -> int:
             if repositories[kind].obj.refs != 1:
                 raise RuntimeError(f"{kind} retained its repository after destruction")
 
+        topology_description = topology.describe()
+        topology.close()
+        topology = None
         emit(
             "result",
             passed=True,
@@ -251,6 +494,7 @@ def run_child(vm_id: str, iteration: int) -> int:
             initialized=list(GRAPH_ORDER),
             teardown=list(reversed(GRAPH_ORDER)),
             concrete_services=concrete_service_names,
+            ram_topology=topology_description,
             ram_construction_complete={
                 "issued": True,
                 "argument": 0,
@@ -284,6 +528,11 @@ def run_child(vm_id: str, iteration: int) -> int:
             obj = objects.get(kind)
             if obj is not None:
                 contract.REF(vtable_of(obj)[2])(obj)
+        if topology is not None:
+            try:
+                topology.close()
+            except BaseException:
+                pass
         if owner is not None:
             owner.close()
         contract.ole.CoUninitialize()
@@ -358,7 +607,7 @@ def run_parent() -> int:
         json.dumps(
             {
                 "probe": "inbox_vdev_composed_initialization",
-                "scope": "initialization_ram_complete_and_teardown_without_vp_start",
+                "scope": "windows_ram_topology_ram_complete_and_teardown_without_vp_start",
                 "deadline_seconds_per_child": CHILD_TIMEOUT_SECONDS,
                 "repetitions": REPETITIONS,
                 "passed": passed,

@@ -96,6 +96,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The immutable minimum Windows/VBS boot inputs pass (`FOLLOWUPS.md` item
+  110, K1.0).** Private flattened bases from the VBS and VBS-off sources each
+  cold-boot three times through disposable differencing children with one VP,
+  fixed 4 GiB RAM, Secure Boot off, no TPM, network, DVD, or Guest Service
+  Interface. Paired saved-state reads distinguish them directly: the positive
+  clone exposes VTL masks `3`, a readable long-mode VTL1 root, and a validated
+  Secure Kernel module list containing `skci.dll`; the control exposes masks
+  `1` and refuses VTL1. This also measures the common two-span physical memory
+  map used by K1.2.
 - **The fatal inbox-device initialization spike for an owned Windows/VBS boot
   passed for all six minimum devices (`FOLLOWUPS.md` item 110, K1.1).**
   `tools/vdev_initialization_probe.py` runs guest emulation, BIOS, RTC, IOAPIC,
@@ -117,11 +126,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `IVmBios` interfaces between the inbox objects, initializes in dependency
   order, mirrors `vmwp`'s recovered `IID_IVirtualDeviceMemoryInfo` notification
   loop, tears down in reverse, verifies repository release after COM object
-  destruction, and deletes the partition. The final three live runs used fresh
-  partitions `0x85`–`0x87`. None of the six devices implements the optional
-  memory-info interface, so the RAM-complete phase is an asserted no-op. The
-  final Windows RAM topology, firmware execution, storage I/O, and VP start are
-  still open.
+  destruction, and deletes the partition. It now also configures VSM and installs
+  the managed one-VP Windows layout: `0xF8000000` bytes of low RAM, a 128 MiB
+  PCI/MMIO hole, and 128 MiB of high RAM at `0x100000000`. Both VSM-capable
+  memory blocks pass mapped-page readback and are destroyed during unwind. The
+  final three live runs used fresh partitions `0x15`–`0x17`. None of the six
+  devices implements the optional memory-info interface, so the RAM-complete
+  phase is an asserted no-op. K1.2 is closed; firmware execution, storage I/O,
+  and VP start remain open.
 - **The owner-partition probe can redirect and restore VTL1 execution state
   while an exception message is pending (`FOLLOWUPS.md` item 110 arm 1).** The
   new `--pending-vtl1-state-write` mode receives its marked VTL1 CPL0 `#BP`,

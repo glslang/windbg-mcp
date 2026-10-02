@@ -5,15 +5,15 @@ owner-created VID partition. It is the K1.2 composition and lifecycle subgate
 for `FOLLOWUPS.md` item 110.
 
 The probe passed three consecutive runs on the guarded Windows 11 build. Each
-run created one fresh process-local partition, activated all six devices,
-supplied concrete VMBus, BIOS, and IOAPIC interfaces to their consumers,
-initialized every device, ran the recovered RAM-construction-complete loop,
-tore down in reverse order, released the objects and repositories, and deleted
-the partition.
+run created one fresh process-local partition, configured VSM, installed the
+measured fixed 4 GiB Windows RAM topology, activated all six devices, supplied
+concrete VMBus, BIOS, and IOAPIC interfaces to their consumers, initialized
+every device, ran the recovered RAM-construction-complete loop, tore down in
+reverse order, released the objects and repositories, destroyed both memory
+ranges, and deleted the partition.
 
-This does not start a VP. It also does not yet construct the final Windows RAM
-topology. Firmware, synthetic-disk attachment, and a VTL0 boot remain later
-gates.
+This does not start a VP. Firmware execution, synthetic-disk attachment, and a
+VTL0 boot remain later gates.
 
 ## Run
 
@@ -25,8 +25,9 @@ python .\tools\vdev_graph_probe.py
 
 The parent runs three children with independent VM GUIDs and 30-second
 deadlines. A fault, hang, binary mismatch, stale contract manifest, unexpected
-callback, lifecycle failure, retained reference after object destruction, or
-partition-cleanup failure makes the parent exit nonzero.
+callback, memory-layout or readback failure, lifecycle failure, retained
+reference after object destruction, or cleanup failure makes the parent exit
+nonzero.
 
 The graph probe imports the guards and device definitions from
 `vdev_initialization_probe.py`. The generated source of truth is
@@ -63,6 +64,27 @@ object is destroyed. The probe therefore checks repository ownership after it
 closes graph-held provider interfaces and releases every device object. This is
 the observed object lifetime, not a leak hidden by process exit.
 
+## Fixed Windows RAM topology
+
+Paired one-VP managed checkpoints establish the same two memory chunks for the
+VBS and VBS-off disks. The positive arm reports VTL0+VTL1 enabled and a valid
+initialized Secure Kernel module list; the control reports only VTL0. Both give
+this fixed 4 GiB physical layout:
+
+| span | start | size | pages |
+|---|---:|---:|---:|
+| low RAM | `0x0` | `0xF8000000` | `0xF8000` |
+| PCI/MMIO hole | `0xF8000000` | `0x08000000` | not RAM |
+| high RAM | `0x100000000` | `0x08000000` | `0x8000` |
+
+Before device initialization, the probe enables VTL0 and VTL1 in the 24-byte
+VSM configuration, creates one VSM-capable VA-backed memory block per RAM span,
+binds both blocks to the partition's notification queue, and creates GPA ranges
+with default VTL protections. It maps and reads back one marked page from each
+block, then clears the markers. The RAM-complete query runs only after both
+ranges exist. Teardown destroys both ranges and blocks before deleting the
+partition.
+
 ## RAM-construction-complete lifecycle
 
 The exact `vmwp.exe` symbols place
@@ -87,12 +109,12 @@ The three-run elevated acceptance passed on 2026-10-02:
 
 | run | partition | initialize | RAM-complete phase | teardown | deleted |
 |---:|---:|---|---|---|---|
-| 1 | `0x85` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
-| 2 | `0x86` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
-| 3 | `0x87` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
+| 1 | `0x15` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
+| 2 | `0x16` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
+| 3 | `0x17` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
 
 This closes the uncertainty around object composition, concrete cross-device
-interfaces, ordering, repeated unwind, and the `vmwp` RAM-complete loop. The
-next owner-side step is to reproduce the final managed-VM RAM topology and
-firmware configuration, then reach a deterministic no-boot-device outcome
-before attaching a disk.
+interfaces, the final fixed RAM map, ordering, repeated unwind, and the `vmwp`
+RAM-complete loop. The next owner-side step is to recover the minimum firmware
+configuration and reach a deterministic no-boot-device outcome before attaching
+a disk.

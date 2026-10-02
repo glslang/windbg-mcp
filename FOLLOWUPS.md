@@ -2379,14 +2379,27 @@ to collect what does not depend on that step, and then to falsify it before anyt
    `VirtualMotherboard::NotifyAllDevicesRamConstructionComplete` at RVA `0x218780`: it queries every
    device for `IID_IVirtualDeviceMemoryInfo` and, when present, calls slot 4 with the value `0` passed
    by its caller. None of the six minimum objects exposes that interface after initialization, so the
-   matching notification phase is a measured six-device no-op. Three bounded runs passed in fresh
-   partitions `0x85`–`0x87`; every initialize and teardown returned `S_OK`, repository references
-   returned to the owner after COM destruction, and every partition was deleted. The runbook is
+   matching notification phase is a measured six-device no-op.
+
+   **K1.0 and the remaining K1.2 RAM gate now pass as a paired control.** D: was expanded, so both
+   source chains were flattened into private immutable bases and used only through differencing
+   children. A one-VP, fixed-4-GiB, Secure-Boot-off, TPM-free shape with no network, DVD, or Guest
+   Service Interface cold-booted three times for each disk. The positive capture reports VTL masks
+   `3`, a distinct readable long-mode VTL1 `CR3`, and a closed module list rooted at
+   `securekernel.exe` with `skci.dll`, `vmsvc.dll`, and `vmsvcext.sys`; the control reports masks `1`
+   and refuses VTL1. Both captures expose the same RAM chunks: `0xF8000` pages at zero and `0x8000`
+   pages at page `0x100000`, leaving the 128 MiB hole below 4 GiB.
+
+   The graph probe now configures VSM, creates those two VSM-capable VA-backed blocks, binds their
+   notification queue, creates the protected GPA ranges, and verifies mapped-page readback before
+   device initialization and RAM-complete. Three bounded runs passed in fresh partitions
+   `0x15`–`0x17`; every initialize and teardown returned `S_OK`, repository references returned to
+   the owner after COM destruction, both RAM ranges and blocks were destroyed, and every partition
+   was deleted. The runbook is
    [`docs/secure-kernel/vdev-graph-probe.md`](docs/secure-kernel/vdev-graph-probe.md).
 
-   K1.2 is not wholly closed because this probe does not yet install the final Windows RAM topology.
-   The remaining owner-side pre-firmware work is the managed-VM memory map and boot configuration;
-   the disk-copy gate is separately waiting for enough host free space. No irreducible managed
+   K1.2 is closed. The next owner-side gate is the minimum firmware configuration and a deterministic
+   no-boot-device outcome before attaching SynthStor to a private disk child. No irreducible managed
    service appeared, so the OpenVMM-derived contingency remains closed.
 4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
    experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
@@ -2423,11 +2436,12 @@ to collect what does not depend on that step, and then to falsify it before anyt
    model or guest OS cannot supply.
 
 **The honest summary, because a cost table invites the opposite reading.** A **resumable** stop
-inside a normally initialized Microsoft Secure Kernel is not reachable on this bench without owning
-the boot, and owning the boot is unvalidated at precisely one step. A **non-resumable observation**
-of one is reachable for days of work. And **inspection** needs neither: item 103 ships it off a
-capture today. **Arm 1 is complete and arm 2 remains worth running whatever arm 3 says**, which is
-why neither is sequenced behind the owned-boot build.
+inside a normally initialized Microsoft Secure Kernel still requires owning the boot. Immutable
+minimum disks, the VBS/control discrimination, the six-device graph, and the final fixed RAM map now
+pass; firmware execution, synthetic storage, and the owner-hosted Windows/VBS boot do not yet. A
+**non-resumable observation** remains cheaper, and **inspection** needs neither route because item
+103 ships it off a capture today. Arm 1 is complete and arm 2 remains independent of the owned-boot
+build.
 
 **Safety rules that are not negotiable per arm.** Never enumerate or open an existing VM from the
 owner-partition probe. Use only flattened clones, fresh copy-on-write children and fresh owned
