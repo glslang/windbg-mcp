@@ -47,9 +47,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   answer with no framework at all. **The absence of the field is deliberately not a claim**: it is
   added when a tell fires and nothing is added when none does, so an image whose import names could
   not be read is a driver nothing said anything about rather than a WDM one. What this does **not**
-  do is resolve the driver's real callbacks — device control reaches an I/O queue's
-  a callback this build cannot resolve and does not guess at, held in a per-device config whose layout moves with `Wdf01000.sys`'s own
-  version line — which is item 108's remaining step and is why the field tells a reader where *not*
+  do is resolve the driver's own handler, and it does not guess at where that is: a client's
+  control-code comparison may be in a callback the framework holds — whose layout moves with
+  `Wdf01000.sys`'s own version line, independently of the OS build — or in a routine that was
+  registered as nothing at all, a manual queue's consumer being pulled by the driver's own worker or
+  timer. Which it is, is item 108's remaining step, and is why the field tells a reader where *not*
   to look. UMDF (`WUDFx02000.dll`, user mode) is recognised nowhere and the note says so. Two gaps
   stated rather than left implied: the `MajorFunction`-entry tell is **unit-tested and
   mutation-verified but has not been run against a live kernel**, `driver_surface` needing one —
