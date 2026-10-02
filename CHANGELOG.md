@@ -33,8 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **`Refused { detail: "ReadIntercept(2)" }`**, so `ReadStats::refused` is above zero outside a
   fixture for the first time and the decode declines to claim the negative: *"this run identified
   nothing while 2 read(s) failed, so its negative has not been earned."* That is the one mistake the
-  seam was shaped to prevent — a refusal collapsing into a failure would have produced the VBS-off
-  control's answer from a VBS-on guest — now demonstrated rather than argued. **It is a command-line
+  seam was shaped to prevent — a refusal collapsing into **success**, zeros handed back as bytes,
+  would have produced the VBS-off control's answer from a VBS-on guest — now demonstrated rather
+  than argued. **Collapsing it into a plain failure is a different and lesser mistake**, and this
+  sentence said it was the same one until review on
+  [#435](https://github.com/glslang/windbg-mcp/pull/435) read it against the message quoted two
+  lines above it: a failed read is exactly what makes the decode withhold the negative, so what
+  that loses is the *classification* naming the cause, not the verdict. **It is a command-line
   role and deliberately not a fifth MCP tool**, because the two consequences a live source has for a
   capture *session* are now measured instead of assumed: one of `securekernel.exe`'s 373 pages changed
   in 20 seconds — 2 bytes, in **`.data`** — while 1,200 sampled non-image pages and every landmark
