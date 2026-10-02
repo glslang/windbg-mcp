@@ -4,9 +4,10 @@ This is the composition and lifecycle subgate of K1.2 from FOLLOWUPS.md item
 110.  Each child
 creates one fresh partition, activates all six devices, supplies the concrete
 VMBus, BIOS, and IOAPIC interfaces to their consumers, initializes in dependency
-order, installs the measured fixed 4 GiB Windows RAM topology, mirrors the
-recovered RAM-construction-complete query loop, and tears down in reverse
-order.  The parent requires three clean runs.
+order, runs the recovered resource-reservation phase around construction of the
+measured fixed 4 GiB Windows RAM topology, mirrors the recovered
+RAM-construction-complete query loop, frees every reservation, and tears down in
+reverse order.  The parent requires three clean runs.
 
 The probe intentionally does not start a VP or execute firmware.  Those remain
 later gates.
@@ -40,6 +41,14 @@ RAM_SPANS = (
     ("low", 0x000000000, 0x0F8000000),
     ("high", 0x100000000, 0x008000000),
 )
+RESOURCE_LIFECYCLE_RVAS = {
+    "vmbus": (0xFEE0, 0xFEE0, 0xFEE0),
+    "ioapic": (0x12890, 0x37FB0, 0x38020),
+    "bios": (0x4A480, 0x44650, 0x446B0),
+    "rtc": (0x12890, 0x37FB0, 0x38020),
+    "guest": (0x6B450, 0x62390, 0x62770),
+    "synthstor": (0x23EA0, 0x17BD0, 0x17CD0),
+}
 
 
 def emit(event: str, **fields: object) -> None:
@@ -69,18 +78,19 @@ def verify_vtable(kind: str, obj: ctypes.c_void_p) -> ctypes.POINTER(ctypes.c_vo
     expected_path, _ = contract.guarded_path(spec.module)
     vtable = vtable_of(obj)
     observed = []
-    for slot in range(3, 6):
+    for slot in range(3, 9):
         module, rva = contract.module_and_rva(int(vtable[slot] or 0))
         if os.path.normcase(os.path.abspath(module)) != os.path.normcase(
             os.path.abspath(expected_path)
         ):
             raise RuntimeError(f"{kind} IVirtualDevice slot {slot} came from {module}")
         observed.append(rva)
-    if tuple(observed) != spec.vtable_rvas:
+    expected = spec.vtable_rvas + RESOURCE_LIFECYCLE_RVAS[kind]
+    if tuple(observed) != expected:
         raise RuntimeError(
-            f"{kind} vtable changed: observed={observed} expected={spec.vtable_rvas}"
+            f"{kind} vtable changed: observed={observed} expected={expected}"
         )
-    emit("vtable_verified", kind=kind, module=spec.module, slots_3_to_5=observed)
+    emit("vtable_verified", kind=kind, module=spec.module, slots_3_to_8=observed)
     return vtable
 
 
@@ -398,6 +408,8 @@ def run_child(vm_id: str, iteration: int) -> int:
     repositories: dict[str, contract.RecordingRepository] = {}
     provided: dict[str, contract.ComInterfaceService] = {}
     initialized: list[str] = []
+    reserving: list[str] = []
+    reserved: list[str] = []
     services = None
     owner = None
     topology = None
@@ -406,8 +418,6 @@ def run_child(vm_id: str, iteration: int) -> int:
         identities = contract.verify_identities()
         emit("identities_verified", files=identities)
         owner = contract.OwnerPartition(vm_id)
-        topology = WindowsRamTopology(owner)
-
         for kind in GRAPH_ORDER:
             spec = contract.DEVICES[kind]
             obj = contract.activate(spec.clsid)
@@ -438,7 +448,53 @@ def run_child(vm_id: str, iteration: int) -> int:
                 )
             initialized.append(kind)
 
+        start_reserving_type = ctypes.WINFUNCTYPE(
+            ctypes.c_long,
+            ctypes.c_void_p,
+            ctypes.c_void_p,
+            wintypes.DWORD,
+        )
+        for kind in GRAPH_ORDER:
+            result = start_reserving_type(vtables[kind][6])(
+                objects[kind], None, 0
+            )
+            emit("start_reserving_resources", kind=kind, result=contract.hresult(result))
+            if result < 0:
+                raise RuntimeError(
+                    f"{kind} StartReservingResources returned {contract.hresult(result)}"
+                )
+            reserving.append(kind)
+
+        topology = WindowsRamTopology(owner)
         memory_info_devices = notify_ram_construction_complete(objects)
+
+        finish_reserving_type = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, wintypes.DWORD
+        )
+        for kind in GRAPH_ORDER:
+            result = finish_reserving_type(vtables[kind][7])(objects[kind], 0)
+            emit(
+                "finish_reserving_resources",
+                kind=kind,
+                rollback=False,
+                result=contract.hresult(result),
+            )
+            if result < 0:
+                raise RuntimeError(
+                    f"{kind} FinishReservingResources returned {contract.hresult(result)}"
+                )
+            reserving.remove(kind)
+            reserved.append(kind)
+
+        free_resources_type = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+        while reserved:
+            kind = reserved.pop()
+            result = free_resources_type(vtables[kind][8])(objects[kind])
+            emit("free_reserved_resources", kind=kind, result=contract.hresult(result))
+            if result < 0:
+                raise RuntimeError(
+                    f"{kind} FreeReservedResources returned {contract.hresult(result)}"
+                )
 
         teardown_type = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
         while initialized:
@@ -492,6 +548,9 @@ def run_child(vm_id: str, iteration: int) -> int:
             passed=True,
             iteration=iteration,
             initialized=list(GRAPH_ORDER),
+            start_reserving_resources=list(GRAPH_ORDER),
+            finish_reserving_resources=list(GRAPH_ORDER),
+            free_reserved_resources=list(reversed(GRAPH_ORDER)),
             teardown=list(reversed(GRAPH_ORDER)),
             concrete_services=concrete_service_names,
             ram_topology=topology_description,
@@ -512,6 +571,30 @@ def run_child(vm_id: str, iteration: int) -> int:
         )
         return 1
     finally:
+        finish_reserving_type = ctypes.WINFUNCTYPE(
+            ctypes.c_long, ctypes.c_void_p, wintypes.DWORD
+        )
+        free_resources_type = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
+        while reserving:
+            kind = reserving.pop()
+            try:
+                result = finish_reserving_type(vtables[kind][7])(objects[kind], 1)
+                emit(
+                    "finish_reserving_resources",
+                    kind=kind,
+                    rollback=True,
+                    result=contract.hresult(result),
+                )
+                if result >= 0:
+                    free_resources_type(vtables[kind][8])(objects[kind])
+            except BaseException:
+                pass
+        while reserved:
+            kind = reserved.pop()
+            try:
+                free_resources_type(vtables[kind][8])(objects[kind])
+            except BaseException:
+                pass
         teardown_type = ctypes.WINFUNCTYPE(ctypes.c_long, ctypes.c_void_p)
         while initialized:
             kind = initialized.pop()
@@ -607,7 +690,7 @@ def run_parent() -> int:
         json.dumps(
             {
                 "probe": "inbox_vdev_composed_initialization",
-                "scope": "windows_ram_topology_ram_complete_and_teardown_without_vp_start",
+                "scope": "resource_lifecycle_windows_ram_topology_and_teardown_without_vp_start",
                 "deadline_seconds_per_child": CHILD_TIMEOUT_SECONDS,
                 "repetitions": REPETITIONS,
                 "passed": passed,

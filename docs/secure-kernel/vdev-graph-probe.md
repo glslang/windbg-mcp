@@ -5,12 +5,13 @@ owner-created VID partition. It is the K1.2 composition and lifecycle subgate
 for `FOLLOWUPS.md` item 110.
 
 The probe passed three consecutive runs on the guarded Windows 11 build. Each
-run created one fresh process-local partition, configured VSM, installed the
-measured fixed 4 GiB Windows RAM topology, activated all six devices, supplied
-concrete VMBus, BIOS, and IOAPIC interfaces to their consumers, initialized
-every device, ran the recovered RAM-construction-complete loop, tore down in
-reverse order, released the objects and repositories, destroyed both memory
-ranges, and deleted the partition.
+run created one fresh process-local partition, activated all six devices,
+supplied concrete VMBus, BIOS, and IOAPIC interfaces to their consumers,
+initialized every device, began resource reservation, configured VSM, installed
+the measured fixed 4 GiB Windows RAM topology, ran the recovered RAM-complete
+and reservation-finish phases, freed every reservation, tore down in reverse
+order, released the objects and repositories, destroyed both memory ranges, and
+deleted the partition.
 
 This does not start a VP. Firmware execution, synthetic-disk attachment, and a
 VTL0 boot remain later gates.
@@ -77,13 +78,30 @@ this fixed 4 GiB physical layout:
 | PCI/MMIO hole | `0xF8000000` | `0x08000000` | not RAM |
 | high RAM | `0x100000000` | `0x08000000` | `0x8000` |
 
-Before device initialization, the probe enables VTL0 and VTL1 in the 24-byte
-VSM configuration, creates one VSM-capable VA-backed memory block per RAM span,
-binds both blocks to the partition's notification queue, and creates GPA ranges
-with default VTL protections. It maps and reads back one marked page from each
-block, then clears the markers. The RAM-complete query runs only after both
-ranges exist. Teardown destroys both ranges and blocks before deleting the
-partition.
+The probe initializes the devices first and calls slot 6,
+`StartReservingResources`, in graph order. It then enables VTL0 and VTL1 in the
+24-byte VSM configuration, creates one VSM-capable VA-backed memory block per
+RAM span, binds both blocks to the partition's notification queue, and creates
+GPA ranges with default VTL protections. It maps and reads back one marked page
+from each block, then clears the markers. The RAM-complete query runs only after
+both ranges exist. Slot 7, `FinishReservingResources`, then runs in graph order
+with rollback clear. Slot 8, `FreeReservedResources`, and teardown run in
+reverse. A partial failure calls `FinishReservingResources` with rollback set
+and frees each successfully started reservation before object teardown.
+
+The guarded slot 6 through 8 RVAs are:
+
+| device | start | finish | free |
+|---|---:|---:|---:|
+| VMBus | `0xFEE0` | `0xFEE0` | `0xFEE0` |
+| IOAPIC | `0x12890` | `0x37FB0` | `0x38020` |
+| BIOS | `0x4A480` | `0x44650` | `0x446B0` |
+| RTC | `0x12890` | `0x37FB0` | `0x38020` |
+| guest emulation | `0x6B450` | `0x62390` | `0x62770` |
+| SynthStor | `0x23EA0` | `0x17BD0` | `0x17CD0` |
+
+The probe checks those entries before making a lifecycle call. Teardown then
+destroys both ranges and blocks before deleting the partition.
 
 ## RAM-construction-complete lifecycle
 
@@ -105,16 +123,16 @@ run; its measured outcome is a six-device no-op.
 
 ## Measured result
 
-The three-run elevated acceptance passed on 2026-10-02:
+The resource-lifecycle acceptance passed on 2026-10-02:
 
-| run | partition | initialize | RAM-complete phase | teardown | deleted |
+| run | partition | start/finish/free | RAM-complete phase | teardown | deleted |
 |---:|---:|---|---|---|---|
-| 1 | `0x15` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
-| 2 | `0x16` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
-| 3 | `0x17` | six devices, `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
+| 1 | `0x1A` | six devices, all `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
+| 2 | `0x1B` | six devices, all `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
+| 3 | `0x1C` | six devices, all `S_OK` | issued; zero supporting devices | six devices, `S_OK` | yes |
 
 This closes the uncertainty around object composition, concrete cross-device
-interfaces, the final fixed RAM map, ordering, repeated unwind, and the `vmwp`
-RAM-complete loop. The next owner-side step is to recover the minimum firmware
-configuration and reach a deterministic no-boot-device outcome before attaching
-a disk.
+interfaces, the final fixed RAM map, the pre-power resource lifecycle, repeated
+unwind, and the `vmwp` RAM-complete loop. The next owner-side step is to replace
+the firmware-time service stubs, create the first VP, and reach a deterministic
+no-boot-device outcome before attaching a disk.

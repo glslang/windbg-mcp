@@ -2390,12 +2390,14 @@ to collect what does not depend on that step, and then to falsify it before anyt
    and refuses VTL1. Both captures expose the same RAM chunks: `0xF8000` pages at zero and `0x8000`
    pages at page `0x100000`, leaving the 128 MiB hole below 4 GiB.
 
-   The graph probe now configures VSM, creates those two VSM-capable VA-backed blocks, binds their
-   notification queue, creates the protected GPA ranges, and verifies mapped-page readback before
-   device initialization and RAM-complete. Three bounded runs passed in fresh partitions
-   `0x15`–`0x17`; every initialize and teardown returned `S_OK`, repository references returned to
-   the owner after COM destruction, both RAM ranges and blocks were destroyed, and every partition
-   was deleted. The runbook is
+   The graph probe now follows the recovered pre-power lifecycle: it initializes the graph, calls
+   `StartReservingResources` on every device, creates those two VSM-capable VA-backed blocks, binds
+   their notification queue, creates the protected GPA ranges, verifies mapped-page readback and
+   issues RAM-complete, then calls `FinishReservingResources` and frees every reservation before
+   teardown. Slots 6 through 8 are guarded by exact per-device RVAs. Three bounded acceptance runs
+   passed in fresh partitions `0x1A` through `0x1C`; all 18 resource calls, every initialize, and
+   every teardown returned `S_OK`, repository references returned to the owner after COM destruction,
+   both RAM ranges and blocks were destroyed, and every partition was deleted. The runbook is
    [`docs/secure-kernel/vdev-graph-probe.md`](docs/secure-kernel/vdev-graph-probe.md).
 
    K1.2 is closed. The next owner-side gate is the minimum firmware configuration and a deterministic

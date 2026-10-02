@@ -103,7 +103,8 @@ isolated children outside `vmwp`; five do so against fresh direct-VID partitions
 execute firmware and storage and boot Windows/VBS before reproducing the stop in an initialized
 Secure Kernel. The next composition gate passes too: the six devices share one partition and real
 VMBus/BIOS/IOAPIC interfaces for three runs, including the exact fixed 4 GiB Windows RAM topology,
-the RAM-complete query loop, and reverse teardown. Firmware execution and storage I/O are next.
+the recovered start/finish/free resource lifecycle, the RAM-complete query loop, and reverse
+teardown. Firmware execution and storage I/O are next.
 Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
 and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even
