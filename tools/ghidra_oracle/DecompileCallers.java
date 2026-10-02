@@ -74,11 +74,17 @@ public class DecompileCallers extends GhidraScript {
         // Split by reference TYPE, because `getReferencesTo` returns every reference and not only
         // calls. A function that merely takes the callee's address -- registering a callback, filling
         // a dispatch-table slot, a bare `lea` -- was being reported as a caller, which is an oracle
-        // stating something the image does not say. Both halves are kept rather than one filtered
-        // away: an address taken is how an indirect call happens, so it is the more interesting row
-        // of the two and dropping it would lose what this script is usually run to find. Same
+        // stating something the image does not say. Nothing is filtered away: an address taken is how
+        // an indirect call happens, so it is often the row this script is run to find. Same
         // convention as `tools/vid_field_census.py`, which reports `lea` separately for this reason.
+        //
+        // THREE buckets rather than two, because `!isCall()` is not the same as "takes the address".
+        // A tail call or a shared-epilogue jump straight to the target is `isJump()`, and calling that
+        // an address-taken would be a second wrong claim in place of the first. Reported as its own
+        // row instead -- it is nearer a caller than a data reference, and conflating it either way
+        // loses which one the image actually holds. Raised in review on #434.
         Set<Function> callers = new LinkedHashSet<>();
+        Set<Function> jumps = new LinkedHashSet<>();
         Set<Function> addressTaken = new LinkedHashSet<>();
         for (Address destination : expanded) {
             ReferenceIterator references = currentProgram.getReferenceManager()
@@ -92,14 +98,20 @@ public class DecompileCallers extends GhidraScript {
                 if (reference.getReferenceType().isCall()) {
                     callers.add(from);
                 }
+                else if (reference.getReferenceType().isJump()) {
+                    jumps.add(from);
+                }
                 else {
                     addressTaken.add(from);
                 }
             }
         }
-        // A function that both calls the target and takes its address is a caller; listing it twice
-        // would make the two counts overlap with nothing saying so.
-        addressTaken.removeAll(callers);
+        // The three sets MAY OVERLAP, deliberately. An earlier version subtracted the callers out of
+        // the address-taken set so the counts would not double-count, which silently deleted the
+        // interesting case: a function that both calls the target and stores its address can be
+        // reached either way, and the second route is exactly what an indirect-call investigation is
+        // looking for. The report says the counts overlap rather than making them disjoint by
+        // dropping evidence.
 
         Files.createDirectories(output.toAbsolutePath().getParent());
         DecompInterface decompiler = new DecompInterface();
@@ -117,8 +129,15 @@ public class DecompileCallers extends GhidraScript {
             // of these addresses is not counted here, and the honest form of that is to name the
             // scope rather than to claim completeness this script cannot deliver.
             out.println("scope=references Ghidra resolved to the target addresses above and their "
-                    + "thunks; a call through an unresolved pointer slot is not counted");
+                    + "thunks, split by reference type; a call through an unresolved pointer slot is "
+                    + "in none of the three counts, and the counts MAY OVERLAP because one function "
+                    + "can reference the target in more than one way");
             out.println("callers=" + callers.size());
+            out.println("jumps=" + jumps.size());
+            for (Function function : jumps) {
+                long rva = function.getEntryPoint().subtract(currentProgram.getImageBase());
+                out.println("jumps_to=" + function.getName() + " rva=0x" + Long.toHexString(rva));
+            }
             out.println("address_taken=" + addressTaken.size());
             for (Function function : addressTaken) {
                 long rva = function.getEntryPoint().subtract(currentProgram.getImageBase());

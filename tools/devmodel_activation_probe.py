@@ -346,20 +346,12 @@ def main() -> int:
         )
     print()
 
-    refused = [r for r in rows if r["hr"] == "0x80040111"]
-    if refused:
-        print("the refusals, against whether their module carries the GUID at all:")
-        for r in refused:
-            print(
-                "  %s %-24s %s  guid_in_image=%s"
-                % (r["clsid"], r.get("name"), r["dll"], clsid_bytes_in_module(r["clsid"], r["path"]))
-            )
-        print()
-    # The controls are read BEFORE the total, and a bad one suppresses it. They exist to tell a
-    # device-model refusal from a broken probe, and a run that prints `ACTIVATED=0` with a positive
-    # control that also failed has measured its own call path and nothing about Hyper-V -- which is
-    # exactly the reading the controls were added to prevent, so leaving them unchecked made them
-    # decoration. Raised in review on #434.
+    # The controls are read before ANYTHING is interpreted, which is stricter than the first version
+    # of this check and for a reason that version demonstrated: it sat after the refusal analysis
+    # below, and a *control* that came back CLASS_E_CLASSNOTAVAILABLE landed in `refused`, where
+    # `r["path"]` raised `KeyError` -- control rows carry no module path. So the one scenario the
+    # check exists to diagnose crashed the probe before it could report it. Raised in review on #434,
+    # against this check's own introduction.
     by_clsid = {r["clsid"]: r for r in rows}
     positive = by_clsid.get(CONTROL_POSITIVE, {})
     negative = by_clsid.get(CONTROL_NEGATIVE, {})
@@ -375,11 +367,26 @@ def main() -> int:
             % (CONTROL_NEGATIVE, negative.get("hr"), negative.get("hr_name") or "")
         )
     if broken:
-        print("CONTROLS FAILED -- no total is reported, because it would not mean anything:")
+        print("CONTROLS FAILED -- nothing below is reported, because it would not mean anything:")
         for why in broken:
             print("  %s" % why)
         return 1
 
+    # Device-model rows only: a control has no backing module, so asking whether its module carries
+    # the GUID is not a question. `CONTROLS`-prefixed `dll` values are how those rows are marked.
+    refused = [
+        r
+        for r in rows
+        if r["hr"] == "0x80040111" and r["dll"] not in ("(control+)", "(control-)")
+    ]
+    if refused:
+        print("the refusals, against whether their module carries the GUID at all:")
+        for r in refused:
+            print(
+                "  %s %-24s %s  guid_in_image=%s"
+                % (r["clsid"], r.get("name"), r["dll"], clsid_bytes_in_module(r["clsid"], r["path"]))
+            )
+        print()
     ok = [r for r in rows if r["hr"] == "0x00000000" and r["dll"] not in ("(control+)", "(control-)")]
     print("controls   positive=S_OK  negative=REGDB_E_CLASSNOTREG")
     print("ACTIVATED=%d of %d device-model classes" % (len(ok), len(targets)))

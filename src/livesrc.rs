@@ -86,9 +86,22 @@ pub(crate) const READY_LINE: &str = "windbg-mcp-gpa/1";
 
 /// How many lines of a transport's own output to skip before giving up on the sentinel.
 ///
-/// A bound rather than reading until it appears: a transport that never prints it — the wrong
-/// program, or one writing a log to stdout — would otherwise be read until it exited or for ever,
-/// and the failure would look like a hang rather than a misconfiguration.
+/// A bound rather than reading until it appears: a transport that prints the wrong thing — the wrong
+/// program, or one writing a log to stdout — is refused instead of being read until it exits.
+///
+/// **It bounds completed lines and not time, and there is no read deadline anywhere in this module.**
+/// A transport that starts and then produces no newline at all blocks this role indefinitely: the
+/// length bound in [`Transport::line`] only fires once [`MAX_LINE_BYTES`] have *arrived*, and
+/// [`TEARDOWN_GRACE`] applies after `Drop` has begun, which a blocked read never reaches. So a
+/// provider that hangs during startup leaves `--sk-live` and its child running until the operator
+/// interrupts it.
+///
+/// That is **declined rather than unnoticed** (raised in review on #434). The remedy is a watchdog —
+/// a reader thread, or non-blocking IO plus a deadline on every exchange — which is real machinery in
+/// a role that is a foreground command, run by the operator who wrote the transport, and
+/// interruptible from the terminal where its diagnostics are already printing. The same hang in the
+/// MCP server would be a different judgement, and this module is deliberately not reachable from it:
+/// see `main.rs`'s dispatch, and gate S5x for the other reason.
 const MAX_BANNER_LINES: usize = 64;
 
 /// The most one line of a transport's output may be. See [`Transport::line`].
@@ -116,6 +129,8 @@ pub(crate) struct Transport<R: BufRead, W: Write> {
     reader: R,
     writer: W,
     max_read: usize,
+    /// Set by a framing fault, after which the stream's position is unknown.
+    poisoned: bool,
 }
 
 /// What a transport said about the processor, before it is turned into a [`GuestShape`].
@@ -133,6 +148,7 @@ impl<R: BufRead, W: Write> Transport<R, W> {
             // Until `SHAPE` answers. One byte is a legal transfer width and a useless one, which is
             // the right default for a field that must not be guessed generously.
             max_read: 1,
+            poisoned: false,
         }
     }
 
@@ -177,21 +193,37 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         let line = self.line().map_err(|e| ReadFailure::SourceError {
             detail: format!("reading the status line failed: {e}"),
         })?;
-        match parse_status(&line, out.len())? {
+        // A framing fault **poisons the transport**, because after one the stream's position is no
+        // longer known and this protocol has no resync token to recover it with. The case that makes
+        // this necessary rather than tidy: `OK 4` against a 16-byte request used to return `Short`
+        // without consuming the four bytes it announced, and the decode carries on after a failed
+        // read — so the *next* request read those bytes as its status line, and every exchange after
+        // that was misaligned. Consuming the announced bytes instead would not fix it, because a
+        // transport that announced four and sends two leaves the same problem one step later.
+        let status = parse_status(&line, out.len()).inspect_err(|failure| {
+            if framing_fault(failure) {
+                self.poisoned = true;
+            }
+        })?;
+        match status {
             // A short count is not an error to report later: the trait says a short read *is* a
             // failed read, so it is one here rather than something a caller might judge on.
-            Some(got) if got != out.len() => Err(ReadFailure::Short {
-                got,
-                want: out.len(),
-            }),
+            Some(got) if got != out.len() => {
+                self.poisoned = true;
+                Err(ReadFailure::Short {
+                    got,
+                    want: out.len(),
+                })
+            }
             Some(got) => {
-                self.reader
-                    .read_exact(&mut out[..got])
-                    .map_err(|e| ReadFailure::SourceError {
+                self.reader.read_exact(&mut out[..got]).map_err(|e| {
+                    self.poisoned = true;
+                    ReadFailure::SourceError {
                         detail: format!(
                             "the transport announced {got} bytes and did not send them: {e}"
                         ),
-                    })?;
+                    }
+                })?;
                 Ok(())
             }
             None => unreachable!("parse_status returns Err for every non-OK status"),
@@ -210,6 +242,12 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     ///
     /// A fresh `take` per call, so the allowance is per line rather than per transport.
     fn line(&mut self) -> Result<String> {
+        if self.poisoned {
+            bail!(
+                "this transport desynchronised on an earlier framing fault, so its stream position \
+                 is unknown and nothing further can be read from it"
+            );
+        }
         let mut line = String::new();
         // `Read::take` by its full path with an explicit `&mut R` receiver: written as
         // `self.reader.by_ref().take(..)` the auto-deref picks `take` on `R` itself and moves the
@@ -329,6 +367,24 @@ pub(crate) fn parse_status(line: &str, want: usize) -> Result<Option<usize>, Rea
         other => Err(ReadFailure::SourceError {
             detail: format!("unknown status word {other:?} in {line:?}"),
         }),
+    }
+}
+
+/// Whether a failure leaves bytes on the wire that nothing has read.
+///
+/// `Refused`, `NotPresent` and a transport-reported `ERROR` are *answers*: the status line is
+/// complete and no payload follows, so the stream is still aligned and the next request is fine.
+/// A malformed status, or an announced length this side will not accept, means the sender and the
+/// reader disagree about where the next line starts.
+fn framing_fault(failure: &ReadFailure) -> bool {
+    match failure {
+        ReadFailure::Refused { .. } | ReadFailure::NotPresent => false,
+        ReadFailure::Short { .. } => true,
+        // `SourceError` covers both: `ERROR <detail>` from the transport, which is an answer, and
+        // an unparseable or over-long `OK`, which is not. The detail is not inspected to tell them
+        // apart -- matching on a message is how that goes wrong later -- so this is conservative
+        // and poisons both. Costing an operator one re-run beats reading a misaligned stream.
+        ReadFailure::SourceError { .. } => true,
     }
 }
 
@@ -696,6 +752,43 @@ mod tests {
         let mut out = [0u8; 16];
         let err = transport.read_chunk(Gpa(0x1000), &mut out).unwrap_err();
         assert_eq!(err, ReadFailure::Short { got: 4, want: 16 });
+    }
+
+    #[test]
+    fn a_framing_fault_poisons_the_transport_rather_than_leaving_the_stream_misaligned() {
+        // The defect: `OK 4` against a 16-byte request left `abcd` unread, and the decode carries on
+        // after a failed read -- so the next request took those bytes as its status line. Here the
+        // second exchange would otherwise read `abcd` and then `OK 4` as data.
+        let mut transport = exchange("OK 4\nabcdOK 4\nefgh");
+        let mut out = [0u8; 16];
+        assert_eq!(
+            transport.read_chunk(Gpa(0x1000), &mut out).unwrap_err(),
+            ReadFailure::Short { got: 4, want: 16 }
+        );
+        let second = transport.read_chunk(Gpa(0x2000), &mut out).unwrap_err();
+        assert!(
+            matches!(&second, ReadFailure::SourceError { detail } if detail.contains("desynchronised")),
+            "a poisoned transport must refuse rather than read the leftover payload: {second:?}"
+        );
+    }
+
+    #[test]
+    fn an_answer_that_carries_no_payload_does_not_poison_the_transport() {
+        // The other side of it, and the reason the classifier exists: a refusal is a complete status
+        // line with nothing after it, so the stream is still aligned and the walk must be able to go
+        // on to the next page. Poisoning here would turn one protected page into a dead transport.
+        let mut transport = exchange("REFUSED ReadIntercept\nNOTPRESENT\nOK 4\nwxyz");
+        let mut out = [0u8; 4];
+        assert!(matches!(
+            transport.read_chunk(Gpa(0x1000), &mut out),
+            Err(ReadFailure::Refused { .. })
+        ));
+        assert_eq!(
+            transport.read_chunk(Gpa(0x2000), &mut out),
+            Err(ReadFailure::NotPresent)
+        );
+        transport.read_chunk(Gpa(0x3000), &mut out).unwrap();
+        assert_eq!(&out, b"wxyz");
     }
 
     #[test]

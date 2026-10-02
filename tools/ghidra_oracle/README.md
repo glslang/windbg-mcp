@@ -60,11 +60,16 @@ the IOCTL differential lane:
 - `DecompileFunctions.java` writes deterministic decompilation for named
   functions or image-relative RVAs.
 - `DecompileCallers.java` follows an internal or imported symbol through its
-  thunk and decompiles the functions that reference it, split into `callers=`
-  (call references) and `address_taken=` (everything else, which is how an
-  indirect call happens). Its `scope=` line says what the report covers: a call
-  reached only through a pointer slot Ghidra left unresolved is in neither count,
-  so `callers=0` is not a claim that none exists. It also accepts an image-relative RVA for
+  thunk and decompiles the functions that reference it, split by **reference
+  type** into `callers=` (call references), `jumps=` (a tail call or shared
+  epilogue jumping straight to it) and `address_taken=` (data references, which is
+  how an indirect call happens). Three buckets rather than two because
+  `!isCall()` is not the same as *takes the address*, and the counts **may
+  overlap**: a function that both calls the target and stores its address appears
+  in two of them, which is the case an indirect-call investigation wants rather
+  than one to subtract away. Its `scope=` line says what the report covers: a call
+  reached only through a pointer slot Ghidra left unresolved is in none of the
+  three, so `callers=0` is not a claim that none exists. It also accepts an image-relative RVA for
   indirect-call investigations. This is useful when an import's parameter
   meaning has changed but its public name has not.
 

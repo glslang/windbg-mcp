@@ -2007,12 +2007,23 @@ static BOOL parse_dword(const wchar_t *text, DWORD *value)
     wchar_t *end = NULL;
     unsigned long parsed;
 
-    /* `wcstoul` accepts a leading sign and WRAPS a negative, so "-1" parses as MAXDWORD with errno
-     * clear -- rejected here rather than range-checked afterwards, because the wrapped value is in
-     * range and no later check can tell it from a number the caller meant. Raised in review on #434.
+    /* Every character must be a decimal digit, and there must be at least one.
+     *
+     * `wcstoul` accepts a leading sign and WRAPS a negative, so "-1" parses as MAXDWORD with errno
+     * clear: the wrapped value is in range, so no check after the call can tell it from a number the
+     * caller meant. A first version of this guard tested `text[0]` for a sign, which was the right
+     * fact pinned at the wrong place -- `wcstoul` skips leading whitespace *before* it reads the
+     * sign, so " -2" walked straight past it and became 4294967294, about 49 days of waiting.
+     * Raised in review on #434, twice: once for the sign and once for this. Requiring digits
+     * throughout cannot be half-written the way a positional test can.
      */
-    if (text[0] == L'-' || text[0] == L'+') {
+    if (text[0] == L'\0') {
         return FALSE;
+    }
+    for (const wchar_t *scan = text; *scan != L'\0'; scan++) {
+        if (*scan < L'0' || *scan > L'9') {
+            return FALSE;
+        }
     }
     errno = 0;
     parsed = wcstoul(text, &end, 10);
