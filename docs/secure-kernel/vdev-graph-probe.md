@@ -133,6 +133,6 @@ The resource-lifecycle acceptance passed on 2026-10-02:
 
 This closes the uncertainty around object composition, concrete cross-device
 interfaces, the final fixed RAM map, the pre-power resource lifecycle, repeated
-unwind, and the `vmwp` RAM-complete loop. The next owner-side step is to replace
-the firmware-time service stubs, create the first VP, and reach a deterministic
-no-boot-device outcome before attaching a disk.
+unwind, and the `vmwp` RAM-complete loop. The firmware-time services and boot
+state are exercised by the next gate, the
+[diskless inbox firmware preflight](vdev-firmware-probe.md).

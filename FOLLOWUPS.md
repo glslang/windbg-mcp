@@ -2400,9 +2400,31 @@ to collect what does not depend on that step, and then to falsify it before anyt
    both RAM ranges and blocks were destroyed, and every partition was deleted. The runbook is
    [`docs/secure-kernel/vdev-graph-probe.md`](docs/secure-kernel/vdev-graph-probe.md).
 
-   K1.2 is closed. The next owner-side gate is the minimum firmware configuration and a deterministic
-   no-boot-device outcome before attaching SynthStor to a private disk child. No irreducible managed
-   service appeared, so the OpenVMM-derived contingency remains closed.
+   K1.2 is closed. At that point the next owner-side gate was the minimum firmware configuration and
+   a deterministic no-boot-device outcome before attaching SynthStor to a private disk child. No
+   irreducible managed service appeared, so the OpenVMM-derived contingency remains closed.
+
+   **The K1.3 diskless firmware preflight passed on 2026-10-03.**
+   [`tools/vdev_firmware_probe.py`](tools/vdev_firmware_probe.py) replaces the firmware-time stubs
+   with the exact one-VP topology and importer contracts recovered from the guarded inbox binaries.
+   It supplies checksummed 80-byte MADT and 144-byte SRAT tables, leaves optional services absent,
+   and cold-powers VMBus, IOAPIC, BIOS, RTC and guest emulation. All five return `S_OK`; SynthStor
+   remains initialized and reserved but is deliberately not powered without a LUN.
+
+   `BiosVdev` imports the 6 MiB UEFI image and four loader regions in five nonoverlapping calls. The
+   probe writes and reads back every requested page, including the two explicitly zero-filled pages,
+   before accepting the call. It then captures the exact 19-record VP0 register sequence, validates
+   the imported long-mode scalars and UEFI entry point, applies the state in one VID call and reads it
+   back. VID's only normalization is setting the architecturally fixed `CR0.ET` bit; all other
+   critical scalars match. Three bounded runs in fresh partitions `0x33` through `0x35` completed
+   power-off, reverse reservation release, teardown, RAM destruction and partition deletion. The
+   runbook is [`docs/secure-kernel/vdev-firmware-probe.md`](docs/secure-kernel/vdev-firmware-probe.md).
+
+   This is boot-state construction, not firmware execution: VP0 is deliberately never started by
+   the acceptance probe. A separate start without the owner-side VID completion dispatcher left the
+   imported `RIP` unchanged. K1.3 therefore narrows the next boundary to a real SynthStor LUN and
+   the central completion dispatcher; it does not claim a no-boot-device screen, a UEFI instruction,
+   or a Windows boot.
 4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
    experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
    the minimum in-box device graph; firmware and one synthetic disk off an immutable
@@ -2439,8 +2461,9 @@ to collect what does not depend on that step, and then to falsify it before anyt
 
 **The honest summary, because a cost table invites the opposite reading.** A **resumable** stop
 inside a normally initialized Microsoft Secure Kernel still requires owning the boot. Immutable
-minimum disks, the VBS/control discrimination, the six-device graph, and the final fixed RAM map now
-pass; firmware execution, synthetic storage, and the owner-hosted Windows/VBS boot do not yet. A
+minimum disks, the VBS/control discrimination, the six-device graph, the final fixed RAM map, and
+diskless UEFI boot-state construction now pass; firmware execution, synthetic storage, and the
+owner-hosted Windows/VBS boot do not yet. A
 **non-resumable observation** remains cheaper, and **inspection** needs neither route because item
 103 ships it off a capture today. Arm 1 is complete and arm 2 remains independent of the owned-boot
 build.

@@ -55,18 +55,46 @@ def emit(event: str, **fields: object) -> None:
     print(json.dumps({"event": event, **fields}, sort_keys=True), flush=True)
 
 
-def unique_dependencies() -> tuple[contract.Dependency, ...]:
+def merge_dependencies(
+    dependencies: list[contract.Dependency] | tuple[contract.Dependency, ...],
+) -> tuple[contract.Dependency, ...]:
     by_iid: dict[str, contract.Dependency] = {}
-    for kind in GRAPH_ORDER:
-        for item in contract.DEVICES[kind].dependencies:
-            previous = by_iid.get(item.iid)
-            if previous is not None and previous.name != item.name:
-                raise RuntimeError(
-                    f"dependency name mismatch for {item.iid}: "
-                    f"{previous.name} != {item.name}"
-                )
-            by_iid.setdefault(item.iid, item)
+    for item in dependencies:
+        previous = by_iid.get(item.iid)
+        if previous is not None and previous.name != item.name:
+            raise RuntimeError(
+                f"dependency name mismatch for {item.iid}: "
+                f"{previous.name} != {item.name}"
+            )
+        if previous is None or (item.required and not previous.required):
+            by_iid[item.iid] = item
     return tuple(by_iid.values())
+
+
+def unique_dependencies() -> tuple[contract.Dependency, ...]:
+    return merge_dependencies(
+        tuple(
+            item
+            for kind in GRAPH_ORDER
+            for item in contract.DEVICES[kind].dependencies
+        )
+    )
+
+
+def locate_ram_pages(gpa_page: int, page_count: int) -> tuple[int, int]:
+    """Return the RAM-span index and block-relative page for one GPA range."""
+
+    if gpa_page < 0 or page_count <= 0:
+        raise ValueError("the GPA page must be nonnegative and the page count positive")
+    end_page = gpa_page + page_count
+    for index, (_name, start, size) in enumerate(RAM_SPANS):
+        start_page = start // PAGE_SIZE
+        span_pages = size // PAGE_SIZE
+        if start_page <= gpa_page and end_page <= start_page + span_pages:
+            return index, gpa_page - start_page
+    raise ValueError(
+        f"GPA page range [0x{gpa_page:X}, 0x{end_page:X}) is outside one RAM span"
+    )
 
 
 def vtable_of(pointer: ctypes.c_void_p) -> ctypes.POINTER(ctypes.c_void_p):
@@ -158,6 +186,16 @@ class WindowsRamTopology:
             ctypes.c_uint64,
         ]
         self.read_pages.restype = wintypes.BOOL
+        self.write_pages_api = module.VidWriteMemoryBlockPageRange
+        self.write_pages_api.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+        ]
+        self.write_pages_api.restype = wintypes.BOOL
         self.setup_message_queue = module.VidSetupMessageQueue
         self.setup_message_queue.argtypes = [ctypes.c_void_p, wintypes.DWORD]
         self.setup_message_queue.restype = wintypes.BOOL
@@ -301,6 +339,60 @@ class WindowsRamTopology:
                 for name, start, size in RAM_SPANS
             ],
         }
+
+    def write_pages(self, gpa_page: int, page_count: int, data: bytes) -> None:
+        """Write a page range, padding its final bytes with zeroes."""
+
+        span_index, block_page = locate_ram_pages(gpa_page, page_count)
+        capacity = page_count * PAGE_SIZE
+        if len(data) > capacity:
+            raise ValueError(
+                f"{len(data)} input bytes exceed the {capacity}-byte page range"
+            )
+        block = self.blocks[span_index]
+        for offset in range(0, page_count, 16):
+            chunk_pages = min(16, page_count - offset)
+            chunk_size = chunk_pages * PAGE_SIZE
+            source_offset = offset * PAGE_SIZE
+            available = max(0, min(chunk_size, len(data) - source_offset))
+            chunk = ctypes.create_string_buffer(chunk_size)
+            if available:
+                ctypes.memmove(chunk, data[source_offset : source_offset + available], available)
+            self._check(
+                self.write_pages_api(
+                    self.owner.handle,
+                    block,
+                    block_page + offset,
+                    chunk_pages,
+                    chunk,
+                    chunk_size,
+                ),
+                f"VidWriteMemoryBlockPageRange(gpa=0x{gpa_page + offset:X})",
+            )
+
+    def read_page_bytes(self, gpa_page: int, page_count: int) -> bytes:
+        """Read one GPA page range through its backing VID memory block."""
+
+        span_index, block_page = locate_ram_pages(gpa_page, page_count)
+        block = self.blocks[span_index]
+        output = bytearray()
+        for offset in range(0, page_count, 16):
+            chunk_pages = min(16, page_count - offset)
+            chunk_size = chunk_pages * PAGE_SIZE
+            chunk = ctypes.create_string_buffer(chunk_size)
+            self._check(
+                self.read_pages(
+                    self.owner.handle,
+                    block,
+                    block_page + offset,
+                    chunk_pages,
+                    chunk,
+                    chunk_size,
+                ),
+                f"VidReadMemoryBlockPageRange(gpa=0x{gpa_page + offset:X})",
+            )
+            output.extend(chunk.raw)
+        return bytes(output)
 
     def close(self) -> None:
         failures = []
