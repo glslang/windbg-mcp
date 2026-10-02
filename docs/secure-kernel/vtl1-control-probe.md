@@ -1,7 +1,7 @@
 # VTL1 kernel controlled-stop probe
 
 `tools/vtl1_control_probe.c` is a build-locked experiment for the control half
-of `FOLLOWUPS.md` item 103. It creates and owns a disposable VID partition,
+of `FOLLOWUPS.md` item 110. It creates and owns a disposable VID partition,
 starts one VP in VTL0, enters VTL1 through a fixed interrupt targeted at VTL1,
 and holds the VP when a selected VTL1 `int3` raises `#BP`.
 
@@ -110,6 +110,30 @@ selected instruction GPA. It proves the controlled stop only when the whole
 run exits zero. A timeout, a different message, or any failed VID call fails
 the gate.
 
+## Pending VTL1 state write
+
+The redirect mode tests the state change needed to stop an initialized Secure
+Kernel without patching its text:
+
+```powershell
+.\target\vtl1-control-probe\vtl1_control_probe.exe `
+    --pending-vtl1-state-write --timeout-ms 10000 --hold-ms 250
+```
+
+It first receives the ordinary marked breakpoint at GPA `0x10008`. While that
+message is pending, it writes VTL1 `RIP=0x10180`, reads the value back, clears
+the message's advance byte, and completes it. The next `GET_NEXT` must produce
+a second marked breakpoint at exactly `0x10180` with the same VTL1 stack.
+While the second message is pending, the probe writes and verifies the original
+continuation at `0x10009`, again completes with instruction advance disabled,
+and requires that continuation to write the resume witness. An unexpected
+message, changed stack, failed readback, or missing witness fails the run and
+deletes the disposable partition.
+
+This is stronger than a successful `VidSetVirtualProcessorStateEx` return: it
+proves both pending writes affect subsequent execution and that message
+completion does not overwrite or advance the restored state.
+
 ## Secure Kernel image breakpoint
 
 Run the image-backed mode from the same elevated prompt:
@@ -162,9 +186,13 @@ The analysis established several details that are easy to get wrong:
 
 The mapped VID type is deliberately not the raw hypervisor exception type.
 `VidHandleExceptionIntercept` asks for `0x01000002`, writes the vector into its
-16-byte payload, and reads the advance byte at mapped offset `0x148` when the
-message is completed. Completing any other message would acknowledge traffic
-the probe does not own, so the exact filter is part of the safety boundary.
+16-byte payload, and enqueues `VidExceptionInterceptReturnCallback`. On this
+exact driver, that callback calls `VidInterceptAdvanceInstructionPointer` only
+when mapped offset `0x148` is nonzero, then performs the common completion.
+The redirect mode confirms that reading dynamically: two completions with the
+byte cleared preserve the VTL1 `RIP` values written while their messages were
+pending. Completing any other message would acknowledge traffic the probe does
+not own, so the exact filter is part of the safety boundary.
 
 ## Validation status
 
@@ -194,5 +222,21 @@ pending breakpoint state: vtl=1 cpl=0 rip=0x14001fa70 rsp=0x1cffd0
 held pending intercept for 250 ms
 completed the owned VTL1 breakpoint intercept
 Secure Kernel breakpoint returned and VTL1 resumed through the interrupt frame
+deleted owner partition
+```
+
+The pending-state-write mode passed on 2026-10-02:
+
+```text
+owner partition 0x4c created
+pending breakpoint state: vtl=1 cpl=0 rip=0x10008 rsp=0x1cffd8
+held pending intercept for 265 ms
+pending VTL1 RIP write verified: rip=0x10180
+completed the first breakpoint without advancing the redirected VTL1 RIP
+pending breakpoint state: vtl=1 cpl=0 rip=0x10180 rsp=0x1cffd8
+received redirected VTL1 breakpoint: rip=0x10180 rsp=0x1cffd8
+pending VTL1 RIP write verified: rip=0x10009
+restored the original VTL1 continuation while the redirected breakpoint was pending
+pending VTL1 state write passed: redirected, restored, and resumed without instruction advance
 deleted owner partition
 ```

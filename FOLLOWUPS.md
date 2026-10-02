@@ -2297,22 +2297,19 @@ from being this item's pass.
 own recorded failure is a schedule written against the obstacle in front of it. The arms are ordered
 to collect what does not depend on that step, and then to falsify it before anything is built on it.
 
-1. **The redirect primitive, on the tiny image — cheapest, and blocked on nothing.**
-   `VidSetVirtualProcessorStateEx` at **VTL1 while a message is pending**. The selector and VTL
-   semantics are already decoded and exercised: the probe reads VTL-selected state through
-   `HV_INPUT_VTL_EXPLICIT` at VTL0 and VTL1 ([`tools/vtl1_control_probe.c:1073`](tools/vtl1_control_probe.c)
-   and `:1114`) and writes VTL0 state before the VP starts (`:1331`). **Closes when** a saved VTL1
-   `RIP` is redirected to the image's own `int3`, the marked message is held, the saved `RIP` is
-   restored *while it is pending*, the completion does not advance the restored state, and the
-   original loop resumes. **Worth more than it costs**: if it passes, a stop in a real Secure Kernel
-   never has to patch a live Secure Kernel instruction, and an initialized one hands you the
-   address to redirect *to*: `SkdInitDebuggerDataBlock` stores `&DbgBreakPointWithStatus` into
-   `KdDebuggerDataBlock+0x20`, which is measured rather than assumed — `lea rax,[…!DbgBreakPointWithStatus]`
-   at `securekernel+0xAC210` followed by the store, in
-   [`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`](docs/samples/secure-kernel-debugger-investigation/26100.9457.txt),
-   and present on 28000.2952 and 29617.1000 at their own RVAs. **If it fails**, retire
-   redirection and keep the restorable software breakpoint, whose completion semantics then need
-   proving separately.
+1. **The redirect primitive, on the tiny image — passed 2026-10-02.** The new
+   `--pending-vtl1-state-write` mode held the marked VTL1 CPL0 `#BP`, wrote and read back
+   `RIP=0x10180`, completed with the advance byte clear, and received the next marked trap at
+   exactly `0x10180` with the same `RSP`. While that second message was pending it wrote and
+   verified the original continuation at `0x10009`, completed again without advance, and the
+   original loop wrote its resume witness. So `VidSetVirtualProcessorStateEx` works at VTL1 while
+   the message is pending, and completion preserves rather than advances the restored state. A stop
+   in a real Secure Kernel no longer needs to patch its text: an initialized one hands the owner the
+   address to redirect *to*. `SkdInitDebuggerDataBlock` stores
+   `&DbgBreakPointWithStatus` into `KdDebuggerDataBlock+0x20`, measured at
+   `securekernel+0xAC210` in
+   [`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`](docs/samples/secure-kernel-debugger-investigation/26100.9457.txt)
+   and present on 28000.2952 and 29617.1000 at their own RVAs.
 2. **A one-shot observation of an initialized Secure Kernel — the only cheap thing that touches
    one, 2–5 days.** A disposable checkpointed VBS guest; resolve the live Secure Kernel base from
    the VTL1 `CR3`; halt every VP; install the parent vector-3 intercept; save and patch one byte to
@@ -2390,23 +2387,22 @@ to collect what does not depend on that step, and then to falsify it before anyt
    command-line role and not a fifth tool. Anything this item adds there lands in a dedicated worker
    process — never in the supervisor, and never with private VID ABI in a DbgEng worker.
 
-6. **Decompile `VidHandleExceptionIntercept`'s branch — inherited from item 103 on 2026-10-02.** It
-   is the one route to *which* branch a delivered message took, which sampling cannot supply at any
-   cadence, and it is this item's rather than 103's because this item arms its own intercepts on its
-   own partition. Parked once as *"not answerable by sampling"*, which is not the same as
-   unanswerable: Ghidra is on this bench and settled three other questions on 2026-09-30 that had
-   been recorded as limits. Item 103's other two control arms — the `[partition+0x10]` writer census
-   and separating the partition reset's two causes — were **declined** when it closed, because both
-   are about retrofitting a **managed** VM's receive loop and this item owns its partition instead.
-   They reopen if this item's owned-boot route fails on something the device model or the guest OS
-   cannot supply, which is arm 3's stop condition.
+6. **The exception branch and completion callback — decoded 2026-10-02.** On guarded `Vid.sys`
+   10.0.26100.9278, `VidHandleExceptionIntercept` reads the vector's claim slot, constructs mapped
+   type `0x01000002`, and enqueues `VidExceptionInterceptReturnCallback`. That callback tests only
+   exchange-buffer byte `+0x148`: nonzero calls `VidInterceptAdvanceInstructionPointer`; zero skips
+   it and goes directly to the common completion. Arm 1 then confirmed the zero branch dynamically.
+   Item 103's other two control arms — the `[partition+0x10]` writer census and separating the
+   partition reset's two causes — remain **declined** because both concern retrofitting a managed
+   VM's receive loop. They reopen only if this item's owned-boot route fails on something the device
+   model or guest OS cannot supply.
 
 **The honest summary, because a cost table invites the opposite reading.** A **resumable** stop
 inside a normally initialized Microsoft Secure Kernel is not reachable on this bench without owning
 the boot, and owning the boot is unvalidated at precisely one step. A **non-resumable observation**
 of one is reachable for days of work. And **inspection** needs neither: item 103 ships it off a
-capture today. **Arms 1 and 2 are worth running whatever arm 3 says**, which is why they are first
-rather than sequenced behind it.
+capture today. **Arm 1 is complete and arm 2 remains worth running whatever arm 3 says**, which is
+why neither is sequenced behind the owned-boot build.
 
 **Safety rules that are not negotiable per arm.** Never enumerate or open an existing VM from the
 owner-partition probe. Use only flattened clones, fresh copy-on-write children and fresh owned
