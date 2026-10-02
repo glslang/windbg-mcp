@@ -13,11 +13,12 @@ it is the second half of this page.
 
 ## What the capture route needs on the host
 
-- **A standard checkpoint of the guest** — a `.vmrs`, or the older `.bin` + `.vsv` pair. It reads
-  the same **copied off the Hyper-V host** as on it, so the machine running the server needs no
-  Hyper-V role at all when the capture is named as a path. Naming it as a `vm` instead asks Hyper-V
-  where that checkpoint lives, which does need the role installed there and an account that may ask
-  about that VM.
+- **A standard checkpoint of the guest, and an *unencrypted* one** — a `.vmrs`, or the older
+  `.bin` + `.vsv` pair. It reads the same **copied off the Hyper-V host** as on it, so the machine
+  running the server needs no Hyper-V role at all when the capture is named as a path. Naming it as
+  a `vm` instead asks Hyper-V where that checkpoint lives, which does need the role installed there
+  and an account that may ask about that VM. Encryption is the one prerequisite whose failure is
+  not a refusal — see below.
 - **The Windows SDK's `vmsavedstatedumpprovider.dll`**, which the tool loads out of an installed
   kit. `kit` and `kit_version` override the search when several are installed or the newest one has
   no provider.
@@ -34,6 +35,18 @@ it is the second half of this page.
 
 No driver, no test-signing, and no debugger attached to anything. A checkpoint is the guest's whole
 RAM in a file, so handle one like a full memory dump of that machine.
+
+**A checkpoint of a VM with `EncryptStateAndVmMigrationTraffic` on will kill the session rather
+than be refused, and the error reads as transient when it is not.** The SDK provider does not
+return a failure for one: `LoadSavedStateFile` `__fastfail`s (`0xC0000409`) and takes the calling
+process with it, which here is the worker holding that session — the provider is loaded once per
+worker. So the open comes back *"the engine worker process holding session … is gone"*, whose own
+advice is that opening again starts a fresh one. **For this cause that advice is wrong**: the same
+capture kills the next worker too, so read that error on an `open_sk_capture` as *check whether the
+VM encrypts its state* before retrying anything. Your other sessions are untouched, one worker
+holding one session being the whole point of the shape. Measured on provider `10.0.26100.7705`,
+x64, and reproduced from two unrelated processes — one of them a Rust binary calling the same
+export — so it is the provider's behaviour and not this server's handling of it.
 
 ## Open a capture
 
@@ -167,8 +180,8 @@ status line on stdout, and for a successful read exactly the requested bytes aft
 `src/livesrc.rs` is the normative spec — this is the shape.
 
 ```text
-<- (anything the provider prints while starting; echoed to stderr, prefixed `transport:`)
-<- windbg-mcp-gpa/1        the ready sentinel — everything before it is ignored
+<- (up to 63 lines the provider prints while starting; echoed to stderr, prefixed `transport:`)
+<- windbg-mcp-gpa/1        the ready sentinel — the lines before it are ignored, not unlimited
 -> SHAPE
 <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long max_read=4096
 -> READ 0xCD12DF 16
@@ -182,7 +195,11 @@ status line on stdout, and for a successful read exactly the requested bytes aft
 Four things to know before writing one:
 
 - **The sentinel is not politeness.** A provider prints during its own setup, so without it the
-  first line of a partition menu gets read as a `SHAPE` reply.
+  first line of a partition menu gets read as a `SHAPE` reply. **It has to arrive within the first
+  64 lines**, those being all the client will read looking for it, so at most **63** may precede
+  it; a transport still talking about itself on line 65 is rejected as probably not a transport,
+  with what it said quoted back. A provider that prints per partition, per device or per loaded
+  component is the one to check this against.
 - **`max_read` is the only required `SHAPE` field**, and it must be the real one — `HvCallReadGpa`
   moves at most **16** bytes. Every other field is optional because a source that cannot read a
   register must be able to say so rather than have a missing `EFER` decoded as a machine not in
