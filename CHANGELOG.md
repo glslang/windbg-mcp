@@ -43,6 +43,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   say what it would cost. Fifteen unit tests pin the framing against in-memory pipes, including a
   provider banner being skipped to a sentinel, a misspelled `SHAPE` key being refused rather than read
   as a guest with no page-table root, and a transport announcing more bytes than were asked for.
+  **The shipped plugin skill now covers both routes**, which it had said nothing about in either
+  direction: `skills/windbg-debugging/secure-kernel.md` is a new playbook for the four capture tools
+  — what the host needs, the three ways of naming a capture, why `image` is required, that a capture
+  session refuses every other debugger tool and that a VBS-off guest's capture opening with no VTL1
+  is the answer rather than a failure, and that the public PDB's missing type records mean structures
+  are hand-decoded — and it states the live route as what it is: **the operator supplies the
+  transport**, this repository ships none, `--sk-live` refuses to start without `--transport`, and
+  there is no MCP call for it, so a request to debug a *running* Secure Kernel is answered with a
+  checkpoint or handed back. `SKILL.md` indexes it in both tables and carries the limit as a
+  cross-cutting one, and `setup.md`'s elevation matrix gains the row — no elevation, but the SDK
+  provider and read access to the checkpoint, and naming a `vm` rather than a path asks Hyper-V on
+  that host.
 
 - **Retracted: `SdkWriteVirtualMemory` does not segfault on VTL1, and the fault blamed on it was an
   8-byte struct overrun in the bench's own Python binding (gate S5u, 2026-10-01).** This project has
