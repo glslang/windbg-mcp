@@ -38,8 +38,19 @@ public class DecompileCallers extends GhidraScript {
         Set<Address> destinations = new LinkedHashSet<>();
         SymbolIterator symbols = currentProgram.getSymbolTable().getSymbols(calleeName);
         if (calleeName.startsWith("0x")) {
-            destinations.add(currentProgram.getImageBase().add(
-                    Long.parseUnsignedLong(calleeName.substring(2), 16)));
+            // `Address.add` is arithmetic in the address space and says nothing about the program, so
+            // a mistyped RVA -- or one belonging to a different image -- can land far outside it and
+            // still be a perfectly good Address. It is also allowed to run off the end of the space,
+            // which throws something a caller of this script would have to decode.
+            try {
+                destinations.add(currentProgram.getImageBase().add(
+                        Long.parseUnsignedLong(calleeName.substring(2), 16)));
+            }
+            catch (RuntimeException e) {
+                throw new IllegalArgumentException(
+                        "RVA " + calleeName + " is not an address in "
+                        + currentProgram.getExecutablePath() + "'s address space: " + e);
+            }
         }
         else {
             while (symbols.hasNext()) {
@@ -57,10 +68,18 @@ public class DecompileCallers extends GhidraScript {
         }
         // An unresolved target FAILS rather than producing a report, because `callers=0` would
         // otherwise mean two different things -- "the target was found and nothing references it" and
-        // "the name was misspelled, or is absent from the PDB that loaded" -- and this script is an
-        // oracle whose zero is read as evidence about the image. A misread of that kind is what the
-        // lane's README warns about in the other direction, and writing no report at all is the only
-        // answer that cannot be mistaken for one. Raised in review on #434.
+        // "the target was never located" -- and this script is an oracle whose zero is read as
+        // evidence about the image. A misread of that kind is what the lane's README warns about in
+        // the other direction, and writing no report at all is the only answer that cannot be
+        // mistaken for one. Raised in review on #434.
+        //
+        // **The condition is that every destination is inside the loaded program, not merely that
+        // there is one.** A first version of this guard tested only `isEmpty()`, which the numeric
+        // branch walks straight past: `getImageBase().add(rva)` always yields an address, so a
+        // mistyped RVA produced a non-empty set, passed the guard, and wrote the same three zeros the
+        // guard was added to prevent. Checking what the destinations ARE cannot be bypassed by a new
+        // way of producing one; checking that some exist can, and was. Raised in review on #434
+        // again, against this guard's own introduction.
         //
         // `DecompileFunctions.java` keeps going in the same situation and is right to: it takes
         // several selectors and names the unresolved ones in a `missing=` line, so its report
@@ -71,6 +90,16 @@ public class DecompileCallers extends GhidraScript {
                     + " -- it resolved to no symbol, no image-relative RVA and no fully qualified "
                     + "function name, so a caller count would be a claim about a target that was "
                     + "never located. Check the spelling and that a PDB is loaded (ConfigurePdb.java).");
+        }
+        for (Address destination : destinations) {
+            if (!currentProgram.getMemory().contains(destination)) {
+                throw new IllegalArgumentException(
+                        "callee " + calleeName + " resolved to " + destination + ", which is outside "
+                        + currentProgram.getExecutablePath() + "'s loaded memory (image base "
+                        + currentProgram.getImageBase() + "). Nothing can reference an address the "
+                        + "program does not contain, so a count here would read as zero callers "
+                        + "rather than as a target in the wrong image.");
+            }
         }
 
         // Imports commonly have both an external symbol and a thunk. Include the
