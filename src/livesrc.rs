@@ -340,7 +340,12 @@ pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
             "cr3" => reply.shape.cr3 = Some(number(key, value)?),
             "cr4" => reply.shape.cr4 = Some(number(key, value)?),
             "efer" => reply.shape.efer = Some(number(key, value)?),
-            "max_read" => max_read = Some(number(key, value)? as usize),
+            // Kept as `u64` here and narrowed only after the bound is applied. Casting first is
+            // target-width-dependent: on the shipped `i686-pc-windows-msvc` image a declaration of
+            // `4294967297` truncates to `1`, passes the bound, and the decode then runs the whole
+            // walk as tens of millions of one-byte exchanges instead of refusing the handshake.
+            // Raised in review on #434.
+            "max_read" => max_read = Some(number(key, value)?),
             "vtl_enabled" => {
                 reply.shape.vtl_enabled = Some(match value {
                     "1" => true,
@@ -378,11 +383,14 @@ pub(crate) fn parse_shape(line: &str) -> Result<ShapeReply> {
             ),
         }
     }
-    let max_read = max_read.context("SHAPE must declare max_read")?;
-    if max_read == 0 || max_read > MAX_DECLARED_READ {
-        bail!("max_read={max_read} is outside 1..={MAX_DECLARED_READ}");
+    let declared = max_read.context("SHAPE must declare max_read")?;
+    if declared == 0 || declared > MAX_DECLARED_READ as u64 {
+        bail!("max_read={declared} is outside 1..={MAX_DECLARED_READ}");
     }
-    reply.max_read = max_read;
+    // Only now, and still fallibly: the bound above already guarantees it fits, so a failure here
+    // would mean the bound and the target width disagree, which is worth an error rather than a cast.
+    reply.max_read = usize::try_from(declared)
+        .with_context(|| format!("max_read={declared} does not fit this build's usize"))?;
     Ok(reply)
 }
 
@@ -744,6 +752,28 @@ mod tests {
     fn an_absurd_max_read_is_refused_before_it_sizes_an_allocation() {
         let err = parse_shape("SHAPE max_read=4294967295").unwrap_err();
         assert!(format!("{err}").contains("outside"), "{err}");
+    }
+
+    #[test]
+    fn a_max_read_that_would_truncate_into_range_is_refused_whatever_the_target_width() {
+        // 0x1_0000_0001 narrows to 1 in a 32-bit `usize`, which is inside the bound -- so a build of
+        // the shipped `x86\windbg-mcp.exe` would have accepted it and then run the entire walk as
+        // one-byte exchanges. The bound is applied to the `u64` for that reason, and this passes on a
+        // 64-bit host for the ordinary reason as well, so it pins the ordering rather than the width.
+        for absurd in ["4294967297", "4294967296", "18446744073709551615"] {
+            let err = parse_shape(&format!("SHAPE max_read={absurd}")).unwrap_err();
+            assert!(
+                format!("{err}").contains("outside"),
+                "max_read={absurd} was not refused: {err}"
+            );
+        }
+        // And the largest legal value still is legal, so the bound was not simply made stricter.
+        assert_eq!(
+            parse_shape(&format!("SHAPE max_read={MAX_DECLARED_READ}"))
+                .unwrap()
+                .max_read,
+            MAX_DECLARED_READ
+        );
     }
 
     #[test]
