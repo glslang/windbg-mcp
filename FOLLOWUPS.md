@@ -2208,11 +2208,24 @@ nothing said anything about rather than as a WDM driver.
 ### What is left: step 2, the real callbacks
 
 The framework's per-device config holds them; the create/close/cleanup trio comes from the
-file-object config, device control from the I/O queue's. This is structure-walking against
+file-object config, and device control from an I/O queue's. This is structure-walking against
 `Wdf01000.sys`'s public types and is the part that wants a **measured layout per framework version**
 rather than a constant — `Wdf01000.sys` carries its own version line (1.35.26100.3323 on this bench)
 independent of the OS build, which is the trap to design around. Until it lands, the `framework`
 field tells a reader where *not* to look rather than where to look, and `docs/limitations.md` says so.
+
+**And "the" queue callback is not one slot, which two review rounds on the step-1 PRs spent
+themselves establishing.** Scoping step 2 against `EvtIoDeviceControl` alone would find nothing for
+every driver that does not use it. Measured on this bench and written up in `src/framework.rs`'s
+module docs: `_WDF_IO_QUEUE_CONFIG` carries **eight** callback slots, so a queue configuring no
+specific handler takes device control on `EvtIoDefault` and an internal control code has its own
+slot; and two further routes — `WdfDeviceInitAssignWdmIrpPreprocessCallback` and
+`WdfDeviceConfigureWdmIrpDispatchCallback` — let a driver see the IRP before the framework dispatches
+it. **Neither of those two replaces the queue**, since `WdfDeviceWdmDispatchPreprocessedIrp` and
+`WdfDeviceWdmDispatchIrpToIoQueue` are exported beside them, so a hook may forward rather than
+terminate and finding one does not mean the queue callback is out of the picture. Step 2 therefore
+answers *which of these a given driver used*, which is a walk rather than a lookup — and the honest
+shape of its answer is a set of candidate sites with what was read at each, not a single address.
 
 **What step 1 measured that step 2 should start from**, stated as the reading rather than as an
 interpretation of it. Disassembled on this bench, `Wdf01000.sys 1.35.26100.3323`:
