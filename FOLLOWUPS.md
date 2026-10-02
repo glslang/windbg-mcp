@@ -2340,8 +2340,8 @@ to collect what does not depend on that step, and then to falsify it before anyt
    than this item's**: `CoCreateInstance` one of the 24 and record the `HRESULT` — **run as gate
    S5v, below** — then ask whether `Initialize` can be driven without the context `vmwp.exe`
    supplies (a partition object, a VMBus channel manager).
-   **Half-answered 2026-10-02 by gate S5v, and the half it answers is the one that was expected to
-   fail.** `CoCreateInstance(CLSCTX_INPROC_SERVER, IID_IUnknown)` on all 24, one child process each:
+   **The activation half was answered 2026-10-02 by gate S5v.**
+   `CoCreateInstance(CLSCTX_INPROC_SERVER, IID_IUnknown)` on all 24, one child process each:
    **20 return `S_OK`**, 4 return `CLASS_E_CLASSNOTAVAILABLE`, none faults, with `msxml3` XMLHTTP
    activating as a positive control and an unregistered CLSID giving `REGDB_E_CLASSNOTREG` as the
    negative. The 4 refusals are a registration artefact rather than a policy: their backing DLL loads
@@ -2350,19 +2350,28 @@ to collect what does not depend on that step, and then to falsify it before anyt
    answers `E_NOINTERFACE` with a nulled out-pointer for an unimplemented IID, so it is live rather
    than merely constructed. **And it is not admin-gated**: `BiosVdev` activates under a restricted
    token and again at genuine medium integrity (`S-1-16-8192`) with no `Administrators` membership.
-   **So *"expect the stop to fire"* has to be weakened.** It was a judgement from there being no
-   activation evidence at all, and there now is some, pointing the other way for step one. What it
-   does **not** touch is step two, which is the whole of the risk: these objects implement
-   **private, undocumented interfaces whose IIDs this record has never read**, so `IVirtualDevice::
-   Initialize` being drivable without a partition object and a VMBus channel manager is exactly as
-   unmeasured as before. Activation was the cheap half and it passed; the stop condition stands on
-   the dear half, unchanged.
-   **Stop condition**: a required service exists only in VMMS or in managed-VM state and cannot be
-   constructed locally — in which case this item closes at *measured and declined* for the owned-boot
-   route, and allow 3–5 days for a spike that connects one OpenVMM-derived device to the direct-VID
-   owner before any port is costed. **Expect the stop to fire** — a judgement from there being no
-   activation evidence at all, which is weaker still than the "weak evidence" this line used to claim.
-   The arm is days; everything in 4 is contingent on it.
+   **The fatal initialization half passed later the same day.**
+   [`tools/vdev_initialization_probe.py`](tools/vdev_initialization_probe.py) requests the recovered
+   `IID_IVirtualDevice`, validates slots 3–5 as `GetDependencies`, `Initialize`, and `Teardown`, and
+   supplies recording repository and service objects in separate 30-second children. `RtcVdev`
+   requests its six symbol-named dependencies, accepts a missing configuration, calls no dependency
+   method, and returns `S_OK` from both initialization and teardown. `VmbusVdev` requests
+   `ISecurityManager`, `IVmMemoryManagement`, `IVmPartitionServices`, and
+   `IVmHandleBrokerServices`; it accepts the minimum three-field XML at repository version `0x201`.
+   The handle-broker lookup deliberately returns `E_NOTIMPL`, after which VMBus opens
+   `\\.\VMBus\vdev\{vm-id}` itself. That open, initialization, and teardown all succeed while the
+   child owns a fresh process-local direct-VID partition under the same bare GUID, and the child then
+   deletes it. No other supplied service method is called. Exact size, SHA-256, CodeView identity,
+   module path, and recovered vtable RVAs guard the private contract; the full run passed live on
+   2026-10-02. The reproducible evidence and binary inventory are in
+   [`docs/secure-kernel/vdev-initialization-probe.md`](docs/secure-kernel/vdev-initialization-probe.md).
+
+   This closes the fatal stop condition in the inbox route's favour: neither initialization requires
+   `vmwp` process identity, an identity-bearing VMMS object, managed-VM state, or a second receive
+   loop. It does **not** make the complete device graph known. Firmware, IOAPIC, storage, and the
+   lifecycle after initialization still need the disposable managed-VM trace below. K1.2 may now
+   proceed; the OpenVMM-derived contingency stays closed unless that larger contract reveals a new
+   irreducible managed service.
 4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
    experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
    the minimum in-box device graph; firmware and one synthetic disk off an immutable

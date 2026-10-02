@@ -95,8 +95,10 @@ the open, and the debugger tools are refused on it — the three questions that 
 answer (where the engine lives, one handle or two, and what a structure walk means with no types) are
 answered in `src/sksession.rs` and in `FOLLOWUPS.md`. VTL1 kernel execution can now be controlled
 in a disposable owner partition: the guarded probe holds and completes its selected CPL0 `#BP`.
-What remains is reproducing that result in an initialized Secure Kernel, because a managed VM's
-VID completion stream belongs to `vmwp.exe`. Driving a live Secure Kernel target through
+The first owned-boot gate also passes: inbox RTC and VMBus initialize and tear down outside `vmwp`,
+with VMBus attached to a fresh direct-VID partition. What remains is the full firmware/storage
+device graph and Windows/VBS boot before reproducing the stop in an initialized Secure Kernel.
+Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
 and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even
 a working EXDI would supply a generic memory target rather than any SK awareness. Since the reads
@@ -151,6 +153,7 @@ Read them in this order; each assumes the one before it.
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
 | 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, **S0**, which finds a driver-free source that carries VTL1 and its page-table root, **S1**, the decode layer over that source, **S2**, symbols against the image with no debuggee — which also settles that the public PDB has no types — and **S5a**, which joins the hypervisor's live-but-unused VTL1 debug port to Secure Kernel shipping no KD transport, and finds them to be the same wall. |
 | 5 | [VTL1 control probe runbook](vtl1-control-probe.md) | The build-locked native probe, live procedure, private ABI derivation, safety boundary, successful high-integrity result, and guarded Secure Kernel image breakpoint/return mode. |
+| 6 | [Inbox device initialization probe](vdev-initialization-probe.md) | K1.1's guarded RTC/VMBus contract and live result: both inbox devices initialize and tear down outside `vmwp`, and VMBus opens a fresh owner-created VID partition without a second receive loop. |
 
 Two older side-investigations, kept because they are about the same binary:
 

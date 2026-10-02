@@ -96,6 +96,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The fatal inbox-device initialization spike for an owned Windows/VBS boot
+  passed (`FOLLOWUPS.md` item 110, K1.1).**
+  `tools/vdev_initialization_probe.py` runs RTC and VMBus in separate bounded
+  children, guards the exact device and VID binaries, validates the recovered
+  `IVirtualDevice` vtable and dependency IIDs, and supplies recording private
+  repository/service objects. RTC initializes and tears down without a
+  partition. VMBus initializes and tears down against a fresh process-local
+  direct-VID partition whose GUID matches the repository VM ID, then deletes
+  it. The only dependency method invoked is the optional handle-broker lookup;
+  returning `E_NOTIMPL` makes VMBus open its owned endpoint directly. This
+  rules out `vmwp` process identity, VMMS-managed repository state, and a
+  second VID receive loop as requirements for these two initialization paths,
+  and opens K1.2's complete device-graph trace.
 - **The owner-partition probe can redirect and restore VTL1 execution state
   while an exception message is pending (`FOLLOWUPS.md` item 110 arm 1).** The
   new `--pending-vtl1-state-write` mode receives its marked VTL1 CPL0 `#BP`,
