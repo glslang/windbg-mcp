@@ -201,7 +201,12 @@ Four things to know before writing one:
   with what it said quoted back. A provider that prints per partition, per device or per loaded
   component is the one to check this against.
 - **`max_read` is the only required `SHAPE` field**, and it must be the real one — `HvCallReadGpa`
-  moves at most **16** bytes. Every other field is optional because a source that cannot read a
+  moves at most **16** bytes, and a transport that claims more than it can do will be asked for it.
+  **Declare the smaller of your real capacity and 1 MiB**: the accepted range is `1..=1048576`, and
+  a declaration outside it refuses the handshake rather than being clamped. That ceiling is a guard
+  on the client's own buffer, which is sized from whatever you declare — not a statement about what
+  your source can do — so a transport that reads more per request simply gets more requests.
+  Every other field is optional because a source that cannot read a
   register must be able to say so rather than have a missing `EFER` decoded as a machine not in
   long mode. An **unknown** key is refused rather than ignored: a misspelled `cr3` would otherwise
   look like a guest with no page-table root, which is a far more plausible-looking wrong answer.
