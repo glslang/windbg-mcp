@@ -210,11 +210,17 @@ Four things to know before writing one:
   register must be able to say so rather than have a missing `EFER` decoded as a machine not in
   long mode. An **unknown** key is refused rather than ignored: a misspelled `cr3` would otherwise
   look like a guest with no page-table root, which is a far more plausible-looking wrong answer.
-- **The four status words must stay distinct.** `REFUSED` is the hypervisor withholding a page, and
-  over `HvCallReadGpa` on a VBS guest it is the **expected** answer; a transport that collapsed it
-  into `ERROR`, or into zeros, would make a protected guest look like one with no Secure Kernel.
-  The decode counts refusals separately for that reason and declines to claim a negative it has not
-  earned.
+- **The four status words must stay distinct, and collapsing them fails in two different
+  directions.** `REFUSED` is the hypervisor withholding a page, and over `HvCallReadGpa` on a VBS
+  guest it is the **expected** answer. **Only `OK` with zero-filled bytes turns a protected guest
+  into one with no Secure Kernel** — a zeroed buffer cannot tell data from silence, which is why
+  refusals are counted on their own. Reporting a refusal as `ERROR` is a different mistake and
+  still a mistake: it becomes a *failed* read, so the report withholds the negative instead of
+  claiming one (*"identified nothing while N read(s) failed, so its negative has not been
+  earned"*) — you lose the reason rather than receive a wrong answer — and an `ERROR` **poisons the
+  transport**, that variant also covering an unparseable `OK`, which the client deliberately will
+  not try to tell apart by reading the detail. On a guest that refuses per access, that ends the
+  run at the first refusal instead of counting every one of them.
 - **Nothing in this role has a read deadline.** A transport that starts and then never emits a
   newline blocks it until the operator interrupts — acceptable in a foreground command run by the
   person who wrote the transport, and one of the reasons it is not reachable from the server.
