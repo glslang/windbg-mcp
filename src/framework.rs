@@ -58,23 +58,41 @@
 //! `EvtIoDefault` at `+0x10`, then `EvtIoRead`, `EvtIoWrite`, `EvtIoDeviceControl` at `+0x28`,
 //! `EvtIoInternalDeviceControl` at `+0x30`, `EvtIoStop`, `EvtIoResume`, `EvtIoCanceledOnQueue` -- so
 //! a device-control request reaches `EvtIoDefault` in a queue that configures no specific handler,
-//! and an internal one reaches its own slot. Two further routes let the driver see the IRP
-//! **before** the framework dispatches it, and are exported by this build:
-//! `WdfDeviceInitAssignWdmIrpPreprocessCallback` and `WdfDeviceConfigureWdmIrpDispatchCallback`.
+//! and an internal one reaches its own slot.
 //!
-//! **Neither of those two replaces the queue, which is the correction review made and then
-//! understated.** The finding said a preprocess callback need not bypass the queue, because it can
-//! hand the IRP back; measuring it says the same of *both*, since this build exports
+//! **Routes that run before the queue sees the request, each exported by this build**, and the list
+//! is *open* for the reason below:
+//!
+//! * `WdfDeviceInitSetIoInCallerContextCallback` -- and its class-extension twin
+//!   `WdfCxDeviceInitSetIoInCallerContextCallback` -- registers a callback the framework invokes
+//!   inside its own dispatch, before enqueueing: `FxPkgIo::DispatchStep1` and `DispatchStep2` both
+//!   reach `GetIoInCallerContextCallback` then `FxIoInCallerContext::Invoke`. **This is the
+//!   `METHOD_NEITHER` route**, which is the one this server's IOCTL work cares about most:
+//!   `WdfRequestRetrieveUnsafeUserInputBuffer` and `...UnsafeUserOutputBuffer` both call
+//!   `VerifyRequestIsInCallerContext`, so a driver touching a raw user buffer has to be here.
+//! * `WdfDeviceInitAssignWdmIrpPreprocessCallback` and `WdfDeviceConfigureWdmIrpDispatchCallback`
+//!   see the IRP before the framework dispatches it at all.
+//!
+//! **None of those replaces the queue, which is a correction review made and then understated.** It
+//! said a preprocess callback need not bypass the queue, because it can hand the IRP back; measuring
+//! it says the same of *both* WDM routes, since this build exports
 //! `WdfDeviceWdmDispatchPreprocessedIrp` -- hand it back for normal dispatch -- **and**
 //! `WdfDeviceWdmDispatchIrpToIoQueue`, which hands it to a named queue. So each is a site that runs
 //! *in addition to* the queue callback unless the driver completes the request itself, and the
 //! distinction the finding proposed, between a conditional interception and a route that replaces
 //! queue handling, is cleaner than the API is.
 //!
-//! Naming one slot as *the* place is the same overclaim as the rest of this file's history, in the
+//! **And the list above is deliberately not certified complete.** Two consecutive rounds found a
+//! route missing from it -- the WDM hooks, then the in-caller-context callback -- which is the shape
+//! `.claude/skills/review-round/SKILL.md` records from #349: an *inclusion* is a claim about one
+//! route and is checkable on its own, where a closed enumeration is a claim about every path a
+//! request can take through a framework this crate does not own. So this names routes that are in
+//! scope and certifies none as out, and step 2's discovery has to be a walk reporting what it found
+//! rather than a lookup against a fixed list (`FOLLOWUPS.md` item 108).
+//!
+//! Naming one slot as *the* place was the overclaim the rest of this file's history is about, in the
 //! one sentence that looked like architecture rather than evidence -- and it is the one that would
-//! send a reader to the wrong callback. Which of them a given driver uses, and whether a hook
-//! forwards, is step 2's question (`FOLLOWUPS.md` item 108).
+//! send a reader to the wrong callback.
 //!
 //! # Engine-free
 //!
@@ -193,8 +211,8 @@ impl Framework {
                  entry is the framework's code rather than this driver's and holds no IOCTL compare \
                  chain: this driver's control codes are compared in a callback the framework holds, \
                  which this build cannot resolve -- an I/O queue's `EvtIoDeviceControl` usually, or \
-                 its `EvtIoDefault` or `EvtIoInternalDeviceControl`, with a WDM preprocess or \
-                 dispatch hook able to see the IRP before any of them."
+                 another of its queue slots such as `EvtIoDefault`, or one of the callbacks that run \
+                 before the queue, among them the `METHOD_NEITHER` in-caller-context one."
             }
             Table::NotEstablished => {
                 " This driver's `MajorFunction` entries **were** read and are in this answer, and \
@@ -357,8 +375,8 @@ pub(crate) fn code_report(framework: Framework) -> crate::structured::DriverFram
                binds to it -- so this answers about code every KMDF driver on the target shares, and \
                about none of them in particular. A KMDF driver whose dispatch table the framework \
                took over compares its control codes in a callback the framework holds -- an I/O \
-               queue's `EvtIoDeviceControl` usually, or another of its queue slots, or a WDM hook \
-               that runs before them -- which this build cannot resolve."
+               queue's `EvtIoDeviceControl` usually, or another of its queue slots, or one of the \
+               callbacks that run before the queue -- which this build cannot resolve."
             .to_string(),
         framework: framework.name().to_string(),
         tells: vec![crate::structured::FrameworkTell::FrameworkImage],
