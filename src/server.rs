@@ -5324,7 +5324,9 @@ impl WindbgServer {
 
     /// Dump a driver object's dispatch table and devices (`!drvobj <name> 7`).
     /// The MajorFunction table's index 0x0e is the IRP_MJ_DEVICE_CONTROL handler — the
-    /// IOCTL dispatch routine. Root of the device-tree walk.
+    /// IOCTL dispatch routine. Root of the device-tree walk. A **KMDF** driver's 28 entries
+    /// are all `Wdf01000!FxDevice::Dispatch`: the framework owns the table and the driver's
+    /// code runs as callbacks it holds, so no entry there holds an IOCTL switch.
     #[rmcp::tool(annotations(
         title = "Inspect driver object",
         read_only_hint = true,

@@ -2735,6 +2735,13 @@ pub struct Reachability {
     /// nothing filled.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub from: Option<CodeLocation>,
+    /// Set when [`Self::from`] is in a **framework's** image rather than in a driver.
+    ///
+    /// The walk is then rooted in code every framework driver on the target shares: what it reaches
+    /// is the framework's own call graph, and a `not_reachable` from there says nothing about
+    /// whether a driver's callback reaches the target.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<DriverFramework>,
     /// Where the walk **began** inside that function, when that is not its entry.
     ///
     /// A `from` naming a handler inside a dispatch routine scopes the walk past the switch, and
@@ -2946,6 +2953,14 @@ pub struct IoctlMap {
     pub images: Vec<ImageRef>,
     /// The dispatch routine the map is about, after the debugger resolved what was asked for.
     pub dispatch: CodeLocation,
+    /// Set when that routine is in a **framework's** image rather than in a driver.
+    ///
+    /// The map below is then true of code every framework driver on the target shares, and is about
+    /// no one driver — most of all, an empty `cases` there is not a driver that accepts no control
+    /// codes. That is the reading `FOLLOWUPS.md` item 108 is about, and it arrives by following a
+    /// `MajorFunction` entry that pointed at the framework.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<DriverFramework>,
     /// Whether the control code was traced from the IRP (`[[Irp+0xb8]+0x18]`) rather than taken
     /// from the bare `+0x18` displacement.
     ///
@@ -3046,10 +3061,16 @@ impl IoctlMap {
     /// **were** read and are reported, each carrying its own `proved: false`. Weaker evidence
     /// about what is here is not the same fact as something missing, and [`SectionStatus::Partial`]
     /// is about the second.
+    ///
+    /// [`Self::framework`] is the second such field, and for a sharper version of the same reason.
+    /// A map rooted in a framework image ran to completion and is **exact** about the routine it was
+    /// asked about; what is wrong is which routine that is, and no amount of a longer clock or a
+    /// wider cap changes it. Calling it partial would send a reader to re-run the identical call.
     pub fn shortfall(&self) -> Option<&'static str> {
         let Self {
             images: _,
             dispatch: _,
+            framework: _,
             code_proved: _,
             cases: _,
             case_count: _,
@@ -3133,6 +3154,57 @@ pub struct ScannedRange {
     pub bytes: u64,
 }
 
+/// Which driver framework a driver was written against, where something said so.
+///
+/// **Present only when a tell fired, and absent is not a negative.** Nothing here reports "this is
+/// not a framework driver": an image whose import names could not be read answers the same as a WDM
+/// driver, and a tool claiming the second from the first would be wrong about exactly the drivers
+/// whose import tables are unreadable. `crate::framework::client_of` says what the tells are.
+///
+/// What it is for is the answer *above* it. Every driver tool here reads
+/// `_DRIVER_OBJECT::MajorFunction` and expects the entries to be the driver's own routines; for a
+/// framework driver they are the framework's, and without this field an answer that correctly reads
+/// 28 identical pointers looks like a driver that dispatches nothing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct DriverFramework {
+    /// Which framework, as `kmdf`.
+    pub framework: String,
+    /// What said so. **A list because the tells are independent**: one is a fact about the image
+    /// and answers with no debuggee, the other is a fact about the driver object and answers only
+    /// where one was read. Neither implies the other — see `crate::framework` for the measured
+    /// reason, which is a configuration flag that keeps a framework client's own dispatch table.
+    pub tells: Vec<FrameworkTell>,
+    /// The framework image the `MajorFunction` entries were found in, where the table was read.
+    ///
+    /// Named rather than implied, because the recognition is by module **name** and a name is not
+    /// an identity: this is the module that matched, for a reader to check against `images`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dispatch_image: Option<String>,
+    /// What it means for the answer this is attached to.
+    ///
+    /// **A field rather than something the renderer adds**, because a structured-aware client is
+    /// served `structuredContent` *instead of* the text — so a qualification only the renderer
+    /// writes is one those clients never see.
+    pub note: String,
+}
+
+/// How a [`DriverFramework`] was recognised.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum FrameworkTell {
+    /// The image imports the framework's bind routine — `WdfVersionBind` from `WdfLdr.sys`. A fact
+    /// about the image, so it answers against a dump, a live target or a bare PE image.
+    BindImport,
+    /// Every `MajorFunction` entry read is in the framework's own image. A fact about the driver
+    /// object, so it answers only where one was read — and it is the reading a caller looking at a
+    /// table of identical pointers needs.
+    DispatchTable,
+    /// The routine this answer is about is **itself** in the framework's image, rather than in a
+    /// driver that binds to it. The answer is then about framework code: true of it, and not an
+    /// answer about any one driver.
+    FrameworkImage,
+}
+
 /// What a driver's image says it can do.
 ///
 /// Read off the image rather than off its behaviour, and **evidence rather than a verdict**. Three
@@ -3151,6 +3223,13 @@ pub struct DriverHazards {
     /// The module scanned, and where it was loaded.
     pub module: String,
     pub base: String,
+    /// Which framework this image was written against, where its imports said so.
+    ///
+    /// Free here and nowhere else: the tell is an import, and the import table is already read to
+    /// build [`Self::sinks`]. It is carried because a reader of a *driver's* hazards is usually on
+    /// their way to its dispatch routine, and for a framework driver that is not in this image.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<DriverFramework>,
     /// The version of the curated sink list this scan used.
     pub sink_list_version: String,
     /// The sensitive imports the driver holds, in **library and name order**.
@@ -3252,10 +3331,17 @@ impl DriverHazards {
     /// one thing and this scan from two.
     ///
     /// Exhaustively destructured for the reason [`IoctlMap::shortfall`] gives.
+    ///
+    /// [`Self::framework`] is not one of them: it is read from the same import table as the sinks, so
+    /// a scan that answered it at all answered it exactly, and what it says is about the image's
+    /// *subject* rather than about how much of the image was read. [`Shortfall::Imports`] is already
+    /// what covers an import table this could not finish — including one that would have carried the
+    /// framework's tell.
     pub fn shortfall(&self) -> Option<Shortfall> {
         let Self {
             module: _,
             base: _,
+            framework: _,
             sink_list_version: _,
             sinks: _,
             privileged: _,
@@ -3756,6 +3842,19 @@ pub struct DriverSurface {
     /// that cannot be unloaded, and is not a failure to read it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub unload: Option<CodeLocation>,
+    /// Which framework this driver was written against, where something said so.
+    ///
+    /// **The field that makes the dispatch section below readable rather than merely correct.** For a
+    /// framework driver every `MajorFunction` entry is the framework's dispatcher, so the table reads
+    /// as a driver that handles nothing of its own and the IOCTL section finds no control codes;
+    /// both are true of the table and neither is what a caller asked. See [`DriverFramework`], and
+    /// note that its absence is not a claim that this is not one.
+    ///
+    /// It is composed from both tells, which arrive in different sections here: the dispatch table is
+    /// read with the driver object, and the import is read by the hazard scan — which runs last and
+    /// may not run at all. So either may be the only one present.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub framework: Option<DriverFramework>,
     pub dispatch: DispatchSection,
     pub devices: DevicesSection,
     pub ioctl: IoctlSection,
@@ -5487,6 +5586,7 @@ mod tests {
         DriverHazards {
             module: "mountmgr".into(),
             base: addr(0xfffff803_1ab10000),
+            framework: None,
             sink_list_version: "2".into(),
             sinks: Vec::new(),
             privileged: Vec::new(),
@@ -5607,6 +5707,7 @@ mod tests {
                 rva: Some("0x2340".into()),
                 attribution_failed: false,
             },
+            framework: None,
             code_proved: true,
             cases: Vec::new(),
             case_count: 0,

@@ -109,6 +109,12 @@ const KERNEL_IMAGES: &[&str] = &[
 ];
 
 /// See [`KERNEL_IMAGES`]: layers that are on the stack on somebody else's behalf.
+///
+/// **Not the same list as `crate::framework`'s**, which names `Wdf01000` alone, and the overlap is
+/// worth knowing about rather than resolving: that one asks whether an image *owns a driver's
+/// dispatch table*, and `wdfldr` -- which belongs here, being on the stack for its client -- does
+/// not own one. Two questions, two lists, cross-referenced so neither is edited believing it is the
+/// only one.
 const PASS_THROUGH_IMAGES: &[&str] = &["wdf01000", "wdfldr", "verifier", "vrfcore"];
 
 /// Whether a frame in this module is bug check machinery rather than a candidate culprit.

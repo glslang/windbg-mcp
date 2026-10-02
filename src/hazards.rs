@@ -401,6 +401,13 @@ pub struct Scan {
     /// Imports this driver holds that are **not** on the list, counted rather than listed: the
     /// number is what says whether a short `sinks` means a small driver or a narrow list.
     pub other_imports: usize,
+    /// Which framework this image binds to, where one of its imports said so.
+    ///
+    /// Read from the same import table the sinks are, so it costs nothing and is exact whenever the
+    /// table was read at all. It is **not** qualified by `unnamed_libraries`: an answer here is
+    /// positive evidence, and its absence is reported as nothing rather than as a negative, so a
+    /// bound import table that hid the tell costs a qualification rather than producing a wrong one.
+    pub framework: Option<crate::framework::Framework>,
     /// Libraries whose imports could not be named at all, carried through from the import table.
     pub unnamed_libraries: Vec<String>,
     /// Why the scan stopped early, when it did.
@@ -716,6 +723,9 @@ pub fn scan(
         scanned,
         unreadable,
         other_imports,
+        // Over the whole table, not over the sinks: the bind routine is not a sink and never will
+        // be -- it is how a driver *loads*, not something it does to a caller's buffer.
+        framework: crate::framework::client_of(imports),
         unnamed_libraries: Vec::new(),
         halted,
         cap_hit,
@@ -928,6 +938,11 @@ pub fn structured_report(
         scanned: scan.scanned.iter().map(scanned_range).collect(),
         unreadable: scan.unreadable.iter().map(scanned_range).collect(),
         other_imports: scan.other_imports,
+        // The import tell, and only it: this end has read no driver object and no dispatch table, so
+        // it must not claim the second tell. `driver_surface` is where the two are composed.
+        framework: scan.framework.map(|framework| {
+            crate::framework::report(framework, vec![structured::FrameworkTell::BindImport], None)
+        }),
         unnamed_libraries: scan.unnamed_libraries.clone(),
         stopped: scan.halted.map(|halt| match halt {
             Halt::Deadline => structured::WalkHalt::Deadline,
@@ -962,6 +977,19 @@ pub fn render(report: &crate::structured::DriverHazards) -> String {
         report.base,
         report.sink_list_version
     );
+
+    // What this image is, before what it holds: a reader of a framework driver's hazards is usually
+    // on their way to its dispatch routine, and that is in another image.
+    //
+    // **The word, not the note**, which is the one place in this change that prints less than it
+    // knows. Two reasons, and the second is the one that decided it: this renderer is embedded whole
+    // inside `surface::render`, which prints the note at the top of the same answer, so the long form
+    // here is a second copy of one fact in one reply -- and what a framework costs a *hazard* scan is
+    // nothing, since the imports and the privileged instructions are this image's either way. The
+    // note travels in `framework.note` for the readers that are served values rather than text.
+    if let Some(framework) = &report.framework {
+        out.push_str(&format!("  framework {}\n", framework.framework));
+    }
 
     // Said above the findings rather than below them, because it changes what an empty list means:
     // a caveat has to arrive before the conclusion it qualifies.
@@ -1255,6 +1283,68 @@ mod tests {
     /// carries no symbol, and the import table says what lives at that address without the slot
     /// ever being read. An import that is not on the curated list is counted rather than reported,
     /// so a short list of sinks can be told from a driver that imports almost nothing.
+    /// The framework tell rides the import table the sinks are built from, so it answers on exactly
+    /// the scans that answer at all -- and it is **not** a sink, which is the mistake available here:
+    /// `WdfVersionBind` is how a driver loads, not something it does to a caller's buffer, so it
+    /// must not show up in `sinks` or move `other_imports` into looking like a finding.
+    #[test]
+    fn the_bind_import_is_the_framework_tell_and_not_a_sink() {
+        let image = image();
+        let bind = pe::Import {
+            library: "WDFLDR.SYS".to_string(),
+            name: pe::ImportName::Named("WdfVersionBind".to_string()),
+            slot: BASE + 0x3000,
+        };
+        let found = scan(
+            &image,
+            &[bind.clone(), import("memcpy", BASE + 0x3008)],
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+        );
+        assert_eq!(found.framework, Some(crate::framework::Framework::Kmdf));
+        assert_eq!(
+            found.sinks.len(),
+            1,
+            "the bind routine is not a sensitive API: {:?}",
+            found.sinks
+        );
+        assert_eq!(
+            found.other_imports, 1,
+            "it is counted as the ordinary import it is"
+        );
+
+        // And it travels into the typed answer as the one tell this end can have seen. The dispatch
+        // tell needs a driver object, which a hazard scan has never read.
+        let report = structured_report("vid", BASE, &found, |address| {
+            crate::structured::CodeLocation {
+                address: crate::structured::addr(address),
+                module: Some("vid".to_string()),
+                rva: Some("0x0".to_string()),
+                attribution_failed: false,
+            }
+        });
+        let framework = report
+            .framework
+            .expect("the scan said so, so the report does");
+        assert_eq!(framework.framework, "kmdf");
+        assert_eq!(
+            framework.tells,
+            vec![crate::structured::FrameworkTell::BindImport]
+        );
+        assert_eq!(framework.dispatch_image, None);
+        // A WDM driver's scan carries no such field at all, which is what keeps the absence from
+        // being a claim.
+        let wdm = scan(
+            &image,
+            &[import("memcpy", BASE + 0x3008)],
+            InstructionSet::Amd64,
+            |_, _| None,
+            never,
+        );
+        assert_eq!(wdm.framework, None);
+    }
+
     #[test]
     fn a_call_site_is_matched_by_its_slot() {
         let image = image();

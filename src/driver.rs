@@ -1534,8 +1534,11 @@ pub(crate) fn structured_report(
     };
     structured::Reachability {
         // Filled in by the caller, from the attributor whose `locate` it passed: this file has
-        // never seen an engine, and the images are what that closure learned on the way.
+        // never seen an engine, and the images are what that closure learned on the way. The
+        // framework qualification is the caller's for the same reason -- it is read off the module
+        // the seed landed in.
         images: Vec::new(),
+        framework: None,
         verdict: if r.verdict_reachable {
             structured::ReachabilityVerdict::Reachable
         } else {

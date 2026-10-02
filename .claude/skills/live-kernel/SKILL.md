@@ -229,6 +229,20 @@ wait. The session becomes `kernel_unresolved`; late completion does not reopen i
    `IRP+0xB8`. `uf` the dispatch to read the (usually binary-search) IOCTL switch, `decode_ioctl`
    each code, and read each case's `DbgPrintEx` string (`da`) for the human name.
 
+**That recipe assumes a WDM driver, and most in-box drivers here are not one.** A **KMDF** driver's
+table is the *framework's*: `Wdf01000!FxDriver::Initialize` writes `FxDevice::Dispatch` or
+`FxDevice::DispatchWithLock` into all 28 slots from `DRIVER_OBJECT+0x70` onwards, so step 3 hands
+you framework code and the `uf` in it has no IOCTL switch — correctly, because the codes are
+compared inside the `EvtIoDeviceControl` of an I/O queue, which this server cannot yet resolve
+(`FOLLOWUPS.md` item 108 step 2). `driver_surface` now says so in a `framework` field rather than
+leaving you to read 28 identical pointers, and `driver_hazards` reports the driver-side tell — an
+import of `WdfVersionBind` from `WdfLdr.sys`. **Check that before concluding a driver dispatches
+nothing**, which is the detour this note exists to save: 132 of the 445 driver images in
+`System32\drivers` on this bench are KMDF clients, including most of the in-box Hyper-V device
+drivers (`Vid`, `vmbus`, `vpci`, `storvsp`, `vmstorfl`) — though not all of them, `vmswitch`,
+`winhv`, `winhvr`, `hvsocket` and `vmbkmcl` carrying no bind import at all. UMDF
+(`WUDFx02000.dll`, user mode) is a third case and is recognised nowhere here.
+
 **Symbols must be on the debugger host.** PDBs are never fetched from the target over KD. Find the
 exact PDB identity the engine wants with `!sym noisy; .reload /f <mod>` (it prints `<pdb>\<GUID>\...`),
 then get that PDB onto this host. **Gotcha: `.sympath` / `.sympath+` swallow the *rest of the command
