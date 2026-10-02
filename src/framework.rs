@@ -58,14 +58,23 @@
 //! `EvtIoDefault` at `+0x10`, then `EvtIoRead`, `EvtIoWrite`, `EvtIoDeviceControl` at `+0x28`,
 //! `EvtIoInternalDeviceControl` at `+0x30`, `EvtIoStop`, `EvtIoResume`, `EvtIoCanceledOnQueue` -- so
 //! a device-control request reaches `EvtIoDefault` in a queue that configures no specific handler,
-//! and an internal one reaches its own slot. Two further routes bypass the queue machinery
-//! altogether and are exported by this build:
+//! and an internal one reaches its own slot. Two further routes let the driver see the IRP
+//! **before** the framework dispatches it, and are exported by this build:
 //! `WdfDeviceInitAssignWdmIrpPreprocessCallback` and `WdfDeviceConfigureWdmIrpDispatchCallback`.
 //!
-//! Naming one of four as *the* place is the same overclaim as the rest of this file's history, in
-//! the one sentence that looked like architecture rather than evidence -- and it is the one that
-//! would send a reader to the wrong callback. Whichever of them a given driver uses is step 2's
-//! question (`FOLLOWUPS.md` item 108).
+//! **Neither of those two replaces the queue, which is the correction review made and then
+//! understated.** The finding said a preprocess callback need not bypass the queue, because it can
+//! hand the IRP back; measuring it says the same of *both*, since this build exports
+//! `WdfDeviceWdmDispatchPreprocessedIrp` -- hand it back for normal dispatch -- **and**
+//! `WdfDeviceWdmDispatchIrpToIoQueue`, which hands it to a named queue. So each is a site that runs
+//! *in addition to* the queue callback unless the driver completes the request itself, and the
+//! distinction the finding proposed, between a conditional interception and a route that replaces
+//! queue handling, is cleaner than the API is.
+//!
+//! Naming one slot as *the* place is the same overclaim as the rest of this file's history, in the
+//! one sentence that looked like architecture rather than evidence -- and it is the one that would
+//! send a reader to the wrong callback. Which of them a given driver uses, and whether a hook
+//! forwards, is step 2's question (`FOLLOWUPS.md` item 108).
 //!
 //! # Engine-free
 //!
@@ -184,8 +193,8 @@ impl Framework {
                  entry is the framework's code rather than this driver's and holds no IOCTL compare \
                  chain: this driver's control codes are compared in a callback the framework holds, \
                  which this build cannot resolve -- an I/O queue's `EvtIoDeviceControl` usually, or \
-                 its `EvtIoDefault` or `EvtIoInternalDeviceControl`, or a WDM preprocess or \
-                 dispatch hook."
+                 its `EvtIoDefault` or `EvtIoInternalDeviceControl`, with a WDM preprocess or \
+                 dispatch hook able to see the IRP before any of them."
             }
             Table::NotEstablished => {
                 " This driver's `MajorFunction` entries **were** read and are in this answer, and \
@@ -348,8 +357,8 @@ pub(crate) fn code_report(framework: Framework) -> crate::structured::DriverFram
                binds to it -- so this answers about code every KMDF driver on the target shares, and \
                about none of them in particular. A KMDF driver whose dispatch table the framework \
                took over compares its control codes in a callback the framework holds -- an I/O \
-               queue's `EvtIoDeviceControl` usually, or one of the three other routes -- which this \
-               build cannot resolve."
+               queue's `EvtIoDeviceControl` usually, or another of its queue slots, or a WDM hook \
+               that runs before them -- which this build cannot resolve."
             .to_string(),
         framework: framework.name().to_string(),
         tells: vec![crate::structured::FrameworkTell::FrameworkImage],
