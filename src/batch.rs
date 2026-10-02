@@ -608,9 +608,9 @@ pub fn validate(steps: &[BatchStep], always: &[BatchStep]) -> Result<(), String>
                     }
                 )
             };
-            step.action.substituted(&mut resolve).map_err(&unresolved)?;
+            step.action.substituted(&mut resolve).map_err(unresolved)?;
             for check in &step.expect {
-                check.substituted(&mut resolve).map_err(&unresolved)?;
+                check.substituted(&mut resolve).map_err(unresolved)?;
             }
 
             if let Some(capture) = &step.capture {

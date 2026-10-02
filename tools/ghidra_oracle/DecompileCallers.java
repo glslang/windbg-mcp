@@ -1,4 +1,9 @@
-// Decompile every function that calls a named function or image-relative RVA.
+// Decompile the functions that reference a named function or image-relative RVA.
+//
+// NOT "every function that calls": what this finds is the references Ghidra resolved to the
+// target and its thunks, split into calls and address-taken. A call reached only through a
+// pointer slot Ghidra left unresolved is not among them, and the report says so in its
+// `scope=` line rather than leaving `callers=0` to be read as none existing.
 //@category Analysis
 
 import ghidra.app.decompiler.DecompInterface;
@@ -66,18 +71,35 @@ public class DecompileCallers extends GhidraScript {
             }
         }
 
+        // Split by reference TYPE, because `getReferencesTo` returns every reference and not only
+        // calls. A function that merely takes the callee's address -- registering a callback, filling
+        // a dispatch-table slot, a bare `lea` -- was being reported as a caller, which is an oracle
+        // stating something the image does not say. Both halves are kept rather than one filtered
+        // away: an address taken is how an indirect call happens, so it is the more interesting row
+        // of the two and dropping it would lose what this script is usually run to find. Same
+        // convention as `tools/vid_field_census.py`, which reports `lea` separately for this reason.
         Set<Function> callers = new LinkedHashSet<>();
+        Set<Function> addressTaken = new LinkedHashSet<>();
         for (Address destination : expanded) {
             ReferenceIterator references = currentProgram.getReferenceManager()
                     .getReferencesTo(destination);
             while (references.hasNext()) {
                 Reference reference = references.next();
-                Function caller = getFunctionContaining(reference.getFromAddress());
-                if (caller != null && !caller.isThunk()) {
-                    callers.add(caller);
+                Function from = getFunctionContaining(reference.getFromAddress());
+                if (from == null || from.isThunk()) {
+                    continue;
+                }
+                if (reference.getReferenceType().isCall()) {
+                    callers.add(from);
+                }
+                else {
+                    addressTaken.add(from);
                 }
             }
         }
+        // A function that both calls the target and takes its address is a caller; listing it twice
+        // would make the two counts overlap with nothing saying so.
+        addressTaken.removeAll(callers);
 
         Files.createDirectories(output.toAbsolutePath().getParent());
         DecompInterface decompiler = new DecompInterface();
@@ -90,7 +112,19 @@ public class DecompileCallers extends GhidraScript {
             for (Symbol symbol : symbolsAt(expanded)) {
                 out.println("target=" + symbol.getName(true) + "@" + symbol.getAddress());
             }
+            // What the report covers, said in the report rather than left to be inferred from
+            // `callers=0`. A call reached only through a pointer slot Ghidra did not resolve to one
+            // of these addresses is not counted here, and the honest form of that is to name the
+            // scope rather than to claim completeness this script cannot deliver.
+            out.println("scope=references Ghidra resolved to the target addresses above and their "
+                    + "thunks; a call through an unresolved pointer slot is not counted");
             out.println("callers=" + callers.size());
+            out.println("address_taken=" + addressTaken.size());
+            for (Function function : addressTaken) {
+                long rva = function.getEntryPoint().subtract(currentProgram.getImageBase());
+                out.println("address_taken_by=" + function.getName() + " rva=0x"
+                        + Long.toHexString(rva));
+            }
             for (Function function : callers) {
                 long rva = function.getEntryPoint().subtract(currentProgram.getImageBase());
                 out.println();
@@ -104,6 +138,13 @@ public class DecompileCallers extends GhidraScript {
                 else {
                     out.println(result.getDecompiledFunction().getC());
                 }
+            }
+            // `PrintWriter` swallows every `IOException` and records a flag instead, so
+            // without this a report truncated by a full disk is announced as a success.
+            // Flushed first, so the only write left for `close()` is an empty buffer.
+            out.flush();
+            if (out.checkError()) {
+                throw new java.io.IOException("writing " + output + " failed");
             }
         }
         finally {

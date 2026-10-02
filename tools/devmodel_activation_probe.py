@@ -24,11 +24,20 @@ surrogate would let COM *start a process* to satisfy the call, and the question 
 whether the object can be created **in this** process. A surrogate activation
 would answer a different question and look like a success.
 
-**One child process per CLSID.** A device-model DLL reached with none of the
+**One child process per CLSID, with a deadline on each.** A device-model DLL reached with none of the
 context `vmwp.exe` supplies may fault rather than return a failing `HRESULT`, and
 a fault in the census process would cost every result after it. Each activation
 therefore runs in a subprocess (`--one <clsid>`), whose crash is recorded as an
-exit status next to the 23 that answered.
+exit status next to the 23 that answered. **A class that blocks costs the same as
+one that faults**, and the subprocess alone does not isolate it, so each child
+also has a deadline and a timeout is recorded as a result of its own: *this class
+did not answer* is a reading, where a missing row is not.
+
+**The controls are checked before the total is printed**, and a bad one suppresses
+it. `ACTIVATED=0` beside a positive control that also failed measures this probe's
+own call path and says nothing about Hyper-V, which is the reading the controls
+exist to prevent -- so leaving them unread would have made them decoration. A
+failed control exits non-zero.
 
 The output pointer is poisoned with `0xAA` before each call, so a provider that
 writes nothing cannot be read as one that wrote null -- the same rule as the rest
@@ -65,6 +74,11 @@ BACKING_DLLS = (
 # be told from a broken call path. Verified at runtime to be in-proc and *not*
 # one of the seven, rather than asserted.
 CONTROL_POSITIVE = "{F6D90F16-9C73-11D3-B32E-00C04F990BB4}"  # msxml3 XMLHTTP
+
+# How long one activation may take before it is recorded as not having answered. A
+# device-model class that blocks is as costly as one that faults, and the
+# one-child-per-CLSID design only isolates the second without this.
+ACTIVATION_TIMEOUT_S = 30
 
 # Well-formed and registered nowhere: the negative control, which must come back
 # REGDB_E_CLASSNOTREG. Without it, that code on a real CLSID cannot be read.
@@ -229,12 +243,17 @@ def activate_one(clsid_text: str) -> dict:
         # Refcount through the vtable: AddRef then Release, and report what the
         # object itself said. A created object that cannot be refcounted would be
         # a far stranger result than a refusal.
+        # `WINFUNCTYPE`, not `CFUNCTYPE`: COM vtable methods are `stdcall`. The two conventions
+        # coincide on x64, so an x64 run cannot tell them apart and this probe's own results do not
+        # establish which was right -- on x86 the `cdecl` version would corrupt the stack on the
+        # first `AddRef`, and the parent would record the child as dead rather than as an activation
+        # that worked. Raised in review on #434.
         vtbl = ctypes.cast(punk, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))
-        query = ctypes.CFUNCTYPE(
+        query = ctypes.WINFUNCTYPE(
             ctypes.c_long, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p
         )(vtbl[0][0])
-        add_ref = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[0][1])
-        release = ctypes.CFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[0][2])
+        add_ref = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[0][1])
+        release = ctypes.WINFUNCTYPE(ctypes.c_ulong, ctypes.c_void_p)(vtbl[0][2])
         result["after_addref"] = add_ref(punk)
         result["after_release"] = release(punk)
 
@@ -277,11 +296,27 @@ def main() -> int:
         + [{"clsid": CONTROL_NEGATIVE, "dll": "(control-)", "name": "unregistered", "threading": "-"}]
         + targets
     ):
-        child = subprocess.run(
-            [sys.executable, __file__, "--one", entry["clsid"]],
-            capture_output=True,
-            text=True,
-        )
+        # A deadline, because the one-child-per-CLSID design is for a device model that *faults* and
+        # a blocking one costs just as much without it: `subprocess.run` would wait for ever, so the
+        # remaining CLSIDs are never tried and no census is printed. A timeout is recorded as a
+        # result of its own -- "this class did not answer" is a reading, where a missing row is not.
+        try:
+            child = subprocess.run(
+                [sys.executable, __file__, "--one", entry["clsid"]],
+                capture_output=True,
+                text=True,
+                timeout=ACTIVATION_TIMEOUT_S,
+                check=False,
+            )
+        except subprocess.TimeoutExpired:
+            rows.append(
+                {
+                    **entry,
+                    "hr": "(timed out)",
+                    "hr_name": "no answer in %ds" % ACTIVATION_TIMEOUT_S,
+                }
+            )
+            continue
         if child.returncode != 0 or not child.stdout.strip():
             rows.append(
                 {
@@ -320,7 +355,33 @@ def main() -> int:
                 % (r["clsid"], r.get("name"), r["dll"], clsid_bytes_in_module(r["clsid"], r["path"]))
             )
         print()
+    # The controls are read BEFORE the total, and a bad one suppresses it. They exist to tell a
+    # device-model refusal from a broken probe, and a run that prints `ACTIVATED=0` with a positive
+    # control that also failed has measured its own call path and nothing about Hyper-V -- which is
+    # exactly the reading the controls were added to prevent, so leaving them unchecked made them
+    # decoration. Raised in review on #434.
+    by_clsid = {r["clsid"]: r for r in rows}
+    positive = by_clsid.get(CONTROL_POSITIVE, {})
+    negative = by_clsid.get(CONTROL_NEGATIVE, {})
+    broken = []
+    if positive.get("hr") != "0x00000000":
+        broken.append(
+            "the positive control (%s) did not activate: %s %s"
+            % (CONTROL_POSITIVE, positive.get("hr"), positive.get("hr_name") or "")
+        )
+    if negative.get("hr") != "0x80040154":
+        broken.append(
+            "the negative control (%s) was not REGDB_E_CLASSNOTREG: %s %s"
+            % (CONTROL_NEGATIVE, negative.get("hr"), negative.get("hr_name") or "")
+        )
+    if broken:
+        print("CONTROLS FAILED -- no total is reported, because it would not mean anything:")
+        for why in broken:
+            print("  %s" % why)
+        return 1
+
     ok = [r for r in rows if r["hr"] == "0x00000000" and r["dll"] not in ("(control+)", "(control-)")]
+    print("controls   positive=S_OK  negative=REGDB_E_CLASSNOTREG")
     print("ACTIVATED=%d of %d device-model classes" % (len(ok), len(targets)))
     for r in ok:
         print("  %s %s  refcount after AddRef=%s" % (r["clsid"], r.get("name"), r.get("after_addref")))
