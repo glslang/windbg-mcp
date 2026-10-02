@@ -84,6 +84,18 @@ ACTIVATION_TIMEOUT_S = 30
 # REGDB_E_CLASSNOTREG. Without it, that code on a real CLSID cannot be read.
 CONTROL_NEGATIVE = "{D0D0D0D0-1111-2222-3333-444455556666}"
 
+# The poison byte pattern, sized to THIS interpreter's pointer width.
+#
+# Writing the 64-bit literal into a `ctypes.c_void_p` keeps only the low 32 bits under 32-bit
+# Python, so comparing the stored value against that literal answered False for a pointer nothing
+# had touched -- which read as a replaced, non-null pointer. The code then dereferenced the
+# truncated sentinel as a COM vtable, the child died, and the parent recorded the class as dead: a
+# probe bug reported as a device-model failure, in the one place the poison exists to prevent
+# exactly that confusion. Derived from `sizeof(c_void_p)` rather than written out, so the
+# comparison cannot disagree with the storage. Raised in review on #434; the same shape as the
+# `max_read` narrowing in `src/livesrc.rs`, which was this mistake in the other language.
+POISON = int.from_bytes(bytes([0xAA]) * ctypes.sizeof(ctypes.c_void_p), "little")
+
 CLSCTX_INPROC_SERVER = 0x1
 COINIT_MULTITHREADED = 0x0
 
@@ -249,7 +261,7 @@ def activate_one(clsid_text: str) -> dict:
     }
 
     # Poisoned, so "wrote nothing" cannot read as "wrote null".
-    punk = ctypes.c_void_p(0xAAAAAAAAAAAAAAAA)
+    punk = ctypes.c_void_p(POISON)
     hr = ole.CoCreateInstance(
         ctypes.byref(clsid),
         None,
@@ -262,7 +274,7 @@ def activate_one(clsid_text: str) -> dict:
     result["hr_name"] = hr_name(hr)
     result["last_error"] = ctypes.get_last_error()
     result["ptr"] = "0x%X" % (punk.value or 0)
-    result["ptr_untouched"] = punk.value == 0xAAAAAAAAAAAAAAAA
+    result["ptr_untouched"] = punk.value == POISON
     result["modules_after"] = sorted(loaded_modules())
 
     if hr == 0 and punk.value and not result["ptr_untouched"]:
@@ -293,7 +305,7 @@ def activate_one(clsid_text: str) -> dict:
             ctypes.c_wchar_p("{DEADBEEF-0000-0000-0000-000000000001}"),
             ctypes.byref(junk_iid),
         )
-        sink = ctypes.c_void_p(0xAAAAAAAAAAAAAAAA)
+        sink = ctypes.c_void_p(POISON)
         qi = query(punk, ctypes.byref(junk_iid), ctypes.byref(sink)) & 0xFFFFFFFF
         result["qi_unknown_iid"] = "0x%08X" % qi
         result["qi_name"] = hr_name(qi)
