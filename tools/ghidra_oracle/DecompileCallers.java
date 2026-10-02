@@ -42,15 +42,28 @@ public class DecompileCallers extends GhidraScript {
             // a mistyped RVA -- or one belonging to a different image -- can land far outside it and
             // still be a perfectly good Address. It is also allowed to run off the end of the space,
             // which throws something a caller of this script would have to decode.
+            Address target;
             try {
-                destinations.add(currentProgram.getImageBase().add(
-                        Long.parseUnsignedLong(calleeName.substring(2), 16)));
+                target = currentProgram.getImageBase().add(
+                        Long.parseUnsignedLong(calleeName.substring(2), 16));
             }
             catch (RuntimeException e) {
                 throw new IllegalArgumentException(
                         "RVA " + calleeName + " is not an address in "
                         + currentProgram.getExecutablePath() + "'s address space: " + e);
             }
+            // An RVA must land in loaded memory, and it is checked HERE rather than with the symbol
+            // destinations below because only this branch can produce an address the program does not
+            // contain: `getImageBase().add` is arithmetic and validates nothing.
+            if (!currentProgram.getMemory().contains(target)) {
+                throw new IllegalArgumentException(
+                        "RVA " + calleeName + " resolves to " + target + ", outside "
+                        + currentProgram.getExecutablePath() + "'s loaded memory (image base "
+                        + currentProgram.getImageBase() + "). Nothing can reference an address the "
+                        + "program does not contain, so a count here would read as zero callers "
+                        + "rather than as a target in the wrong image.");
+            }
+            destinations.add(target);
         }
         else {
             while (symbols.hasNext()) {
@@ -73,14 +86,6 @@ public class DecompileCallers extends GhidraScript {
         // the other direction, and writing no report at all is the only answer that cannot be
         // mistaken for one. Raised in review on #434.
         //
-        // **The condition is that every destination is inside the loaded program, not merely that
-        // there is one.** A first version of this guard tested only `isEmpty()`, which the numeric
-        // branch walks straight past: `getImageBase().add(rva)` always yields an address, so a
-        // mistyped RVA produced a non-empty set, passed the guard, and wrote the same three zeros the
-        // guard was added to prevent. Checking what the destinations ARE cannot be bypassed by a new
-        // way of producing one; checking that some exist can, and was. Raised in review on #434
-        // again, against this guard's own introduction.
-        //
         // `DecompileFunctions.java` keeps going in the same situation and is right to: it takes
         // several selectors and names the unresolved ones in a `missing=` line, so its report
         // distinguishes them. This script takes one target, so there is nothing left to report.
@@ -91,14 +96,26 @@ public class DecompileCallers extends GhidraScript {
                     + "function name, so a caller count would be a claim about a target that was "
                     + "never located. Check the spelling and that a PDB is loaded (ConfigurePdb.java).");
         }
+        // **An EXTERNAL address is a resolved target, not a bad one**, and a previous round of this
+        // guard got that wrong in a way that would have broken the script's main use. Ghidra puts an
+        // imported symbol in the external address space, which `getMemory().contains` answers false
+        // for -- so checking every destination against loaded memory threw for exactly the imported
+        // callee this script exists to follow through its thunk, which the README lists first. The
+        // RVA branch above is where an unvalidated address can actually come from, and it is checked
+        // there; here the test is only that the space is one of the two that mean something.
+        //
+        // The sequence is worth keeping: round 6 guarded `isEmpty()` and the RVA path walked past it;
+        // round 7 guarded every destination and broke imports. Both were a check written for the case
+        // in front of me rather than for what the inputs are, and the fix is per-origin validation
+        // rather than one more predicate over the set. Raised in review on #434, twice.
         for (Address destination : destinations) {
-            if (!currentProgram.getMemory().contains(destination)) {
+            if (!currentProgram.getMemory().contains(destination) && !destination.isExternalAddress()) {
                 throw new IllegalArgumentException(
-                        "callee " + calleeName + " resolved to " + destination + ", which is outside "
-                        + currentProgram.getExecutablePath() + "'s loaded memory (image base "
-                        + currentProgram.getImageBase() + "). Nothing can reference an address the "
-                        + "program does not contain, so a count here would read as zero callers "
-                        + "rather than as a target in the wrong image.");
+                        "callee " + calleeName + " resolved to " + destination + ", which is neither "
+                        + "in " + currentProgram.getExecutablePath() + "'s loaded memory (image base "
+                        + currentProgram.getImageBase() + ") nor an external/import address. A count "
+                        + "against it would read as zero callers rather than as a target Ghidra never "
+                        + "placed.");
             }
         }
 
