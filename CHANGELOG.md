@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   of those entries reported a routine accepting no control codes — both correct about the table and
   neither an answer to the question asked, the same failure as item 107. `src/framework.rs`
   recognises the case and `driver_surface`, `driver_hazards`, `ioctl_map` and
-  `reachable_from_dispatch` each carry a `framework` field saying so. **Two tells, because neither
+  `reachable_from_dispatch` each carry a `framework` field saying so — and each **renders** it as well, since `structuredContent` replaces the text block rather than accompanying it, so a qualification on one half reaches none of the callers served the other. `reachable_from_dispatch` had it on one side only until review round 2. **Two tells, because neither
   implies the other**: a `WdfVersionBind` import from `WdfLdr.sys`, which is a fact about the *image*
   and so answers with no debuggee, and every `MajorFunction` entry read being in the framework's
   image, which is a fact about the *driver object*. A client passing

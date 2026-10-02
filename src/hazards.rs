@@ -1343,6 +1343,25 @@ mod tests {
             never,
         );
         assert_eq!(wdm.framework, None);
+
+        // **And the rendered half says it too.** A structured-aware client is served
+        // `structuredContent` instead of the text, so a field on one half reaches none of the
+        // clients served the other -- the rule review on #437 found broken in
+        // `reachable_from_dispatch`, pinned here as well so it is pinned at every site that has one.
+        // This renderer prints the **word** rather than the note, deliberately: it is embedded whole
+        // inside `surface::render`, which prints the note at the top of the same answer.
+        let locate = |address: u64| crate::structured::CodeLocation {
+            address: crate::structured::addr(address),
+            module: Some("vid".to_string()),
+            rva: Some("0x0".to_string()),
+            attribution_failed: false,
+        };
+        let text = render(&structured_report("vid", BASE, &found, locate));
+        assert!(text.contains("framework kmdf"), "{text}");
+        assert!(
+            !render(&structured_report("vid", BASE, &wdm, locate)).contains("framework"),
+            "and a WDM driver's rendering gains nothing"
+        );
     }
 
     #[test]

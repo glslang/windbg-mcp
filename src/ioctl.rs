@@ -13119,6 +13119,58 @@ mod tests {
         );
     }
 
+    /// **A map rooted in a framework's own image says so in the rendering as well as in the values.**
+    ///
+    /// Pinned here because that rule was pinned at two of its four sites and not at the other two,
+    /// and review on #437 found the missing one in `reachable_from_dispatch` -- the same defect this
+    /// renderer could have. A structured-aware client is served `structuredContent` instead of the
+    /// text, so a note on one half reaches none of the clients served the other.
+    ///
+    /// And **above** the cases, since it changes what an empty list means.
+    #[test]
+    fn a_map_of_framework_code_is_qualified_in_the_rendering_too() {
+        let mut report = crate::structured::IoctlMap {
+            images: Vec::new(),
+            dispatch: crate::structured::CodeLocation {
+                address: "0x0000000140051c90".to_string(),
+                module: Some("Wdf01000".to_string()),
+                rva: Some("0x51c90".to_string()),
+                attribution_failed: false,
+            },
+            framework: None,
+            code_proved: true,
+            cases: Vec::new(),
+            case_count: 0,
+            tables: Vec::new(),
+            unresolved: Vec::new(),
+            untracked: Vec::new(),
+            stopped: None,
+            unproved: 0,
+            cap_hit: false,
+            unsettled: false,
+            blind: 0,
+        };
+        assert!(
+            !render(&report).contains("Wdf01000.sys"),
+            "a map of a driver's own routine gains nothing"
+        );
+
+        report.framework = Some(crate::framework::report(
+            crate::framework::Framework::Kmdf,
+            vec![crate::structured::FrameworkTell::FrameworkImage],
+            None,
+        ));
+        let text = render(&report);
+        let note = text.find("Wdf01000.sys").expect("the framework is named");
+        let cases = text
+            .find("No control codes recovered")
+            .expect("and the empty list it qualifies is still printed");
+        assert!(
+            note < cases,
+            "the qualification arrives before the emptiness it explains:\n{text}"
+        );
+    }
+
     /// The facts a rejection's own path carries go with it over the tail jump.
     ///
     /// A shared error block's *entry* facts are what every path into it agreed on, so a case that
