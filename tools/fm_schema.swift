@@ -101,7 +101,9 @@ final class SchemaConverter {
             let props = (d["properties"] as? [String: Any]) ?? [:]
             let required = Set((d["required"] as? [String]) ?? [])
             guard !props.isEmpty else {
-                // An empty `properties` is rejected outright, and `attach_kernel_local` has one.
+                // An empty `properties` is rejected outright, and `attach_kernel_local` reaches
+                // here: since item 107 it carries no `properties` key at all (an empty args struct
+                // that denies unknown fields), which the `?? [:]` above reads as the same case.
                 // A single optional field nothing reads is the cheapest way through.
                 return DynamicGenerationSchema(name: name, description: desc, properties: [
                     .init(name: "_", description: "unused",
