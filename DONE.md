@@ -150,6 +150,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 81](#81-windbg-mcp--dbgscope-changes_debug_target-reads-a-name-and-a-wrapper-does-not-say-one--done-2026-09-25) — [windbg-mcp + dbgscope] `changes_debug_target` reads a name, and a wrapper does not say one — done (2026-09-25)
 - [Item 102](#102-windbg-mcp-a-debug_batch-runs-its-rollback-against-whatever-target-it-ends-up-holding--done-2026-09-26) — [windbg-mcp] A `debug_batch` runs its rollback against whatever target it ends up holding — done (2026-09-26)
 - [Item 103](#103-windbg-mcp-h5b--expose-the-secure-kernel-reads-without-forcing-them-through-dbgeng--done-2026-10-02) — [windbg-mcp] H5b — expose the Secure Kernel reads, without forcing them through DbgEng — done (2026-10-02)
+- [Item 107](#107-windbg-mcp-a-misspelt-tool-argument-is-silently-ignored-and-the-call-answers-status-ok--done-2026-10-02) — [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok` — done (2026-10-02)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -8202,3 +8203,171 @@ validated. The full record is the
    with `SizeOfImage` sixteen bytes later, then follow its `Blink` — as the **cross-check** rather
    than the primary. It is what found the head independently in H4, and the two agreeing is what
    made either believable.
+
+## 107. [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok` — **done** (2026-10-02)
+
+**Repo:** `windbg-mcp`. **Origin:** hit live, 2026-09-29, during item 103's S5o gate. Three
+`disassemble` calls passed `target` — which is not a parameter; the parameter is `address` — and
+each was served as though it had asked for nothing: `address` deserialised to `None`, the tool
+disassembled at the current instruction pointer, and the result came back `"status": "ok"` with a
+`start` that was the image entry point. It read as a tool defect for several minutes, and the gate
+fell back to `execute` + `uf` to get the disassembly it wanted — which is the text hatch this repo
+tries not to reach for.
+
+**The failure shape is the one this repo has already written down, in `src/batch.rs`:** *"Serde
+ignores unknown fields by default, which is the wrong default for a step: a misspelt `expect` is a
+step that asserts nothing while reading as though it asserts, and it fails open."* A misspelt
+`address` is a call that disassembles somewhere else while reading as though it disassembled where
+asked, and it fails open the same way. **So this is an unfinished class fix rather than a new
+idea** — `#[serde(deny_unknown_fields)]` is already the convention here and reaches **3 of the 52**
+`*Args` structs in `src/server.rs` (`BreakpointArgs`, `ClearBreakpointsArgs`, `DebugBatchArgs`).
+
+**The MCP spec neither requires nor forbids rejecting unknown arguments, and that shapes the fix
+rather than excusing it.** The 2025-06-18 tools page makes servers responsible — *"Servers MUST:
+Validate all tool inputs"* — and lists *"Invalid arguments"* among the protocol errors carrying
+JSON-RPC `-32602`. What it does not say is that a property absent from `inputSchema` is invalid,
+and **JSON Schema's default is that it is not**: without `additionalProperties: false`, an extra
+key conforms. So a client sending `target` is, today, sending something our own published contract
+calls valid, and rejecting it while advertising otherwise would be the server breaking its own
+schema.
+
+**Which makes the remedy two halves that must land together**, and is the reason this is an item
+rather than a one-line patch:
+
+1. `#[serde(deny_unknown_fields)]` on the remaining `*Args` structs, so the argument is refused
+   rather than dropped; and
+2. the published `inputSchema` carrying `additionalProperties: false` to match, so a client can see
+   the constraint before it violates it. `schemars` emits that from the same attribute, so the two
+   halves are one change per struct — but **verify it reaches the served schema**, since
+   `src/schema.rs` walks and rewrites schemas for per-client surfaces and treats
+   `additionalProperties` as a subschema keyword (`SUBSCHEMA`), with a boolean form handled
+   specially at `schema.rs:293`.
+
+**Two things to check before doing it wholesale.** `deny_unknown_fields` and `#[serde(flatten)]`
+are mutually exclusive, which is exactly why `batch.rs` collects leftovers by hand instead — so any
+args struct that flattens needs the `batch.rs` treatment rather than the attribute. And the
+per-client surface work means a tool's schema is not always served verbatim; a test that asserts
+the refusal should drive it through the served surface, not the struct, or it pins the wrong thing.
+
+**Worth a regression test of the shape this repo prefers**: not "an unknown field is refused" on
+one struct, but a test that enumerates the `*Args` types and asserts the property holds for each,
+so the next tool added cannot quietly opt out. The three that already carry it would pass today and
+the other 49 would not, which is the point.
+
+**A second shape of the same family, inherited from item 103 when it closed on 2026-10-02.**
+`sk_symbol`'s `name` is documented **unqualified** — the module is applied by the tool — so a
+*qualified* `securekernel!SkdInitDebuggerDataBlock` is outside its contract. A lenient engine resolves
+it anyway and the tool reports `securekernel!securekernel!SkdInitDebuggerDataBlock`: the right address
+with a doubled rendering, `status: ok`, and the identifier fields (`address`, `rva`,
+`engine_address`) byte-identical to the unqualified call. So nothing downstream is wrong; what is
+wrong is the one field a caller would quote back — and a lossy display form must never be the
+thing anyone keys on.
+
+**It is here rather than on item 103 because the judgement it needs is this item's, not one tool's**:
+*strip a redundant qualifier* and *refuse a foreign one* are different answers, and `skci!Foo` passed
+to `sk_symbol` should plainly be refused rather than doubled. Deciding that per tool is how a surface
+ends up with 52 conventions. The remedy above — `deny_unknown_fields` plus a matching
+`additionalProperties: false` — does **not** cover it, because the argument here is well-named and
+ill-formed rather than unknown; what it needs is a validator on the *value*, which is the second
+shape this item now carries.
+
+### What landed
+
+**Both halves, on all 52 `*Args` structs plus two places the item did not name.** The attribute is
+on every one of them — not a `#[serde(flatten)]` among the 52, so the `batch.rs` treatment this
+entry warned might be needed was needed nowhere new — and `schemars` emits the matching
+`additionalProperties: false` into each served `inputSchema` from the same attribute.
+`mcp_smoke::every_tool_refuses_an_unknown_argument` walks the surface and asserts both halves per
+tool: 67 schemas that say so, and 67 calls carrying a key no tool has, each refused with that key
+named and the tool's own names listed beside it. `src/server.rs`'s tool-parameter section now states
+the rule once, where the next struct is written.
+
+**The two places the "remaining `*Args` structs" formulation does not reach**, both found by
+enumerating rather than by the item:
+
+- **A nested object a caller fills in.** `walk::FieldArg` and `structured::WatchRequest` are the
+  same failure one level down — a misspelt `size` inside a `fields[]` entry is a column read eight
+  bytes wide instead of four, silently. (The coordinate types already denied unknown fields, which
+  is why only two were left.) The test holds every `$defs` entry of every input schema to the rule,
+  with `BatchStep` the one exception and `src/batch.rs`'s hand-rolled `unknown_fields` the reason
+  it is an exception rather than a gap.
+- **The one tool declared with no `Parameters` at all.** `attach_kernel_local` had no schema of its
+  own, so rmcp dropped *every* argument rather than an unknown one — and there the dropped argument
+  reads as the caller having reached for `attach_kernel` and getting a local kernel attach reported
+  as success. An empty `NoArgs` closes it, and the invariant then has no exception for the test to
+  carry. It also decided the order of the test: the schema pass runs over every tool before any tool
+  is called, so a regression that took that refusal away fails the assertion rather than attaching to
+  the local kernel on the way past.
+
+**Two things this entry had wrong, both about where the fix lands rather than what it is.**
+
+1. **`src/schema.rs` has nothing to do with it.** That module rewrites **output** schemas —
+   `constraints_of` is called for `output_schema` and nothing in this crate touches an input schema —
+   so its `SUBSCHEMA` handling of `additionalProperties` was never on this path. The input half is
+   rmcp's `validate_and_strip`, which removes the root `title` and `description` and nothing else,
+   and the per-client narrowing drops whole tools without editing a schema. Verified on the wire
+   rather than reasoned about, which is what the item asked for and is the half it got right.
+2. **The refusal is not `-32602`.** rmcp's `into_tool_argument_error` converts an argument
+   deserialization failure — which *is* `invalid_params` internally — into a tool result with
+   `isError: true` and the message as its text, so the code the spec lists never reaches the client
+   and the refusal travels the same channel as every other refusal here. One consequence is worth
+   naming: that result carries no `structuredContent`, so a client branching on `error.category` sees
+   nothing for the commonest caller mistake there is. Left as it stands rather than rewrapped —
+   intercepting it means matching rmcp's message prefix, and the message already names the field and
+   lists the names the tool does have, which is what a caller acts on. What would make it worth
+   doing is a second refusal shape arriving on that path, or a client that branches on the category
+   and cannot read text.
+
+**The second shape — a well-named, ill-formed value — is decided as *refuse*.**
+`server::reject_module_qualifier` sits beside `reject_command_breakers` as the same kind of rule, and
+`sk_symbol` applies it to `name` beside the existing `name`/`address` check, so both refusals happen
+before a session is looked for. **Refusing rather than stripping is the decision**, and it is about
+the surface rather than about this tool: telling a redundant qualifier from a foreign one needs the
+qualifier itself, which is the engine's spelling of the captured image and lives in the worker — so a
+lenient reading would move the check away from the caller's terms and buy a second convention, and
+`skci!Foo` is plainly the foreign case either way. One rule, stated once, for the next parameter whose
+module this server owns. `a_qualified_name_is_refused_where_the_tool_supplies_the_module` drives both
+qualifiers and asserts the unqualified form still reaches the ordinary session refusal, which is what
+says the rule is about the qualifier rather than about the parameter.
+
+**What it found, which is the half an entry like this is worth reading for.** Turning the default
+round immediately failed three tests in the dump tier, all on one call shape: four places in
+`tests/mcp_smoke.rs` asked `registers` for `{ "filter": "pc" }`, and `registers` has no `filter` —
+that is `modules`' parameter. Every one of those calls had been reading the whole integer register
+set and reporting success, which is the item's own failure verbatim, in the suite that exists to
+catch it. A static sweep then checked **every** tool-call argument object in the repository against
+the served schemas and found three more, all in `tools/`: `attach_kernel { "timeout_ms": … }` in both
+the Binary Ninja and Ghidra oracles, and `execute { "timeout_ms": 5000 }` in the Secure Kernel
+handoff probe. None of the three is a parameter; all three had been dropped in silence, and all three
+would now be refused at runtime — so the class fix's first act was to break three of this project's
+own drivers, which is the evidence that the keys were never doing anything. The sweep is the cheap
+half to repeat: ask a running server for `tools/list`, then brace-match every `"<tool>", json!({…})`
+and `<tool> { … }` in the tree and compare top-level keys against `properties`. It reports four
+remaining hits and all four are deliberate — two doc examples *of* the bug, one typo test, and a
+comment naming `attach_kernel_local`'s hazard.
+
+**One thing is deliberately still open, and it is in the batch vocabulary rather than in a tool.**
+Measured off the wire: of the defs an input schema carries, the ones with no `properties` of their own
+are the string enums — and `Check`, which is an internally tagged enum rendered as a `oneOf` of
+objects. So a key **added** beside an `expect` entry's own fields is still dropped. It is narrower
+than the class this item is about: every field of every `Check` variant is required, so a misspelt one
+already fails closed, and what a step carries at its own level *is* collected and named by
+`BatchStep::unknown_fields`. Closing it would put the same keyword on three `oneOf` branches that the
+test's `$defs` walk does not reach, which makes it `src/batch.rs`'s mechanism to extend rather than a
+hole in this one — and the one place in the input surface where "refused" is code rather than a schema
+keyword stays one place.
+
+**What it cost, measured rather than estimated** (2026-10-02, and the arithmetic is in
+`MODEL_VISIBLE_CEILING`'s doc comment and `docs/token-budget.md`): the model-visible surface goes
+103,321 -> **105,276 B** and the payload 290,241 -> **292,196**, the same +1,955 on both, because
+`,"additionalProperties":false` is 29 B wherever it lands and nothing else moved. 64 of the 67 tools
+gain one at the root, two gain a second for a nested type, and `attach_kernel_local` costs 70 rather
+than 29 — it gains the `2020-12` declaration an empty args struct brings and loses the empty
+`properties` rmcp served it. 64 x 29 + 58 + 41 = 1,955. The model ceiling moves 105,000 -> 108,000,
+leaving 2.6%; the wire and per-tool ceilings are unchanged, `debug_batch` being untouched at 10,842 B
+for the `flatten` reason above. **No `outputSchema` moved**, which is the question this repository
+asks of any schema change. Both goldens re-recorded; the shape golden's whole diff is one line — the
+`(none)` dialect leaving, because every tool now declares one.
+
+Verified on the ARM64 bench: `cargo test` is **1,124 unit tests and 132 `mcp_smoke`**, 0 failed, and
+the dump tier green beside it.

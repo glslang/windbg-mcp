@@ -107,7 +107,10 @@ def drive(server: list, dispatch: str, profile=None, dump=None, module=None) -> 
     # A live kernel **by profile, never by connection string**: the target's debug key stays on the
     # host that resolves it and out of this argument, this transcript and the recorded JSON.
     opened = (
-        tool("attach_kernel", {"profile": profile, "timeout_ms": 180000})
+        # No `timeout_ms`: `attach_kernel` has no such parameter, and one passed here was
+        # silently dropped until the server started refusing unknown arguments. A live attach
+        # waits for its target by design; what a deadline here would abandon is the waiter.
+        tool("attach_kernel", {"profile": profile})
         if profile
         else tool("open_dump", {"path": dump})
     )

@@ -2016,7 +2016,35 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// surface is a change to what `--tools` means, and `FOLLOWUPS.md` records it rather than this
 /// raise deciding it.
 // 2026-09-19: the opt-in attach field adds 329 B; retain its experimental safety qualifiers.
-const MODEL_VISIBLE_CEILING: usize = 105_000;
+//
+/// **105,000 -> 108,000 for refusing an unknown argument** (2026-10-02, item 107), and this is the
+/// first raise bought by a *keyword* rather than by a tool. The model-visible surface went
+/// 103,321 -> 105,276, a difference of 1,955, and every byte of it is
+/// `,"additionalProperties":false` — 29 B — repeated once per schema that now carries it:
+///
+/// * **64 of the 67 tools** gain it at the root of their input schema. The other three had it
+///   already: `set_breakpoint`, `clear_breakpoints` and `debug_batch` are the structs that denied
+///   unknown fields before this, and `clear_breakpoints` and `debug_batch` therefore moved **0 B**.
+/// * **Two gain a second copy**, for a nested object a caller fills in: `walk_memory`'s `FieldArg`
+///   (+58 in all) and `set_breakpoint`'s `WatchRequest`, which is the whole of why `set_breakpoint`
+///   moves at all.
+/// * **`attach_kernel_local` costs 70 rather than 29**, because it had no schema of its own: it was
+///   declared with no parameters at all, so rmcp served `{"type":"object","properties":{}}` and
+///   dropped whatever a call carried. 33 B -> 103 B is +29 for the keyword and +57 for the `2020-12`
+///   declaration an empty `NoArgs` brings with it, less the 16 B of empty `properties`.
+///
+/// 64 x 29 = 1,856, plus 58 for the two nested copies, plus 41 for that last trade, is 1,955 —
+/// which is the arithmetic rather than a reading, so a figure here that does not add up is a schema
+/// that grew for some other reason.
+///
+/// `debug_batch` is untouched at 10,842 B and still the worst single tool, 358 B under its own
+/// ceiling: `BatchStep` flattens its action and serde makes `deny_unknown_fields` and `flatten`
+/// mutually exclusive, so the step vocabulary keeps the hand-rolled check `src/batch.rs` already
+/// had. The new figure leaves 2,724 B, 2.6%, which is the headroom the last several raises left and
+/// for the same reason. [`WIRE_CEILING`] is **not** raised with it: the payload moved by the same
+/// 1,955 to 292,196 and has 2,804 B left, and a ceiling raised before something needs it absorbs
+/// the next regression in silence.
+const MODEL_VISIBLE_CEILING: usize = 108_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2233,12 +2261,14 @@ fn tool_surface_stays_within_its_token_budget() {
 /// outside the document, or two dialects across one tool list, breaks strict validators — and
 /// both are things a codegen dependency can introduce without any change here.
 ///
-/// On the dialect: every tool that has parameters declares `2020-12`; the one tool with no
-/// parameters at all (`attach_kernel_local`) emits a bare empty object schema with no `$schema`
-/// at all. That is schemars' emission, not something this crate chooses, and it is harmless —
-/// an empty schema constrains nothing, so there is no keyword whose meaning a dialect could
-/// change. What would *not* be harmless is two different declared dialects, so that is what is
-/// pinned here.
+/// On the dialect: every tool declares `2020-12`, including `attach_kernel_local`, which takes no
+/// arguments of its own — it is declared with an empty `NoArgs` rather than with no parameters at
+/// all, so that an argument it does not have is refused instead of dropped
+/// (`every_tool_refuses_an_unknown_argument`). Before that it emitted rmcp's bare empty object
+/// schema with no `$schema` in it, which was harmless for the reason the branch below still
+/// allows: an empty schema constrains nothing, so there is no keyword whose meaning a dialect
+/// could change. What would *not* be harmless is two different declared dialects, so that is what
+/// is pinned here.
 #[test]
 fn tool_schemas_declare_one_dialect_and_are_self_contained() {
     let mut server = Server::started();
@@ -2293,6 +2323,185 @@ fn tool_schemas_declare_one_dialect_and_are_self_contained() {
              `{other_tool}` declares {other}"
         );
     }
+}
+
+/// **A tool refuses an argument it does not have, rather than dropping it** — every tool, and the
+/// schema says so before a client violates it.
+///
+/// Serde ignores an unknown field by default, and for a tool argument that default fails *open*.
+/// Measured: three `disassemble` calls passed `target`, which is not a parameter — `address` is —
+/// and each was served as though it had asked for nothing, disassembling at the current instruction
+/// pointer and answering `"status": "ok"` with a `start` that was the image entry point. It reads
+/// as a tool defect for several minutes and its remedy is the `execute` text hatch, which is the
+/// thing this server's typed tools exist instead of.
+///
+/// **A refusal arrives as a tool result, not as a JSON-RPC error**, which is rmcp's decision rather
+/// than this crate's: serde's failure is `invalid_params` and `into_tool_argument_error` turns an
+/// argument fault into `isError: true` with the message as its text. Measured, and worth stating
+/// because item 107 cites the spec's `-32602` for invalid arguments — that is the code for a
+/// *protocol* fault, and an argument fault reaches the caller through the same channel every other
+/// refusal in this server uses. The message lists the names the tool does have, which is the half a
+/// caller acts on; what it does *not* carry is this crate's `structuredContent` category, so a
+/// client branching on `error.category` sees nothing here.
+///
+/// **Both halves are checked because neither is sufficient.** `#[serde(deny_unknown_fields)]`
+/// refuses the call; the `additionalProperties: false` that `schemars` emits from the same
+/// attribute is what makes refusing it honest, because JSON Schema's default is that an extra key
+/// *conforms* — a server rejecting what its own published `inputSchema` calls valid is breaking its
+/// own contract, whatever the spec's "Validate all tool inputs" says about the rest.
+///
+/// **The schema pass runs over every tool before any tool is called**, which is not tidiness: the
+/// one tool with no arguments of its own is `attach_kernel_local`, and a regression that took the
+/// refusal away would otherwise make this test *attach to the local kernel* on its way past. A lax
+/// schema fails here while the behaviour pass is still unstarted.
+///
+/// Driven through the served surface rather than over the `*Args` types, for the reason
+/// `.claude/rules/tool-surface.md` gives about per-client surfaces: the property has to hold where
+/// the client reads it. Enumerating is the point — a tool added later is held to this by a test
+/// nobody has to remember to extend.
+#[test]
+fn every_tool_refuses_an_unknown_argument() {
+    /// A key no tool has and no caller would reach for by accident.
+    const UNKNOWN: &str = "windbg_mcp_not_a_parameter";
+
+    /// Named types in an input schema's `$defs` that may carry unknown keys, with the reason.
+    ///
+    /// `#[serde(deny_unknown_fields)]` and `#[serde(flatten)]` are mutually exclusive in serde, and
+    /// a batch step flattens its action to keep one step one flat object — so `src/batch.rs`
+    /// collects the leftover keys into a map and checks them by hand in `BatchStep::unknown_fields`
+    /// instead. That is the same guarantee reached another way, which is why this is an exception
+    /// here rather than a gap: the step vocabulary is the one part of the input surface whose typo
+    /// check is code rather than a schema keyword.
+    const FLATTENED: &[&str] = &["BatchStep"];
+
+    let mut server = Server::started();
+    let response = server.request("tools/list", json!({}), STEP);
+    assert_no_error(&response, "tools/list");
+    let tools = response["result"]["tools"]
+        .as_array()
+        .expect("tools/list returns an array")
+        .clone();
+    assert!(!tools.is_empty(), "tools/list must not be empty");
+
+    let denies = |schema: &Value| schema["additionalProperties"] == json!(false);
+    // A subschema that constrains no properties constrains no *names* either: an enum renders as a
+    // `oneOf` of string constants, and `additionalProperties` on one of those would say nothing.
+    //
+    // **It does mean the walk stops at one shape**, and that is worth knowing rather than
+    // discovering: `debug_batch`'s `Check` is a `oneOf` of *objects* — an internally tagged enum —
+    // so it has no `properties` of its own and is skipped here. Every field of every `Check`
+    // variant is required, so a *misspelt* one already fails closed; what is still dropped is a key
+    // **added** beside them. That is `src/batch.rs`'s mechanism to extend, with the step-level
+    // leftovers it already collects, rather than something this walk can reach.
+    let has_fields = |schema: &Value| {
+        schema["properties"]
+            .as_object()
+            .is_some_and(|fields| !fields.is_empty())
+    };
+
+    let mut lax: Vec<String> = Vec::new();
+    for tool in &tools {
+        let name = tool["name"].as_str().expect("a tool has a name");
+        let schema = &tool["inputSchema"];
+        if !denies(schema) {
+            lax.push(format!("`{name}` takes any argument at all: {schema}"));
+        }
+        // The nested objects a caller fills in — a coordinate, a walk's field list, a data
+        // breakpoint's watch — are the same question one level down, and a typo inside one is
+        // dropped by the same default.
+        for (def, subschema) in schema["$defs"].as_object().into_iter().flatten() {
+            if FLATTENED.contains(&def.as_str()) || !has_fields(subschema) || denies(subschema) {
+                continue;
+            }
+            lax.push(format!(
+                "`{name}`'s `{def}` takes any key at all: {subschema}"
+            ));
+        }
+    }
+    assert!(
+        lax.is_empty(),
+        "an input schema that does not say `additionalProperties: false` is one a client may \
+         send anything to, and serde drops what it does not recognise:\n  {}",
+        lax.join("\n  ")
+    );
+
+    let mut accepted: Vec<String> = Vec::new();
+    for tool in &tools {
+        let name = tool["name"].as_str().expect("a tool has a name");
+        // Nothing here reaches a session: arguments are deserialised before the handler runs, so
+        // the refusal costs no engine round trip and needs no target.
+        let refused = server.call_tool(name, json!({ UNKNOWN: true }), STEP);
+        if !is_tool_error(&refused) {
+            accepted.push(format!("`{name}` answered {refused}"));
+            continue;
+        }
+        let said = text_of(&refused["result"]);
+        assert!(
+            said.contains(UNKNOWN),
+            "`{name}`'s refusal must name the argument it did not recognise, got: {said}"
+        );
+    }
+    assert!(
+        accepted.is_empty(),
+        "an unknown argument must be refused, not dropped:\n  {}",
+        accepted.join("\n  ")
+    );
+}
+
+/// **The other half of the same family: an argument that is well-named and ill-formed.**
+///
+/// `deny_unknown_fields` sees a key it does not recognise. It cannot see a key whose *value* is
+/// outside the contract, and `sk_symbol`'s `name` is documented unqualified — the module is the
+/// engine's spelling of the captured image, which only the worker holds. A lenient engine resolved
+/// `securekernel!securekernel!SkdInitDebuggerDataBlock` anyway: the right address, `status: ok`,
+/// `address`/`rva`/`engine_address` byte-identical to the unqualified call, and `symbol` — the one
+/// field a caller quotes back — carrying the doubled spelling. Nothing downstream was wrong, which
+/// is what made it invisible (item 107).
+///
+/// Driven with **no session open**, which is the ordering half: the refusal has to beat the session
+/// lookup, or a caller who misspelt an argument is told to go and open a target. The same thing
+/// `clearing_breakpoints_without_a_selector_is_refused` pins for its own two cases, and the reason
+/// the check sits beside the `name`/`address` one rather than in the worker.
+#[test]
+fn a_qualified_name_is_refused_where_the_tool_supplies_the_module() {
+    let mut server = Server::started();
+
+    for name in [
+        // Redundant: the module this tool would have applied itself.
+        "securekernel!SkdInitDebuggerDataBlock",
+        // Foreign: a module the capture does not hold at all.
+        "skci!SkciValidateImageHeader",
+    ] {
+        let refused = server.call_tool("sk_symbol", json!({ "name": name }), STEP);
+        assert!(
+            is_tool_error(&refused),
+            "`{name}` must be refused: {refused}"
+        );
+        let text = text_of(&refused["result"]);
+        assert!(
+            text.contains("module qualifier"),
+            "the refusal must say what is wrong with the argument, got:\n{text}"
+        );
+        assert!(
+            !text.contains("session"),
+            "this is refused before any session is needed, got:\n{text}"
+        );
+        assert_eq!(
+            refused["result"]["structuredContent"]["error"]["category"], "invalid_argument",
+            "a caller branches on the category, not the wording: {refused}"
+        );
+    }
+
+    // And the contract's own form reaches the session refusal instead, which is what says the rule
+    // is about the qualifier rather than about the parameter: refusing both would pass the
+    // assertions above while making the tool unusable.
+    let unqualified = server.call_tool("sk_symbol", json!({ "name": "SkLoadedModuleList" }), STEP);
+    assert!(is_tool_error(&unqualified), "{unqualified}");
+    let text = text_of(&unqualified["result"]);
+    assert!(
+        !text.contains("module qualifier"),
+        "an unqualified name is what this tool takes, got:\n{text}"
+    );
 }
 
 /// An `outputSchema` carries constraints; the prose stays in the source and `docs/`.
@@ -7174,11 +7383,7 @@ fn ending_a_session_leaves_a_process_this_server_only_attached_to_running() {
     let session = server.open_session("attach_process", json!({ "pid": target.id() }), TARGET_STEP);
     // A session that is really holding the process, rather than one that failed to attach and
     // would pass this by never having been in a position to kill anything.
-    server.tool_data(
-        "registers",
-        json!({ "session_id": &session, "filter": "pc" }),
-        TARGET_STEP,
-    );
+    server.tool_data("registers", json!({ "session_id": &session }), TARGET_STEP);
 
     let ended = server.call_tool(
         "end_session",
@@ -7294,11 +7499,7 @@ fn a_handle_a_raw_command_retired_can_still_end_its_own_session() {
     );
 
     // The newer session is untouched — this released one worker, not whichever was current.
-    let sibling = server.call_tool(
-        "registers",
-        json!({ "session_id": &newer, "filter": "pc" }),
-        TARGET_STEP,
-    );
+    let sibling = server.call_tool("registers", json!({ "session_id": &newer }), TARGET_STEP);
     assert!(
         !is_tool_error(&sibling),
         "ending the retired session took the newer one with it: {}",
@@ -7563,7 +7764,7 @@ fn a_randomised_command_sequence_leaves_the_session_in_one_state_and_the_server_
         let sibling = fuzz_call(
             &mut server,
             "registers",
-            json!({ "session_id": &bystander, "filter": "pc" }),
+            json!({ "session_id": &bystander }),
             &format!("round {round}, {}\n{replay}", sequence.join(" -> ")),
         );
         assert!(
@@ -7797,10 +7998,7 @@ fn fuzz_probe(
     // to walk while the session is perfectly healthy.
     let mut held = Held::Moving;
     for (tool, args) in [
-        (
-            "registers",
-            json!({ "session_id": session, "filter": "pc" }),
-        ),
+        ("registers", json!({ "session_id": session })),
         (
             "execute",
             json!({ "session_id": session, "command": ".echo alive" }),

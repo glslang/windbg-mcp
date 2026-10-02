@@ -339,35 +339,35 @@ None of these is a bug. They are recorded because they were invisible, and
    and, since item 41, for the sentences the tools it keeps used to spend on pointing at them.
    Where the bytes sit, and what each profile costs:
 
-   Both tables are measurements of **2026-09-27** and move with any edit to a description.
+   Both tables are measurements of **2026-10-02** and move with any edit to a description.
 
    | group | tools | bytes | share |
    |---|---:|---:|---:|
-   | `allocator` | 10 | 16,549 | 16.0% |
-   | `exec` | 10 | 14,876 | 14.4% |
-   | `session` | 10 | 13,682 | 13.2% |
-   | `inspect` | 10 | 13,152 | 12.7% |
-   | `ioctl` | 10 | 12,435 | 12.0% |
-   | `batch` | 1 | 10,842 | 10.5% |
-   | `securekernel` | 4 | 7,529 | 7.3% |
-   | `crash` | 3 | 7,427 | 7.2% |
-   | `ttd` | 9 | 6,829 | 6.6% |
+   | `allocator` | 10 | 16,868 | 16.0% |
+   | `exec` | 10 | 15,137 | 14.4% |
+   | `session` | 10 | 14,013 | 13.3% |
+   | `inspect` | 10 | 13,442 | 12.8% |
+   | `ioctl` | 10 | 12,725 | 12.1% |
+   | `batch` | 1 | 10,842 | 10.3% |
+   | `securekernel` | 4 | 7,645 | 7.3% |
+   | `crash` | 3 | 7,514 | 7.1% |
+   | `ttd` | 9 | 7,090 | 6.7% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 67 | 103,321 |
-   | `session,inspect,exec,crash` | 33 | 48,216 |
-   | `session,inspect,crash` | 23 | 33,187 |
-   | `crash` | 13 | 19,943 |
+   | *(absent)* | 67 | 105,276 |
+   | `session,inspect,exec,crash` | 33 | 49,185 |
+   | `session,inspect,crash` | 23 | 33,895 |
+   | `crash` | 13 | 20,361 |
 
    **The two tables do not reconcile, and that is the point of item 41.** The first is each group's
    share of the whole surface; the second is what a spec actually serves, which is less — `crash`
-   is 19,943 rather than the 21,109 its two rows sum to, because the cross-references leave with
+   is 20,361 rather than the 21,527 its two rows sum to, because the cross-references leave with
    the tools they name — 1,166 B of them, pointing at `modules`, `debug_batch`, `backtrace`,
    `continue_async` and `break_in`.
 
    `session` is in every surface because every other tool routes by a `session_id` this server is
-   the only issuer of — 11,916 B is the floor, and `crash` is thirteen tools rather than three. The
+   the only issuer of — 12,910 B is the floor, and `crash` is thirteen tools rather than three. The
    flag is a **run's** choice, and on a listener it is the *default*: a named client may be
    configured with a spec of its own (`WINDBG_MCP_TOOLS_<NAME>`), so the figures above are per
    client rather than per server — which is what lets a local model and a hosted client share one
@@ -558,6 +558,32 @@ Those margins are stable rather than noisy, which is worth knowing before anyone
 dump on both CI runners — and both printed it byte for byte identically, ARM64 included. That is
 not true of the baseline table further up, three of whose rows were re-measured on the ARM64 bench
 against the ARM64 dump; the two tables are read differently for that reason.
+
+## Refusing an unknown argument (2026-10-02)
+
+Item 107's class fix is the first change here whose whole cost is a **keyword**. The model-visible
+surface goes 103,321 -> **105,276 B** across the same 67 tools, and the payload 290,241 ->
+**292,196**: the same +1,955 on both, because `,"additionalProperties":false` is 29 B wherever it
+appears and nothing else moved.
+
+Where the copies are: 64 of the 67 tools gain one at the root of their input schema (the three that
+already denied unknown fields — `set_breakpoint`, `clear_breakpoints`, `debug_batch` — did not, and
+the last two moved **0 B**); two gain a second for a nested request type, `walk_memory`'s `FieldArg`
+and `set_breakpoint`'s `WatchRequest`, which is the only reason `set_breakpoint` moves; and
+`attach_kernel_local` costs **70** rather than 29, because it was declared with no parameters at all
+and so had no schema of its own — 33 B -> 103 B is the keyword plus the 57 B `2020-12` declaration an
+empty args struct brings, less 16 B of the empty `properties` rmcp served for it. 64 x 29 + 58 + 41
+= 1,955, which is arithmetic rather than a reading.
+
+The model ceiling moves **105,000 -> 108,000 B**, leaving 2,724 B (2.6%). The wire ceiling is
+unchanged at 295,000 with 2,804 B left, and the per-tool ceiling is unchanged: `debug_batch` is
+still the worst single tool at 10,842 B and did not grow, because `BatchStep` flattens its action —
+serde makes `deny_unknown_fields` and `flatten` mutually exclusive — so the step vocabulary keeps
+the hand-rolled leftover check `src/batch.rs` already had.
+
+**No `outputSchema` moved**, which is the question this file exists to ask of any schema change:
+the keyword is on the input half only, so there is no shared type inlined into thirty-three `$defs`
+closures here. The per-tool golden records it tool by tool.
 
 ## Experimental attach input (2026-09-19)
 

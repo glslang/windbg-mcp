@@ -1,7 +1,7 @@
 //! Which of this server's sixty-seven tools a run advertises.
 //!
 //! The tool surface is paid **once per conversation, before anything is debugged**, and it is
-//! 103,321 bytes — roughly 26k tokens (measured 2026-09-27; every figure here moves with any edit
+//! 105,276 bytes — roughly 26k tokens (measured 2026-10-02; every figure here moves with any edit
 //! to a description, so re-derive rather than cite). Seven tenths of that is prose, and the prose is what tells
 //! a model how to drive the tools, so there is no strip here the way there was in
 //! [`crate::schema`]: `FOLLOWUPS.md` item 24 measured it and the only honest lever left is the one
@@ -16,28 +16,28 @@
 //!
 //! A group is *an activity*, not a subsystem: the tools you reach for while doing one kind of
 //! debugging. A caller reading a crash dump has no use for the nine TTD tools or the ten allocator
-//! ones, and pays 23,286 bytes for them at the start of every conversation.
+//! ones, and pays 23,958 bytes for them at the start of every conversation.
 //!
 //! ```text
 //!   group        tools   bytes   what it is for
-//!   allocator       10   16,549  pool and heap walks, and `walk_memory`
-//!   inspect         10   13,152  registers, stacks, memory, modules, symbols, location, raw commands
-//!   session         10   13,682  opening a target, ending it, and watching this server
-//!   exec            10   14,876  breakpoints and execution control
+//!   allocator       10   16,868  pool and heap walks, and `walk_memory`
+//!   inspect         10   13,442  registers, stacks, memory, modules, symbols, location, raw commands
+//!   session         10   14,013  opening a target, ending it, and watching this server
+//!   exec            10   15,137  breakpoints and execution control
 //!   batch            1   10,842  `debug_batch`
-//!   crash            3    7,427  a bug check, a user-mode fault, and an error code
-//!   ttd              9    6,829  recording, indexing and querying a Time Travel trace
-//!   ioctl           10   12,435  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
+//!   crash            3    7,514  a bug check, a user-mode fault, and an error code
+//!   ttd              9    7,090  recording, indexing and querying a Time Travel trace
+//!   ioctl           10   12,725  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  device security and the whole-driver survey
-//!   securekernel     4    7,529  a Hyper-V capture's VTL1: its decode, modules, memory and symbols
+//!   securekernel     4    7,645  a Hyper-V capture's VTL1: its decode, modules, memory and symbols
 //! ```
 //!
-//! Those bytes are a measurement of **2026-09-27** and move with any edit to a description — the
-//! whole surface they are shares of is 67 tools and 103,321 B, which is what the rows above sum to.
+//! Those bytes are a measurement of **2026-10-02** and move with any edit to a description — the
+//! whole surface they are shares of is 67 tools and 105,276 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
-//! 19,280 bytes, not the 20,446 its two rows add to, because the thirteen tools it keeps also stop
+//! 20,361 bytes, not the 21,527 its two rows add to, because the thirteen tools it keeps also stop
 //! carrying the sentences that pointed at `modules`, `debug_batch`, `backtrace`, `continue_async`
 //! and `break_in` — 1,166 bytes of them. A spec is always cheaper than its rows suggest, never
 //! dearer.
@@ -46,8 +46,8 @@
 //!
 //! Not a convenience: every other tool here routes by a `session_id`, and this server is the only
 //! thing that can issue one. A surface with `registers` and no opener cannot be used at all, so a
-//! spec that leaves one out is asking for something that does not exist. On its own it is 11,916
-//! bytes, and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
+//! spec that leaves one out is asking for something that does not exist. On its own it is 12,910
+//! bytes (2026-10-02), and that is the floor of any usable surface — `--tools crash` is thirteen tools, not three,
 //! and the startup line says so rather than leaving the addition to be discovered.
 //!
 //! # Who a surface belongs to

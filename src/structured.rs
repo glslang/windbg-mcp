@@ -1578,6 +1578,7 @@ pub enum WatchAccess {
 
 /// The region a data breakpoint watches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WatchRequest {
     pub access: WatchAccess,
     /// Bytes watched: 1, 2, 4 or 8 (1, 2 or 4 on x86). The address must be a multiple of it.

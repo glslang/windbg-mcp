@@ -404,7 +404,8 @@ async def capture(
                 (
                     "breakpoints_after",
                     "execute",
-                    {"session_id": session_id, "command": "bl", "timeout_ms": 5000},
+                    # `execute` takes no `timeout_ms` — the server bounds the command itself.
+                    {"session_id": session_id, "command": "bl"},
                 ),
             ):
                 try:

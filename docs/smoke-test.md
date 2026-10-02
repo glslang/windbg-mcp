@@ -279,6 +279,29 @@ $env:UPDATE_GOLDEN = "1"; cargo test --test mcp_smoke tools_list_matches
 inside the same document. External or dangling refs break strict client-side validators, and a
 codegen dependency can introduce them with no change here.
 
+**Unknown arguments.** `every_tool_refuses_an_unknown_argument` walks the served surface and asserts
+both halves of one rule per tool: the published `inputSchema` says `additionalProperties: false`, and
+a call carrying a key the tool does not have is refused with that key named. It is a tripwire as well
+as a guard — the keyword comes from `schemars` and the refusal from serde, so a dependency that
+stopped emitting one or stopped enforcing the other would land here rather than as a tool quietly
+disassembling somewhere else and reporting `"status": "ok"`, which is what `FOLLOWUPS.md` item 107
+was filed for. The schema pass runs over **every** tool before any tool is called, deliberately:
+`attach_kernel_local` takes no arguments of its own, and a regression that took its refusal away
+would otherwise have this test attach to the local kernel on its way past. Its nested defs are held
+to the rule too, with `BatchStep` the one exception — it flattens its action, which serde makes
+mutually exclusive with the attribute, so `src/batch.rs` checks its leftover keys by hand. One
+consequence shows up in the golden beside it: every tool now declares the `2020-12` dialect, where
+`attach_kernel_local` used to carry rmcp's bare empty-object schema and no dialect at all.
+
+**A value outside the contract** is a different check with its own test.
+`a_qualified_name_is_refused_where_the_tool_supplies_the_module` drives `sk_symbol` with
+`securekernel!…` and with `skci!…`, both refused before a session is looked for, because the module
+there is the engine's spelling of the captured image and the tool applies it: a lenient engine
+resolves the doubled form and answers the right address under the name
+`securekernel!securekernel!SkdInitDebuggerDataBlock`, which is the one field a caller would quote
+back. The unqualified form still reaches the ordinary session refusal, which is what says the rule is
+about the qualifier rather than about the parameter.
+
 **Kernel connection secrecy.** `attach_kernel` takes exactly one of `connection` and `profile`, and
 the schema cannot say so — both are optional there, deliberately (an untagged `oneOf` renders as a
 schema composition clients handle unevenly). So the exclusivity is this server's own check, and

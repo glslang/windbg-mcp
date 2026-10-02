@@ -811,9 +811,42 @@ pub(crate) fn parse_eval(text: &str) -> Option<u64> {
 // "Session handles" section below). The field is repeated per struct rather than
 // flattened from a shared type so each tool's input schema stays a plain, self-contained
 // object — flattening renders as a schema composition that clients handle unevenly.
+//
+// **Every one of them denies unknown fields, and the two halves of that go together.** Serde
+// ignores an unknown field by default, which for a tool argument fails *open* in the way
+// [`crate::batch`] already records for a step: three `disassemble` calls on this bench passed
+// `target`,
+// which is not a parameter — `address` is — and each was answered `"status": "ok"` with a
+// disassembly of wherever the instruction pointer happened to be. `deny_unknown_fields` refuses
+// the call instead, and `schemars` emits the matching `additionalProperties: false` from the same
+// attribute, which is the half that makes refusing it honest: JSON Schema's default is that an
+// extra key *conforms*, so without it the server would be rejecting what its own published
+// contract calls valid.
+//
+// Two consequences for a struct added here. The attribute and `#[serde(flatten)]` are mutually
+// exclusive, so a struct that flattens collects its leftovers by hand the way
+// [`crate::batch::BatchStep`] does. And a nested object a caller fills in is the same question one
+// level down — [`crate::walk::FieldArg`] and [`structured::WatchRequest`] carry the attribute for
+// that reason, and the coordinate types already did.
+// `mcp_smoke::every_tool_refuses_an_unknown_argument` enumerates the served surface, so a tool
+// that arrives without the attribute fails that test rather than waiting to be noticed.
+
+/// Parameters for the one tool that takes none at all.
+///
+/// A tool declared with no `Parameters` is served a schema that constrains nothing and rmcp drops
+/// whatever arguments a call to it carried — so `attach_kernel_local { "connection": "net:…" }`
+/// attaches to the *local* kernel and reports success, which is the one case where a dropped
+/// argument means the caller reached for the wrong tool rather than misspelling a field. An empty
+/// struct that denies unknown fields costs this tool 70 B of model context — the keyword, plus the
+/// dialect declaration it now carries, less the empty `properties` rmcp was serving (2026-10-02) —
+/// and leaves the rule above with no exception for a test to carry.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct NoArgs {}
 
 /// Parameters for tools that take no arguments beyond the session handle.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SessionArgs {
     /// Which session to act on. Omit for the current one; pass an opener's handle to route to that
     /// session and be refused if its target was replaced or closed.
@@ -822,6 +855,7 @@ pub struct SessionArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct EndSessionArgs {
     #[serde(default)]
     pub session_id: Option<String>,
@@ -834,6 +868,7 @@ pub struct EndSessionArgs {
 
 /// Parameters for `continue_async`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ContinueAsyncArgs {
     /// How long the debugger may let the target run before breaking it in itself (milliseconds).
     /// Defaults to the standard execution wait, and is capped — a run nothing is bounding is a
@@ -848,6 +883,7 @@ pub struct ContinueAsyncArgs {
 
 /// Parameters for `wait_for_stop`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WaitForStopArgs {
     /// The run to wait on: the `execution` handle the resume that started it reported.
     pub execution: String,
@@ -864,6 +900,7 @@ pub struct WaitForStopArgs {
 
 /// Parameters for `break_in`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BreakInArgs {
     /// The run to break in: the `execution` handle the resume that started it reported.
     pub execution: String,
@@ -875,6 +912,7 @@ pub struct BreakInArgs {
 
 /// Parameters for `server_log`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct LogArgs {
     /// Only records about this session — what its engine worker logged. The supervisor's own
     /// records about that session (spawning its worker, timing a call out) carry no session id
@@ -898,6 +936,7 @@ pub struct LogArgs {
 
 /// Parameters for `modules`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ModulesArgs {
     /// List only the modules whose name matches this pattern, instead of the whole table —
     /// `"MessageManager"` for one driver's load base. Matched against the name symbols are
@@ -933,6 +972,7 @@ pub struct ModulesArgs {
 
 /// Parameters for `registers`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RegistersArgs {
     /// Include every register the engine knows, not just the integer ones: x87 and vector
     /// registers, and subregister views such as `eax` within `rax`. Off by default because on
@@ -946,6 +986,7 @@ pub struct RegistersArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PathArgs {
     /// Filesystem path to the dump (.dmp) or TTD trace (.run) file.
     pub path: String,
@@ -954,6 +995,7 @@ pub struct PathArgs {
 /// `attach_kernel`'s target, named one of two ways. Exactly one is required, and that is checked
 /// at runtime rather than in the schema — see [`crate::kdconn::select`] for why.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ConnectionArgs {
     /// Raw kernel debugging connection string, e.g. "net:port=50000,key=<w.x.y.z>". Pass exactly
     /// one of `connection` or `profile`. This puts the target's KDNET key in this request — and
@@ -975,18 +1017,21 @@ pub struct ConnectionArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PidArgs {
     /// Process ID to attach to.
     pub pid: u32,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CommandLineArgs {
     /// Full command line of the program to launch under the debugger.
     pub command_line: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExecuteArgs {
     /// Raw debugger command to run (e.g. "!analyze -v", "u rip", "dt nt!_EPROCESS").
     pub command: String,
@@ -1015,6 +1060,7 @@ fn guarded_location(
 /// acts on them ([`crate::savedstate::CaptureSpec::one_of`]): the tool resolves them, refuses
 /// anything but exactly one, and the worker is handed the choice already made.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SkCaptureArgs {
     /// The Hyper-V virtual machine whose checkpoint to read. Needs Hyper-V on this host.
     #[serde(default)]
@@ -1065,6 +1111,7 @@ pub struct SkCaptureArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SkReadArgs {
     /// Guest virtual address in the captured VTL1 (decimal, or "0x"-hex).
     pub address: String,
@@ -1078,6 +1125,7 @@ pub struct SkReadArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SkSymbolArgs {
     /// A symbol in the Secure Kernel image, unqualified — the module name is the engine's and is
     /// applied here.
@@ -1092,6 +1140,7 @@ pub struct SkSymbolArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReadMemoryArgs {
     /// Virtual address (decimal or 0x-hex).
     #[serde(default)]
@@ -1108,6 +1157,7 @@ pub struct ReadMemoryArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct WalkMemoryArgs {
     /// Walk these addresses exactly, in this order. The bulk read: pass the pointers you already
     /// have and get a value for each, with the unreadable ones marked instead of ending the walk.
@@ -1141,6 +1191,7 @@ pub struct WalkMemoryArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DisassembleArgs {
     /// Address or symbol to disassemble at; uses the current instruction pointer if omitted.
     #[serde(default)]
@@ -1165,6 +1216,7 @@ const MAX_DISASSEMBLE_COUNT: u32 = 128;
 const DEFAULT_DISASSEMBLE_COUNT: u32 = 16;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DxArgs {
     /// Data-model (LINQ) expression, e.g. "@$cursession.TTD.Calls(\"ntdll!*\")".
     pub expression: String,
@@ -1242,6 +1294,7 @@ pub struct ClearBreakpointsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PositionArgs {
     /// TTD position to travel to, e.g. "12:0" or "0" for the start of the trace.
     pub position: String,
@@ -1252,6 +1305,7 @@ pub struct PositionArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RecordArgs {
     /// Directory to write the .run/.idx trace files into.
     pub out_dir: String,
@@ -1269,6 +1323,7 @@ pub struct RecordArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TtdCallsArgs {
     /// Function symbol or wildcard pattern to find calls to, e.g.
     /// "kernelbase!CreateFileW" or "ntdll!Nt*".
@@ -1280,6 +1335,7 @@ pub struct TtdCallsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct TtdMemoryArgs {
     /// Start virtual address of the range to watch (decimal or 0x-hex).
     pub address: String,
@@ -1296,12 +1352,14 @@ pub struct TtdMemoryArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DecodeIoctlArgs {
     /// 32-bit IOCTL control code (decimal or 0x-hex), e.g. "0x70000".
     pub code: String,
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct SymbolPathArgs {
     /// Symbol search path to apply: a directory holding a module's PDB, a
     /// `srv*downstream*server` spec, or a `;`-separated list. Point it at the folder
@@ -1330,6 +1388,7 @@ pub struct SymbolPathArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PoolFindTagArgs {
     /// Pool tag to find, either way a listing names one: 1..4 ASCII bytes, e.g. "Tgsm", or the
     /// `raw_tag` form — "0x" and the four bytes as hex, e.g. "0x5467736d". Both are in memory
@@ -1360,6 +1419,7 @@ pub struct PoolFindTagArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PoolChunkArgs {
     /// Address to locate, in any form the debugger prints or accepts: a backtick address
     /// ("ffffc00f`6ec02f90"), a bare hex run, "0x"-hex, or decimal. A bare run of 8+ hex
@@ -1375,6 +1435,7 @@ pub struct PoolChunkArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PoolCensusArgs {
     /// Force a fresh walk instead of reusing this session's cached snapshot (default false).
     #[serde(default)]
@@ -1389,6 +1450,7 @@ pub struct PoolCensusArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct PoolDiagnosticsArgs {
     /// Case-insensitive substring to narrow the diagnostics to, e.g. a heap address
     /// ("ffff8c8f0d300000") or a phrase ("cannot fully discover heap"). Omit for all.
@@ -1407,6 +1469,7 @@ pub struct PoolDiagnosticsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HeapListArgs {
     /// Force a fresh snapshot instead of reusing the one cached for this stopped target.
     #[serde(default)]
@@ -1437,6 +1500,7 @@ pub enum HeapStateArg {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HeapAllocationsArgs {
     /// Optional Segment Heap root address.
     #[serde(default)]
@@ -1462,6 +1526,7 @@ pub struct HeapAllocationsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HeapChunkArgs {
     /// Address anywhere in the allocator header or user capacity.
     pub address: String,
@@ -1474,6 +1539,7 @@ pub struct HeapChunkArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HeapCensusArgs {
     /// Optional Segment Heap root address.
     #[serde(default)]
@@ -1490,6 +1556,7 @@ pub struct HeapCensusArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct HeapDiagnosticsArgs {
     /// Optional Segment Heap root address.
     #[serde(default)]
@@ -1509,6 +1576,7 @@ pub struct HeapDiagnosticsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct CrashTriageArgs {
     /// How many stack frames to walk (default 16, maximum 128). The default reaches past the
     /// kernel's own bug-check path to the driver frame on every crash seen so far; raise it for a
@@ -1531,6 +1599,7 @@ pub struct CrashTriageArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ExceptionTriageArgs {
     /// How many stack frames to walk (default 16, maximum 128). The default reaches past the CRT's
     /// and the exception dispatcher's own frames to the throw site on every fault seen so far.
@@ -1555,6 +1624,7 @@ pub struct ExceptionTriageArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DecodeErrorReportingArgs {
     /// A 32-bit status value: an HRESULT, an NTSTATUS, or a Win32 error — e.g. "0x80670015".
     /// 0x-hex, or decimal signed or unsigned ("-2147024891" is 0x80070005, as an HRESULT held in a
@@ -1573,6 +1643,7 @@ const MAX_TRIAGE_FRAMES: u32 = 128;
 const DEFAULT_TRIAGE_FRAMES: u32 = 16;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct BacktraceArgs {
     /// How many frames to walk (default 32, maximum 256).
     #[serde(default)]
@@ -1595,6 +1666,7 @@ const MAX_BACKTRACE_FRAMES: u32 = 256;
 const DEFAULT_BACKTRACE_FRAMES: u32 = 32;
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverObjectArgs {
     /// Driver object name, e.g. "mydriver" or "\\Driver\\mydriver".
     pub name: String,
@@ -1605,6 +1677,7 @@ pub struct DriverObjectArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IoctlMapArgs {
     /// The IOCTL dispatch routine: a symbol (`mountmgr!MountMgrDeviceControl`) or an address.
     /// It is the `MajorFunction` table's index 0x0e, which a driver object's dispatch table names.
@@ -1616,6 +1689,7 @@ pub struct IoctlMapArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverHazardsArgs {
     /// The driver to scan, as `modules` lists it, e.g. "mydriver". The image must be readable in
     /// this session: on a dump that means the engine can obtain the binary.
@@ -1627,6 +1701,7 @@ pub struct DriverHazardsArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceSecurityArgs {
     /// The object path, as `!object` takes it: "\\Device\\MountPointManager". A symbolic
     /// link is followed once, so "\\GLOBAL??\\MountPointManager" reaches the same device.
@@ -1640,6 +1715,7 @@ pub struct DeviceSecurityArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DriverSurfaceArgs {
     /// The driver object: a path ("\\Driver\\mountmgr"), or the bare name
     /// ("mountmgr"), which is looked up under "\\Driver" and then "\\FileSystem".
@@ -1653,6 +1729,7 @@ pub struct DriverSurfaceArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct DeviceObjectArgs {
     /// Device object: a name (e.g. "\\Device\\MyDevice") or an address (0x-hex).
     pub device: String,
@@ -1663,6 +1740,7 @@ pub struct DeviceObjectArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IrpStackArgs {
     /// IRP address (decimal or 0x-hex). Omit it for the PIRP the dispatch routine was
     /// entered with, read per the target's calling convention — valid only at that
@@ -1676,6 +1754,7 @@ pub struct IrpStackArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct IoctlTraceArgs {
     /// Virtual address of the IRP_MJ_DEVICE_CONTROL dispatch routine, rebased to the
     /// live load base. Recover it via `driver_object` (MajorFunction[0x0e]).
@@ -1687,6 +1766,7 @@ pub struct IoctlTraceArgs {
 }
 
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct ReachabilityArgs {
     /// Start of the search: the IRP_MJ_DEVICE_CONTROL dispatch routine — a symbol,
     /// address, or expression `uf` accepts (e.g. "mydriver!DispatchDeviceControl" or
@@ -1725,6 +1805,7 @@ pub struct ReachabilityArgs {
 
 /// Address to run the target to, for `run_to_address`.
 #[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct RunToAddressArgs {
     /// Address, symbol, or expression to run until (any WinDbg form — a bare value is
     /// hex, "0x"-hex and symbols also work). Typically a block from `reachable_from_dispatch`.
@@ -1864,6 +1945,38 @@ pub(crate) fn reject_command_breakers(
          and let the rest run as a separate command. This parameter takes a single operand. \
          Use `execute` if you meant to run a command list — it is annotated as destructive \
          and retires the session handle when a command replaces the target."
+    ))
+}
+
+/// Rejects a module qualifier on a parameter whose module this server supplies itself.
+///
+/// The companion to [`reject_command_breakers`] and the same kind of rule: that one refuses an
+/// operand that could end the command built around it, this one refuses an operand that names a
+/// module where the tool has already chosen one. `sk_symbol`'s `name` is documented unqualified —
+/// the qualifier is the engine's spelling of the captured image, which only the worker holds — and
+/// the engine is lenient enough to resolve `securekernel!securekernel!SkdInitDebuggerDataBlock`
+/// anyway. Measured: the right address, `status: ok`, `address`/`rva`/`engine_address` identical to
+/// the unqualified call, and `symbol` — the one field a caller quotes back — carrying the doubled
+/// spelling. A display form that is wrong while every identifier beside it is right is the worst
+/// shape this can fail in, because nothing downstream reports it.
+///
+/// **Refused rather than stripped, and that is a decision about the surface rather than about this
+/// tool** (item 107). Stripping a redundant qualifier and refusing a foreign one are different
+/// answers to one question, and `skci!Foo` is plainly the second: a module this session does not
+/// hold, asked for in a form the engine may well answer from somewhere else. Telling the two apart
+/// needs the qualifier, which lives in the worker's capture, so a lenient reading would move the
+/// check away from the caller's terms and buy a second convention — and a surface decided per tool
+/// is a surface with fifty-two conventions. So the rule is the same wherever a tool owns the
+/// qualifier: pass the name, not the module.
+pub(crate) fn reject_module_qualifier(field: &str, value: &str) -> Result<(), String> {
+    if !value.contains('!') {
+        return Ok(());
+    }
+    Err(format!(
+        "`{field}` carries a module qualifier, and this tool applies its own — the engine's \
+         spelling of the captured image. Pass the symbol name alone. A name from another module \
+         is not in this image, and a redundant qualifier resolves to the right address under a \
+         doubled name."
     ))
 }
 
@@ -2798,7 +2911,10 @@ impl WindbgServer {
         ),
         output_schema = constraints_of::<structured::OpenOutcome>()
     )]
-    async fn attach_kernel_local(&self) -> Result<CallToolResult, ErrorData> {
+    async fn attach_kernel_local(
+        &self,
+        Parameters(_): Parameters<NoArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
         self.opened(
             SessionKind::KernelLocal,
             "local kernel".to_string(),
@@ -3724,6 +3840,15 @@ impl WindbgServer {
                 "give exactly one of `name` or `address`".to_string(),
                 args.session_id,
             );
+        }
+        // The other half of item 107: an argument that is well-named and ill-formed, which
+        // `deny_unknown_fields` cannot see. Refused on this side for the reason the check above is
+        // — it is a fact about the request — and refusing it *here* is also what keeps the lenient
+        // engine from answering a question nobody asked.
+        if let Some(name) = args.name.as_deref()
+            && let Err(why) = reject_module_qualifier("name", name)
+        {
+            return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
         }
         let out = self
             .run(
@@ -7490,6 +7615,44 @@ mod tests {
             reject_command_breakers("function", "kernelbase!CreateFileW", Quotes::Rejected).is_ok()
         );
         assert!(reject_command_breakers("function", "ntdll!Nt*", Quotes::Rejected).is_ok());
+    }
+
+    /// The other half of item 107: an argument that is well-named and *ill-formed*.
+    ///
+    /// `sk_symbol`'s `name` is the one parameter whose module **this server** supplies — the
+    /// engine's spelling of the captured image, which only the worker holds — and the engine
+    /// resolves `securekernel!securekernel!SkdInitDebuggerDataBlock` rather than refusing it. So
+    /// the call answered `status: ok` with the right address and a doubled `symbol`, which is the
+    /// one field a caller quotes back.
+    ///
+    /// **One rule covers both qualifiers rather than one of them being quietly stripped.** Telling
+    /// a redundant qualifier from a foreign one needs the qualifier itself, which is the worker's;
+    /// and `skci!Foo` is plainly the foreign case — a module this capture does not hold. Nothing
+    /// here reaches the *other* parameters: a qualified symbol is exactly what `disassemble` and
+    /// `set_breakpoint` are for, which is why [`reject_command_breakers`] accepts
+    /// `nt!NtCreateFile` two tests above.
+    #[test]
+    fn a_name_whose_module_this_server_supplies_may_not_carry_one() {
+        for value in [
+            "securekernel!SkdInitDebuggerDataBlock",
+            "skci!SkciValidateImageHeader",
+            "!SkLoadedModuleList",
+        ] {
+            assert!(
+                reject_module_qualifier("name", value).is_err(),
+                "`{value}` must be refused"
+            );
+        }
+        for value in [
+            "SkdInitDebuggerDataBlock",
+            "SkLoadedModuleList",
+            "SkmmAllocatePagesForMdl",
+        ] {
+            assert!(
+                reject_module_qualifier("name", value).is_ok(),
+                "`{value}` must be accepted"
+            );
+        }
     }
 
     // ---- what a module filter means ----------------------------------------

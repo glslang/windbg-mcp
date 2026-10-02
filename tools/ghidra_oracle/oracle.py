@@ -88,7 +88,9 @@ def ask_the_tool(dump: pathlib.Path, dispatch: str, profile: str | None = None) 
     # **A live kernel by profile, never by connection string**, which is how the rest of this
     # repo reaches one: the debug key stays out of the argument and out of anything this prints.
     opened = (
-        tool("attach_kernel", {"profile": profile, "timeout_ms": 120000})
+        # No `timeout_ms`: `attach_kernel` has no such parameter (it was being dropped in
+        # silence), and a live attach waits for its target by design.
+        tool("attach_kernel", {"profile": profile})
         if profile
         else tool("open_dump", {"path": str(dump)})
     )
