@@ -55,7 +55,7 @@ The `MajorFunction` table's index **`0x0e`** (`IRP_MJ_DEVICE_CONTROL`) is the IO
 driver with no PDB, you'd rebase an RVA to `lm m <driver>`.)
 
 `mountmgr` is a WDM driver, which is why the entry is its own routine. For a **KMDF** driver every
-entry is `Wdf01000!FxDevice::Dispatch` or `FxDevice::DispatchWithLock` instead, the framework owning
+entry is ordinarily `Wdf01000!FxDevice::Dispatch` or `FxDevice::DispatchWithLock` instead, the framework owning
 the whole table and calling the driver's code as callbacks — so step 3 on one of those addresses
 recovers no control codes, because none are compared there. `driver_surface` says so in a
 `framework` field; `docs/limitations.md` has what that covers and what it does not.
