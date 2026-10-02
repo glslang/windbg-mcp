@@ -60,36 +60,29 @@
 //! a device-control request reaches `EvtIoDefault` in a queue that configures no specific handler,
 //! and an internal one reaches its own slot.
 //!
-//! **Routes that run before the queue sees the request, each exported by this build**, and the list
-//! is *open* for the reason below:
+//! A request can also reach the driver before any queue does. Registrations exported by this build,
+//! as **names to look for** rather than a model of what each does:
+//! `WdfDeviceInitSetIoInCallerContextCallback` and its class-extension twin (the framework invokes it
+//! inside its own dispatch -- `FxPkgIo::DispatchStep1` and `DispatchStep2` reach
+//! `GetIoInCallerContextCallback` then `FxIoInCallerContext::Invoke`),
+//! `WdfDeviceInitAssignWdmIrpPreprocessCallback`, and
+//! `WdfDeviceConfigureWdmIrpDispatchCallback`. What any of them *does* with a request -- complete it,
+//! pend it, hand it to a queue through `WdfDeviceWdmDispatchPreprocessedIrp` or
+//! `WdfDeviceWdmDispatchIrpToIoQueue`, or something else -- is the driver's choice and is step 2's
+//! question (`FOLLOWUPS.md` item 108), not a claim this file makes.
 //!
-//! * `WdfDeviceInitSetIoInCallerContextCallback` -- and its class-extension twin
-//!   `WdfCxDeviceInitSetIoInCallerContextCallback` -- registers a callback the framework invokes
-//!   inside its own dispatch, before enqueueing: `FxPkgIo::DispatchStep1` and `DispatchStep2` both
-//!   reach `GetIoInCallerContextCallback` then `FxIoInCallerContext::Invoke`. **This is the
-//!   `METHOD_NEITHER` route**, which is the one this server's IOCTL work cares about most:
-//!   `WdfRequestRetrieveUnsafeUserInputBuffer` and `...UnsafeUserOutputBuffer` both call
-//!   `VerifyRequestIsInCallerContext`, so a driver touching a raw user buffer has to be here.
-//! * `WdfDeviceInitAssignWdmIrpPreprocessCallback` and `WdfDeviceConfigureWdmIrpDispatchCallback`
-//!   see the IRP before the framework dispatches it at all.
-//!
-//! **None of those replaces the queue, which is a correction review made and then understated.** It
-//! said a preprocess callback need not bypass the queue, because it can hand the IRP back; measuring
-//! it says the same of *both* WDM routes, since this build exports
-//! `WdfDeviceWdmDispatchPreprocessedIrp` -- hand it back for normal dispatch -- **and**
-//! `WdfDeviceWdmDispatchIrpToIoQueue`, which hands it to a named queue. So each is a site that runs
-//! *in addition to* the queue callback unless the driver completes the request itself, and the
-//! distinction the finding proposed, between a conditional interception and a route that replaces
-//! queue handling, is cleaner than the API is.
-//!
-//! **And the list above is deliberately not certified complete.** Two consecutive rounds found a
-//! route missing from it -- the WDM hooks, then the in-caller-context callback -- which is the shape
-//! `.claude/skills/review-round/SKILL.md` records from #349: an *inclusion* is a claim about one
-//! route and is checkable on its own, where a closed enumeration is a claim about every path a
-//! request can take through a framework this crate does not own. So this names routes that are in
-//! scope and certifies none as out, and step 2's discovery has to be a walk reporting what it found
-//! rather than a lookup against a fixed list (`FOLLOWUPS.md` item 108).
-//!
+//! **That last sentence is the deliberate end of a run of four review findings, and the shape of this
+//! section is the remedy rather than its wording.** Each round corrected a claim here and the
+//! correction was the next round's finding: the list was closed and missed the WDM hooks, then closed
+//! again and missed the in-caller-context one; then the in-caller-context route was called *the*
+//! `METHOD_NEITHER` route, inferred from two unsafe-buffer helpers requiring caller context -- which
+//! says nothing about a driver reading `Type3InputBuffer` straight off the IRP in a preprocess
+//! callback, having never made a WDF request; and then "none of these replaces the queue" was written
+//! as a headline above its own qualifier, when a callback may complete or pend the request and no
+//! queue callback runs at all. Every one of those was me characterising a framework this crate does
+//! not own, from partial evidence, in prose no code here depends on. So the characterisation is gone:
+//! what stays is what was *measured on this build* -- the queue slots, the registration names, the
+//! call path -- and the taxonomy belongs to WDF's own documentation.
 //! Naming one slot as *the* place was the overclaim the rest of this file's history is about, in the
 //! one sentence that looked like architecture rather than evidence -- and it is the one that would
 //! send a reader to the wrong callback.
