@@ -9,6 +9,48 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
+- **The driver tools say when a dispatch table is a *framework's* rather than the driver's, which is
+  the reading that was silently useless (`FOLLOWUPS.md` item 108 step 1).** Every driver tool here
+  reads `_DRIVER_OBJECT->MajorFunction` and expected the entries to be the driver's own routines; a
+  **KMDF** driver's 28 entries are all `Wdf01000!FxDevice::Dispatch` or `FxDevice::DispatchWithLock`,
+  so `driver_surface` reported a driver dispatching nothing of its own and `ioctl_map` started at one
+  of those entries reported a routine accepting no control codes — both correct about the table and
+  neither an answer to the question asked, the same failure as item 107. `src/framework.rs`
+  recognises the case and `driver_surface`, `driver_hazards`, `ioctl_map` and
+  `reachable_from_dispatch` each carry a `framework` field saying so. **Two tells, because neither
+  implies the other**: a `WdfVersionBind` import from `WdfLdr.sys`, which is a fact about the *image*
+  and so answers with no debuggee, and every `MajorFunction` entry read being in the framework's
+  image, which is a fact about the *driver object*. A client passing
+  `WdfDriverInitNoDispatchOverride` keeps a table of its own — measured:
+  `FxDriver::Initialize+0x1b8` is a `test cl,2` on the driver config's flags with a `jne` over the
+  whole fill loop at `+0x200`, which writes `DRIVER_OBJECT+0x70` onwards with `cl` running `0`
+  through `0x1B` and asks `FxDevice::_RequiresRemLock(cl, 0)` per **major function**, not per device.
+  So the dispatch tell requires *every* entry, which also keeps a WDM filter forwarding one major
+  function into a framework image from being reported as a framework driver. **And the tell is the
+  import's name, never its library**: `Wdf01000.sys` itself imports `WdfRegisterLibrary` and
+  `WdfLdrDiagnosticsValueByNameAsULONG` from `WdfLdr.sys`, so a library-only rule would report the
+  framework as its own client — the one image a reader of this field is most likely to be pointing a
+  tool at. `driver_surface`'s IOCTL section now names the framework as the **third** reason a handler
+  sits outside the driver's image, beside the kernel's stub and a filter; that sentence enumerated two
+  and explained a KMDF table as one of them, which is the wrong sentence item 108 records this
+  repository shipping. Measured through the dev build against real images on 2026-10-02:
+  `driver_hazards` on `Vid.sys` answers `kmdf`/`bind_import`, `ioctl_map` at `Wdf01000+0x51c90`
+  answers `kmdf`/`framework_image` beside `case_count: 0`, and `Wdf01000.sys` and `mountmgr.sys`
+  answer with no framework at all. **The absence of the field is deliberately not a claim**: it is
+  added when a tell fires and nothing is added when none does, so an image whose import names could
+  not be read is a driver nothing said anything about rather than a WDM one. What this does **not**
+  do is resolve the driver's real callbacks — device control reaches an I/O queue's
+  `EvtIoDeviceControl`, held in a per-device config whose layout moves with `Wdf01000.sys`'s own
+  version line — which is item 108's remaining step and is why the field tells a reader where *not*
+  to look. UMDF (`WUDFx02000.dll`, user mode) is recognised nowhere and the note says so. Two gaps
+  stated rather than left implied: the `MajorFunction`-entry tell is **unit-tested and
+  mutation-verified but has not been run against a live kernel**, `driver_surface` needing one —
+  what corroborates it is that the module name it matches is the name a kernel target's own
+  inventory gives, measured on the checked-in ARM64 kernel dump (`Wdf01000`, with an address inside
+  it attributed to that module); and the census behind "most in-box Hyper-V drivers are KMDF" is
+  **132 of 445** driver images on this host, 13 of 25 Hyper-V-ish ones, `vmswitch`, `winhv`,
+  `winhvr`, `hvsocket` and `vmbkmcl` among those that are not — item 108's title claimed all of them
+  and is corrected in its own entry.
 - **Secure Kernel reads can now come from a *live* guest, through a transport the operator supplies —
   and the first `ReadFailure::Refused` ever raised by a real source (gates S5w and S5x, 2026-10-01).**
   `src/sk.rs`'s source seam said *"a future driver-backed live source joins here and changes nothing

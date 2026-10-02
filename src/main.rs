@@ -27,6 +27,7 @@ mod device;
 mod driver;
 mod engine;
 mod fault;
+mod framework;
 mod hazards;
 mod ioctl;
 mod kdconn;

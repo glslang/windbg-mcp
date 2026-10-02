@@ -664,6 +664,93 @@ pub(crate) fn dispatch_section(
     }
 }
 
+/// Whether a dispatch table that has already been read belongs to a **framework**.
+///
+/// Derived from the section rather than from the driver object, because the question is about the
+/// *module* each entry is in and that is what `locate` already answered. Answers the framework and
+/// the module that matched, for [`crate::framework::report`] to carry.
+///
+/// **Every entry, not any.** The measured shape is a framework that fills the whole table
+/// ([`crate::framework`] has the loop), and the loose rule would fire on a WDM driver forwarding one
+/// major function into a framework image -- turning a filter into a framework driver. A table that
+/// is only partly the framework's therefore says nothing here, and the import tell is what still
+/// answers for it.
+///
+/// **An empty table answers `None`**, which `all` on its own would not: `Layout::check` makes one
+/// unreachable from a real target, and a vacuous truth reported as a framework would be the one
+/// answer no caller could check.
+pub(crate) fn dispatch_framework(
+    section: &crate::structured::DispatchSection,
+) -> Option<(crate::framework::Framework, String)> {
+    let mut answer = None;
+    for handler in &section.handlers {
+        // `owned` is not consulted: it answers about *this* driver's image, and a module that is a
+        // framework image is by construction not it. Reading both would be two ways to ask one
+        // question, which is how they come to disagree.
+        let module = handler.location.module.as_deref()?;
+        let framework = crate::framework::image_is(module)?;
+        answer.get_or_insert_with(|| (framework, module.to_string()));
+    }
+    answer
+}
+
+/// Why a driver's `MajorFunction[0x0e]` is not in its own image, as the IOCTL section says it.
+///
+/// **Here rather than in the worker because it is a rule, and a rule in the worker has no test** --
+/// the judgement [`crate::device::link_search`] is a named function for. It enumerated two causes
+/// and a framework driver is a third; naming the third is most of what step 1 of `FOLLOWUPS.md`
+/// item 108 buys, and the one that would have stopped that item's own write-up shipping a wrong
+/// sentence.
+///
+/// `module` is the handler's own, from the attribution the dispatch section already did. The
+/// framework clause **points at the `framework` field** rather than restating it, for the reason
+/// [`crate::framework::Framework::as_clause`] gives.
+pub(crate) fn foreign_dispatch_note(address: &str, module: Option<&str>) -> String {
+    let cause = match module.and_then(crate::framework::image_is) {
+        Some(framework) => framework.as_clause(),
+        None => {
+            "the kernel's stub for a major function it does not handle, or a filter forwarding to \
+             the driver below it"
+        }
+    };
+    format!(
+        "this driver's IOCTL handler is at {address}, which is outside its own image -- {cause}. \
+         Mapping it would report another image's control codes as this driver's. `ioctl_map` takes \
+         that address directly if it is wanted anyway."
+    )
+}
+
+/// The framework a driver survey reports, from the two tells that arrive in different sections.
+///
+/// `dispatched` is [`dispatch_framework`]'s answer, read from the driver object. `imported` is the
+/// hazard scan's, read from the image's import table -- **already a finished report**, because that
+/// section built one, so it is carried up rather than rebuilt from a framework this end does not
+/// hold.
+///
+/// **Either can be the only one present**, which is the whole reason this is a function with a test
+/// rather than three lines at the one call site: the scan runs last and may not run at all, and a
+/// framework client can keep its own dispatch table (`WdfDriverInitNoDispatchOverride` --
+/// [`crate::framework`] has the measurement), so neither tell implies the other.
+pub(crate) fn compose_framework(
+    dispatched: Option<(crate::framework::Framework, String)>,
+    imported: Option<&crate::structured::DriverFramework>,
+) -> Option<crate::structured::DriverFramework> {
+    use crate::structured::FrameworkTell as Tell;
+    match dispatched {
+        Some((framework, image)) => {
+            // Both where both fired, in the order they are measured in: the import is a fact about
+            // the image, the table a fact about this object.
+            let mut tells = Vec::new();
+            if imported.is_some() {
+                tells.push(Tell::BindImport);
+            }
+            tells.push(Tell::DispatchTable);
+            Some(crate::framework::report(framework, tells, Some(image)))
+        }
+        None => imported.cloned(),
+    }
+}
+
 /// A section's status as a word a reader can act on, or nothing where it is simply fine.
 ///
 /// **`ok` prints nothing**, deliberately: a composite is four sections, and marking the ordinary
@@ -717,6 +804,13 @@ pub(crate) fn render(report: &crate::structured::DriverSurface) -> String {
     );
     if let Some(unload) = &report.unload {
         let _ = writeln!(out, "  DriverUnload    {}", location(unload));
+    }
+    // **Above the dispatch table, not below it.** It is what the table under it has to be read in
+    // the light of, and a qualification printed after the thing it qualifies is one a reader reaches
+    // having already drawn the conclusion.
+    if let Some(framework) = &report.framework {
+        let _ = writeln!(out, "  Framework       {}", framework.framework);
+        let _ = writeln!(out, "  [!] {}", framework.note);
     }
 
     // ---- dispatch --------------------------------------------------------
@@ -1325,6 +1419,153 @@ mod tests {
         }
     }
 
+    /// A `locate` that puts every address in `module`, for the framework tells below.
+    fn located_in(module: &'static str) -> impl FnMut(u64) -> crate::structured::CodeLocation {
+        move |address| crate::structured::CodeLocation {
+            address: crate::structured::addr(address),
+            module: Some(module.to_string()),
+            rva: Some(format!("{address:#x}")),
+            attribution_failed: false,
+        }
+    }
+
+    /// **The measured shape of a KMDF driver's table**: every one of the 28 entries in the
+    /// framework's image, because `Wdf01000!FxDriver::Initialize` writes all of them.
+    #[test]
+    fn a_dispatch_table_entirely_in_the_framework_says_so() {
+        let section = dispatch_section(
+            &with_table(&[0xffff_f805_1234_0000; 28]),
+            located_in("Wdf01000"),
+        );
+        let (framework, image) = dispatch_framework(&section)
+            .expect("a table wholly inside Wdf01000 is the framework's");
+        assert_eq!(framework.name(), "kmdf");
+        assert_eq!(
+            image, "Wdf01000",
+            "the module that matched is named, because the match was by name"
+        );
+    }
+
+    /// **One entry of its own is enough to not be it**, which is the strictness the loose rule would
+    /// lose: a WDM filter forwarding a single major function into a framework image is a filter, and
+    /// reporting it as a framework driver would put the framework's note on a driver whose other 27
+    /// entries are its own.
+    #[test]
+    fn a_table_with_one_entry_of_its_own_is_not_the_frameworks() {
+        let mut table = [0xffff_f805_1234_0000u64; 28];
+        table[0x0e] = 0x2000;
+        // The driver's own entry has to locate to the driver, or this test would pass on the wrong
+        // half of the rule -- every entry being in *one* image rather than in the framework's.
+        let mut n = 0;
+        let section = dispatch_section(&with_table(&table), |address| {
+            n += 1;
+            let _ = n;
+            match address {
+                0x2000 => at(address),
+                _ => located_in("Wdf01000")(address),
+            }
+        });
+        assert_eq!(dispatch_framework(&section), None);
+    }
+
+    /// An unattributed entry is not a framework entry, and must not be read as one by an `all` that
+    /// never saw a module.
+    #[test]
+    fn a_table_whose_entries_name_no_module_says_nothing() {
+        let section = dispatch_section(&with_table(&[0xffff_f805_1234_0000; 28]), |address| {
+            crate::structured::CodeLocation {
+                address: crate::structured::addr(address),
+                module: None,
+                rva: None,
+                attribution_failed: true,
+            }
+        });
+        assert_eq!(dispatch_framework(&section), None);
+    }
+
+    /// The third cause, in the sentence a caller reads. **Both arms**, because the two-cause version
+    /// was not wrong about its two -- it was wrong about the one it did not have, and a test for the
+    /// new arm alone would not notice the old one being lost.
+    #[test]
+    fn a_handler_in_the_framework_is_explained_as_one() {
+        let kmdf = foreign_dispatch_note("0xfffff8051234abcd", Some("Wdf01000"));
+        assert!(
+            kmdf.contains("KMDF") && kmdf.contains("`framework`"),
+            "names the framework and points at the field that explains it: {kmdf}"
+        );
+        assert!(
+            !kmdf.contains("filter forwarding"),
+            "and does not also offer the two causes it is not: {kmdf}"
+        );
+        let wdm = foreign_dispatch_note("0xfffff8051234abcd", Some("someotherdriver"));
+        assert!(
+            wdm.contains("kernel's stub") && wdm.contains("filter forwarding"),
+            "a handler in a driver still gets the two causes it may be: {wdm}"
+        );
+        // An entry nothing could attribute gets the same two: they are what is left, and the
+        // framework arm is the one that needs evidence.
+        assert_eq!(wdm, foreign_dispatch_note("0xfffff8051234abcd", None));
+    }
+
+    /// **The rendered half carries the note too**, which is the half that is easy to leave out:
+    /// a structured-aware client is served `structuredContent` instead of the text, so a
+    /// qualification in one and not the other is one half the clients never see. And it is printed
+    /// **above** the dispatch table it qualifies.
+    #[test]
+    fn a_rendered_survey_qualifies_the_table_before_printing_it() {
+        use crate::structured as s;
+        let plain = || surveyed(Vec::new(), s::SectionStatus::Ok, Some(true));
+        let mut report = plain();
+        report.framework = compose_framework(
+            Some((crate::framework::Framework::Kmdf, "Wdf01000".to_string())),
+            None,
+        );
+        let text = render(&report);
+        let framework = text
+            .find("Framework")
+            .expect("the framework is named in the rendering");
+        let note = text.find("KMDF driver").expect("and so is what it means");
+        let table = text
+            .find("Dispatch table")
+            .expect("the table it qualifies is still there");
+        assert!(
+            framework < note && note < table,
+            "the qualification arrives before the table it is about:\n{text}"
+        );
+        // And a WDM driver's rendering gains nothing at all.
+        assert!(!render(&plain()).contains("Framework"));
+    }
+
+    /// Either tell alone, and both together. The case this is for is the hazard scan not running:
+    /// the import tell is then absent and the table's is the whole answer.
+    #[test]
+    fn a_survey_reports_whichever_tell_fired() {
+        use crate::structured::FrameworkTell as Tell;
+        let imported = crate::framework::report(
+            crate::framework::Framework::Kmdf,
+            vec![Tell::BindImport],
+            None,
+        );
+        let dispatched = || Some((crate::framework::Framework::Kmdf, "Wdf01000".to_string()));
+
+        let both = compose_framework(dispatched(), Some(&imported)).expect("both tells fired");
+        assert_eq!(both.tells, vec![Tell::BindImport, Tell::DispatchTable]);
+        assert_eq!(both.dispatch_image.as_deref(), Some("Wdf01000"));
+
+        let table_only = compose_framework(dispatched(), None).expect("the table alone");
+        assert_eq!(table_only.tells, vec![Tell::DispatchTable]);
+        assert_eq!(table_only.dispatch_image.as_deref(), Some("Wdf01000"));
+
+        let import_only = compose_framework(None, Some(&imported)).expect("the import alone");
+        assert_eq!(import_only.tells, vec![Tell::BindImport]);
+        assert_eq!(
+            import_only.dispatch_image, None,
+            "nothing read a table, so nothing names the image one dispatches through"
+        );
+
+        assert_eq!(compose_framework(None, None), None);
+    }
+
     /// **The shape of a real dispatch table**: three of the driver's own routines and a kernel
     /// stub on everything else, grouped so the three are what you read.
     #[test]
@@ -1442,8 +1683,17 @@ mod tests {
         devices_status: crate::structured::SectionStatus,
         named_completely: Option<bool>,
     ) -> String {
+        render(&surveyed(devices, devices_status, named_completely))
+    }
+
+    /// The same fixture as a **value**, for the one test that varies a field after building it.
+    fn surveyed(
+        devices: Vec<crate::structured::SurfaceDevice>,
+        devices_status: crate::structured::SectionStatus,
+        named_completely: Option<bool>,
+    ) -> crate::structured::DriverSurface {
         use crate::structured as s;
-        render(&s::DriverSurface {
+        s::DriverSurface {
             images: Vec::new(),
             // Nothing was stopped, which is what every fixture here is about.
             not_started: None,
@@ -1454,6 +1704,7 @@ mod tests {
             image_base: s::addr(0x1000),
             image_size: "0x10000".to_string(),
             unload: None,
+            framework: None,
             dispatch: dispatch_section(&with_table(&[0x2000; 28]), at),
             devices: s::DevicesSection {
                 status: devices_status,
@@ -1474,7 +1725,7 @@ mod tests {
                 note: None,
                 hazards: None,
             },
-        })
+        }
     }
 
     fn a_device(path: Option<&str>) -> crate::structured::SurfaceDevice {
@@ -1905,6 +2156,7 @@ mod tests {
                 image_base: s::addr(0x1000),
                 image_size: "0x10000".to_string(),
                 unload: None,
+                framework: None,
                 dispatch: dispatch_section(&with_table(&[0x2000; 28]), at),
                 devices: s::DevicesSection {
                     status: s::SectionStatus::Ok,

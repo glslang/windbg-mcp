@@ -78,6 +78,16 @@ want only the map, or when you want the symbolic links, which the composite leav
 1. **Find the dispatch routine.** `driver_object { "name": "mydriver" }` (`!drvobj <name> 7`)
    dumps the `MajorFunction` table. Index **`0x0e`** (`IRP_MJ_DEVICE_CONTROL`) is the IOCTL
    dispatch handler's address.
+
+   **First check whose code that address is.** A **KMDF** driver has no dispatch routine of its
+   own: `Wdf01000.sys` fills all 28 slots with its own dispatcher and calls the driver's code as
+   callbacks it holds, so every entry reads `Wdf01000!FxDevice::Dispatch` or
+   `FxDevice::DispatchWithLock` and step 2 on one of them finds no control codes -- correctly,
+   because there are none there to find. A KMDF driver's codes are compared inside the
+   `EvtIoDeviceControl` of an I/O queue, which this server cannot yet resolve. `driver_surface`
+   recognises the case and says so in a `framework` field; `driver_object` prints the debugger's
+   raw table, so on that output the tell is the module name on every entry. The driver-side tell is
+   an import of `WdfVersionBind` from `WdfLdr.sys`, which `driver_hazards` reports.
 2. **Recover the switch.** `disassemble { "address": "<dispatchVA>" }` or `execute { "command":
    "uf <dispatchVA>" }` to read the `IoControlCode` comparisons / jump-table constants. Each
    `cmp`/case constant is a candidate IOCTL.
@@ -269,6 +279,9 @@ Save it under `docs/` (the repo's walkthrough convention) or hand it back inline
   entry `@rcx` is the `DriverObject` and `poi(@rsp)` the return into `nt!PnpCallDriverEntry` —
   breakpoint that return, `go`, and now `MajorFunction[0x0e]` (at `DriverObject+0xe0`) is the real
   dispatch. (A driver already loaded when you attach needs none of this — just `driver_object`.)
+  For a **KMDF** driver the populated table is the framework's either way, which is step 1's note:
+  letting `DriverEntry` finish gets you `Wdf01000!FxDevice::Dispatch` rather than a routine of the
+  driver's, and that is the table rather than a stale reading of it.
 - **No PDBs → rebase.** Static RVAs are ASLR-relative; rebase to `lm m <driver>` before setting
   any breakpoint. See the symbol/elevation notes in [setup.md](setup.md) and
   [live-and-kernel.md](live-and-kernel.md).

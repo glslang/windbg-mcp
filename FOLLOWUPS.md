@@ -136,8 +136,10 @@ each records the measurement that settled it and the condition that would reopen
 a judgement call open, and item 100 answers its own question against itself — the walk it was filed
 about turns out to be right, and what the run found instead went into item 98, now in
 [`DONE.md`](./DONE.md). And one that has
-**half** landed (2, 50) — the entry is narrowed to the half that is left rather than split across
-two files.
+**half** landed (2, 50, 108) — the entry is narrowed to the half that is left rather than split
+across two files. Item 108's first step landed on 2026-10-02 and its entry now carries what that
+step measured, what step 2 should start from, and the three claims of its own that measurement
+did not support.
 
 Items are roughly ordered by how soon they're worth doing, within each cluster.
 
@@ -2167,58 +2169,94 @@ whose doc comments record what each raise bought. If the eval arm is ever added 
 carry the served surface, so the label is a reader's hint rather than a measurement, and a new arm is
 the moment to re-derive it.
 
-## 108. [windbg-mcp] The driver tools assume a WDM dispatch table, and every in-box Hyper-V driver is KMDF
+## 108. [windbg-mcp] A KMDF driver's real callbacks — step 1 landed, the framework's per-device config is what is left
 
 **Repo:** `windbg-mcp`. **Origin:** item 103's S5o gate, 2026-09-29, where it cost a gate's worth of
-detour and produced a wrong sentence in a checked-in document before review caught it.
+detour and produced a wrong sentence in a checked-in document before review caught it. **Step 1
+landed 2026-10-02 and step 3 with it; this entry is narrowed to step 2**, which is the expensive half
+and was deliberately not started first.
 
-**What the tools assume.** `driver_object`, `ioctl_map`, `reachable_from_dispatch`,
+**What the tools assumed.** `driver_object`, `ioctl_map`, `reachable_from_dispatch`,
 `driver_surface` and the `MajorFunction[0x0e]` recipes in `skills/windbg-debugging/driver-ioctl.md`
 and `.claude/skills/live-kernel/SKILL.md` all read a driver's dispatch out of
-`DRIVER_OBJECT->MajorFunction` and expect the entries to name routines **in that driver**. For a
-WDM driver they do. For a KMDF driver they do not, and the tools do not say so.
+`DRIVER_OBJECT->MajorFunction` and expected the entries to name routines **in that driver**. For a
+WDM driver they do. For a KMDF driver they do not — all 28 entries are the framework's — so
+`driver_object` reported a driver that dispatches nothing of its own, and `ioctl_map` started at one
+of those entries found no IOCTL switch because there is none there to find. None of that was *wrong*
+as a reading of the table; it was the tools answering a question the caller did not mean to ask,
+which is the same failure mode as item 107.
 
-**Measured on this bench, from the images themselves** (`Wdf01000.sys 1.35.26100.3323`,
-`Vid.sys 10.0.26100.9278`, both opened as PE targets with public PDBs):
-`Wdf01000!FxDriver::Initialize` runs a loop over `0` through `0x1B` — 28 entries,
-`IRP_MJ_MAXIMUM_FUNCTION_CODE + 1` — writing `Wdf01000!FxDevice::Dispatch` or
-`FxDevice::DispatchWithLock` into every slot, chosen per device by `FxDevice::_RequiresRemLock`.
-So **all 28 entries point into `Wdf01000.sys`**, none into the client driver, and the driver's own
-handlers are callbacks the framework holds: an `IRP_MJ_CREATE` travels `FxDevice::Dispatch` →
-`FxPkgGeneral::OnCreate` → the driver's file-object create callback, and device control reaches an
-I/O queue's `EvtIoDeviceControl` rather than a dispatch routine.
+### What step 1 shipped (2026-10-02)
 
-**What that costs today.** `driver_object` on a KMDF driver reports 28 identical framework pointers
-and looks like a driver that dispatches nothing of its own; `ioctl_map` and
-`reachable_from_dispatch` start from an entry that is not the driver's code and find no IOCTL
-switch, because there is not one to find — the codes are compared inside the queue callback the
-framework calls. None of that is *wrong* as a reading of the table; it is the tools answering a
-question the caller did not mean to ask, which is the same failure mode as item 107.
+`src/framework.rs` recognises a framework from facts the tools already read, and `driver_surface`,
+`driver_hazards`, `ioctl_map` and `reachable_from_dispatch` each carry a `framework` field when one
+of them fires. **Two tells, because neither implies the other**: a `WdfVersionBind` import from
+`WdfLdr.sys` (a fact about the *image*, so it answers with no debuggee) and every `MajorFunction`
+entry read being in the framework's image (a fact about the *driver object*). `driver_surface`'s
+IOCTL section names the framework as the third reason a handler can sit outside the driver's image,
+beside the kernel's stub and a filter — the sentence that previously enumerated two and explained a
+KMDF table as one of them. Measured through the dev build against real images on 2026-10-02:
+`driver_hazards` on `Vid.sys` reports `kmdf` with tell `bind_import`; `ioctl_map` at
+`Wdf01000+0x51c90` reports `kmdf` with tell `framework_image` beside `case_count: 0`; and
+`Wdf01000.sys` and `mountmgr.sys` report no framework at all.
 
-**Why it matters here rather than in general.** The secure-kernel line of work reads in-box Hyper-V
-components, and they are KMDF: `Vid.sys` is the one measured, and `DriverEntry` → `FxDriverEntry`
-→ `WdfVersionBind` is the tell that costs nothing to check. S5n spent an arm looking for an
-`IRP_MJ_CREATE` dispatcher by symbol name and concluded none existed, which was right about the
-symbol and wrong about the cause; S5o then shipped *"there is no `MajorFunction` table to read"*,
-which is wrong outright, and both bots caught it.
+**Absence is deliberately not a negative** anywhere: the field is added when a tell fires and nothing
+is added when none does, so an image whose import names could not be read is reported as a driver
+nothing said anything about rather than as a WDM driver.
 
-**Sketch of the fix, cheapest first, and the first is most of the value.**
+### What is left: step 2, the real callbacks
 
-1. **Recognise the case and say so.** A driver importing `WdfVersionBind`, or carrying a
-   `WdfBindInfo`, is KMDF. `driver_object` reporting that — and that its `MajorFunction` entries
-   belong to the framework — turns a silently useless answer into a true one, and is a field on an
-   existing result rather than new machinery.
-2. **Resolve the real callbacks.** The framework's per-device config holds them; the create/close/
-   cleanup trio comes from the file-object config, device control from the I/O queue's. This is
-   structure-walking against `Wdf01000.sys`'s public types and is the part that wants a measured
-   layout per framework version rather than a constant — `Wdf01000.sys` carries its own version
-   line (1.35 here) independent of the OS build, which is the trap to design around.
-3. **UMDF is a different image again** (`WUDFx02000.dll`, user mode) and is out of scope until
-   something needs it. Say so rather than implying coverage.
+The framework's per-device config holds them; the create/close/cleanup trio comes from the
+file-object config, device control from the I/O queue's. This is structure-walking against
+`Wdf01000.sys`'s public types and is the part that wants a **measured layout per framework version**
+rather than a constant — `Wdf01000.sys` carries its own version line (1.35.26100.3323 on this bench)
+independent of the OS build, which is the trap to design around. Until it lands, the `framework`
+field tells a reader where *not* to look rather than where to look, and `docs/limitations.md` says so.
 
-**Do not start with step 2.** The layout work is the expensive half and buys nothing until a caller
-knows they are looking at a KMDF driver, which step 1 tells them — and step 1 would have prevented
-both wrong sentences above on its own.
+**What step 1 measured that step 2 should start from**, stated as the reading rather than as an
+interpretation of it. Disassembled on this bench, `Wdf01000.sys 1.35.26100.3323`:
+`FxDevice::Dispatch(DEVICE_OBJECT*, IRP*)` takes the current `IO_STACK_LOCATION` from `[Irp+0xB8]`
+and reads its `MajorFunction` at `+0` and `MinorFunction` at `+1`. It then reaches
+`[[DeviceObject+0x40]-0x30]`, adds `0x170`, and walks the **linked list** whose head is there —
+`r9 = [r9]` per step. At each link it indexes by `3 * major` in qwords: `+0x10` of that triple is
+the handler, `+0x18` a count, `+0x20` a byte array the minor function is searched in. A link whose
+`+0x10` is null is skipped and the walk continues; otherwise the handler is called through
+`Wdf01000!_guard_dispatch_icall`. **So a per-major handler is a field reached through a list rather
+than a slot in a table**, and the walk that finds one is what step 2 has to write — whether those
+links are the "packages" KMDF's own naming calls them is an inference this reading does not settle.
+Separately, S5o traced an `IRP_MJ_CREATE` by hand as `FxDevice::Dispatch` → `FxPkgGeneral::OnCreate`
+→ the driver's file-object create callback, which is consistent with the above and is a second
+source rather than the same one.
+
+**Step 3 is answered and needs nothing.** UMDF is a different image again (`WUDFx02000.dll`, user
+mode) and is recognised nowhere; the `framework` note says so rather than implying coverage.
+
+### Three claims this entry made that measurement did not support
+
+Corrected here rather than quietly dropped, since this entry is what anyone picking step 2 up will
+read, and all three were written from the S5o gate rather than re-derived.
+
+- **"every in-box Hyper-V driver is KMDF"** — the old title, and false. Censused off disk on
+  2026-10-02: **132 of the 445** driver images in `System32\drivers` import `WdfVersionBind`, and of
+  25 Hyper-V-ish ones **13** do. `Vid`, `vmbus`, `vmbusr`, `vpci`, `vpcivsp`, `storvsp`, `vmstorfl`,
+  `vmgid`, `vmgencounter`, `vms3cap`, `hvcrash` are KMDF; `vmswitch`, `winhv`, `winhvr`, `hvsocket`,
+  `hvservice`, `vmbkmcl`, `vmbkmclr`, `vmbusproxy`, `VmsProxy`, `VmsProxyHNic`, `VMBusHID`,
+  `vmsvcext`, `videoprt` carry no bind import at all.
+- **"chosen per device by `FxDevice::_RequiresRemLock`"** — it is chosen per **major function**. The
+  fill loop at `FxDriver::Initialize+0x200` calls `_RequiresRemLock(cl, 0)` with `cl` being the major
+  index it is about to write, once per iteration.
+- **The fill is conditional, which the entry did not say.** `FxDriver::Initialize+0x1b8` is a
+  `test cl,2` on the driver config's flags with a `jne` over the whole loop —
+  `WdfDriverInitNoDispatchOverride` — so a KMDF client that sets it keeps a dispatch table of its
+  own. That is why step 1 reports two independent tells rather than inferring the table's contents
+  from the import.
+
+**Also worth knowing before step 2, and not about KMDF.** A library-only rule misclassifies the
+framework as its own client: `Wdf01000.sys` imports `WdfRegisterLibrary` and
+`WdfLdrDiagnosticsValueByNameAsULONG` from `WdfLdr.sys` and neither bind routine, so the tell is the
+**name**. And `uf Wdf01000!FxDevice::Dispatch` fails `0x80040205` on this image because `x` matches
+that name twice — the routine and an inline caller inside `DispatchWithLock` — so anything driving
+the framework by symbol wants module+RVA.
 
 ## 109. [windbg-mcp] The server can walk a call graph forward and find calls to imports, and cannot answer "who calls this address"
 

@@ -3712,6 +3712,9 @@ pub(crate) fn structured_report(
         // coordinates came from.
         images: Vec::new(),
         dispatch: locate(found.dispatch),
+        // Filled in by the caller for the same reason `images` is: whether the routine is in a
+        // framework's own image is a question about the module inventory, which this file cannot ask.
+        framework: None,
         code_proved: found.code_proved,
         cases: found
             .cases
@@ -3795,6 +3798,11 @@ pub(crate) fn render(report: &crate::structured::IoctlMap) -> String {
             _ => location.address.clone(),
         };
     out.push_str(&format!("IOCTL map of {}\n", where_(&report.dispatch)));
+    // Before the cases, for the reason `hazards::render` says above its own caveats: it changes what
+    // an empty list means, and a caveat after the conclusion is a caveat nobody reads.
+    if let Some(framework) = &report.framework {
+        out.push_str(&format!("  [!] {}\n", framework.note));
+    }
     if !report.code_proved {
         out.push_str(&format!(
             "  [!] {} of {} case(s) tested a value taken from a displacement this could not trace \

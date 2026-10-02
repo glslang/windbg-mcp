@@ -8691,6 +8691,12 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
 
     // ---- the dispatch table, which came with the driver object ------------
     let dispatch = surface::dispatch_section(&fields, &mut locate);
+    // **Read here, used twice, and the reason it is read at all is the IOCTL section below.** A
+    // framework driver's entries are the framework's, so a table of identical pointers and an empty
+    // control-code map are both correct readings of a question nobody asked (`FOLLOWUPS.md` item
+    // 108). This is the half of the answer the driver object can give on its own; the other half is
+    // an import and arrives with the hazard scan, which runs last.
+    let dispatch_framework = surface::dispatch_framework(&dispatch);
     let unload = (fields.unload != 0).then(|| locate(fields.unload));
     // **The whole coordinate, not just its module.** An address in no image and a lookup that did
     // not answer are different facts, and `CodeLocation` is where they are told apart; taking
@@ -8772,12 +8778,20 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
             Some(address) => match fields.device_control().filter(|at| fields.owns(*at)) {
                 None => structured::IoctlSection {
                     status: structured::SectionStatus::Unavailable,
-                    note: Some(format!(
-                        "this driver's IOCTL handler is at {address}, which is outside its own image \
-                         -- the kernel's stub for a major function it does not handle, or a filter \
-                         forwarding to the driver below it. Mapping it would report another image's \
-                         control codes as this driver's. `ioctl_map` takes that address directly if \
-                         it is wanted anyway."
+                    // **The sentence is `surface`'s, not this function's**, because it carries a
+                    // rule: a handler outside the driver's image had two explanations here and a
+                    // framework driver is a third, which is the wrong sentence `FOLLOWUPS.md` item
+                    // 108 records this repo shipping. A rule stated in the worker has no test.
+                    //
+                    // Read off the handler's **own** module rather than off the whole table, which
+                    // is a different question: `dispatch_framework` asks whether *every* entry is
+                    // the framework's, and the one that decides this note is `0x0e`.
+                    note: Some(surface::foreign_dispatch_note(
+                        address,
+                        dispatch
+                            .device_control
+                            .as_ref()
+                            .and_then(|at| at.module.as_deref()),
                     )),
                     map: None,
                 },
@@ -8863,6 +8877,20 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         }
     };
 
+    // **Composed after both sections, because the two tells arrive in different ones.** The dispatch
+    // table came with the driver object; the import came with the hazard scan, which runs last and
+    // may not have run -- so either can be the only one present, and a composition that waited for
+    // both would report nothing for the case the field exists for. The scan's own answer is read
+    // back out of its section rather than recomputed: it already holds the only import table this
+    // call read, and re-deriving a figure downstream measures the re-derivation.
+    let framework = surface::compose_framework(
+        dispatch_framework,
+        hazards
+            .hazards
+            .as_ref()
+            .and_then(|scan| scan.framework.as_ref()),
+    );
+
     let report = structured::DriverSurface {
         images: attributor.images(),
         driver: path,
@@ -8872,6 +8900,7 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
         image_base: structured::addr(fields.image_base),
         image_size: format!("{:#x}", fields.image_size),
         unload,
+        framework,
         dispatch,
         devices,
         ioctl,
@@ -9793,7 +9822,32 @@ fn ioctl_map_of(
     report.images = attributor.images();
     // The walk's own stop wins, for the reason the scan's does above.
     report.stopped = report.stopped.or_else(|| stopped.get());
+    report.framework = framework_of_code(report.dispatch.module.as_deref());
     Ok(report)
+}
+
+/// Qualifies an answer whose **root is in a framework's own image** rather than in a driver.
+///
+/// One helper for the two tools that are given an address and asked about the code at it, so the
+/// qualification is a reading of one rule rather than a sentence written twice. `driver_surface`
+/// does not use it: its root is a driver object, and what it says about one is composed from two
+/// tells rather than from the module a single address is in.
+///
+/// Answers `None` for an address in no module as readily as for one in a driver -- which is the
+/// shape `FOLLOWUPS.md` item 108's own writing-up got wrong, so it is said here: nothing in an
+/// absent qualification claims the routine is a driver's.
+///
+/// **No `dispatch_image`.** That field names where a *dispatch table's* entries were found, and
+/// nothing here read a table; the module is already beside this in the answer's own root location,
+/// and filling one field from two different questions is how it stops being one a caller can branch
+/// on.
+fn framework_of_code(module: Option<&str>) -> Option<structured::DriverFramework> {
+    let framework = crate::framework::image_is(module?)?;
+    Some(crate::framework::report(
+        framework,
+        vec![structured::FrameworkTell::FrameworkImage],
+        None,
+    ))
 }
 
 /// Why attribution should stop, or `None` to carry on.
@@ -10680,6 +10734,10 @@ fn reachable(e: &DebugEngine, args: ReachabilityOp, deadline: Instant) -> Result
     // Assigned after, because it is what the closure above *learned*: which images the walk ended
     // up naming is not known until every address has been through it.
     report.images = attributor.images();
+    // The same qualification `ioctl_map` carries, read off the same thing: the module the root is
+    // in. Here the root is `from`, which is absent only for a walk the caller never sees.
+    report.framework =
+        framework_of_code(report.from.as_ref().and_then(|from| from.module.as_deref()));
     Ok(Output::typed(out, report))
 }
 
