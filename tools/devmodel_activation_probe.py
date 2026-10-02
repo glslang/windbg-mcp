@@ -176,6 +176,32 @@ def loaded_modules() -> set[str]:
     return present
 
 
+def activated(row: dict) -> bool:
+    """Whether a row is an object this probe actually obtained.
+
+    **`S_OK` alone is not enough, and the probe already collects the reason why.** The output pointer
+    is poisoned with `0xAA` before every call precisely so that a provider which returns success and
+    writes nothing can be told from one that wrote null -- and then the census counted rows on `hr`
+    and never read that evidence, which made the poisoning decoration. The failure it was added to
+    catch is exactly the one that would corrupt the result rather than fail it: a wrong calling
+    convention or a provider stub returning `S_OK` with no object would have been counted as an
+    activation. Raised in review on #434.
+
+    So a row counts only with a pointer that was **replaced** and is **non-null**, and with the
+    refcount readings present -- those are taken through the object's own vtable, so their presence is
+    the evidence that there was something there to call. The exact refcounts are reported rather than
+    pinned: 2/1/0 is what every class on this bench gives, and an object legitimately holding a
+    self-reference would give another number without being less of an object.
+    """
+    return (
+        row.get("hr") == "0x00000000"
+        and row.get("ptr_untouched") is False
+        and (row.get("ptr") or "0x0") != "0x0"
+        and row.get("after_addref") is not None
+        and row.get("final_release") is not None
+    )
+
+
 def clsid_bytes_in_module(clsid_text: str, path: str) -> bool | None:
     """Whether the DLL's own image contains this CLSID's 16 little-endian bytes.
 
@@ -356,10 +382,16 @@ def main() -> int:
     positive = by_clsid.get(CONTROL_POSITIVE, {})
     negative = by_clsid.get(CONTROL_NEGATIVE, {})
     broken = []
-    if positive.get("hr") != "0x00000000":
+    if not activated(positive):
         broken.append(
-            "the positive control (%s) did not activate: %s %s"
-            % (CONTROL_POSITIVE, positive.get("hr"), positive.get("hr_name") or "")
+            "the positive control (%s) did not activate: %s %s (ptr=%s untouched=%s)"
+            % (
+                CONTROL_POSITIVE,
+                positive.get("hr"),
+                positive.get("hr_name") or "",
+                positive.get("ptr"),
+                positive.get("ptr_untouched"),
+            )
         )
     if negative.get("hr") != "0x80040154":
         broken.append(
@@ -387,7 +419,7 @@ def main() -> int:
                 % (r["clsid"], r.get("name"), r["dll"], clsid_bytes_in_module(r["clsid"], r["path"]))
             )
         print()
-    ok = [r for r in rows if r["hr"] == "0x00000000" and r["dll"] not in ("(control+)", "(control-)")]
+    ok = [r for r in rows if activated(r) and r["dll"] not in ("(control+)", "(control-)")]
     print("controls   positive=S_OK  negative=REGDB_E_CLASSNOTREG")
     print("ACTIVATED=%d of %d device-model classes" % (len(ok), len(targets)))
     for r in ok:
