@@ -50,6 +50,23 @@
 //!
 //! So that flag is the bit, read from the image that tests it rather than from a header.
 //!
+//! # Where a client's control codes are, which is **not** one place
+//!
+//! The notes below name `EvtIoDeviceControl` as the usual destination and not the required one, and
+//! that correction is measured here rather than taken from the documentation link review cited.
+//! `dt Wdf01000!_WDF_IO_QUEUE_CONFIG` on this bench's framework holds **eight** callback slots --
+//! `EvtIoDefault` at `+0x10`, then `EvtIoRead`, `EvtIoWrite`, `EvtIoDeviceControl` at `+0x28`,
+//! `EvtIoInternalDeviceControl` at `+0x30`, `EvtIoStop`, `EvtIoResume`, `EvtIoCanceledOnQueue` -- so
+//! a device-control request reaches `EvtIoDefault` in a queue that configures no specific handler,
+//! and an internal one reaches its own slot. Two further routes bypass the queue machinery
+//! altogether and are exported by this build:
+//! `WdfDeviceInitAssignWdmIrpPreprocessCallback` and `WdfDeviceConfigureWdmIrpDispatchCallback`.
+//!
+//! Naming one of four as *the* place is the same overclaim as the rest of this file's history, in
+//! the one sentence that looked like architecture rather than evidence -- and it is the one that
+//! would send a reader to the wrong callback. Whichever of them a given driver uses is step 2's
+//! question (`FOLLOWUPS.md` item 108).
+//!
 //! # Engine-free
 //!
 //! Like [`crate::surface`], [`crate::device`] and [`crate::hazards`], nothing here takes a
@@ -165,8 +182,10 @@ impl Framework {
             Table::Frameworks(_) => {
                 " Every `MajorFunction` entry read here is in the framework's image, so a dispatch \
                  entry is the framework's code rather than this driver's and holds no IOCTL compare \
-                 chain: this driver's control codes are compared in an I/O queue's \
-                 `EvtIoDeviceControl`, which this build cannot resolve."
+                 chain: this driver's control codes are compared in a callback the framework holds, \
+                 which this build cannot resolve -- an I/O queue's `EvtIoDeviceControl` usually, or \
+                 its `EvtIoDefault` or `EvtIoInternalDeviceControl`, or a WDM preprocess or \
+                 dispatch hook."
             }
             Table::NotEstablished => {
                 " This driver's `MajorFunction` entries **were** read and are in this answer, and \
@@ -328,8 +347,9 @@ pub(crate) fn code_report(framework: Framework) -> crate::structured::DriverFram
         note: "this routine is in `Wdf01000.sys`, the KMDF framework, rather than in a driver that \
                binds to it -- so this answers about code every KMDF driver on the target shares, and \
                about none of them in particular. A KMDF driver whose dispatch table the framework \
-               took over compares its control codes in an I/O queue's `EvtIoDeviceControl`, which \
-               this build cannot resolve."
+               took over compares its control codes in a callback the framework holds -- an I/O \
+               queue's `EvtIoDeviceControl` usually, or one of the three other routes -- which this \
+               build cannot resolve."
             .to_string(),
         framework: framework.name().to_string(),
         tells: vec![crate::structured::FrameworkTell::FrameworkImage],

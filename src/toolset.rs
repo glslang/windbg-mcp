@@ -27,13 +27,13 @@
 //!   batch            1   10,842  `debug_batch`
 //!   crash            3    7,514  a bug check, a user-mode fault, and an error code
 //!   ttd              9    7,090  recording, indexing and querying a Time Travel trace
-//!   ioctl           10   13,004  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
+//!   ioctl           10   13,037  driver objects, IRP stacks, reachability, hazards, IOCTL maps,
 //!                                  device security and the whole-driver survey
 //!   securekernel     4    7,645  a Hyper-V capture's VTL1: its decode, modules, memory and symbols
 //! ```
 //!
 //! Those bytes are a measurement of **2026-10-02** and move with any edit to a description — the
-//! whole surface they are shares of is 67 tools and 105,555 B, which is what the rows above sum to.
+//! whole surface they are shares of is 67 tools and 105,588 B, which is what the rows above sum to.
 //! Re-derive rather than quoting them.
 //!
 //! **Those are shares of the whole surface, and they do not sum to a narrowed one.** `crash` reads
