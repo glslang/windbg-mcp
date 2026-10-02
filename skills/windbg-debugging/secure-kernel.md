@@ -28,7 +28,9 @@ it is the second half of this page.
   the wrong file; point `image` at the guest's own copy or the decode finds nothing and reports
   that it did.
 - **The `securekernel` tool group.** It is in the default surface, so a server started plainly has
-  all four. One started with a narrowed `--tools` has them only if that spec names `securekernel`.
+  all four. One started with a narrowed `--tools` has them if that spec names the `securekernel`
+  group **or** names the tools it wants individually — `--tools` takes either, so a surface can
+  carry `open_sk_capture` and `sk_read_memory` and not the other two.
 
 No driver, no test-signing, and no debugger attached to anything. A checkpoint is the guest's whole
 RAM in a file, so handle one like a full memory dump of that machine.
@@ -69,11 +71,14 @@ figures mean something — not a failure to work around.
 
 Two consequences, both of them from the target being a file:
 
-- **Only its own tools work on it.** `sk_modules`, `sk_read_memory` and `sk_symbol` read the
-  capture; every other debugger tool is **refused by name**. That is not tidiness: the engine in
-  that worker holds the Secure Kernel **image on disk** — or nothing at all, when the session was
-  opened without `symbols` — so `read_memory` there would read the file and report it as the
-  guest's memory, and `registers` would answer about no thread.
+- **Only its own tools read it.** `sk_modules`, `sk_read_memory` and `sk_symbol` read the capture;
+  every other tool that answers about a **debugger target** is **refused by name**. That is not
+  tidiness: the engine in that worker holds the Secure Kernel **image on disk** — or nothing at
+  all, when the session was opened without `symbols` — so `read_memory` there would read the file
+  and report it as the guest's memory, and `registers` would answer about no thread. What is *not*
+  refused is everything that is about the **session** rather than its target: `end_session` and
+  `interrupt` are accepted on any session kind, and `session_status` and `server_log` never reach
+  the worker at all. So a capture session is closed the ordinary way.
 - **Nothing executes.** There is no thread, nothing to resume, step or break into, and no use for
   `go`, `set_breakpoint` or `continue_async`. The capture is opened read-only and never written;
   `end_session` closes a file.
@@ -112,7 +117,8 @@ Two limits to plan around:
 - **It needs a session opened with `symbols`.** Without it the refusal says so and the remedy is to
   open the capture again — the decode is identical either way, so nothing is lost but the call.
 - **There are no types.** Microsoft's public `securekernel.pdb` carries **no type records**, so
-  there is no `dt` over VTL1 and no structure formatting anywhere in this surface. A structure is
+  nothing in this session formats a structure over VTL1 — and `dt` is not a way round it, the
+  debugger tools being refused here in the first place. A structure is
   read with `sk_read_memory` and decoded by hand, from offsets you derive. The open's report says
   what the engine answered when asked, rather than leaving you to infer it.
 
@@ -135,8 +141,12 @@ used, and all three matter:
 2. **This repository ships no transport, and the role will not start without one.** `--transport`
    is required. Reading another partition's VTL1 *live* needs a kernel component this project will
    not distribute — on the bench that has meant a test-signed driver issuing `HvCallReadGpa`, and
-   `hvlib.dll` with its own driver — so the operator supplies the transport and accepts the posture
-   it needs (test-signing on, Secure Boot and HVCI off). What ships here is the **client** half: a
+   `hvlib.dll` with its own driver — so the operator supplies the transport and accepts whatever
+   posture **that** transport needs. Do not prescribe one here: which settings a host has to give
+   up depends on the transport, this project has nothing to say about a transport it does not
+   ship, and the one time that posture was guessed at on this bench it cost a protection for
+   nothing (HVCI, turned off because a Code Integrity event was read as naming it when the policy
+   id in it named something else, measured to change the failure not at all, and restored). What ships here is the **client** half: a
    line protocol, no privileged code, no unsafe FFI. It is the same arrangement as the live-kernel
    tier's KDNET wiring. **Without a transport there is no live route at all** — not a degraded one.
 3. **It is deliberately not a fifth tool.** `open_sk_capture` can hand back a whole decode at the

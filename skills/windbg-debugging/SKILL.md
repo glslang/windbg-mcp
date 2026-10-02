@@ -41,7 +41,7 @@ already does the job.
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
-| Secure Kernel | `open_sk_capture` (a Hyper-V checkpoint's VTL1, decoded at the open), `sk_modules`, `sk_read_memory`, `sk_symbol` — a session of their own, on which every other tool here is refused |
+| Secure Kernel | `open_sk_capture` (a Hyper-V checkpoint's VTL1, decoded at the open), `sk_modules`, `sk_read_memory`, `sk_symbol` — a session of their own, on which the tools that answer about a debugger target are refused (`end_session` and `interrupt` are not) |
 | Server | `server_log` — the server's own records: the supervisor's, plus your own sessions' workers, tagged by session |
 | Raw | `execute` — run any debugger command, returns full text output |
 
@@ -195,8 +195,9 @@ where its stderr is not on your screen.
   execution. Ordinary TTD queries don't trip it.
 - **TTD is user-mode only** (a Microsoft limitation) — you cannot time-travel a kernel target.
 - **The Secure Kernel tools read a *capture*, and nothing here reaches a live one.** A
-  `open_sk_capture` session's target is a Hyper-V checkpoint, so nothing executes and every tool
-  outside its own three is refused on it. The live route exists — `--sk-live`, a command-line role
+  `open_sk_capture` session's target is a Hyper-V checkpoint, so nothing executes and the tools
+  that answer about a debugger target are refused on it — but it is an ordinary session otherwise,
+  so **close it with `end_session`** as you would any other. The live route exists — `--sk-live`, a command-line role
   on this same binary — but it needs a **transport the operator supplies**: this server ships none,
   the role refuses to start without `--transport`, and there is no MCP call for it either way. So a
   request to debug a running Secure Kernel is answered with a checkpoint, or handed back to the
