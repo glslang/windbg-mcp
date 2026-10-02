@@ -748,24 +748,41 @@ pub(crate) fn foreign_dispatch_note(
 /// rather than three lines at the one call site: the scan runs last and may not run at all, and a
 /// framework client can keep its own dispatch table (`WdfDriverInitNoDispatchOverride` --
 /// [`crate::framework`] has the measurement), so neither tell implies the other.
+///
+/// **It builds a survey's own report rather than cloning the scan's**, which is review round 5's
+/// correction. A clone carried the scan's note, and that note's business is a `driver_hazards`
+/// answer, which reads no dispatch table: served here it told a caller nothing had read the entries
+/// printed directly below it and instructed them to go and read the table. A survey always read the
+/// table -- it comes with the driver object -- so it passes
+/// [`crate::framework::Table::NotEstablished`] where the scan passes `Unread`, and the two get
+/// different sentences because they are different facts.
 pub(crate) fn compose_framework(
     dispatched: Option<(crate::framework::Framework, String)>,
     imported: Option<&crate::structured::DriverFramework>,
 ) -> Option<crate::structured::DriverFramework> {
-    use crate::structured::FrameworkTell as Tell;
-    match dispatched {
-        Some((framework, image)) => {
-            // Both where both fired, in the order they are measured in: the import is a fact about
-            // the image, the table a fact about this object.
-            let mut tells = Vec::new();
-            if imported.is_some() {
-                tells.push(Tell::BindImport);
+    use crate::framework::Table;
+    let framework = match (&dispatched, imported) {
+        (Some((framework, _)), _) => *framework,
+        // Taken from the scan's own answer rather than assumed, so a second recognised framework
+        // could not have this end reporting the wrong one.
+        (None, Some(reported)) => match reported.framework.as_str() {
+            name if name == crate::framework::Framework::Kmdf.name() => {
+                crate::framework::Framework::Kmdf
             }
-            tells.push(Tell::DispatchTable);
-            Some(crate::framework::report(framework, tells, Some(image)))
-        }
-        None => imported.cloned(),
-    }
+            // A framework this build does not know how to word a survey's note for is carried as the
+            // scan reported it rather than renamed into one it is not.
+            _ => return imported.cloned(),
+        },
+        (None, None) => return None,
+    };
+    Some(crate::framework::client_report(
+        framework,
+        imported.is_some(),
+        match dispatched {
+            Some((_, image)) => Table::Frameworks(image),
+            None => Table::NotEstablished,
+        },
+    ))
 }
 
 /// A section's status as a word a reader can act on, or nothing where it is simply fine.
@@ -1589,10 +1606,12 @@ mod tests {
     #[test]
     fn a_survey_reports_whichever_tell_fired() {
         use crate::structured::FrameworkTell as Tell;
-        let imported = crate::framework::report(
+        // The scan's own answer, as `driver_hazards` builds it: the import tell and a table
+        // nothing read.
+        let imported = crate::framework::client_report(
             crate::framework::Framework::Kmdf,
-            vec![Tell::BindImport],
-            None,
+            true,
+            crate::framework::Table::Unread,
         );
         let dispatched = || Some((crate::framework::Framework::Kmdf, "Wdf01000".to_string()));
 
@@ -1608,7 +1627,28 @@ mod tests {
         assert_eq!(import_only.tells, vec![Tell::BindImport]);
         assert_eq!(
             import_only.dispatch_image, None,
-            "nothing read a table, so nothing names the image one dispatches through"
+            "nothing recognised a table, so nothing names the image one dispatches through"
+        );
+        // **And the survey's own sentence, not the scan's.** This arm used to clone the scan's whole
+        // report, note included -- and that note's business is an answer that read no dispatch table,
+        // which a survey always does: a caller was told nothing had read the entries printed
+        // immediately below and sent off to go and read them. The tells agree because the *evidence*
+        // agrees; what differs is what each answer read about the table.
+        assert_ne!(
+            import_only.note, imported.note,
+            "a survey that read the table must not be served the scan's no-table sentence"
+        );
+        assert!(
+            import_only
+                .note
+                .contains("were** read and are in this answer"),
+            "{}",
+            import_only.note
+        );
+        assert!(
+            imported.note.contains("Nothing in this answer read"),
+            "and the scan's own answer keeps saying so: {}",
+            imported.note
         );
 
         assert_eq!(compose_framework(None, None), None);

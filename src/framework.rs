@@ -134,36 +134,21 @@ impl Framework {
     /// `driver_surface` answer carrying `bind_import` *without* `dispatch_table` it contradicted the
     /// answer it sat in, that tell having been tried and failed.
     ///
-    /// Assembling it from the tells is what makes the half-version unexpressible: there is no way to
-    /// say anything about the table without `DispatchTable` being in the list. Which is the same
-    /// correction, in the same round, as the clause [`Self::table_clause`] replaced.
-    pub(crate) fn note(self, tells: &[crate::structured::FrameworkTell]) -> String {
-        use crate::structured::FrameworkTell as Tell;
+    /// Assembling it from what was read is what makes the half-version unexpressible: there is no way
+    /// to say anything about the table without a [`Table`] value saying it was read.
+    ///
+    /// **The input is [`Table`] rather than the tells, which is review round 5's correction.** The
+    /// tells have two states where the answer has three, so the import-only sentence -- "nothing here
+    /// read this driver's `MajorFunction` entries ... read the table" -- was being served by
+    /// `driver_surface` *after* it had read the table and printed it, because the tell list for that
+    /// case and for `driver_hazards`' is the same list. [`Table::NotEstablished`] is the state that
+    /// had nowhere to go.
+    fn note(self, table: Table) -> String {
         let Self::Kmdf = self;
-        // **The two subjects are never mixed**, which the early return below would silently resolve
-        // in favour of one: a report is either about an address inside the framework or about a
-        // driver that binds to it, and no caller builds both. Pinned here because the sentence
-        // chosen is what a caller reads, and a wrong one would read as a true statement about the
-        // other subject.
-        debug_assert!(
-            !tells.contains(&Tell::FrameworkImage)
-                || tells.iter().all(|tell| *tell == Tell::FrameworkImage),
-            "being framework code and binding to the framework are different subjects: {tells:?}"
-        );
-        // Its own sentence and not a clause of the others: this is about an *address*, where the two
-        // below are about a driver, and nothing is known here about any driver object.
-        if tells.contains(&Tell::FrameworkImage) {
-            return "this routine is in `Wdf01000.sys`, the KMDF framework, rather than in a driver \
-                    that binds to it -- so this answers about code every KMDF driver on the target \
-                    shares, and about none of them in particular. A KMDF driver whose dispatch table \
-                    the framework took over compares its control codes in an I/O queue's \
-                    `EvtIoDeviceControl`, which this build cannot resolve."
-                .to_string();
-        }
         // **The base says only what *binding* establishes, which is that this driver is a client of a
         // framework that can take a dispatch table over -- never that it took this one.** Every
-        // consequence of that having happened is in the `DispatchTable` clause below, because that
-        // tell is what reads it. The base carried them for three rounds and each round found one:
+        // consequence of that having happened is in the clause below, because reading the table is
+        // what licenses it. The base carried them for three rounds and each round found one:
         // "installs its own dispatcher in every slot", and then "calls the driver's code as callbacks
         // rather than through dispatch routines of its own -- control codes are compared in an
         // `EvtIoDeviceControl`", which contradicted the clause under it and sent a reader *away* from
@@ -172,25 +157,27 @@ impl Framework {
         let mut note = "this is a KMDF driver: it binds to `Wdf01000.sys`, the framework that can \
                         take a client's dispatch table over and call its code as callbacks instead."
             .to_string();
-        // **What was read about the table, and only that.** Either clause is a statement about this
-        // answer's own evidence, so neither can outrun it.
-        //
-        // **And the second gives a direction without naming a destination**, which took two rounds
-        // to land between. It said nothing about where to look, which leaves a reader nowhere; the
-        // correction said the handler "is then a routine in this image", which is a location nothing
-        // had read -- an override client may leave the kernel's stub in the slot, forward it, or
-        // handle no IOCTL at all, the three cases `surface::foreign_dispatch_note` exists to tell
-        // apart once a table *is* read. So it says to read the table and stops.
-        note.push_str(match tells.contains(&Tell::DispatchTable) {
-            true => {
+        // **What this answer read about the table, and only that.** Each clause is a statement about
+        // its own answer's evidence, so none can outrun it -- and each tells the reader where to go
+        // next *within what was read*, since a reader sent nowhere and a reader sent somewhere
+        // unverified were rounds 3 and 4.
+        note.push_str(match table {
+            Table::Frameworks(_) => {
                 " Every `MajorFunction` entry read here is in the framework's image, so a dispatch \
                  entry is the framework's code rather than this driver's and holds no IOCTL compare \
                  chain: this driver's control codes are compared in an I/O queue's \
                  `EvtIoDeviceControl`, which this build cannot resolve."
             }
-            false => {
-                " Nothing here read this driver's `MajorFunction` entries, so whether the framework \
-                 took its dispatch table over is not something this answer says -- a client passing \
+            Table::NotEstablished => {
+                " This driver's `MajorFunction` entries **were** read and are in this answer, and \
+                 they were not established as wholly the framework's -- an entry in another image, \
+                 or one that could not be attributed -- so part of its dispatch may be its own. Read \
+                 the table below rather than assuming either; a client passing \
+                 `WdfDriverInitNoDispatchOverride` keeps a dispatch table of its own."
+            }
+            Table::Unread => {
+                " Nothing in this answer read this driver's `MajorFunction` entries, so whether the \
+                 framework took its dispatch table over is not something it says -- a client passing \
                  `WdfDriverInitNoDispatchOverride` keeps one of its own. Read the table to find out \
                  which this is."
             }
@@ -270,29 +257,83 @@ pub(crate) fn client_of(imports: &[pe::Import]) -> Option<Framework> {
         .then_some(Framework::Kmdf)
 }
 
-/// The structured answer the tools carry, assembled in **one** place.
+/// What an answer established about a driver's `MajorFunction` table.
 ///
-/// Four tools report this and the wording is the whole of what step 1 of `FOLLOWUPS.md` item 108
+/// **Three states, because the answer has three and the tells have two.** A report carrying
+/// `bind_import` alone is `driver_hazards`, which read no table, *or* `driver_surface` having read
+/// one and not recognised it as wholly the framework's -- and until review round 5 those two were
+/// served the same sentence, so a survey that had printed the table directly below was told nothing
+/// had read it and instructed to go and read it. The tells stay as they are, being evidence *for the
+/// framework*; this is evidence about the **table**, which is a different axis.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Table {
+    /// Nothing in this answer read it.
+    Unread,
+    /// Read, and every entry is in the framework's image, named here.
+    Frameworks(String),
+    /// Read, and **not** established as wholly the framework's: an entry in another image, or one
+    /// this answer could not attribute. The two are not told apart, because
+    /// `surface::dispatch_framework` cannot and a fourth state would be the same overclaim one
+    /// level down.
+    NotEstablished,
+}
+
+/// The structured answer about a **driver** that binds to a framework.
+///
+/// Three tools report one and the wording is the whole of what step 1 of `FOLLOWUPS.md` item 108
 /// buys, so it is built here rather than at each of them: a helper the callers route through, with
 /// nothing left for a caller to word differently.
 ///
-/// **The note is written from the tells, not beside them**, so a caller cannot hand in a sentence
-/// its evidence does not support -- which is the defect review found when the note was two fixed
-/// sentences picked by a subject argument. [`Framework::note`] says what each tell licenses.
-pub(crate) fn report(
+/// **Both the note and the tells are derived from the same two inputs**, so a caller cannot hand in
+/// a sentence its evidence does not support, nor a tell list the sentence disagrees with. Review
+/// found both halves of that: the note was two fixed sentences picked by a subject argument, and
+/// then a note built for one tool was cloned into another whose evidence differed.
+pub(crate) fn client_report(
     framework: Framework,
-    tells: Vec<crate::structured::FrameworkTell>,
-    dispatch_image: Option<String>,
+    bind_import: bool,
+    table: Table,
 ) -> crate::structured::DriverFramework {
+    use crate::structured::FrameworkTell as Tell;
     debug_assert!(
-        !tells.is_empty(),
-        "a framework is reported because something said so, and `tells` is what said so"
+        bind_import || matches!(table, Table::Frameworks(_)),
+        "a framework is reported because something said so, and these are what can say so"
     );
+    let mut tells = Vec::new();
+    if bind_import {
+        tells.push(Tell::BindImport);
+    }
+    if matches!(table, Table::Frameworks(_)) {
+        tells.push(Tell::DispatchTable);
+    }
     crate::structured::DriverFramework {
-        note: framework.note(&tells),
+        note: framework.note(table.clone()),
         framework: framework.name().to_string(),
         tells,
-        dispatch_image,
+        dispatch_image: match table {
+            Table::Frameworks(image) => Some(image),
+            _ => None,
+        },
+    }
+}
+
+/// The structured answer about **code inside the framework's own image**.
+///
+/// Its own constructor rather than a variant of [`client_report`], because the two subjects must
+/// never be mixed and a shared one made that a list a caller could get wrong: this is about an
+/// *address*, nothing here has read a driver object, and the sentence is not a clause of the
+/// others. A `debug_assert` kept them apart for one round; two functions make it unexpressible.
+pub(crate) fn code_report(framework: Framework) -> crate::structured::DriverFramework {
+    let Framework::Kmdf = framework;
+    crate::structured::DriverFramework {
+        note: "this routine is in `Wdf01000.sys`, the KMDF framework, rather than in a driver that \
+               binds to it -- so this answers about code every KMDF driver on the target shares, and \
+               about none of them in particular. A KMDF driver whose dispatch table the framework \
+               took over compares its control codes in an I/O queue's `EvtIoDeviceControl`, which \
+               this build cannot resolve."
+            .to_string(),
+        framework: framework.name().to_string(),
+        tells: vec![crate::structured::FrameworkTell::FrameworkImage],
+        dispatch_image: None,
     }
 }
 
@@ -390,63 +431,80 @@ mod tests {
         }
     }
 
-    /// **A note says only what its tells establish.** The import tell is a fact about an image and
-    /// licenses nothing about a dispatch table -- which is every `driver_hazards` answer, and is a
-    /// `driver_surface` answer whose dispatch tell was tried and failed, where the old fixed sentence
-    /// contradicted the result it sat in.
+    /// **A note says only what its answer read about the table, and the three readings are three
+    /// sentences.** Two of them were one sentence until review round 5: a survey that had read the
+    /// table and not recognised it was served `driver_hazards`' wording, which says nothing read it
+    /// and tells the reader to go and read it -- printed directly above the table it says nobody read.
     #[test]
-    fn a_note_claims_the_dispatch_table_only_where_a_tell_read_it() {
-        use crate::structured::FrameworkTell as Tell;
-        let import_only = Framework::Kmdf.note(&[Tell::BindImport]);
+    fn a_note_claims_the_dispatch_table_only_as_far_as_the_answer_read_it() {
+        let unread = Framework::Kmdf.note(Table::Unread);
         assert!(
-            import_only.contains("not something this answer says")
-                && import_only.contains("WdfDriverInitNoDispatchOverride"),
-            "says what it did not read, and the case that makes it matter: {import_only}"
+            unread.contains("Nothing in this answer read")
+                && unread.contains("WdfDriverInitNoDispatchOverride"),
+            "says what it did not read, and the case that makes it matter: {unread}"
         );
         assert!(
-            import_only.contains("Read the table"),
-            "and gives the reader a direction, rather than leaving them nowhere: {import_only}"
+            unread.contains("Read the table"),
+            "and gives the reader a direction, rather than leaving them nowhere: {unread}"
         );
         assert!(
-            !import_only.contains("in this image"),
-            "without naming a destination nothing read -- an override client may leave the kernel's \
-             stub in the slot, or handle no IOCTL at all: {import_only}"
-        );
-        assert!(
-            !import_only.contains("Every `MajorFunction` entry"),
-            "and claims nothing about the table: {import_only}"
+            !unread.contains("in this image"),
+            "without naming a destination nothing read -- an override client may leave the kernel's              stub in the slot, or handle no IOCTL at all: {unread}"
         );
 
         // **The whole note, not just its clause.** Three rounds found a consequence of the table
-        // having been taken over sitting in the *base* sentence, where no tell licenses it -- the
+        // having been taken over sitting in the *base* sentence, where nothing licenses it -- the
         // last of them contradicting the clause printed underneath it. So this asserts the absence
-        // across the note as a whole, which is the only form that catches it moving back up.
+        // across the note as a whole, which is the only form that catches it moving back up. Both
+        // readings that did not establish the framework owns the table are checked, since the
+        // sentence could drift into either.
+        let read_but_not = Framework::Kmdf.note(Table::NotEstablished);
         for forbidden in [
             "EvtIoDeviceControl",
             "callbacks it holds",
             "no IOCTL compare chain",
         ] {
-            assert!(
-                !import_only.contains(forbidden),
-                "the import tell licenses no consequence of the framework owning the table \
-                 ({forbidden}): {import_only}"
-            );
+            for (reading, note) in [("an unread", &unread), ("an unrecognised", &read_but_not)] {
+                assert!(
+                    !note.contains(forbidden),
+                    "{reading} table licenses no consequence of the framework owning it                      ({forbidden}): {note}"
+                );
+            }
         }
 
-        let with_table = Framework::Kmdf.note(&[Tell::BindImport, Tell::DispatchTable]);
+        let whole = Framework::Kmdf.note(Table::Frameworks("Wdf01000".to_string()));
         assert!(
-            with_table.contains("Every `MajorFunction` entry read here")
-                && with_table.contains("EvtIoDeviceControl"),
-            "the table tell licenses the table claim and its consequence: {with_table}"
-        );
-        assert!(
-            !with_table.contains("not something this answer says"),
-            "and the two clauses are exclusive: {with_table}"
+            whole.contains("Every `MajorFunction` entry read here")
+                && whole.contains("EvtIoDeviceControl"),
+            "a table read as the framework's licenses the claim and its consequence: {whole}"
         );
 
-        // The framework's own code is a different subject and keeps its own sentence -- it must not
+        // **The state that had nowhere to go.** It has to say the entries *were* read -- the opposite
+        // of the `Unread` sentence it used to borrow -- and must claim neither that the framework
+        // owns them nor that nobody looked.
+        assert!(
+            read_but_not.contains("**were** read and are in this answer")
+                && read_but_not.contains("Read the table below"),
+            "says the table is here and points at it: {read_but_not}"
+        );
+        assert!(
+            !read_but_not.contains("Nothing in this answer read"),
+            "and does not borrow the sentence for a table nobody read: {read_but_not}"
+        );
+
+        // All three are distinct, which is the property the two-state version could not have.
+        assert_eq!(
+            [&unread, &whole, &read_but_not]
+                .into_iter()
+                .collect::<std::collections::BTreeSet<_>>()
+                .len(),
+            3,
+            "three readings, three sentences"
+        );
+
+        // The framework's own code is a different subject with its own constructor -- it must not
         // tell a reader their *driver* is KMDF.
-        let in_framework = Framework::Kmdf.note(&[Tell::FrameworkImage]);
+        let in_framework = code_report(Framework::Kmdf).note;
         assert!(
             in_framework.contains("rather than in a driver that binds to it")
                 && !in_framework.contains("this is a KMDF driver"),

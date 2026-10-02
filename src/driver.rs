@@ -3383,11 +3383,7 @@ fffff803`3e250000 fffff803`3e270000   mydriver   (pdb symbols)
     /// had been written for `driver_surface`, which is why it is here rather than only there.
     #[test]
     fn a_rendered_reachability_report_carries_the_framework_above_its_verdict() {
-        let framework = crate::framework::report(
-            crate::framework::Framework::Kmdf,
-            vec![crate::structured::FrameworkTell::FrameworkImage],
-            None,
-        );
+        let framework = crate::framework::code_report(crate::framework::Framework::Kmdf);
         let plain = "IOCTL dispatch reachability\n  from   : entry 00000001`40051c90\nVERDICT: \
                      NOT REACHABLE\n";
         let text = qualified_with_framework(plain.to_string(), Some(&framework));
