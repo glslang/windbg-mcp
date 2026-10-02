@@ -55,6 +55,23 @@ public class DecompileCallers extends GhidraScript {
                 }
             }
         }
+        // An unresolved target FAILS rather than producing a report, because `callers=0` would
+        // otherwise mean two different things -- "the target was found and nothing references it" and
+        // "the name was misspelled, or is absent from the PDB that loaded" -- and this script is an
+        // oracle whose zero is read as evidence about the image. A misread of that kind is what the
+        // lane's README warns about in the other direction, and writing no report at all is the only
+        // answer that cannot be mistaken for one. Raised in review on #434.
+        //
+        // `DecompileFunctions.java` keeps going in the same situation and is right to: it takes
+        // several selectors and names the unresolved ones in a `missing=` line, so its report
+        // distinguishes them. This script takes one target, so there is nothing left to report.
+        if (destinations.isEmpty()) {
+            throw new IllegalArgumentException(
+                    "no address for callee " + calleeName + " in " + currentProgram.getExecutablePath()
+                    + " -- it resolved to no symbol, no image-relative RVA and no fully qualified "
+                    + "function name, so a caller count would be a claim about a target that was "
+                    + "never located. Check the spelling and that a PDB is loaded (ConfigurePdb.java).");
+        }
 
         // Imports commonly have both an external symbol and a thunk. Include the
         // thunk so an ordinary direct CALL is found as well as an IAT reference.

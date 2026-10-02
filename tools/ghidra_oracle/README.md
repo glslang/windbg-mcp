@@ -69,7 +69,9 @@ the IOCTL differential lane:
   in two of them, which is the case an indirect-call investigation wants rather
   than one to subtract away. Its `scope=` line says what the report covers: a call
   reached only through a pointer slot Ghidra left unresolved is in none of the
-  three, so `callers=0` is not a claim that none exists. It also accepts an image-relative RVA for
+  three, so `callers=0` is not a claim that none exists. **An unresolved target
+  fails instead of reporting zeros**, so `callers=0` always means the target was
+  located — a misspelling or a missing PDB is an error, not a count. It also accepts an image-relative RVA for
   indirect-call investigations. This is useful when an import's parameter
   meaning has changed but its public name has not.
 
