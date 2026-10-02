@@ -46,8 +46,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **The shipped plugin skill now covers both routes**, which it had said nothing about in either
   direction: `skills/windbg-debugging/secure-kernel.md` is a new playbook for the four capture tools
   — what the host needs, the three ways of naming a capture, why `image` is required, that a capture
-  session refuses every other debugger tool and that a VBS-off guest's capture opening with no VTL1
-  is the answer rather than a failure, and that the public PDB's missing type records mean structures
+  session refuses the tools that answer about a debugger target while `end_session` and `interrupt`
+  go on working, and that a VBS-off guest's capture opening with no VTL1 is the answer rather than a
+  failure, and that the public PDB's missing type records mean structures
   are hand-decoded — and it states the live route as what it is: **the operator supplies the
   transport**, this repository ships none, `--sk-live` refuses to start without `--transport`, and
   there is no MCP call for it, so a request to debug a *running* Secure Kernel is answered with a
