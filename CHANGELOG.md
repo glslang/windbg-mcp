@@ -33,8 +33,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **`Refused { detail: "ReadIntercept(2)" }`**, so `ReadStats::refused` is above zero outside a
   fixture for the first time and the decode declines to claim the negative: *"this run identified
   nothing while 2 read(s) failed, so its negative has not been earned."* That is the one mistake the
-  seam was shaped to prevent — a refusal collapsing into a failure would have produced the VBS-off
-  control's answer from a VBS-on guest — now demonstrated rather than argued. **It is a command-line
+  seam was shaped to prevent — a refusal collapsing into **success**, zeros handed back as bytes,
+  would have produced the VBS-off control's answer from a VBS-on guest — now demonstrated rather
+  than argued. **Collapsing it into a plain failure is a different and lesser mistake**, and this
+  sentence said it was the same one until review on
+  [#435](https://github.com/glslang/windbg-mcp/pull/435) read it against the message quoted two
+  lines above it: a failed read is exactly what makes the decode withhold the negative, so what
+  that loses is the *classification* naming the cause, not the verdict. **It is a command-line
   role and deliberately not a fifth MCP tool**, because the two consequences a live source has for a
   capture *session* are now measured instead of assumed: one of `securekernel.exe`'s 373 pages changed
   in 20 seconds — 2 bytes, in **`.data`** — while 1,200 sampled non-image pages and every landmark
@@ -43,6 +48,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   say what it would cost. Fifteen unit tests pin the framing against in-memory pipes, including a
   provider banner being skipped to a sentinel, a misspelled `SHAPE` key being refused rather than read
   as a guest with no page-table root, and a transport announcing more bytes than were asked for.
+  **The shipped plugin skill now covers both routes**, which it had said nothing about in either
+  direction: `skills/windbg-debugging/secure-kernel.md` is a new playbook for the four capture tools
+  — what the host needs, the three ways of naming a capture, why `image` is required, that a capture
+  session refuses the tools that answer about a debugger target while `end_session` and `interrupt`
+  go on working, and that a VBS-off guest's capture opening with no VTL1 is the answer rather than a
+  failure, and that the public PDB's missing type records mean structures
+  are hand-decoded — and it states the live route as what it is: **the operator supplies the
+  transport**, this repository ships none, `--sk-live` refuses to start without `--transport`, and
+  there is no MCP call for it, so a request to debug a *running* Secure Kernel is answered with a
+  checkpoint or handed back. `SKILL.md` indexes it in both tables and carries the limit as a
+  cross-cutting one. **And the five places that enumerate what this project debugs now name this as
+  one of them**, which none of them did — not since the four tools shipped: the skill's
+  `description` (the only part of it in context before it is loaded, so the playbook was
+  unreachable for the request it exists for), the skill's own opening sentence, `README.md`'s, and
+  the `description` plus `keywords` of both `.claude-plugin/plugin.json` and
+  `.claude-plugin/marketplace.json`. `setup.md`'s elevation matrix gains the row — no elevation, but the SDK
+  provider and read access to the checkpoint, and naming a `vm` rather than a path asks Hyper-V on
+  that host.
 
 - **Retracted: `SdkWriteVirtualMemory` does not segfault on VTL1, and the fault blamed on it was an
   8-byte struct overrun in the bench's own Python binding (gate S5u, 2026-10-01).** This project has

@@ -1,13 +1,15 @@
 ---
 name: windbg-debugging
-description: Drive WinDbg/DbgEng via the `windbg` MCP server to debug Windows crash dumps, live user-mode and kernel targets, and Time Travel Debugging (.run) traces. Use when analyzing a .dmp, attaching to a process or the kernel, or recording/navigating/analyzing a TTD trace.
+description: Drive WinDbg/DbgEng via the `windbg` MCP server to debug Windows crash dumps, live user-mode and kernel targets, and Time Travel Debugging (.run) traces, and to read a VBS guest's Secure Kernel (VTL1) out of a Hyper-V checkpoint. Use when analyzing a .dmp, attaching to a process or the kernel, recording/navigating/analyzing a TTD trace, or inspecting securekernel.exe, VTL1 memory or a saved state's Secure Kernel.
 ---
 
 # WinDbg debugging via the `windbg` MCP server
 
 This skill drives the `windbg` MCP server, which wraps WinDbg/DbgEng for four kinds of
 Windows debugging: **crash-dump** analysis, **live user-mode** debugging, **kernel**
-debugging, and **Time Travel Debugging (TTD)** of `.run` traces.
+debugging, and **Time Travel Debugging (TTD)** of `.run` traces. It also reads a fifth
+kind of target that is not a debuggee at all — a **Hyper-V checkpoint's Secure Kernel
+(VTL1)**, where nothing executes and the tools only read.
 
 **Verify the environment first.** Most failures are setup, not debugging — wrong engine
 DLL, missing symbols, or no elevation. Read **[setup.md](setup.md)** before the first
@@ -23,6 +25,7 @@ session of a workflow you haven't run yet in this environment.
 | Walk kernel pools or user Segment Heaps | [heap-walking.md](heap-walking.md) |
 | Record / open / navigate / analyze a `.run` trace | [ttd.md](ttd.md) |
 | Enumerate a driver's IOCTLs & test user-mode reachability | [driver-ioctl.md](driver-ioctl.md) |
+| Read a guest's Secure Kernel (VTL1) out of a Hyper-V checkpoint | [secure-kernel.md](secure-kernel.md) |
 | Compare Windows component builds for an MSRC CVE with BN Personal | [MSRC patch-diff skill](../msrc-patch-diff/SKILL.md) |
 
 ## Tool map
@@ -40,6 +43,7 @@ already does the job.
 | TTD analysis | `ttd_calls`, `ttd_memory`, `ttd_events`, `index_trace`, `record_trace` |
 | Kernel pool | `pool_find_tag`, `pool_chunk`, `pool_census`, `pool_diagnostics` |
 | User Segment Heap | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
+| Secure Kernel | `open_sk_capture` (a Hyper-V checkpoint's VTL1, decoded at the open), `sk_modules`, `sk_read_memory`, `sk_symbol` — a session of their own, on which the tools that answer about a debugger target are refused (`end_session` and `interrupt` are not) |
 | Server | `server_log` — the server's own records: the supervisor's, plus your own sessions' workers, tagged by session |
 | Raw | `execute` — run any debugger command, returns full text output |
 
@@ -192,5 +196,13 @@ where its stderr is not on your screen.
   annotated destructive and retires your `session_id` when the expression touches command
   execution. Ordinary TTD queries don't trip it.
 - **TTD is user-mode only** (a Microsoft limitation) — you cannot time-travel a kernel target.
+- **The Secure Kernel tools read a *capture*, and nothing here reaches a live one.** A
+  `open_sk_capture` session's target is a Hyper-V checkpoint, so nothing executes and the tools
+  that answer about a debugger target are refused on it — but it is an ordinary session otherwise,
+  so **close it with `end_session`** as you would any other. The live route exists — `--sk-live`, a command-line role
+  on this same binary — but it needs a **transport the operator supplies**: this server ships none,
+  the role refuses to start without `--transport`, and there is no MCP call for it either way. So a
+  request to debug a running Secure Kernel is answered with a checkpoint, or handed back to the
+  operator. [secure-kernel.md](secure-kernel.md) has both routes and what to tell them.
 - **Each tool call is bounded by a per-call timeout** (~60s for load/exec waits); a `go`
   against a long-running live target may hit it.

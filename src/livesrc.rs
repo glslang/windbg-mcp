@@ -609,6 +609,11 @@ impl sk::RawSource for LiveSource {
 /// Not a shell: there is no expansion, no escaping and no single-quote handling, because the string
 /// comes from an operator's own command line and a surprise expansion in *this* role would run
 /// something they did not type.
+///
+/// **Quoting groups whitespace; it does not create a word.** A token is emitted only when it has
+/// accumulated something, so `""` contributes no argument at all and an explicit empty positional
+/// cannot be expressed here — a transport needing one is named through a wrapper script instead.
+/// Raised in review on #435, against the shipped skill that documented this grammar.
 fn split_command(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
