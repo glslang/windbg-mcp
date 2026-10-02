@@ -3,12 +3,16 @@
 //!
 //! # Why this exists
 //!
-//! Every driver tool here starts from `_DRIVER_OBJECT::MajorFunction` and expects the entries to
-//! name routines **in the driver whose object it is**. For a WDM driver they do. For a KMDF driver
-//! they name the *framework*, and nothing in the answer said so -- so `driver_surface` reported a
-//! driver dispatching nothing of its own, `ioctl_map` started from code that is not the driver's
-//! and found no control codes, and both readings were true about the table and about nothing a
-//! caller had asked.
+//! The driver tools that read `_DRIVER_OBJECT::MajorFunction` -- `driver_object` and
+//! `driver_surface` -- expect its entries to name routines **in the driver whose object it is**, and
+//! the two that are *handed* one of those entries as an address -- `ioctl_map` and
+//! `reachable_from_dispatch` -- inherit the expectation from whoever read the table. (The other
+//! driver tools do not come near it: `device_security` and `device_object` read a device,
+//! `driver_hazards` an image, `decode_ioctl` one code.) For a WDM driver the entries are the
+//! driver's. For a KMDF driver they name the *framework*, and nothing in the answer said so -- so
+//! `driver_surface` reported a driver dispatching nothing of its own, `ioctl_map` started from code
+//! that is not the driver's and found no control codes, and both readings were true about the table
+//! and about nothing a caller had asked.
 //!
 //! This answers the one question that turns those into true answers: **is this a framework
 //! driver**. It is deliberately not the question *where are its real callbacks*, which is
