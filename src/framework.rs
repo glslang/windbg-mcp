@@ -155,28 +155,38 @@ impl Framework {
         if tells.contains(&Tell::FrameworkImage) {
             return "this routine is in `Wdf01000.sys`, the KMDF framework, rather than in a driver \
                     that binds to it -- so this answers about code every KMDF driver on the target \
-                    shares, and about none of them in particular. A KMDF driver's own control codes \
-                    are compared in an I/O queue's `EvtIoDeviceControl`, which this build cannot \
-                    resolve."
+                    shares, and about none of them in particular. A KMDF driver whose dispatch table \
+                    the framework took over compares its control codes in an I/O queue's \
+                    `EvtIoDeviceControl`, which this build cannot resolve."
                 .to_string();
         }
-        let mut note = "this is a KMDF driver: it binds to `Wdf01000.sys`, which calls the driver's \
-                        code as callbacks it holds rather than through dispatch routines of its own \
-                        -- control codes are compared in an I/O queue's `EvtIoDeviceControl`, which \
-                        this build cannot resolve."
+        // **The base says only what *binding* establishes, which is that this driver is a client of a
+        // framework that can take a dispatch table over -- never that it took this one.** Every
+        // consequence of that having happened is in the `DispatchTable` clause below, because that
+        // tell is what reads it. The base carried them for three rounds and each round found one:
+        // "installs its own dispatcher in every slot", and then "calls the driver's code as callbacks
+        // rather than through dispatch routines of its own -- control codes are compared in an
+        // `EvtIoDeviceControl`", which contradicted the clause under it and sent a reader *away* from
+        // an override client's real IOCTL handler. Keeping consequences out of the base is what ends
+        // that rather than wording them more carefully.
+        let mut note = "this is a KMDF driver: it binds to `Wdf01000.sys`, the framework that can \
+                        take a client's dispatch table over and call its code as callbacks instead."
             .to_string();
         // **What was read about the table, and only that.** Either clause is a statement about this
-        // answer's own evidence, so neither can outrun it.
+        // answer's own evidence, so neither can outrun it -- and the second says where the handler
+        // *is* rather than only what was not established, since a reader sent nowhere is the harm.
         note.push_str(match tells.contains(&Tell::DispatchTable) {
             true => {
                 " Every `MajorFunction` entry read here is in the framework's image, so a dispatch \
                  entry is the framework's code rather than this driver's and holds no IOCTL compare \
-                 chain."
+                 chain: this driver's control codes are compared in an I/O queue's \
+                 `EvtIoDeviceControl`, which this build cannot resolve."
             }
             false => {
-                " Nothing here read this driver's `MajorFunction` entries as the framework's, so \
-                 what that table holds is not a claim this answer makes -- a client passing \
-                 `WdfDriverInitNoDispatchOverride` keeps a dispatch table of its own."
+                " Nothing here read this driver's `MajorFunction` entries, so whether the framework \
+                 took its dispatch table over is not something this answer says -- a client passing \
+                 `WdfDriverInitNoDispatchOverride` keeps one of its own, and its IOCTL handler is \
+                 then a routine in this image. Read the table."
             }
         });
         note.push_str(
@@ -383,22 +393,43 @@ mod tests {
         use crate::structured::FrameworkTell as Tell;
         let import_only = Framework::Kmdf.note(&[Tell::BindImport]);
         assert!(
-            import_only.contains("not a claim this answer makes")
+            import_only.contains("not something this answer says")
                 && import_only.contains("WdfDriverInitNoDispatchOverride"),
             "says what it did not read, and the case that makes it matter: {import_only}"
+        );
+        assert!(
+            import_only.contains("a routine in this image"),
+            "and sends the reader where the handler then is, rather than nowhere: {import_only}"
         );
         assert!(
             !import_only.contains("Every `MajorFunction` entry"),
             "and claims nothing about the table: {import_only}"
         );
 
+        // **The whole note, not just its clause.** Three rounds found a consequence of the table
+        // having been taken over sitting in the *base* sentence, where no tell licenses it -- the
+        // last of them contradicting the clause printed underneath it. So this asserts the absence
+        // across the note as a whole, which is the only form that catches it moving back up.
+        for forbidden in [
+            "EvtIoDeviceControl",
+            "callbacks it holds",
+            "no IOCTL compare chain",
+        ] {
+            assert!(
+                !import_only.contains(forbidden),
+                "the import tell licenses no consequence of the framework owning the table \
+                 ({forbidden}): {import_only}"
+            );
+        }
+
         let with_table = Framework::Kmdf.note(&[Tell::BindImport, Tell::DispatchTable]);
         assert!(
-            with_table.contains("Every `MajorFunction` entry read here"),
-            "the table tell licenses the table claim: {with_table}"
+            with_table.contains("Every `MajorFunction` entry read here")
+                && with_table.contains("EvtIoDeviceControl"),
+            "the table tell licenses the table claim and its consequence: {with_table}"
         );
         assert!(
-            !with_table.contains("not a claim this answer makes"),
+            !with_table.contains("not something this answer says"),
             "and the two clauses are exclusive: {with_table}"
         );
 
