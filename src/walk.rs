@@ -139,6 +139,7 @@ pub struct Field {
 /// far side of the pipe is a decision the worker would have to make, and the worker is the one
 /// place that cannot see the rest of the request to make it consistently.
 #[derive(Debug, Clone, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
 pub struct FieldArg {
     /// Column name for this value, at most 64 characters. Defaults to the offset, e.g. `+0x18`.
     #[serde(default)]

@@ -1,13 +1,13 @@
 # The tool surface
 
 The tools themselves are listed by group in the [README](../README.md#tools). This file covers
-how much of that surface a run serves, and three behaviours the table has no room for.
+how much of that surface a run serves, and four behaviours the table has no room for.
 
 ## Serving fewer tools (`--tools`)
 
 All sixty-seven tools are served unless you say otherwise, and their definitions cost the model
-**103,321 bytes — about 26k tokens — before it has asked anything**, once per conversation. Every
-figure on this page is a measurement of 2026-09-27 rather than an invariant: any edit to a tool's
+**105,276 bytes — about 26k tokens — before it has asked anything**, once per conversation. Every
+figure on this page is a measurement of 2026-10-02 rather than an invariant: any edit to a tool's
 description moves it, so re-derive before quoting one. The tables below are checked against a
 running server by `every_documented_surface_figure_matches_the_served_surface`; this sentence is
 **not**, which is how it came to say 94,921 while the table beside it said 94,957. Seven
@@ -22,10 +22,10 @@ windbg-mcp.exe --tools session,inspect,crash
 
 | `--tools` | Tools | Model context |
 |---|---:|---:|
-| *(absent)* — every tool | 67 | 103,321 B |
-| `session,inspect,exec,crash` | 33 | 48,216 B |
-| `session,inspect,crash` | 23 | 33,187 B |
-| `crash` | 13 | 19,943 B |
+| *(absent)* — every tool | 67 | 105,276 B |
+| `session,inspect,exec,crash` | 33 | 49,185 B |
+| `session,inspect,crash` | 23 | 33,895 B |
+| `crash` | 13 | 20,361 B |
 
 The spec is a comma-separated list of the group names in the [tool table](../README.md#tools), of
 individual tool names, or `all`.
@@ -73,6 +73,38 @@ without a reinstall or a restart; `--list-listen-clients` prints the whole set, 
 and surface, and changes nothing. [`remote-listener.md`](remote-listener.md#a-tool-surface-per-client)
 is the operator's half, including when a change reaches a client (the next time it is identified —
 its next handshake, or its next request if it holds no session) and why nothing announces one.
+
+## An argument a tool does not have is refused
+
+Every tool's `inputSchema` says `additionalProperties: false`, and every tool refuses a call that
+carries a key it does not know — with the names it *does* have in the refusal:
+
+```text
+failed to deserialize parameters: unknown field `target`, expected one of `address`, `count`, `session_id`
+```
+
+Both halves are the point. Serde ignores an unknown field by default, so `disassemble { "target":
+"nt!Foo" }` used to disassemble at the current instruction pointer and answer `"status": "ok"` with
+a `start` that was the image entry point — a wrong answer that reads as a right one, which cost a
+gate a detour into `execute` + `uf` before anyone suspected the argument. And JSON Schema's default
+is that an extra key *conforms*, so refusing one while advertising nothing would be this server
+breaking its own published contract; the keyword is what makes the refusal honest. `FOLLOWUPS.md`
+item 107.
+
+Two things to expect from it. The refusal arrives as a **tool result** with `isError: true`, not as
+a JSON-RPC `-32602` — that is where rmcp routes an argument fault, and it is the same channel every
+other refusal here uses — and it carries no `structuredContent`, so a client branching on
+`error.category` sees nothing for this one. And a **nested** object is held to the same rule: a
+coordinate, a `walk_memory` field and a `set_breakpoint` `watch` each refuse a key of their own.
+The one exception is a `debug_batch` **step**, which flattens its action and so cannot carry the
+serde attribute; it collects its leftover keys and refuses them in a message of its own, naming them
+and what a step takes.
+
+A value that is well-formed JSON and still outside the contract is a different check, and there is
+one of those: `sk_symbol`'s `name` is unqualified, because the module is the engine's spelling of
+the captured image and this server applies it. A qualified name is refused rather than stripped —
+`skci!Foo` is a module the capture does not hold, and a lenient engine answers
+`securekernel!securekernel!Foo` with the right address under a doubled name.
 
 ## Typed operands are operands, not commands
 

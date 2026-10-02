@@ -1444,6 +1444,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Changed
 
+- **A tool argument this server does not have is refused, and the published schema says so
+  (`FOLLOWUPS.md` item 107).** Serde ignores an unknown field by default, which for a tool argument
+  fails *open*: three `disassemble` calls passing `target` — the parameter is `address` — were each
+  served as though they had asked for nothing, disassembling at the current instruction pointer and
+  answering `"status": "ok"` with a `start` that was the image entry point. All 52 `*Args` structs
+  now carry `#[serde(deny_unknown_fields)]` (three did), so the call is refused with the offending
+  key named and the tool's own parameter names listed beside it, and `schemars` emits the matching
+  **`additionalProperties: false`** into every served `inputSchema` from the same attribute — which
+  is the half that makes refusing it honest, JSON Schema's default being that an extra key conforms.
+  Two places the struct list does not reach are closed with it: a **nested** object a caller fills in
+  (`walk_memory`'s field list, `set_breakpoint`'s `watch`; the coordinate types already denied), and
+  `attach_kernel_local`, which was declared with no parameters at all and so dropped *every*
+  argument — `attach_kernel_local { "connection": "net:…" }` attached to the local kernel and
+  reported success. A `debug_batch` **step** keeps the hand-rolled check `src/batch.rs` already had,
+  serde making the attribute and `#[serde(flatten)]` mutually exclusive.
+  `mcp_smoke::every_tool_refuses_an_unknown_argument` enumerates the served surface and holds both
+  halves per tool, so a tool added later cannot opt out; the schema pass deliberately runs before any
+  tool is called, since the one tool with no arguments of its own is the local-kernel attach. The
+  refusal arrives as a tool result with `isError: true` rather than as JSON-RPC `-32602` — rmcp routes
+  an argument fault there, which is the channel every other refusal here uses — and carries no
+  structured error category. **It cost +1,955 B of model context** (103,321 → 105,276 across the same
+  67 tools; the payload moves by the same amount), every byte of it one 29-byte keyword per schema:
+  64 roots, two nested types, and 70 for `attach_kernel_local`, which also gains the `2020-12`
+  declaration and loses rmcp's empty `properties`. The model ceiling moves 105,000 → 108,000 B;
+  nothing else moved and no `outputSchema` changed. Turning it on broke four of this repository's own
+  calls, which is the evidence the keys were doing nothing: `registers { "filter": "pc" }` in four
+  places in the smoke suite, and an invented `timeout_ms` on `attach_kernel` in the Binary Ninja and
+  Ghidra oracles and on `execute` in the Secure Kernel handoff probe.
+
+- **`sk_symbol` refuses a qualified `name` rather than doubling it (the second shape of item 107).**
+  That parameter is documented unqualified, because the module is the engine's spelling of the
+  captured image and the tool applies it — but a lenient engine resolves
+  `securekernel!securekernel!SkdInitDebuggerDataBlock` anyway, so the call answered `status: ok` with
+  the right address, identifier fields byte-identical to the unqualified call, and a doubled name in
+  `symbol`: the one field a caller quotes back. It is **refused rather than stripped**, and that is a
+  decision about the surface rather than about one tool — telling a redundant qualifier from a foreign
+  one needs the qualifier itself, which lives in the worker's capture, and `skci!Foo` is plainly
+  foreign. `server::reject_module_qualifier` states the rule once, beside
+  `reject_command_breakers`, for the next parameter whose module this server owns; the refusal happens
+  before a session is looked for, like the `name`/`address` exclusivity check it sits next to.
+
 - **The debugger tier's ARM64 half is one entry again, and it names an image rather than a moving label.** It was a pair -- `windows-11-arm` beside `windows-11-vs2026-arm` -- run side by side through the window GitHub announced for migrating the older label onto the Visual Studio 2026 ARM64 image, so that a break arriving with the new image would be attributable to the image rather than to the change under review. Nothing broke and the two converged: this workflow's own runs report `Image: windows-11-arm64` at 2026-09-23T06:22Z and `windows-11-vs2026-arm64` at 12:57Z the same day, then the new image on every run since -- eleven sampled over the following 47 hours, ending with both entries reporting `windows-11-vs2026-arm64`, `Version: 20260920.164.1` on the same run. Same image, same version, same inbox `dbgeng.dll`, which is the one thing that job exists to load, so the pair had stopped buying attribution and started buying a duplicate twenty-minute run on every PR. What survives is `windows-11-vs2026-arm` under the suffix `, arm64`: the **label pins the image and the name says which tier it is**, since carrying `vs2026` in a job name would rot one image later exactly as `windows-11-arm` did. The convention the pair established is now written where the next migration will be read -- add the new image as a second entry naming it in its suffix, keep both while they differ, drop the older when they do not. Checked rather than assumed: the repository ruleset requires `Build & test`, `Documentation lint` and `Smoke test (debugger tier)` and **neither ARM64 name**, so renaming one could not strand a required context on a job that will never report again. And the migration invalidated a measurement, which is the part worth carrying forward: issue #153's finding that `windows-11-arm`'s System32 ships no `symsrv.dll` is now about an image that label no longer names, and nobody has probed the new one. It cost nothing only because the symbol-half copy step was deliberately written to be independent of that answer -- a prediction made at the time, tested by this migration, and held. `docs/smoke-test.md` and `.claude/skills/live-kernel/SKILL.md` now say which image the probe was taken on rather than which label. `FOLLOWUPS.md` item 32, now in `DONE.md`.
 
 ### Fixed
