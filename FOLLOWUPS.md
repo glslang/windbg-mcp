@@ -2219,22 +2219,19 @@ themselves establishing.** Scoping step 2 against `EvtIoDeviceControl` alone wou
 every driver that does not use it. Measured on this bench and written up in `src/framework.rs`'s
 module docs: `_WDF_IO_QUEUE_CONFIG` carries **eight** callback slots, so a queue configuring no
 specific handler takes device control on `EvtIoDefault` and an internal control code has its own
-slot. Several further routes run **before** the queue sees the request, each exported by this build:
-`WdfDeviceInitSetIoInCallerContextCallback` and its class-extension twin, which is the
-`METHOD_NEITHER` route and so the one this server's IOCTL work cares about most — the unsafe
-user-buffer retrieval APIs require it — plus `WdfDeviceInitAssignWdmIrpPreprocessCallback` and
-`WdfDeviceConfigureWdmIrpDispatchCallback`. **None of them replaces the queue**, since
-`WdfDeviceWdmDispatchPreprocessedIrp` and `WdfDeviceWdmDispatchIrpToIoQueue` are exported beside
-them, so such a callback may forward rather than terminate, and finding one does not mean the queue
-callback is out of the picture.
+slot. A request can also reach the driver before any queue does, through registrations this build
+exports — `WdfDeviceInitSetIoInCallerContextCallback` and its class-extension twin,
+`WdfDeviceInitAssignWdmIrpPreprocessCallback`, `WdfDeviceConfigureWdmIrpDispatchCallback` — and what
+any of them does with a request is the driver's choice. `src/framework.rs`'s module docs hold the
+measurements.
 
-**And that list is deliberately not certified complete, which is a scoping decision rather than a
-gap.** Two consecutive review rounds each found a route missing from it, which is #349's shape: an
-inclusion is a claim about one route and is checkable on its own, where a closed enumeration is a
-claim about every path a request can take through a framework this repo does not own. So step 2 does
-**not** answer *which of these*: it walks what the driver registered and reports what it found, and
-the honest shape of its answer is a set of candidate sites with what was read at each rather than a
-single address. `src/framework.rs` holds the measurements and is where the list is kept.
+**So step 2 is a walk and not a lookup, and that is the one conclusion worth carrying.** It does not
+answer *which of a fixed list* a driver used: it reads what the driver registered and reports what it
+found, so the honest shape of its answer is a set of candidate sites with what was read at each
+rather than a single address. **Four review findings on the step-1 PRs went into learning that**, each
+one correcting a claim about which route is *the* route or what a route *must* do, and each correction
+becoming the next finding — against a framework this repo does not own, in prose no code depends on.
+Whoever scopes step 2 should take the walk and leave the taxonomy to WDF's documentation.
 
 **What step 1 measured that step 2 should start from**, stated as the reading rather than as an
 interpretation of it. Disassembled on this bench, `Wdf01000.sys 1.35.26100.3323`:
