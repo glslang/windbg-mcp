@@ -79,8 +79,8 @@ want only the map, or when you want the symbolic links, which the composite leav
    dumps the `MajorFunction` table. Index **`0x0e`** (`IRP_MJ_DEVICE_CONTROL`) is the IOCTL
    dispatch handler's address.
 
-   **First check whose code that address is.** A **KMDF** driver has no dispatch routine of its
-   own: `Wdf01000.sys` fills all 28 slots with its own dispatcher and calls the driver's code as
+   **First check whose code that address is.** A **KMDF** driver ordinarily has no dispatch routine
+   of its own: `Wdf01000.sys` fills all 28 slots with its own dispatcher and calls the driver's code as
    callbacks it holds, so every entry reads `Wdf01000!FxDevice::Dispatch` or
    `FxDevice::DispatchWithLock` and step 2 on one of them finds no control codes -- correctly,
    because there are none there to find. A KMDF driver's codes are compared inside the

@@ -173,8 +173,14 @@ impl Framework {
                         take a client's dispatch table over and call its code as callbacks instead."
             .to_string();
         // **What was read about the table, and only that.** Either clause is a statement about this
-        // answer's own evidence, so neither can outrun it -- and the second says where the handler
-        // *is* rather than only what was not established, since a reader sent nowhere is the harm.
+        // answer's own evidence, so neither can outrun it.
+        //
+        // **And the second gives a direction without naming a destination**, which took two rounds
+        // to land between. It said nothing about where to look, which leaves a reader nowhere; the
+        // correction said the handler "is then a routine in this image", which is a location nothing
+        // had read -- an override client may leave the kernel's stub in the slot, forward it, or
+        // handle no IOCTL at all, the three cases `surface::foreign_dispatch_note` exists to tell
+        // apart once a table *is* read. So it says to read the table and stops.
         note.push_str(match tells.contains(&Tell::DispatchTable) {
             true => {
                 " Every `MajorFunction` entry read here is in the framework's image, so a dispatch \
@@ -185,8 +191,8 @@ impl Framework {
             false => {
                 " Nothing here read this driver's `MajorFunction` entries, so whether the framework \
                  took its dispatch table over is not something this answer says -- a client passing \
-                 `WdfDriverInitNoDispatchOverride` keeps one of its own, and its IOCTL handler is \
-                 then a routine in this image. Read the table."
+                 `WdfDriverInitNoDispatchOverride` keeps one of its own. Read the table to find out \
+                 which this is."
             }
         });
         note.push_str(
@@ -398,8 +404,13 @@ mod tests {
             "says what it did not read, and the case that makes it matter: {import_only}"
         );
         assert!(
-            import_only.contains("a routine in this image"),
-            "and sends the reader where the handler then is, rather than nowhere: {import_only}"
+            import_only.contains("Read the table"),
+            "and gives the reader a direction, rather than leaving them nowhere: {import_only}"
+        );
+        assert!(
+            !import_only.contains("in this image"),
+            "without naming a destination nothing read -- an override client may leave the kernel's \
+             stub in the slot, or handle no IOCTL at all: {import_only}"
         );
         assert!(
             !import_only.contains("Every `MajorFunction` entry"),

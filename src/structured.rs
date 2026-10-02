@@ -3161,10 +3161,20 @@ pub struct ScannedRange {
 /// driver, and a tool claiming the second from the first would be wrong about exactly the drivers
 /// whose import tables are unreadable. `crate::framework::client_of` says what the tells are.
 ///
-/// What it is for is the answer *above* it. Every driver tool here reads
-/// `_DRIVER_OBJECT::MajorFunction` and expects the entries to be the driver's own routines; for a
-/// framework driver they are the framework's, and without this field an answer that correctly reads
+/// What it is for is the answer *above* it. The driver tools that read
+/// `_DRIVER_OBJECT::MajorFunction` expect its entries to be the driver's own routines; a framework
+/// client's are ordinarily the *framework's*, and without this field an answer that correctly reads
 /// 28 identical pointers looks like a driver that dispatches nothing.
+///
+/// **Ordinarily, and only [`FrameworkTell::DispatchTable`] says it happened here.** A client passing
+/// `WdfDriverInitNoDispatchOverride` keeps a dispatch table of its own, so a report carrying
+/// `bind_import` alone says this driver is a framework client and says nothing about its table --
+/// [`Self::note`] is written from the tells for that reason, and is the field to read rather than
+/// this sentence.
+///
+/// (This doc comment reaches developers, not clients: `output_schemas_carry_constraints_not_prose`
+/// asserts on the wire that no `description` prose survives into a served output schema. Said
+/// because review read it as client-facing, which it would be in most servers.)
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 pub struct DriverFramework {
     /// Which framework, as `kmdf`.

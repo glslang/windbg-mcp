@@ -230,7 +230,9 @@ wait. The session becomes `kernel_unresolved`; late completion does not reopen i
    each code, and read each case's `DbgPrintEx` string (`da`) for the human name.
 
 **That recipe assumes a WDM driver, and most in-box drivers here are not one.** A **KMDF** driver's
-table is the *framework's*: `Wdf01000!FxDriver::Initialize` writes `FxDevice::Dispatch` or
+table is ordinarily the *framework's* — ordinarily, because a client passing
+`WdfDriverInitNoDispatchOverride` keeps its own, so read the module name on the entries rather than
+assuming either: `Wdf01000!FxDriver::Initialize` writes `FxDevice::Dispatch` or
 `FxDevice::DispatchWithLock` into all 28 slots from `DRIVER_OBJECT+0x70` onwards, so step 3 hands
 you framework code and the `uf` in it has no IOCTL switch — correctly, because the codes are
 compared inside the `EvtIoDeviceControl` of an I/O queue, which this server cannot yet resolve
