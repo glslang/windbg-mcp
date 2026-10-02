@@ -199,6 +199,9 @@ status line on stdout, and for a successful read exactly the requested bytes aft
 <- windbg-mcp-gpa/1        the ready sentinel — the lines before it are ignored, not unlimited
 -> SHAPE
 <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long max_read=4096
+<- SHAPE max_read=16 switch_refused=VTL_switch_denied unreadable=efer:not_exposed
+                           a VBS-off guest, and a register the source cannot get: both are
+                           answers that travel, and both spell a space as `_`
 -> READ 0xCD12DF 16
 <- OK 16
 <- <16 raw bytes>
@@ -225,7 +228,33 @@ the transport's side, and none is clamped — each refuses.
 | stdout | stays open until stdin closes | an EOF mid-exchange is "the transport closed its stdout" |
 | teardown | **10s** after its stdin closes | the child is killed rather than waited for |
 
-Four things to know besides the numbers:
+**And the grammar, which is the other half of the same contract.** Rounds of review found the
+bounds one at a time and then found these the same way, so they are read off the source together:
+nothing here is a shell, and no value is free text except where the table says it is.
+
+| where | the rule | what ignoring it does |
+|---|---|---|
+| the `--transport` string | words split on whitespace, `"` toggling quoting; **no shell at all** — no expansion, no escapes, no single quotes | `$VAR`, `%VAR%`, `>`, `\|`, `'…'` and `\` reach the program **literally, as arguments**, so it usually fails to start or starts wrong |
+| a `SHAPE` field | `key=value`, with whitespace in **neither** | the reply is split on whitespace first, so a value containing a space becomes a field that is not `key=value`, and the handshake fails |
+| a `SHAPE` reason — `switch_refused`, `unreadable` | spaces written as `_`, which the client turns back into spaces | a reason with real spaces fails the handshake as above |
+| `unreadable` | `unreadable=<register>:<reason>`, the register one of `cr0`, `cr3`, `cr4`, `efer` | an unknown register name is refused; no colon means the whole value is the register name |
+| a status line's detail — `REFUSED`, `ERROR` | free text to the end of the line | **nothing**: these may contain spaces, and that asymmetry with `SHAPE` is the one to remember |
+
+**If the provider needs shell features, put them in a script and name the script.** That is the
+advice rather than a quoting recipe for invoking `cmd.exe` or `pwsh` inline, because this grammar
+has no escape character: a `"` toggles quoting wherever it appears, so nested quotes do not nest.
+Note also that the string reaches `--transport` only after **your own** shell has had it, so what
+this grammar sees is whatever that shell passed on.
+
+Things to know besides the numbers and the grammar:
+
+- **After the sentinel, say nothing that was not asked for.** Every line the client reads from then
+  on is read as the reply to the request it just sent, and there are only two requests ever sent:
+  `SHAPE`, once, and then `READ <0xADDR> <len>` — the address in uppercase hex with an `0x` prefix.
+  A progress line, a warning or a log written to stdout after the handshake is therefore consumed as
+  a status line and desynchronises the stream. Diagnostics belong on **stderr**, which is never
+  read as protocol and is the right place for them anyway: it reaches the operator's terminal
+  directly.
 
 - **The sentinel is not politeness.** A provider prints during its own setup, so without it the
   first line of a partition menu gets read as a `SHAPE` reply. A provider that prints per
