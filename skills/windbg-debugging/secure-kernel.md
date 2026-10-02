@@ -235,6 +235,7 @@ nothing here is a shell, and no value is free text except where the table says i
 | where | the rule | what ignoring it does |
 |---|---|---|
 | the `--transport` string | words split on whitespace, `"` toggling quoting; **no shell at all** — no expansion, no escapes, no single quotes | `$VAR`, `%VAR%`, `>`, `\|`, `'…'` and `\` reach the program **literally, as arguments**, so it usually fails to start or starts wrong |
+| an **empty** argument | cannot be expressed: quoting groups whitespace, it does not create a word, so `""` contributes nothing | a provider needing an explicit empty positional gets it **dropped** and everything after it shifted — the one case that needs the wrapper script rather than merely preferring it |
 | a `SHAPE` field | `key=value`, with whitespace in **neither** | the reply is split on whitespace first, so a value containing a space becomes a field that is not `key=value`, and the handshake fails |
 | a `SHAPE` reason — `switch_refused`, `unreadable` | spaces written as `_`, which the client turns back into spaces | a reason with real spaces fails the handshake as above |
 | `unreadable` | `unreadable=<register>:<reason>`, the register one of `cr0`, `cr3`, `cr4`, `efer` | an unknown register name is refused; no colon means the whole value is the register name |
