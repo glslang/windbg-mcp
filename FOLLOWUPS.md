@@ -2350,28 +2350,44 @@ to collect what does not depend on that step, and then to falsify it before anyt
    answers `E_NOINTERFACE` with a nulled out-pointer for an unimplemented IID, so it is live rather
    than merely constructed. **And it is not admin-gated**: `BiosVdev` activates under a restricted
    token and again at genuine medium integrity (`S-1-16-8192`) with no `Administrators` membership.
-   **The fatal initialization half passed later the same day.**
+   **The fatal initialization half passed later the same day, and the independent census now covers
+   all six minimum devices.**
    [`tools/vdev_initialization_probe.py`](tools/vdev_initialization_probe.py) requests the recovered
    `IID_IVirtualDevice`, validates slots 3–5 as `GetDependencies`, `Initialize`, and `Teardown`, and
-   supplies recording repository and service objects in separate 30-second children. `RtcVdev`
-   requests its six symbol-named dependencies, accepts a missing configuration, calls no dependency
-   method, and returns `S_OK` from both initialization and teardown. `VmbusVdev` requests
-   `ISecurityManager`, `IVmMemoryManagement`, `IVmPartitionServices`, and
-   `IVmHandleBrokerServices`; it accepts the minimum three-field XML at repository version `0x201`.
-   The handle-broker lookup deliberately returns `E_NOTIMPL`, after which VMBus opens
-   `\\.\VMBus\vdev\{vm-id}` itself. That open, initialization, and teardown all succeed while the
-   child owns a fresh process-local direct-VID partition under the same bare GUID, and the child then
-   deletes it. No other supplied service method is called. Exact size, SHA-256, CodeView identity,
-   module path, and recovered vtable RVAs guard the private contract; the full run passed live on
-   2026-10-02. The reproducible evidence and binary inventory are in
-   [`docs/secure-kernel/vdev-initialization-probe.md`](docs/secure-kernel/vdev-initialization-probe.md).
+   supplies recording repository and service objects in separate 30-second children.
+   `GuestEmulationDevice`, `BiosVdev`, `RtcVdev`, `IoApicVdev`, `VmbusVdev`, and `SynthStor` all
+   return `S_OK` from initialization and teardown and release every supplied dependency. RTC needs
+   no partition; each other child owns and deletes a fresh process-local direct-VID partition.
+   The probe asserts required and optional dependency IIDs, minimum XML, repository calls, the guest
+   and BIOS security-state callbacks, module paths, vtable RVAs, full-file hashes, and CodeView
+   identities. The build-bound record is
+   [`docs/secure-kernel/vdev-contract-26100.8457.json`](docs/secure-kernel/vdev-contract-26100.8457.json).
 
-   This closes the fatal stop condition in the inbox route's favour: neither initialization requires
-   `vmwp` process identity, an identity-bearing VMMS object, managed-VM state, or a second receive
-   loop. It does **not** make the complete device graph known. Firmware, IOAPIC, storage, and the
-   lifecycle after initialization still need the disposable managed-VM trace below. K1.2 may now
-   proceed; the OpenVMM-derived contingency stays closed unless that larger contract reveals a new
-   irreducible managed service.
+   VMBus still supplies the ownership discriminator: its handle-broker lookup returns `E_NOTIMPL`,
+   after which it opens `\\.\VMBus\vdev\{vm-id}` against the fresh partition with the same bare GUID.
+   The full six-child run passed live on 2026-10-02. This closes the fatal stop condition in the inbox
+   route's favour: none of the six independent initialization paths requires `vmwp` process identity,
+   an identity-bearing VMMS object, managed-VM state, or a second receive loop. It does **not** prove
+   the complete graph. At that point K1.2 still had to put the six objects in one partition, replace
+   recording stubs with shared services, issue the RAM-construction-complete notification, and
+   unwind that graph three times. The next result records that subgate.
+
+   **The composition and lifecycle subgate passed the same day.**
+   [`tools/vdev_graph_probe.py`](tools/vdev_graph_probe.py) creates one partition, supplies the real
+   `IVmbusServices`, `IVmIoApic`, and `IVmBios` interfaces from the inbox objects, initializes in
+   dependency order, and tears down in reverse. Exact-build `vmwp.exe` analysis recovered
+   `VirtualMotherboard::NotifyAllDevicesRamConstructionComplete` at RVA `0x218780`: it queries every
+   device for `IID_IVirtualDeviceMemoryInfo` and, when present, calls slot 4 with the value `0` passed
+   by its caller. None of the six minimum objects exposes that interface after initialization, so the
+   matching notification phase is a measured six-device no-op. Three bounded runs passed in fresh
+   partitions `0x85`–`0x87`; every initialize and teardown returned `S_OK`, repository references
+   returned to the owner after COM destruction, and every partition was deleted. The runbook is
+   [`docs/secure-kernel/vdev-graph-probe.md`](docs/secure-kernel/vdev-graph-probe.md).
+
+   K1.2 is not wholly closed because this probe does not yet install the final Windows RAM topology.
+   The remaining owner-side pre-firmware work is the managed-VM memory map and boot configuration;
+   the disk-copy gate is separately waiting for enough host free space. No irreducible managed
+   service appeared, so the OpenVMM-derived contingency remains closed.
 4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
    experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
    the minimum in-box device graph; firmware and one synthetic disk off an immutable

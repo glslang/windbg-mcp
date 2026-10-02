@@ -1,9 +1,11 @@
-"""Prove that the minimum inbox Hyper-V devices initialize outside vmwp.
+"""Prove that six minimum inbox Hyper-V devices initialize outside vmwp.
 
 This is the fatal K1.1 spike from FOLLOWUPS.md item 110.  The parent starts one
 30-second child per device so an inbox DLL fault or hang cannot erase the other
-result.  The RTC is the repository/ABI control.  VMBus gets a fresh process-
-local VID partition whose bare GUID is also returned as the repository VM ID.
+results.  RTC is the repository/ABI control.  The other five devices each get a
+fresh process-local VID partition whose GUID is also returned as the repository
+VM ID.  This proves independent initialization paths; it does not compose the
+devices into a runnable motherboard.
 
 The private interfaces and VID entry points are build-specific.  Every child
 checks the exact SHA-256, size, and (for the device DLLs) CodeView identity
@@ -31,6 +33,7 @@ import subprocess
 import sys
 import uuid
 from ctypes import wintypes
+from dataclasses import dataclass
 
 
 CHILD_TIMEOUT_SECONDS = 30
@@ -38,31 +41,243 @@ VID_SETUP_BYTES = 0xCAE0
 
 IID_IUNKNOWN = "{00000000-0000-0000-C000-000000000046}"
 IID_IVIRTUAL_DEVICE = "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}"
+IID_IVIRTUAL_DEVICE_MEMORY_INFO = "{2E223C59-62C4-4D03-93E4-05674B3B94EB}"
 IID_IVIRTUAL_DEVICE_REPOSITORY = "{355AC5A8-8A94-44A9-BE14-ECF7FB8F7C3B}"
 IID_IVIRTUAL_DEVICE_SERVICES = "{20BEEF08-C3AB-44D8-92C3-03EC0CF398DC}"
 
-CLSID_RTC = "{E51B7EF6-4A7F-4780-AAAE-D4B291AACD2E}"
-CLSID_VMBUS = "{D41A1872-3740-41CE-A1EE-4522AB82F991}"
+IID_SECURITY_MANAGER = "{5315507B-19F0-4E86-AB51-18F159F1A197}"
 
-RTC_DEPENDENCIES = (
-    ("IVmBios", "{9BE0B79F-68DF-4C59-9D88-4BFC1BF7A73D}"),
-    ("IVmAmd64EmulationServices", "{FCACE8D2-AB0D-480D-B979-55C2DA5F9579}"),
-    ("IVmIoApic", "{9D33829B-58BE-4BBF-AB6E-3B16DBCEF954}"),
-    ("IVmManagementAccess", "{BB011455-A4F6-4E08-9982-09AFD303DF20}"),
-    ("ISecurityManager", "{5315507B-19F0-4E86-AB51-18F159F1A197}"),
-    ("IVmTimeSource", "{E162FE7A-72C6-4D0E-93DD-7DF91A5B979D}"),
-)
-VMBUS_DEPENDENCIES = (
-    ("ISecurityManager", "{5315507B-19F0-4E86-AB51-18F159F1A197}"),
-    ("IVmMemoryManagement", "{E7BB1D35-AD97-464B-8A3F-95F43E0F4389}"),
-    ("IVmPartitionServices", "{773E9A95-1B2D-4479-955F-402000EBE6C2}"),
-    ("IVmHandleBrokerServices", "{E9E61D12-A2C3-4E55-AC35-B8F26D216A69}"),
-)
 
-VMBUS_XML = (
-    "<VMBusDevice><VDEVVersion>513</VDEVVersion><version>1</version>"
-    "<MessageRedirection>false</MessageRedirection></VMBusDevice>"
-)
+@dataclass(frozen=True)
+class Dependency:
+    name: str
+    iid: str
+    required: bool = True
+
+
+@dataclass(frozen=True)
+class DeviceSpec:
+    kind: str
+    name: str
+    clsid: str
+    module: str
+    vtable_rvas: tuple[int, int, int]
+    dependencies: tuple[Dependency, ...]
+    xml: str | None
+    owner_partition: bool
+    repository_calls: tuple[int, ...]
+    service_calls: tuple[tuple[str, tuple[int, ...]], ...] = ()
+    provided_interfaces: tuple[tuple[str, str], ...] = ()
+
+
+def dependency(name: str, iid: str, required: bool = True) -> Dependency:
+    return Dependency(name, iid.upper(), required)
+
+
+DEVICES = {
+    "guest": DeviceSpec(
+        "guest",
+        "GuestEmulationDevice",
+        "{455C0F1B-D51B-40B1-BEAC-87377FE6E041}",
+        "vmchipset.dll",
+        (0x629E0, 0x63E10, 0x6B830),
+        (
+            dependency("ISecurityManager", IID_SECURITY_MANAGER),
+            dependency("IVmBios", "{9BE0B79F-68DF-4C59-9D88-4BFC1BF7A73D}"),
+            dependency("IVmBootMemoryTopology", "{B80FE14E-B5F6-43D4-B206-40B3BF511959}"),
+            dependency("IVmbusServices", "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}"),
+            dependency("IVmGuestCrashServices", "{4F80E76E-0D0F-44E8-87BD-0280E1799351}"),
+            dependency("IVmGuestMemoryAccess", "{2461C824-4E2A-4848-BB65-5708B27F06D9}"),
+            dependency("IVmGuestStateRawStorage", "{F299B139-1550-4327-84F7-C1F433258EEF}"),
+            dependency("IVmMemoryTopology", "{4F99E8B7-37BC-4EE4-B539-50263B4783B6}"),
+            dependency("IVmPowerServices", "{3EE9144C-27D7-4C8E-A07E-5DD5F7A0207D}"),
+            dependency("IVmProcessorServices", "{5F662E9D-2097-4EB5-8527-658BA54AC049}"),
+            dependency("IVmTimeSource", "{E162FE7A-72C6-4D0E-93DD-7DF91A5B979D}"),
+            dependency("IVpciServices", "{C8769BE0-2C2B-4DED-BD3C-FF7515D74E90}"),
+            dependency("IVmCrashRegisterServices", "{F0109DC7-3F96-41B1-B0BC-5AEA911C404C}"),
+            dependency("IVpmemController", "{521087AB-2963-4859-B6D9-D6F1EC9F3382}", False),
+            dependency("IVmPsp", "{B0C36D19-3F91-4B3D-B8DC-EEE5BB2C9ABA}", False),
+            dependency("IProxiedPciVgaDevice", "{FCB3759F-D139-46BE-8500-5C50A6FBFF9B}", False),
+        ),
+        "<GuestEmulationDevice><VDEVVersion>256</VDEVVersion><version>1</version>"
+        "<ForceProtocol>0</ForceProtocol><OfferLogPipe>false</OfferLogPipe>"
+        "</GuestEmulationDevice>",
+        True,
+        (11, 3, 17, 7, 40, 18, 17, 23, 18),
+        (("ISecurityManager", (11,)),),
+    ),
+    "bios": DeviceSpec(
+        "bios",
+        "BiosVdev",
+        "{AC6B8DC1-3257-4A70-B1B2-A9C9215659AD}",
+        "vmchipset.dll",
+        (0x44D30, 0x46180, 0x4A7D0),
+        (
+            dependency("IVmbusServices", "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}"),
+            dependency("IVmAmd64EmulationServices", "{FCACE8D2-AB0D-480D-B979-55C2DA5F9579}"),
+            dependency("IVmGuestMemoryAccess", "{2461C824-4E2A-4848-BB65-5708B27F06D9}"),
+            dependency("IVmProcessorServices", "{5F662E9D-2097-4EB5-8527-658BA54AC049}"),
+            dependency("IVmBootMemoryTopology", "{B80FE14E-B5F6-43D4-B206-40B3BF511959}"),
+            dependency("IVmBootStateImporter", "{034E6428-672E-403A-A342-4F4C8D6A705C}"),
+            dependency("IVmMemoryTopology", "{4F99E8B7-37BC-4EE4-B539-50263B4783B6}"),
+            dependency("IVmPowerManagementDevice", "{3F60DA8B-E8EF-403A-8173-9EF5C6EE0152}"),
+            dependency("IVmIoApic", "{9D33829B-58BE-4BBF-AB6E-3B16DBCEF954}"),
+            dependency("IVmManagementAccess", "{BB011455-A4F6-4E08-9982-09AFD303DF20}"),
+            dependency("IVmPowerServices", "{3EE9144C-27D7-4C8E-A07E-5DD5F7A0207D}"),
+            dependency("IVmTimeSource", "{E162FE7A-72C6-4D0E-93DD-7DF91A5B979D}"),
+            dependency("IVmMemoryManagement", "{E7BB1D35-AD97-464B-8A3F-95F43E0F4389}"),
+            dependency("ISecurityManager", IID_SECURITY_MANAGER),
+            dependency("IVmPartitionServices", "{773E9A95-1B2D-4479-955F-402000EBE6C2}"),
+            dependency("IVmHandleBrokerServices", "{E9E61D12-A2C3-4E55-AC35-B8F26D216A69}"),
+            dependency("IVmPsp", "{B0C36D19-3F91-4B3D-B8DC-EEE5BB2C9ABA}", False),
+            dependency("IVmBattery", "{2A811607-C21C-47DA-84A0-3C3B29AAD4E4}", False),
+            dependency("IVpmemController", "{521087AB-2963-4859-B6D9-D6F1EC9F3382}", False),
+            dependency("IVmGuestStateAccess", "{96DDF97A-0B79-4966-8B56-740F0D766E2E}", False),
+        ),
+        "<BiosLoader><VDEVVersion>512</VDEVVersion><version>1</version></BiosLoader>",
+        True,
+        (11, 3, 17, 7, 40, 18, 17, 23, 18),
+        (("ISecurityManager", (12, 13, 10)),),
+        provided_interfaces=(
+            ("IVmBios", "{9BE0B79F-68DF-4C59-9D88-4BFC1BF7A73D}"),
+        ),
+    ),
+    "rtc": DeviceSpec(
+        "rtc",
+        "RtcVdev",
+        "{E51B7EF6-4A7F-4780-AAAE-D4B291AACD2E}",
+        "vmchipset.dll",
+        (0x7CA70, 0x7CEC0, 0x7D730),
+        (
+            dependency("IVmBios", "{9BE0B79F-68DF-4C59-9D88-4BFC1BF7A73D}"),
+            dependency("IVmAmd64EmulationServices", "{FCACE8D2-AB0D-480D-B979-55C2DA5F9579}"),
+            dependency("IVmIoApic", "{9D33829B-58BE-4BBF-AB6E-3B16DBCEF954}"),
+            dependency("IVmManagementAccess", "{BB011455-A4F6-4E08-9982-09AFD303DF20}"),
+            dependency("ISecurityManager", IID_SECURITY_MANAGER),
+            dependency("IVmTimeSource", "{E162FE7A-72C6-4D0E-93DD-7DF91A5B979D}"),
+        ),
+        None,
+        False,
+        (11, 3, 17, 7, 40, 18, 39),
+    ),
+    "ioapic": DeviceSpec(
+        "ioapic",
+        "IoApicVdev",
+        "{72682FC4-040A-430A-BE0B-224574B953FE}",
+        "vmchipset.dll",
+        (0x77830, 0x77D20, 0x78650),
+        (
+            dependency("ISecurityManager", IID_SECURITY_MANAGER),
+            dependency("IVmAmd64EmulationServices", "{FCACE8D2-AB0D-480D-B979-55C2DA5F9579}"),
+            dependency("IVmPartitionServices", "{773E9A95-1B2D-4479-955F-402000EBE6C2}"),
+            dependency("IVmProcessorServices", "{5F662E9D-2097-4EB5-8527-658BA54AC049}"),
+            dependency("IVmPicService", "{81A7B678-73B5-4188-AE42-882BFCDC7562}", False),
+        ),
+        "<IoApicDevice><VDEVVersion>256</VDEVVersion><version>1</version>"
+        "<ForceLegacyRteWidth>false</ForceLegacyRteWidth></IoApicDevice>",
+        True,
+        (11, 3, 17, 7, 40, 18),
+        provided_interfaces=(
+            ("IVmIoApic", "{9D33829B-58BE-4BBF-AB6E-3B16DBCEF954}"),
+        ),
+    ),
+    "vmbus": DeviceSpec(
+        "vmbus",
+        "VmbusVdev",
+        "{D41A1872-3740-41CE-A1EE-4522AB82F991}",
+        "vmbusvdev.dll",
+        (0x10A20, 0x12720, 0x17780),
+        (
+            dependency("ISecurityManager", IID_SECURITY_MANAGER),
+            dependency("IVmMemoryManagement", "{E7BB1D35-AD97-464B-8A3F-95F43E0F4389}"),
+            dependency("IVmPartitionServices", "{773E9A95-1B2D-4479-955F-402000EBE6C2}"),
+            dependency("IVmHandleBrokerServices", "{E9E61D12-A2C3-4E55-AC35-B8F26D216A69}"),
+        ),
+        "<VMBusDevice><VDEVVersion>513</VDEVVersion><version>1</version>"
+        "<MessageRedirection>false</MessageRedirection></VMBusDevice>",
+        True,
+        (11, 3, 17, 7, 40, 18),
+        (("IVmHandleBrokerServices", (3,)),),
+        provided_interfaces=(
+            ("IVmbusServices", "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}"),
+        ),
+    ),
+    "synthstor": DeviceSpec(
+        "synthstor",
+        "SynthStor",
+        "{D422512D-2BF2-4752-809D-7B82B5FCB1B4}",
+        "vmsynthstor.dll",
+        (0x17D80, 0x191E0, 0x26290),
+        (
+            dependency("IVmHandleBrokerServices", "{E9E61D12-A2C3-4E55-AC35-B8F26D216A69}"),
+            dependency("IVmManagementAccess", "{BB011455-A4F6-4E08-9982-09AFD303DF20}"),
+            dependency("IVmPowerServices", "{3EE9144C-27D7-4C8E-A07E-5DD5F7A0207D}"),
+            dependency("IVmbusServices", "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}"),
+        ),
+        "<SyntheticStorageDevice><VDEVVersion>256</VDEVVersion><version>1</version>"
+        "</SyntheticStorageDevice>",
+        True,
+        (11, 3, 17, 7, 40, 18, 39, 17, 26, 18),
+    ),
+}
+
+CONFIG_FIELDS = {
+    "guest": (
+        "VDEVVersion",
+        "version",
+        "DevicePlatformSettings",
+        "DevicePlatformSettingsV2",
+        "ForceProtocol",
+        "OfferLogPipe",
+    ),
+    "bios": (
+        "VDEVVersion",
+        "version",
+        "bios_guid",
+        "bios_serial_number",
+        "num_lock",
+        "base_board",
+        "chassis",
+        "secure_boot_enabled",
+        "secure_boot_template_id",
+        "bios_flags",
+        "pause_after_boot_failure",
+        "pxe_preferred_protocol",
+        "console_mode",
+        "boot",
+        "imc_data",
+        "memory_attributes_table",
+        "nvram",
+        "boot_next",
+        "FirmwareMode",
+        "BiosLockString",
+        "EnableHibernation",
+        "memoryprotection_mode",
+        "LinuxKernelDirect",
+        "DisableFrontpage",
+        "ApplySbTemplate",
+        "EnableProcessorIdling",
+        "SystemInformation",
+        "MemoryDeviceSerialNumber",
+        "DisableSha384Pcr",
+        "WatchdogEnabled",
+        "LegacyPcrMeasurement",
+    ),
+    "rtc": (),
+    "ioapic": ("VDEVVersion", "version", "ForceLegacyRteWidth"),
+    "vmbus": ("VDEVVersion", "version", "MessageRedirection"),
+    "synthstor": (
+        "VDEVVersion",
+        "version",
+        "ElementName",
+        "ChannelInstanceGuid",
+        "DisableInterruptBatching",
+        "VPCPerChannel",
+        "ThreadsPerChannel",
+        "controller0",
+        "TargetVtl",
+    ),
+}
 
 S_OK = 0
 S_FALSE = 1
@@ -119,7 +334,161 @@ GUARDS = {
         "{A1F04F82-DB3B-3AF6-6744-C606F24BEEB9}",
         1,
     ),
+    "vmsynthstor.dll": GuardedFile(
+        "System32/vmsynthstor.dll",
+        517_624,
+        "E7972B586FA2E8540ED9738C3CA5B6D9D0EF0EB02C1A7FAAABAC33689790446B",
+        "10.0.26100.8457",
+        "{894A49E8-F56D-3957-E8EB-2214733ECA28}",
+        1,
+    ),
+    "vmwp.exe": GuardedFile(
+        "System32/vmwp.exe",
+        3_720_352,
+        "AC076752BD5424B57C994D4529C5179BB153F9DA0119FB23AD1C13AC9A571B20",
+        "10.0.26100.8457",
+        "{DC281C89-2BE3-8A04-AC2B-1C27F20A2865}",
+        1,
+    ),
+    "vmfirmware.dll": GuardedFile(
+        "System32/vmfirmware.dll",
+        6_436_256,
+        "4FE86E4B71D814F2D679D32BFC813B9B2600A4F1CBFE67C3FEB6689E681A53F6",
+        "10.0.26100.7623",
+    ),
 }
+
+PDB_NAMES = {
+    "vmchipset.dll": "vmchipset.pdb",
+    "vmbusvdev.dll": "vmbusvdev.pdb",
+    "vmsynthstor.dll": "VmSynthStor.pdb",
+    "vmwp.exe": "vmwp.pdb",
+}
+
+BINARY_ROLES = {
+    "vmwp.exe": "symbol source for motherboard lifecycle and device ordering",
+    "vmfirmware.dll": "firmware resource consumed by BiosVdev",
+}
+
+CONTRACT_PATH = (
+    pathlib.Path(__file__).resolve().parents[1]
+    / "docs"
+    / "secure-kernel"
+    / "vdev-contract-26100.8457.json"
+)
+
+
+def contract_manifest() -> dict[str, object]:
+    binaries: dict[str, object] = {}
+    for name, guard in GUARDS.items():
+        entry: dict[str, object] = {
+            "version": guard.version,
+            "size": guard.size,
+            "sha256": guard.sha256,
+        }
+        if guard.pdb_guid is not None:
+            entry.update(
+                {
+                    "pdb_guid": guard.pdb_guid,
+                    "pdb_age": guard.pdb_age,
+                    "pdb_name": PDB_NAMES[name],
+                }
+            )
+        elif name == "vmfirmware.dll":
+            entry["codeview"] = None
+        if name in BINARY_ROLES:
+            entry["role"] = BINARY_ROLES[name]
+        binaries[name] = entry
+
+    devices = []
+    for spec in DEVICES.values():
+        required = [item for item in spec.dependencies if item.required]
+        optional = [item for item in spec.dependencies if not item.required]
+        devices.append(
+            {
+                "kind": spec.kind,
+                "name": spec.name,
+                "clsid": spec.clsid,
+                "module": spec.module,
+                "ivirtual_device": {
+                    "iid": IID_IVIRTUAL_DEVICE,
+                    "lifecycle": [
+                        {"slot": 3, "method": "GetDependencies", "rva": f"0x{spec.vtable_rvas[0]:X}"},
+                        {"slot": 4, "method": "Initialize", "rva": f"0x{spec.vtable_rvas[1]:X}"},
+                        {"slot": 5, "method": "Teardown", "rva": f"0x{spec.vtable_rvas[2]:X}"},
+                    ],
+                },
+                "owner_partition": spec.owner_partition,
+                "get_dependencies_order": [
+                    {"name": item.name, "iid": item.iid, "required": item.required}
+                    for item in spec.dependencies
+                ],
+                "required_count": len(required),
+                "initialize_dependency_order": [
+                    item.name for item in (*required, *reversed(optional))
+                ],
+                "provided_interfaces": [
+                    {"name": name, "iid": iid}
+                    for name, iid in spec.provided_interfaces
+                ],
+                "configuration_fields": list(CONFIG_FIELDS[spec.kind]),
+                "minimum_xml": spec.xml,
+                "observed_repository_slots": list(spec.repository_calls),
+                "observed_service_calls": {
+                    name: list(slots) for name, slots in spec.service_calls
+                },
+            }
+        )
+
+    return {
+        "schema_version": 1,
+        "observed_on": "2026-10-02",
+        "scope": {
+            "result": "six independent initialization and teardown paths pass",
+            "does_not_prove": [
+                "one composed device graph",
+                "RAM-construction-complete notification",
+                "firmware execution",
+                "synthetic disk I/O",
+            ],
+        },
+        "interfaces": {
+            "IVirtualDevice": IID_IVIRTUAL_DEVICE,
+            "IVirtualDeviceMemoryInfo": IID_IVIRTUAL_DEVICE_MEMORY_INFO,
+            "IVirtualDeviceRepository": IID_IVIRTUAL_DEVICE_REPOSITORY,
+            "IVirtualDeviceServices": IID_IVIRTUAL_DEVICE_SERVICES,
+        },
+        "repository_slots": {
+            "3": "GetId",
+            "7": "ReadVersion",
+            "9": "GetDeviceId",
+            "11": "GetVmNameAndId",
+            "17": "Open",
+            "18": "Close",
+            "23": "ReadString",
+            "26": "ReadBoolean",
+            "39": "GetRuntimeConfiguration",
+            "40": "ExportConfiguration",
+        },
+        "repository_values": {
+            "/generation_id": "00000000-0000-0000-0000-000000000000",
+            "/PreallocatedResources": False,
+        },
+        "binary_identities": binaries,
+        "devices": devices,
+    }
+
+
+def verify_contract_file() -> None:
+    try:
+        recorded = json.loads(CONTRACT_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError as error:
+        raise RuntimeError(f"missing contract manifest: {CONTRACT_PATH}") from error
+    expected = contract_manifest()
+    if recorded != expected:
+        raise RuntimeError(
+            f"contract manifest is stale: regenerate {CONTRACT_PATH} with --contract-only"
+        )
 
 
 class GUID(ctypes.Structure):
@@ -196,6 +565,15 @@ STREAM_WRITE = ctypes.WINFUNCTYPE(
     ctypes.c_void_p,
     wintypes.DWORD,
     ctypes.POINTER(wintypes.DWORD),
+)
+READ_STRING = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.POINTER(ctypes.c_void_p)
+)
+READ_BOOLEAN = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_void_p, ctypes.c_wchar_p, ctypes.POINTER(wintypes.BOOL)
+)
+SET_U32 = ctypes.WINFUNCTYPE(
+    ctypes.c_long, ctypes.c_void_p, ctypes.POINTER(wintypes.DWORD)
 )
 
 
@@ -297,13 +675,11 @@ def guarded_path(name: str) -> tuple[pathlib.Path, dict[str, object]]:
 
 
 def verify_identities(kind: str | None = None) -> dict[str, dict[str, object]]:
-    names = (
-        ("vmchipset.dll",)
-        if kind == "rtc"
-        else ("vmbusvdev.dll", "vid.dll", "Vid.sys")
-        if kind == "vmbus"
-        else tuple(GUARDS)
-    )
+    if kind is None:
+        names = tuple(GUARDS)
+    else:
+        spec = DEVICES[kind]
+        names = (spec.module, "vid.dll", "Vid.sys") if spec.owner_partition else (spec.module,)
     identities = {}
     for name in names:
         _, identities[name] = guarded_path(name)
@@ -356,7 +732,7 @@ class OwnerPartition:
         struct.pack_into("<I", setup, 0x30, 1)
         struct.pack_into("<I", setup, 0xC8A8, 0)
         name = vm_id.strip("{}")
-        self.handle = self.create(name, "windbg-mcp VMBus initialization probe", setup)
+        self.handle = self.create(name, "windbg-mcp inbox device initialization probe", setup)
         ctypes.memset(setup, 0, len(setup))
         if self.handle in (None, INVALID_HANDLE_VALUE):
             raise ctypes.WinError(ctypes.get_last_error())
@@ -462,6 +838,28 @@ class RecordingRepository:
             emit("repository_call", slot=11, vm_id=self.vm_id)
             return S_OK
 
+        @READ_STRING
+        def read_string(_this, name, output):
+            self.calls.append(23)
+            if name != "/generation_id":
+                output[0] = None
+                emit("repository_call", slot=23, name=name, result="E_NOTIMPL")
+                return E_NOTIMPL
+            value = "00000000-0000-0000-0000-000000000000"
+            output[0] = oleaut.SysAllocString(value)
+            emit("repository_call", slot=23, name=name, value=value, result="S_OK")
+            return S_OK
+
+        @READ_BOOLEAN
+        def read_boolean(_this, name, output):
+            self.calls.append(26)
+            if name != "/PreallocatedResources":
+                emit("repository_call", slot=26, name=name, result="E_NOTIMPL")
+                return E_NOTIMPL
+            output[0] = False
+            emit("repository_call", slot=26, name=name, value=False, result="S_OK")
+            return S_OK
+
         @OPEN
         def open_repository(_this, configuration, access):
             self.calls.append(17)
@@ -514,6 +912,8 @@ class RecordingRepository:
             11: get_vm_name_id,
             17: open_repository,
             18: close_repository,
+            23: read_string,
+            26: read_boolean,
             39: get_runtime,
             40: export_configuration,
         }
@@ -573,17 +973,80 @@ class RecordingService:
             self.callbacks.append(callback)
             self.vtable[index] = ctypes.cast(callback, ctypes.c_void_p)
 
+        if self.service_id == IID_SECURITY_MANAGER.upper():
+            for index in (10, 11, 12, 13):
+                def make_zero(slot):
+                    @SET_U32
+                    def zero(_this, output):
+                        self.calls.append(slot)
+                        output[0] = 0
+                        emit(
+                            "service_call",
+                            service=self.name,
+                            slot=slot,
+                            value=0,
+                            result="S_OK",
+                        )
+                        return S_OK
+
+                    return zero
+
+                callback = make_zero(index)
+                self.callbacks.append(callback)
+                self.vtable[index] = ctypes.cast(callback, ctypes.c_void_p)
+
     @property
     def pointer(self) -> int:
         return ctypes.addressof(self.obj)
 
+    def add_reference(self) -> None:
+        self.obj.refs += 1
+
+
+class ComInterfaceService:
+    def __init__(self, name: str, service_id: str, pointer: ctypes.c_void_p) -> None:
+        self.name = name
+        self.service_id = service_id.upper()
+        self.calls: list[int] = []
+        self._pointer = pointer
+        self._closed = False
+
+    @property
+    def pointer(self) -> int:
+        if self._closed or not self._pointer.value:
+            raise RuntimeError(f"{self.name} interface is closed")
+        return int(self._pointer.value)
+
+    def add_reference(self) -> None:
+        vtable = ctypes.cast(
+            self._pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+        )[0]
+        REF(vtable[1])(self._pointer)
+
+    def close(self) -> None:
+        if not self._closed and self._pointer.value:
+            vtable = ctypes.cast(
+                self._pointer, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+            )[0]
+            REF(vtable[2])(self._pointer)
+            self._closed = True
+
 
 class RecordingServices:
-    def __init__(self, dependencies: tuple[tuple[str, str], ...]) -> None:
-        self.services = {
-            service_id.upper(): RecordingService(name, service_id)
-            for name, service_id in dependencies
-        }
+    def __init__(
+        self,
+        dependencies: tuple[Dependency, ...],
+        overrides: dict[str, ComInterfaceService] | None = None,
+    ) -> None:
+        supplied = overrides or {}
+        self.services = {}
+        for item in dependencies:
+            service = supplied.get(item.iid)
+            if service is not None and service.name != item.name:
+                raise RuntimeError(
+                    f"service name mismatch for {item.iid}: {service.name} != {item.name}"
+                )
+            self.services[item.iid] = service or RecordingService(item.name, item.iid)
         self.callbacks: list[object] = []
         self.vtable = (ctypes.c_void_p * 4)()
         self.obj = ComObject(ctypes.cast(self.vtable, ctypes.POINTER(ctypes.c_void_p)), 1)
@@ -616,7 +1079,7 @@ class RecordingServices:
                 output[0] = None
                 return E_NOINTERFACE
             output[0] = service.pointer
-            service.obj.refs += 1
+            service.add_reference()
             emit("dependency_resolved", service=service.name, iid=service_id)
             return S_OK
 
@@ -645,7 +1108,7 @@ def read_dependencies(
     obj: ctypes.c_void_p,
     vtable: ctypes.POINTER(ctypes.c_void_p),
     repository: RecordingRepository,
-) -> list[str]:
+) -> tuple[list[str], int]:
     count = wintypes.DWORD()
     required = wintypes.DWORD()
     entries = ctypes.c_void_p()
@@ -666,38 +1129,31 @@ def read_dependencies(
     )
     if result < 0:
         raise RuntimeError(f"GetDependencies returned {hresult(result)}")
-    if count.value != required.value or not entries.value:
+    if required.value > count.value or (count.value and not entries.value):
         raise RuntimeError(
             f"GetDependencies returned count={count.value} required={required.value} entries={entries.value}"
         )
     try:
         array = ctypes.cast(entries, ctypes.POINTER(GUID))
-        return [guid_text(array[index]) for index in range(count.value)]
+        return [guid_text(array[index]) for index in range(count.value)], required.value
     finally:
-        ole.CoTaskMemFree(entries)
+        if entries.value:
+            ole.CoTaskMemFree(entries)
 
 
 def run_child(kind: str, vm_id: str) -> int:
+    spec = DEVICES[kind]
     identities = verify_identities(kind)
     emit("identities_verified", kind=kind, files=identities)
-    dependencies = RTC_DEPENDENCIES if kind == "rtc" else VMBUS_DEPENDENCIES
-    class_id = CLSID_RTC if kind == "rtc" else CLSID_VMBUS
-    expected_module = "vmchipset.dll" if kind == "rtc" else "vmbusvdev.dll"
-    expected_module_path, _ = guarded_path(expected_module)
-    expected_rvas = (0x7CA70, 0x7CEC0, 0x7D730) if kind == "rtc" else (0x10A20, 0x12720, 0x17780)
-    expected_repository_calls = (
-        [11, 3, 17, 7, 40, 18, 39]
-        if kind == "rtc"
-        else [11, 3, 17, 7, 40, 18]
-    )
+    expected_module_path, _ = guarded_path(spec.module)
     owner = None
     obj = None
     initialized = False
     ole.CoInitializeEx(None, 0)
     try:
-        if kind == "vmbus":
+        if spec.owner_partition:
             owner = OwnerPartition(vm_id)
-        obj = activate(class_id)
+        obj = activate(spec.clsid)
         vtable = ctypes.cast(obj, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p)))[0]
         observed_rvas = []
         for slot in range(3, 6):
@@ -707,29 +1163,55 @@ def run_child(kind: str, vm_id: str) -> int:
             ):
                 raise RuntimeError(f"IVirtualDevice slot {slot} came from {module}")
             observed_rvas.append(rva)
-        if tuple(observed_rvas) != expected_rvas:
+        if tuple(observed_rvas) != spec.vtable_rvas:
             raise RuntimeError(
-                f"IVirtualDevice slot RVAs changed: observed={observed_rvas} expected={expected_rvas}"
+                "IVirtualDevice slot RVAs changed: "
+                f"observed={observed_rvas} expected={spec.vtable_rvas}"
             )
-        emit("vtable_verified", module=expected_module, slots_3_to_5=observed_rvas)
+        emit("vtable_verified", module=spec.module, slots_3_to_5=observed_rvas)
 
-        repository = RecordingRepository(
-            class_id, vm_id, None if kind == "rtc" else VMBUS_XML
-        )
-        observed_dependencies = read_dependencies(obj, vtable, repository)
-        expected_dependencies = [service_id.upper() for _, service_id in dependencies]
+        for interface_name, interface_id in spec.provided_interfaces:
+            interface = ctypes.c_void_p()
+            query_result = QI(vtable[0])(
+                obj, ctypes.byref(make_guid(interface_id)), ctypes.byref(interface)
+            )
+            if query_result < 0 or not interface.value:
+                raise RuntimeError(
+                    f"QueryInterface({interface_name}) returned {hresult(query_result)}"
+                )
+            interface_vtable = ctypes.cast(
+                interface, ctypes.POINTER(ctypes.POINTER(ctypes.c_void_p))
+            )[0]
+            REF(interface_vtable[2])(interface)
+            emit(
+                "provided_interface_verified",
+                name=interface_name,
+                iid=interface_id,
+            )
+
+        repository = RecordingRepository(spec.clsid, vm_id, spec.xml)
+        observed_dependencies, observed_required = read_dependencies(obj, vtable, repository)
+        expected_dependencies = [item.iid for item in spec.dependencies]
         if observed_dependencies != expected_dependencies:
             raise RuntimeError(
                 f"dependency list changed: observed={observed_dependencies} expected={expected_dependencies}"
             )
+        expected_required = sum(item.required for item in spec.dependencies)
+        if observed_required != expected_required:
+            raise RuntimeError(
+                "required dependency count changed: "
+                f"observed={observed_required} expected={expected_required}"
+            )
         emit(
             "dependencies_verified",
             dependencies=[
-                {"name": name, "iid": service_id} for name, service_id in dependencies
+                {"name": item.name, "iid": item.iid, "required": item.required}
+                for item in spec.dependencies
             ],
+            required=observed_required,
         )
 
-        services = RecordingServices(dependencies)
+        services = RecordingServices(spec.dependencies)
         initialize = ctypes.WINFUNCTYPE(
             ctypes.c_long,
             ctypes.c_void_p,
@@ -749,18 +1231,19 @@ def run_child(kind: str, vm_id: str) -> int:
         emit("teardown", kind=kind, result=hresult(teardown_result))
         if teardown_result < 0:
             raise RuntimeError(f"Teardown returned {hresult(teardown_result)}")
-        if repository.calls != expected_repository_calls:
+        if tuple(repository.calls) != spec.repository_calls:
             raise RuntimeError(
-                f"repository calls changed: observed={repository.calls} expected={expected_repository_calls}"
+                "repository calls changed: "
+                f"observed={repository.calls} expected={spec.repository_calls}"
             )
         service_calls = {
             service.name: service.calls
             for service in services.services.values()
             if service.calls
         }
-        expected_service_calls = (
-            {} if kind == "rtc" else {"IVmHandleBrokerServices": [3]}
-        )
+        expected_service_calls = {
+            name: list(slots) for name, slots in spec.service_calls
+        }
         if service_calls != expected_service_calls:
             raise RuntimeError(
                 f"service callbacks changed: observed={service_calls} expected={expected_service_calls}"
@@ -811,9 +1294,10 @@ def parse_json_lines(output: str | bytes) -> list[object]:
 
 
 def run_parent() -> int:
+    verify_contract_file()
     children = []
     passed = True
-    for kind in ("rtc", "vmbus"):
+    for kind in DEVICES:
         vm_id = "{" + str(uuid.uuid4()).upper() + "}"
         command = [
             sys.executable,
@@ -879,13 +1363,31 @@ def run_parent() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--identity-only", action="store_true")
-    parser.add_argument("--child", choices=("rtc", "vmbus"), help=argparse.SUPPRESS)
+    parser.add_argument("--contract-only", action="store_true")
+    parser.add_argument("--check-contract", action="store_true")
+    parser.add_argument("--child", choices=tuple(DEVICES), help=argparse.SUPPRESS)
     parser.add_argument("--vm-id", help=argparse.SUPPRESS)
     args = parser.parse_args()
     if ctypes.sizeof(ctypes.c_void_p) != 8:
         parser.error("the guarded interfaces require 64-bit Python")
+    if sum((args.identity_only, args.contract_only, args.check_contract)) > 1:
+        parser.error("select at most one read-only mode")
+    if args.contract_only:
+        print(json.dumps(contract_manifest(), indent=2) + "\n", end="")
+        return 0
+    if args.check_contract:
+        verify_contract_file()
+        print(json.dumps({"contract": str(CONTRACT_PATH), "current": True}, indent=2))
+        return 0
     if args.identity_only:
-        print(json.dumps({"identities": verify_identities()}, indent=2, sort_keys=True))
+        verify_contract_file()
+        print(
+            json.dumps(
+                {"contract": str(CONTRACT_PATH), "identities": verify_identities()},
+                indent=2,
+                sort_keys=True,
+            )
+        )
         return 0
     if args.child:
         if not args.vm_id:

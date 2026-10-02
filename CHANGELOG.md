@@ -97,18 +97,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **The fatal inbox-device initialization spike for an owned Windows/VBS boot
-  passed (`FOLLOWUPS.md` item 110, K1.1).**
-  `tools/vdev_initialization_probe.py` runs RTC and VMBus in separate bounded
-  children, guards the exact device and VID binaries, validates the recovered
-  `IVirtualDevice` vtable and dependency IIDs, and supplies recording private
-  repository/service objects. RTC initializes and tears down without a
-  partition. VMBus initializes and tears down against a fresh process-local
-  direct-VID partition whose GUID matches the repository VM ID, then deletes
-  it. The only dependency method invoked is the optional handle-broker lookup;
-  returning `E_NOTIMPL` makes VMBus open its owned endpoint directly. This
-  rules out `vmwp` process identity, VMMS-managed repository state, and a
-  second VID receive loop as requirements for these two initialization paths,
-  and opens K1.2's complete device-graph trace.
+  passed for all six minimum devices (`FOLLOWUPS.md` item 110, K1.1).**
+  `tools/vdev_initialization_probe.py` runs guest emulation, BIOS, RTC, IOAPIC,
+  VMBus, and SynthStor in separate bounded children; guards the exact device
+  and VID binaries; and asserts their recovered `IVirtualDevice` vtables,
+  required and optional dependencies, minimum XML, repository reads, and
+  service callbacks. Each independently returns `S_OK` from initialization and
+  teardown. RTC needs no partition; the other five children each create and
+  delete a fresh process-local direct-VID partition. VMBus still proves the
+  ownership link by opening its endpoint after the optional handle broker
+  returns `E_NOTIMPL`. The generated, build-bound contract is committed as
+  `docs/secure-kernel/vdev-contract-26100.8457.json`. This rules out `vmwp`
+  process identity, VMMS-managed repository state, and a second VID receive
+  loop as requirements for all six independent initialization paths. That
+  result opened the composition work recorded in the next entry.
+- **The six-device composition and lifecycle subgate passes three times in one
+  owner partition (`FOLLOWUPS.md` item 110, K1.2).**
+  `tools/vdev_graph_probe.py` supplies the real `IVmbusServices`, `IVmIoApic`,
+  and `IVmBios` interfaces between the inbox objects, initializes in dependency
+  order, mirrors `vmwp`'s recovered `IID_IVirtualDeviceMemoryInfo` notification
+  loop, tears down in reverse, verifies repository release after COM object
+  destruction, and deletes the partition. The final three live runs used fresh
+  partitions `0x85`–`0x87`. None of the six devices implements the optional
+  memory-info interface, so the RAM-complete phase is an asserted no-op. The
+  final Windows RAM topology, firmware execution, storage I/O, and VP start are
+  still open.
 - **The owner-partition probe can redirect and restore VTL1 execution state
   while an exception message is pending (`FOLLOWUPS.md` item 110 arm 1).** The
   new `--pending-vtl1-state-write` mode receives its marked VTL1 CPL0 `#BP`,
