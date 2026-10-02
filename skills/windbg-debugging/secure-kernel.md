@@ -103,9 +103,15 @@ sk_read_memory { "session_id": "sess-…", "address": "0xFFFFF80220D89000", "siz
 ```
 
 The address is a **guest virtual** address in the captured VTL1, translated through the page-table
-walk the open made. The physical address it landed on comes back with the bytes — so a reading here
-can be compared with one taken another way — and, where the session has symbols, what the image
-calls that address. `size` is 1 to 65536 and the read is **whole or nothing**: a range reaching a
+walk the open made. The physical address comes back with the bytes — so a reading here can be
+compared with one taken another way — and, where the session has symbols, what the image calls that
+address.
+
+**That `gpa` is where the range *starts*, and nothing more.** A read crossing a page boundary is
+assembled page by page, each translated on its own, and two adjacent virtual pages need not be
+adjacent physically — so the returned `gpa` is the first page's and the buffer is **not** a window
+onto `gpa..gpa+size`. To line a reading up against a physical source, read a page at a time and
+translate each one, rather than comparing a multi-page buffer against a contiguous physical range. `size` is 1 to 65536 and the read is **whole or nothing**: a range reaching a
 page the capture does not carry is refused naming that page rather than answered short, which would
 look like the end of a structure.
 
@@ -180,7 +186,8 @@ status line on stdout, and for a successful read exactly the requested bytes aft
 `src/livesrc.rs` is the normative spec — this is the shape.
 
 ```text
-<- (up to 63 lines the provider prints while starting; echoed to stderr, prefixed `transport:`)
+<- (the provider's own startup lines; echoed to stderr, prefixed `transport:`, and bounded — see
+    the table below, which is where every number in this protocol lives)
 <- windbg-mcp-gpa/1        the ready sentinel — the lines before it are ignored, not unlimited
 -> SHAPE
 <- SHAPE cr3=0x1201000 vtl_enabled=1 paging=long max_read=4096
@@ -192,24 +199,41 @@ status line on stdout, and for a successful read exactly the requested bytes aft
 <- ERROR the driver is not loaded
 ```
 
-Four things to know before writing one:
+**Every bound the client enforces, in one place.** Three of these were found one review round at a
+time, each as a provider that satisfied the protocol as written and failed anyway, so the list is
+read off `src/livesrc.rs` rather than grown a row per bug report. None of them is negotiable from
+the transport's side, and none is clamped — each refuses.
+
+| what | bound | what a breach does |
+|---|---|---|
+| lines before the sentinel | **63** (64 are read in all) | rejected as "probably not a transport", with what it said quoted back |
+| bytes in **any** one line | under **64 KiB**, newline included | 64 KiB with no newline is "not one line"; the exchange is refused and the transport poisoned |
+| `max_read` declared | **`1..=1048576`** | the handshake is refused — declare the smaller of your real capacity and 1 MiB |
+| `SHAPE` keys | the documented ones only | an unknown key is refused, not ignored |
+| `vtl_enabled` | `0` or `1` | anything else is refused |
+| `paging` | `long` | refused; this decode walks long mode only |
+| `unreadable` names | `cr0`, `cr3`, `cr4`, `efer` | an unknown register name is refused |
+| `OK <n>` | `n` no greater than the bytes asked for | announcing more is a source error, and poisons |
+| stdout | stays open until stdin closes | an EOF mid-exchange is "the transport closed its stdout" |
+| teardown | **10s** after its stdin closes | the child is killed rather than waited for |
+
+Four things to know besides the numbers:
 
 - **The sentinel is not politeness.** A provider prints during its own setup, so without it the
-  first line of a partition menu gets read as a `SHAPE` reply. **It has to arrive within the first
-  64 lines**, those being all the client will read looking for it, so at most **63** may precede
-  it; a transport still talking about itself on line 65 is rejected as probably not a transport,
-  with what it said quoted back. A provider that prints per partition, per device or per loaded
-  component is the one to check this against.
+  first line of a partition menu gets read as a `SHAPE` reply. A provider that prints per
+  partition, per device or per loaded component is the one to check the line bound against — and a
+  single long line is as fatal as too many, which is the easier one to hit with a provider that
+  dumps a table or a JSON blob in one write.
 - **`max_read` is the only required `SHAPE` field**, and it must be the real one — `HvCallReadGpa`
   moves at most **16** bytes, and a transport that claims more than it can do will be asked for it.
-  **Declare the smaller of your real capacity and 1 MiB**: the accepted range is `1..=1048576`, and
-  a declaration outside it refuses the handshake rather than being clamped. That ceiling is a guard
-  on the client's own buffer, which is sized from whatever you declare — not a statement about what
-  your source can do — so a transport that reads more per request simply gets more requests.
-  Every other field is optional because a source that cannot read a
+  Its ceiling above is a guard on the client's own buffer, which is sized from whatever you
+  declare, rather than a statement about your source: a transport that reads more per request
+  simply gets more requests. Every other field is optional because a source that cannot read a
   register must be able to say so rather than have a missing `EFER` decoded as a machine not in
-  long mode. An **unknown** key is refused rather than ignored: a misspelled `cr3` would otherwise
-  look like a guest with no page-table root, which is a far more plausible-looking wrong answer.
+  long mode. An unknown key is refused rather than ignored because a misspelled `cr3` would
+  otherwise look like a guest with no page-table root, which is a far more plausible-looking wrong
+  answer. One `SHAPE` field is **not** a failure: `switch_refused=<reason>` is how a transport says
+  the VTL could not be selected, which on a VBS-off guest is the result and travels as one.
 - **The four status words must stay distinct, and collapsing them fails in two different
   directions.** `REFUSED` is the hypervisor withholding a page, and over `HvCallReadGpa` on a VBS
   guest it is the **expected** answer. **Only `OK` with zero-filled bytes turns a protected guest
