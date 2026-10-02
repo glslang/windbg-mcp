@@ -346,16 +346,16 @@ None of these is a bug. They are recorded because they were invisible, and
    | `allocator` | 10 | 16,868 | 16.0% |
    | `exec` | 10 | 15,137 | 14.4% |
    | `session` | 10 | 14,013 | 13.3% |
-   | `inspect` | 10 | 13,442 | 12.8% |
-   | `ioctl` | 10 | 12,725 | 12.1% |
+   | `inspect` | 10 | 13,442 | 12.7% |
+   | `ioctl` | 10 | 12,917 | 12.2% |
    | `batch` | 1 | 10,842 | 10.3% |
-   | `securekernel` | 4 | 7,645 | 7.3% |
+   | `securekernel` | 4 | 7,645 | 7.2% |
    | `crash` | 3 | 7,514 | 7.1% |
    | `ttd` | 9 | 7,090 | 6.7% |
 
    | `--tools` | tools | model |
    |---|---:|---:|
-   | *(absent)* | 67 | 105,276 |
+   | *(absent)* | 67 | 105,468 |
    | `session,inspect,exec,crash` | 33 | 49,185 |
    | `session,inspect,crash` | 23 | 33,895 |
    | `crash` | 13 | 20,361 |

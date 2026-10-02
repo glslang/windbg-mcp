@@ -67,13 +67,25 @@ pub(crate) enum Framework {
     Kmdf,
 }
 
-/// The import that says a driver bound to KMDF.
+/// The import that says a driver bound to KMDF: **this name, from this library, and both.**
 ///
-/// **Matched by name, not by library.** `Wdf01000.sys` itself imports from `WdfLdr.sys` --
-/// `WdfRegisterLibrary` and `WdfLdrDiagnosticsValueByNameAsULONG`, measured on this bench -- so a
-/// rule that read the library alone would report the framework as its own client, which is the one
-/// image a reader of this field is most likely to be looking at.
+/// Neither half is sufficient and they fail in opposite directions, which is why the first version
+/// of this took one of them and was wrong.
+///
+/// * **The library alone** reports the framework as its own client: `Wdf01000.sys` imports
+///   `WdfRegisterLibrary` and `WdfLdrDiagnosticsValueByNameAsULONG` from `WdfLdr.sys` and neither
+///   bind routine -- measured on this bench, and the one image a reader of this field is most likely
+///   to be pointing a tool at.
+/// * **The name alone** reports an image that imports something *called* `WdfVersionBind` from any
+///   library at all, which an untrusted driver can arrange and which is not the evidence
+///   [`crate::structured::FrameworkTell::BindImport`] says it carries.
+///
+/// Both are compared case-insensitively, because the case is the image's own: every one of the 132
+/// KMDF clients in `System32\drivers` on this bench spells the library `WDFLDR.SYS`, which is the
+/// only spelling observed and not a constant to rely on.
 const KMDF_BIND: &str = "WdfVersionBind";
+/// See [`KMDF_BIND`]: the library the bind routines have to come from.
+const KMDF_BIND_LIBRARY: &str = "WdfLdr.sys";
 
 /// The class-extension form, which a client importing [`KMDF_BIND`] also imports.
 ///
@@ -106,57 +118,94 @@ impl Framework {
         }
     }
 
-    /// What the framework means for the answer it is attached to.
+    /// What the framework means for the answer it is attached to, **assembled from the tells that
+    /// fired** rather than chosen from fixed sentences.
     ///
-    /// **One sentence per subject, in one place.** Four tools want it, and four copies is how a
-    /// correction lands in three of them. The two subjects need different sentences and are not
-    /// interchangeable: one is about a driver whose table points elsewhere, the other is about
-    /// being *at* the code it points to.
-    pub(crate) fn note(self, subject: Subject) -> &'static str {
-        match (self, subject) {
-            (Self::Kmdf, Subject::Client) => {
-                "this is a KMDF driver: it binds to `Wdf01000.sys`, which installs its own \
-                 dispatcher in every `MajorFunction` slot and calls the driver's code as callbacks \
-                 it holds. So a dispatch entry is the framework's code rather than this driver's, \
-                 and holds no IOCTL compare chain -- a KMDF driver's control codes are compared in \
-                 an I/O queue's `EvtIoDeviceControl`, which this build cannot resolve. UMDF \
-                 (`WUDFx02000.dll`, user mode) is a different framework and is not recognised at \
-                 all."
-            }
-            (Self::Kmdf, Subject::FrameworkCode) => {
-                "this routine is in `Wdf01000.sys`, the KMDF framework, rather than in a driver \
-                 that binds to it -- so this answers about code every KMDF driver on the target \
-                 shares, and about none of them in particular. A KMDF driver's own control codes \
-                 are compared in an I/O queue's `EvtIoDeviceControl`, which this build cannot \
-                 resolve."
-            }
+    /// This was two fixed sentences picked by a `Subject`, and review on
+    /// [#437](https://github.com/glslang/windbg-mcp/pull/437) found the shape wrong rather than the
+    /// wording: the client sentence said the framework *"installs its own dispatcher in every
+    /// `MajorFunction` slot"*, which only [`crate::structured::FrameworkTell::DispatchTable`]
+    /// establishes. On the import tell alone -- which is every `driver_hazards` answer, since that
+    /// end never reads a driver object -- it was a claim about a table nothing had read, and in a
+    /// `driver_surface` answer carrying `bind_import` *without* `dispatch_table` it contradicted the
+    /// answer it sat in, that tell having been tried and failed.
+    ///
+    /// Assembling it from the tells is what makes the half-version unexpressible: there is no way to
+    /// say anything about the table without `DispatchTable` being in the list. Which is the same
+    /// correction, in the same round, as the clause [`Self::table_clause`] replaced.
+    pub(crate) fn note(self, tells: &[crate::structured::FrameworkTell]) -> String {
+        use crate::structured::FrameworkTell as Tell;
+        let Self::Kmdf = self;
+        // Its own sentence and not a clause of the others: this is about an *address*, where the two
+        // below are about a driver, and nothing is known here about any driver object.
+        if tells.contains(&Tell::FrameworkImage) {
+            return "this routine is in `Wdf01000.sys`, the KMDF framework, rather than in a driver \
+                    that binds to it -- so this answers about code every KMDF driver on the target \
+                    shares, and about none of them in particular. A KMDF driver's own control codes \
+                    are compared in an I/O queue's `EvtIoDeviceControl`, which this build cannot \
+                    resolve."
+                .to_string();
         }
+        let mut note = "this is a KMDF driver: it binds to `Wdf01000.sys`, which calls the driver's \
+                        code as callbacks it holds rather than through dispatch routines of its own \
+                        -- control codes are compared in an I/O queue's `EvtIoDeviceControl`, which \
+                        this build cannot resolve."
+            .to_string();
+        // **What was read about the table, and only that.** Either clause is a statement about this
+        // answer's own evidence, so neither can outrun it.
+        note.push_str(match tells.contains(&Tell::DispatchTable) {
+            true => {
+                " Every `MajorFunction` entry read here is in the framework's image, so a dispatch \
+                 entry is the framework's code rather than this driver's and holds no IOCTL compare \
+                 chain."
+            }
+            false => {
+                " Nothing here read this driver's `MajorFunction` entries as the framework's, so \
+                 what that table holds is not a claim this answer makes -- a client passing \
+                 `WdfDriverInitNoDispatchOverride` keeps a dispatch table of its own."
+            }
+        });
+        note.push_str(
+            " UMDF (`WUDFx02000.dll`, user mode) is a different framework and is not recognised at \
+             all.",
+        );
+        note
     }
 
-    /// The framework as a **clause** inside somebody else's sentence, pointing at the field that
-    /// explains it rather than explaining it again.
+    /// The framework as a **clause** inside somebody else's sentence, for a dispatch table that was
+    /// read and found to be the framework's **whole**.
     ///
     /// A second spelling for the same fact, which the repo already does once
     /// (`structured::SurveySection::in_prose`) and for the same reason: a note that reads "outside
     /// its own image -- `<this>`" wants a clause, a structured field wants a standalone paragraph,
     /// and keeping both here is what stops a correction landing in one of them.
-    pub(crate) fn as_clause(self) -> &'static str {
+    ///
+    /// **Only where the whole table was read as the framework's**, which is the condition review
+    /// added: this clause claims the driver dispatches its whole table through the framework and
+    /// points at a `framework` field, and on one forwarded entry alone both are wrong -- the field
+    /// may not be there at all. [`Self::one_entry_clause`] is that case.
+    pub(crate) fn table_clause(self) -> &'static str {
         match self {
             Self::Kmdf => {
-                "the KMDF framework image `Wdf01000.sys` this driver binds to, which owns its whole \
-                 dispatch table -- the `framework` field says what that means for this answer"
+                "the KMDF framework image `Wdf01000.sys` this driver dispatches its whole table \
+                 through -- the `framework` field says what that means for this answer"
             }
         }
     }
-}
 
-/// What a [`Framework::note`] is about, which decides which sentence it is.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum Subject {
-    /// A driver that binds to the framework. Its dispatch entries point into the framework.
-    Client,
-    /// Code inside the framework's own image, which is where those entries point.
-    FrameworkCode,
+    /// The same clause for a table where **this entry** is the framework's and another is not.
+    ///
+    /// The case a WDM filter forwarding one major function into a KMDF driver below it produces, and
+    /// the one [`Self::table_clause`] must not be used for.
+    pub(crate) fn one_entry_clause(self) -> &'static str {
+        match self {
+            Self::Kmdf => {
+                "the KMDF framework image `Wdf01000.sys` -- this entry dispatches into it while at \
+                 least one other entry in this table does not, so nothing here says this driver's \
+                 table is the framework's"
+            }
+        }
+    }
 }
 
 /// Whether an image is a **client** of a framework, from its import table.
@@ -171,11 +220,15 @@ pub(crate) enum Subject {
 pub(crate) fn client_of(imports: &[pe::Import]) -> Option<Framework> {
     imports
         .iter()
-        .any(|import| match &import.name {
-            pe::ImportName::Named(name) => {
-                name.eq_ignore_ascii_case(KMDF_BIND) || name.eq_ignore_ascii_case(KMDF_BIND_CLASS)
-            }
-            pe::ImportName::Ordinal(_) => false,
+        .any(|import| {
+            import.library.eq_ignore_ascii_case(KMDF_BIND_LIBRARY)
+                && match &import.name {
+                    pe::ImportName::Named(name) => {
+                        name.eq_ignore_ascii_case(KMDF_BIND)
+                            || name.eq_ignore_ascii_case(KMDF_BIND_CLASS)
+                    }
+                    pe::ImportName::Ordinal(_) => false,
+                }
         })
         .then_some(Framework::Kmdf)
 }
@@ -184,29 +237,25 @@ pub(crate) fn client_of(imports: &[pe::Import]) -> Option<Framework> {
 ///
 /// Four tools report this and the wording is the whole of what step 1 of `FOLLOWUPS.md` item 108
 /// buys, so it is built here rather than at each of them: a helper the callers route through, with
-/// nothing left for a caller to word differently. The [`Subject`] is **derived** from the tells
-/// rather than passed beside them, because the pair that must not be mixed up -- a driver that
-/// dispatches into the framework, and code inside the framework -- is exactly the pair a second
-/// argument lets a caller mix up.
+/// nothing left for a caller to word differently.
+///
+/// **The note is written from the tells, not beside them**, so a caller cannot hand in a sentence
+/// its evidence does not support -- which is the defect review found when the note was two fixed
+/// sentences picked by a subject argument. [`Framework::note`] says what each tell licenses.
 pub(crate) fn report(
     framework: Framework,
     tells: Vec<crate::structured::FrameworkTell>,
     dispatch_image: Option<String>,
 ) -> crate::structured::DriverFramework {
-    use crate::structured::FrameworkTell as Tell;
     debug_assert!(
         !tells.is_empty(),
         "a framework is reported because something said so, and `tells` is what said so"
     );
-    let subject = match tells.contains(&Tell::FrameworkImage) {
-        true => Subject::FrameworkCode,
-        false => Subject::Client,
-    };
     crate::structured::DriverFramework {
+        note: framework.note(&tells),
         framework: framework.name().to_string(),
         tells,
         dispatch_image,
-        note: framework.note(subject).to_string(),
     }
 }
 
@@ -280,6 +329,66 @@ mod tests {
     fn a_wdm_driver_matches_no_framework() {
         let imports = vec![named("ntoskrnl.exe", "IoCreateDevice")];
         assert_eq!(client_of(&imports), None);
+    }
+
+    /// **The name alone is not the tell either**, which is the other half of [`KMDF_BIND`]'s rule and
+    /// the one review found missing: an untrusted image can import a routine *called* `WdfVersionBind`
+    /// from anywhere, and `bind_import` says it came from the framework's loader.
+    #[test]
+    fn the_bind_routine_from_another_library_is_not_the_tell() {
+        for library in ["evil.sys", "ntoskrnl.exe", "WdfLdrr.sys", "Wdf01000.sys"] {
+            assert_eq!(
+                client_of(&[named(library, "WdfVersionBind")]),
+                None,
+                "{library}"
+            );
+        }
+        // And the library is still the image's own spelling, so the match is case-insensitive.
+        for library in ["WDFLDR.SYS", "wdfldr.sys", "WdfLdr.sys"] {
+            assert_eq!(
+                client_of(&[named(library, "WdfVersionBind")]),
+                Some(Framework::Kmdf),
+                "{library}"
+            );
+        }
+    }
+
+    /// **A note says only what its tells establish.** The import tell is a fact about an image and
+    /// licenses nothing about a dispatch table -- which is every `driver_hazards` answer, and is a
+    /// `driver_surface` answer whose dispatch tell was tried and failed, where the old fixed sentence
+    /// contradicted the result it sat in.
+    #[test]
+    fn a_note_claims_the_dispatch_table_only_where_a_tell_read_it() {
+        use crate::structured::FrameworkTell as Tell;
+        let import_only = Framework::Kmdf.note(&[Tell::BindImport]);
+        assert!(
+            import_only.contains("not a claim this answer makes")
+                && import_only.contains("WdfDriverInitNoDispatchOverride"),
+            "says what it did not read, and the case that makes it matter: {import_only}"
+        );
+        assert!(
+            !import_only.contains("Every `MajorFunction` entry"),
+            "and claims nothing about the table: {import_only}"
+        );
+
+        let with_table = Framework::Kmdf.note(&[Tell::BindImport, Tell::DispatchTable]);
+        assert!(
+            with_table.contains("Every `MajorFunction` entry read here"),
+            "the table tell licenses the table claim: {with_table}"
+        );
+        assert!(
+            !with_table.contains("not a claim this answer makes"),
+            "and the two clauses are exclusive: {with_table}"
+        );
+
+        // The framework's own code is a different subject and keeps its own sentence -- it must not
+        // tell a reader their *driver* is KMDF.
+        let in_framework = Framework::Kmdf.note(&[Tell::FrameworkImage]);
+        assert!(
+            in_framework.contains("rather than in a driver that binds to it")
+                && !in_framework.contains("this is a KMDF driver"),
+            "{in_framework}"
+        );
     }
 
     /// An ordinal import cannot be the tell, and must not panic the match either.

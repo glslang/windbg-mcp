@@ -150,17 +150,17 @@
       "inputSchema": 570,
       "modelVisible": 1239,
       "name": "driver_hazards",
-      "outputSchema": 3043,
-      "wire": 4426
+      "outputSchema": 3529,
+      "wire": 4912
     },
     {
       "annotations": 74,
-      "description": 282,
+      "description": 474,
       "inputSchema": 473,
-      "modelVisible": 809,
+      "modelVisible": 1001,
       "name": "driver_object",
       "outputSchema": 0,
-      "wire": 898
+      "wire": 1090
     },
     {
       "annotations": 118,
@@ -168,8 +168,8 @@
       "inputSchema": 652,
       "modelVisible": 1735,
       "name": "driver_surface",
-      "outputSchema": 10416,
-      "wire": 12300
+      "outputSchema": 11052,
+      "wire": 12936
     },
     {
       "annotations": 130,
@@ -294,8 +294,8 @@
       "inputSchema": 592,
       "modelVisible": 1397,
       "name": "ioctl_map",
-      "outputSchema": 4132,
-      "wire": 5649
+      "outputSchema": 4618,
+      "wire": 6135
     },
     {
       "annotations": 124,
@@ -402,8 +402,8 @@
       "inputSchema": 2037,
       "modelVisible": 2657,
       "name": "reachable_from_dispatch",
-      "outputSchema": 4670,
-      "wire": 7448
+      "outputSchema": 5156,
+      "wire": 7934
     },
     {
       "annotations": 64,
@@ -606,14 +606,14 @@
   ],
   "totals": {
     "annotations": 7180,
-    "description": 40653,
+    "description": 40845,
     "inputSchema": 61093,
     "instructions": 2022,
-    "modelVisible": 105276,
-    "outputSchema": 177825,
-    "payload": 292196,
+    "modelVisible": 105468,
+    "outputSchema": 179919,
+    "payload": 294482,
     "tools": 67,
-    "wire": 292118,
+    "wire": 294404,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }

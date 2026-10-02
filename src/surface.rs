@@ -702,12 +702,29 @@ pub(crate) fn dispatch_framework(
 /// item 108 buys, and the one that would have stopped that item's own write-up shipping a wrong
 /// sentence.
 ///
-/// `module` is the handler's own, from the attribution the dispatch section already did. The
-/// framework clause **points at the `framework` field** rather than restating it, for the reason
-/// [`crate::framework::Framework::as_clause`] gives.
-pub(crate) fn foreign_dispatch_note(address: &str, module: Option<&str>) -> String {
+/// `module` is the handler's own, from the attribution the dispatch section already did, and
+/// `whole_table` is [`dispatch_framework`]'s answer. The framework clause **points at the
+/// `framework` field** rather than restating it, for the reason
+/// [`crate::framework::Framework::table_clause`] gives.
+///
+/// **Both are needed and the handler's module alone was the defect review found.** A WDM filter
+/// forwarding only `IRP_MJ_DEVICE_CONTROL` into a KMDF driver below it has one framework entry and
+/// 27 of its own, so `dispatch_framework` refuses it -- correctly -- and this note, reading the
+/// module alone, claimed the driver dispatched its whole table through the framework and pointed at
+/// a `framework` field that the refusal had left absent. The two clauses are the two readings, and
+/// each says only what its own evidence covers.
+pub(crate) fn foreign_dispatch_note(
+    address: &str,
+    module: Option<&str>,
+    whole_table: Option<&(crate::framework::Framework, String)>,
+) -> String {
     let cause = match module.and_then(crate::framework::image_is) {
-        Some(framework) => framework.as_clause(),
+        // The whole table, and the *same* framework: a table recognised as one framework's with the
+        // IOCTL entry in another is not a reading either clause describes.
+        Some(framework) if whole_table.is_some_and(|(whole, _)| *whole == framework) => {
+            framework.table_clause()
+        }
+        Some(framework) => framework.one_entry_clause(),
         None => {
             "the kernel's stub for a major function it does not handle, or a filter forwarding to \
              the driver below it"
@@ -1483,12 +1500,13 @@ mod tests {
         assert_eq!(dispatch_framework(&section), None);
     }
 
-    /// The third cause, in the sentence a caller reads. **Both arms**, because the two-cause version
-    /// was not wrong about its two -- it was wrong about the one it did not have, and a test for the
-    /// new arm alone would not notice the old one being lost.
+    /// The third cause, in the sentence a caller reads. **All three arms**, because the two-cause
+    /// version was not wrong about its two -- it was wrong about the one it did not have, and a test
+    /// for the new arm alone would not notice the old ones being lost.
     #[test]
     fn a_handler_in_the_framework_is_explained_as_one() {
-        let kmdf = foreign_dispatch_note("0xfffff8051234abcd", Some("Wdf01000"));
+        let whole = (crate::framework::Framework::Kmdf, "Wdf01000".to_string());
+        let kmdf = foreign_dispatch_note("0xfffff8051234abcd", Some("Wdf01000"), Some(&whole));
         assert!(
             kmdf.contains("KMDF") && kmdf.contains("`framework`"),
             "names the framework and points at the field that explains it: {kmdf}"
@@ -1497,14 +1515,37 @@ mod tests {
             !kmdf.contains("filter forwarding"),
             "and does not also offer the two causes it is not: {kmdf}"
         );
-        let wdm = foreign_dispatch_note("0xfffff8051234abcd", Some("someotherdriver"));
+        let wdm = foreign_dispatch_note("0xfffff8051234abcd", Some("someotherdriver"), None);
         assert!(
             wdm.contains("kernel's stub") && wdm.contains("filter forwarding"),
             "a handler in a driver still gets the two causes it may be: {wdm}"
         );
         // An entry nothing could attribute gets the same two: they are what is left, and the
         // framework arm is the one that needs evidence.
-        assert_eq!(wdm, foreign_dispatch_note("0xfffff8051234abcd", None));
+        assert_eq!(wdm, foreign_dispatch_note("0xfffff8051234abcd", None, None));
+    }
+
+    /// **One forwarded entry is not a framework driver's table**, which is the reading the first
+    /// version of this note got wrong: a WDM filter sending only `IRP_MJ_DEVICE_CONTROL` into a KMDF
+    /// driver below it has one framework entry and 27 of its own, `dispatch_framework` refuses it,
+    /// and the note claimed the whole table *and* pointed at a `framework` field the refusal had
+    /// left absent.
+    #[test]
+    fn one_forwarded_entry_claims_nothing_about_the_rest_of_the_table() {
+        let note = foreign_dispatch_note("0xfffff8051234abcd", Some("Wdf01000"), None);
+        assert!(
+            note.contains("Wdf01000") && note.contains("at least one other entry"),
+            "names the framework this entry reaches and says what it does not cover: {note}"
+        );
+        assert!(
+            !note.contains("whole table") && !note.contains("`framework`"),
+            "and claims neither the table nor a field that may not be there: {note}"
+        );
+        // And the same guard the other way round: a table recognised as one framework's with the
+        // IOCTL entry in a module that is not it is neither reading.
+        let elsewhere = (crate::framework::Framework::Kmdf, "Wdf01000".to_string());
+        let other = foreign_dispatch_note("0x1000", Some("someotherdriver"), Some(&elsewhere));
+        assert!(other.contains("kernel's stub"), "{other}");
     }
 
     /// **The rendered half carries the note too**, which is the half that is easy to leave out:

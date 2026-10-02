@@ -8783,15 +8783,17 @@ fn driver_surface(e: &DebugEngine, driver: &str, deadline: Instant) -> Result<Ou
                     // framework driver is a third, which is the wrong sentence `FOLLOWUPS.md` item
                     // 108 records this repo shipping. A rule stated in the worker has no test.
                     //
-                    // Read off the handler's **own** module rather than off the whole table, which
-                    // is a different question: `dispatch_framework` asks whether *every* entry is
-                    // the framework's, and the one that decides this note is `0x0e`.
+                    // **Both the handler's own module and the whole table's answer**, which are
+                    // different questions and were conflated here: `dispatch_framework` asks
+                    // whether *every* entry is the framework's, the module asks about `0x0e`
+                    // alone, and the sentence it licenses differs. See `foreign_dispatch_note`.
                     note: Some(surface::foreign_dispatch_note(
                         address,
                         dispatch
                             .device_control
                             .as_ref()
                             .and_then(|at| at.module.as_deref()),
+                        dispatch_framework.as_ref(),
                     )),
                     map: None,
                 },
