@@ -2176,11 +2176,12 @@ detour and produced a wrong sentence in a checked-in document before review caug
 landed 2026-10-02 and step 3 with it; this entry is narrowed to step 2**, which is the expensive half
 and was deliberately not started first.
 
-**What the tools assumed.** `driver_object`, `ioctl_map`, `reachable_from_dispatch`,
-`driver_surface` and the `MajorFunction[0x0e]` recipes in `skills/windbg-debugging/driver-ioctl.md`
-and `.claude/skills/live-kernel/SKILL.md` all read a driver's dispatch out of
-`DRIVER_OBJECT->MajorFunction` and expected the entries to name routines **in that driver**. For a
-WDM driver they do. For a KMDF driver they do not — all 28 entries are the framework's — so
+**What the tools assumed.** `driver_object`, `driver_surface` and the `MajorFunction[0x0e]` recipes
+in `skills/windbg-debugging/driver-ioctl.md` and `.claude/skills/live-kernel/SKILL.md` read a
+driver's dispatch out of `DRIVER_OBJECT->MajorFunction` and expected its entries to name routines
+**in that driver**; `ioctl_map` and `reachable_from_dispatch` are *handed* one of those entries as
+an address and inherit the expectation from whoever read the table. For a WDM driver the entries
+are the driver's. For a KMDF driver they are not — all 28 are the framework's — so
 `driver_object` reported a driver that dispatches nothing of its own, and `ioctl_map` started at one
 of those entries found no IOCTL switch because there is none there to find. None of that was *wrong*
 as a reading of the table; it was the tools answering a question the caller did not mean to ask,

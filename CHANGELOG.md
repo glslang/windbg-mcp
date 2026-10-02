@@ -10,8 +10,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **The driver tools say when a dispatch table is a *framework's* rather than the driver's, which is
-  the reading that was silently useless (`FOLLOWUPS.md` item 108 step 1).** Every driver tool here
-  reads `_DRIVER_OBJECT->MajorFunction` and expected the entries to be the driver's own routines; a
+  the reading that was silently useless (`FOLLOWUPS.md` item 108 step 1).** The driver tools that read
+  `_DRIVER_OBJECT->MajorFunction` expected its entries to be the driver's own routines, and the two
+  handed one of those entries as an address — `ioctl_map` and `reachable_from_dispatch` — inherited
+  the expectation; a
   **KMDF** driver's 28 entries are all `Wdf01000!FxDevice::Dispatch` or `FxDevice::DispatchWithLock`,
   so `driver_surface` reported a driver dispatching nothing of its own and `ioctl_map` started at one
   of those entries reported a routine accepting no control codes — both correct about the table and
