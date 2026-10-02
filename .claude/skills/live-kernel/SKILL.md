@@ -235,8 +235,8 @@ table is ordinarily the *framework's* — ordinarily, because a client passing
 assuming either: `Wdf01000!FxDriver::Initialize` writes `FxDevice::Dispatch` or
 `FxDevice::DispatchWithLock` into all 28 slots from `DRIVER_OBJECT+0x70` onwards, so step 3 hands
 you framework code and the `uf` in it has no IOCTL switch — correctly, because the codes are
-compared inside the `EvtIoDeviceControl` of an I/O queue -- usually, that being one of several
-callback slots and not the only one -- which this server cannot yet resolve
+compared somewhere in the driver's own code that this server cannot yet resolve, and not
+necessarily in any callback the framework registered
 (`FOLLOWUPS.md` item 108 step 2). `driver_surface` now says so in a `framework` field rather than
 leaving you to read 28 identical pointers, and `driver_hazards` reports the driver-side tell — an
 import of `WdfVersionBind` from `WdfLdr.sys`. **Check that before concluding a driver dispatches
