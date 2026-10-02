@@ -87,6 +87,13 @@ public class DecompileFunctions extends GhidraScript {
                     out.println(result.getDecompiledFunction().getC());
                 }
             }
+            // `PrintWriter` swallows every `IOException` and records a flag instead, so
+            // without this a report truncated by a full disk is announced as a success.
+            // Flushed first, so the only write left for `close()` is an empty buffer.
+            out.flush();
+            if (out.checkError()) {
+                throw new java.io.IOException("writing " + output + " failed");
+            }
         }
         finally {
             decompiler.dispose();

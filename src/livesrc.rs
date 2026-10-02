@@ -91,6 +91,16 @@ pub(crate) const READY_LINE: &str = "windbg-mcp-gpa/1";
 /// and the failure would look like a hang rather than a misconfiguration.
 const MAX_BANNER_LINES: usize = 64;
 
+/// The most one line of a transport's output may be. See [`Transport::line`].
+const MAX_LINE_BYTES: u64 = 64 * 1024;
+
+/// How long [`LiveSource`]'s teardown waits for the transport to exit before killing it.
+///
+/// A bound rather than a plain `wait()`, because `wait()` returns an error only on a real failure
+/// and **not** because the child is still alive — so a transport that ignores its stdin closing, or
+/// hangs tearing its own provider down, would block teardown for ever and never reach the kill.
+const TEARDOWN_GRACE: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// The most a transport may declare for `max_read`.
 ///
 /// Not a protocol limit but a guard on *our* allocation: `read_chunk` is handed a buffer by
@@ -188,11 +198,34 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         }
     }
 
+    /// One line of the transport's output, bounded.
+    ///
+    /// **The bound is on the line's length as well as on the number of lines**, because
+    /// [`MAX_BANNER_LINES`] limits only the count: a transport that writes a binary log to its
+    /// stdout, or any provider that prints without a newline, would otherwise grow this buffer
+    /// until the process ran out of memory. `read_line` has no limit of its own. The failure is a
+    /// misconfigured transport rather than a hostile one — the operator wrote it — but *out of
+    /// memory* is the wrong way to report that, and the skipped lines are echoed to stderr, so a
+    /// gigabyte of them would be printed as well as held.
+    ///
+    /// A fresh `take` per call, so the allowance is per line rather than per transport.
     fn line(&mut self) -> Result<String> {
         let mut line = String::new();
-        let read = self.reader.read_line(&mut line)?;
+        // `Read::take` by its full path with an explicit `&mut R` receiver: written as
+        // `self.reader.by_ref().take(..)` the auto-deref picks `take` on `R` itself and moves the
+        // reader out of `self`, which does not compile.
+        let mut limited = std::io::Read::take(&mut self.reader, MAX_LINE_BYTES);
+        let read = limited.read_line(&mut line)?;
         if read == 0 {
             bail!("the transport closed its stdout");
+        }
+        // Hitting the allowance with no newline is the overlong case, and it has to be told from a
+        // final line at EOF, which also arrives without one — that one is short and is legal.
+        if read as u64 == MAX_LINE_BYTES && !line.ends_with('\n') {
+            bail!(
+                "the transport sent {MAX_LINE_BYTES} bytes with no newline; a status line is one \
+                 line, so this is not one"
+            );
         }
         Ok(line.trim_end_matches(['\r', '\n']).to_string())
     }
@@ -361,7 +394,27 @@ impl LiveSource {
         };
         let stdin = child.stdin.take().context("the child has no stdin")?;
         let stdout = child.stdout.take().context("the child has no stdout")?;
-        let mut transport = Transport::new(BufReader::new(stdout), stdin);
+        // **Constructed before the handshake, not after**, so that every failure below runs this
+        // type's `Drop` and the transport is reaped. Dropping a bare `std::process::Child` neither
+        // kills nor waits for the process, so a `?` on the handshake used to leave a transport
+        // running with whatever privileged provider and driver handles it had opened — and the CLI
+        // reported failure and exited, so nothing would ever close them. The shape is a placeholder
+        // until `handshake` fills it in; a source whose handshake failed is returned to no caller
+        // and so reaches no `Reader`.
+        let mut source = LiveSource {
+            child,
+            transport: std::cell::RefCell::new(Some(Transport::new(BufReader::new(stdout), stdin))),
+            shape: GuestShape::default(),
+            max_read: 1,
+        };
+        source.handshake()?;
+        Ok(source)
+    }
+
+    /// The `SHAPE` exchange, run against a source that already owns its child.
+    fn handshake(&mut self) -> Result<()> {
+        let mut held = self.transport.borrow_mut();
+        let transport = held.as_mut().context("the transport was already closed")?;
         for line in transport
             .await_ready()
             .context("the transport never said it was ready")?
@@ -369,12 +422,10 @@ impl LiveSource {
             eprintln!("transport: {line}");
         }
         let reply = transport.shape().context("the SHAPE handshake failed")?;
-        Ok(LiveSource {
-            child,
-            transport: std::cell::RefCell::new(Some(transport)),
-            shape: reply.shape,
-            max_read: reply.max_read,
-        })
+        drop(held);
+        self.shape = reply.shape;
+        self.max_read = reply.max_read;
+        Ok(())
     }
 }
 
@@ -382,13 +433,37 @@ impl Drop for LiveSource {
     fn drop(&mut self) {
         // Closing stdin is the transport's cue to exit, which lets an operator's script tear its own
         // provider down in order — on this bench that means `SdkCloseAllPartitions` and a driver
-        // handle. A kill is the fallback rather than the method, because a provider killed mid-read
-        // can leave that handle open.
+        // handle. So the kill is a fallback rather than the method, because a provider killed
+        // mid-read can leave that handle open.
         self.transport.borrow_mut().take();
-        if self.child.wait().is_err() {
-            let _ = self.child.kill();
+        reap(&mut self.child, TEARDOWN_GRACE);
+    }
+}
+
+/// Wait for a transport to exit, then kill it if it will not.
+///
+/// **Polled to a deadline rather than waited on.** `Child::wait` answers an error only when the wait
+/// itself fails, never because the child is still alive — so a transport that ignores EOF, or hangs
+/// tearing its provider down, would block here for ever and the kill would be unreachable. An
+/// earlier version did exactly that, and its comment called the kill a fallback while nothing could
+/// reach it.
+///
+/// The grace is a parameter rather than read from [`TEARDOWN_GRACE`] so that a test can pin the
+/// bound: at the constant it would take ten seconds to find out whether the bound exists at all.
+fn reap(child: &mut Child, grace: std::time::Duration) {
+    let deadline = std::time::Instant::now() + grace;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return,
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            // Either the grace expired or the wait itself failed. Both end the same way.
+            _ => break,
         }
     }
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 impl sk::RawSource for LiveSource {
@@ -676,6 +751,60 @@ mod tests {
         let noise = "not a transport\n".repeat(MAX_BANNER_LINES + 10);
         let err = exchange(&noise).await_ready().unwrap_err();
         assert!(format!("{err}").contains("probably"), "{err}");
+    }
+
+    #[test]
+    fn an_unterminated_line_is_refused_rather_than_read_until_memory_runs_out() {
+        // `MAX_BANNER_LINES` bounds how many lines are read and not how long one is, so a transport
+        // writing a binary log to its stdout -- or any provider printing without a newline -- would
+        // grow this buffer until the process died. Rather more than the allowance, with no newline
+        // anywhere in it.
+        let flood = "x".repeat(MAX_LINE_BYTES as usize + 4096);
+        let err = exchange(&flood).await_ready().unwrap_err();
+        assert!(format!("{err}").contains("no newline"), "{err}");
+    }
+
+    #[test]
+    fn a_line_at_the_allowance_that_does_end_in_a_newline_is_still_read() {
+        // The other side of it: the bound must not refuse a legal line that happens to be long, and
+        // must not refuse a final line at EOF, which also arrives with no newline.
+        let long = "y".repeat(MAX_LINE_BYTES as usize - 1);
+        let mut transport = exchange(&(long.clone() + "\n"));
+        assert_eq!(transport.line().unwrap(), long);
+        assert_eq!(
+            exchange("short, no newline").line().unwrap(),
+            "short, no newline"
+        );
+    }
+
+    #[test]
+    fn a_transport_that_will_not_exit_is_killed_at_the_grace_rather_than_waited_on_for_ever() {
+        // The defect this pins: `Child::wait` does not fail because a child is alive, so a teardown
+        // built on it never reaches its own kill. A child that outlives the grace by a long way is
+        // what tells a bound from no bound -- against `wait()` this test does not fail, it hangs for
+        // thirty seconds, which is the reading to expect when mutating it back.
+        let mut child = {
+            let _guard = crate::engine::spawn_guard();
+            Command::new("cmd")
+                .args(["/c", "ping", "-n", "30", "127.0.0.1"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("cmd is on every Windows host")
+        };
+        let started = std::time::Instant::now();
+        reap(&mut child, std::time::Duration::from_millis(50));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(10),
+            "teardown took {:?}, so it waited rather than bounding",
+            started.elapsed()
+        );
+        // And it was reaped rather than merely abandoned: a killed-and-waited child has a status.
+        assert!(
+            matches!(child.try_wait(), Ok(Some(_))),
+            "the child was not reaped"
+        );
     }
 
     #[test]

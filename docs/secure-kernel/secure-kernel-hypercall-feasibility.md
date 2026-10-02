@@ -5337,22 +5337,31 @@ the point.
 #### Direct mode — the whole decode, live
 
 `SdkReadPhysicalMemory` through hvlib's hvmm driver, which reads VTL1 and never refuses. Against the
-running VBS guest (partition 5, `max_read` 4096):
+running VBS guest (partition 5, `max_read` 4096), **run of 2026-10-01** — the date matters and the
+second column is why:
 
-| | |
-|---|---|
-| root | `0x1201000`, 26 present entries, self-map at `[290]`, 26 in the upper half |
-| walk | **11,819 leaf mappings over 4,229 distinct pages**, 169 table reads, 0 malformed, **complete** |
-| scan | 11,819 pages, 6 PE headers found, **1 matching the image on disk** |
-| identified | `securekernel.exe` at **`0xFFFFF8024278A000`** (GPA `0xCD1000`), 4 `KDBG` hits, 3 other PE headers rejected on `KernBase` |
-| `KdDebuggerDataBlock` | `0xFFFFF802428BD5E0` = base `+0x1335E0`, Size `0x3A0` |
-| `SkLoadedModuleList` | `0xFFFFF802428B1770` = base `+0x127770` |
-| image | 1,527,808 bytes gathered, 0 pages unreadable |
-| **modules** | **6**, complete: `securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`, `vmsvc.dll`, `vmsvcext.sys` |
-| reads | **12,375 attempted, 0 failed, 0 refused, 50,688,000 bytes** |
+| | 2026-10-01 | re-run 2026-10-02 |
+|---|---|---|
+| root | `0x1201000`, 26 present entries, self-map at `[290]`, 26 in the upper half | identical |
+| walk | **11,819 leaf mappings over 4,229 distinct pages**, 169 table reads, 0 malformed, **complete** | **11,820 leaves over 4,318 pages**, same 169 table reads, still complete |
+| scan | 11,819 pages, 6 PE headers found, **1 matching the image on disk** | 11,820 pages, same 6, same 1 |
+| identified | `securekernel.exe` at **`0xFFFFF8024278A000`** (GPA `0xCD1000`), 4 `KDBG` hits, 3 other PE headers rejected on `KernBase` | identical |
+| `KdDebuggerDataBlock` | `0xFFFFF802428BD5E0` = base `+0x1335E0`, Size `0x3A0` | identical |
+| `SkLoadedModuleList` | `0xFFFFF802428B1770` = base `+0x127770` | identical |
+| image | 1,527,808 bytes gathered, 0 pages unreadable | identical |
+| **modules** | **6**, complete: `securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`, `vmsvc.dll`, `vmsvcext.sys` | identical |
+| reads | **12,375 attempted, 0 failed, 0 refused, 50,688,000 bytes** | 12,376 reads, 50,692,096 bytes |
 
 So every figure gate S1 reports from a capture, it now reports from a **running** guest, through a
 source the repository does not ship.
+
+**And the second column is a result rather than noise.** It is the same command against the same
+guest on the same boot, a day apart, and what moved is the **mapping**: 89 more distinct pages behind
+one more leaf. Every landmark, the identified base, the debugger data block, the loader list and the
+module names are byte-identical. So S5x's finding below — that a live source is not a snapshot — shows
+up in the headline figures and not only in its own churn arm, and it is the *stronger* form of it:
+S5x measured page *contents* changing, while this is the page *table* changing. A capture cannot do
+this, which is exactly why these numbers carry a date. Do not "correct" one column against the other.
 
 #### Hypercall mode — the refusal, at last from a real source
 

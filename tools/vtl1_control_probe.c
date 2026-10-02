@@ -1024,6 +1024,27 @@ static DWORD WINAPI receive_message(void *parameter)
     }
 }
 
+/* A receiver thread that will not stop owns memory this process is about to destroy.
+ *
+ * `receive_message` runs on a stack-allocated MESSAGE_RECEIVER and calls through a VID_API whose
+ * function pointers live in `vid.dll`. If it has not exited, unwinding deletes the partition,
+ * closes the thread handle -- which does not stop a thread -- drops that stack frame, and unloads
+ * the library the thread is executing in. So there is nothing safe to do here except stop the
+ * process: every cleanup step is a use-after-free, and leaving the thread running is worse than
+ * exiting without tidying a disposable partition the kernel reclaims anyway.
+ *
+ * Raised in review on #434, against both this path and `start_message_receiver`'s timeout.
+ */
+static void abort_on_live_receiver(const wchar_t *where)
+{
+    fwprintf(stderr,
+             L"%ls: the message receiver is still running, so this process cannot unwind "
+             L"without freeing memory that thread is using. Terminating.\n",
+             where);
+    fflush(stderr);
+    TerminateProcess(GetCurrentProcess(), 3);
+}
+
 static HANDLE start_message_receiver(const VID_API *api, HANDLE partition,
                                      HANDLE ready,
                                      MESSAGE_RECEIVER *receiver)
@@ -1047,7 +1068,9 @@ static HANDLE start_message_receiver(const VID_API *api, HANDLE partition,
         InterlockedExchange(&receiver->stop_requested, 1);
         api->message_slot_handle_and_get_next(
             partition, MESSAGE_SLOT, CANCEL_MESSAGE_WAIT_FLAGS, NULL);
-        WaitForSingleObject(thread, 5000);
+        if (WaitForSingleObject(thread, 5000) != WAIT_OBJECT_0) {
+            abort_on_live_receiver(L"start_message_receiver");
+        }
         CloseHandle(thread);
         SetLastError(WAIT_TIMEOUT);
         return NULL;
@@ -1209,6 +1232,7 @@ static void cancel_message_receiver(const VID_API *api, HANDLE partition,
                      L"message receiver did not exit after cancellation: "
                      L"wait=%lu\n",
                      wait);
+            abort_on_live_receiver(L"cancel_message_receiver");
         }
     }
 }
@@ -1983,6 +2007,13 @@ static BOOL parse_dword(const wchar_t *text, DWORD *value)
     wchar_t *end = NULL;
     unsigned long parsed;
 
+    /* `wcstoul` accepts a leading sign and WRAPS a negative, so "-1" parses as MAXDWORD with errno
+     * clear -- rejected here rather than range-checked afterwards, because the wrapped value is in
+     * range and no later check can tell it from a number the caller meant. Raised in review on #434.
+     */
+    if (text[0] == L'-' || text[0] == L'+') {
+        return FALSE;
+    }
     errno = 0;
     parsed = wcstoul(text, &end, 10);
     if (errno != 0 || end == text || *end != L'\0' || parsed > MAXDWORD) {
@@ -2028,7 +2059,11 @@ int wmain(int argc, wchar_t **argv)
             wcscmp(argv[1], L"--securekernel-breakpoint") == 0;
         for (i = 2; i < argc; i++) {
             if (wcscmp(argv[i], L"--timeout-ms") == 0 && i + 1 < argc) {
-                if (!parse_dword(argv[++i], &timeout_ms) || timeout_ms == 0) {
+                /* INFINITE (0xFFFFFFFF) is a legal DWORD and the one value that defeats every wait
+                 * built on it: a breakpoint that never arrives would hold the probe, the VP and the
+                 * partition for ever rather than timing out and cleaning up. */
+                if (!parse_dword(argv[++i], &timeout_ms) || timeout_ms == 0 ||
+                    timeout_ms == INFINITE) {
                     usage(argv[0]);
                     return 2;
                 }

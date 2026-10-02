@@ -5375,7 +5375,9 @@ made, and that what they measured settles where the *remaining* ones belong.
 Hyper-V checkpoint through four MCP tools, with no driver and no debuggee and DbgEng appearing only
 as gate S2's image-symbol server. Since gate S5w the same decode also runs against a **live** guest
 through `--sk-live`, over a transport the operator supplies: 11,819 leaf mappings, `securekernel.exe`
-identified, six VTL1 modules, 12,375 reads and 50,688,000 bytes with nothing failed. VTL1 kernel
+identified, six VTL1 modules, 12,375 reads and 50,688,000 bytes with nothing failed (run of
+2026-10-01; a re-run the next day reported 11,820 leaves over **4,318** distinct pages, with every
+landmark identical — see S5w, where the two readings sit side by side). VTL1 kernel
 memory is **fully readable and writable** from the root — read by two routes and written by two, the
 second of which this entry had recorded as broken until S5u retracted that.
 
@@ -5560,7 +5562,8 @@ rather than deleted.
    **child process speaking a line protocol on its stdio**, so what this repository gains is the
    *client* and the operator still supplies the transport; `windbg-mcp --sk-live --transport
    "<command>" --image <path>` drives gate S1's whole decode through it. Against the **running** VBS
-   guest it reports what a capture reports: root `0x1201000`, a complete walk of **11,819 leaf
+   guest it reports what a capture reports — figures from the run of 2026-10-01, which S5w pairs with
+   a re-run that moved them: root `0x1201000`, a complete walk of **11,819 leaf
    mappings over 4,229 distinct pages**, `securekernel.exe` identified at `0xFFFFF8024278A000` with 4
    `KDBG` hits and three other PE headers rejected, `KdDebuggerDataBlock` at base `+0x1335E0`,
    `SkLoadedModuleList` at base `+0x127770`, and **six VTL1 modules** — over **12,375 reads and

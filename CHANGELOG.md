@@ -18,11 +18,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partition's VTL1 live needs a kernel component this project will not distribute — the same standing
   decision as the live-kernel tier's KDNET wiring. `windbg-mcp --sk-live --transport "<command>"
   --image <path>` drives gate S1's whole decode through it. Measured against the running VBS lab
-  guest: root `0x1201000`, a **complete** walk of **11,819 leaf mappings over 4,229 distinct pages**,
+  guest (run of 2026-10-01): root `0x1201000`, a **complete** walk of **11,819 leaf mappings over
+  4,229 distinct pages**,
   `securekernel.exe` identified at `0xFFFFF8024278A000` with 4 `KDBG` hits and three other PE headers
   rejected on `KernBase`, `KdDebuggerDataBlock` at base `+0x1335E0`, `SkLoadedModuleList` at base
   `+0x127770`, and **six VTL1 modules** (`securekernel.exe`, `skci.dll`, `symcryptk.dll`, `cng.sys`,
   `vmsvc.dll`, `vmsvcext.sys`) — over **12,375 reads and 50,688,000 bytes with nothing failed**.
+  **The walk counts are a reading of a running guest and move between runs**: the same command on
+  2026-10-02 reported 11,820 leaves over **4,318** distinct pages and 12,376 reads, with every
+  landmark, the identified base and the module list byte-identical. That is the first consequence
+  below, visible in the headline figures rather than only in the churn arm.
   A second transport drives `HvCallReadGpa` instead, at its real `max_read` of **16** — the width
   `RawSource::max_read` exists because of — and answers
   **`Refused { detail: "ReadIntercept(2)" }`**, so `ReadStats::refused` is above zero outside a
