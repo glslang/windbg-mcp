@@ -71,18 +71,25 @@
 //! `WdfDeviceWdmDispatchIrpToIoQueue`, or something else -- is the driver's choice and is step 2's
 //! question (`FOLLOWUPS.md` item 108), not a claim this file makes.
 //!
-//! **That last sentence is the deliberate end of a run of four review findings, and the shape of this
-//! section is the remedy rather than its wording.** Each round corrected a claim here and the
-//! correction was the next round's finding: the list was closed and missed the WDM hooks, then closed
-//! again and missed the in-caller-context one; then the in-caller-context route was called *the*
-//! `METHOD_NEITHER` route, inferred from two unsafe-buffer helpers requiring caller context -- which
-//! says nothing about a driver reading `Type3InputBuffer` straight off the IRP in a preprocess
-//! callback, having never made a WDF request; and then "none of these replaces the queue" was written
-//! as a headline above its own qualifier, when a callback may complete or pend the request and no
-//! queue callback runs at all. Every one of those was me characterising a framework this crate does
-//! not own, from partial evidence, in prose no code here depends on. So the characterisation is gone:
-//! what stays is what was *measured on this build* -- the queue slots, the registration names, the
-//! call path -- and the taxonomy belongs to WDF's own documentation.
+//! **And the answer is not even necessarily in a callback.** `_WDF_IO_QUEUE_DISPATCH_TYPE` on this
+//! build is `Invalid`, `Sequential`, `Parallel`, `Manual`, `Max`: a driver whose queue is **manual**
+//! takes requests out of it with `WdfIoQueueRetrieveNextRequest` whenever it likes -- a worker thread,
+//! a timer -- so the control-code comparison need be in no registered callback at all. Which is why
+//! the notes this file builds assert nothing about where a client's comparison is, only that this
+//! build cannot say.
+//!
+//! **That is the deliberate end of a run of five review findings, and the shape of this section is
+//! the remedy rather than its wording.** Each round corrected a claim here and the correction was the
+//! next round's finding: a closed list missing the WDM hooks, a closed list missing the
+//! in-caller-context callback, then that callback called *the* `METHOD_NEITHER` route -- inferred from
+//! two unsafe-buffer helpers requiring caller context, which says nothing about a driver reading
+//! `Type3InputBuffer` straight off the IRP in a preprocess callback, having made no WDF request --
+//! then "none of these replaces the queue" written as a headline above its own qualifier, and finally
+//! "compared in a callback the framework holds", which manual queues falsify outright. Every one was
+//! me characterising a framework this crate does not own, from partial evidence, in prose no code here
+//! depends on. So the characterisation is gone: what stays is what was *measured on this build* -- the
+//! queue slots, the dispatch types, the registration names, the call path -- as names to look for, and
+//! the taxonomy belongs to WDF's own documentation.
 //! Naming one slot as *the* place was the overclaim the rest of this file's history is about, in the
 //! one sentence that looked like architecture rather than evidence -- and it is the one that would
 //! send a reader to the wrong callback.
@@ -202,10 +209,7 @@ impl Framework {
             Table::Frameworks(_) => {
                 " Every `MajorFunction` entry read here is in the framework's image, so a dispatch \
                  entry is the framework's code rather than this driver's and holds no IOCTL compare \
-                 chain: this driver's control codes are compared in a callback the framework holds, \
-                 which this build cannot resolve -- an I/O queue's `EvtIoDeviceControl` usually, or \
-                 another of its queue slots such as `EvtIoDefault`, or one of the callbacks that run \
-                 before the queue, among them the `METHOD_NEITHER` in-caller-context one."
+                 chain. Where this driver's own control-code comparison is, this build cannot say."
             }
             Table::NotEstablished => {
                 " This driver's `MajorFunction` entries **were** read and are in this answer, and \
@@ -366,10 +370,8 @@ pub(crate) fn code_report(framework: Framework) -> crate::structured::DriverFram
     crate::structured::DriverFramework {
         note: "this routine is in `Wdf01000.sys`, the KMDF framework, rather than in a driver that \
                binds to it -- so this answers about code every KMDF driver on the target shares, and \
-               about none of them in particular. A KMDF driver whose dispatch table the framework \
-               took over compares its control codes in a callback the framework holds -- an I/O \
-               queue's `EvtIoDeviceControl` usually, or another of its queue slots, or one of the \
-               callbacks that run before the queue -- which this build cannot resolve."
+               about none of them in particular. Where a client driver's own control-code comparison \
+               is, this build cannot say."
             .to_string(),
         framework: framework.name().to_string(),
         tells: vec![crate::structured::FrameworkTell::FrameworkImage],
@@ -492,32 +494,48 @@ mod tests {
             "without naming a destination nothing read -- an override client may leave the kernel's              stub in the slot, or handle no IOCTL at all: {unread}"
         );
 
-        // **The whole note, not just its clause.** Three rounds found a consequence of the table
-        // having been taken over sitting in the *base* sentence, where nothing licenses it -- the
-        // last of them contradicting the clause printed underneath it. So this asserts the absence
-        // across the note as a whole, which is the only form that catches it moving back up. Both
-        // readings that did not establish the framework owns the table are checked, since the
-        // sentence could drift into either.
         let read_but_not = Framework::Kmdf.note(Table::NotEstablished);
-        for forbidden in [
-            "EvtIoDeviceControl",
-            "callbacks it holds",
-            "no IOCTL compare chain",
-        ] {
-            for (reading, note) in [("an unread", &unread), ("an unrecognised", &read_but_not)] {
-                assert!(
-                    !note.contains(forbidden),
-                    "{reading} table licenses no consequence of the framework owning it                      ({forbidden}): {note}"
-                );
-            }
-        }
-
         let whole = Framework::Kmdf.note(Table::Frameworks("Wdf01000".to_string()));
         assert!(
             whole.contains("Every `MajorFunction` entry read here")
-                && whole.contains("EvtIoDeviceControl"),
-            "a table read as the framework's licenses the claim and its consequence: {whole}"
+                && whole.contains("holds no IOCTL compare chain"),
+            "a table read as the framework's licenses the claim about the entry: {whole}"
         );
+        assert!(
+            whole.contains("this build cannot say"),
+            "and declines to locate the driver's own comparison rather than guessing: {whole}"
+        );
+        // **A claim about the table's contents belongs only to the reading that read them**, which the
+        // base sentence carried for three rounds -- the last of those contradicting the clause printed
+        // underneath it. Asserted across the note as a whole, since that is the only form that catches
+        // one moving back up into the base.
+        for forbidden in ["no IOCTL compare chain", "callbacks it holds"] {
+            for (reading, note) in [("an unread", &unread), ("an unrecognised", &read_but_not)] {
+                assert!(
+                    !note.contains(forbidden),
+                    "{reading} table licenses no claim about the entries ({forbidden}): {note}"
+                );
+            }
+        }
+        // **And no reading names a callback at all**, which is where five consecutive review findings
+        // landed: every attempt to say where a client's control codes *are* was wrong, the last of
+        // them because a manual queue's consumer need be no registered callback. The rule now is that
+        // these notes locate nothing, so the assertion is the absence of every name they used to
+        // offer -- non-vacuous because each string was in one of them one commit ago.
+        for named in [
+            "EvtIoDeviceControl",
+            "EvtIoDefault",
+            "EvtIoInternalDeviceControl",
+            "in-caller-context",
+            "preprocess",
+        ] {
+            for note in [&unread, &read_but_not, &whole] {
+                assert!(
+                    !note.contains(named),
+                    "a note locates no callback ({named}): {note}"
+                );
+            }
+        }
 
         // **The state that had nowhere to go.** It has to say the entries *were* read -- the opposite
         // of the `Unread` sentence it used to borrow -- and must claim neither that the framework
