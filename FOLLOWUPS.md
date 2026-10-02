@@ -2253,8 +2253,9 @@ read, and all three were written from the S5o gate rather than re-derived.
 
 **Also worth knowing before step 2, and not about KMDF.** A library-only rule misclassifies the
 framework as its own client: `Wdf01000.sys` imports `WdfRegisterLibrary` and
-`WdfLdrDiagnosticsValueByNameAsULONG` from `WdfLdr.sys` and neither bind routine, so the tell is the
-**name**. And `uf Wdf01000!FxDevice::Dispatch` fails `0x80040205` on this image because `x` matches
+`WdfLdrDiagnosticsValueByNameAsULONG` from `WdfLdr.sys` and neither bind routine — and a name-only
+rule admits any image importing something *called* `WdfVersionBind` from anywhere, so the tell is
+**both**, which took a review round to get right. And `uf Wdf01000!FxDevice::Dispatch` fails `0x80040205` on this image because `x` matches
 that name twice — the routine and an inline caller inside `DispatchWithLock` — so anything driving
 the framework by symbol wants module+RVA.
 

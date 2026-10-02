@@ -26,11 +26,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   whole fill loop at `+0x200`, which writes `DRIVER_OBJECT+0x70` onwards with `cl` running `0`
   through `0x1B` and asks `FxDevice::_RequiresRemLock(cl, 0)` per **major function**, not per device.
   So the dispatch tell requires *every* entry, which also keeps a WDM filter forwarding one major
-  function into a framework image from being reported as a framework driver. **And the tell is the
-  import's name, never its library**: `Wdf01000.sys` itself imports `WdfRegisterLibrary` and
-  `WdfLdrDiagnosticsValueByNameAsULONG` from `WdfLdr.sys`, so a library-only rule would report the
-  framework as its own client — the one image a reader of this field is most likely to be pointing a
-  tool at. `driver_surface`'s IOCTL section now names the framework as the **third** reason a handler
+  function into a framework image from being reported as a framework driver. **And the bind tell is the import's name *and* its
+  library, both.** Either alone is wrong in its own direction, which took a review round to get
+  right: a library-only rule reports the framework as its own client, `Wdf01000.sys` importing
+  `WdfRegisterLibrary` and `WdfLdrDiagnosticsValueByNameAsULONG` from `WdfLdr.sys` and neither bind
+  routine — the one image a reader of this field is most likely to be pointing a tool at — while a
+  name-only rule reports any image that imports something *called* `WdfVersionBind` from anywhere,
+  which an untrusted driver can arrange and which is not the evidence `bind_import` says it carries.
+  **And each tell licenses only its own sentence**: the note is assembled from the tells that fired,
+  so the clause about what the `MajorFunction` entries hold is there only where the dispatch tell read
+  them — on the import alone, which is every `driver_hazards` answer, the note says instead that it
+  made no such claim and names `WdfDriverInitNoDispatchOverride` as why that matters. `driver_surface`'s IOCTL section now names the framework as the **third** reason a handler
   sits outside the driver's image, beside the kernel's stub and a filter; that sentence enumerated two
   and explained a KMDF table as one of them, which is the wrong sentence item 108 records this
   repository shipping. Measured through the dev build against real images on 2026-10-02:
