@@ -171,10 +171,33 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         )
     }
 
+    /// Send one request line — **the only path to the writer**, and that is the point.
+    ///
+    /// Every exchange now has exactly two chokepoints, this and [`Transport::line`], and both refuse
+    /// a poisoned transport before touching its pipes. Checking in `line` alone was not enough and
+    /// the failure was worse than the one it fixed: `read_chunk` wrote its `READ` first and asked
+    /// afterwards, so a poisoned transport still had requests pushed at it. The decode continues past
+    /// failed pages, so the child kept answering into a stdout nobody drained, that pipe filled, the
+    /// child blocked writing, and this side then blocked flushing stdin — turning a framing error
+    /// into a deadlock. Raised in review on #434, against the poison guard's own introduction.
+    ///
+    /// A predicate placed at one of two IO sites is a rule half-written. With the writer private to
+    /// this method, forgetting the check means not sending anything at all.
+    fn send(&mut self, request: &str) -> Result<()> {
+        if self.poisoned {
+            bail!(
+                "this transport desynchronised on an earlier framing fault, so nothing further may \
+                 be sent to it"
+            );
+        }
+        self.writer.write_all(request.as_bytes())?;
+        self.writer.flush()?;
+        Ok(())
+    }
+
     /// Ask for the processor state, and remember the transfer width it declares.
     pub(crate) fn shape(&mut self) -> Result<ShapeReply> {
-        self.writer.write_all(b"SHAPE\n")?;
-        self.writer.flush()?;
+        self.send("SHAPE\n")?;
         let line = self.line()?;
         let reply = parse_shape(&line)?;
         self.max_read = reply.max_read;
@@ -183,12 +206,9 @@ impl<R: BufRead, W: Write> Transport<R, W> {
 
     /// Fill `out` from guest physical memory, or say why not.
     fn read_chunk(&mut self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
-        let request = format!("READ {:#X} {}\n", gpa.0, out.len());
-        self.writer
-            .write_all(request.as_bytes())
-            .and_then(|()| self.writer.flush())
+        self.send(&format!("READ {:#X} {}\n", gpa.0, out.len()))
             .map_err(|e| ReadFailure::SourceError {
-                detail: format!("writing the request failed: {e}"),
+                detail: format!("sending the request failed: {e}"),
             })?;
         let line = self.line().map_err(|e| ReadFailure::SourceError {
             detail: format!("reading the status line failed: {e}"),
@@ -769,6 +789,15 @@ mod tests {
         assert!(
             matches!(&second, ReadFailure::SourceError { detail } if detail.contains("desynchronised")),
             "a poisoned transport must refuse rather than read the leftover payload: {second:?}"
+        );
+        // And it must refuse **before writing**, which is a stronger claim than refusing. The guard
+        // sat in `line()` only, after `read_chunk` had already pushed its `READ` — so a poisoned
+        // transport kept being fed requests it answered into a pipe nobody drained, which deadlocks
+        // both sides instead of failing. One request on the wire, not two.
+        assert_eq!(
+            String::from_utf8(transport.writer.clone()).unwrap(),
+            "READ 0x1000 16\n",
+            "a second request reached the wire after the transport was poisoned"
         );
     }
 
