@@ -2219,13 +2219,22 @@ themselves establishing.** Scoping step 2 against `EvtIoDeviceControl` alone wou
 every driver that does not use it. Measured on this bench and written up in `src/framework.rs`'s
 module docs: `_WDF_IO_QUEUE_CONFIG` carries **eight** callback slots, so a queue configuring no
 specific handler takes device control on `EvtIoDefault` and an internal control code has its own
-slot; and two further routes — `WdfDeviceInitAssignWdmIrpPreprocessCallback` and
-`WdfDeviceConfigureWdmIrpDispatchCallback` — let a driver see the IRP before the framework dispatches
-it. **Neither of those two replaces the queue**, since `WdfDeviceWdmDispatchPreprocessedIrp` and
-`WdfDeviceWdmDispatchIrpToIoQueue` are exported beside them, so a hook may forward rather than
-terminate and finding one does not mean the queue callback is out of the picture. Step 2 therefore
-answers *which of these a given driver used*, which is a walk rather than a lookup — and the honest
-shape of its answer is a set of candidate sites with what was read at each, not a single address.
+slot. Several further routes run **before** the queue sees the request, each exported by this build:
+`WdfDeviceInitSetIoInCallerContextCallback` and its class-extension twin, which is the
+`METHOD_NEITHER` route and so the one this server's IOCTL work cares about most — the unsafe
+user-buffer retrieval APIs require it — plus `WdfDeviceInitAssignWdmIrpPreprocessCallback` and
+`WdfDeviceConfigureWdmIrpDispatchCallback`. **None of them replaces the queue**, since
+`WdfDeviceWdmDispatchPreprocessedIrp` and `WdfDeviceWdmDispatchIrpToIoQueue` are exported beside
+them, so such a callback may forward rather than terminate, and finding one does not mean the queue
+callback is out of the picture.
+
+**And that list is deliberately not certified complete, which is a scoping decision rather than a
+gap.** Two consecutive review rounds each found a route missing from it, which is #349's shape: an
+inclusion is a claim about one route and is checkable on its own, where a closed enumeration is a
+claim about every path a request can take through a framework this repo does not own. So step 2 does
+**not** answer *which of these*: it walks what the driver registered and reports what it found, and
+the honest shape of its answer is a set of candidate sites with what was read at each rather than a
+single address. `src/framework.rs` holds the measurements and is where the list is kept.
 
 **What step 1 measured that step 2 should start from**, stated as the reading rather than as an
 interpretation of it. Disassembled on this bench, `Wdf01000.sys 1.35.26100.3323`:
