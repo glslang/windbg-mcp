@@ -1,0 +1,780 @@
+{
+  "schema_version": 1,
+  "observed_on": "2026-10-02",
+  "scope": {
+    "result": "six independent initialization and teardown paths pass",
+    "does_not_prove": [
+      "one composed device graph",
+      "RAM-construction-complete notification",
+      "firmware execution",
+      "synthetic disk I/O"
+    ]
+  },
+  "interfaces": {
+    "IVirtualDevice": "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}",
+    "IVirtualDeviceMemoryInfo": "{2E223C59-62C4-4D03-93E4-05674B3B94EB}",
+    "IVirtualDeviceRepository": "{355AC5A8-8A94-44A9-BE14-ECF7FB8F7C3B}",
+    "IVirtualDeviceServices": "{20BEEF08-C3AB-44D8-92C3-03EC0CF398DC}"
+  },
+  "repository_slots": {
+    "3": "GetId",
+    "7": "ReadVersion",
+    "9": "GetDeviceId",
+    "11": "GetVmNameAndId",
+    "17": "Open",
+    "18": "Close",
+    "23": "ReadString",
+    "26": "ReadBoolean",
+    "39": "GetRuntimeConfiguration",
+    "40": "ExportConfiguration"
+  },
+  "repository_values": {
+    "/generation_id": "00000000-0000-0000-0000-000000000000",
+    "/PreallocatedResources": false
+  },
+  "binary_identities": {
+    "vid.dll": {
+      "version": "10.0.26100.8457",
+      "size": 263552,
+      "sha256": "9B538C07FA65C09D406956371EF3C68F4BCE4E1FA9F694E4CCB727409366FA26"
+    },
+    "Vid.sys": {
+      "version": "10.0.26100.9278",
+      "size": 910816,
+      "sha256": "6611BCD768EFCFF90C13D39C4D9770315269C43201B3A58B638977486AB06697"
+    },
+    "vmchipset.dll": {
+      "version": "10.0.26100.8457",
+      "size": 1177064,
+      "sha256": "8C13A65575EC35C73B4AABA631F7E7E1E52F88D503A3186B3EAECD375C2BE2D9",
+      "pdb_guid": "{2E91C425-4BBA-1675-375F-8AF8720410F8}",
+      "pdb_age": 1,
+      "pdb_name": "vmchipset.pdb"
+    },
+    "vmbusvdev.dll": {
+      "version": "10.0.26100.8457",
+      "size": 271840,
+      "sha256": "64104CEFE36B4E7695D39550FF64CE94A0CD21F2D9693171E8331BCC60A51736",
+      "pdb_guid": "{A1F04F82-DB3B-3AF6-6744-C606F24BEEB9}",
+      "pdb_age": 1,
+      "pdb_name": "vmbusvdev.pdb"
+    },
+    "vmsynthstor.dll": {
+      "version": "10.0.26100.8457",
+      "size": 517624,
+      "sha256": "E7972B586FA2E8540ED9738C3CA5B6D9D0EF0EB02C1A7FAAABAC33689790446B",
+      "pdb_guid": "{894A49E8-F56D-3957-E8EB-2214733ECA28}",
+      "pdb_age": 1,
+      "pdb_name": "VmSynthStor.pdb"
+    },
+    "vmwp.exe": {
+      "version": "10.0.26100.8457",
+      "size": 3720352,
+      "sha256": "AC076752BD5424B57C994D4529C5179BB153F9DA0119FB23AD1C13AC9A571B20",
+      "pdb_guid": "{DC281C89-2BE3-8A04-AC2B-1C27F20A2865}",
+      "pdb_age": 1,
+      "pdb_name": "vmwp.pdb",
+      "role": "symbol source for motherboard lifecycle and device ordering"
+    },
+    "vmfirmware.dll": {
+      "version": "10.0.26100.7623",
+      "size": 6436256,
+      "sha256": "4FE86E4B71D814F2D679D32BFC813B9B2600A4F1CBFE67C3FEB6689E681A53F6",
+      "codeview": null,
+      "role": "firmware resource consumed by BiosVdev"
+    }
+  },
+  "devices": [
+    {
+      "kind": "guest",
+      "name": "GuestEmulationDevice",
+      "clsid": "{455C0F1B-D51B-40B1-BEAC-87377FE6E041}",
+      "module": "vmchipset.dll",
+      "ivirtual_device": {
+        "iid": "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}",
+        "lifecycle": [
+          {
+            "slot": 3,
+            "method": "GetDependencies",
+            "rva": "0x629E0"
+          },
+          {
+            "slot": 4,
+            "method": "Initialize",
+            "rva": "0x63E10"
+          },
+          {
+            "slot": 5,
+            "method": "Teardown",
+            "rva": "0x6B830"
+          }
+        ]
+      },
+      "owner_partition": true,
+      "get_dependencies_order": [
+        {
+          "name": "ISecurityManager",
+          "iid": "{5315507B-19F0-4E86-AB51-18F159F1A197}",
+          "required": true
+        },
+        {
+          "name": "IVmBios",
+          "iid": "{9BE0B79F-68DF-4C59-9D88-4BFC1BF7A73D}",
+          "required": true
+        },
+        {
+          "name": "IVmBootMemoryTopology",
+          "iid": "{B80FE14E-B5F6-43D4-B206-40B3BF511959}",
+          "required": true
+        },
+        {
+          "name": "IVmbusServices",
+          "iid": "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}",
+          "required": true
+        },
+        {
+          "name": "IVmGuestCrashServices",
+          "iid": "{4F80E76E-0D0F-44E8-87BD-0280E1799351}",
+          "required": true
+        },
+        {
+          "name": "IVmGuestMemoryAccess",
+          "iid": "{2461C824-4E2A-4848-BB65-5708B27F06D9}",
+          "required": true
+        },
+        {
+          "name": "IVmGuestStateRawStorage",
+          "iid": "{F299B139-1550-4327-84F7-C1F433258EEF}",
+          "required": true
+        },
+        {
+          "name": "IVmMemoryTopology",
+          "iid": "{4F99E8B7-37BC-4EE4-B539-50263B4783B6}",
+          "required": true
+        },
+        {
+          "name": "IVmPowerServices",
+          "iid": "{3EE9144C-27D7-4C8E-A07E-5DD5F7A0207D}",
+          "required": true
+        },
+        {
+          "name": "IVmProcessorServices",
+          "iid": "{5F662E9D-2097-4EB5-8527-658BA54AC049}",
+          "required": true
+        },
+        {
+          "name": "IVmTimeSource",
+          "iid": "{E162FE7A-72C6-4D0E-93DD-7DF91A5B979D}",
+          "required": true
+        },
+        {
+          "name": "IVpciServices",
+          "iid": "{C8769BE0-2C2B-4DED-BD3C-FF7515D74E90}",
+          "required": true
+        },
+        {
+          "name": "IVmCrashRegisterServices",
+          "iid": "{F0109DC7-3F96-41B1-B0BC-5AEA911C404C}",
+          "required": true
+        },
+        {
+          "name": "IVpmemController",
+          "iid": "{521087AB-2963-4859-B6D9-D6F1EC9F3382}",
+          "required": false
+        },
+        {
+          "name": "IVmPsp",
+          "iid": "{B0C36D19-3F91-4B3D-B8DC-EEE5BB2C9ABA}",
+          "required": false
+        },
+        {
+          "name": "IProxiedPciVgaDevice",
+          "iid": "{FCB3759F-D139-46BE-8500-5C50A6FBFF9B}",
+          "required": false
+        }
+      ],
+      "required_count": 13,
+      "initialize_dependency_order": [
+        "ISecurityManager",
+        "IVmBios",
+        "IVmBootMemoryTopology",
+        "IVmbusServices",
+        "IVmGuestCrashServices",
+        "IVmGuestMemoryAccess",
+        "IVmGuestStateRawStorage",
+        "IVmMemoryTopology",
+        "IVmPowerServices",
+        "IVmProcessorServices",
+        "IVmTimeSource",
+        "IVpciServices",
+        "IVmCrashRegisterServices",
+        "IProxiedPciVgaDevice",
+        "IVmPsp",
+        "IVpmemController"
+      ],
+      "provided_interfaces": [],
+      "configuration_fields": [
+        "VDEVVersion",
+        "version",
+        "DevicePlatformSettings",
+        "DevicePlatformSettingsV2",
+        "ForceProtocol",
+        "OfferLogPipe"
+      ],
+      "minimum_xml": "<GuestEmulationDevice><VDEVVersion>256</VDEVVersion><version>1</version><ForceProtocol>0</ForceProtocol><OfferLogPipe>false</OfferLogPipe></GuestEmulationDevice>",
+      "observed_repository_slots": [
+        11,
+        3,
+        17,
+        7,
+        40,
+        18,
+        17,
+        23,
+        18
+      ],
+      "observed_service_calls": {
+        "ISecurityManager": [
+          11
+        ]
+      }
+    },
+    {
+      "kind": "bios",
+      "name": "BiosVdev",
+      "clsid": "{AC6B8DC1-3257-4A70-B1B2-A9C9215659AD}",
+      "module": "vmchipset.dll",
+      "ivirtual_device": {
+        "iid": "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}",
+        "lifecycle": [
+          {
+            "slot": 3,
+            "method": "GetDependencies",
+            "rva": "0x44D30"
+          },
+          {
+            "slot": 4,
+            "method": "Initialize",
+            "rva": "0x46180"
+          },
+          {
+            "slot": 5,
+            "method": "Teardown",
+            "rva": "0x4A7D0"
+          }
+        ]
+      },
+      "owner_partition": true,
+      "get_dependencies_order": [
+        {
+          "name": "IVmbusServices",
+          "iid": "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}",
+          "required": true
+        },
+        {
+          "name": "IVmAmd64EmulationServices",
+          "iid": "{FCACE8D2-AB0D-480D-B979-55C2DA5F9579}",
+          "required": true
+        },
+        {
+          "name": "IVmGuestMemoryAccess",
+          "iid": "{2461C824-4E2A-4848-BB65-5708B27F06D9}",
+          "required": true
+        },
+        {
+          "name": "IVmProcessorServices",
+          "iid": "{5F662E9D-2097-4EB5-8527-658BA54AC049}",
+          "required": true
+        },
+        {
+          "name": "IVmBootMemoryTopology",
+          "iid": "{B80FE14E-B5F6-43D4-B206-40B3BF511959}",
+          "required": true
+        },
+        {
+          "name": "IVmBootStateImporter",
+          "iid": "{034E6428-672E-403A-A342-4F4C8D6A705C}",
+          "required": true
+        },
+        {
+          "name": "IVmMemoryTopology",
+          "iid": "{4F99E8B7-37BC-4EE4-B539-50263B4783B6}",
+          "required": true
+        },
+        {
+          "name": "IVmPowerManagementDevice",
+          "iid": "{3F60DA8B-E8EF-403A-8173-9EF5C6EE0152}",
+          "required": true
+        },
+        {
+          "name": "IVmIoApic",
+          "iid": "{9D33829B-58BE-4BBF-AB6E-3B16DBCEF954}",
+          "required": true
+        },
+        {
+          "name": "IVmManagementAccess",
+          "iid": "{BB011455-A4F6-4E08-9982-09AFD303DF20}",
+          "required": true
+        },
+        {
+          "name": "IVmPowerServices",
+          "iid": "{3EE9144C-27D7-4C8E-A07E-5DD5F7A0207D}",
+          "required": true
+        },
+        {
+          "name": "IVmTimeSource",
+          "iid": "{E162FE7A-72C6-4D0E-93DD-7DF91A5B979D}",
+          "required": true
+        },
+        {
+          "name": "IVmMemoryManagement",
+          "iid": "{E7BB1D35-AD97-464B-8A3F-95F43E0F4389}",
+          "required": true
+        },
+        {
+          "name": "ISecurityManager",
+          "iid": "{5315507B-19F0-4E86-AB51-18F159F1A197}",
+          "required": true
+        },
+        {
+          "name": "IVmPartitionServices",
+          "iid": "{773E9A95-1B2D-4479-955F-402000EBE6C2}",
+          "required": true
+        },
+        {
+          "name": "IVmHandleBrokerServices",
+          "iid": "{E9E61D12-A2C3-4E55-AC35-B8F26D216A69}",
+          "required": true
+        },
+        {
+          "name": "IVmPsp",
+          "iid": "{B0C36D19-3F91-4B3D-B8DC-EEE5BB2C9ABA}",
+          "required": false
+        },
+        {
+          "name": "IVmBattery",
+          "iid": "{2A811607-C21C-47DA-84A0-3C3B29AAD4E4}",
+          "required": false
+        },
+        {
+          "name": "IVpmemController",
+          "iid": "{521087AB-2963-4859-B6D9-D6F1EC9F3382}",
+          "required": false
+        },
+        {
+          "name": "IVmGuestStateAccess",
+          "iid": "{96DDF97A-0B79-4966-8B56-740F0D766E2E}",
+          "required": false
+        }
+      ],
+      "required_count": 16,
+      "initialize_dependency_order": [
+        "IVmbusServices",
+        "IVmAmd64EmulationServices",
+        "IVmGuestMemoryAccess",
+        "IVmProcessorServices",
+        "IVmBootMemoryTopology",
+        "IVmBootStateImporter",
+        "IVmMemoryTopology",
+        "IVmPowerManagementDevice",
+        "IVmIoApic",
+        "IVmManagementAccess",
+        "IVmPowerServices",
+        "IVmTimeSource",
+        "IVmMemoryManagement",
+        "ISecurityManager",
+        "IVmPartitionServices",
+        "IVmHandleBrokerServices",
+        "IVmGuestStateAccess",
+        "IVpmemController",
+        "IVmBattery",
+        "IVmPsp"
+      ],
+      "provided_interfaces": [
+        {
+          "name": "IVmBios",
+          "iid": "{9BE0B79F-68DF-4C59-9D88-4BFC1BF7A73D}"
+        }
+      ],
+      "configuration_fields": [
+        "VDEVVersion",
+        "version",
+        "bios_guid",
+        "bios_serial_number",
+        "num_lock",
+        "base_board",
+        "chassis",
+        "secure_boot_enabled",
+        "secure_boot_template_id",
+        "bios_flags",
+        "pause_after_boot_failure",
+        "pxe_preferred_protocol",
+        "console_mode",
+        "boot",
+        "imc_data",
+        "memory_attributes_table",
+        "nvram",
+        "boot_next",
+        "FirmwareMode",
+        "BiosLockString",
+        "EnableHibernation",
+        "memoryprotection_mode",
+        "LinuxKernelDirect",
+        "DisableFrontpage",
+        "ApplySbTemplate",
+        "EnableProcessorIdling",
+        "SystemInformation",
+        "MemoryDeviceSerialNumber",
+        "DisableSha384Pcr",
+        "WatchdogEnabled",
+        "LegacyPcrMeasurement"
+      ],
+      "minimum_xml": "<BiosLoader><VDEVVersion>512</VDEVVersion><version>1</version></BiosLoader>",
+      "observed_repository_slots": [
+        11,
+        3,
+        17,
+        7,
+        40,
+        18,
+        17,
+        23,
+        18
+      ],
+      "observed_service_calls": {
+        "ISecurityManager": [
+          12,
+          13,
+          10
+        ]
+      }
+    },
+    {
+      "kind": "rtc",
+      "name": "RtcVdev",
+      "clsid": "{E51B7EF6-4A7F-4780-AAAE-D4B291AACD2E}",
+      "module": "vmchipset.dll",
+      "ivirtual_device": {
+        "iid": "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}",
+        "lifecycle": [
+          {
+            "slot": 3,
+            "method": "GetDependencies",
+            "rva": "0x7CA70"
+          },
+          {
+            "slot": 4,
+            "method": "Initialize",
+            "rva": "0x7CEC0"
+          },
+          {
+            "slot": 5,
+            "method": "Teardown",
+            "rva": "0x7D730"
+          }
+        ]
+      },
+      "owner_partition": false,
+      "get_dependencies_order": [
+        {
+          "name": "IVmBios",
+          "iid": "{9BE0B79F-68DF-4C59-9D88-4BFC1BF7A73D}",
+          "required": true
+        },
+        {
+          "name": "IVmAmd64EmulationServices",
+          "iid": "{FCACE8D2-AB0D-480D-B979-55C2DA5F9579}",
+          "required": true
+        },
+        {
+          "name": "IVmIoApic",
+          "iid": "{9D33829B-58BE-4BBF-AB6E-3B16DBCEF954}",
+          "required": true
+        },
+        {
+          "name": "IVmManagementAccess",
+          "iid": "{BB011455-A4F6-4E08-9982-09AFD303DF20}",
+          "required": true
+        },
+        {
+          "name": "ISecurityManager",
+          "iid": "{5315507B-19F0-4E86-AB51-18F159F1A197}",
+          "required": true
+        },
+        {
+          "name": "IVmTimeSource",
+          "iid": "{E162FE7A-72C6-4D0E-93DD-7DF91A5B979D}",
+          "required": true
+        }
+      ],
+      "required_count": 6,
+      "initialize_dependency_order": [
+        "IVmBios",
+        "IVmAmd64EmulationServices",
+        "IVmIoApic",
+        "IVmManagementAccess",
+        "ISecurityManager",
+        "IVmTimeSource"
+      ],
+      "provided_interfaces": [],
+      "configuration_fields": [],
+      "minimum_xml": null,
+      "observed_repository_slots": [
+        11,
+        3,
+        17,
+        7,
+        40,
+        18,
+        39
+      ],
+      "observed_service_calls": {}
+    },
+    {
+      "kind": "ioapic",
+      "name": "IoApicVdev",
+      "clsid": "{72682FC4-040A-430A-BE0B-224574B953FE}",
+      "module": "vmchipset.dll",
+      "ivirtual_device": {
+        "iid": "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}",
+        "lifecycle": [
+          {
+            "slot": 3,
+            "method": "GetDependencies",
+            "rva": "0x77830"
+          },
+          {
+            "slot": 4,
+            "method": "Initialize",
+            "rva": "0x77D20"
+          },
+          {
+            "slot": 5,
+            "method": "Teardown",
+            "rva": "0x78650"
+          }
+        ]
+      },
+      "owner_partition": true,
+      "get_dependencies_order": [
+        {
+          "name": "ISecurityManager",
+          "iid": "{5315507B-19F0-4E86-AB51-18F159F1A197}",
+          "required": true
+        },
+        {
+          "name": "IVmAmd64EmulationServices",
+          "iid": "{FCACE8D2-AB0D-480D-B979-55C2DA5F9579}",
+          "required": true
+        },
+        {
+          "name": "IVmPartitionServices",
+          "iid": "{773E9A95-1B2D-4479-955F-402000EBE6C2}",
+          "required": true
+        },
+        {
+          "name": "IVmProcessorServices",
+          "iid": "{5F662E9D-2097-4EB5-8527-658BA54AC049}",
+          "required": true
+        },
+        {
+          "name": "IVmPicService",
+          "iid": "{81A7B678-73B5-4188-AE42-882BFCDC7562}",
+          "required": false
+        }
+      ],
+      "required_count": 4,
+      "initialize_dependency_order": [
+        "ISecurityManager",
+        "IVmAmd64EmulationServices",
+        "IVmPartitionServices",
+        "IVmProcessorServices",
+        "IVmPicService"
+      ],
+      "provided_interfaces": [
+        {
+          "name": "IVmIoApic",
+          "iid": "{9D33829B-58BE-4BBF-AB6E-3B16DBCEF954}"
+        }
+      ],
+      "configuration_fields": [
+        "VDEVVersion",
+        "version",
+        "ForceLegacyRteWidth"
+      ],
+      "minimum_xml": "<IoApicDevice><VDEVVersion>256</VDEVVersion><version>1</version><ForceLegacyRteWidth>false</ForceLegacyRteWidth></IoApicDevice>",
+      "observed_repository_slots": [
+        11,
+        3,
+        17,
+        7,
+        40,
+        18
+      ],
+      "observed_service_calls": {}
+    },
+    {
+      "kind": "vmbus",
+      "name": "VmbusVdev",
+      "clsid": "{D41A1872-3740-41CE-A1EE-4522AB82F991}",
+      "module": "vmbusvdev.dll",
+      "ivirtual_device": {
+        "iid": "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}",
+        "lifecycle": [
+          {
+            "slot": 3,
+            "method": "GetDependencies",
+            "rva": "0x10A20"
+          },
+          {
+            "slot": 4,
+            "method": "Initialize",
+            "rva": "0x12720"
+          },
+          {
+            "slot": 5,
+            "method": "Teardown",
+            "rva": "0x17780"
+          }
+        ]
+      },
+      "owner_partition": true,
+      "get_dependencies_order": [
+        {
+          "name": "ISecurityManager",
+          "iid": "{5315507B-19F0-4E86-AB51-18F159F1A197}",
+          "required": true
+        },
+        {
+          "name": "IVmMemoryManagement",
+          "iid": "{E7BB1D35-AD97-464B-8A3F-95F43E0F4389}",
+          "required": true
+        },
+        {
+          "name": "IVmPartitionServices",
+          "iid": "{773E9A95-1B2D-4479-955F-402000EBE6C2}",
+          "required": true
+        },
+        {
+          "name": "IVmHandleBrokerServices",
+          "iid": "{E9E61D12-A2C3-4E55-AC35-B8F26D216A69}",
+          "required": true
+        }
+      ],
+      "required_count": 4,
+      "initialize_dependency_order": [
+        "ISecurityManager",
+        "IVmMemoryManagement",
+        "IVmPartitionServices",
+        "IVmHandleBrokerServices"
+      ],
+      "provided_interfaces": [
+        {
+          "name": "IVmbusServices",
+          "iid": "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}"
+        }
+      ],
+      "configuration_fields": [
+        "VDEVVersion",
+        "version",
+        "MessageRedirection"
+      ],
+      "minimum_xml": "<VMBusDevice><VDEVVersion>513</VDEVVersion><version>1</version><MessageRedirection>false</MessageRedirection></VMBusDevice>",
+      "observed_repository_slots": [
+        11,
+        3,
+        17,
+        7,
+        40,
+        18
+      ],
+      "observed_service_calls": {
+        "IVmHandleBrokerServices": [
+          3
+        ]
+      }
+    },
+    {
+      "kind": "synthstor",
+      "name": "SynthStor",
+      "clsid": "{D422512D-2BF2-4752-809D-7B82B5FCB1B4}",
+      "module": "vmsynthstor.dll",
+      "ivirtual_device": {
+        "iid": "{0693ED7D-8A8A-4D87-A468-1103B8C63D9C}",
+        "lifecycle": [
+          {
+            "slot": 3,
+            "method": "GetDependencies",
+            "rva": "0x17D80"
+          },
+          {
+            "slot": 4,
+            "method": "Initialize",
+            "rva": "0x191E0"
+          },
+          {
+            "slot": 5,
+            "method": "Teardown",
+            "rva": "0x26290"
+          }
+        ]
+      },
+      "owner_partition": true,
+      "get_dependencies_order": [
+        {
+          "name": "IVmHandleBrokerServices",
+          "iid": "{E9E61D12-A2C3-4E55-AC35-B8F26D216A69}",
+          "required": true
+        },
+        {
+          "name": "IVmManagementAccess",
+          "iid": "{BB011455-A4F6-4E08-9982-09AFD303DF20}",
+          "required": true
+        },
+        {
+          "name": "IVmPowerServices",
+          "iid": "{3EE9144C-27D7-4C8E-A07E-5DD5F7A0207D}",
+          "required": true
+        },
+        {
+          "name": "IVmbusServices",
+          "iid": "{ECE3F556-F87F-4120-9E37-AAA55E5E0CA9}",
+          "required": true
+        }
+      ],
+      "required_count": 4,
+      "initialize_dependency_order": [
+        "IVmHandleBrokerServices",
+        "IVmManagementAccess",
+        "IVmPowerServices",
+        "IVmbusServices"
+      ],
+      "provided_interfaces": [],
+      "configuration_fields": [
+        "VDEVVersion",
+        "version",
+        "ElementName",
+        "ChannelInstanceGuid",
+        "DisableInterruptBatching",
+        "VPCPerChannel",
+        "ThreadsPerChannel",
+        "controller0",
+        "TargetVtl"
+      ],
+      "minimum_xml": "<SyntheticStorageDevice><VDEVVersion>256</VDEVVersion><version>1</version></SyntheticStorageDevice>",
+      "observed_repository_slots": [
+        11,
+        3,
+        17,
+        7,
+        40,
+        18,
+        39,
+        17,
+        26,
+        18
+      ],
+      "observed_service_calls": {}
+    }
+  ]
+}
