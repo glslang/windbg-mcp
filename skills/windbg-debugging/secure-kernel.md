@@ -36,17 +36,23 @@ it is the second half of this page.
 No driver, no test-signing, and no debugger attached to anything. A checkpoint is the guest's whole
 RAM in a file, so handle one like a full memory dump of that machine.
 
-**A checkpoint of a VM with `EncryptStateAndVmMigrationTraffic` on will kill the session rather
-than be refused, and the error reads as transient when it is not.** The SDK provider does not
-return a failure for one: `LoadSavedStateFile` `__fastfail`s (`0xC0000409`) and takes the calling
-process with it, which here is the worker holding that session — the provider is loaded once per
-worker. So the open comes back *"the engine worker process holding session … is gone"*, whose own
-advice is that opening again starts a fresh one. **For this cause that advice is wrong**: the same
-capture kills the next worker too, so read that error on an `open_sk_capture` as *check whether the
-VM encrypts its state* before retrying anything. Your other sessions are untouched, one worker
-holding one session being the whole point of the shape. Measured on provider `10.0.26100.7705`,
-x64, and reproduced from two unrelated processes — one of them a Rust binary calling the same
-export — so it is the provider's behaviour and not this server's handling of it.
+**An encrypted `.vmrs` will kill the session rather than be refused, and the error reads as
+transient when it is not.** For a checkpoint of a VM with `EncryptStateAndVmMigrationTraffic` on,
+the SDK provider does not return a failure: `LoadSavedStateFile` `__fastfail`s (`0xC0000409`) and
+takes the calling process with it, which here is the worker holding that session — the provider is
+loaded once per worker. So the open comes back *"the engine worker process holding session … is
+gone"*, whose own advice is that opening again starts a fresh one. **For this cause that advice is
+wrong**: the same capture kills the next worker too, so read that error on an `open_sk_capture` as
+*check whether the VM encrypts its state* before retrying anything. Your other sessions are
+untouched, one worker holding one session being the whole point of the shape.
+
+**What that is measured on, because the scope is narrower than the warning sounds.** Provider
+`10.0.26100.7705`, x64, a standard checkpoint, reproduced from two unrelated processes — one a Rust
+binary calling the same export — so it is the provider's behaviour rather than this server's
+handling of it. The older `bin` + `vsv` pair goes through a **different** export
+(`LoadSavedStateFiles`) and is **untested**, encrypted or not: expect the same symptom, but if an
+encrypted pair gives you an ordinary error instead, that is new information and not a contradiction
+of this page. The ARM64 provider is untested too.
 
 ## Open a capture
 
@@ -135,15 +141,17 @@ Two limits to plan around:
 
 - **It needs a session opened with `symbols`.** Without it the refusal says so and the remedy is to
   open the capture again — the decode is identical either way, so nothing is lost but the call.
-- **There are no types.** Microsoft's public `securekernel.pdb` carries **no type records**, so
-  nothing in this session formats a structure over VTL1 — and `dt` is not a way round it, the
-  debugger tools being refused here in the first place. A structure is
-  read with `sk_read_memory` and decoded by hand, from offsets you derive. The open's report says
-  what the engine answered when asked, rather than leaving you to infer it.
+- **There are no types — on every build anyone here has looked at.** Microsoft's public
+  `securekernel.pdb` has carried **no type records**, so nothing in this session formats a
+  structure over VTL1, and `dt` is not a way round it, the debugger tools being refused here in the
+  first place. A structure is read with `sk_read_memory` and decoded by hand, from offsets you
+  derive. Whether a public PDB ships types is Microsoft's to change, which is why the open **probes
+  for them and reports what the engine answered** — read that rather than this sentence, and if it
+  ever says otherwise, that is the build worth saying so about.
 
 Symbols are loaded against the **image** with no debuggee, at its preferred base, rebased onto the
-base the decode found. What that gives is the **names**, completely; what it does not give is the
-types, at all.
+base the decode found. So what a session with `symbols` buys is the **names**; the types are what
+the paragraph above is about, and the open's probes are what answer for the build in front of you.
 
 ## The live route: the operator supplies the transport
 
@@ -213,7 +221,7 @@ the transport's side, and none is clamped — each refuses.
 | `vtl_enabled` | `0` or `1` | anything else is refused |
 | `paging` | `long` | refused; this decode walks long mode only |
 | `unreadable` names | `cr0`, `cr3`, `cr4`, `efer` | an unknown register name is refused |
-| `OK <n>` | `n` no greater than the bytes asked for | announcing more is a source error, and poisons |
+| `OK <n>` | `n` **equal to** the bytes asked for | both directions poison: more is a source error, fewer is a short read, and a short read *is* a failed read rather than a partial answer |
 | stdout | stays open until stdin closes | an EOF mid-exchange is "the transport closed its stdout" |
 | teardown | **10s** after its stdin closes | the child is killed rather than waited for |
 
