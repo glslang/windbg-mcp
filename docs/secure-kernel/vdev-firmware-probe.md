@@ -86,7 +86,7 @@ The importer then receives 19 VP0 state records in this exact order:
 
 The measured scalar state is `CR0=0x80000023`, `CR3=0x700000`,
 `CR4=0x660`, `EFER=0xD00`, `PAT=0x7040600070406`, `RFLAGS=0x2`,
-`RSP=0x6E0000`, and `RIP=0x6E1474`. `RIP` is also required to fall inside the
+`RBP=0x6E0000`, and `RIP=0x6E1474`. `RIP` is also required to fall inside the
 imported UEFI image rather than merely match this observation.
 
 All 19 records are applied in one `VidSetVirtualProcessorStateEx` call and read

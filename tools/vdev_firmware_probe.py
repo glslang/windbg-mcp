@@ -71,7 +71,7 @@ SCALAR_REGISTERS = {
     0x80001: ("efer", 0xD00),
     0x80004: ("pat", 0x7040600070406),
     0x20011: ("rflags", 2),
-    0x20005: ("rsp", 0x6E0000),
+    0x20005: ("rbp", 0x6E0000),
 }
 E_INVALIDARG = -2147024809
 E_OUTOFMEMORY = -2147024882
