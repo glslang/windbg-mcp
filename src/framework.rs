@@ -136,6 +136,16 @@ impl Framework {
     pub(crate) fn note(self, tells: &[crate::structured::FrameworkTell]) -> String {
         use crate::structured::FrameworkTell as Tell;
         let Self::Kmdf = self;
+        // **The two subjects are never mixed**, which the early return below would silently resolve
+        // in favour of one: a report is either about an address inside the framework or about a
+        // driver that binds to it, and no caller builds both. Pinned here because the sentence
+        // chosen is what a caller reads, and a wrong one would read as a true statement about the
+        // other subject.
+        debug_assert!(
+            !tells.contains(&Tell::FrameworkImage)
+                || tells.iter().all(|tell| *tell == Tell::FrameworkImage),
+            "being framework code and binding to the framework are different subjects: {tells:?}"
+        );
         // Its own sentence and not a clause of the others: this is about an *address*, where the two
         // below are about a driver, and nothing is known here about any driver object.
         if tells.contains(&Tell::FrameworkImage) {
@@ -193,16 +203,23 @@ impl Framework {
         }
     }
 
-    /// The same clause for a table where **this entry** is the framework's and another is not.
+    /// The same clause for a table where **this entry** is the framework's and the table as a whole
+    /// was not read as one.
     ///
     /// The case a WDM filter forwarding one major function into a KMDF driver below it produces, and
     /// the one [`Self::table_clause`] must not be used for.
+    ///
+    /// **It says the table was not *read* as the framework's, not that it is not**, which is the same
+    /// correction as the round that produced this clause, one level down. `dispatch_framework`
+    /// refuses a table for two reasons -- an entry in another image, and an entry in **no** image it
+    /// could name -- and only the first licenses "another entry is not the framework's". An
+    /// unattributed entry may well be.
     pub(crate) fn one_entry_clause(self) -> &'static str {
         match self {
             Self::Kmdf => {
-                "the KMDF framework image `Wdf01000.sys` -- this entry dispatches into it while at \
-                 least one other entry in this table does not, so nothing here says this driver's \
-                 table is the framework's"
+                "the KMDF framework image `Wdf01000.sys` -- this entry dispatches into it, while \
+                 this driver's table as a whole was not read as the framework's, so nothing here \
+                 says that it is"
             }
         }
     }

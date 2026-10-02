@@ -1534,8 +1534,15 @@ mod tests {
     fn one_forwarded_entry_claims_nothing_about_the_rest_of_the_table() {
         let note = foreign_dispatch_note("0xfffff8051234abcd", Some("Wdf01000"), None);
         assert!(
-            note.contains("Wdf01000") && note.contains("at least one other entry"),
+            note.contains("Wdf01000") && note.contains("was not read as the framework's"),
             "names the framework this entry reaches and says what it does not cover: {note}"
+        );
+        // **Not read as, rather than is not.** `dispatch_framework` also refuses a table holding an
+        // entry it could attribute to no image at all, and that entry may well be the framework's --
+        // so the clause claims nothing about the other entries' contents.
+        assert!(
+            !note.contains("does not") && !note.contains("is not"),
+            "and makes no claim about what the other entries are: {note}"
         );
         assert!(
             !note.contains("whole table") && !note.contains("`framework`"),
