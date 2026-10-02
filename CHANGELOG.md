@@ -53,7 +53,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   transport**, this repository ships none, `--sk-live` refuses to start without `--transport`, and
   there is no MCP call for it, so a request to debug a *running* Secure Kernel is answered with a
   checkpoint or handed back. `SKILL.md` indexes it in both tables and carries the limit as a
-  cross-cutting one, and `setup.md`'s elevation matrix gains the row — no elevation, but the SDK
+  cross-cutting one. **And the five places that enumerate what this project debugs now name this as
+  one of them**, which none of them did — not since the four tools shipped: the skill's
+  `description` (the only part of it in context before it is loaded, so the playbook was
+  unreachable for the request it exists for), the skill's own opening sentence, `README.md`'s, and
+  the `description` plus `keywords` of both `.claude-plugin/plugin.json` and
+  `.claude-plugin/marketplace.json`. `setup.md`'s elevation matrix gains the row — no elevation, but the SDK
   provider and read access to the checkpoint, and naming a `vm` rather than a path asks Hyper-V on
   that host.
 

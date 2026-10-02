@@ -1,13 +1,15 @@
 ---
 name: windbg-debugging
-description: Drive WinDbg/DbgEng via the `windbg` MCP server to debug Windows crash dumps, live user-mode and kernel targets, and Time Travel Debugging (.run) traces. Use when analyzing a .dmp, attaching to a process or the kernel, or recording/navigating/analyzing a TTD trace.
+description: Drive WinDbg/DbgEng via the `windbg` MCP server to debug Windows crash dumps, live user-mode and kernel targets, and Time Travel Debugging (.run) traces, and to read a VBS guest's Secure Kernel (VTL1) out of a Hyper-V checkpoint. Use when analyzing a .dmp, attaching to a process or the kernel, recording/navigating/analyzing a TTD trace, or inspecting securekernel.exe, VTL1 memory or a saved state's Secure Kernel.
 ---
 
 # WinDbg debugging via the `windbg` MCP server
 
 This skill drives the `windbg` MCP server, which wraps WinDbg/DbgEng for four kinds of
 Windows debugging: **crash-dump** analysis, **live user-mode** debugging, **kernel**
-debugging, and **Time Travel Debugging (TTD)** of `.run` traces.
+debugging, and **Time Travel Debugging (TTD)** of `.run` traces. It also reads a fifth
+kind of target that is not a debuggee at all — a **Hyper-V checkpoint's Secure Kernel
+(VTL1)**, where nothing executes and the tools only read.
 
 **Verify the environment first.** Most failures are setup, not debugging — wrong engine
 DLL, missing symbols, or no elevation. Read **[setup.md](setup.md)** before the first
