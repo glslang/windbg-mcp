@@ -5,15 +5,16 @@ The operator supplies the privileged provider as a child process. The repository
 private VID layout, or provider DLL.
 
 This is an implementation boundary, not an MCP session yet. `--sk-control-probe` validates a
-provider's startup identity, epoch, and capabilities. `src/sklive.rs` now supplies the worker-side
-state machine over that contract. The build-specific `vmwp` dispatcher adapter and MCP tools remain
-later gates.
+provider's startup identity, epoch, and capabilities. `src/sklive.rs` supplies the worker-side
+state machine over that contract, and `src/skdispatch.rs` supplies the build-guarded `vmwp` adapter.
+The opt-in `--sk-live-control` role runs the complete narrow acceptance lifecycle through the same
+engine constructor and thread ownership as an engine worker. The MCP tools remain a later gate.
 
 ## Process boundary
 
 The provider owns exact-partition VTL1 register access. It does not receive or complete VID
-messages. A dedicated debugger worker will attach to the existing `vmwp`, observe the dispatcher
-holding the exception, and publish that event to the provider. This keeps the private provider out
+messages. The debugger owner attaches to the existing `vmwp`, observes the dispatcher holding the
+exception, and publishes that event to the provider. This keeps the private provider out
 of the MCP supervisor and leaves Windows' existing VM process responsible for boot, devices,
 message receipt, and native completion.
 
@@ -128,6 +129,33 @@ must leave the disposable target paused. Teardown does not erase the fault recor
 
 The offline state-machine tests cover hardware stop to step to continue, stale epochs, instruction
 guard failure, non-owned callback context, unstable held registers, completion failure, stopped
-close, restoration, and idempotent close. The remaining adapter must supply an exact-build profile
-for the private `vmwp` registration and completion sites and pass the same lifecycle on the
-allowlisted disposable VM before this becomes an MCP session.
+close, restoration, and idempotent close.
+
+## Build-guarded dispatcher adapter
+
+`src/skdispatch.rs` implements the concrete K4.2b boundary without constructing another engine.
+The opt-in role calls the engine constructor in `worker.rs`; every adapter call then borrows that
+engine on the same thread. Its retained state owns the provider child, live-memory transport,
+breakpoint ids, callback scratch allocation, handler context, VM pause state, and delayed completion
+helper.
+
+The local dispatcher profile contains an absolute `vmwp.exe` image path, SHA-256 and SizeOfImage;
+function and stop-site RVAs; original bytes for every software-breakpoint site; bounded scratch
+offsets; and no debugger command text. The per-boot VND pointer is a separate session input. Before
+mutation the adapter checks the VM GUID against the `vmwp` command line, the image identity, every
+guarded site, the current VTL1 CR3, and the selected Secure Kernel instruction. It refuses an
+existing mapping at the requested scratch base or a pre-existing breakpoint at an owned site.
+
+All debugger commands are fixed internal operations with validated numeric substitutions. Software
+breakpoints are created and removed through the typed DbgEng API, and their original bytes are read
+back after removal. The adapter uses `.detach /h` at the pending native breakpoint, because the
+measured unhandled detach terminates `vmwp`. The delayed `Suspend-VM` completion kick runs on a host
+helper thread and makes no DbgEng call; the engine itself never leaves its owner thread.
+
+The live acceptance role performs exactly one guarded hardware stop, one trap-flag step, continue,
+handler unregister, deferred cleanup, scratch free, and handled detach. On 2026-10-03 it passed twice
+against the allowlisted disposable K3 VM. Both runs stopped at the selected VTL1 CPL0 address with
+DR6.B0, stepped five bytes to the exact successor with DR6.BS, restored the full saved state, and
+closed. The recorded repeat kept the same `vmwp` PID and healthy heartbeat for 60 seconds, found no
+scoped crash record, re-read unchanged Secure Kernel text, and left the VM Off. The exact profile,
+provider, command and evidence remain ignored under `target/private/`.

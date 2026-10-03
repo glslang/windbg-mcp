@@ -1041,7 +1041,7 @@ pub fn fingerprint(token: &str) -> String {
 /// a refusal: `BCryptHash` against the SHA-256 pseudo-handle with a correctly sized output buffer
 /// has no failure that is not a bug here, and threading an error out of it would spread a
 /// `Result` through every line that prints a fingerprint.
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 
     let mut digest = [0u8; 32];

@@ -84,6 +84,16 @@ use dbgscope::pe;
 /// re-executes itself with it, and nothing else should.
 pub const WORKER_FLAG: &str = "--engine-worker";
 
+/// Runs the opt-in K4.2b acceptance path with the same engine construction and thread ownership as
+/// an engine worker, but without exposing a public MCP surface before the live adapter passes.
+pub(crate) fn run_sk_live_control(args: &[String]) -> anyhow::Result<()> {
+    let (engine, limitation) = build_engine(None).map_err(anyhow::Error::msg)?;
+    if let Some(limitation) = limitation {
+        anyhow::bail!("the selected debugger engine cannot run live control: {limitation}");
+    }
+    crate::skdispatch::run_acceptance(args, &engine)
+}
+
 /// The flags carrying this worker's two ends of the protocol channel, as raw handle values:
 /// requests to read, messages to write ([`crate::proto`]).
 ///
