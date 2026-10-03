@@ -4318,7 +4318,23 @@ block wrote**, which is the conservative reading of the single-path rule it alre
 fixture was written to fail first and then fixed. What it costs is a chain whose first link is in
 another block: it answers with its site instead of its codes, which is what every other cross-block
 chain shape answers here, and `rdyboost`'s own chains are contiguous -- re-measured after the change
-at 21 codes with nothing `untracked`. The pair of declines above is a third pass over one line, with the answer unmoved for five rounds, is the
+at 21 codes with nothing `untracked`. **And the same union sharpened the unreachable-case rule.** Finding this link's code on *one*
+predecessor does not make the case unreachable on *every* path: with `cmp code,A` on one edge and
+`cmp code,B` on another, a link comparing against `A` is dead along the first and **accepted** along
+the second, where `B` is forced out and `A` is what the comparison matches. So the case goes only
+when every incoming reading named a code and every one of them is this link's -- a sharpening rather
+than the per-path provenance the finding offered first, which would be a second kind of fact at
+every join for a shape no driver here has. Its sibling guard, *"and there were readings at all"*,
+was found **unpinned** by the mutation matrix: vacuous truth over an empty set would have dropped
+the case of a forced-clear link with no predecessor, which is a real accepted code, and no test
+failed when it was backed out. It has one now.
+
+**Nineteen tests in all, sixteen of them mutation-verified against the mutation they are for.** The
+other three are controls, and they are there so a later round does not *fix* something already
+right: the non-`ccmp` form of a folded guard, an ordinary flag write after a chain, and the blind
+link a forced-clear one resolves.
+
+The pair of declines above is a third pass over one line, with the answer unmoved for five rounds, is the
 reading the review-round skill says to record rather than escalate. **Two** of the five were against a previous round's own fix, which
 is what the class fixes cost: each closed its class and the next round read what the closure could
 not express. The rule going on is that a defect in what is here is worth fixing and a request for new

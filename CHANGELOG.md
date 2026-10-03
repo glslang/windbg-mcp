@@ -72,7 +72,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the others -- `cmp code,A` on one and `cmp w2,#0` on another lets a `ZF`-forcing link admit every
   code on the second. The fold therefore asks for flags the block itself wrote, which costs a chain
   whose first link is in another block the codes it used to name and gives it the site instead.
-  Fourteen rules, fourteen tests, fourteen mutations --
+  **And a case is dropped only where every path excludes it**: a join unions the readings, so this
+  link's code appearing on one predecessor leaves it accepted along another, which costs a real code
+  rather than inventing one. The guard beside that rule -- *"and there were readings at all"* -- was
+  found unpinned by the matrix and now has its own test, vacuous truth over an empty set having been
+  enough to drop a forced-clear link's only case. Nineteen tests, sixteen of them mutation-verified
+  against the mutation they are for, the other three controls against a later round *fixing*
+  something already right --
   and the first draft of the one that keeps a dropped chain visible keyed on the terminator's
   *condition* alone, which a `ccmp` carries, so a block ending in one left no case and no site; the
   block-boundary test caught it.
