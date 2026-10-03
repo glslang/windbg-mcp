@@ -610,7 +610,7 @@ enum State {
     Arming,
     Stopped(StopRecord),
     Releasing,
-    Faulted(FaultRecord),
+    Faulted,
     Closed,
 }
 
@@ -626,6 +626,7 @@ pub(crate) struct LiveControl<P> {
     arm_mode: Option<ArmMode>,
     dispatcher_context: Option<HexU64>,
     expected_stop: Option<ExpectedStop>,
+    fault: Option<FaultRecord>,
 }
 
 impl<P: ControlProvider> LiveControl<P> {
@@ -645,6 +646,7 @@ impl<P: ControlProvider> LiveControl<P> {
             arm_mode: None,
             dispatcher_context: None,
             expected_stop: None,
+            fault: None,
         })
     }
 
@@ -654,7 +656,7 @@ impl<P: ControlProvider> LiveControl<P> {
             State::Arming => LivePhase::Arming,
             State::Stopped(_) => LivePhase::Stopped,
             State::Releasing => LivePhase::Releasing,
-            State::Faulted(_) => LivePhase::Faulted,
+            State::Faulted => LivePhase::Faulted,
             State::Closed => LivePhase::Closed,
         }
     }
@@ -664,10 +666,7 @@ impl<P: ControlProvider> LiveControl<P> {
     }
 
     pub(crate) fn fault(&self) -> Option<&FaultRecord> {
-        match &self.state {
-            State::Faulted(fault) => Some(fault),
-            _ => None,
-        }
+        self.fault.as_ref()
     }
 
     pub(crate) fn stopped(&self) -> Option<&StopRecord> {
@@ -900,18 +899,20 @@ impl<P: ControlProvider> LiveControl<P> {
     pub(crate) fn close(&mut self, dispatcher: &mut impl EventDispatcher) -> Result<()> {
         match self.state.clone() {
             State::Closed => return Ok(()),
-            State::Faulted(fault) => {
-                let teardown = dispatcher.teardown();
-                match teardown {
-                    Ok(()) => bail!(
-                        "the terminal live-control fault remains after teardown: {}",
-                        fault.cause
-                    ),
-                    Err(error) => bail!(
-                        "the terminal live-control fault remains and teardown failed: {}; {error:#}",
-                        fault.cause
-                    ),
+            State::Faulted => {
+                let cause = self
+                    .fault
+                    .as_ref()
+                    .context("the faulted session has no fault record")?
+                    .cause
+                    .clone();
+                if let Err(error) = dispatcher.teardown() {
+                    bail!(
+                        "the terminal live-control fault remains and teardown failed: {cause}; {error:#}"
+                    );
                 }
+                self.state = State::Closed;
+                return Ok(());
             }
             State::Stopped(stop) => {
                 self.continue_from(dispatcher, &stop.epoch)?;
@@ -1246,7 +1247,8 @@ impl<P: ControlProvider> LiveControl<P> {
             recovery_errors,
             target_left_paused: !dispatcher_safe || !dispatcher_recovered,
         };
-        self.state = State::Faulted(fault.clone());
+        self.fault = Some(fault.clone());
+        self.state = State::Faulted;
         anyhow!(
             "live Secure Kernel control faulted: {}; recovery_errors={:?}; target_left_paused={}",
             fault.cause,
@@ -1491,6 +1493,7 @@ mod tests {
         fail_begin: Option<&'static str>,
         fail_wait: Option<&'static str>,
         fail_recover: Option<&'static str>,
+        fail_teardown: Option<&'static str>,
     }
 
     impl FakeDispatcher {
@@ -1502,6 +1505,7 @@ mod tests {
                 fail_begin: None,
                 fail_wait: None,
                 fail_recover: None,
+                fail_teardown: None,
             }
         }
     }
@@ -1562,6 +1566,9 @@ mod tests {
 
         fn teardown(&mut self) -> Result<()> {
             self.actions.push(Action::Teardown);
+            if let Some(reason) = self.fail_teardown {
+                bail!("{reason}");
+            }
             Ok(())
         }
     }
@@ -1618,6 +1625,44 @@ mod tests {
                 Action::Release(ReleaseMode::ArmNextStop),
                 Action::Wait,
                 Action::Release(ReleaseMode::Resume),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_completed_cycle_can_arm_the_same_session_again() {
+        let mut dispatcher = FakeDispatcher::new([
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+            observed(StopReason::HardwareBreakpoint { slot: 0 }),
+        ]);
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+
+        control
+            .arm(&mut dispatcher, instruction(), ArmMode::Redirect)
+            .unwrap();
+        let first = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .continue_from(&mut dispatcher, &first.epoch)
+            .unwrap();
+        control
+            .arm(&mut dispatcher, instruction(), ArmMode::Redirect)
+            .unwrap();
+        let second = control.wait_for_stop(&mut dispatcher).unwrap();
+
+        assert_eq!(
+            second.event.reason,
+            StopReason::HardwareBreakpoint { slot: 0 }
+        );
+        assert_eq!(
+            dispatcher.actions,
+            vec![
+                Action::BeginArm,
+                Action::FinishArm,
+                Action::Wait,
+                Action::Release(ReleaseMode::Resume),
+                Action::BeginArm,
+                Action::FinishArm,
+                Action::Wait,
             ]
         );
     }
@@ -1904,6 +1949,52 @@ mod tests {
                 owned_event: false,
             })
         );
+    }
+
+    #[test]
+    fn successful_fault_teardown_closes_and_retains_the_fault_record() {
+        let mut dispatcher = FakeDispatcher::new([]);
+        dispatcher.fail_wait = Some("dispatcher wait timed out");
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, instruction(), ArmMode::Redirect)
+            .unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap_err();
+        let fault = control.fault().unwrap().clone();
+
+        control.close(&mut dispatcher).unwrap();
+        control.close(&mut dispatcher).unwrap();
+
+        assert_eq!(control.phase(), LivePhase::Closed);
+        assert_eq!(control.fault(), Some(&fault));
+        assert_eq!(
+            dispatcher
+                .actions
+                .iter()
+                .filter(|action| **action == Action::Teardown)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn failed_fault_teardown_remains_retryable_until_it_succeeds() {
+        let mut dispatcher = FakeDispatcher::new([]);
+        dispatcher.fail_wait = Some("dispatcher wait timed out");
+        dispatcher.fail_teardown = Some("handler removal failed");
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control
+            .arm(&mut dispatcher, instruction(), ArmMode::Redirect)
+            .unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap_err();
+
+        let error = control.close(&mut dispatcher).unwrap_err();
+        assert!(error.to_string().contains("handler removal failed"));
+        assert_eq!(control.phase(), LivePhase::Faulted);
+
+        dispatcher.fail_teardown = None;
+        control.close(&mut dispatcher).unwrap();
+        assert_eq!(control.phase(), LivePhase::Closed);
     }
 
     #[test]

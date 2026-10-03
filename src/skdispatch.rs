@@ -447,6 +447,17 @@ impl VmwpDispatcherState {
         }
     }
 
+    fn record_handler_context(&mut self, context: u64) -> Result<()> {
+        if context == 0 {
+            bail!("handler registration returned a zero context");
+        }
+        if self.handler_context.is_some() {
+            bail!("the dispatcher already owns a registered handler context");
+        }
+        self.handler_context = Some(context);
+        Ok(())
+    }
+
     fn read_memory(
         &self,
         epoch: crate::skcontrol::StopEpoch,
@@ -494,6 +505,26 @@ enum DispatcherPhase {
     Detached,
     Contained(String),
     Closed,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmPreparation {
+    OpenAndRegister,
+    VerifyAttached,
+    Reattach,
+}
+
+impl DispatcherPhase {
+    fn arm_preparation(&self) -> Result<ArmPreparation> {
+        match self {
+            Self::Fresh => Ok(ArmPreparation::OpenAndRegister),
+            Self::ReadyForStop(_) | Self::NativeReturn(_) => Ok(ArmPreparation::VerifyAttached),
+            Self::Detached => Ok(ArmPreparation::Reattach),
+            Self::Contained(why) => bail!("the dispatcher is fail-closed: {why}"),
+            Self::Closed => bail!("the dispatcher is closed"),
+            _ => bail!("cannot arm while the dispatcher owns a held event"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -557,16 +588,12 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             bail!("the dispatcher adapter is already bound to another target");
         }
 
-        match self.state.phase {
-            DispatcherPhase::Fresh => self.open_and_register(target, instruction)?,
-            DispatcherPhase::ReadyForStop(_) | DispatcherPhase::NativeReturn(_) => {
+        match self.state.phase.arm_preparation()? {
+            ArmPreparation::OpenAndRegister => self.open_and_register(target, instruction)?,
+            ArmPreparation::VerifyAttached => {
                 self.verify_instruction(instruction)?;
             }
-            DispatcherPhase::Contained(ref why) => {
-                bail!("the dispatcher is fail-closed: {why}");
-            }
-            DispatcherPhase::Closed => bail!("the dispatcher is closed"),
-            _ => bail!("cannot arm while the dispatcher owns a held event"),
+            ArmPreparation::Reattach => self.reattach_registered_handler(target, instruction)?,
         }
         Ok(HexU64(
             self.state
@@ -806,6 +833,37 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
+    fn reattach_registered_handler(
+        &mut self,
+        target: &TargetIdentity,
+        instruction: &InstructionGuard,
+    ) -> Result<()> {
+        if self.state.handler_context.is_none() || !self.state.scratch_allocated {
+            bail!("the detached dispatcher no longer owns a registered handler");
+        }
+        run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
+        self.state.vm_paused = true;
+        verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
+        let pending = self
+            .engine
+            .attach_process_begin(self.state.vmwp_pid)
+            .map_err(debugger)?;
+        self.state.attached = true;
+        pending.wait().map_err(debugger)?;
+        self.engine.execute_command("sxd 6ba").map_err(debugger)?;
+        self.engine
+            .execute_command("sxd e06d7363")
+            .map_err(debugger)?;
+        self.verify_vmwp_build()?;
+        self.verify_all_sites()?;
+        self.verify_instruction(instruction)?;
+        let site = self.state.profile.event_held.clone();
+        self.set_site_breakpoint(&site)?;
+        self.state.phase =
+            DispatcherPhase::ReadyForStop(StopReason::HardwareBreakpoint { slot: 0 });
+        Ok(())
+    }
+
     fn verify_vmwp_build(&mut self) -> Result<()> {
         let module = self.engine.module("vmwp").map_err(debugger)?;
         if module.size != self.state.profile.vmwp_size_of_image {
@@ -940,14 +998,13 @@ impl VmwpDispatcher<'_> {
             bail!("handler registration returned failure");
         }
         let context = self.read_u64(self.scratch(self.state.profile.layout.returned_context)?)?;
-        if context == 0 {
-            bail!("handler registration returned a zero context");
-        }
+        // Registration is already live in vmwp. Record its context before any fallible local
+        // restoration so teardown must unregister it rather than free callback scratch directly.
+        self.state.record_handler_context(context)?;
         self.write_u64(stack_handler, saved_handler)?;
         self.write_u64(stack_context, saved_context)?;
         self.engine.execute_command("~* u").map_err(debugger)?;
         self.state.threads_frozen = false;
-        self.state.handler_context = Some(context);
         Ok(())
     }
 
@@ -1584,6 +1641,30 @@ mod tests {
         let mut profile = profile();
         profile.scratch_base = HexU64(u64::MAX - 0x7ff);
         assert!(profile.validate().is_err());
+    }
+
+    #[test]
+    fn a_detached_registered_dispatcher_reattaches_before_the_next_arm() {
+        assert_eq!(
+            DispatcherPhase::Detached.arm_preparation().unwrap(),
+            ArmPreparation::Reattach
+        );
+        assert_eq!(
+            DispatcherPhase::Fresh.arm_preparation().unwrap(),
+            ArmPreparation::OpenAndRegister
+        );
+        assert!(DispatcherPhase::Closed.arm_preparation().is_err());
+    }
+
+    #[test]
+    fn a_successful_registration_context_is_owned_before_cleanup_can_fail() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+
+        assert!(state.record_handler_context(0).is_err());
+        state.record_handler_context(0x2000_0000_2000).unwrap();
+        assert_eq!(state.handler_context, Some(0x2000_0000_2000));
+        assert!(state.record_handler_context(0x2000_0000_3000).is_err());
     }
 
     fn profile() -> DispatcherProfile {
