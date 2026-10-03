@@ -2846,8 +2846,45 @@ fn absorb(
         // comparison nobody evaluated, over a value the chain before it had established is the
         // control code. With no such predecessor there is nothing about the code here at all.
         (false, _) => {
-            *compared = next.into_iter().collect();
-            *lost = just_lost.take().or((blind && predecessor).then_some(at));
+            // **The links before this one say what its case is *not*, so discarding them is not
+            // free.** `ZF` forced clear means an earlier match leaves the case, so the code this
+            // link compares against reaches it only where none of them matched -- and that is a
+            // fact about them:
+            //
+            // - one that matched the **same** code makes the case unreachable, and publishing it
+            //   would name a code the driver never routes there. `cmp code,A` / `ccmpne code,A,#0`
+            //   / `b.ne` rejects every value -- `A` skips the comparison and is forced to `ZF`
+            //   clear, everything else compares unequal -- so the fall-through is dead. Raised as a
+            //   P2 by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439).
+            // - one whose code could **not** be read leaves it unknown whether that is the case.
+            //   The code is still published, with the site it tested recorded beside it: an unread
+            //   constant equal to this one would mean the routine compared the same code twice,
+            //   which is the dead shape above rather than a driver, and this module publishes a
+            //   case with its caveat elsewhere too (`proved`, `accepted`) rather than withholding
+            //   one. **This half is the realistic one, and the fold had dropped the marker it used
+            //   to leave**: before a chain could be read, the link's own `note_loss` recorded the
+            //   site, because a conditional compare reads a register carrying the code.
+            //
+            // A predecessor that matched a *different* code needs neither, which is the whole
+            // point of the shape: it is the arm the routine rejects, and `rdyboost+0xf00c` is it.
+            let unreachable = next.as_ref().is_some_and(|own| {
+                compared
+                    .iter()
+                    .any(|was| was.code.is_some() && was.code == own.code)
+            });
+            let unnamed = compared
+                .iter()
+                .find(|was| was.code.is_none())
+                .map(|was| was.at);
+            *compared = match unreachable {
+                true => Vec::new(),
+                false => next.into_iter().collect(),
+            };
+            *lost = just_lost
+                .take()
+                .or((blind && predecessor).then_some(at))
+                .or(unnamed)
+                .or(unreachable.then_some(at));
         }
     }
     Some(at)
@@ -5880,6 +5917,177 @@ mod tests {
             found.untracked.is_empty(),
             "a loss this walk has never committed at a non-equality branch still is not: {:?}",
             found.untracked
+        );
+    }
+
+    /// **A forced-clear link against a code an earlier link already matched names no case**, its
+    /// fall-through being unreachable.
+    ///
+    /// `cmp w9,w11` / `ccmpne w9,w11,#0` / `b.ne` rejects every value: `w11`'s code skips the
+    /// conditional comparison and is forced to `ZF` clear, and everything else compares unequal, so
+    /// the branch is always taken and the case block is dead. Publishing that code would name one
+    /// the driver never routes there. Raised as a P2 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439); the shape is a routine comparing one
+    /// register against one constant twice, which is dead code rather than anything a compiler
+    /// emits, and the arm it is about is shared with the realistic case below.
+    #[test]
+    fn a_forced_clear_link_against_a_code_already_matched_names_no_case() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w9",
+                reg("w11"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x1c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "the fall-through is dead, so nothing routes there: {:?}",
+            found.cases
+        );
+        assert_eq!(found.untracked, vec![DISPATCH + 0x14]);
+    }
+
+    /// **And one after a predecessor whose code could not be read publishes its case with the site
+    /// recorded**, which is the half of that arm a driver actually reaches.
+    ///
+    /// `cmp w9,w12` / `ccmpne w9,w10,#0` / `b.ne` with `w12` never written is `rdyboost`'s own
+    /// shape with its first constant unread -- the live target's `w12` was exactly that. `w10`'s
+    /// code reaches the case unless the unread constant equals it, which would make the routine
+    /// compare one code twice, so the code is published and the unread site goes in `untracked`
+    /// beside it. **The fold had dropped that marker**: before it, the link's own `note_loss` left
+    /// one, a conditional compare reading a register that carries the code.
+    #[test]
+    fn a_forced_clear_link_after_an_unread_predecessor_records_the_site() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            // `w12` is never written, as the live target's never was.
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w9"), reg("w12")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "mov",
+                vec![reg("w0"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x22_4194, DISPATCH + 0x1c)],
+            "{:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x10],
+            "the predecessor nobody could read is the site, not the link"
         );
     }
 
