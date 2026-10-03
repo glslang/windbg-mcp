@@ -4334,6 +4334,19 @@ other three are controls, and they are there so a later round does not *fix* som
 right: the non-`ccmp` form of a folded guard, an ordinary flag write after a chain, and the blind
 link a forced-clear one resolves.
 
+**One limit is left open and pinned, which is where the rounds stopped.** A link that reads the code
+and is not modelled -- a `ccmn`, whose operand is **negated** -- leaves a loss, and a forced-clear
+link after it replaces that loss rather than keeping it, so `cmp code,A` / `ccmnne code,C,#4` /
+`ccmpne code,B,#0` / `b.eq` publishes `B` without saying `B` is rejected where `B == -C`. Closing it
+means telling two losses apart -- *this link lost the code* against *this link's forced arm admits
+every code* -- which share one slot and which a `#0` link treats oppositely: it resolves the second
+and not the first. That is a fifth distinction on this seam, for a shape that needs a negated
+compare against a control code, and
+`a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss` records the answer instead, so the limit
+is known rather than implied. Filed beside it and also declined: a duplicate-constant forced-set
+chain emits two cases for one code, which is `docs/structured-results.md`'s documented **case per
+site** rather than a defect.
+
 The pair of declines above is a third pass over one line, with the answer unmoved for five rounds, is the
 reading the review-round skill says to record rather than escalate. **Two** of the five were against a previous round's own fix, which
 is what the class fixes cost: each closed its class and the next round read what the closure could

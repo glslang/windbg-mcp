@@ -2763,6 +2763,19 @@ fn folded_compare(
 /// `ccmn` compares against the **negation** of its operand, which no control code is written as, so
 /// its own reading is withheld and only the propagation kept: a chain whose middle link this cannot
 /// read still leaves the links around it readable, with the unreadable one in [`Map::untracked`].
+///
+/// **That last sentence has one hole, and it is recorded rather than closed.** A link that reads the
+/// code and is not modelled leaves a loss, and a **forced-clear** link after it *replaces* that
+/// loss rather than keeping it -- so `cmp code,A` / `ccmnne code,C,#4` / `ccmpne code,B,#0` /
+/// `b.eq` publishes `B` with nothing saying `B` is rejected where `B == -C`. Raised as a P1 by
+/// Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439) and **declined** there, with
+/// `a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss` pinning the answer so the limit is
+/// known rather than implied. Closing it means telling two losses apart -- *this link lost the
+/// code* against *this link's forced arm admits every code* -- which share one slot and which a
+/// `#0` link treats oppositely: it resolves the second, as the rounds before it established, and
+/// does not resolve the first. That is a fifth distinction on this seam, for a shape that needs a
+/// negated compare against a control code, where the four already here are what read the chains a
+/// driver has.
 fn chained_compare(
     facts: &Facts,
     instruction: &Instruction,
@@ -6809,6 +6822,126 @@ mod tests {
             found.cases
         );
         assert!(found.untracked.is_empty(), "{:?}", found.untracked);
+    }
+
+    /// **The limit of the chain fold, pinned rather than implied**: a forced-clear link does not
+    /// carry the loss a `ccmn` before it left.
+    ///
+    /// `cmp w9,w11` / `ccmnne w9,w10,#4` / `ccmpne w9,w12,#0` / `b.eq`. The `ccmn` reads the control
+    /// code against the **negation** of its operand, which this walk does not model, so it records
+    /// its site; the `#0` link then replaces that loss, a `#0` link being exactly what *resolves*
+    /// the other kind of loss standing before it -- a forced arm that admits every code -- and the
+    /// two share one slot. So `w12`'s code is published with nothing saying it is rejected where
+    /// `w10`'s negation equals it.
+    ///
+    /// Raised as a P1 by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439) and
+    /// declined: telling the two losses apart is a fifth distinction on this seam, for a shape that
+    /// needs a negated compare against a control code. **This test exists so that it is a known
+    /// limit rather than an implied one**, and so the next reader meets the argument rather than
+    /// the finding. If it starts failing because a loss was kept, that is the fix landing, and this
+    /// assertion is the thing to update.
+    #[test]
+    fn a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0x30)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "mov",
+                vec![reg("w12"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "movk",
+                vec![reg("w12"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            // Reads the code against a negation this walk does not model: a site, and no reading.
+            conditional(
+                DISPATCH + 0x20,
+                "ccmn",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            conditional(
+                DISPATCH + 0x24,
+                "ccmp",
+                "w9",
+                reg("w12"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x22_4194, 0x900)],
+            "{:?}",
+            found.cases
+        );
+        assert!(
+            found.untracked.is_empty(),
+            "the known limit: the `ccmn`'s site does not survive the link after it -- {:?}",
+            found.untracked
+        );
     }
 
     /// A PC-relative literal load, as dbgscope decodes one: no base, no index, and the address the
