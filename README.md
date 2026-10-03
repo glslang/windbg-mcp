@@ -30,6 +30,7 @@ This file is the map. Each topic is one document, and each document is the whole
 | [Sessions and session handles](docs/sessions.md) | `session_id` routing, the four-session cap, `interrupt`, progress notifications, and recovering a parked attach |
 | [Kernel connection profiles](docs/kernel-profiles.md) | Keeping a KDNET debug key out of tool arguments and out of the client's transcript |
 | [Hypervisor debugging](docs/hypervisor-debugging.md) | Attach to the Microsoft hypervisor through KDNET, with target identity, limitations, and a separate live test |
+| [Secure Kernel research](docs/secure-kernel/README.md) | Capture inspection, live VTL1 reads, the initialized kernel stop/step result, and the operator-provider control contract |
 | [Structured results](docs/structured-results.md) | Which tools answer with `structuredContent`, what each carries, and the error categories a caller can branch on |
 | [Transactional batches](docs/debug-batch.md) | `debug_batch`: a mutating sequence whose cleanup runs on every path it can be aimed at, including a timeout or a disconnect |
 | [Walking a structure](docs/walk-memory.md) | `walk_memory`: lists, arrays and chains where an unreadable node is a row rather than the end of the walk |

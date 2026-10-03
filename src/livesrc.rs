@@ -614,7 +614,7 @@ impl sk::RawSource for LiveSource {
 /// accumulated something, so `""` contributes no argument at all and an explicit empty positional
 /// cannot be expressed here — a transport needing one is named through a wrapper script instead.
 /// Raised in review on #435, against the shipped skill that documented this grammar.
-fn split_command(command: &str) -> Vec<String> {
+pub(crate) fn split_command(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut quoted = false;

@@ -7,10 +7,13 @@
 //! is what dbgeng.dll's one-session-per-process rule makes the natural unit, and what lets a
 //! session that cannot be unwound be killed without taking the server with it.
 //!
-//! There are also two that are not servers at all, and they are here rather than in a second
-//! binary for the same reason: each reads a format this crate defines, and a reader that could
-//! drift out of step with the writer is a reader that will. [`cast::RENDER_FLAG`] turns a recorded
-//! transcript into a terminal recording and exits, touching neither DbgEng nor MCP.
+//! There are also foreground roles that are not servers. They are here rather than in a second
+//! binary because each reads a format this crate defines, and a reader that could drift out of step
+//! with the writer is a reader that will. [`cast::RENDER_FLAG`] turns a recorded transcript into a
+//! terminal recording and exits, touching neither DbgEng nor MCP. [`livesrc::LIVE_FLAG`] drives the
+//! VTL1 decoder over an operator-supplied source, and [`skcontrol::CONTROL_PROBE_FLAG`] validates an
+//! operator-supplied live-control provider's non-mutating handshake; neither loads DbgEng or starts
+//! MCP.
 //! [`skinspect::INSPECT_FLAG`] reads a Hyper-V saved state's VTL1 and reports what is in it
 //! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — **one**
 //! target, and that target is a **file**: an image opened for its symbols, with no process behind it
@@ -43,6 +46,7 @@ mod sd;
 mod server;
 mod service;
 mod sk;
+mod skcontrol;
 mod skinspect;
 mod sksession;
 mod sksym;
@@ -136,6 +140,14 @@ fn main() -> Result<()> {
         // one behind that opener would quietly change what a session's figures mean. What that
         // costs the session model is measured in item 103 rather than assumed here.
         return livesrc::run(&args[at + 1..]);
+    }
+    if let Some(at) = args
+        .iter()
+        .position(|arg| arg == skcontrol::CONTROL_PROBE_FLAG)
+    {
+        // Contract probe only: the operator supplies the privileged provider, and this role checks
+        // its identity/epoch/capability handshake before any MCP runtime or DbgEng session exists.
+        return skcontrol::run_probe(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == skinspect::INSPECT_FLAG) {
         // The same shape and the same reason: it reads a Hyper-V capture and writes a report,
