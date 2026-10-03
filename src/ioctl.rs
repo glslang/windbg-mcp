@@ -2984,6 +2984,15 @@ fn absorb(
                 .iter()
                 .find(|was| was.code.is_none())
                 .map(|was| was.at);
+            // **Whether there were readings at all, which is not the same question as whether they
+            // are this block's.** `own_flags` is in `predecessor` to stop a forced-**set** arm
+            // folding over a join it cannot speak for; a forced-clear arm admits no code on its own,
+            // so requiring it there only suppressed a conservative marker -- and a chain whose
+            // readable link is in another block then reported no case *and* no site, where the
+            // comment on `own_flags` says it answers with its site. Raised by CodeRabbit on
+            // [#439](https://github.com/glslang/windbg-mcp/pull/439), whose reading of the
+            // asymmetry is the one above.
+            let had_readings = !compared.is_empty();
             *compared = match unreachable {
                 true => Vec::new(),
                 false => next.into_iter().collect(),
@@ -3000,7 +3009,7 @@ fn absorb(
             // properly.
             *lost = (*lost)
                 .or(just_lost.take())
-                .or((blind && predecessor).then_some(at))
+                .or((blind && had_readings).then_some(at))
                 .or(unnamed)
                 .or(unreachable.then_some(at));
             *forced = None;
@@ -7462,6 +7471,102 @@ mod tests {
             found.untracked,
             vec![DISPATCH + 0x1c],
             "the blind link, not the `cmp` before it"
+        );
+    }
+
+    /// **A blind forced-clear link marks the chain even when the readable link is in another
+    /// block**, which is what `own_flags` must not suppress.
+    ///
+    /// Block A ends `cmp w9,w11`; a label starts block B with `ccmpne w2,w3,#0` / `b.ne`. On the
+    /// path through A the case block is reached by every code *but* `w11`'s wherever `w2 == w3`, so
+    /// the answer is incomplete -- and it reported no case and no site, because the blind-link
+    /// marker asked for `predecessor`, which carries `own_flags`, and the readings here came in on
+    /// an edge.
+    ///
+    /// `own_flags` is there to stop a forced-**set** arm folding over a join whose other paths it
+    /// cannot speak for. A forced-clear arm admits no code by itself, so the condition bought
+    /// nothing there and cost the marker. Raised by **CodeRabbit** on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439) -- its first finding on this branch,
+    /// with the asymmetry and the minimal remedy both correct.
+    #[test]
+    fn a_blind_forced_clear_link_marks_a_chain_from_another_block() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            // Block A ends here: the compare is its last instruction, and the label below is a
+            // branch target, so the chain crosses the boundary.
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            // Block B, entered here and from the jump at the end.
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w2",
+                reg("w3"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "mov",
+                vec![reg("w0"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "b",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x14)),
+            ),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x14],
+            "the blind link's site, with the readable one an edge away"
         );
     }
 
