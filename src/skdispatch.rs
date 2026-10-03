@@ -458,6 +458,22 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
+    fn finish_completion_kick(&mut self) -> Result<()> {
+        let Some(kick) = self.completion_kick.take() else {
+            return Ok(());
+        };
+        if let Err(error) = kick.finish() {
+            // Every transition held here ends in Resume-VM; a delayed completion kick first pauses
+            // the VM. If the helper fails, the only safe retained state is that a pause may have
+            // succeeded. Recovery and teardown will issue an idempotent resume before release.
+            self.vm_paused = true;
+            return Err(error.context(
+                "the Hyper-V transition failed, so the VM is conservatively retained as paused",
+            ));
+        }
+        Ok(())
+    }
+
     fn read_memory(
         &self,
         epoch: crate::skcontrol::StopEpoch,
@@ -773,9 +789,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         if self.state.attached {
             self.detach_handled()?;
         }
-        if let Some(kick) = self.state.completion_kick.take() {
-            kick.finish()?;
-        }
+        self.state.finish_completion_kick()?;
         if self.state.vm_paused {
             run_vm_action(self.bound_vm_id()?, VmAction::Resume, POWERSHELL_WAIT)?;
             self.state.vm_paused = false;
@@ -807,9 +821,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         if self.state.attached {
             self.detach_handled()?;
         }
-        if let Some(kick) = self.state.completion_kick.take() {
-            kick.finish()?;
-        }
+        self.state.finish_completion_kick()?;
         if self.state.handler_context.is_some() {
             self.unregister_handler()?;
         } else if self.state.scratch_allocated {
@@ -826,9 +838,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 
 impl VmwpDispatcher<'_> {
     fn prepare_held_event(&mut self) -> Result<()> {
-        if let Some(kick) = self.state.completion_kick.take() {
-            kick.finish()?;
-        }
+        self.state.finish_completion_kick()?;
         if self.state.breakpoint.is_some() {
             self.remove_owned_breakpoint()?;
         }
@@ -1119,9 +1129,7 @@ impl VmwpDispatcher<'_> {
             }
             ReleaseMode::Resume => {
                 self.detach_handled()?;
-                if let Some(kick) = self.state.completion_kick.take() {
-                    kick.finish()?;
-                }
+                self.state.finish_completion_kick()?;
                 self.state.vm_paused = false;
                 self.state.phase = DispatcherPhase::Detached;
             }
@@ -1629,6 +1637,19 @@ impl VmTransition {
         }
         result
     }
+
+    #[cfg(test)]
+    fn completed_for_test(result: Result<()>) -> Self {
+        let (cancel, cancel_rx) = mpsc::channel();
+        drop(cancel_rx);
+        let (result_tx, result_rx) = mpsc::channel();
+        result_tx.send(result).unwrap();
+        Self {
+            cancel,
+            result: result_rx,
+            thread: None,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1727,6 +1748,21 @@ mod tests {
         state.record_handler_context(0x2000_0000_2000).unwrap();
         assert_eq!(state.handler_context, Some(0x2000_0000_2000));
         assert!(state.record_handler_context(0x2000_0000_3000).is_err());
+    }
+
+    #[test]
+    fn a_failed_completion_kick_retains_conservative_pause_ownership() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        state.completion_kick = Some(VmTransition::completed_for_test(Err(anyhow!(
+            "Resume-VM failed after Suspend-VM"
+        ))));
+
+        let error = state.finish_completion_kick().unwrap_err();
+
+        assert!(error.to_string().contains("conservatively retained"));
+        assert!(state.vm_paused);
+        assert!(state.completion_kick.is_none());
     }
 
     fn profile() -> DispatcherProfile {
