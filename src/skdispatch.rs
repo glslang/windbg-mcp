@@ -569,8 +569,11 @@ enum DispatcherPhase {
     Registering,
     ReadyForStop(StopReason),
     Holding(HeldEvent),
+    ReturningCallback(HeldEvent),
     CallbackEntry(HeldEvent),
+    ReturningHandle(HeldEvent),
     HandleReturn(HeldEvent),
+    ReturningNative(HeldEvent),
     NativeReturn(HeldEvent),
     Detached,
     Contained(String),
@@ -609,8 +612,11 @@ impl DispatcherPhase {
     fn held_event(&self) -> Option<&HeldEvent> {
         match self {
             Self::Holding(event)
+            | Self::ReturningCallback(event)
             | Self::CallbackEntry(event)
+            | Self::ReturningHandle(event)
             | Self::HandleReturn(event)
+            | Self::ReturningNative(event)
             | Self::NativeReturn(event) => Some(event),
             _ => None,
         }
@@ -944,8 +950,11 @@ impl EventDispatcher for VmwpDispatcher<'_> {
                 bail!("refusing teardown while handler registration is incomplete")
             }
             DispatcherPhase::Holding(_)
+            | DispatcherPhase::ReturningCallback(_)
             | DispatcherPhase::CallbackEntry(_)
-            | DispatcherPhase::HandleReturn(_) => {
+            | DispatcherPhase::ReturningHandle(_)
+            | DispatcherPhase::HandleReturn(_)
+            | DispatcherPhase::ReturningNative(_) => {
                 bail!("refusing teardown while a native event is incomplete")
             }
             _ => {}
@@ -1215,8 +1224,11 @@ impl VmwpDispatcher<'_> {
     fn complete_event(&mut self, mode: ReleaseMode) -> Result<()> {
         let held = match &self.state.phase {
             DispatcherPhase::Holding(event) => event.clone(),
-            DispatcherPhase::CallbackEntry(event)
+            DispatcherPhase::ReturningCallback(event)
+            | DispatcherPhase::CallbackEntry(event)
+            | DispatcherPhase::ReturningHandle(event)
             | DispatcherPhase::HandleReturn(event)
+            | DispatcherPhase::ReturningNative(event)
             | DispatcherPhase::NativeReturn(event) => event.clone(),
             _ => bail!("the dispatcher is not in a releasable event phase"),
         };
@@ -1224,9 +1236,17 @@ impl VmwpDispatcher<'_> {
         if matches!(self.state.phase, DispatcherPhase::Holding(_)) {
             let site = self.state.profile.callback_entry.clone();
             self.set_site_breakpoint(&site)?;
-            self.run_to_current_breakpoint(
-                Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-            )?;
+            self.state.phase = DispatcherPhase::ReturningCallback(held.clone());
+        }
+
+        if matches!(self.state.phase, DispatcherPhase::ReturningCallback(_)) {
+            let site = self.state.profile.callback_entry.clone();
+            let target = self.require_owned_site_breakpoint(&site)?;
+            if self.engine.instruction_pointer().map_err(debugger)? != target {
+                self.run_to_current_breakpoint(
+                    Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
+                )?;
+            }
             self.require_site(&site)?;
             let message = self.register("rcx")?;
             let context = self.register("rbx")?;
@@ -1248,10 +1268,24 @@ impl VmwpDispatcher<'_> {
         if matches!(self.state.phase, DispatcherPhase::CallbackEntry(_)) {
             let site = self.state.profile.handle_return.clone();
             self.set_site_breakpoint(&site)?;
-            self.write_register("rip", self.image(self.state.profile.callback_resume_rva.0)?)?;
-            self.run_to_current_breakpoint(
-                Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-            )?;
+            // From here recovery owns the installed handle-return breakpoint. Record that before
+            // either the RIP write or the wait can fail, so retry does not install it twice.
+            self.state.phase = DispatcherPhase::ReturningHandle(held.clone());
+        }
+
+        if matches!(self.state.phase, DispatcherPhase::ReturningHandle(_)) {
+            let entry = self.site_address(&self.state.profile.callback_entry)?;
+            let site = self.state.profile.handle_return.clone();
+            let target = self.require_owned_site_breakpoint(&site)?;
+            let rip = self.engine.instruction_pointer().map_err(debugger)?;
+            if rip == entry {
+                self.write_register("rip", self.image(self.state.profile.callback_resume_rva.0)?)?;
+            }
+            if rip != target {
+                self.run_to_current_breakpoint(
+                    Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
+                )?;
+            }
             self.require_site(&site)?;
             if self.register("rax")? != 1 {
                 bail!("registered callback did not report the event handled");
@@ -1263,12 +1297,24 @@ impl VmwpDispatcher<'_> {
         if matches!(self.state.phase, DispatcherPhase::HandleReturn(_)) {
             let site = self.state.profile.native_return.clone();
             self.set_site_breakpoint(&site)?;
-            self.state.completion_kick = Some(VmTransition::completion_kick(
-                self.bound_vm_id()?.to_string(),
-            ));
-            self.run_to_current_breakpoint(
-                Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
-            )?;
+            // The retained breakpoint is recoverable before even resolving the VM coordinate for
+            // the completion kick.
+            self.state.phase = DispatcherPhase::ReturningNative(held.clone());
+        }
+
+        if matches!(self.state.phase, DispatcherPhase::ReturningNative(_)) {
+            let site = self.state.profile.native_return.clone();
+            let target = self.require_owned_site_breakpoint(&site)?;
+            if self.state.completion_kick.is_none() {
+                self.state.completion_kick = Some(VmTransition::completion_kick(
+                    self.bound_vm_id()?.to_string(),
+                ));
+            }
+            if self.engine.instruction_pointer().map_err(debugger)? != target {
+                self.run_to_current_breakpoint(
+                    Instant::now() + Duration::from_millis(u64::from(DEBUG_WAIT)),
+                )?;
+            }
             self.require_site(&site)?;
             if self.register("rax")? != 1 {
                 bail!("native dispatcher completion did not report success");
@@ -1542,6 +1588,32 @@ impl VmwpDispatcher<'_> {
     fn set_site_breakpoint(&mut self, site: &DispatcherSite) -> Result<()> {
         let address = self.site_address(site)?;
         self.set_guarded_breakpoint(address, site.original.clone())
+    }
+
+    fn require_owned_site_breakpoint(&self, site: &DispatcherSite) -> Result<u64> {
+        let address = self.site_address(site)?;
+        let owned = self
+            .state
+            .breakpoint
+            .as_ref()
+            .context("the resumable event stage owns no breakpoint")?;
+        if owned.address != address || owned.original != site.original {
+            bail!("the resumable event stage owns an unexpected breakpoint");
+        }
+        let still_owned = self
+            .engine
+            .breakpoints()
+            .map_err(debugger)?
+            .into_iter()
+            .find(|breakpoint| breakpoint.id == owned.id)
+            .context("the resumable event breakpoint disappeared")?;
+        if still_owned.address != Some(address)
+            || still_owned.kind != BreakpointKind::Code
+            || !still_owned.enabled
+        {
+            bail!("the resumable event breakpoint id was reused, changed or disabled");
+        }
+        Ok(address)
     }
 
     fn set_dynamic_breakpoint(&mut self, address: u64) -> Result<()> {
@@ -2000,6 +2072,18 @@ mod tests {
 
         assert_eq!(
             DispatcherPhase::Holding(event.clone()).held_event(),
+            Some(&event)
+        );
+        assert_eq!(
+            DispatcherPhase::ReturningCallback(event.clone()).held_event(),
+            Some(&event)
+        );
+        assert_eq!(
+            DispatcherPhase::ReturningHandle(event.clone()).held_event(),
+            Some(&event)
+        );
+        assert_eq!(
+            DispatcherPhase::ReturningNative(event.clone()).held_event(),
             Some(&event)
         );
         assert!(
