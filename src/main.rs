@@ -47,6 +47,7 @@ mod server;
 mod service;
 mod sk;
 mod skcontrol;
+mod skdispatch;
 mod skinspect;
 mod sklive;
 mod sksession;
@@ -118,16 +119,25 @@ fn main() -> Result<()> {
     // engine thread must be free to block in DbgEng indefinitely.
     let args: Vec<String> = std::env::args().collect();
     let is_worker = args.iter().any(|arg| arg == worker::WORKER_FLAG);
+    let is_live_control = args.iter().any(|arg| arg == skdispatch::LIVE_CONTROL_FLAG);
     // A service has no console, so its stderr goes nowhere at all — and the failure most worth
     // seeing is a listener that refuses to start, which happens before `server_log` can be asked
     // anything. Decided here because logging is initialised before the role is acted on.
     let to_file =
         matches!(service::requested(&args), Some(service::Role::Run)).then(service::log_path);
-    init_logging(is_worker, to_file);
+    init_logging(is_worker || is_live_control, to_file);
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
         worker::run(&args);
+    }
+    if let Some(at) = args
+        .iter()
+        .position(|arg| arg == skdispatch::LIVE_CONTROL_FLAG)
+    {
+        // K4.2b acceptance uses the worker's engine constructor and runs synchronously on this
+        // thread. It speaks no MCP and accepts no debugger command text.
+        return worker::run_sk_live_control(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == cast::RENDER_FLAG) {
         // Before the runtime: this reads a file and writes a file, and neither wants one.

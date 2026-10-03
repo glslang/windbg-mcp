@@ -29,6 +29,9 @@ const DR6_CAUSE_MASK: u64 = 0xe00f;
 const DR7_ENABLE_MASK: u64 = 0xff;
 const DR7_SLOT0_KIND_MASK: u64 = 0xf << 16;
 const MAX_INSTRUCTION_BYTES: usize = 15;
+const PROFILE_SCHEMA: &str = "windbg-mcp.sk-live-dispatcher-profile.v1";
+const MAX_PROFILE_BYTES: u64 = 64 * 1024;
+const MAX_SCRATCH_BYTES: u32 = 64 * 1024;
 
 const SNAPSHOT_REGISTERS: [RegisterName; 12] = [
     RegisterName::Rip,
@@ -172,16 +175,221 @@ pub(crate) struct ObservedStop {
 /// deliberately paused; it may remove only resources whose ownership it can still prove.
 pub(crate) trait EventDispatcher {
     /// Pause the target and return the exact native callback context owned by this adapter.
-    fn begin_arm(&mut self, target: &TargetIdentity) -> Result<HexU64>;
+    fn begin_arm(
+        &mut self,
+        target: &TargetIdentity,
+        instruction: &InstructionGuard,
+    ) -> Result<HexU64>;
     fn finish_arm(&mut self) -> Result<()>;
     fn wait_for_stop(
         &mut self,
         target: &TargetIdentity,
         instruction: &InstructionGuard,
     ) -> Result<ObservedStop>;
-    fn release_event(&mut self, event: &HeldEvent) -> Result<()>;
+    fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()>;
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()>;
     fn teardown(&mut self) -> Result<()>;
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ReleaseMode {
+    /// Arm the dispatcher stop first, then let DbgEng begin pumping only when `wait_for_stop` runs.
+    ArmNextStop,
+    /// Complete the event and detach it as handled so `vmwp` and the guest really resume.
+    Resume,
+}
+
+/// Original bytes at one build-specific vmwp stop site. The adapter verifies them after every
+/// breakpoint removal, so an RVA from another build cannot silently become executable again.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DispatcherSite {
+    pub(crate) rva: HexU64,
+    pub(crate) original: Vec<u8>,
+}
+
+/// Offsets within the operator-owned callback scratch allocation and the private dispatcher
+/// records. Values live in the local profile rather than this repository's source because they are
+/// build-specific private ABI, not a Windows contract.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DispatcherLayout {
+    pub(crate) returned_context: u32,
+    pub(crate) handler_descriptor: u32,
+    pub(crate) callback_descriptor: u32,
+    pub(crate) callback_mirror: u32,
+    pub(crate) event_context: u32,
+    pub(crate) exchange_advance: u32,
+    pub(crate) callback_pointer: u32,
+    pub(crate) callback_flags: u32,
+    pub(crate) register_stack_handler: u32,
+    pub(crate) register_stack_context: u32,
+}
+
+/// Exact-build input for the DbgEng dispatcher adapter. It contains only numbers and byte guards;
+/// no field is debugger command text.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct DispatcherProfile {
+    pub(crate) schema: String,
+    pub(crate) vmwp_image: std::path::PathBuf,
+    pub(crate) vmwp_sha256: String,
+    pub(crate) vmwp_size_of_image: u32,
+    pub(crate) scratch_base: HexU64,
+    pub(crate) scratch_size: u32,
+    pub(crate) registration_tag: HexU64,
+    pub(crate) register_handler_rva: HexU64,
+    pub(crate) unregister_handler_rva: HexU64,
+    pub(crate) callback_stub_rva: HexU64,
+    pub(crate) callback_resume_rva: HexU64,
+    pub(crate) event_held: DispatcherSite,
+    pub(crate) callback_entry: DispatcherSite,
+    pub(crate) handle_return: DispatcherSite,
+    pub(crate) native_return: DispatcherSite,
+    pub(crate) deferred_cleanup: DispatcherSite,
+    pub(crate) layout: DispatcherLayout,
+}
+
+impl DispatcherProfile {
+    pub(crate) fn load(path: &std::path::Path) -> Result<Self> {
+        let file = std::fs::File::open(path)
+            .with_context(|| format!("opening dispatcher profile {}", path.display()))?;
+        let length = file
+            .metadata()
+            .with_context(|| format!("reading dispatcher profile size {}", path.display()))?
+            .len();
+        if length == 0 || length > MAX_PROFILE_BYTES {
+            bail!("dispatcher profile size must be in 1..={MAX_PROFILE_BYTES} bytes, got {length}");
+        }
+        let profile: Self = serde_json::from_reader(file)
+            .with_context(|| format!("parsing dispatcher profile {}", path.display()))?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub(crate) fn validate(&self) -> Result<()> {
+        if self.schema != PROFILE_SCHEMA {
+            bail!(
+                "dispatcher profile schema is {:?}, expected {PROFILE_SCHEMA:?}",
+                self.schema
+            );
+        }
+        if self.vmwp_sha256.len() != 64
+            || !self
+                .vmwp_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            bail!("vmwp_sha256 must contain exactly 64 hexadecimal digits");
+        }
+        if !self.vmwp_image.is_absolute()
+            || !self
+                .vmwp_image
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.eq_ignore_ascii_case("vmwp.exe"))
+        {
+            bail!("vmwp_image must be an absolute path ending in vmwp.exe");
+        }
+        if self.vmwp_size_of_image == 0 {
+            bail!("vmwp_size_of_image must be nonzero");
+        }
+        if self.scratch_base.0 == 0 || self.scratch_base.0 & 0xfff != 0 {
+            bail!("scratch_base must be a nonzero page-aligned address");
+        }
+        if self.scratch_size == 0
+            || self.scratch_size > MAX_SCRATCH_BYTES
+            || !self.scratch_size.is_multiple_of(0x1000)
+        {
+            bail!("scratch_size must be a page multiple in 0x1000..={MAX_SCRATCH_BYTES:#x}");
+        }
+        for (name, rva) in [
+            ("register_handler_rva", self.register_handler_rva.0),
+            ("unregister_handler_rva", self.unregister_handler_rva.0),
+            ("callback_stub_rva", self.callback_stub_rva.0),
+            ("callback_resume_rva", self.callback_resume_rva.0),
+        ] {
+            self.validate_rva(name, rva, 1)?;
+        }
+        let sites = [
+            ("event_held", &self.event_held),
+            ("callback_entry", &self.callback_entry),
+            ("handle_return", &self.handle_return),
+            ("native_return", &self.native_return),
+            ("deferred_cleanup", &self.deferred_cleanup),
+        ];
+        for (name, site) in sites {
+            if site.original.is_empty() || site.original.len() > MAX_INSTRUCTION_BYTES {
+                bail!("{name}.original must contain 1..={MAX_INSTRUCTION_BYTES} bytes");
+            }
+            self.validate_rva(name, site.rva.0, site.original.len() as u64)?;
+        }
+        for (index, (_, left)) in sites.iter().enumerate() {
+            for (_, right) in &sites[index + 1..] {
+                let left_end = left.rva.0 + left.original.len() as u64;
+                let right_end = right.rva.0 + right.original.len() as u64;
+                if left.rva.0 < right_end && right.rva.0 < left_end {
+                    bail!("dispatcher breakpoint byte guards overlap");
+                }
+            }
+        }
+        for (name, offset) in [
+            ("returned_context", self.layout.returned_context),
+            ("handler_descriptor", self.layout.handler_descriptor),
+            ("callback_descriptor", self.layout.callback_descriptor),
+            ("callback_mirror", self.layout.callback_mirror),
+        ] {
+            self.validate_scratch(name, offset, 8)?;
+        }
+        for (name, offset) in [
+            ("event_context", self.layout.event_context),
+            ("exchange_advance", self.layout.exchange_advance),
+            ("callback_pointer", self.layout.callback_pointer),
+            ("callback_flags", self.layout.callback_flags),
+        ] {
+            if offset > 0x1000 {
+                bail!("dispatcher field offset {name} exceeds the bounded record window");
+            }
+        }
+        for (name, offset) in [
+            ("register_stack_handler", self.layout.register_stack_handler),
+            ("register_stack_context", self.layout.register_stack_context),
+        ] {
+            if !(0x20..=0x100).contains(&offset) || !offset.is_multiple_of(8) {
+                bail!("{name} must be an aligned x64 stack-argument offset in 0x20..=0x100");
+            }
+        }
+        let callback_mirror = self
+            .layout
+            .callback_descriptor
+            .checked_add(self.layout.callback_mirror)
+            .context("callback mirror offset overflowed")?;
+        self.validate_scratch("callback_descriptor+callback_mirror", callback_mirror, 8)?;
+        Ok(())
+    }
+
+    fn validate_rva(&self, name: &str, rva: u64, size: u64) -> Result<()> {
+        let end = rva
+            .checked_add(size)
+            .with_context(|| format!("{name} range overflowed"))?;
+        if rva == 0 || end > u64::from(self.vmwp_size_of_image) {
+            bail!(
+                "{name} range {rva:#x}..{end:#x} is outside vmwp SizeOfImage {:#x}",
+                self.vmwp_size_of_image
+            );
+        }
+        Ok(())
+    }
+
+    fn validate_scratch(&self, name: &str, offset: u32, size: u32) -> Result<()> {
+        let end = offset
+            .checked_add(size)
+            .with_context(|| format!("scratch field {name} overflowed"))?;
+        if !offset.is_multiple_of(8) || end > self.scratch_size {
+            bail!("scratch field {name} is misaligned or outside the allocation");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -317,9 +525,8 @@ enum State {
 
 /// One-VP, one-breakpoint coordinator. It is synchronous because its owner is the worker's single
 /// engine thread.
-pub(crate) struct LiveControl<P, D> {
+pub(crate) struct LiveControl<P> {
     provider: P,
-    dispatcher: D,
     target: TargetIdentity,
     provider_phase: ProviderPhase,
     state: State,
@@ -329,8 +536,8 @@ pub(crate) struct LiveControl<P, D> {
     expected_stop: Option<ExpectedStop>,
 }
 
-impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
-    pub(crate) fn open(mut provider: P, dispatcher: D) -> Result<Self> {
+impl<P: ControlProvider> LiveControl<P> {
+    pub(crate) fn open(mut provider: P) -> Result<Self> {
         provider.target().validate()?;
         let capabilities = provider.capabilities()?;
         require_registers(&capabilities, &SNAPSHOT_REGISTERS, false)?;
@@ -338,7 +545,6 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
         let target = provider.target().clone();
         Ok(Self {
             provider,
-            dispatcher,
             target,
             provider_phase: ProviderPhase::Running,
             state: State::Running,
@@ -380,12 +586,16 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
 
     /// Pause the dispatcher, save the original VTL1 state, install DR0, and redirect RIP to the
     /// guarded instruction. Natural-flow arming is deliberately a later revision.
-    pub(crate) fn arm(&mut self, instruction: InstructionGuard) -> Result<StopEpoch> {
+    pub(crate) fn arm(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        instruction: InstructionGuard,
+    ) -> Result<StopEpoch> {
         self.require_running_unarmed()?;
         instruction.validate()?;
         self.state = State::Arming;
-        if let Err(error) = self.arm_inner(&instruction) {
-            return Err(self.enter_fault(error, None));
+        if let Err(error) = self.arm_inner(dispatcher, &instruction) {
+            return Err(self.enter_fault(dispatcher, error, None));
         }
         self.instruction = Some(instruction);
         self.expected_stop = Some(ExpectedStop::Hardware);
@@ -393,8 +603,12 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
         Ok(self.provider.epoch().clone())
     }
 
-    fn arm_inner(&mut self, instruction: &InstructionGuard) -> Result<()> {
-        self.begin_dispatcher_arm()?;
+    fn arm_inner(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        instruction: &InstructionGuard,
+    ) -> Result<()> {
+        self.begin_dispatcher_arm(dispatcher, instruction)?;
         self.provider.begin_arm()?;
         self.provider_phase = ProviderPhase::Arming;
         let baseline = self.read_snapshot()?;
@@ -438,13 +652,16 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
 
         self.provider.finish_arm()?;
         self.provider_phase = ProviderPhase::Running;
-        self.dispatcher.finish_arm()?;
+        dispatcher.finish_arm()?;
         Ok(())
     }
 
     /// Wait for and validate the next owned vector-1 event. Two complete register reads must agree
     /// before the stop becomes visible to a caller.
-    pub(crate) fn wait_for_stop(&mut self) -> Result<StopRecord> {
+    pub(crate) fn wait_for_stop(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+    ) -> Result<StopRecord> {
         if !matches!(self.state, State::Running) || self.expected_stop.is_none() {
             bail!("wait_for_stop requires an armed running session");
         }
@@ -452,15 +669,15 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
             .instruction
             .clone()
             .context("the armed session has no instruction guard")?;
-        let observed = match self.dispatcher.wait_for_stop(&self.target, &instruction) {
+        let observed = match dispatcher.wait_for_stop(&self.target, &instruction) {
             Ok(observed) => observed,
-            Err(error) => return Err(self.enter_fault(error, None)),
+            Err(error) => return Err(self.enter_fault(dispatcher, error, None)),
         };
         if let Err(error) = self.validate_observation(&observed) {
-            return Err(self.enter_fault(error, Some(observed.event)));
+            return Err(self.enter_fault(dispatcher, error, Some(observed.event)));
         }
         if let Err(error) = self.provider.publish_stop(observed.event.clone()) {
-            return Err(self.enter_fault(error, Some(observed.event)));
+            return Err(self.enter_fault(dispatcher, error, Some(observed.event)));
         }
         self.provider_phase = ProviderPhase::Stopped;
         let result = (|| {
@@ -488,12 +705,16 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
                 self.state = State::Stopped(stop.clone());
                 Ok(stop)
             }
-            Err(error) => Err(self.enter_fault(error, Some(observed.event))),
+            Err(error) => Err(self.enter_fault(dispatcher, error, Some(observed.event))),
         }
     }
 
     /// Consume a hardware-breakpoint stop and arm one architectural trap-flag step.
-    pub(crate) fn step(&mut self, epoch: &StopEpoch) -> Result<StopEpoch> {
+    pub(crate) fn step(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+    ) -> Result<StopEpoch> {
         let stop = self.require_stop_epoch(epoch)?.clone();
         if !matches!(
             stop.event.reason,
@@ -523,11 +744,11 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
             self.write_one(RegisterName::Rflags, rflags, (rflags | TF) & !RF)?;
             self.provider.release()?;
             self.provider_phase = ProviderPhase::Running;
-            self.dispatcher.release_event(&stop.event)?;
+            dispatcher.release_event(&stop.event, ReleaseMode::ArmNextStop)?;
             Ok(())
         })();
         if let Err(error) = result {
-            return Err(self.enter_fault(error, Some(stop.event)));
+            return Err(self.enter_fault(dispatcher, error, Some(stop.event)));
         }
         self.expected_stop = Some(ExpectedStop::SingleStep);
         self.state = State::Running;
@@ -535,18 +756,22 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
     }
 
     /// Restore the complete writable baseline and release the exact event once.
-    pub(crate) fn continue_from(&mut self, epoch: &StopEpoch) -> Result<StopEpoch> {
+    pub(crate) fn continue_from(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        epoch: &StopEpoch,
+    ) -> Result<StopEpoch> {
         let stop = self.require_stop_epoch(epoch)?.clone();
         self.state = State::Releasing;
         let result = (|| {
             self.restore_baseline()?;
             self.provider.release()?;
             self.provider_phase = ProviderPhase::Running;
-            self.dispatcher.release_event(&stop.event)?;
+            dispatcher.release_event(&stop.event, ReleaseMode::Resume)?;
             Ok(())
         })();
         if let Err(error) = result {
-            return Err(self.enter_fault(error, Some(stop.event)));
+            return Err(self.enter_fault(dispatcher, error, Some(stop.event)));
         }
         self.baseline = None;
         self.instruction = None;
@@ -556,11 +781,11 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
     }
 
     /// Restore or release anything this session still owns, then remove the handler and detach.
-    pub(crate) fn close(&mut self) -> Result<()> {
+    pub(crate) fn close(&mut self, dispatcher: &mut impl EventDispatcher) -> Result<()> {
         match self.state.clone() {
             State::Closed => return Ok(()),
             State::Faulted(fault) => {
-                let teardown = self.dispatcher.teardown();
+                let teardown = dispatcher.teardown();
                 match teardown {
                     Ok(()) => bail!(
                         "the terminal live-control fault remains after teardown: {}",
@@ -573,22 +798,26 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
                 }
             }
             State::Stopped(stop) => {
-                self.continue_from(&stop.epoch)?;
+                self.continue_from(dispatcher, &stop.epoch)?;
             }
             State::Running if self.baseline.is_some() => {
                 self.state = State::Arming;
                 let result = (|| {
-                    self.begin_dispatcher_arm()?;
+                    let instruction = self
+                        .instruction
+                        .clone()
+                        .context("the armed session has no instruction guard")?;
+                    self.begin_dispatcher_arm(dispatcher, &instruction)?;
                     self.provider.begin_arm()?;
                     self.provider_phase = ProviderPhase::Arming;
                     self.restore_baseline()?;
                     self.provider.finish_arm()?;
                     self.provider_phase = ProviderPhase::Running;
-                    self.dispatcher.finish_arm()?;
+                    dispatcher.finish_arm()?;
                     Ok(())
                 })();
                 if let Err(error) = result {
-                    return Err(self.enter_fault(error, None));
+                    return Err(self.enter_fault(dispatcher, error, None));
                 }
                 self.baseline = None;
                 self.instruction = None;
@@ -598,13 +827,14 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
             State::Running => {}
             State::Arming | State::Releasing => {
                 return Err(self.enter_fault(
+                    dispatcher,
                     anyhow!("close observed an incomplete control transition"),
                     None,
                 ));
             }
         }
-        if let Err(error) = self.dispatcher.teardown() {
-            return Err(self.enter_fault(error, None));
+        if let Err(error) = dispatcher.teardown() {
+            return Err(self.enter_fault(dispatcher, error, None));
         }
         self.state = State::Closed;
         Ok(())
@@ -631,6 +861,9 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
         registers: &RegisterSnapshot,
         instruction: &InstructionGuard,
     ) -> Result<()> {
+        if registers.low(RegisterName::Cs)? & 3 != u64::from(event.cpl) {
+            bail!("the held event CPL does not match the provider's CS register");
+        }
         match event.reason {
             StopReason::HardwareBreakpoint { slot: 0 } => {
                 if registers.low(RegisterName::Rip)? != instruction.address.0
@@ -662,8 +895,12 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
         )
     }
 
-    fn begin_dispatcher_arm(&mut self) -> Result<()> {
-        let context = self.dispatcher.begin_arm(&self.target)?;
+    fn begin_dispatcher_arm(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        instruction: &InstructionGuard,
+    ) -> Result<()> {
+        let context = dispatcher.begin_arm(&self.target, instruction)?;
         if context.0 == 0 {
             bail!("the debugger adapter returned a zero handler context");
         }
@@ -749,7 +986,12 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
         Ok(stop)
     }
 
-    fn enter_fault(&mut self, cause: anyhow::Error, event: Option<HeldEvent>) -> anyhow::Error {
+    fn enter_fault(
+        &mut self,
+        dispatcher: &mut impl EventDispatcher,
+        cause: anyhow::Error,
+        event: Option<HeldEvent>,
+    ) -> anyhow::Error {
         let mut recovery_errors = Vec::new();
         let mut safe_to_resume = self.baseline.is_none();
 
@@ -798,9 +1040,8 @@ impl<P: ControlProvider, D: EventDispatcher> LiveControl<P, D> {
                 && Some(event.dispatcher_context) == self.dispatcher_context
         });
         let dispatcher_safe = safe_to_resume && (event.is_none() || owned_event.is_some());
-        let dispatcher_recovered = if let Err(error) = self
-            .dispatcher
-            .recover(dispatcher_safe, owned_event.filter(|_| dispatcher_safe))
+        let dispatcher_recovered = if let Err(error) =
+            dispatcher.recover(dispatcher_safe, owned_event.filter(|_| dispatcher_safe))
         {
             recovery_errors.push(format!("dispatcher recovery: {error:#}"));
             false
@@ -1003,7 +1244,7 @@ mod tests {
         BeginArm,
         FinishArm,
         Wait,
-        Release,
+        Release(ReleaseMode),
         Recover { safe: bool, owned_event: bool },
         Teardown,
     }
@@ -1025,7 +1266,11 @@ mod tests {
     }
 
     impl EventDispatcher for FakeDispatcher {
-        fn begin_arm(&mut self, _target: &TargetIdentity) -> Result<HexU64> {
+        fn begin_arm(
+            &mut self,
+            _target: &TargetIdentity,
+            _instruction: &InstructionGuard,
+        ) -> Result<HexU64> {
             self.actions.push(Action::BeginArm);
             Ok(HexU64(0x2000_0000_1000))
         }
@@ -1044,8 +1289,8 @@ mod tests {
             self.stops.pop_front().context("no scripted stop")
         }
 
-        fn release_event(&mut self, _event: &HeldEvent) -> Result<()> {
-            self.actions.push(Action::Release);
+        fn release_event(&mut self, _event: &HeldEvent, mode: ReleaseMode) -> Result<()> {
+            self.actions.push(Action::Release(mode));
             if self.fail_release {
                 bail!("scripted native completion failure");
             }
@@ -1068,14 +1313,14 @@ mod tests {
 
     #[test]
     fn hardware_stop_step_and_continue_consume_two_distinct_epochs() {
-        let dispatcher = FakeDispatcher::new([
+        let mut dispatcher = FakeDispatcher::new([
             observed(StopReason::HardwareBreakpoint { slot: 0 }),
             observed(StopReason::SingleStep),
         ]);
-        let mut control = LiveControl::open(FakeProvider::new(), dispatcher).unwrap();
-        control.arm(instruction()).unwrap();
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control.arm(&mut dispatcher, instruction()).unwrap();
 
-        let hardware = control.wait_for_stop().unwrap();
+        let hardware = control.wait_for_stop(&mut dispatcher).unwrap();
         assert_eq!(control.phase(), LivePhase::Stopped);
         assert_eq!(
             hardware.registers.low(RegisterName::Rip).unwrap(),
@@ -1084,33 +1329,35 @@ mod tests {
         let stale = epoch("stopped", 999);
         assert!(
             control
-                .step(&stale)
+                .step(&mut dispatcher, &stale)
                 .unwrap_err()
                 .to_string()
                 .contains("stale")
         );
 
-        control.step(&hardware.epoch).unwrap();
-        let stepped = control.wait_for_stop().unwrap();
+        control.step(&mut dispatcher, &hardware.epoch).unwrap();
+        let stepped = control.wait_for_stop(&mut dispatcher).unwrap();
         assert_eq!(
             stepped.registers.low(RegisterName::Rip).unwrap(),
             TARGET_RIP + 5
         );
-        control.continue_from(&stepped.epoch).unwrap();
+        control
+            .continue_from(&mut dispatcher, &stepped.epoch)
+            .unwrap();
         assert_eq!(control.phase(), LivePhase::Running);
         assert_eq!(
             control.provider.registers,
             register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46)
         );
         assert_eq!(
-            control.dispatcher.actions,
+            dispatcher.actions,
             vec![
                 Action::BeginArm,
                 Action::FinishArm,
                 Action::Wait,
-                Action::Release,
+                Action::Release(ReleaseMode::ArmNextStop),
                 Action::Wait,
-                Action::Release,
+                Action::Release(ReleaseMode::Resume),
             ]
         );
     }
@@ -1119,13 +1366,13 @@ mod tests {
     fn changed_instruction_faults_and_restores_before_completing_the_owned_event() {
         let mut changed = instruction();
         changed.bytes[0] ^= 1;
-        let dispatcher = FakeDispatcher::new([ObservedStop {
+        let mut dispatcher = FakeDispatcher::new([ObservedStop {
             event: event(StopReason::HardwareBreakpoint { slot: 0 }),
             instruction: changed,
         }]);
-        let mut control = LiveControl::open(FakeProvider::new(), dispatcher).unwrap();
-        control.arm(instruction()).unwrap();
-        let error = control.wait_for_stop().unwrap_err();
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control.arm(&mut dispatcher, instruction()).unwrap();
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
 
         assert!(error.to_string().contains("guarded instruction changed"));
         assert_eq!(control.phase(), LivePhase::Faulted);
@@ -1134,7 +1381,7 @@ mod tests {
             register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46)
         );
         assert_eq!(
-            control.dispatcher.actions.last(),
+            dispatcher.actions.last(),
             Some(&Action::Recover {
                 safe: true,
                 owned_event: true
@@ -1146,17 +1393,17 @@ mod tests {
     fn unrelated_event_faults_without_authorising_native_completion() {
         let mut unrelated = event(StopReason::HardwareBreakpoint { slot: 0 });
         unrelated.dispatcher_context = HexU64(0x2000_0000_2000);
-        let dispatcher = FakeDispatcher::new([ObservedStop {
+        let mut dispatcher = FakeDispatcher::new([ObservedStop {
             event: unrelated,
             instruction: instruction(),
         }]);
-        let mut control = LiveControl::open(FakeProvider::new(), dispatcher).unwrap();
-        control.arm(instruction()).unwrap();
-        control.wait_for_stop().unwrap_err();
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control.arm(&mut dispatcher, instruction()).unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap_err();
 
         assert_eq!(control.phase(), LivePhase::Faulted);
         assert_eq!(
-            control.dispatcher.actions.last(),
+            dispatcher.actions.last(),
             Some(&Action::Recover {
                 safe: false,
                 owned_event: false
@@ -1167,13 +1414,13 @@ mod tests {
 
     #[test]
     fn unstable_held_registers_fault_and_restore_the_original_state() {
-        let dispatcher =
+        let mut dispatcher =
             FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
         let mut provider = FakeProvider::new();
         provider.unstable_once = true;
-        let mut control = LiveControl::open(provider, dispatcher).unwrap();
-        control.arm(instruction()).unwrap();
-        let error = control.wait_for_stop().unwrap_err();
+        let mut control = LiveControl::open(provider).unwrap();
+        control.arm(&mut dispatcher, instruction()).unwrap();
+        let error = control.wait_for_stop(&mut dispatcher).unwrap_err();
 
         assert!(error.to_string().contains("changed while"));
         assert_eq!(control.phase(), LivePhase::Faulted);
@@ -1188,16 +1435,18 @@ mod tests {
         let mut dispatcher =
             FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
         dispatcher.fail_release = true;
-        let mut control = LiveControl::open(FakeProvider::new(), dispatcher).unwrap();
-        control.arm(instruction()).unwrap();
-        let stopped = control.wait_for_stop().unwrap();
-        let error = control.continue_from(&stopped.epoch).unwrap_err();
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control.arm(&mut dispatcher, instruction()).unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        let error = control
+            .continue_from(&mut dispatcher, &stopped.epoch)
+            .unwrap_err();
 
         assert!(error.to_string().contains("native completion failure"));
         assert_eq!(control.phase(), LivePhase::Faulted);
         assert!(!control.fault().unwrap().target_left_paused);
         assert_eq!(
-            control.dispatcher.actions.last(),
+            dispatcher.actions.last(),
             Some(&Action::Recover {
                 safe: true,
                 owned_event: true
@@ -1207,19 +1456,70 @@ mod tests {
 
     #[test]
     fn close_while_stopped_restores_releases_tears_down_and_is_idempotent() {
-        let dispatcher =
+        let mut dispatcher =
             FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
-        let mut control = LiveControl::open(FakeProvider::new(), dispatcher).unwrap();
-        control.arm(instruction()).unwrap();
-        control.wait_for_stop().unwrap();
-        control.close().unwrap();
-        control.close().unwrap();
+        let mut control = LiveControl::open(FakeProvider::new()).unwrap();
+        control.arm(&mut dispatcher, instruction()).unwrap();
+        control.wait_for_stop(&mut dispatcher).unwrap();
+        control.close(&mut dispatcher).unwrap();
+        control.close(&mut dispatcher).unwrap();
 
         assert_eq!(control.phase(), LivePhase::Closed);
-        assert_eq!(control.dispatcher.actions.last(), Some(&Action::Teardown));
+        assert_eq!(dispatcher.actions.last(), Some(&Action::Teardown));
         assert_eq!(
             control.provider.registers,
             register_values(BASE_RIP, 0xffff_0ff0, 0x400, 0x46)
+        );
+    }
+
+    #[test]
+    fn dispatcher_profile_accepts_only_bounded_numeric_build_inputs() {
+        let profile = dispatcher_profile();
+        profile.validate().unwrap();
+        let encoded = serde_json::to_string(&profile).unwrap();
+        assert!(!encoded.contains("command"));
+
+        let mut bad_hash = profile.clone();
+        bad_hash.vmwp_sha256 = "not-a-hash".into();
+        assert!(
+            bad_hash
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("64 hexadecimal")
+        );
+
+        let mut bad_stack = profile.clone();
+        bad_stack.layout.register_stack_handler = 0x21;
+        assert!(
+            bad_stack
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("stack-argument")
+        );
+    }
+
+    #[test]
+    fn dispatcher_profile_rejects_overlapping_or_out_of_image_stop_sites() {
+        let mut overlap = dispatcher_profile();
+        overlap.callback_entry.rva = overlap.event_held.rva;
+        assert!(
+            overlap
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("overlap")
+        );
+
+        let mut outside = dispatcher_profile();
+        outside.native_return.rva = HexU64(u64::from(outside.vmwp_size_of_image));
+        assert!(
+            outside
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("outside vmwp")
         );
     }
 
@@ -1230,6 +1530,46 @@ mod tests {
             vp: 0,
             vtl: 1,
             expected_cr3: HexU64(0x120_1000),
+        }
+    }
+
+    fn dispatcher_profile() -> DispatcherProfile {
+        DispatcherProfile {
+            schema: PROFILE_SCHEMA.into(),
+            vmwp_image: r"C:\Windows\System32\vmwp.exe".into(),
+            vmwp_sha256: "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".into(),
+            vmwp_size_of_image: 0x300000,
+            scratch_base: HexU64(0x2000_0000_0000),
+            scratch_size: 0x1000,
+            registration_tag: HexU64(0x4b34_4155_544f_5354),
+            register_handler_rva: HexU64(0x10000),
+            unregister_handler_rva: HexU64(0x11000),
+            callback_stub_rva: HexU64(0x12000),
+            callback_resume_rva: HexU64(0x13000),
+            event_held: site(0x20000),
+            callback_entry: site(0x21000),
+            handle_return: site(0x22000),
+            native_return: site(0x23000),
+            deferred_cleanup: site(0x24000),
+            layout: DispatcherLayout {
+                returned_context: 0,
+                handler_descriptor: 0x100,
+                callback_descriptor: 0x200,
+                callback_mirror: 0x30,
+                event_context: 8,
+                exchange_advance: 0x148,
+                callback_pointer: 0x80,
+                callback_flags: 0x88,
+                register_stack_handler: 0x28,
+                register_stack_context: 0x30,
+            },
+        }
+    }
+
+    fn site(rva: u64) -> DispatcherSite {
+        DispatcherSite {
+            rva: HexU64(rva),
+            original: vec![0x48, 0x89, 0x5c, 0x24, 0x08],
         }
     }
 
