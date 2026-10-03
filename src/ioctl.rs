@@ -6327,6 +6327,106 @@ mod tests {
         );
     }
 
+    /// **An ordinary guard on something other than the control code is not a loss**, and the same
+    /// source written with `ccmp` must answer the same way.
+    ///
+    /// `cmp w2,w3` / `b.ne skip` / `cmp w9,w10` / `b.eq handler` is what a compiler emits for
+    /// `if (flag && code == B)` when it does not fold the guard into a conditional compare. This
+    /// walk publishes `w10`'s code and marks nothing: the guard tests a value that is not the
+    /// control code, so there is no test on the code it failed to attribute -- which is what
+    /// [`Map::untracked`] is for -- and the case means what every case here means, that this code
+    /// routes to that block on the path the walk followed.
+    ///
+    /// It is the control for
+    /// [`a_forced_clear_link_resolves_a_blind_link_before_it`]: the `ccmp` form of the same
+    /// routine answers identically, and marking one and not the other would make the map depend on
+    /// the compiler's instruction selection rather than on the driver. Two rounds of #439 asked for
+    /// the `ccmp` form to be marked, the second arguing that the case is conditional on the unread
+    /// comparison -- which is true of this fixture too, and of every input-dependent guard in every
+    /// driver.
+    #[test]
+    fn a_guard_on_something_else_is_not_a_loss_however_it_is_written() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            // The guard the `ccmp` form folds in, here as its own compare and branch.
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w2"), reg("w3")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(DISPATCH + 0x24)),
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w10")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+            insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x22_4194, 0x900)],
+            "{:?}",
+            found.cases
+        );
+        assert!(
+            found.untracked.is_empty(),
+            "a guard on another value is control flow, not a code this walk lost: {:?}",
+            found.untracked
+        );
+    }
+
     /// A PC-relative literal load, as dbgscope decodes one: no base, no index, and the address the
     /// encoding names.
     ///
