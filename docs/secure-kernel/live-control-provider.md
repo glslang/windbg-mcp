@@ -5,8 +5,9 @@ The operator supplies the privileged provider as a child process. The repository
 private VID layout, or provider DLL.
 
 This is an implementation boundary, not an MCP session yet. `--sk-control-probe` validates a
-provider's startup identity, epoch, and capabilities. The dedicated debugger worker and MCP tools
-that use the rest of the contract are later gates.
+provider's startup identity, epoch, and capabilities. `src/sklive.rs` now supplies the worker-side
+state machine over that contract. The build-specific `vmwp` dispatcher adapter and MCP tools remain
+later gates.
 
 ## Process boundary
 
@@ -59,8 +60,13 @@ The first revision has seven capabilities:
 - `held_event` reads that immutable event identity back;
 - `read_registers` returns named values and per-register hypervisor status;
 - `write_registers` compares every named register before applying any replacement;
-- `release` consumes one held epoch after the worker completes that event through `vmwp`'s native
-  path.
+- `release` consumes one held epoch immediately before the worker completes that event through
+  `vmwp`'s native path.
+
+The ordering on the last operation is load-bearing. Once native completion runs, the next vector-1
+event may arrive immediately, so the provider must already accept a new `publish_stop`. The worker's
+outer state machine remains in `releasing` between the provider transition and native completion;
+failure in that interval faults the session and runs bounded recovery.
 
 The readable bank is `rip`, `rsp`, `rflags`, `cr3`, `cs`, `dr0` through `dr3`, `dr6`, `dr7`, and
 `vsm_vp_status`. `cr3`, `cs`, and `vsm_vp_status` are read-only. A held event records message type,
@@ -91,3 +97,37 @@ fake provider, including guarded register reads and writes. They also pin fixed-
 encoding, running-state refusal, target validation, and the rule that every state transition must
 rotate the epoch. A live acceptance still requires the disposable Hyper-V target and the
 operator-supplied provider.
+
+## Worker state machine
+
+`src/sklive.rs` joins one provider to one debugger-owned dispatcher. It contains no DbgEng engine
+and no private VID layout; its production owner will be the existing engine worker, on the thread
+which created that worker's engine. The dispatcher boundary must return the exact registered
+callback context, a bounded observation of the held event, and a second read of the guarded guest
+instruction.
+
+The first revision deliberately implements the narrow gate that passed live:
+
+1. pause the disposable target and enter the provider's arming epoch;
+2. save RIP, RSP, RFLAGS, CR3, CS, DR0â€“DR3, DR6, DR7 and VSM VP status;
+3. refuse an already-enabled hardware breakpoint, install one DR0 execution breakpoint, and
+   redirect RIP to one guarded 1â€“15-byte instruction;
+4. accept only the registered dispatcher context, VTL1 CPL0 vector 1, the bound CR3, the expected
+   DR6 cause, and two identical held-state reads;
+5. consume the stop epoch once to arm TF, then accept the single-step only at the guarded
+   instruction's successor;
+6. restore the complete writable baseline, verify the complete snapshot, rotate the provider to
+   running, and complete only the exact owned native event.
+
+Its outer phases are `running`, `arming`, `stopped`, `releasing`, `faulted`, and `closed`. A stale
+epoch is a refusal with no mutation. A changed instruction, unexpected stop reason, changed
+callback context, unstable held state, provider failure, or native-completion failure enters the
+terminal `faulted` phase. Recovery first tries to restore the saved register state. It authorizes
+native completion only when both restoration and event ownership are proven; otherwise the adapter
+must leave the disposable target paused. Teardown does not erase the fault record.
+
+The offline state-machine tests cover hardware stop to step to continue, stale epochs, instruction
+guard failure, non-owned callback context, unstable held registers, completion failure, stopped
+close, restoration, and idempotent close. The remaining adapter must supply an exact-build profile
+for the private `vmwp` registration and completion sites and pass the same lifecycle on the
+allowlisted disposable VM before this becomes an MCP session.

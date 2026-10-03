@@ -15,7 +15,7 @@
 
 use std::fmt;
 use std::io::{BufRead, BufReader, Write};
-use std::process::{Child, Command, Stdio};
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -75,7 +75,7 @@ pub(crate) struct TargetIdentity {
 }
 
 impl TargetIdentity {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         let bytes = self.vm_id.as_bytes();
         if bytes.len() != 36
             || !bytes.iter().enumerate().all(|(index, byte)| {
@@ -263,11 +263,7 @@ pub(crate) struct HeldEvent {
 }
 
 impl HeldEvent {
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
-    fn validate(&self, target: &TargetIdentity) -> Result<()> {
+    pub(crate) fn validate(&self, target: &TargetIdentity) -> Result<()> {
         if self.message_type.0 != 0x0100_0002 {
             bail!(
                 "held event has unexpected message type {:#x}",
@@ -393,10 +389,6 @@ pub(crate) struct Response {
     pub(crate) outcome: Outcome,
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the K4.2 worker after this K4.1 protocol slice"
-)]
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum Phase {
     Running,
@@ -412,10 +404,6 @@ pub(crate) struct ControlSession<R: BufRead, W: Write> {
     epoch: StopEpoch,
     next_id: u64,
     capabilities: Option<Capabilities>,
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     phase: Phase,
     poisoned: bool,
 }
@@ -482,10 +470,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(value)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     pub(crate) fn begin_arm(&mut self) -> Result<()> {
         self.require_capability(Capability::BeginArm)?;
         if self.phase != Phase::Running {
@@ -498,10 +482,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     pub(crate) fn finish_arm(&mut self) -> Result<()> {
         self.require_capability(Capability::FinishArm)?;
         if self.phase != Phase::Arming {
@@ -514,10 +494,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     pub(crate) fn publish_stop(&mut self, event: HeldEvent) -> Result<()> {
         self.require_capability(Capability::PublishStop)?;
         if self.phase != Phase::Running {
@@ -538,10 +514,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     pub(crate) fn held_event(&mut self) -> Result<HeldEvent> {
         self.require_stopped()?;
         self.require_capability(Capability::HeldEvent)?;
@@ -557,10 +529,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(event)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     pub(crate) fn read_registers(
         &mut self,
         registers: Vec<RegisterName>,
@@ -581,10 +549,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(values)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     pub(crate) fn write_registers(
         &mut self,
         writes: Vec<RegisterWrite>,
@@ -607,10 +571,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(values)
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     pub(crate) fn release(&mut self) -> Result<()> {
         self.require_stopped()?;
         self.require_capability(Capability::Release)?;
@@ -622,10 +582,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     fn held(&self) -> Option<&HeldEvent> {
         match &self.phase {
             Phase::Running | Phase::Arming => None,
@@ -633,10 +589,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         }
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     fn require_register_stop(&self) -> Result<()> {
         if self.phase == Phase::Running {
             bail!("register access is refused while the target is running")
@@ -644,10 +596,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     fn require_stopped(&self) -> Result<()> {
         if self.held().is_none() {
             bail!("operation requires a held event")
@@ -655,10 +603,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     fn require_capability(&self, capability: Capability) -> Result<()> {
         let capabilities = self
             .capabilities
@@ -670,10 +614,6 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
         Ok(())
     }
 
-    #[allow(
-        dead_code,
-        reason = "used by the K4.2 worker after this K4.1 protocol slice"
-    )]
     fn validate_register_names(&self, registers: &[RegisterName], writes: bool) -> Result<()> {
         if registers.is_empty() || registers.len() > MAX_REGISTERS {
             bail!("register request size must be in 1..={MAX_REGISTERS}");
@@ -769,6 +709,123 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
     }
 }
 
+/// Owns one operator provider and closes its request pipe before applying the bounded child-process
+/// teardown. The live-control worker keeps this object on its engine thread beside its dispatcher.
+pub(crate) struct ControlProcess {
+    session: Option<ControlSession<BufReader<ChildStdout>, ChildStdin>>,
+    child: ChildGuard,
+}
+
+impl ControlProcess {
+    pub(crate) fn spawn(
+        transport: &str,
+        expected_target: TargetIdentity,
+    ) -> Result<(Self, Vec<String>)> {
+        let mut parts = crate::livesrc::split_command(transport);
+        let program = parts
+            .first()
+            .cloned()
+            .context("the control provider command line is empty")?;
+        let mut command = Command::new(&program);
+        command
+            .args(parts.split_off(1))
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit());
+        let child = {
+            let _guard = crate::engine::spawn_guard();
+            command
+                .spawn()
+                .with_context(|| format!("spawning the control provider {program:?} failed"))?
+        };
+        let mut child = ChildGuard(Some(child));
+        let stdin = child
+            .0
+            .as_mut()
+            .and_then(|child| child.stdin.take())
+            .context("the provider has no stdin")?;
+        let stdout = child
+            .0
+            .as_mut()
+            .and_then(|child| child.stdout.take())
+            .context("the provider has no stdout")?;
+        let (session, skipped) =
+            ControlSession::open(BufReader::new(stdout), stdin, expected_target)?;
+        Ok((
+            Self {
+                session: Some(session),
+                child,
+            },
+            skipped,
+        ))
+    }
+
+    fn session(&self) -> &ControlSession<BufReader<ChildStdout>, ChildStdin> {
+        self.session
+            .as_ref()
+            .expect("a live ControlProcess always owns its session")
+    }
+
+    fn session_mut(&mut self) -> &mut ControlSession<BufReader<ChildStdout>, ChildStdin> {
+        self.session
+            .as_mut()
+            .expect("a live ControlProcess always owns its session")
+    }
+
+    pub(crate) fn target(&self) -> &TargetIdentity {
+        self.session().target()
+    }
+
+    pub(crate) fn epoch(&self) -> &StopEpoch {
+        self.session().epoch()
+    }
+
+    pub(crate) fn capabilities(&mut self) -> Result<Capabilities> {
+        self.session_mut().capabilities()
+    }
+
+    pub(crate) fn begin_arm(&mut self) -> Result<()> {
+        self.session_mut().begin_arm()
+    }
+
+    pub(crate) fn finish_arm(&mut self) -> Result<()> {
+        self.session_mut().finish_arm()
+    }
+
+    pub(crate) fn publish_stop(&mut self, event: HeldEvent) -> Result<()> {
+        self.session_mut().publish_stop(event)
+    }
+
+    pub(crate) fn held_event(&mut self) -> Result<HeldEvent> {
+        self.session_mut().held_event()
+    }
+
+    pub(crate) fn read_registers(
+        &mut self,
+        registers: Vec<RegisterName>,
+    ) -> Result<Vec<RegisterValue>> {
+        self.session_mut().read_registers(registers)
+    }
+
+    pub(crate) fn write_registers(
+        &mut self,
+        writes: Vec<RegisterWrite>,
+    ) -> Result<Vec<RegisterValue>> {
+        self.session_mut().write_registers(writes)
+    }
+
+    pub(crate) fn release(&mut self) -> Result<()> {
+        self.session_mut().release()
+    }
+}
+
+impl Drop for ControlProcess {
+    fn drop(&mut self) {
+        drop(self.session.take());
+        self.child.reap();
+    }
+}
+
 #[derive(Clone, Copy)]
 enum ExpectedReply {
     Capabilities,
@@ -810,10 +867,6 @@ impl ExpectedReply {
     }
 }
 
-#[allow(
-    dead_code,
-    reason = "used by the K4.2 worker after this K4.1 protocol slice"
-)]
 fn validate_values(wanted: &[RegisterName], values: &[RegisterValue]) -> Result<()> {
     if wanted.len() != values.len() {
         bail!(
@@ -901,36 +954,7 @@ pub(crate) fn run_probe(args: &[String]) -> Result<()> {
         expected_cr3: HexU64(expected_cr3.context("--expected-cr3 is required")?),
     };
     expected_target.validate()?;
-    let mut parts = crate::livesrc::split_command(&transport);
-    let program = parts
-        .first()
-        .cloned()
-        .context("the transport command line is empty")?;
-    let mut command = Command::new(&program);
-    command
-        .args(parts.split_off(1))
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit());
-    let child = {
-        let _guard = crate::engine::spawn_guard();
-        command
-            .spawn()
-            .with_context(|| format!("spawning the control provider {program:?} failed"))?
-    };
-    let mut child = ChildGuard(Some(child));
-    let stdin = child
-        .0
-        .as_mut()
-        .and_then(|child| child.stdin.take())
-        .context("the provider has no stdin")?;
-    let stdout = child
-        .0
-        .as_mut()
-        .and_then(|child| child.stdout.take())
-        .context("the provider has no stdout")?;
-    let (mut session, skipped) =
-        ControlSession::open(BufReader::new(stdout), stdin, expected_target)?;
+    let (mut session, skipped) = ControlProcess::spawn(&transport, expected_target)?;
     for line in skipped {
         eprintln!("provider: {line}");
     }
@@ -940,8 +964,6 @@ pub(crate) fn run_probe(args: &[String]) -> Result<()> {
     println!("target      {}", serde_json::to_string(session.target())?);
     println!("epoch       {}", session.epoch());
     println!("capabilities {}", serde_json::to_string(&capabilities)?);
-    drop(session);
-    child.reap();
     Ok(())
 }
 
