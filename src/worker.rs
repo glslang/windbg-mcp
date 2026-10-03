@@ -2817,9 +2817,9 @@ fn execute(
             ))
         }
 
-        EngineOp::SkLiveArm { instruction } => {
+        EngineOp::SkLiveArm { instruction, mode } => {
             let transition = held_live_control(sk_live)?
-                .arm(e, instruction)
+                .arm(e, instruction, mode)
                 .map_err(failed)?;
             Ok(Output::typed(
                 crate::skdispatch::render_transition(&transition),
@@ -2849,9 +2849,9 @@ fn execute(
             Ok(Output::typed(crate::skdispatch::render_read(&read), read))
         }
 
-        EngineOp::SkLiveStep { epoch } => {
+        EngineOp::SkLiveStep { epoch, guard } => {
             let transition = held_live_control(sk_live)?
-                .step(e, &epoch)
+                .step(e, &epoch, guard)
                 .map_err(failed)?;
             Ok(Output::typed(
                 crate::skdispatch::render_transition(&transition),
@@ -14928,6 +14928,7 @@ mod tests {
                     address: crate::skcontrol::HexU64(0xfffff80000001000),
                     bytes: vec![0x90],
                 },
+                mode: crate::sklive::ArmMode::Redirect,
             },
             EngineOp::SkLiveRegisters,
             EngineOp::SkLiveRead {
@@ -14937,6 +14938,10 @@ mod tests {
             EngineOp::SkLiveStep {
                 epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef")
                     .expect("the fixture epoch is valid"),
+                guard: crate::sklive::StepGuard {
+                    instruction: None,
+                    expected_rips: Vec::new(),
+                },
             },
             EngineOp::SkLiveContinue {
                 epoch: crate::skcontrol::StopEpoch::new("fedcba9876543210")

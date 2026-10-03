@@ -39,6 +39,10 @@ The target object contains the VM GUID, hypervisor partition ID, VP, VTL, and ex
 request and response repeats the full target and current opaque epoch. Addresses are fixed-width
 hex strings so JSON implementations cannot round 64-bit values.
 
+Provider stdout is read on a dedicated non-DbgEng thread. Each complete protocol line has a
+10-second deadline, including the startup banner and hello, so a provider which remains alive but
+stops answering cannot pin the worker's engine thread indefinitely. EOF is reported immediately.
+
 ## Epoch state machine
 
 ```mermaid
@@ -108,18 +112,23 @@ that worker's engine. The dispatcher boundary must return the exact registered
 callback context, a bounded observation of the held event, and a second read of the guarded guest
 instruction.
 
-The first revision deliberately implements the narrow gate that passed live:
+The state machine implements both the narrow redirected gate and natural control-flow stepping:
 
 1. pause the disposable target and enter the provider's arming epoch;
-2. save RIP, RSP, RFLAGS, CR3, CS, DR0â€“DR3, DR6, DR7 and VSM VP status;
-3. refuse an already-enabled hardware breakpoint, install one DR0 execution breakpoint, and
-   redirect RIP to one guarded 1â€“15-byte instruction;
-4. accept only the registered dispatcher context, VTL1 CPL0 vector 1, the bound CR3, the expected
-   DR6 cause, and two identical held-state reads;
-5. consume the stop epoch once to arm TF, then accept the single-step only at the guarded
-   instruction's successor;
-6. restore the complete writable baseline, verify the complete snapshot, rotate the provider to
-   running, and complete only the exact owned native event.
+2. save RIP, RSP, RFLAGS, CR3, CS, DR0–DR3, DR6, DR7 and VSM VP status;
+3. refuse an already-enabled hardware breakpoint and install one DR0 execution breakpoint;
+4. in `redirect` mode move RIP to the guarded instruction; in `natural` mode leave RIP untouched
+   and require TF and RF to have been clear;
+5. accept only the registered dispatcher context, the native event's selected VP, VTL1 CPL0
+   vector 1, the bound CR3, the expected DR6 cause, and two identical held-state reads;
+6. consume each stop epoch once to arm TF. The first step may reuse the hardware-stop instruction;
+   every later step must re-prove the exact current instruction bytes. A step accepts one default
+   fall-through address or at most four explicit destinations for a branch;
+7. accept a single-step only with DR6.BS set, TF still set in the held state, RF clear, and RIP in
+   that bounded destination set;
+8. restore and verify the debug-register baseline and the baseline TF/RF bits. Redirect mode also
+   restores the original RIP, RSP and ordinary flags; natural mode preserves guest execution
+   progress. Finally rotate the provider to running and complete only the exact owned native event.
 
 Its outer phases are `running`, `arming`, `stopped`, `releasing`, `faulted`, and `closed`. A stale
 epoch is a refusal with no mutation. A changed instruction, unexpected stop reason, changed
@@ -128,25 +137,29 @@ terminal `faulted` phase. Recovery first tries to restore the saved register sta
 native completion only when both restoration and event ownership are proven; otherwise the adapter
 must leave the disposable target paused. Teardown does not erase the fault record.
 
-The offline state-machine tests cover hardware stop to step to continue, stale epochs, instruction
-guard failure, non-owned callback context, unstable held registers, completion failure, stopped
-close, restoration, and idempotent close.
+The offline state-machine tests cover redirected and natural hardware stops, repeated and
+branching steps, stale epochs, instruction-guard failure, wrong callback context, unstable held
+registers, dispatcher timeout, provider death, debugger loss, target identity change, build-guard
+failure, completion failure, stopped close, restoration, containment, and idempotent close. The
+provider transport tests also pin bounded silence and reader death.
 
 ## MCP live-control session
 
-The `securekernel` tool group now includes the minimum one-VP live surface:
+The `securekernel` tool group exposes one selected VP through a worker-owned live session. The
+adapter pauses the whole disposable VM while it changes that VP's state:
 
 1. `open_sk_live_control` binds the exact VM, partition, VP, CR3, `vmwp` PID, dispatcher pointer,
    profile and two provider commands. It validates and starts the provider but does not pause the
    VM or install a breakpoint.
 2. `sk_live_arm` re-reads one exact instruction, saves the complete writable baseline and installs
-   the slot-0 execution breakpoint.
+   the slot-0 execution breakpoint. Its `mode` chooses guarded RIP redirection or natural flow.
 3. `sk_live_wait` pumps `vmwp` until it owns the matching vector-1 event and returns the complete
    stop evidence with a fresh epoch.
 4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
    uses the bound VTL1 CR3 and refuses an unmapped range whole.
 5. `sk_live_step` consumes the stopped epoch once, clears the hardware breakpoint and arms TF.
-   The next wait must stop at the guarded instruction's exact successor.
+   It may be repeated from any owned stop. Each later step supplies the exact current instruction;
+   the next wait accepts only the supplied bounded destination set.
 6. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
    execution control and completes the owned event. The session can then be armed again.
 7. `end_session` restores any held state, removes the handler and scratch allocation, and performs
@@ -172,6 +185,36 @@ continue and close lifecycle against the allowlisted disposable K3 VM. An indepe
 observed the same `vmwp` PID and a healthy advancing heartbeat for 60 seconds, found no scoped crash
 record, verified the guarded Secure Kernel bytes were unchanged, and confirmed that the VM was Off.
 
+The natural-flow gate then armed `securekernel!KiTimerInterrupt` without changing RIP. It reached
+the breakpoint through the initialized Secure Kernel's own execution and stepped 16 guarded
+instructions, including register, stack, memory and conditional-branch instructions. Each step
+verified the current bytes before mutation; the conditional branch admitted only its fall-through
+and taken destinations. Continue preserved the progressed RIP, RSP and ordinary flags while
+restoring the saved debug registers and TF/RF bits. The independent 60-second audit passed.
+
+The multi-VP gate ran the same session on VP1 of a two-vCPU K3 boot. The exact-build profile reads
+the native vector-event VP field, and the dispatcher ignored any event that did not report the
+selected VP. VP1 stopped and stepped over the guarded Secure Kernel NOP while the adapter's VM-wide
+pause kept both VPs stable. The independent audit found VP0's debug registers unchanged, VP1's
+baseline restored, TF/RF clear on both VPs, unchanged guest text, the same healthy `vmwp`, and no
+scoped crash record. A preceding natural-flow VP1 attempt timed out because that interrupt was not
+scheduled there; bounded recovery restored the baseline and resumed the VM before faulting the
+session.
+
+Two more runs from fresh differencing children repeated the 16-instruction natural-flow lifecycle
+and independent 60-second audit at new partition IDs and Secure Kernel bases. A live wrong-build
+injection then changed the profiled `vmwp` SHA: the adapter refused before provider mutation,
+resumed the guest, and left the debug registers, TF/RF and guest text unchanged.
+
+A provider-death injection exited immediately before acknowledging `publish_stop`. The wait
+returned a terminal fault with `target_left_paused=true`; `end_session` reported
+`recovery_required=true`, `released=false` and retained the exact worker. An independent provider
+read found DR0 still armed at the owned `KiTimerInterrupt` address and the guarded text unchanged.
+Because the dead provider could no longer restore that state, the dedicated failure child was
+discarded after evidence capture; ending the unresolved debugger replaced `vmwp`, as expected for
+an unhandled DbgEng detach, before the replacement boot was stopped. This proves containment, not
+recovery or continued guest health after provider loss.
+
 ## Build-guarded dispatcher adapter
 
 `src/skdispatch.rs` implements the concrete K4.2b boundary without constructing another engine.
@@ -181,11 +224,12 @@ breakpoint ids, callback scratch allocation, handler context, VM pause state, an
 helper.
 
 The local dispatcher profile contains an absolute `vmwp.exe` image path, SHA-256 and SizeOfImage;
-function and stop-site RVAs; original bytes for every software-breakpoint site; bounded scratch
-offsets; and no debugger command text. The per-boot VND pointer is a separate session input. Before
-mutation the adapter checks the VM GUID against the `vmwp` command line, the image identity, every
-guarded site, the current VTL1 CR3, and the selected Secure Kernel instruction. It refuses an
-existing mapping at the requested scratch base or a pre-existing breakpoint at an owned site.
+function and stop-site RVAs; original bytes for every software-breakpoint site; exact-build event
+context, event-VP and native-advance offsets; bounded scratch offsets; and no debugger command
+text. The per-boot VND pointer is a separate session input. Before mutation the adapter checks the
+VM GUID against the `vmwp` command line, the image identity, every guarded site, the current VTL1
+CR3, and the selected Secure Kernel instruction. It refuses an existing mapping at the requested
+scratch base or a pre-existing breakpoint at an owned site.
 
 All debugger commands are fixed internal operations with validated numeric substitutions. Software
 breakpoints are created and removed through the typed DbgEng API, and their original bytes are read
@@ -193,10 +237,11 @@ back after removal. The adapter uses `.detach /h` at the pending native breakpoi
 measured unhandled detach terminates `vmwp`. The delayed `Suspend-VM` completion kick runs on a host
 helper thread and makes no DbgEng call; the engine itself never leaves its owner thread.
 
-The live acceptance role performs exactly one guarded hardware stop, one trap-flag step, continue,
-handler unregister, deferred cleanup, scratch free, and handled detach. On 2026-10-03 it passed twice
-against the allowlisted disposable K3 VM. Both runs stopped at the selected VTL1 CPL0 address with
-DR6.B0, stepped five bytes to the exact successor with DR6.BS, restored the full saved state, and
-closed. The recorded repeat kept the same `vmwp` PID and healthy heartbeat for 60 seconds, found no
-scoped crash record, re-read unchanged Secure Kernel text, and left the VM Off. The exact profile,
-provider, command and evidence remain ignored under `target/private/`.
+The CLI acceptance role performs one guarded hardware stop, one trap-flag step, continue, handler
+unregister, deferred cleanup, scratch free, and handled detach. The MCP session extends that narrow
+role with natural arming and repeated guarded steps. On 2026-10-03 the redirected one-VP gate passed
+twice, the 16-instruction natural-flow gate passed, and the selected-VP gate passed on VP1 of a
+two-vCPU boot. Their independent audits kept the same `vmwp` PID and healthy heartbeat for 60
+seconds, found no scoped crash record, re-read unchanged Secure Kernel text, restored the selected
+VP's debug state, and left the VM Off. The exact profile, provider, commands and evidence remain
+ignored under `target/private/`.

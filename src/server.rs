@@ -1159,7 +1159,7 @@ pub struct SkLiveOpenArgs {
     pub partition_id: String,
     /// VTL1 page-table root read for this boot, decimal or `0x` hexadecimal.
     pub expected_cr3: String,
-    /// Virtual processor to control. Defaults to VP 0; this revision supports one VP.
+    /// Virtual processor to control. Defaults to VP 0. The native event must report this VP.
     #[serde(default)]
     pub vp: Option<u32>,
 }
@@ -1171,6 +1171,10 @@ pub struct SkLiveArmArgs {
     pub address: String,
     /// Exact 1..=15 instruction bytes expected there, as hexadecimal with optional spaces or `-`.
     pub bytes: String,
+    /// How the breakpoint is reached. `redirect` moves RIP to the guarded instruction and later
+    /// restores it; `natural` leaves RIP untouched and preserves real guest progress.
+    #[serde(default)]
+    pub mode: crate::sklive::ArmMode,
     /// Which live Secure Kernel session to arm. Omit for the current one.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -1181,6 +1185,27 @@ pub struct SkLiveArmArgs {
 pub struct SkLiveEpochArgs {
     /// The opaque epoch from the current stopped record. It is consumed exactly once.
     pub epoch: String,
+    /// Which live Secure Kernel session to act on. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveStepArgs {
+    /// The opaque epoch from the current stopped record. It is consumed exactly once.
+    pub epoch: String,
+    /// Exact current RIP for a repeated step. Supply this together with `bytes` after the first
+    /// single-step stop; it may also be supplied for the first step.
+    #[serde(default)]
+    pub address: Option<String>,
+    /// Exact 1..=15 instruction bytes at `address`, as hexadecimal with optional spaces or `-`.
+    #[serde(default)]
+    pub bytes: Option<String>,
+    /// Allowed RIP values after the instruction executes. Omit for address plus byte length;
+    /// branches may name at most four distinct destinations.
+    #[serde(default)]
+    pub expected_rips: Vec<String>,
     /// Which live Secure Kernel session to act on. Omit for the current one.
     #[serde(default)]
     pub session_id: Option<String>,
@@ -3924,9 +3949,9 @@ impl WindbgServer {
             .await;
         engine_result_for(args.session_id.as_deref(), out)
     }
-    /// Bind a live one-VP Secure Kernel controller to an exact disposable VM, partition, CR3 and
-    /// host `vmwp` process. Opening validates identity and capabilities but does not pause the VM
-    /// or arm a breakpoint.
+    /// Bind a live Secure Kernel controller to one VP of an exact disposable VM, partition, CR3
+    /// and host `vmwp` process. Opening validates identity and capabilities but does not pause the
+    /// VM or arm a breakpoint.
     #[rmcp::tool(
         annotations(
             title = "Open live Secure Kernel control",
@@ -4006,9 +4031,9 @@ impl WindbgServer {
         .await
     }
 
-    /// Save the VTL1 register baseline and arm slot-0 DR0 for one exact instruction. This first
-    /// revision redirects RIP deliberately; the address and bytes are re-read from live guest
-    /// memory before any register changes.
+    /// Save the VTL1 register baseline and arm slot-0 DR0 for one exact instruction. Redirect mode
+    /// moves RIP deliberately; natural mode leaves RIP untouched. The address and bytes are
+    /// re-read from live guest memory before any register changes.
     #[rmcp::tool(
         annotations(
             title = "Arm live Secure Kernel stop",
@@ -4053,7 +4078,10 @@ impl WindbgServer {
         let out = self
             .run(
                 args.session_id.as_deref(),
-                EngineOp::SkLiveArm { instruction },
+                EngineOp::SkLiveArm {
+                    instruction,
+                    mode: args.mode,
+                },
             )
             .await;
         engine_result_for(args.session_id.as_deref(), out)
@@ -4139,8 +4167,9 @@ impl WindbgServer {
         engine_result_for(args.session_id.as_deref(), out)
     }
 
-    /// Consume the current stopped epoch and arm one trap-flag step. Collect the single-step stop
-    /// and its new epoch with the live session's wait operation.
+    /// Consume the current stopped epoch and arm one trap-flag step. The first step can reuse the
+    /// breakpoint guard. For each later step, provide the exact current instruction. A branch can
+    /// provide up to four allowed destinations. Collect the stop with the live wait operation.
     #[rmcp::tool(
         annotations(
             title = "Step live Secure Kernel",
@@ -4153,7 +4182,7 @@ impl WindbgServer {
     )]
     async fn sk_live_step(
         &self,
-        Parameters(args): Parameters<SkLiveEpochArgs>,
+        Parameters(args): Parameters<SkLiveStepArgs>,
     ) -> Result<CallToolResult, ErrorData> {
         let epoch = match crate::skcontrol::StopEpoch::new(args.epoch) {
             Ok(epoch) => epoch,
@@ -4165,8 +4194,64 @@ impl WindbgServer {
                 );
             }
         };
+        let instruction = match (args.address.as_deref(), args.bytes.as_deref()) {
+            (None, None) => None,
+            (Some(address), Some(bytes)) => {
+                let address = match parse_u64(address) {
+                    Ok(value) => value,
+                    Err(why) => {
+                        return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+                    }
+                };
+                let bytes = match crate::skdispatch::parse_hex_bytes(bytes) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        return typed_error(
+                            ErrorCategory::InvalidArgument,
+                            error.to_string(),
+                            args.session_id,
+                        );
+                    }
+                };
+                Some(crate::sklive::InstructionGuard {
+                    address: crate::skcontrol::HexU64(address),
+                    bytes,
+                })
+            }
+            _ => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    "address and bytes must be supplied together".to_string(),
+                    args.session_id,
+                );
+            }
+        };
+        let mut expected_rips = Vec::with_capacity(args.expected_rips.len());
+        for value in &args.expected_rips {
+            let address = match parse_u64(value) {
+                Ok(value) => value,
+                Err(why) => {
+                    return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+                }
+            };
+            expected_rips.push(crate::skcontrol::HexU64(address));
+        }
+        let guard = crate::sklive::StepGuard {
+            instruction,
+            expected_rips,
+        };
+        if let Err(error) = guard.validate() {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                error.to_string(),
+                args.session_id,
+            );
+        }
         let out = self
-            .run(args.session_id.as_deref(), EngineOp::SkLiveStep { epoch })
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkLiveStep { epoch, guard },
+            )
             .await;
         engine_result_for(args.session_id.as_deref(), out)
     }

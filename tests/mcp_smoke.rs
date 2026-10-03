@@ -2056,6 +2056,10 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// to continue. Keeping these as distinct typed operations is part of the safety boundary: the
 /// model never supplies debugger command text, and a stale stopped epoch cannot be reused. The
 /// new ceiling leaves 2,944 B (2.7%) rather than absorbing another tool-sized change silently.
+///
+/// Natural arming and guarded repeated steps then move 111,056 -> 112,429 B without another
+/// ceiling raise. The 1,373 B is the `mode`, current-instruction and bounded-destination inputs plus
+/// the descriptions that explain their fail-closed use. The ceiling now leaves 1,571 B (1.4%).
 const MODEL_VISIBLE_CEILING: usize = 114_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
@@ -2199,7 +2203,8 @@ const MODEL_VISIBLE_CEILING: usize = 114_000;
 /// moves 294,602 -> 318,855 B; its 24,253 B growth is the input constraints and output schemas for target
 /// identity, complete stop evidence, memory reads, and epoch transitions. Those fields are the
 /// machine-readable proof that a stop belongs to the configured VTL1 target. The new ceiling
-/// leaves 11,145 B (3.5%).
+/// first left 11,145 B. Natural mode, bounded repeated-step inputs and the stop's mode/destination
+/// evidence move it another 1,827 B to 320,682 B, leaving 9,318 B (2.8%).
 const WIRE_CEILING: usize = 330_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,842
@@ -19169,7 +19174,8 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
             json!({
                 "session_id": id,
                 "address": address,
-                "bytes": instruction_bytes
+                "bytes": instruction_bytes,
+                "mode": config.get("arm_mode").cloned().unwrap_or(json!("redirect"))
             }),
             TARGET_STEP,
         );
@@ -19183,6 +19189,11 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
         assert_eq!(hardware["event"]["reason"]["slot"], 0, "{hardware}");
         assert_eq!(hardware["event"]["vtl"], 1, "{hardware}");
         assert_eq!(hardware["event"]["cpl"], 0, "{hardware}");
+        assert_eq!(
+            hardware["arm_mode"],
+            config.get("arm_mode").cloned().unwrap_or(json!("redirect")),
+            "{hardware}"
+        );
         let hardware_epoch = hardware["epoch"]
             .as_str()
             .expect("a stop carries its epoch")
@@ -19219,25 +19230,57 @@ fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
             "the stopped read does not begin with the guarded instruction: {read}"
         );
 
-        let stepping = server.tool_data(
-            "sk_live_step",
-            json!({ "session_id": id, "epoch": hardware_epoch }),
-            TARGET_STEP,
-        );
-        assert_eq!(stepping["phase"], "running", "{stepping}");
-        let single_step =
-            server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
-        assert_eq!(
-            single_step["event"]["reason"]["reason"], "single_step",
-            "{single_step}"
-        );
-        assert_ne!(single_step["epoch"], hardware["epoch"], "{single_step}");
-        let step_epoch = single_step["epoch"]
-            .as_str()
-            .expect("the single-step stop carries its epoch");
+        let configured_steps = config.get("steps").and_then(Value::as_array);
+        let perform_step = config
+            .get("perform_step")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let default_step = json!({});
+        let steps: Vec<&Value> = match configured_steps {
+            Some(steps) => steps.iter().collect(),
+            None if perform_step => vec![&default_step],
+            None => Vec::new(),
+        };
+        let mut final_epoch = hardware_epoch;
+        for step in steps {
+            let mut arguments = json!({ "session_id": id, "epoch": final_epoch });
+            let object = arguments
+                .as_object_mut()
+                .expect("step arguments begin as an object");
+            for field in ["address", "bytes", "expected_rips"] {
+                if let Some(value) = step.get(field) {
+                    object.insert(field.to_string(), value.clone());
+                }
+            }
+            let stepping = server.tool_data("sk_live_step", arguments, TARGET_STEP);
+            assert_eq!(stepping["phase"], "running", "{stepping}");
+            let single_step =
+                server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
+            assert_eq!(
+                single_step["event"]["reason"]["reason"], "single_step",
+                "{single_step}"
+            );
+            assert_ne!(single_step["epoch"], final_epoch, "{single_step}");
+            if let Some(address) = step.get("address") {
+                assert_eq!(
+                    single_step["instruction"]["address"], *address,
+                    "{single_step}"
+                );
+            }
+            if let Some(expected_rips) = step.get("expected_rips") {
+                assert_eq!(
+                    single_step["expected_rips"], *expected_rips,
+                    "{single_step}"
+                );
+            }
+            final_epoch = single_step["epoch"]
+                .as_str()
+                .expect("the single-step stop carries its epoch")
+                .to_string();
+        }
         let resumed = server.tool_data(
             "sk_live_continue",
-            json!({ "session_id": id, "epoch": step_epoch }),
+            json!({ "session_id": id, "epoch": final_epoch }),
             TARGET_STEP,
         );
         assert_eq!(resumed["phase"], "running", "{resumed}");

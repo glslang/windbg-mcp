@@ -353,12 +353,12 @@
     },
     {
       "annotations": 132,
-      "description": 205,
-      "inputSchema": 1334,
-      "modelVisible": 1600,
+      "description": 208,
+      "inputSchema": 1341,
+      "modelVisible": 1610,
       "name": "open_sk_live_control",
       "outputSchema": 4614,
-      "wire": 6377
+      "wire": 6387
     },
     {
       "annotations": 114,
@@ -497,12 +497,12 @@
     },
     {
       "annotations": 127,
-      "description": 215,
-      "inputSchema": 536,
-      "modelVisible": 803,
+      "description": 240,
+      "inputSchema": 1148,
+      "modelVisible": 1440,
       "name": "sk_live_arm",
       "outputSchema": 1291,
-      "wire": 2252
+      "wire": 2889
     },
     {
       "annotations": 127,
@@ -528,17 +528,17 @@
       "inputSchema": 343,
       "modelVisible": 491,
       "name": "sk_live_registers",
-      "outputSchema": 3603,
-      "wire": 4257
+      "outputSchema": 3830,
+      "wire": 4484
     },
     {
       "annotations": 123,
-      "description": 151,
-      "inputSchema": 401,
-      "modelVisible": 605,
+      "description": 273,
+      "inputSchema": 1005,
+      "modelVisible": 1331,
       "name": "sk_live_step",
       "outputSchema": 1291,
-      "wire": 2050
+      "wire": 2776
     },
     {
       "annotations": 132,
@@ -546,8 +546,8 @@
       "inputSchema": 343,
       "modelVisible": 569,
       "name": "sk_live_wait",
-      "outputSchema": 3603,
-      "wire": 4335
+      "outputSchema": 3830,
+      "wire": 4562
     },
     {
       "annotations": 126,
@@ -669,14 +669,14 @@
   ],
   "totals": {
     "annotations": 8082,
-    "description": 42138,
-    "inputSchema": 64994,
+    "description": 42288,
+    "inputSchema": 66217,
     "instructions": 2022,
-    "modelVisible": 111056,
-    "outputSchema": 197578,
-    "payload": 318855,
+    "modelVisible": 112429,
+    "outputSchema": 198032,
+    "payload": 320682,
     "tools": 74,
-    "wire": 318770,
+    "wire": 320597,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }
