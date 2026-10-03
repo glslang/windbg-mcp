@@ -100,6 +100,22 @@ class FirmwareAcpiTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "four bytes"):
             firmware.acpi_table(b"BAD", 1, b"")
 
+    def test_boot_memory_topology_uses_byte_ranges(self):
+        self.assertEqual(
+            firmware.BOOT_MEMORY_RANGES,
+            ((0, 0xF8000000), (0x100000000, 0x08000000)),
+        )
+        self.assertEqual(
+            struct.unpack("<IIIIQQ", firmware.encode_boot_memory_range(0)),
+            (0, 0, 0, 0, 0, 0xF8000000),
+        )
+        self.assertEqual(
+            struct.unpack("<IIIIQQ", firmware.encode_boot_memory_range(1)),
+            (1, 1, 0, 0, 0x100000000, 0x08000000),
+        )
+        with self.assertRaises(IndexError):
+            firmware.encode_boot_memory_range(2)
+
 
 if __name__ == "__main__":
     unittest.main()
