@@ -4334,18 +4334,22 @@ other three are controls, and they are there so a later round does not *fix* som
 right: the non-`ccmp` form of a folded guard, an ordinary flag write after a chain, and the blind
 link a forced-clear one resolves.
 
-**One limit is left open and pinned, which is where the rounds stopped.** A link that reads the code
-and is not modelled -- a `ccmn`, whose operand is **negated** -- leaves a loss, and a forced-clear
-link after it replaces that loss rather than keeping it, so `cmp code,A` / `ccmnne code,C,#4` /
-`ccmpne code,B,#0` / `b.eq` publishes `B` without saying `B` is rejected where `B == -C`. Closing it
-means telling two losses apart -- *this link lost the code* against *this link's forced arm admits
-every code* -- which share one slot and which a `#0` link treats oppositely: it resolves the second
-and not the first. That is a fifth distinction on this seam, for a shape that needs a negated
-compare against a control code, and
-`a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss` records the answer instead, so the limit
-is known rather than implied. Filed beside it and also declined: a duplicate-constant forced-set
-chain emits two cases for one code, which is `docs/structured-results.md`'s documented **case per
-site** rather than a defect.
+**And the last thing to land is the one I declined and should not have.** A link that reads the code
+and is not modelled leaves a loss, and the forced-clear arm replaced it -- so `cmp code,A` /
+`ccmnne code,C,#4` / `ccmpne code,B,#0` / `b.eq` published `B` without saying `B` is rejected where
+`B == -C`. That was declined as a fifth distinction for a shape needing a negated compare against a
+control code, and pinned as a known limit. **The round after it reached the same gap through
+`tst`** -- `tst code,#1` / `ccmpne code,B,#0` / `b.eq` admits only an **odd** code, so an even `B`
+is an invented case -- and a bit test before a conditional compare is ordinary codegen. The decline
+was wrong on **price**, not on fact, and what closed both is the thing three findings on that line
+were really about: *a loss about the control code* and *a forced arm admitting every code* were one
+slot, and a `#0` link treats them oppositely -- it resolves the second, as rounds five and six
+measured, and resolves nothing about the first. Separated, each is pinned by a mutation in its own
+direction: dropping the code-dependent loss fails the `ccmn` and `tst` tests, and not resolving the
+forced arm fails the blind-link test the declines rest on.
+
+Also filed there and declined: a duplicate-constant forced-set chain emits two cases for one code,
+which is `docs/structured-results.md`'s documented **case per site** rather than a defect.
 
 The pair of declines above is a third pass over one line, with the answer unmoved for five rounds, is the
 reading the review-round skill says to record rather than escalate. **Two** of the five were against a previous round's own fix, which
