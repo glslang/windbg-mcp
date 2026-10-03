@@ -48,6 +48,7 @@ mod service;
 mod sk;
 mod skcontrol;
 mod skinspect;
+mod sklive;
 mod sksession;
 mod sksym;
 mod structured;

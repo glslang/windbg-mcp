@@ -2287,12 +2287,15 @@ verified before release. No token was duplicated, no helper thread or DLL was in
 controller consumed no VID queue. Stock OpenVMM remains irrelevant because its Windows path is
 VTL0-only. The direct owner-built Windows boot below is historical work, not the selected route.
 
-What remains is productization. `src/skcontrol.rs` now defines the operator-provider contract with
-exact VM/partition/VP/VTL/CR3 identity, rotating running/arming/stopped epochs, compare-and-write
-register updates, and held-event identity; `--sk-control-probe` checks its non-mutating handshake.
-The dedicated DbgEng worker, MCP tools, broader instruction stepping, multi-VP coordination, and
-repeatability runs are still open. The detailed bench sequence and binary guards remain in the
-ignored private plan.
+What remains is productization. `src/skcontrol.rs` defines the operator-provider contract with exact
+VM/partition/VP/VTL/CR3 identity, rotating running/arming/stopped epochs, compare-and-write register
+updates, and held-event identity; `--sk-control-probe` checks its non-mutating handshake.
+`src/sklive.rs` now adds the worker-side one-VP state machine: it owns the outer
+running/arming/stopped/releasing/faulted lifecycle, exact callback-context and instruction guards,
+two-read stop evidence, epoch-consuming step/continue, and fail-closed restoration. The
+build-specific DbgEng dispatcher adapter, MCP tools, broader instruction stepping, multi-VP
+coordination, and repeatability runs are still open. The detailed bench sequence and binary guards
+remain in the ignored private plan.
 
 The record below explains how the route was chosen. Cost and “still open” statements in it describe
 the decision point and are superseded by the result above.
@@ -2475,8 +2478,9 @@ to collect what does not depend on that step, and then to falsify it before anyt
    implemented and what is left is deciding whether it belongs behind a *session*: gate S5x measured
    a page of `securekernel.exe`'s `.data` moving inside 20 seconds, which is why S5w is a
    command-line role and not a fifth capture tool. `src/skcontrol.rs` adds the versioned child-process
-   contract for live register control and held-event correlation. Its capability probe is implemented;
-   the dedicated worker and MCP session still remain. No private provider or VID ABI enters the
+   contract for live register control and held-event correlation. Its capability probe is implemented,
+   and `src/sklive.rs` adds the worker-side epoch state machine and recovery policy. The concrete
+   DbgEng dispatcher adapter and MCP session still remain. No private provider or VID ABI enters the
    supervisor.
 
 6. **The exception branch and completion callback — decoded 2026-10-02.** On guarded `Vid.sys`
@@ -2492,8 +2496,9 @@ to collect what does not depend on that step, and then to falsify it before anyt
 **Current summary.** A resumable initialized Secure Kernel stop and a one-instruction hardware
 stop/step both pass on the allowlisted disposable managed VM. That proves the minimum one-VP
 mechanism; it is not yet a supported MCP session. Capture inspection remains the shipped surface.
-The next boundary is a dedicated worker which owns one `vmwp` DbgEng attachment and one provider,
-then a small epoch-bound MCP surface. The direct owner-built Windows boot is no longer on that path.
+The repository now has the provider owner and dedicated worker state machine, but not the exact-build
+adapter which attaches that state machine to `vmwp`. That adapter is the next boundary, followed by
+the small epoch-bound MCP surface. The direct owner-built Windows boot is no longer on that path.
 
 **Safety rules that are not negotiable per arm.** The owner-partition probes never enumerate or open
 an existing VM. The managed route targets only its exact allowlisted disposable VM and refuses every
