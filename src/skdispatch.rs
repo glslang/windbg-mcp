@@ -517,6 +517,17 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
+    fn retry_unregister_scratch_free(&mut self) -> Result<()> {
+        if !matches!(self.unregister, Some(UnregisterProgress::FreeingScratch))
+            || !self.scratch_allocated
+            || self.handler_context.is_none()
+        {
+            bail!("scratch-free retry was requested outside its owned unregister state");
+        }
+        self.unregister = Some(UnregisterProgress::ReadyToFreeScratch);
+        Ok(())
+    }
+
     fn read_memory(
         &self,
         epoch: crate::skcontrol::StopEpoch,
@@ -572,6 +583,7 @@ enum UnregisterProgress {
     WaitingCleanup,
     ReturningCleanup { return_address: u64 },
     CleanupReturned,
+    ReadyToFreeScratch,
     FreeingScratch,
 }
 
@@ -1300,6 +1312,9 @@ impl VmwpDispatcher<'_> {
                 Some(UnregisterProgress::CleanupReturned) => {
                     self.settle_unregister_cleanup(context)?
                 }
+                Some(UnregisterProgress::ReadyToFreeScratch) => {
+                    self.issue_unregister_scratch_free(context)?
+                }
                 Some(UnregisterProgress::FreeingScratch) => {
                     self.verify_unregister_scratch_free()?;
                 }
@@ -1436,9 +1451,17 @@ impl VmwpDispatcher<'_> {
         if callback != self.scratch(self.state.profile.layout.handler_descriptor)? || flags == 0 {
             bail!("old callback record changed before scratch release");
         }
+        self.state.unregister = Some(UnregisterProgress::ReadyToFreeScratch);
+        Ok(())
+    }
+
+    fn issue_unregister_scratch_free(&mut self, context: u64) -> Result<()> {
+        self.verify_owned_scratch(context)?;
         let scratch = self.state.profile.scratch_base.0;
         // Claim the free before the fallible command: if DbgEng loses the reply, a teardown retry
-        // verifies the allocation state and never issues a second free against an ambiguous result.
+        // verifies whether the allocation remains. A still-owned mapping returns to the ready
+        // state before a later retry issues the command again; an absent mapping is never freed
+        // twice.
         self.state.unregister = Some(UnregisterProgress::FreeingScratch);
         self.engine
             .execute_command(&format!(".dvfree {scratch:016x} 0"))
@@ -1446,10 +1469,33 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
+    fn verify_owned_scratch(&self, context: u64) -> Result<()> {
+        let callback = self.scratch(self.state.profile.layout.callback_descriptor)?;
+        let callback_stub = self.image(self.state.profile.callback_stub_rva.0)?;
+        let mirror = callback
+            .checked_add(u64::from(self.state.profile.layout.callback_mirror))
+            .context("callback mirror address overflowed")?;
+        if self.read_u64(self.scratch(self.state.profile.layout.returned_context)?)? != context
+            || self.read_u64(self.scratch(self.state.profile.layout.handler_descriptor)?)?
+                != callback
+            || self.read_u64(callback)? != callback_stub
+            || self.read_u64(mirror)? != callback_stub
+        {
+            bail!("callback scratch changed before release");
+        }
+        Ok(())
+    }
+
     fn verify_unregister_scratch_free(&mut self) -> Result<()> {
         let scratch = self.state.profile.scratch_base.0;
         if self.engine.read_memory(scratch, 1).is_ok() {
-            bail!("callback scratch remained readable after .dvfree");
+            let context = self.state.handler_context.context("no handler context")?;
+            self.verify_owned_scratch(context)?;
+            self.state.retry_unregister_scratch_free()?;
+            bail!(
+                "callback scratch remained readable after .dvfree; its contents still belong to \
+                 this controller, so retry end_session to issue the free again"
+            );
         }
         self.state.scratch_allocated = false;
         self.state.handler_context = None;
@@ -2034,6 +2080,25 @@ mod tests {
         let error = cleanup.refuse_unsafe_recovery().unwrap_err();
         assert!(error.to_string().contains("cleanup is incomplete"));
         assert!(matches!(cleanup.phase, DispatcherPhase::Detached));
+    }
+
+    #[test]
+    fn a_proved_unfreed_unregister_scratch_allocation_becomes_retryable() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        state.handler_context = Some(0x2000_0000_2000);
+        state.scratch_allocated = true;
+        state.unregister = Some(UnregisterProgress::FreeingScratch);
+
+        state.retry_unregister_scratch_free().unwrap();
+
+        assert_eq!(
+            state.unregister,
+            Some(UnregisterProgress::ReadyToFreeScratch)
+        );
+        assert_eq!(state.handler_context, Some(0x2000_0000_2000));
+        assert!(state.scratch_allocated);
+        assert!(state.retry_unregister_scratch_free().is_err());
     }
 
     fn target() -> TargetIdentity {
