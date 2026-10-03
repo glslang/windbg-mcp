@@ -83,11 +83,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   without saying that code is rejected where the negated operand equals it. Closing that means
   telling *lost the code* from *the forced arm admits every code*, which share one slot and which a
   `#0` link treats oppositely, and the shape needs a negated compare against a control code --
-  `a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss` holds the answer so the limit is known
-  --
-  and the first draft of the one that keeps a dropped chain visible keyed on the terminator's
-  *condition* alone, which a `ccmp` carries, so a block ending in one left no case and no site; the
-  block-boundary test caught it.
+  `a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss` holds the answer so the limit is
+  known -- and the first draft of the one that keeps a dropped chain visible keyed on the
+  terminator's *condition* alone, which a `ccmp` carries, so a block ending in one left no case
+  and no site; the block-boundary test caught it.
 
 ## [0.21.0] - 2026-10-02
 
