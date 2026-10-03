@@ -4180,13 +4180,18 @@ what decides whether it does:
 
 **Measured end to end through the tool surface**, against the debugger guest's own
 `rdyboost.sys` -- `10.0.26100.1`, SHA-256 `D872CFF761A83D3D508076FA76F90027EDA1C3360CD6BF3DBE3FE5637C87F4AA`,
-opened as an image target, dispatch `rdyboost+0xf6a0`, server `windbg-mcp 0.20.0+g3b8d6fee-dirty`,
-2026-10-02:
+opened as an image target, dispatch `rdyboost+0xf6a0`, 2026-10-03:
 
 | | codes | `untracked` |
 |---|---|---|
-| before (`3b8d6fe`) | 17 | `rdyboost+0xf800`, `rdyboost+0xf708` |
-| after | **21** | none |
+| `0.21.0+gdaa11a3d` (without this) | 17 | `rdyboost+0xf800`, `rdyboost+0xf708` |
+| `0.21.0+gc02152aa` (with it) | **21** | none |
+
+**Both builds are named and clean, and that is a re-take.** The first pair was `0.20.0+g3b8d6fee`
+against a `-dirty` tree, which is a reading nobody can reproduce; and by the time this merged `main`
+had moved seventeen commits, item 108's step 1 among them, which touches `ioctl_map`'s own `render`.
+Re-taking the baseline *after* that rebase is what makes the four codes attributable to this change
+rather than to the release -- it comes back identical, sites included.
 
 The four gained are exactly `0x0056c008`, `0x00070000`, `0x000700a0` and `0x00224194`, and nothing
 was lost. **That is not the build this item was filed against** -- its chains are at
