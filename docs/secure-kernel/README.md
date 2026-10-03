@@ -35,8 +35,8 @@ travel on every request; reads and compare-and-write register updates are refuse
 and the debugger-owned process publishes the exact held dispatcher event without giving the
 provider a VID receive loop. `--sk-control-probe` validates the non-mutating handshake. The contract
 and its state machine are documented in
-[`live-control-provider.md`](live-control-provider.md). A dedicated worker and MCP tools still have
-to be built around it.
+[`live-control-provider.md`](live-control-provider.md). The live-control worker and MCP tools now
+expose the documented live-control session.
 
 ## The answer so far
 
@@ -89,7 +89,7 @@ this build's `securekernel.pdb` and gets `+0x1335E0` and `+0x127770`, the same t
 the capture produced. The PDB is therefore where a *different* build's offsets come from — but only
 where one is served, which is why the tag scan stays the primary route and not the fallback.
 
-**The capture path is complete; the open work is a live execution session.** Item 103's **S0** is
+**The capture path and minimum live execution session are complete.** Item 103's **S0** is
 answered above and **S1**, the decode layer, is now in
 `src/sk.rs` and reproduces every capture-derived landmark in the table below from a checkpoint, with
 two checks the probe did not run: a structural route to the module list that agrees with the block,
@@ -119,8 +119,8 @@ passed. A normal Hyper-V VBS boot now reaches its initialized Secure Kernel thro
 second used DR0/DR7 to stop before a selected five-byte instruction, set TF, held the next vector-1
 event at the decoded successor, restored the original state, completed both events through the
 native dispatcher, removed the handler after deferred cleanup, and survived for more than 60
-seconds. Secure Kernel text was unchanged. The remaining work is repeatable automation and the
-dedicated live-control worker/tool surface, not another boot path.
+seconds. Secure Kernel text was unchanged. The remaining work is repeatable automation, not
+another boot path.
 Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
 and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even

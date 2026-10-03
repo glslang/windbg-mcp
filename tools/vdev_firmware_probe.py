@@ -118,7 +118,7 @@ def firmware_acpi_tables() -> dict[str, bytes]:
     srat = acpi_table(
         b"SRAT",
         2,
-        bytes(12)
+        struct.pack("<IQ", 1, 0)
         + struct.pack("<BBBBIB3sI", 0, 16, 0, 0, 1, 0, bytes(3), 0)
         + struct.pack("<BBIHQQIIQ", 1, 40, 0, 0, 0, 0xF8000000, 0, 1, 0)
         + struct.pack(

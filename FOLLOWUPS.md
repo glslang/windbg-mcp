@@ -2265,7 +2265,7 @@ are all there and are the parts that took the review rounds to get right.
 so `securekernel.exe`, `winhvr.sys`, `Vid.sys` and any driver answer offline — which is the mode
 most of item 103's static work has actually run in.
 
-## 110. [windbg-mcp] Initialized Secure Kernel stop/step — live session remains
+## 110. [windbg-mcp] Initialized Secure Kernel stop/step — hardening remains
 
 **Repo:** `windbg-mcp`. **Origin:** item 103's control axis, 2026-10-01, after the owner-partition
 probe passed and then its `--securekernel-breakpoint` mode stopped and resumed real
@@ -2527,8 +2527,9 @@ to collect what does not depend on that step, and then to falsify it before anyt
 **Current summary.** A resumable initialized Secure Kernel stop and a one-instruction hardware
 stop/step both pass on the allowlisted disposable managed VM. The repository now has the provider
 owner, dedicated worker state machine, exact-build adapter and separate epoch-bound MCP session
-surface. Capture inspection remains independent. The next boundary is natural-flow, repeated-step
-and multi-VP hardening. The direct owner-built Windows boot is no longer on that path.
+surface. Capture inspection remains independent. The next boundary is live debugger loss after
+restoration, VM-reset identity and wider exact-build profile coverage. The direct owner-built
+Windows boot is no longer on that path.
 
 **Safety rules that are not negotiable per arm.** The owner-partition probes never enumerate or open
 an existing VM. The managed route targets only its exact allowlisted disposable VM and refuses every
