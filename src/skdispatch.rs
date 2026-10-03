@@ -525,6 +525,16 @@ impl DispatcherPhase {
             _ => bail!("cannot arm while the dispatcher owns a held event"),
         }
     }
+
+    fn held_event(&self) -> Option<&HeldEvent> {
+        match self {
+            Self::Holding(event)
+            | Self::CallbackEntry(event)
+            | Self::HandleReturn(event)
+            | Self::NativeReturn(event) => Some(event),
+            _ => None,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -536,6 +546,7 @@ struct OwnedBreakpoint {
 
 struct LiveGuestMemory {
     source: crate::livesrc::LiveSource,
+    root: sk::Gpa,
     space: sk::AddressSpace,
 }
 
@@ -559,8 +570,19 @@ impl LiveGuestMemory {
         }
         Ok(Self {
             source,
+            root,
             space: sk::AddressSpace::new(leaves),
         })
+    }
+
+    fn refresh(&mut self) -> Result<()> {
+        let reader = sk::Reader::new(&self.source);
+        let (leaves, stats) = sk::walk(&reader, self.root);
+        if !stats.complete() {
+            bail!("live VTL1 page-table refresh was incomplete: {stats:?}");
+        }
+        self.space = sk::AddressSpace::new(leaves);
+        Ok(())
     }
 
     fn read_guard(&self, guard: &InstructionGuard) -> Result<InstructionGuard> {
@@ -670,26 +692,6 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             }
         };
 
-        if let Some(kick) = self.state.completion_kick.take() {
-            kick.finish()?;
-            self.state.vm_paused = false;
-        }
-
-        let advance = self.read_u8(
-            event_pointer
-                .checked_add(u64::from(self.state.profile.layout.exchange_advance))
-                .context("event advance address overflowed")?,
-        )?;
-        if advance != 0 {
-            bail!("the native dispatcher event already requests instruction-pointer advance");
-        }
-        self.remove_owned_breakpoint()?;
-        let observed_instruction = self
-            .state
-            .memory
-            .as_ref()
-            .context("the live VTL1 memory source is absent")?
-            .read_guard(instruction)?;
         let event = HeldEvent {
             message_type: HexU64(EVENT_TYPE_VECTOR_1),
             vector: 1,
@@ -700,7 +702,28 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             advance_instruction_pointer: false,
             reason,
         };
+        // Matching the vector, VP and registered context proves ownership of the native event.
+        // Record it before any cleanup or live-memory operation can fail so recovery completes this
+        // callback instead of detaching from a still-pending one.
         self.state.phase = DispatcherPhase::Holding(event.clone());
+        self.state.vm_paused = false;
+        self.prepare_held_event()?;
+
+        let advance = self.read_u8(
+            event_pointer
+                .checked_add(u64::from(self.state.profile.layout.exchange_advance))
+                .context("event advance address overflowed")?,
+        )?;
+        if advance != 0 {
+            bail!("the native dispatcher event already requests instruction-pointer advance");
+        }
+        let memory = self
+            .state
+            .memory
+            .as_mut()
+            .context("the live VTL1 memory source is absent")?;
+        memory.refresh()?;
+        let observed_instruction = memory.read_guard(instruction)?;
         Ok(ObservedStop {
             event,
             instruction: observed_instruction,
@@ -708,13 +731,11 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn release_event(&mut self, event: &HeldEvent, mode: ReleaseMode) -> Result<()> {
-        let held = match &self.state.phase {
-            DispatcherPhase::Holding(held)
-            | DispatcherPhase::CallbackEntry(held)
-            | DispatcherPhase::HandleReturn(held)
-            | DispatcherPhase::NativeReturn(held) => held,
-            _ => bail!("the dispatcher owns no event to release"),
-        };
+        let held = self
+            .state
+            .phase
+            .held_event()
+            .context("the dispatcher owns no event to release")?;
         if held != event {
             bail!("release does not name the event held by the dispatcher");
         }
@@ -732,8 +753,14 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             return Ok(());
         }
 
+        let event = event
+            .cloned()
+            .or_else(|| self.state.phase.held_event().cloned());
         if let Some(event) = event {
-            return self.release_event(event, ReleaseMode::Resume);
+            if matches!(self.state.phase, DispatcherPhase::Holding(_)) {
+                self.prepare_held_event()?;
+            }
+            return self.release_event(&event, ReleaseMode::Resume);
         }
 
         if self.state.breakpoint.is_some() {
@@ -798,6 +825,16 @@ impl EventDispatcher for VmwpDispatcher<'_> {
 }
 
 impl VmwpDispatcher<'_> {
+    fn prepare_held_event(&mut self) -> Result<()> {
+        if let Some(kick) = self.state.completion_kick.take() {
+            kick.finish()?;
+        }
+        if self.state.breakpoint.is_some() {
+            self.remove_owned_breakpoint()?;
+        }
+        Ok(())
+    }
+
     fn open_and_register(
         &mut self,
         target: &TargetIdentity,
@@ -909,13 +946,14 @@ impl VmwpDispatcher<'_> {
         Ok(())
     }
 
-    fn verify_instruction(&self, instruction: &InstructionGuard) -> Result<()> {
-        let observed = self
+    fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
+        let memory = self
             .state
             .memory
-            .as_ref()
-            .context("the live VTL1 memory source is absent")?
-            .read_guard(instruction)?;
+            .as_mut()
+            .context("the live VTL1 memory source is absent")?;
+        memory.refresh()?;
+        let observed = memory.read_guard(instruction)?;
         if &observed != instruction {
             bail!("the guarded VTL1 instruction does not match live memory");
         }
@@ -1654,6 +1692,30 @@ mod tests {
             ArmPreparation::OpenAndRegister
         );
         assert!(DispatcherPhase::Closed.arm_preparation().is_err());
+    }
+
+    #[test]
+    fn a_matched_event_remains_owned_for_recovery_before_validation_finishes() {
+        let event = HeldEvent {
+            message_type: HexU64(EVENT_TYPE_VECTOR_1),
+            vector: 1,
+            vp: 0,
+            vtl: 1,
+            cpl: 0,
+            dispatcher_context: HexU64(0x2000_0000_2000),
+            advance_instruction_pointer: false,
+            reason: StopReason::HardwareBreakpoint { slot: 0 },
+        };
+
+        assert_eq!(
+            DispatcherPhase::Holding(event.clone()).held_event(),
+            Some(&event)
+        );
+        assert!(
+            DispatcherPhase::ReadyForStop(StopReason::HardwareBreakpoint { slot: 0 })
+                .held_event()
+                .is_none()
+        );
     }
 
     #[test]

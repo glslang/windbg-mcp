@@ -81,6 +81,9 @@ windows-sys = { version = "0.61", features = [
     # message table and in no other, so `0xc0000409` resolves there or nowhere. A handle lookup and
     # never a load — ntdll is mapped into every process that exists.
     "Win32_System_LibraryLoader",
+    # `PeekNamedPipe`, used by the operator-supplied live VTL1 transport. Child stdout has no
+    # standard-library read timeout; polling the pipe gives every response an absolute deadline.
+    "Win32_System_Pipes",
 ] }
 # The Windows service role (`src/service.rs`). A wrapper rather than hand-rolled SCM FFI because
 # that lifecycle is the one part of this which must not be subtly wrong: a service that mishandles
