@@ -1452,6 +1452,12 @@ fn simulate(
     // The loss the last flag-writing instruction left, carried exactly as `compared` is: whether
     // it matters is decided by what reads those flags, which is the terminator's business.
     let mut just_lost: Option<u64> = None;
+    // **The conditional compare the live flags came from**, when they came from one. A chain can
+    // leave a reading, or only a loss, or nothing with the control code in it -- so what the
+    // terminator owes the answer cannot be read off `compared` alone, and this is what says there
+    // is a chain to ask about at all. Cleared by an ordinary flag write and by a call, exactly as
+    // the readings are, because both of those replace the flags it describes.
+    let mut chain: Option<u64> = None;
     let mut blind = 0usize;
     let mut cases = Vec::new();
     let mut table = None;
@@ -1490,8 +1496,9 @@ fn simulate(
         if matches!(instruction.flow, Flow::Call(_)) {
             compared.clear();
             lost = None;
+            chain = None;
         } else if instruction.writes_flags {
-            absorb(&mut compared, &mut lost, next, &mut just_lost, chained);
+            chain = absorb(&mut compared, &mut lost, next, &mut just_lost, chained);
         }
     }
 
@@ -1617,8 +1624,9 @@ fn simulate(
                 if matches!(last.flow, Flow::Call(_)) {
                     compared.clear();
                     lost = None;
+                    chain = None;
                 } else if last.writes_flags {
-                    absorb(&mut compared, &mut lost, next, &mut just_lost, chained);
+                    chain = absorb(&mut compared, &mut lost, next, &mut just_lost, chained);
                 }
             }
         }
@@ -1690,21 +1698,37 @@ fn simulate(
     // not and the block-boundary test caught: a conditional compare carries a condition of its own,
     // so a block *ending* in one looked like a block whose branch had just read an equality, and
     // the chain left no trace at all.
-    if let Some(dropped) = compared.iter().rev().find(|was| was.chained) {
+    // **What a chain this block read owes the answer**: the site of a reading no equality will
+    // consume, or the loss an unreadable link left, or nothing at all where neither has the control
+    // code in it. Both halves have to be asked -- a forced-clear blind link clears the readings and
+    // leaves *only* the loss, and a check reading `compared` alone silently dropped it (Codex, #439,
+    // against the round that added the commit below).
+    let owed = chain.and_then(|_| {
+        compared
+            .iter()
+            .rev()
+            .find(|was| was.chained)
+            .map(|was| was.at)
+            .or(lost)
+    });
+    if let Some(site) = owed {
         match last.map(|last| (last.flow, last.condition)) {
-            // An equality here has already read them, as cases or as `untracked` sites.
+            // An equality here has already read it, as cases or as an `untracked` site.
             Some((Flow::Branch(_), Some(Condition::Equal | Condition::NotEqual))) => {}
             // **Any other conditional branch reads these flags and decides something about the
-            // code that no case can name, so the site is committed here.** Handing it to the
-            // successor edges instead waits for an equality branch that may never come: two
-            // successors that return leave `cmp code,A` / `ccmpne code,B,#4` / `b.lo` reported as
-            // a complete map. Raised as a P1 by Codex on #439. `cbz`/`cbnz` are deliberately not
-            // this arm -- they read a register rather than the flags, so the chain is still live
-            // for a branch further on, which is the `_` below.
-            Some((Flow::Branch(_), Some(_))) => untracked.push(dropped.at),
+            // code that no case can name, so the site is committed here** -- and the loss does not
+            // also travel, or a later equality branch reports the same site twice. Handing it on
+            // instead waits for an equality branch that may never come: two successors that return
+            // leave `cmp code,A` / `ccmpne code,B,#4` / `b.lo` reported as a complete map.
+            // `cbz`/`cbnz` are deliberately not this arm -- they read a register rather than the
+            // flags, so the chain is still live for a branch further on, which is the `_` below.
+            Some((Flow::Branch(_), Some(_))) => {
+                untracked.push(site);
+                lost = None;
+            }
             // A terminator that reads no flags asks nothing of the chain, so the branch that does
             // is in the next block and the loss travels to it, as an unmodelled flag write's does.
-            _ => lost = lost.or(Some(dropped.at)),
+            _ => lost = lost.or(Some(site)),
         }
     }
     // **The compare that makes a bounds check, asked of each in turn.** A bound is a claim
@@ -2772,17 +2796,24 @@ fn chained_compare(
 /// *of the control code* that this walk read. A compare of something else leaves it empty
 /// ([`compare`] answers `None`), so does a call ([`simulate`] clears it), so does a block that
 /// begins with the link, and so does an arithmetic flag write.
+///
+/// **What it answers is the site of the conditional compare whose flags are now live**, or `None`
+/// for an ordinary flag write -- which is how [`simulate`]'s terminator knows a chain is what it is
+/// about to read. Asking `compared` instead cannot see a chain that left **only** a loss, which the
+/// forced-clear blind arm does: raised as a P1 by Codex on
+/// [#439](https://github.com/glslang/windbg-mcp/pull/439) against the round before it, where the
+/// check it corrects was written searching those readings.
 fn absorb(
     compared: &mut Vec<Compared>,
     lost: &mut Option<u64>,
     next: Option<Compared>,
     just_lost: &mut Option<u64>,
     chained: Option<(u64, bool)>,
-) {
+) -> Option<u64> {
     let Some((at, keeps_earlier)) = chained else {
         *compared = next.into_iter().collect();
         *lost = just_lost.take();
-        return;
+        return None;
     };
     // **Whether the links before this one are comparisons the walk read.** `compared` is replaced
     // at every flag write, so it is non-empty here only when the last thing to write the flags was
@@ -2819,6 +2850,7 @@ fn absorb(
             *lost = just_lost.take().or((blind && predecessor).then_some(at));
         }
     }
+    Some(at)
 }
 
 /// Whether a branch this walk could not read is branching **on the control code**.
@@ -5668,6 +5700,186 @@ mod tests {
             found.untracked,
             vec![DISPATCH + 0xc],
             "and the site says so"
+        );
+    }
+
+    /// **A chain that left only a loss is recorded at a non-equality branch too**, which the check
+    /// that reads the surviving readings cannot do.
+    ///
+    /// `cmp w9,w11` / `ccmpne w2,w3,#0` / `b.lo`: the blind link forces `NZCV` to zero where
+    /// `w9 == w11`, so `C` is clear there and the `b.lo` is **taken** by that code -- and the link
+    /// cleared the readings, leaving the chain represented by its loss alone. With both successors
+    /// returning there is no later equality branch to commit it, and the map reported no case and
+    /// no warning. Raised as a P1 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439), against the round that added the
+    /// commit this extends: what that check could not express was a chain with no reading left.
+    #[test]
+    fn a_loss_only_chain_is_recorded_at_a_non_equality_branch() {
+        const DEFAULT: u64 = 0xb00;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w2",
+                reg("w3"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "b.lo",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(DISPATCH + 0x1c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x14],
+            "the chain's loss is committed where its flags are read, not handed to edges that return"
+        );
+    }
+
+    /// **An ordinary flag write ends the chain, and the loss it leaves is reported the way it
+    /// always was** -- which is the half of these rules that must *not* change.
+    ///
+    /// `cmp w9,w11` / `ccmpne w9,w10,#4` / `and w9,w9,#0xff` / `b.lo`: the `and` replaces the flags
+    /// the chain left and takes the control code with it, so what the `b.lo` reads is the `and`'s
+    /// answer and not the chain's. This walk has always carried such a loss to the successor edges
+    /// and committed it only where an equality reads it, on x64 as much as here, and the
+    /// conditional-compare rules deliberately do not widen that: commit it at the `b.lo` and every
+    /// `ja` over a lost code in every driver grows an `untracked` entry it did not have.
+    ///
+    /// So this is a characterisation of the boundary rather than a rule about chains, and it is
+    /// what pins the clearing: with the chain left standing across the `and`, the site below is
+    /// committed here instead.
+    #[test]
+    fn an_ordinary_flag_write_after_a_chain_is_reported_the_way_it_always_was() {
+        const DEFAULT: u64 = 0xb00;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            // Writes the flags the chain left, and takes the code with it.
+            insn(
+                DISPATCH + 0x20,
+                "and",
+                vec![reg("w9"), reg("w9"), imm(0xff)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.lo",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert!(
+            found.untracked.is_empty(),
+            "a loss this walk has never committed at a non-equality branch still is not: {:?}",
+            found.untracked
         );
     }
 

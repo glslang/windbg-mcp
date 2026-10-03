@@ -1583,8 +1583,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   **A dropped chain is recorded at the branch that consumes it**, since leaving the site on the
   outgoing edges made the answer depend on a later equality branch arriving at all. All three P1s
   were Codex's, on [#439](https://github.com/glslang/windbg-mcp/pull/439); CodeRabbit reviewed the
-  same head and filed nothing. Nine tests against nine rules, each mutation-verified against the
-  rule it is for --
+  same head and filed nothing. **And the chain is a fact the block keeps in its own right** -- the
+  site of the conditional compare whose flags are live, cleared by an ordinary flag write and by a
+  call as the readings are -- because the check above was written searching the readings that
+  survive a chain, and the forced-clear blind arm leaves *only* a loss, so `cmp code,A` /
+  `ccmpne w2,w3,#0` / `b.lo` was still a complete-looking map with an accepted code in it (Codex
+  again, against its own round's fix). The boundary is pinned as well: an ordinary flag write after
+  a chain ends it, and the loss it leaves is reported the way this walk has always reported one, so
+  no `ja` over a lost code anywhere grows an `untracked` entry it did not have. Eleven rules, eleven
+  tests, each mutation-verified against the rule it is for; the `rdyboost` figures above were
+  re-measured after the last of them and are unchanged --
   and the first draft of the one that keeps a dropped chain visible keyed on the terminator's
   *condition* alone, which a `ccmp` carries, so a block ending in one left no case and no site; the
   block-boundary test caught it.
