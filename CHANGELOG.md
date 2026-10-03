@@ -67,7 +67,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   unreachable, so it is dropped (`cmp code,A` / `ccmpne code,A,#0` / `b.ne` rejects every value),
   and one whose code could not be read leaves that unknown, so the code is published with the
   unread site recorded beside it -- the marker the fold had dropped, which `note_loss` used to
-  leave. Thirteen rules, thirteen tests, thirteen mutations --
+  leave. **And a chain needs a predecessor on every path into its block**, not on one of them: `Facts::join`
+  unions `pending` by design, so a carried-in reading is one edge's comparison and says nothing about
+  the others -- `cmp code,A` on one and `cmp w2,#0` on another lets a `ZF`-forcing link admit every
+  code on the second. The fold therefore asks for flags the block itself wrote, which costs a chain
+  whose first link is in another block the codes it used to name and gives it the site instead.
+  Fourteen rules, fourteen tests, fourteen mutations --
   and the first draft of the one that keeps a dropped chain visible keyed on the terminator's
   *condition* alone, which a `ccmp` carries, so a block ending in one left no case and no site; the
   block-boundary test caught it.

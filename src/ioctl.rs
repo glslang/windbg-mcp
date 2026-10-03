@@ -1458,6 +1458,17 @@ fn simulate(
     // is a chain to ask about at all. Cleared by an ordinary flag write and by a call, exactly as
     // the readings are, because both of those replace the flags it describes.
     let mut chain: Option<u64> = None;
+    // **Whether the live flags were written in this block**, which is what a chain's predecessor
+    // has to be. [`Facts::join`] **unions** `pending` -- a comparison is a claim about the path
+    // that made it -- so a carried-in reading proves one incoming path compared the control code
+    // and proves nothing about the others: with `cmp code,A` on one edge and `cmp w2,#0` on
+    // another, a `ZF`-forcing link sends every code to the handler on the second. Raised as a P1
+    // by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439), and the conservative
+    // reading of the same rule the single-path check already applies. What it costs is a chain
+    // whose first link is in another block, which answers with its site instead of its codes --
+    // the shape `FOLLOWUPS.md` item 87 is about, and the same answer every other cross-block chain
+    // shape gets here.
+    let mut own_flags = false;
     let mut blind = 0usize;
     let mut cases = Vec::new();
     let mut table = None;
@@ -1497,8 +1508,17 @@ fn simulate(
             compared.clear();
             lost = None;
             chain = None;
+            own_flags = false;
         } else if instruction.writes_flags {
-            chain = absorb(&mut compared, &mut lost, next, &mut just_lost, chained);
+            chain = absorb(
+                &mut compared,
+                &mut lost,
+                next,
+                &mut just_lost,
+                chained,
+                own_flags,
+            );
+            own_flags = true;
         }
     }
 
@@ -1621,12 +1641,23 @@ fn simulate(
                     &mut just_lost,
                     &mut chained,
                 );
+                // Nothing after this reads `own_flags` -- the terminator is the block's last
+                // instruction, so there is no later flag write to be this block's -- and clippy
+                // says so under `-D warnings`. It is still *read* here, the terminator being as
+                // able to carry a chain as any other flag write.
                 if matches!(last.flow, Flow::Call(_)) {
                     compared.clear();
                     lost = None;
                     chain = None;
                 } else if last.writes_flags {
-                    chain = absorb(&mut compared, &mut lost, next, &mut just_lost, chained);
+                    chain = absorb(
+                        &mut compared,
+                        &mut lost,
+                        next,
+                        &mut just_lost,
+                        chained,
+                        own_flags,
+                    );
                 }
             }
         }
@@ -2809,6 +2840,7 @@ fn absorb(
     next: Option<Compared>,
     just_lost: &mut Option<u64>,
     chained: Option<(u64, bool)>,
+    own_flags: bool,
 ) -> Option<u64> {
     let Some((at, keeps_earlier)) = chained else {
         *compared = next.into_iter().collect();
@@ -2819,7 +2851,11 @@ fn absorb(
     // at every flag write, so it is non-empty here only when the last thing to write the flags was
     // a comparison of the control code that [`compare`] answered -- which is what makes this one
     // question rather than a list of shapes.
-    let predecessor = !compared.is_empty();
+    //
+    // **And it has to be flags this block wrote.** A join unions `pending`, so a carried-in
+    // reading is one path's comparison and says nothing about what the others left -- which a
+    // forced arm over them would admit every code on. See `own_flags` in [`simulate`].
+    let predecessor = !compared.is_empty() && own_flags;
     // **A link whose own comparison could not be read** leaves a question nobody can evaluate in
     // the middle of the chain. A reading with no *code* is not this: it comes back `Some`, and the
     // terminator files its site itself.
@@ -6424,6 +6460,128 @@ mod tests {
             found.untracked.is_empty(),
             "a guard on another value is control flow, not a code this walk lost: {:?}",
             found.untracked
+        );
+    }
+
+    /// **A chain needs a predecessor on *every* path into it, and a join unions them.**
+    ///
+    /// `Facts::join` unions `pending`, deliberately -- a comparison is a claim about the path that
+    /// made it, so an execution taking that path reaches the case whatever the others did. That
+    /// makes a non-empty set at a conditional compare proof that **one** incoming path supplied a
+    /// comparison this walk read, and no proof at all about the rest. Here one predecessor leaves
+    /// `cmp w9,w11` and the other leaves `cmp w2,#0`: on the first path the fold is sound, and on
+    /// the second the `#4` forces `ZF` whenever `w2 == 0`, which sends **every** code to the
+    /// handler. Raised as a P1 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439), and it is the same claim as the
+    /// single-path predecessor rule met across a join rather than inside a block.
+    ///
+    /// So the fold asks for flags **this block wrote**, which is the conservative reading of the
+    /// same rule: a carried-in set came from an edge, and the walk cannot say what the other edges
+    /// left. The cost is a chain whose first link is in another block -- the shape
+    /// `FOLLOWUPS.md` item 87 is about -- which now answers with the site rather than with codes.
+    #[test]
+    fn a_chain_needs_a_predecessor_on_every_path_into_the_block() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            // Two paths from here: the fall-through compares the code, the branch compares
+            // something else.
+            insn(
+                DISPATCH + 0x18,
+                "cbnz",
+                vec![reg("w5")],
+                Flow::Branch(Some(DISPATCH + 0x24)),
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "b",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x28)),
+            ),
+            // The other path: a comparison this walk reads nothing from, falling into the join.
+            insn(
+                DISPATCH + 0x24,
+                "cmp",
+                vec![reg("w2"), imm(0)],
+                Flow::Fallthrough,
+            ),
+            // The join, with the chain's own link and the branch that reads it.
+            conditional(
+                DISPATCH + 0x28,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x2c,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x30, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "one path's comparison is not every path's: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x28],
+            "and the site says the list is a lower bound"
         );
     }
 
