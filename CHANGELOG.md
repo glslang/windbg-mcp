@@ -1570,7 +1570,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `untracked` instead of its codes. That costs a real code on the `b.lo` shape and is the right way
   round. `ccmn`, and a `ccmp` conditioned on `eq`, are deliberately not read: the first compares
   against a negation no control code is written as, the second chains a conjunction in which two
-  distinct codes cannot both hold. Five tests, each mutation-verified against the rule it is for --
+  distinct codes cannot both hold. **And the fold needs a predecessor the walk read**: `ccmpne …,#4`
+  defers to the comparison before it, so where that comparison is not one of the walk's readings --
+  `cmp w2,#0` / `ccmpne w9,w10,#4` / `b.eq` -- the forced arm sends every code to the handler, and a
+  case list naming only `w10`'s code with an empty `untracked` would read as the whole set. Such a
+  link is dropped and its site becomes the loss, which is what this module answered for that shape
+  before a chain could be read at all (raised as a P1 by Codex on
+  [#439](https://github.com/glslang/windbg-mcp/pull/439)). Six tests, each mutation-verified against
+  the rule it is for --
   and the first draft of the one that keeps a dropped chain visible keyed on the terminator's
   *condition* alone, which a `ccmp` carries, so a block ending in one left no case and no site; the
   block-boundary test caught it.
