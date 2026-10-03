@@ -665,6 +665,12 @@ impl SecureKernelLiveTarget {
             target,
         }
     }
+
+    fn conflicts(&self, other: &Self) -> bool {
+        // Pausing is VM-wide and the debugger attachment is process-wide. A different VP, CR3 or
+        // partition coordinate does not create an independent controller boundary for either.
+        self.vmwp_pid == other.vmwp_pid || self.target.vm_id == other.target.vm_id
+    }
 }
 
 #[derive(Debug)]
@@ -3441,10 +3447,13 @@ impl Sessions {
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                         .is_some())
-                    && held.secure_kernel_live_target.as_ref() == Some(target)
+                    && held
+                        .secure_kernel_live_target
+                        .as_ref()
+                        .is_some_and(|other| target.conflicts(other))
             })
         {
-            return Err("This Secure Kernel live target is already reserved by a controller. No second live session was opened. Resolve the existing controller before retrying.".into());
+            return Err("This Secure Kernel VM or vmwp process is already reserved by a controller. No second live session was opened. Resolve the existing controller before retrying.".into());
         }
         registry.all.push_back(Arc::clone(session));
         registry.trim();
@@ -7240,16 +7249,34 @@ mod tests {
     }
 
     fn secure_kernel_live_double(id: &str, state: SessionState, vmwp_pid: u32) -> Arc<Session> {
+        secure_kernel_live_double_at(
+            id,
+            state,
+            vmwp_pid,
+            "00000000-0000-0000-0000-000000000001",
+            0,
+            0x1000,
+        )
+    }
+
+    fn secure_kernel_live_double_at(
+        id: &str,
+        state: SessionState,
+        vmwp_pid: u32,
+        vm_id: &str,
+        vp: u32,
+        expected_cr3: u64,
+    ) -> Arc<Session> {
         let mut session = Arc::into_inner(dormant(id, state)).unwrap();
         session.kind = SessionKind::SecureKernelLive;
         session.secure_kernel_live_target = Some(SecureKernelLiveTarget {
             vmwp_pid,
             target: crate::skcontrol::TargetIdentity {
-                vm_id: "00000000-0000-0000-0000-000000000001".into(),
+                vm_id: vm_id.into(),
                 partition_id: crate::skcontrol::HexU64(1),
-                vp: 0,
+                vp,
                 vtl: 1,
-                expected_cr3: crate::skcontrol::HexU64(0x1000),
+                expected_cr3: crate::skcontrol::HexU64(expected_cr3),
             },
         });
         Arc::new(session)
@@ -7597,12 +7624,42 @@ mod tests {
         );
         assert!(
             sessions
-                .admit(&secure_kernel_live_double(
-                    "different-process",
+                .admit(&secure_kernel_live_double_at(
+                    "same-vm-different-process",
                     SessionState::Opening,
-                    4101
+                    4101,
+                    "00000000-0000-0000-0000-000000000001",
+                    1,
+                    0x2000,
                 ))
-                .is_ok()
+                .is_err(),
+            "pausing is shared by every VP in one VM"
+        );
+        assert!(
+            sessions
+                .admit(&secure_kernel_live_double_at(
+                    "same-process-different-coordinate",
+                    SessionState::Opening,
+                    4100,
+                    "00000000-0000-0000-0000-000000000002",
+                    1,
+                    0x2000,
+                ))
+                .is_err(),
+            "one vmwp process cannot belong to two controllers"
+        );
+        assert!(
+            sessions
+                .admit(&secure_kernel_live_double_at(
+                    "independent",
+                    SessionState::Opening,
+                    4101,
+                    "00000000-0000-0000-0000-000000000002",
+                    1,
+                    0x2000,
+                ))
+                .is_ok(),
+            "a different VM and process has an independent controller boundary"
         );
 
         first.preserve_live_control("test");
@@ -7614,7 +7671,7 @@ mod tests {
                     4100
                 ))
                 .is_err(),
-            "an unresolved controller keeps its exact target reservation"
+            "an unresolved controller keeps its VM and process reservation"
         );
 
         first.released.store(true, Ordering::SeqCst);
