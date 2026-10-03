@@ -2903,10 +2903,21 @@ fn absorb(
             //
             // A predecessor that matched a *different* code needs neither, which is the whole
             // point of the shape: it is the arm the routine rejects, and `rdyboost+0xf00c` is it.
+            //
+            // **And "a predecessor matched it" means every path's, because a join's readings are a
+            // union.** With `cmp code,A` on one edge and `cmp code,B` on another, this link
+            // comparing against `A` is unreachable along the first and **accepted** along the
+            // second, where `B` is forced out and `A` is what the comparison matches. So the case
+            // goes only when every incoming reading named a code and every one of them is this
+            // link's; a reading with no code names no exclusion, and its path's answer is the site
+            // recorded below. Raised as a P2 by Codex on #439, whose other remedy -- per-path
+            // provenance for the readings -- is declined as a second kind of fact at every join,
+            // for a shape no driver here has.
             let unreachable = next.as_ref().is_some_and(|own| {
-                compared
-                    .iter()
-                    .any(|was| was.code.is_some() && was.code == own.code)
+                !compared.is_empty()
+                    && compared
+                        .iter()
+                        .all(|was| was.code.is_some() && was.code == own.code)
             });
             let unnamed = compared
                 .iter()
@@ -6583,6 +6594,221 @@ mod tests {
             vec![DISPATCH + 0x28],
             "and the site says the list is a lower bound"
         );
+    }
+
+    /// **A case is dropped only where *every* path into the block excludes it**, a join's readings
+    /// being a union.
+    ///
+    /// One predecessor leaves `cmp w9,w11` and the other `cmp w9,w10`, and the link is
+    /// `ccmpne w9,w11,#0`. On the first path everything is rejected -- `w11`'s code is forced to
+    /// `ZF` clear and every other code compares unequal -- which is what the unreachable-case rule
+    /// is about. On the **second** path `w10`'s code is forced out, every other code reaches the
+    /// comparison, and `w11`'s code matches it: so `w11`'s code *is* accepted, through a
+    /// predecessor that never compared it. Raised as a P2 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439).
+    ///
+    /// Its first remedy -- per-path provenance for the readings -- is declined: that is a second
+    /// kind of fact at every join, for a shape no driver here has. Its second is what landed, and
+    /// it is a sharpening of the rule rather than machinery: the case goes only when every incoming
+    /// reading named a code **and** every one of them is this link's. A reading with no code names
+    /// no exclusion, so its path's answer is unknown and the site is recorded instead, which is the
+    /// forced-clear arm's other half.
+    #[test]
+    fn a_case_is_dropped_only_where_every_path_excludes_it() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cbnz",
+                vec![reg("w5")],
+                Flow::Branch(Some(DISPATCH + 0x24)),
+            ),
+            // Path one compares the code this link also compares.
+            insn(
+                DISPATCH + 0x1c,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "b",
+                Vec::new(),
+                Flow::Jmp(Some(DISPATCH + 0x28)),
+            ),
+            // Path two compares a different one, and falls into the join.
+            insn(
+                DISPATCH + 0x24,
+                "cmp",
+                vec![reg("w9"), reg("w10")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x28,
+                "ccmp",
+                "w9",
+                reg("w11"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x2c,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(
+                DISPATCH + 0x30,
+                "mov",
+                vec![reg("w0"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x34, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x56_c008, DISPATCH + 0x30)],
+            "the path that never compared this code accepts it: {:?}",
+            found.cases
+        );
+        assert!(
+            found.untracked.is_empty(),
+            "and nothing else reaches that block on either path: {:?}",
+            found.untracked
+        );
+    }
+
+    /// **A forced-clear link with no predecessor at all publishes its code**, which is the guard
+    /// the rule above needs and the mutation matrix found unpinned.
+    ///
+    /// `cmp w2,#0` / `ccmpne w9,w10,#0` / `b.eq`: nothing before the link compared the control
+    /// code, so there are no readings to exclude anything, and `w10`'s code is accepted wherever
+    /// `w2 != 0` -- an ordinary guard, like the control above. *"Every incoming reading is this
+    /// link's code"* is vacuously true of no readings at all, so without `!compared.is_empty()`
+    /// beside it the case would be dropped as unreachable and a real code would go. No test failed
+    /// when that guard was backed out, which is why this one exists.
+    #[test]
+    fn a_forced_clear_link_with_no_predecessor_publishes_its_code() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            // A guard on another value: no reading, so nothing excludes anything.
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w2"), imm(0)],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x1c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x22_4194, 0x900)],
+            "{:?}",
+            found.cases
+        );
+        assert!(found.untracked.is_empty(), "{:?}", found.untracked);
     }
 
     /// A PC-relative literal load, as dbgscope decodes one: no base, no index, and the address the
