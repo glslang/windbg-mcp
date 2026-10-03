@@ -1139,6 +1139,66 @@ pub struct SkSymbolArgs {
     pub session_id: Option<String>,
 }
 
+/// Bind an operator-supplied live VTL1 provider to one exact disposable VM and `vmwp` build.
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveOpenArgs {
+    /// Local build profile containing the guarded `vmwp.exe` identity, RVAs and original bytes.
+    pub profile: String,
+    /// Command line for the privileged register-control provider child.
+    pub control_transport: String,
+    /// Command line for the live VTL1 physical-memory source child.
+    pub live_transport: String,
+    /// Exact host `vmwp.exe` process id for this VM.
+    pub vmwp_pid: u32,
+    /// Per-boot VID partition pointer in that `vmwp`, decimal or `0x` hexadecimal.
+    pub dispatcher_vnd: String,
+    /// Canonical GUID of the exact disposable VM.
+    pub vm_id: String,
+    /// Hyper-V partition id, decimal or `0x` hexadecimal.
+    pub partition_id: String,
+    /// VTL1 page-table root read for this boot, decimal or `0x` hexadecimal.
+    pub expected_cr3: String,
+    /// Virtual processor to control. Defaults to VP 0; this revision supports one VP.
+    #[serde(default)]
+    pub vp: Option<u32>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveArmArgs {
+    /// Exact VTL1 virtual address to stop before, decimal or `0x` hexadecimal.
+    pub address: String,
+    /// Exact 1..=15 instruction bytes expected there, as hexadecimal with optional spaces or `-`.
+    pub bytes: String,
+    /// Which live Secure Kernel session to arm. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveEpochArgs {
+    /// The opaque epoch from the current stopped record. It is consumed exactly once.
+    pub epoch: String,
+    /// Which live Secure Kernel session to act on. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
+#[derive(Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub struct SkLiveReadArgs {
+    /// Guest virtual address in live VTL1, decimal or `0x` hexadecimal.
+    pub address: String,
+    /// How many bytes to read while the stop is held, 1 to 65536.
+    #[schemars(range(min = 1, max = 65536))]
+    pub size: u32,
+    /// Which live Secure Kernel session to read. Omit for the current one.
+    #[serde(default)]
+    pub session_id: Option<String>,
+}
+
 #[derive(Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct ReadMemoryArgs {
@@ -2049,6 +2109,9 @@ fn describe_session(s: &SessionSnapshot) -> String {
     match &s.state {
         SessionState::KernelUnresolved(why) => out.push_str(&format!(
             "  UNRESOLVED KERNEL CONTROLLER for {waited}: {why}\n"
+        )),
+        SessionState::LiveControlUnresolved(why) => out.push_str(&format!(
+            "  UNRESOLVED LIVE VTL1 CONTROL for {waited}: {why}\n"
         )),
         SessionState::Opening => {
             out.push_str(&format!(
@@ -3861,6 +3924,288 @@ impl WindbgServer {
             .await;
         engine_result_for(args.session_id.as_deref(), out)
     }
+    /// Bind a live one-VP Secure Kernel controller to an exact disposable VM, partition, CR3 and
+    /// host `vmwp` process. Opening validates identity and capabilities but does not pause the VM
+    /// or arm a breakpoint.
+    #[rmcp::tool(
+        annotations(
+            title = "Open live Secure Kernel control",
+            read_only_hint = false,
+            destructive_hint = false,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<structured::OpenOutcome>()
+    )]
+    async fn open_sk_live_control(
+        &self,
+        Parameters(args): Parameters<SkLiveOpenArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let parse =
+            |name: &str, value: &str| parse_u64(value).map_err(|why| format!("{name}: {why}"));
+        let dispatcher_vnd = match parse("dispatcher_vnd", &args.dispatcher_vnd) {
+            Ok(value) => value,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
+        let partition_id = match parse("partition_id", &args.partition_id) {
+            Ok(value) => value,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
+        let expected_cr3 = match parse("expected_cr3", &args.expected_cr3) {
+            Ok(value) => value,
+            Err(why) => {
+                return open_failure(ErrorCategory::InvalidArgument, why, None, TargetCreated::No);
+            }
+        };
+        let target = crate::skcontrol::TargetIdentity {
+            vm_id: args.vm_id,
+            partition_id: crate::skcontrol::HexU64(partition_id),
+            vp: args.vp.unwrap_or(0),
+            vtl: 1,
+            expected_cr3: crate::skcontrol::HexU64(expected_cr3),
+        };
+        if let Err(error) = target.validate() {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                error.to_string(),
+                None,
+                TargetCreated::No,
+            );
+        }
+        if args.vmwp_pid == 0
+            || dispatcher_vnd == 0
+            || args.profile.trim().is_empty()
+            || args.control_transport.trim().is_empty()
+            || args.live_transport.trim().is_empty()
+        {
+            return open_failure(
+                ErrorCategory::InvalidArgument,
+                "vmwp_pid, dispatcher_vnd, profile and both transport command lines must be nonzero/nonempty"
+                    .to_string(),
+                None,
+                TargetCreated::No,
+            );
+        }
+        let what = format!("VM {} VTL1 VP {}", target.vm_id, target.vp);
+        self.opened(
+            SessionKind::SecureKernelLive,
+            what,
+            EngineOp::OpenSecureKernelLive(Box::new(crate::skdispatch::OpenRequest {
+                profile: PathBuf::from(args.profile),
+                control_transport: args.control_transport,
+                live_transport: args.live_transport,
+                vmwp_pid: args.vmwp_pid,
+                dispatcher_vnd,
+                target,
+            })),
+        )
+        .await
+    }
+
+    /// Save the VTL1 register baseline and arm slot-0 DR0 for one exact instruction. This first
+    /// revision redirects RIP deliberately; the address and bytes are re-read from live guest
+    /// memory before any register changes.
+    #[rmcp::tool(
+        annotations(
+            title = "Arm live Secure Kernel stop",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::LiveTransition>>()
+    )]
+    async fn sk_live_arm(
+        &self,
+        Parameters(args): Parameters<SkLiveArmArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let address = match parse_u64(&args.address) {
+            Ok(value) => value,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        let bytes = match crate::skdispatch::parse_hex_bytes(&args.bytes) {
+            Ok(value) => value,
+            Err(error) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    args.session_id,
+                );
+            }
+        };
+        let instruction = crate::sklive::InstructionGuard {
+            address: crate::skcontrol::HexU64(address),
+            bytes,
+        };
+        if let Err(error) = instruction.validate() {
+            return typed_error(
+                ErrorCategory::InvalidArgument,
+                error.to_string(),
+                args.session_id,
+            );
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkLiveArm { instruction },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Move the VM and wait until `vmwp` holds the exact owned vector-1 event. Returns two matching
+    /// register snapshots, the guarded instruction bytes, and the new stopped epoch.
+    #[rmcp::tool(
+        annotations(
+            title = "Wait for live Secure Kernel stop",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::StopRecord>>()
+    )]
+    async fn sk_live_wait(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(args.session_id.as_deref(), EngineOp::SkLiveWait)
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Return the complete register and event evidence retained for the current live VTL1 stop.
+    #[rmcp::tool(
+        annotations(
+            title = "Read live Secure Kernel registers",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::StopRecord>>()
+    )]
+    async fn sk_live_registers(
+        &self,
+        Parameters(args): Parameters<SessionArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let out = self
+            .run(args.session_id.as_deref(), EngineOp::SkLiveRegisters)
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Read guest virtual memory through the live VTL1 page-table walk while an owned stop is held.
+    /// The answer carries the stop epoch and starting GPA; an unmapped range is refused whole.
+    #[rmcp::tool(
+        annotations(
+            title = "Read live Secure Kernel memory",
+            read_only_hint = true,
+            destructive_hint = false,
+            idempotent_hint = true,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::skdispatch::LiveMemoryRead>>()
+    )]
+    async fn sk_live_read_memory(
+        &self,
+        Parameters(args): Parameters<SkLiveReadArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let address = match parse_u64(&args.address) {
+            Ok(value) => value,
+            Err(why) => {
+                return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+            }
+        };
+        if let Err(why) = crate::sksession::readable(address, args.size) {
+            return typed_error(ErrorCategory::InvalidArgument, why, args.session_id);
+        }
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkLiveRead {
+                    address,
+                    size: args.size,
+                },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Consume the current stopped epoch and arm one trap-flag step. Collect the single-step stop
+    /// and its new epoch with the live session's wait operation.
+    #[rmcp::tool(
+        annotations(
+            title = "Step live Secure Kernel",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::LiveTransition>>()
+    )]
+    async fn sk_live_step(
+        &self,
+        Parameters(args): Parameters<SkLiveEpochArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let epoch = match crate::skcontrol::StopEpoch::new(args.epoch) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    args.session_id,
+                );
+            }
+        };
+        let out = self
+            .run(args.session_id.as_deref(), EngineOp::SkLiveStep { epoch })
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
+    /// Consume the current stopped epoch, restore the full baseline, clear the execution
+    /// breakpoint and resume. The session remains open and can be armed again.
+    #[rmcp::tool(
+        annotations(
+            title = "Continue live Secure Kernel",
+            read_only_hint = false,
+            destructive_hint = true,
+            idempotent_hint = false,
+            open_world_hint = true
+        ),
+        output_schema = constraints_of::<Outcome<crate::sklive::LiveTransition>>()
+    )]
+    async fn sk_live_continue(
+        &self,
+        Parameters(args): Parameters<SkLiveEpochArgs>,
+    ) -> Result<CallToolResult, ErrorData> {
+        let epoch = match crate::skcontrol::StopEpoch::new(args.epoch) {
+            Ok(epoch) => epoch,
+            Err(error) => {
+                return typed_error(
+                    ErrorCategory::InvalidArgument,
+                    error.to_string(),
+                    args.session_id,
+                );
+            }
+        };
+        let out = self
+            .run(
+                args.session_id.as_deref(),
+                EngineOp::SkLiveContinue { epoch },
+            )
+            .await;
+        engine_result_for(args.session_id.as_deref(), out)
+    }
+
     /// List the debug sessions this server holds — what each one is, how long it has been in
     /// its current state, and which one a call that names no session is routed to. Pass a
     /// `session_id` to ask about one in particular.

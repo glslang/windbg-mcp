@@ -9,11 +9,7 @@
 //! original instruction bytes. Every command issued here is a fixed command whose substituted
 //! fields have already been validated as numbers. No caller can supply debugger command text.
 
-#![allow(
-    dead_code,
-    reason = "the concrete K4.2b adapter is wired to the MCP surface in K4.3"
-)]
-
+use std::fmt;
 use std::io::Read;
 use std::os::windows::process::CommandExt;
 use std::process::{Child, Command, Stdio};
@@ -31,7 +27,7 @@ use crate::sk::RawSource;
 use crate::skcontrol::{HeldEvent, HexU64, StopReason, TargetIdentity};
 use crate::sklive::{
     DispatcherProfile, DispatcherSite, EventDispatcher, InstructionGuard, LiveControl, LivePhase,
-    ObservedStop, ReleaseMode, StopRecord,
+    LiveTransition, ObservedStop, ReleaseMode, StopRecord,
 };
 
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
@@ -78,13 +74,21 @@ impl Session {
         self.control.phase()
     }
 
+    pub(crate) fn stopped(&self) -> Option<&StopRecord> {
+        self.control.stopped()
+    }
+
     pub(crate) fn arm(
         &mut self,
         engine: &DebugEngine,
         instruction: InstructionGuard,
-    ) -> Result<crate::skcontrol::StopEpoch> {
+    ) -> Result<LiveTransition> {
         let mut dispatcher = self.dispatcher.bind(engine);
-        self.control.arm(&mut dispatcher, instruction)
+        let epoch = self.control.arm(&mut dispatcher, instruction)?;
+        Ok(LiveTransition {
+            phase: self.control.phase(),
+            epoch,
+        })
     }
 
     pub(crate) fn wait_for_stop(&mut self, engine: &DebugEngine) -> Result<StopRecord> {
@@ -96,18 +100,36 @@ impl Session {
         &mut self,
         engine: &DebugEngine,
         epoch: &crate::skcontrol::StopEpoch,
-    ) -> Result<crate::skcontrol::StopEpoch> {
+    ) -> Result<LiveTransition> {
         let mut dispatcher = self.dispatcher.bind(engine);
-        self.control.step(&mut dispatcher, epoch)
+        let epoch = self.control.step(&mut dispatcher, epoch)?;
+        Ok(LiveTransition {
+            phase: self.control.phase(),
+            epoch,
+        })
     }
 
     pub(crate) fn continue_from(
         &mut self,
         engine: &DebugEngine,
         epoch: &crate::skcontrol::StopEpoch,
-    ) -> Result<crate::skcontrol::StopEpoch> {
+    ) -> Result<LiveTransition> {
         let mut dispatcher = self.dispatcher.bind(engine);
-        self.control.continue_from(&mut dispatcher, epoch)
+        let epoch = self.control.continue_from(&mut dispatcher, epoch)?;
+        Ok(LiveTransition {
+            phase: self.control.phase(),
+            epoch,
+        })
+    }
+
+    pub(crate) fn read_memory(&self, address: u64, size: u32) -> Result<LiveMemoryRead> {
+        crate::sksession::readable(address, size).map_err(anyhow::Error::msg)?;
+        let stop = self
+            .control
+            .stopped()
+            .context("live VTL1 memory can be read only while the session is stopped")?;
+        self.dispatcher
+            .read_memory(stop.epoch.clone(), address, size)
     }
 
     pub(crate) fn close(&mut self, engine: &DebugEngine) -> Result<()> {
@@ -116,18 +138,85 @@ impl Session {
     }
 }
 
+#[derive(Clone, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct OpenRequest {
-    profile: std::path::PathBuf,
-    control_transport: String,
-    live_transport: String,
-    vmwp_pid: u32,
-    dispatcher_vnd: u64,
-    target: TargetIdentity,
+    pub(crate) profile: std::path::PathBuf,
+    pub(crate) control_transport: String,
+    pub(crate) live_transport: String,
+    pub(crate) vmwp_pid: u32,
+    pub(crate) dispatcher_vnd: u64,
+    pub(crate) target: TargetIdentity,
+}
+
+impl fmt::Debug for OpenRequest {
+    fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
+        out.debug_struct("OpenRequest")
+            .field("profile", &self.profile)
+            .field("control_transport", &"<redacted>")
+            .field("live_transport", &"<redacted>")
+            .field("vmwp_pid", &self.vmwp_pid)
+            .field(
+                "dispatcher_vnd",
+                &format_args!("{:#x}", self.dispatcher_vnd),
+            )
+            .field("target", &self.target)
+            .finish()
+    }
+}
+
+/// A stopped VTL1 read, tied to the epoch whose register snapshot it accompanies.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveMemoryRead {
+    pub(crate) epoch: crate::skcontrol::StopEpoch,
+    pub(crate) address: HexU64,
+    pub(crate) gpa: HexU64,
+    pub(crate) requested_size: u32,
+    pub(crate) read_size: u32,
+    /// Uppercase hexadecimal bytes with no separators.
+    pub(crate) data: String,
+}
+
+pub(crate) fn render_transition(transition: &LiveTransition) -> String {
+    format!(
+        "VTL1 control is {:?} at epoch {}.",
+        transition.phase, transition.epoch
+    )
+}
+
+pub(crate) fn render_stop(stop: &StopRecord) -> String {
+    let rip = stop
+        .registers
+        .values
+        .iter()
+        .find(|value| value.name == crate::skcontrol::RegisterName::Rip)
+        .map(|value| value.low.0);
+    format!(
+        "VTL1 VP {} stopped for {:?}{} at epoch {}. The guarded instruction begins at {:#x}.",
+        stop.target.vp,
+        stop.event.reason,
+        rip.map(|value| format!(" at RIP {value:#x}"))
+            .unwrap_or_default(),
+        stop.epoch,
+        stop.instruction.address.0,
+    )
+}
+
+pub(crate) fn render_read(read: &LiveMemoryRead) -> String {
+    format!(
+        "{} byte(s) of stopped VTL1 at {:#x} (physical {:#x}, epoch {})\n{}",
+        read.read_size, read.address.0, read.gpa.0, read.epoch, read.data
+    )
+}
+
+struct AcceptanceRequest {
+    open: OpenRequest,
     instruction: InstructionGuard,
 }
 
-impl OpenRequest {
-    pub(crate) fn parse(args: &[String]) -> Result<Self> {
+impl AcceptanceRequest {
+    fn parse(args: &[String]) -> Result<Self> {
         let mut profile = None;
         let mut control_transport = None;
         let mut live_transport = None;
@@ -186,12 +275,14 @@ impl OpenRequest {
             bytes: instruction_bytes.context(live_control_usage())?,
         };
         Ok(Self {
-            profile: profile.context(live_control_usage())?,
-            control_transport: control_transport.context(live_control_usage())?,
-            live_transport: live_transport.context(live_control_usage())?,
-            vmwp_pid: vmwp_pid.context(live_control_usage())?,
-            dispatcher_vnd: dispatcher_vnd.context(live_control_usage())?,
-            target,
+            open: OpenRequest {
+                profile: profile.context(live_control_usage())?,
+                control_transport: control_transport.context(live_control_usage())?,
+                live_transport: live_transport.context(live_control_usage())?,
+                vmwp_pid: vmwp_pid.context(live_control_usage())?,
+                dispatcher_vnd: dispatcher_vnd.context(live_control_usage())?,
+                target,
+            },
             instruction,
         })
     }
@@ -206,9 +297,9 @@ struct AcceptanceResult {
 }
 
 pub(crate) fn run_acceptance(args: &[String], engine: &DebugEngine) -> Result<()> {
-    let request = OpenRequest::parse(args)?;
+    let request = AcceptanceRequest::parse(args)?;
     let instruction = request.instruction.clone();
-    let (mut session, skipped) = Session::open(&request)?;
+    let (mut session, skipped) = Session::open(&request.open)?;
     for line in skipped {
         eprintln!("control provider: {line}");
     }
@@ -254,7 +345,7 @@ fn cli_word(name: &str, value: &str) -> Result<u64> {
         .with_context(|| format!("--{name} must be hexadecimal 0x or unsigned decimal"))
 }
 
-fn parse_hex_bytes(text: &str) -> Result<Vec<u8>> {
+pub(crate) fn parse_hex_bytes(text: &str) -> Result<Vec<u8>> {
     let compact: String = text
         .chars()
         .filter(|character| !character.is_ascii_whitespace() && *character != '-')
@@ -332,6 +423,35 @@ impl VmwpDispatcherState {
             engine,
             state: self,
         }
+    }
+
+    fn read_memory(
+        &self,
+        epoch: crate::skcontrol::StopEpoch,
+        address: u64,
+        size: u32,
+    ) -> Result<LiveMemoryRead> {
+        let memory = self
+            .memory
+            .as_ref()
+            .context("the live VTL1 memory source is absent")?;
+        let at = sk::Gva(address);
+        let gpa = memory
+            .space
+            .translate(at)
+            .with_context(|| format!("nothing in live VTL1 maps {address:#x}"))?;
+        let reader = sk::Reader::new(&memory.source);
+        let bytes = sk::Space::new(&reader, &memory.space)
+            .read_span(at, size as usize)
+            .map_err(|why| anyhow!("reading live VTL1 at {address:#x} failed: {why:?}"))?;
+        Ok(LiveMemoryRead {
+            epoch,
+            address: HexU64(address),
+            gpa: HexU64(gpa.0),
+            requested_size: size,
+            read_size: bytes.len() as u32,
+            data: bytes.iter().map(|byte| format!("{byte:02X}")).collect(),
+        })
     }
 }
 
@@ -1409,11 +1529,11 @@ mod tests {
             "0f 1f 44 00 00",
         ]
         .map(str::to_string);
-        let request = OpenRequest::parse(&args).unwrap();
+        let request = AcceptanceRequest::parse(&args).unwrap();
 
-        assert_eq!(request.vmwp_pid, 4242);
-        assert_eq!(request.dispatcher_vnd, 0x200000001000);
-        assert_eq!(request.target.partition_id, HexU64(0x27));
+        assert_eq!(request.open.vmwp_pid, 4242);
+        assert_eq!(request.open.dispatcher_vnd, 0x200000001000);
+        assert_eq!(request.open.target.partition_id, HexU64(0x27));
         assert_eq!(request.instruction.bytes, [0x0f, 0x1f, 0x44, 0, 0]);
         assert!(
             !serde_json::to_string(&profile())

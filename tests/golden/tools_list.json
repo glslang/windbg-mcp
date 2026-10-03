@@ -2,7 +2,7 @@
   "schemaDialects": [
     "https://json-schema.org/draft/2020-12/schema"
   ],
-  "toolCount": 67,
+  "toolCount": 74,
   "tools": [
     {
       "hints": {
@@ -1257,6 +1257,57 @@
     },
     {
       "hints": {
+        "destructive": false,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "open_sk_live_control",
+      "output": {
+        "branches": [
+          {
+            "payload": "#/$defs/OpenedSession",
+            "required": [
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/OpenFailure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "control_transport: string",
+        "dispatcher_vnd: string",
+        "expected_cr3: string",
+        "live_transport: string",
+        "partition_id: string",
+        "profile: string",
+        "vm_id: string",
+        "vmwp_pid: integer/uint32",
+        "vp: integer|null/uint32"
+      ],
+      "required": [
+        "control_transport",
+        "dispatcher_vnd",
+        "expected_cr3",
+        "live_transport",
+        "partition_id",
+        "profile",
+        "vm_id",
+        "vmwp_pid"
+      ],
+      "title": "Open live Secure Kernel control"
+    },
+    {
+      "hints": {
         "destructive": true,
         "idempotent": false,
         "openWorld": true,
@@ -1783,6 +1834,248 @@
         "path"
       ],
       "title": "Set symbol search path"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "sk_live_arm",
+      "output": {
+        "branches": [
+          {
+            "payload": null,
+            "required": [
+              "epoch",
+              "phase",
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "address: string",
+        "bytes: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "address",
+        "bytes"
+      ],
+      "title": "Arm live Secure Kernel stop"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "sk_live_continue",
+      "output": {
+        "branches": [
+          {
+            "payload": null,
+            "required": [
+              "epoch",
+              "phase",
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "epoch: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "epoch"
+      ],
+      "title": "Continue live Secure Kernel"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "sk_live_read_memory",
+      "output": {
+        "branches": [
+          {
+            "payload": null,
+            "required": [
+              "address",
+              "data",
+              "epoch",
+              "gpa",
+              "read_size",
+              "requested_size",
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "address: string",
+        "session_id: string|null",
+        "size: integer/uint32"
+      ],
+      "required": [
+        "address",
+        "size"
+      ],
+      "title": "Read live Secure Kernel memory"
+    },
+    {
+      "hints": {
+        "destructive": false,
+        "idempotent": true,
+        "openWorld": true,
+        "readOnly": true
+      },
+      "name": "sk_live_registers",
+      "output": {
+        "branches": [
+          {
+            "payload": null,
+            "required": [
+              "epoch",
+              "event",
+              "instruction",
+              "registers",
+              "status",
+              "target"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Read live Secure Kernel registers"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "sk_live_step",
+      "output": {
+        "branches": [
+          {
+            "payload": null,
+            "required": [
+              "epoch",
+              "phase",
+              "status"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "epoch: string",
+        "session_id: string|null"
+      ],
+      "required": [
+        "epoch"
+      ],
+      "title": "Step live Secure Kernel"
+    },
+    {
+      "hints": {
+        "destructive": true,
+        "idempotent": false,
+        "openWorld": true,
+        "readOnly": false
+      },
+      "name": "sk_live_wait",
+      "output": {
+        "branches": [
+          {
+            "payload": null,
+            "required": [
+              "epoch",
+              "event",
+              "instruction",
+              "registers",
+              "status",
+              "target"
+            ],
+            "status": "ok"
+          },
+          {
+            "payload": "#/$defs/Failure",
+            "required": [
+              "status"
+            ],
+            "status": "error"
+          }
+        ],
+        "dialect": "https://json-schema.org/draft/2020-12/schema",
+        "root": "object"
+      },
+      "params": [
+        "session_id: string|null"
+      ],
+      "required": [],
+      "title": "Wait for live Secure Kernel stop"
     },
     {
       "hints": {

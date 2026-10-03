@@ -2287,7 +2287,7 @@ verified before release. No token was duplicated, no helper thread or DLL was in
 controller consumed no VID queue. Stock OpenVMM remains irrelevant because its Windows path is
 VTL0-only. The direct owner-built Windows boot below is historical work, not the selected route.
 
-What remains is the MCP surface and broader hardening. `src/skcontrol.rs` defines the operator-provider contract with exact
+The minimum MCP surface is implemented; broader hardening remains. `src/skcontrol.rs` defines the operator-provider contract with exact
 VM/partition/VP/VTL/CR3 identity, rotating running/arming/stopped epochs, compare-and-write register
 updates, and held-event identity; `--sk-control-probe` checks its non-mutating handshake.
 `src/sklive.rs` now adds the worker-side one-VP state machine: it owns the outer
@@ -2298,8 +2298,12 @@ two-read stop evidence, epoch-consuming step/continue, and fail-closed restorati
 handler registration and deferred cleanup, completes both events through the native path, frees
 callback scratch, and detaches handled. That Rust path passed twice on the allowlisted disposable
 VM; the recorded repeat preserved the same `vmwp` and heartbeat for 60 seconds, found no scoped
-crash record, re-read unchanged guest text, and left the VM Off. MCP tools, broader instruction
-stepping, multi-VP coordination, and three-fresh-boot hardening remain open. The detailed bench
+crash record, re-read unchanged guest text, and left the VM Off. A separate live session now binds,
+arms, waits, inspects, steps, continues and closes through typed epoch-bound MCP tools; its live MCP
+acceptance also retained the same `vmwp` and healthy advancing heartbeat for 60 seconds, found no
+scoped crash record, preserved the guarded bytes and left the VM Off. Ordinary debugger tools are
+refused because their target would be `vmwp`. Broader instruction stepping,
+multi-VP coordination, and three-fresh-boot hardening remain open. The detailed bench
 sequence, profile, provider and evidence remain in the ignored private plan.
 
 The record below explains how the route was chosen. Cost and “still open” statements in it describe
@@ -2486,8 +2490,8 @@ to collect what does not depend on that step, and then to falsify it before anyt
    contract for live register control and held-event correlation. Its capability probe is implemented,
    `src/sklive.rs` adds the worker-side epoch state machine and recovery policy, and
    `src/skdispatch.rs` supplies the concrete DbgEng adapter. The adapter's exact-build profile stays
-   local and the opt-in role has passed live; the MCP session still remains. No private provider or
-   VID ABI enters the supervisor.
+   local, the opt-in role has passed live, and the minimum MCP session surface is implemented with
+   fail-closed teardown. No private provider or VID ABI enters the supervisor.
 
 6. **The exception branch and completion callback — decoded 2026-10-02.** On guarded `Vid.sys`
    10.0.26100.9278, `VidHandleExceptionIntercept` reads the vector's claim slot, constructs mapped
@@ -2500,12 +2504,10 @@ to collect what does not depend on that step, and then to falsify it before anyt
    model or guest OS cannot supply.
 
 **Current summary.** A resumable initialized Secure Kernel stop and a one-instruction hardware
-stop/step both pass on the allowlisted disposable managed VM. That proves the minimum one-VP
-mechanism; it is not yet a supported MCP session. Capture inspection remains the shipped surface.
-The repository now has the provider owner, dedicated worker state machine, and exact-build adapter
-which attaches that state machine to `vmwp`; their Rust acceptance lifecycle has passed twice. The
-next boundary is the small epoch-bound MCP surface. The direct owner-built Windows boot is no longer
-on that path.
+stop/step both pass on the allowlisted disposable managed VM. The repository now has the provider
+owner, dedicated worker state machine, exact-build adapter and separate epoch-bound MCP session
+surface. Capture inspection remains independent. The next boundary is natural-flow, repeated-step
+and multi-VP hardening. The direct owner-built Windows boot is no longer on that path.
 
 **Safety rules that are not negotiable per arm.** The owner-partition probes never enumerate or open
 an existing VM. The managed route targets only its exact allowlisted disposable VM and refuses every

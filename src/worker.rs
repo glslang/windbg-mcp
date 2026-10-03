@@ -355,6 +355,12 @@ impl KernelSafety {
 
 static KERNEL_SAFETY: KernelSafety = KernelSafety::new();
 
+/// True while this worker owns a live Secure Kernel provider or `vmwp` adapter that has not
+/// completed its guarded teardown. Metadata only; all provider and DbgEng calls stay on the engine
+/// thread. On supervisor loss this keeps the process alive if restoration cannot be proved, which
+/// preserves the adapter's fail-closed state instead of dropping an attachment beside a paused VM.
+static LIVE_CONTROL_ACTIVE: AtomicBool = AtomicBool::new(false);
+
 fn kernel_recovery_required() -> Failed {
     Failed::categorised(
         crate::structured::ErrorCategory::RecoveryRequired,
@@ -369,6 +375,19 @@ fn retain_orphaned_kernel() -> ! {
     );
     crate::logbridge::flush(LOG_FLUSH);
     KERNEL_SAFETY.wait_until_released();
+    std::process::exit(0);
+}
+
+fn retain_orphaned_live_control() -> ! {
+    tracing::error!(
+        "worker {}: retaining unresolved live Secure Kernel control after supervisor loss; the \
+         disposable VM may be paused and operator recovery is required",
+        std::process::id()
+    );
+    crate::logbridge::flush(LOG_FLUSH);
+    while LIVE_CONTROL_ACTIVE.load(Ordering::SeqCst) {
+        thread::park_timeout(Duration::from_secs(1));
+    }
     std::process::exit(0);
 }
 
@@ -815,7 +834,13 @@ fn sealed_as(op: &EngineOp) -> Option<Cleanup> {
         EngineOp::OpenSecureKernel(_)
         | EngineOp::SkModules
         | EngineOp::SkRead { .. }
-        | EngineOp::SkSymbol { .. } => Some(Cleanup::NotInterruptible),
+        | EngineOp::SkSymbol { .. }
+        | EngineOp::OpenSecureKernelLive(_)
+        | EngineOp::SkLiveArm { .. }
+        | EngineOp::SkLiveRegisters
+        | EngineOp::SkLiveRead { .. }
+        | EngineOp::SkLiveStep { .. }
+        | EngineOp::SkLiveContinue { .. } => Some(Cleanup::NotInterruptible),
         _ => None,
     }
 }
@@ -1092,7 +1117,9 @@ pub fn run(args: &[String]) -> ! {
         tracing::error!(
             "worker: the engine thread is gone, so nothing was asked to release the target"
         );
-        if KERNEL_SAFETY.remote.load(Ordering::SeqCst) {
+        if LIVE_CONTROL_ACTIVE.load(Ordering::SeqCst) {
+            retain_orphaned_live_control();
+        } else if KERNEL_SAFETY.remote.load(Ordering::SeqCst) {
             retain_orphaned_kernel();
         }
     } else {
@@ -1100,8 +1127,12 @@ pub fn run(args: &[String]) -> ! {
         // evidence that the target was detached.
         match released.recv_timeout(grace) {
             Ok(true) => {}
+            Ok(false) if LIVE_CONTROL_ACTIVE.load(Ordering::SeqCst) => {
+                retain_orphaned_live_control()
+            }
             Ok(false) if KERNEL_SAFETY.remote.load(Ordering::SeqCst) => retain_orphaned_kernel(),
             Ok(false) => {}
+            Err(_) if LIVE_CONTROL_ACTIVE.load(Ordering::SeqCst) => retain_orphaned_live_control(),
             Err(_) if KERNEL_SAFETY.remote.load(Ordering::SeqCst) => retain_orphaned_kernel(),
             Err(mpsc::RecvTimeoutError::Timeout) => tracing::warn!(
                 "worker: the engine did not finish releasing within {grace:?} (parked in DbgEng, \
@@ -1283,6 +1314,9 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
     // `Send`/`Sync` question entirely: the provider's handles are raw pointers, every call on them
     // is made from here, and there is nowhere else in this process that could reach them.
     let mut sk: Option<crate::sksession::Session> = None;
+    // The live counterpart. It owns the provider child and the build-guarded adapter state; every
+    // method receives this thread's engine by reference, so neither can escape this thread.
+    let mut sk_live: Option<crate::skdispatch::Session> = None;
     emit(&WorkerMessage::Ready {
         build: crate::BUILD_VERSION.to_string(),
     });
@@ -1299,36 +1333,84 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                     let _ = ack.send(false);
                     continue;
                 }
+                let released_live_control = if let Some(session) = sk_live.as_mut() {
+                    match catch_unwind(AssertUnwindSafe(|| session.close(&engine))) {
+                        Ok(Ok(())) => {
+                            sk_live = None;
+                            LIVE_CONTROL_ACTIVE.store(false, Ordering::SeqCst);
+                            true
+                        }
+                        Ok(Err(error)) => {
+                            tracing::error!(
+                                "worker: live Secure Kernel teardown failed after supervisor loss \
+                                 ({error:#}); retaining the fail-closed adapter"
+                            );
+                            let _ = ack.send(false);
+                            continue;
+                        }
+                        Err(_) => {
+                            tracing::error!(
+                                "worker: live Secure Kernel teardown panicked after supervisor \
+                                 loss; retaining the fail-closed adapter"
+                            );
+                            let _ = ack.send(false);
+                            continue;
+                        }
+                    }
+                } else {
+                    false
+                };
                 // The attach's leftover break-ins are spent inside this call, by dbgscope's
                 // `quit_and_detach_target` — so this path gets it without asking, which is why
                 // there is nothing here to go with it. Nothing on this path came from a caller,
                 // so there is no seal to take and nobody to refuse either: the request reader has
                 // already met EOF. See [`ABRUPT_EXIT_RELEASE`] for the budget it runs inside.
                 let result = catch_unwind(AssertUnwindSafe(|| engine.end_session()));
-                let confirmed = matches!(&result, Ok(Ok(_)));
+                // The adapter's close is the release contract for a live-control session. After
+                // it returns, this worker's DbgEng instance no longer owns `vmwp`; a failure while
+                // ending any remaining idle image target cannot turn a proved register restore
+                // and handled adapter detach back into an unresolved VTL1 controller.
+                let confirmed = released_live_control || matches!(&result, Ok(Ok(_)));
                 if confirmed {
                     KERNEL_SAFETY.released();
                 }
-                match result {
-                    // The disposition, not just "released": on this path there is no reply to put
-                    // it on, so the log is the only place a halted kernel can be said at all.
-                    Ok(Ok(dbgscope::dbgeng::TargetLeft::KernelHalted)) => tracing::error!(
-                        "worker: the live kernel could not be told to run before it was detached, \
+                if released_live_control {
+                    match result {
+                        Ok(Ok(left)) => tracing::info!(
+                            "worker: live Secure Kernel adapter released; idle debugger target \
+                             ended ({left:?})"
+                        ),
+                        Ok(Err(error)) => tracing::warn!(
+                            "worker: live Secure Kernel adapter released; ending the idle \
+                             debugger target failed ({error})"
+                        ),
+                        Err(_) => tracing::warn!(
+                            "worker: live Secure Kernel adapter released; ending the idle \
+                             debugger target panicked"
+                        ),
+                    }
+                } else {
+                    match result {
+                        // The disposition, not just "released": on this path there is no reply to put
+                        // it on, so the log is the only place a halted kernel can be said at all.
+                        Ok(Ok(dbgscope::dbgeng::TargetLeft::KernelHalted)) => tracing::error!(
+                            "worker: the live kernel could not be told to run before it was detached, \
                          so it is probably still halted; attaching again and running `qd` \
                          releases it"
-                    ),
-                    Ok(Ok(left)) => tracing::info!("worker: target released ({left:?})"),
-                    Ok(Err(e)) => tracing::error!(
-                        "worker: the debugger refused to release the target ({}); a live kernel \
+                        ),
+                        Ok(Ok(left)) => tracing::info!("worker: target released ({left:?})"),
+                        Ok(Err(e)) => tracing::error!(
+                            "worker: the debugger refused to release the target ({}); a live kernel \
                          target may be left halted, and a process this session attached to may \
                          have been killed rather than detached",
-                        e
-                    ),
-                    Err(_) => tracing::error!(
-                        "worker: releasing the target panicked; a live kernel target may be left \
+                            e
+                        ),
+                        Err(_) => tracing::error!(
+                            "worker: releasing the target panicked; a live kernel target may be left \
                          halted, and a process this session attached to may have been killed \
                          rather than detached"
-                    ),
+                        ),
+                    }
                 }
                 let _ = ack.send(confirmed);
                 continue;
@@ -1373,6 +1455,7 @@ fn engine_thread(rx: mpsc::Receiver<Job>, target: Option<Opening>) {
                 queued,
                 request.handle_bound,
                 &mut sk,
+                &mut sk_live,
             )
         }));
         let panicked = result.is_err();
@@ -1776,6 +1859,15 @@ fn refuse_when_the_target_is_gone(e: &DebugEngine, op: &EngineOp) -> Option<Fail
             | EngineOp::SkModules
             | EngineOp::SkRead { .. }
             | EngineOp::SkSymbol { .. }
+            // A live-control session's engine has no target before its first arm and holds `vmwp`
+            // only while the adapter needs it. These operations answer about the provider-bound
+            // VTL1 state, so DbgEng's target-presence gate is the wrong question for all of them.
+            | EngineOp::SkLiveArm { .. }
+            | EngineOp::SkLiveWait
+            | EngineOp::SkLiveRegisters
+            | EngineOp::SkLiveRead { .. }
+            | EngineOp::SkLiveStep { .. }
+            | EngineOp::SkLiveContinue { .. }
         )
     {
         return None;
@@ -2118,7 +2210,15 @@ fn watch_for(op: &EngineOp) -> Watch {
         // the engine's target — the image, when there is one — is not what they answer about. It
         // also cannot move under them, since a Secure Kernel session accepts no op that can run a
         // command (`crate::engine::refuse_op_on_kind`).
-        EngineOp::SkModules | EngineOp::SkRead { .. } | EngineOp::SkSymbol { .. } => Watch::Ignore,
+        EngineOp::SkModules
+        | EngineOp::SkRead { .. }
+        | EngineOp::SkSymbol { .. }
+        | EngineOp::SkLiveArm { .. }
+        | EngineOp::SkLiveWait
+        | EngineOp::SkLiveRegisters
+        | EngineOp::SkLiveRead { .. }
+        | EngineOp::SkLiveStep { .. }
+        | EngineOp::SkLiveContinue { .. } => Watch::Ignore,
         _ => Watch::Compare,
     }
 }
@@ -2501,6 +2601,7 @@ fn execute(
     queued: Duration,
     handle_bound: bool,
     sk: &mut Option<crate::sksession::Session>,
+    sk_live: &mut Option<crate::skdispatch::Session>,
 ) -> Result<Output, Failed> {
     // **How much of the caller's patience is gone by the time a bound is armed** — the queue wait
     // *plus* whatever this op has already spent getting to the point of arming one. Every budget
@@ -2689,6 +2790,8 @@ fn execute(
 
         EngineOp::OpenSecureKernel(request) => open_secure_kernel(e, id, &request, sk),
 
+        EngineOp::OpenSecureKernelLive(request) => open_secure_kernel_live(id, &request, sk_live),
+
         EngineOp::SkModules => {
             let modules = held_capture(sk)?.modules().map_err(Failed::from)?;
             Ok(Output::typed(
@@ -2711,6 +2814,58 @@ fn execute(
             Ok(Output::typed(
                 crate::sksession::render_symbol(&symbol),
                 symbol,
+            ))
+        }
+
+        EngineOp::SkLiveArm { instruction } => {
+            let transition = held_live_control(sk_live)?
+                .arm(e, instruction)
+                .map_err(failed)?;
+            Ok(Output::typed(
+                crate::skdispatch::render_transition(&transition),
+                transition,
+            ))
+        }
+
+        EngineOp::SkLiveWait => {
+            let stop = held_live_control(sk_live)?
+                .wait_for_stop(e)
+                .map_err(failed)?;
+            Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
+        }
+
+        EngineOp::SkLiveRegisters => {
+            let stop = held_live_control(sk_live)?
+                .stopped()
+                .cloned()
+                .ok_or_else(|| Failed::from("live VTL1 registers are available only at a stop"))?;
+            Ok(Output::typed(crate::skdispatch::render_stop(&stop), stop))
+        }
+
+        EngineOp::SkLiveRead { address, size } => {
+            let read = held_live_control(sk_live)?
+                .read_memory(address, size)
+                .map_err(failed)?;
+            Ok(Output::typed(crate::skdispatch::render_read(&read), read))
+        }
+
+        EngineOp::SkLiveStep { epoch } => {
+            let transition = held_live_control(sk_live)?
+                .step(e, &epoch)
+                .map_err(failed)?;
+            Ok(Output::typed(
+                crate::skdispatch::render_transition(&transition),
+                transition,
+            ))
+        }
+
+        EngineOp::SkLiveContinue { epoch } => {
+            let transition = held_live_control(sk_live)?
+                .continue_from(e, &epoch)
+                .map_err(failed)?;
+            Ok(Output::typed(
+                crate::skdispatch::render_transition(&transition),
+                transition,
             ))
         }
 
@@ -3124,13 +3279,49 @@ fn execute(
         // Reaching here means any batch has already been told to stop and has finished unwinding —
         // the reader saw this request go past and said so, and this thread runs one job at a time.
         EngineOp::EndSession => {
+            let live_control = sk_live.is_some();
+            if let Some(session) = sk_live.as_mut()
+                && let Err(error) = session.close(e)
+            {
+                return Err(Failed::categorised(
+                    structured::ErrorCategory::RecoveryRequired,
+                    format!(
+                        "live Secure Kernel teardown could not prove restoration and detach: \
+                         {error:#}. The worker and its adapter were retained fail-closed; do not \
+                         attach another controller. Retry this teardown or inspect the disposable \
+                         VM and worker out of band."
+                    ),
+                ));
+            }
+            if live_control {
+                *sk_live = None;
+                LIVE_CONTROL_ACTIVE.store(false, Ordering::SeqCst);
+
+                // `Session::close` above is the live-control release boundary: it proves the
+                // register baseline was restored, the owned event completed, and the adapter
+                // detached handled. DbgEng only owns this worker's idle image target, so its
+                // cleanup is best effort and cannot make that proved VTL1 release unresolved.
+                if let Err(error) = e.end_session() {
+                    tracing::warn!(
+                        "worker: live Secure Kernel adapter released; ending the idle debugger \
+                         target failed ({error})"
+                    );
+                }
+                query::invalidate_allocator_caches();
+                return Ok(Output::released(
+                    "Session ended. The live VTL1 baseline and debug registers were restored, \
+                     the owned event was completed, the handler and scratch were removed, and \
+                     `vmwp` was detached handled.",
+                    Some(true),
+                ));
+            }
             // Read *before* the teardown, which is the only moment it is still true: ending a
             // session is what clears it. And it is worth saying at all because the two endings
             // are opposite and neither is visible from the caller's side — a process this server
             // attached to is detached and goes on running, where one it launched goes with the
             // session. Naming no tool, per `FOLLOWUPS.md` item 43: this is built in the worker,
             // which has never heard of the client's surface.
-            let detaching = e.attached_to_a_live_process();
+            let detaching = !live_control && e.attached_to_a_live_process();
             // This op reaches here already closed to breaks, sealed by [`claim`] before its first
             // statement ran — for the reason a batch's rollback is sealed, and with the live
             // kernel as the sharp case. The teardown below resumes the target: dbgscope's
@@ -7833,6 +8024,48 @@ fn open_secure_kernel(
     Ok(Output::opened_capture(text, summary, report))
 }
 
+/// Bind a live Secure Kernel provider and retain its adapter in this worker. The opener itself is
+/// non-mutating: it validates the exact target identity and provider capabilities. `SkLiveArm` is
+/// the first operation allowed to pause or attach to `vmwp`.
+fn open_secure_kernel_live(
+    id: u64,
+    request: &crate::skdispatch::OpenRequest,
+    slot: &mut Option<crate::skdispatch::Session>,
+) -> Result<Output, Failed> {
+    if slot.is_some() {
+        return Err(Failed::from(
+            "this worker already holds a live Secure Kernel controller",
+        ));
+    }
+    let (session, skipped) = crate::skdispatch::Session::open(request).map_err(failed)?;
+    emit(&WorkerMessage::Committed { id });
+    emit(&WorkerMessage::Opened { id });
+    let target = &request.target;
+    let text = format!(
+        "Bound live Secure Kernel control to VM {} partition {:#x}, VP {}, VTL1, expected CR3 \
+         {:#x}. The provider ignored {} startup banner line(s). No execution breakpoint is armed.",
+        target.vm_id,
+        target.partition_id.0,
+        target.vp,
+        target.expected_cr3.0,
+        skipped.len(),
+    );
+    let summary = structured::TargetSummary {
+        kernel_mode: Some(true),
+        kernel_target: Some(structured::KernelTarget::Windows),
+        limitation: Some(
+            "This session controls one Secure Kernel VTL1 VP through a build-guarded adapter. \
+             Ordinary debugger operations are unavailable because its temporary DbgEng target is \
+             the host `vmwp` process, not the guest."
+                .to_string(),
+        ),
+        ..Default::default()
+    };
+    *slot = Some(session);
+    LIVE_CONTROL_ACTIVE.store(true, Ordering::SeqCst);
+    Ok(Output::opened(text, summary))
+}
+
 /// The capture this worker holds, for the three ops that read one.
 ///
 /// The supervisor refuses these against any other kind of session, so reaching this with an empty
@@ -7845,6 +8078,17 @@ fn held_capture(
         Failed::categorised(
             structured::ErrorCategory::StaleSession,
             "this session holds no Secure Kernel capture".to_string(),
+        )
+    })
+}
+
+fn held_live_control(
+    slot: &mut Option<crate::skdispatch::Session>,
+) -> Result<&mut crate::skdispatch::Session, Failed> {
+    slot.as_mut().ok_or_else(|| {
+        Failed::categorised(
+            structured::ErrorCategory::StaleSession,
+            "this session holds no live Secure Kernel controller".to_string(),
         )
     })
 }
@@ -10766,6 +11010,23 @@ mod tests {
 
     use super::TargetFingerprint;
 
+    fn live_control_open() -> EngineOp {
+        EngineOp::OpenSecureKernelLive(Box::new(crate::skdispatch::OpenRequest {
+            profile: "vmwp-profile.json".into(),
+            control_transport: "control-provider".into(),
+            live_transport: "live-memory-provider".into(),
+            vmwp_pid: 4242,
+            dispatcher_vnd: 0xfffff80000001000,
+            target: crate::skcontrol::TargetIdentity {
+                vm_id: "00000000-0000-0000-0000-000000000001".into(),
+                partition_id: crate::skcontrol::HexU64(1),
+                vp: 0,
+                vtl: 1,
+                expected_cr3: crate::skcontrol::HexU64(0x1000),
+            },
+        }))
+    }
+
     fn kind(class: u32, qualifier: u32) -> Option<DebuggeeType> {
         Some(DebuggeeType { class, qualifier })
     }
@@ -13071,6 +13332,21 @@ mod tests {
                 },
                 Some(TargetOrigin::Kernel),
             ),
+            (
+                EngineOp::OpenSecureKernel(Box::new(crate::sksession::Request {
+                    capture: crate::savedstate::CaptureSpec::Vmrs("capture.vmrs".into()),
+                    image: "securekernel.exe".into(),
+                    kit: None,
+                    kit_version: None,
+                    vp: 0,
+                    vtl: 1,
+                    cross_check: false,
+                    symbols: false,
+                    symbol_path: None,
+                })),
+                Some(TargetOrigin::Kernel),
+            ),
+            (live_control_open(), Some(TargetOrigin::Kernel)),
             // And something that opens nothing, so the wildcard arm means what it says.
             (
                 EngineOp::SymbolPath {
@@ -13104,6 +13380,18 @@ mod tests {
             EngineOp::Launch {
                 command_line: "c".into(),
             },
+            EngineOp::OpenSecureKernel(Box::new(crate::sksession::Request {
+                capture: crate::savedstate::CaptureSpec::Vmrs("c".into()),
+                image: "s".into(),
+                kit: None,
+                kit_version: None,
+                vp: 0,
+                vtl: 1,
+                cross_check: false,
+                symbols: false,
+                symbol_path: None,
+            })),
+            live_control_open(),
         ] {
             assert!(
                 op.target_origin().is_some(),
@@ -14634,6 +14922,26 @@ mod tests {
                 name: Some("SkLoadedModuleList".into()),
                 address: None,
             },
+            live_control_open(),
+            EngineOp::SkLiveArm {
+                instruction: crate::sklive::InstructionGuard {
+                    address: crate::skcontrol::HexU64(0xfffff80000001000),
+                    bytes: vec![0x90],
+                },
+            },
+            EngineOp::SkLiveRegisters,
+            EngineOp::SkLiveRead {
+                address: 0xfffff80000001000,
+                size: 16,
+            },
+            EngineOp::SkLiveStep {
+                epoch: crate::skcontrol::StopEpoch::new("0123456789abcdef")
+                    .expect("the fixture epoch is valid"),
+            },
+            EngineOp::SkLiveContinue {
+                epoch: crate::skcontrol::StopEpoch::new("fedcba9876543210")
+                    .expect("the fixture epoch is valid"),
+            },
         ] {
             assert_eq!(
                 sealed_as(&op),
@@ -14642,6 +14950,11 @@ mod tests {
                  {op:?}"
             );
         }
+        assert_eq!(
+            sealed_as(&EngineOp::SkLiveWait),
+            None,
+            "the one live operation that waits inside DbgEng must remain interruptible"
+        );
         assert_eq!(
             sealed_as(&EngineOp::Batch(BatchOp {
                 steps: Vec::new(),
