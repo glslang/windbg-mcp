@@ -23,9 +23,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ([binja-windbg-mcp#14](https://github.com/glslang/binja-windbg-mcp/issues/14)) -- so each shape is
   pinned by its own test. Measured end to end against the debugger guest's own `rdyboost.sys`
   (`10.0.26100.1`, SHA-256 `D872CFF7…`, opened as an image target, dispatch `rdyboost+0xf6a0`,
-  server `0.20.0+g3b8d6fee-dirty`, 2026-10-02): **17 codes with two `untracked` sites before, 21
-  with none after**, the four gained being exactly `0x0056c008`, `0x00070000`, `0x000700a0` and
-  `0x00224194`, with nothing lost. That is **not** the build the item was filed against -- its
+  2026-10-03): **17 codes with two `untracked` sites before, 21 with none after**, the four gained
+  being exactly `0x0056c008`, `0x00070000`, `0x000700a0` and `0x00224194`, with nothing lost. Both
+  readings are from **named, clean** builds one change apart -- `0.21.0+gdaa11a3d` against
+  `0.21.0+gc02152aa` -- which is a re-take: the first pair was measured across `0.20.0+g3b8d6fee`
+  and a `-dirty` tree, and by the time this merged, `main` had moved seventeen commits and item 108
+  had touched `ioctl_map`'s own `render`. The baseline is unchanged across that, so the four codes
+  are this change's and not the release's. That is **not** the build the item was filed against -- its
   chains are at `rdyboost+0xef00` and `+0xf00c`, this build's at `+0xf708` and `+0xf800` -- and on
   this one the link whose register the live-target reading could not resolve *is* readable, so the
   fold recovered four codes where the item named three. **A kept reading is good for an equality and
