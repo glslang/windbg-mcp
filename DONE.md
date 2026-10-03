@@ -4307,8 +4307,18 @@ and marks nothing, because the guard tests a value that is not the control code 
 for a test on the code this walk could not attribute. Marking the `ccmp` form would make the map's
 completeness depend on the compiler's instruction selection rather than on the driver, and would
 make an `untracked` entry of every input-dependent guard in every driver that happens to be folded.
-`a_guard_on_something_else_is_not_a_loss_however_it_is_written` is that control, and the pair is
-where this stopped: a third pass over one line, with the answer unmoved for five rounds, is the
+`a_guard_on_something_else_is_not_a_loss_however_it_is_written` is that control.
+
+**And then a seventh finding on a different line, which was real: a join unions the readings.**
+`Facts::join` unions `pending` deliberately -- a comparison is a claim about the path that made it
+-- so a non-empty set at a conditional compare proves that **one** incoming path compared the
+control code and proves nothing about the rest. With `cmp code,A` on one edge and `cmp w2,#0` on
+another, a `ZF`-forcing link admits every code on the second. So the fold asks for flags **this
+block wrote**, which is the conservative reading of the single-path rule it already had, and the
+fixture was written to fail first and then fixed. What it costs is a chain whose first link is in
+another block: it answers with its site instead of its codes, which is what every other cross-block
+chain shape answers here, and `rdyboost`'s own chains are contiguous -- re-measured after the change
+at 21 codes with nothing `untracked`. The pair of declines above is a third pass over one line, with the answer unmoved for five rounds, is the
 reading the review-round skill says to record rather than escalate. **Two** of the five were against a previous round's own fix, which
 is what the class fixes cost: each closed its class and the next round read what the closure could
 not express. The rule going on is that a defect in what is here is worth fixing and a request for new
