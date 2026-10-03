@@ -151,6 +151,7 @@ engine — it adds a target and leaves the current one alone. The entry records 
 - [Item 102](#102-windbg-mcp-a-debug_batch-runs-its-rollback-against-whatever-target-it-ends-up-holding--done-2026-09-26) — [windbg-mcp] A `debug_batch` runs its rollback against whatever target it ends up holding — done (2026-09-26)
 - [Item 103](#103-windbg-mcp-h5b--expose-the-secure-kernel-reads-without-forcing-them-through-dbgeng--done-2026-10-02) — [windbg-mcp] H5b — expose the Secure Kernel reads, without forcing them through DbgEng — done (2026-10-02)
 - [Item 107](#107-windbg-mcp-a-misspelt-tool-argument-is-silently-ignored-and-the-call-answers-status-ok--done-2026-10-02) — [windbg-mcp] A misspelt tool argument is silently ignored, and the call answers `status: ok` — done (2026-10-02)
+- [Item 92](#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read--done-2026-10-02) — [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read — done (2026-10-02)
 
 ## 1. [dbgscope] Managed breakpoint lifecycle for `run_to_address` — **done upstream**
 
@@ -4118,8 +4119,8 @@ chain**: `rdyboost+0xef10` is `cmp w8,w11` / `ccmpne w8,w12,#4` / `ccmpne w8,w10
 / `bne` with `w10 = 0x00224194`. **Neither implementation reads one**, and they fail differently:
 the companion publishes the chain's *first* operand as a case -- including a meaningless
 `0x00000000` -- and misses the `ccmp` operands, while this walk publishes neither and records the
-site. So `ioctl_map` is missing at least `0x000700a0` and `0x00224194` on this driver, which is
-[item 92](./FOLLOWUPS.md#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read).
+site. So `ioctl_map` **was** missing at least `0x000700a0` and `0x00224194` on this driver, which
+is [item 92](#92-windbg-mcp-an-a64-conditional-compare-chain-is-a-compare-chain-the-walk-does-not-read--done-2026-10-02), closed 2026-10-02.
 The companion's half is a finding for its own repository and is not filed here.
 
 **What the entry expected and did not get.** It expected the Ghidra lane to grow an ARM64 mode and
@@ -4137,6 +4138,111 @@ so the sizes question is untouched by the second opinion and remains item 91's.
 above. The captures themselves are **not** checked in: each is a reading of the build the debuggee
 is running at the time, and a stale one would be the exact failure this lane's identity gate
 exists to catch.
+
+## 92. [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read — **done** (2026-10-02)
+
+**Repo:** `windbg-mcp`. Filed 2026-09-20 from item 85's ARM64 diff lane; closed by folding the chain
+onto the branch that reads it.
+
+A64 has `ccmp`, so a compiler writes `if (code == A || code == B || code == C)` as **one** branch
+fed by several compares. `ioctl_map` read the instruction before the branch and filed the rest in
+`untracked`, so every other code in such a chain was lost. Measured on `rdyboost` on the live ARM64
+target, 2026-09-20, against `windbg-mcp 0.18.0+g30c4af94`:
+
+```
+rdyboost+0xef00  mov    w11,#0xC008 / movk w11,#0x56,lsl #0x10   ; w11 = 0x0056c008
+rdyboost+0xef08  mov    w10,#0xA0   / movk w10,#7,lsl #0x10      ; w10 = 0x000700a0
+rdyboost+0xef10  cmp    w8,w11
+rdyboost+0xef14  ccmpne w8,w12,#4
+rdyboost+0xef18  ccmpne w8,w10,#4
+rdyboost+0xef1c  beq    rdyboost+0xef7c
+```
+
+Three codes, one handler, and the map named none of them: `untracked` carried `0xef18`. The second
+chain was the same shape with the opposite meaning -- `rdyboost+0xf00c` is `cmp w8,#0` /
+`ccmpne w8,w10,#0` / `bne`, with `w10 = 0x00224194`.
+
+### What landed
+
+`ioctl::chained_compare` and `absorb` (`src/ioctl.rs`). **A flag write replaces the set of live
+compares; a conditional compare continues it**, and the `nzcv` immediate the encoding carries is
+what decides whether it does:
+
+- `ccmpne …,#4` forces `ZF` **set** where the link before it matched, so a match at *any* link
+  reaches the `b.eq` and every readable link is a case at its own site. That is the first chain:
+  the walk's existing "a case per site" rule is what publishes two of its three codes, and the
+  third -- `w12`, whose value the target's registers never showed -- comes back as a reading with
+  no code, which the terminator already files in `untracked`.
+- `ccmpne …,#0` forces it **clear**, so an earlier match takes the `b.ne` *away* from the case and
+  only this compare's own operand can be one. That is the second chain, and reading the first shape
+  onto it publishes the arm the routine **rejects**: `0x00000000`, which is exactly what the Binary
+  Ninja companion's map carries ([binja-windbg-mcp#14](https://github.com/glslang/binja-windbg-mcp/issues/14)).
+
+**Measured end to end through the tool surface**, against the debugger guest's own
+`rdyboost.sys` -- `10.0.26100.1`, SHA-256 `D872CFF761A83D3D508076FA76F90027EDA1C3360CD6BF3DBE3FE5637C87F4AA`,
+opened as an image target, dispatch `rdyboost+0xf6a0`, server `windbg-mcp 0.20.0+g3b8d6fee-dirty`,
+2026-10-02:
+
+| | codes | `untracked` |
+|---|---|---|
+| before (`3b8d6fe`) | 17 | `rdyboost+0xf800`, `rdyboost+0xf708` |
+| after | **21** | none |
+
+The four gained are exactly `0x0056c008`, `0x00070000`, `0x000700a0` and `0x00224194`, and nothing
+was lost. **That is not the build this item was filed against** -- its chains are at
+`rdyboost+0xef00` and `+0xf00c`, this build's are at `+0xf708` and `+0xf800`, and the file hashes
+differ -- which is the same trap item 85 found in the published `mountmgr` agreement, so it is
+stated rather than glossed. On *this* build the link the live-target reading could not resolve is
+readable, so the fold recovered **four** codes where the entry named three.
+
+### What the entry got wrong, and what it did not see
+
+**The remedy it proposed was a fold into the condition** -- *"reading a chain means folding several
+comparisons into one branch's condition"*. That is not what it needed. The walk already carries a
+**set** of live compares and already makes a case per site, so what the chain wanted was for that
+set to *survive* a flag write; the `nzcv` bit decides survival, and nothing about `Condition`
+changed.
+
+**And a kept reading is good for an equality and nothing else**, which the entry did not reach at
+all. The forced flags are not the flags that compare would have left: `#4` is `ZF` alone, which on
+A64 leaves `C` **clear** -- borrow -- so a `b.lo` after the chain is taken where the comparison it
+stands in for would not have been. `equality_survives` answers from an equality's flags, so a
+chained reading carried onto an edge would be read against a state the target never reached, and a
+case built there is a code the routine sent somewhere else. So `Compared::chained` marks them, the
+terminator's equality arms are the only thing that reads them, and they found no table bound and
+cross no edge. A chain read by any other branch -- or split across a block boundary -- reports its
+site in `untracked` instead of its codes: that **costs a real code** on the `b.lo` shape, which is
+the right way round and is pinned as a characterisation rather than implied.
+
+**The first draft of that substitution keyed on the terminator's condition alone**, and a `ccmp`
+carries a condition of its own -- so a block *ending* in one looked like a block whose branch had
+just read an equality, and the chain left the answer with no case and no site. The block-boundary
+test caught it before review did; the guard asks the flow as well now.
+
+`ccmn`, and a `ccmp` conditioned on `eq`, are deliberately not read. The first compares against a
+negation no control code is written as; the second chains a *conjunction*, where two distinct codes
+cannot both hold and the earlier reading is a rejection whichever way the branch goes. Both keep
+what the module did before -- the flag write loses the compare, `note_loss` records the site -- and
+the propagation still applies, so a chain whose middle link is a `ccmn` leaves the links around it
+readable.
+
+### What is still open
+
+The companion's half ([binja-windbg-mcp#14](https://github.com/glslang/binja-windbg-mcp/issues/14)),
+which is a finding for its own repository. It publishes the chain's first operand and misses the
+`ccmp` operands, so item 85's lane now disagrees about `rdyboost` **in the other direction** --
+and the lane has **not** been re-run against this fix, which would need a fresh companion capture
+of the build the debuggee is running (`tools/binja_oracle/README.md`).
+
+### Where it was
+
+`ioctl::compare` and the `Condition` it derives (`src/ioctl.rs`). Five tests, each
+mutation-verified against the rule it is for:
+`an_arm64_conditional_compare_chain_recovers_the_codes_it_accepts`,
+`a_conditional_compare_that_forces_no_equality_publishes_only_its_own_code`,
+`a_chained_reading_founds_no_table_bound`,
+`a_chained_reading_is_not_split_across_a_branch_that_reads_the_flags` and
+`a_conditional_compare_chain_does_not_cross_a_block_boundary`.
 
 ## 93. [windbg-mcp + dbgscope] Multiprocessor hypervisor stops after a temporary breakpoint and detach — **done** (2026-09-21)
 

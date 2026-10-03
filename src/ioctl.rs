@@ -1467,7 +1467,15 @@ fn simulate(
         if position == terminator {
             break;
         }
-        let next = update(&mut facts, instruction, layout, &mut traced, &mut just_lost);
+        let mut chains = false;
+        let next = update(
+            &mut facts,
+            instruction,
+            layout,
+            &mut traced,
+            &mut just_lost,
+            &mut chains,
+        );
         // **A compare survives anything that does not write the flags.** A compiler puts the
         // setup for the case block between the compare and its branch -- `cmp r13d,N` /
         // `mov rbx,rcx` / `je handler` -- and dropping the pending compare there loses the case
@@ -1483,10 +1491,7 @@ fn simulate(
             compared.clear();
             lost = None;
         } else if instruction.writes_flags {
-            // A flag write replaces the whole set with the one comparison it leaves: every live
-            // compare was about the flags this just overwrote.
-            compared = next.into_iter().collect();
-            lost = just_lost.take();
+            absorb(&mut compared, &mut lost, next, &mut just_lost, chains);
         }
     }
 
@@ -1500,9 +1505,11 @@ fn simulate(
                 // case the list would otherwise be short of with nothing saying so. Committed here
                 // rather than where the value was lost, because an instruction nothing branches on
                 // costs the answer nothing.
-                // `compared` is deliberately not consulted: a flag-writing instruction
-                // either leaves a compare or loses the code, never both, so `lost` being set
-                // already means there is no compare here. Asserting it as well was dead.
+                // `compared` is deliberately not consulted, and since a chain can be read it
+                // is no longer true that the two are exclusive: `cmp` / `ccmpne` with an
+                // unreadable operand / `beq` leaves a case for the first link **and** a loss for
+                // the second, and both are wanted -- the code that reaches the handler, and the
+                // site that says the list is a lower bound ([`chained_compare`]).
                 if let Some(at) = lost
                     && matches!(last.condition, Some(Condition::Equal | Condition::NotEqual))
                 {
@@ -1598,13 +1605,20 @@ fn simulate(
                 // from earlier in the block outlived a call that had overwritten the flags it was
                 // about. The first two are short case lists with nothing saying so; the third is
                 // an `untracked` entry for a branch reading a callee's flags.
-                let next = update(&mut facts, last, layout, &mut traced, &mut just_lost);
+                let mut chains = false;
+                let next = update(
+                    &mut facts,
+                    last,
+                    layout,
+                    &mut traced,
+                    &mut just_lost,
+                    &mut chains,
+                );
                 if matches!(last.flow, Flow::Call(_)) {
                     compared.clear();
                     lost = None;
                 } else if last.writes_flags {
-                    compared = next.into_iter().collect();
-                    lost = just_lost.take();
+                    absorb(&mut compared, &mut lost, next, &mut just_lost, chains);
                 }
             }
         }
@@ -1634,9 +1648,13 @@ fn simulate(
             // that comparison's own fact: one reached by a `sub` and one by an `add` answer `jae`
             // differently, and a set decided by whichever arrived first would be right about one
             // of them by luck.
+            // **A chained reading leaves the block it was read in**, which is the other half of
+            // [`Compared::chained`]: what the flags hold on a match is the `nzcv` the chain forced
+            // and not that compare's own, so `equality_survives` would answer for a state the
+            // target never reached. The terminator has already recorded the cases they make.
             let mut taken = Vec::new();
             let mut fallen = Vec::new();
-            for was in &compared {
+            for was in compared.iter().filter(|was| !was.chained) {
                 let (on_taken, on_fallen) = equality_survives(condition, was.equality);
                 if on_taken {
                     taken.push(was.clone());
@@ -1652,8 +1670,37 @@ fn simulate(
         // condition is what lets one edge know the equality is false; a fall-through, a call or an
         // unconditional jump asks nothing and so takes nothing away. Answering `(None, None)` here
         // dropped the compare at every block boundary a compiler's label happened to fall on.
-        _ => (compared.clone(), compared.clone()),
+        _ => {
+            let live: Vec<Compared> = compared
+                .iter()
+                .filter(|was| !was.chained)
+                .cloned()
+                .collect();
+            (live.clone(), live)
+        }
     };
+    // **A chain no equality here reads is a test on the code this answer cannot name.** Its
+    // readings are withheld from the edges above, so the site goes onward as a **loss** instead --
+    // committed by the branch that reads those flags, exactly as an unmodelled flag write's is.
+    // Without this a chain ending a block would leave the answer altogether, where before this
+    // module could read one it was at least an `untracked` entry. The last of them is the site, so
+    // the answer is the one an unreadable conditional compare already gave.
+    //
+    // **Asked of the terminator's flow as well as its condition**, which a first draft of this did
+    // not and the block-boundary test caught: a conditional compare carries a condition of its own,
+    // so a block *ending* in one looked like a block whose branch had just read an equality, and
+    // the chain left no trace at all.
+    if let Some(dropped) = compared.iter().rev().find(|was| was.chained)
+        && !matches!(
+            last.map(|last| (last.flow, last.condition)),
+            Some((
+                Flow::Branch(_),
+                Some(Condition::Equal | Condition::NotEqual)
+            ))
+        )
+    {
+        lost = lost.or(Some(dropped.at));
+    }
     // **The compare that makes a bounds check, asked of each in turn.** A bound is a claim
     // about one register, so the compare that supplies it is the one whose index that register
     // still holds -- not whichever of them the join happened to put first.
@@ -1667,7 +1714,11 @@ fn simulate(
                 Condition::UnsignedAbove | Condition::UnsignedAboveOrEqual
             ) =>
         {
-            compared.iter().find_map(|was| {
+            // **And a chained reading founds no bound**, for the reason it carries onto no edge:
+            // a bound is a claim about the value from here on, and a conditional compare's flags
+            // are the chain's forced state wherever an earlier link matched. A table sized from one
+            // is read to a limit the admitted path never checked.
+            compared.iter().filter(|was| !was.chained).find_map(|was| {
                 let (register, offset, shift) = was.index.clone()?;
                 let limit = was.bound?;
                 // **A bound is about the register's value from here on, so the register has to
@@ -2034,6 +2085,18 @@ struct Compared {
     index: Option<(String, i64, u32)>,
     /// The bound, when the compare was against an immediate.
     bound: Option<u64>,
+    /// Whether this reading reached the branch through a **conditional** compare, which confines
+    /// it to an equality.
+    ///
+    /// A64's `ccmp` leaves either its own comparison or the literal `nzcv` the encoding carries, so
+    /// a chain's earlier links are live at the branch in the *forced* state only -- `ccmpne …,#4`
+    /// forces `ZF`, and a match at any link is what the `b.eq` after it reads
+    /// ([`chained_compare`]). That is a statement about **equality** and nothing else: the forced
+    /// flags are not the flags that compare would have left, so a `b.lo` reading them answers the
+    /// opposite of what [`Equality`] says, and a bounds check founded on one would size a table
+    /// from a comparison the admitted path never made. So the terminator's equality arms read these
+    /// and the bound and the outgoing edges do not.
+    chained: bool,
     /// Where the compare is.
     at: u64,
 }
@@ -2063,6 +2126,7 @@ fn update(
     layout: Layout,
     traced: &mut bool,
     lost: &mut Option<u64>,
+    chains: &mut bool,
 ) -> Option<Compared> {
     // **Which registers carry the control code as this begins**, snapshotted because the loss
     // check cannot be asked afterwards from one operand. An instruction writes registers it does
@@ -2082,6 +2146,22 @@ fn update(
     // A compare writes no register and is the only thing a branch reads.
     if instruction.effect == Effect::Compare {
         return compare(facts, instruction, layout, traced);
+    }
+    // **A conditional compare continues the chain the compare before it began** rather than being
+    // the whole of what the branch reads. [`chained_compare`] answers with this instruction's own
+    // reading, where it has one, and whether the earlier links are still live -- which is the
+    // caller's to apply, it being the one that holds them.
+    if let Some((was, keeps_earlier)) = chained_compare(facts, instruction, layout, traced) {
+        *chains = keeps_earlier;
+        // A link this could not read at all is a test on the code that cannot be named, exactly as
+        // an unmodelled flag write is, and it is recorded for the same reason: what makes it matter
+        // is the branch that reads these flags. A link read with an operand this could not resolve
+        // needs nothing here -- it comes back as a reading with no code, and the terminator files
+        // the site itself.
+        if was.is_none() {
+            note_loss(facts, &carried_the_code, instruction, lost, layout, traced);
+        }
+        return was;
     }
     // A call returns over the volatile registers, so a belief about one does not survive it --
     // including a bound whose index is one of them, and including a **status** sitting in the
@@ -2276,6 +2356,7 @@ fn update(
                     proved,
                     index: Some((destination, offset, shift)),
                     bound: Some(0),
+                    chained: false,
                     at: instruction.address,
                 });
             }
@@ -2316,6 +2397,7 @@ fn update(
                     proved,
                     index: Some((destination, offset, shift)),
                     bound: Some(0),
+                    chained: false,
                     at: instruction.address,
                 });
             }
@@ -2586,6 +2668,103 @@ fn folded_compare(
     Some((compare(facts, &probe, layout, traced)?, condition))
 }
 
+/// A64's **conditional** compare, folded onto the compares before it.
+///
+/// `ccmp` compares when the condition it carries holds and writes the literal `nzcv` when it does
+/// not, which is how a compiler writes `code == A || code == B || code == C`: one branch fed by
+/// several compares, each link handing the next the question only if it did not answer it itself.
+/// Measured on `rdyboost!SmdDispatchDeviceControl` (ARM64 26100, `FOLLOWUPS.md` item 92), whose two
+/// chains are the two shapes and mean opposite things:
+///
+/// ```text
+/// cmp    w8,w11        ; w11 = 0x0056c008
+/// ccmpne w8,w12,#4     ; ZF forced *set* where the compare before it matched
+/// ccmpne w8,w10,#4     ; w10 = 0x000700a0
+/// beq    handler       ; taken by a match at any link -- three accepted codes
+///
+/// cmp    w8,#0
+/// ccmpne w8,w10,#0     ; ZF forced *clear* where the compare before it matched
+/// bne    rejected      ; so `w8 == 0` leaves the case, and only `w10` reaches it
+/// ```
+///
+/// **The `nzcv` immediate decides which**, and reading the first of those onto both is the error
+/// this was written against: it publishes `0x00000000` -- the arm the routine *rejects* -- as a code
+/// the driver accepts. `ZF` set (`#4`) means a match at an earlier link reaches the `b.eq`, so those
+/// readings stay live; `ZF` clear (`#0`) means it reaches the `b.ne` instead, so they are rejections
+/// and only this compare's own operand can be a case.
+///
+/// **Only the `ne` condition is read**, because it is the one that spells a disjunction over a
+/// single register. `eq` chains a *conjunction*, where two distinct codes cannot both hold and the
+/// earlier reading is a rejection whichever way the branch goes; anything else keeps what this
+/// module did before, which is that the flag write loses the compare and [`note_loss`] records the
+/// site so the map reads as a lower bound.
+///
+/// `ccmn` compares against the **negation** of its operand, which no control code is written as, so
+/// its own reading is withheld and only the propagation kept: a chain whose middle link this cannot
+/// read still leaves the links around it readable, with the unreadable one in [`Map::untracked`].
+fn chained_compare(
+    facts: &Facts,
+    instruction: &Instruction,
+    layout: Layout,
+    traced: &mut bool,
+) -> Option<(Option<Compared>, bool)> {
+    if !matches!(instruction.mnemonic.as_str(), "ccmp" | "ccmn") {
+        return None;
+    }
+    if instruction.condition != Some(Condition::NotEqual) {
+        return None;
+    }
+    // `NZCV` as the encoding holds it, which is where the shape is: `N` is bit 3 and `ZF` bit 2.
+    let forced = immediate_of(instruction.operands.get(2)?)?;
+    let keeps_earlier = forced & 0b0100 != 0;
+    // Asked of [`compare`] through a probe rather than rebuilt, so the width guard, the shifted-
+    // index rule and the `Value::Code` arithmetic are the ones every other compare gets.
+    let own = match instruction.mnemonic.as_str() {
+        "ccmp" => {
+            let mut probe = instruction.clone();
+            probe.operands = vec![
+                instruction.operands.first()?.clone(),
+                instruction.operands.get(1)?.clone(),
+            ];
+            probe.effect = Effect::Compare;
+            compare(facts, &probe, layout, traced).map(|was| Compared {
+                chained: true,
+                ..was
+            })
+        }
+        _ => None,
+    };
+    Some((own, keeps_earlier))
+}
+
+/// What a flag write leaves live, which is all of it or only its own.
+///
+/// **A flag write replaces the whole set with the one comparison it leaves**, every live compare
+/// having been about the flags it just overwrote. A64's conditional compare is the exception and the
+/// only one: it writes its own comparison *or* leaves the state the chain before it forced, so the
+/// earlier readings are still what the branch after it reads ([`chained_compare`]). They are kept
+/// as equality-only readings, which [`Compared::chained`] is what marks, and the loss an unreadable
+/// link recorded is kept **beside** them -- a chain can leave both a case and an `untracked`, where
+/// an ordinary flag write leaves one or the other.
+fn absorb(
+    compared: &mut Vec<Compared>,
+    lost: &mut Option<u64>,
+    next: Option<Compared>,
+    just_lost: &mut Option<u64>,
+    chains: bool,
+) {
+    if !chains {
+        *compared = next.into_iter().collect();
+        *lost = just_lost.take();
+        return;
+    }
+    for was in compared.iter_mut() {
+        was.chained = true;
+    }
+    compared.extend(next);
+    *lost = (*lost).or(just_lost.take());
+}
+
 /// Whether a branch this walk could not read is branching **on the control code**.
 ///
 /// The question a silent short list needs asked: `tbz w9,#3,handler` where `w9` holds the code is
@@ -2631,6 +2810,7 @@ fn compare(
                 proved,
                 index: None,
                 bound,
+                chained: false,
                 at: instruction.address,
             });
         }
@@ -2666,6 +2846,7 @@ fn compare(
             proved: *proved,
             index: Some((register.clone(), *offset, *shift)),
             bound,
+            chained: false,
             at: instruction.address,
         }),
         _ => None,
@@ -2920,7 +3101,14 @@ fn follow_table(
         for instruction in instructions.iter().take(position) {
             // A replay to recover a table's base, not a walk that reports: what it loses about the
             // control code is recorded by the pass that walks these same instructions.
-            update(&mut replay, instruction, layout, &mut traced, &mut None);
+            update(
+                &mut replay,
+                instruction,
+                layout,
+                &mut traced,
+                &mut None,
+                &mut false,
+            );
         }
         replay
     };
@@ -3219,7 +3407,14 @@ fn error_status(
     let mut facts = arrived.clone();
     let mut traced = false;
     for instruction in instructions {
-        update(&mut facts, instruction, layout, &mut traced, &mut None);
+        update(
+            &mut facts,
+            instruction,
+            layout,
+            &mut traced,
+            &mut None,
+            &mut false,
+        );
         // **A tail jump out of the routine hands the request on exactly as a call does**, and what
         // the routine returns is then the callee's. A dispatcher that loads a default error before
         // its compare chain and reaches a case through `jmp handler` accepts that code, and
@@ -3464,7 +3659,14 @@ fn failure_block(
         // What the block has established **so far**, which is what says whether the call it is
         // about to make is a completion on the way out or a block doing something else. Kept by
         // `update` with everything else, so what arrived on the edge is already in it.
-        update(&mut facts, instruction, layout, &mut traced, &mut None);
+        update(
+            &mut facts,
+            instruction,
+            layout,
+            &mut traced,
+            &mut None,
+            &mut false,
+        );
         let status = facts.status;
         match instruction.flow {
             Flow::Return => {
@@ -3669,7 +3871,14 @@ fn sizes_in(
         // Everything else updates the facts, which is what retires a base the block overwrites.
         // The pending compare survives anything that writes no flags, for the reason the block
         // walk's does -- and not a call, for the reason it does not there either.
-        update(&mut facts, instruction, layout, &mut traced, &mut None);
+        update(
+            &mut facts,
+            instruction,
+            layout,
+            &mut traced,
+            &mut None,
+            &mut false,
+        );
         if instruction.writes_flags || matches!(instruction.flow, Flow::Call(_)) {
             pending = None;
         }
@@ -3991,7 +4200,10 @@ mod tests {
             // `b.hi` is A64's `ja`, and it is the branch a switch's bounds check leaves on.
             "ja" | "jnbe" | "b.hi" => Some(Condition::UnsignedAbove),
             "jae" | "jnb" | "jnc" => Some(Condition::UnsignedAboveOrEqual),
-            "jb" | "jnae" | "jc" => Some(Condition::UnsignedBelow),
+            // `b.lo` is A64's `jb`: the branch a chain's *forced* flags answer differently
+            // from the comparison they stand in for, which is what
+            // `a_chained_reading_is_not_split_across_a_branch_that_reads_the_flags` is about.
+            "jb" | "jnae" | "jc" | "b.lo" => Some(Condition::UnsignedBelow),
             "jbe" | "jna" => Some(Condition::UnsignedBelowOrEqual),
             "jg" | "jnle" => Some(Condition::SignedGreater),
             "jge" | "jnl" => Some(Condition::SignedGreaterOrEqual),
@@ -4023,6 +4235,13 @@ mod tests {
             // would clear the very fact the branch is about, so the test would pass for having
             // nothing left to find rather than for the rule under test.
             ("cbz" | "cbnz" | "tbz" | "tbnz", _) => Vec::new(),
+            // **A64's conditional compare reads both its operands and writes only the flags**,
+            // which is the other shape a first-operand rule gets backwards: a fixture saying
+            // `ccmp w9,w10,#4` writes `w9` clears the control code the chain is about, and the
+            // test would then pass for having nothing left to find. dbgscope decodes both as
+            // reads (`conditional_compare` in its `arm64/operand.rs`, whose own test pins
+            // `fa4a1284` as reading `x20` and `x10` and writing neither).
+            ("ccmp" | "ccmn", _) => Vec::new(),
             // **A64's indirect branch writes nothing**, the register being where it reads its
             // destination from. The first-operand rule below would say `br x8` writes `x8`.
             ("br" | "blr", _) => Vec::new(),
@@ -4108,7 +4327,12 @@ mod tests {
             // says (`rflags_written()`, which for `mul` is the carry and the overflow). A test
             // putting one between a compare and its branch would then be pinning a rule the real
             // answer does not reach.
-            writes_flags: matches!(mnemonic, "mul" | "div")
+            //
+            // **And a conditional compare is filed under `Other` too**, for the reason dbgscope
+            // files it there: what it leaves in the flags is its own comparison *or* the literal
+            // `nzcv` it carries. It writes them either way, and a fixture that said otherwise
+            // would leave the compare before it live and test nothing this walk does.
+            writes_flags: matches!(mnemonic, "mul" | "div" | "ccmp" | "ccmn")
                 || matches!(
                     effect,
                     Effect::Compare
@@ -4122,6 +4346,32 @@ mod tests {
                         | Effect::BitXor
                 ),
         }
+    }
+
+    /// A64's conditional compare, as the decoder answers one: the bare mnemonic, the condition
+    /// the **encoding** carries, and the `nzcv` immediate it falls back on.
+    ///
+    /// Stated here rather than derived from the mnemonic, because the decoder does not spell it
+    /// there -- dbgscope's own test pins `fa4a1284` as mnemonic `ccmp` with
+    /// `condition: Some(NotEqual)` and `#4` as operand two, which is what the engine renders
+    /// `ccmpne x20,x10,#4`. A fixture spelling `ccmpne` in the mnemonic would be exercising a
+    /// shape no target produces, and the walk matches on `ccmp`.
+    fn conditional(
+        address: u64,
+        mnemonic: &str,
+        left: &str,
+        right: Operand,
+        nzcv: u64,
+        condition: Condition,
+    ) -> Instruction {
+        let mut instruction = insn(
+            address,
+            mnemonic,
+            vec![reg(left), right, imm(nzcv)],
+            Flow::Fallthrough,
+        );
+        instruction.condition = Some(condition);
+        instruction
     }
 
     /// A register as the decoder names it: the printed spelling, and the full-width register it is
@@ -4488,6 +4738,536 @@ mod tests {
             vec![(0x6d_0008, 0x900, Recovery::Compare)],
             "{:?}",
             found.cases
+        );
+    }
+
+    /// **A64 writes `code == A || code == B || code == C` as one branch fed by several
+    /// compares**, and what the branch reads is the whole chain rather than the compare nearest
+    /// it.
+    ///
+    /// `rdyboost!SmdDispatchDeviceControl` on a live ARM64 26100 target is where that was measured
+    /// -- `FOLLOWUPS.md` item 92, against `windbg-mcp 0.18.0+g30c4af94`, where the map reported
+    /// `untracked` at the last `ccmp` and named none of the three codes the chain accepts. This is
+    /// that routine's first chain, at `rdyboost+0xef00`, including its **middle link's register
+    /// left unset** because the target's was never read: a chain this can read around an
+    /// unreadable link answers for the links it read and files the one it did not, which is the
+    /// difference between a lower bound and a short answer.
+    #[test]
+    fn an_arm64_conditional_compare_chain_recovers_the_codes_it_accepts() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            // `w11 = 0x0056c008`, `w10 = 0x000700a0` -- the two the target's registers held.
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            // `w12` is never written here, as the target's never was: the link is read, its
+            // operand is not, and the site is what the answer carries instead of a code.
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w9",
+                reg("w12"),
+                4,
+                Condition::NotEqual,
+            ),
+            conditional(
+                DISPATCH + 0x20,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.site))
+                .collect::<Vec<_>>(),
+            vec![
+                (0x56_c008, 0x900, DISPATCH + 0x18),
+                (0x7_00a0, 0x900, DISPATCH + 0x20),
+            ],
+            "every link read is a case at its own site: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x1c],
+            "the link whose operand was not read is the one site in the answer"
+        );
+    }
+
+    /// **The `nzcv` immediate decides what the links before a conditional compare mean**, and
+    /// reading one shape onto the other publishes a code the driver rejects.
+    ///
+    /// `rdyboost`'s second chain (`rdyboost+0xf00c`, same build as above) is `cmp w8,#0` /
+    /// `ccmpne w8,w10,#0` / `bne`. The `#0` leaves `ZF` **clear** where the compare before it
+    /// matched, so `w8 == 0` takes the `bne` *away* from the case and only `w10`'s value reaches
+    /// it. The Binary Ninja companion reads this chain the other way round and publishes
+    /// `0x00000000` as an accepted code
+    /// ([binja-windbg-mcp#14](https://github.com/glslang/binja-windbg-mcp/issues/14)), which is
+    /// the failure this fixture exists to hold a fix to: the arm the routine refuses must not
+    /// arrive as a code it serves.
+    #[test]
+    fn a_conditional_compare_that_forces_no_equality_publishes_only_its_own_code() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            // `w10 = 0x00224194`, which the target built two instructions before the chain.
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w9"), imm(0)],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                0,
+                Condition::NotEqual,
+            ),
+            // The branch is the rejection, so the case is the instruction after the block.
+            insn(
+                DISPATCH + 0x18,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "mov",
+                vec![reg("w0"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x20, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands, case.site))
+                .collect::<Vec<_>>(),
+            vec![(0x22_4194, DISPATCH + 0x1c, DISPATCH + 0x14)],
+            "the rejected arm is not a case and the accepted one is: {:?}",
+            found.cases
+        );
+        assert!(
+            found.untracked.is_empty(),
+            "both links were read: {:?}",
+            found.untracked
+        );
+    }
+
+    /// **A chained reading founds no table bound**, which is the other half of confining one to an
+    /// equality.
+    ///
+    /// A conditional compare's flags are the chain's forced state wherever an earlier link
+    /// matched, so a bound taken from one describes a comparison the admitted path never made --
+    /// and a table sized from it is read to a limit nothing checked, which is how a switch becomes
+    /// a list of plausible addresses. The fixture is
+    /// [`an_a64_switch_scales_its_entries_by_the_shift_the_fold_carries`]'s own table with one
+    /// `ccmp` inserted after its bounds check: nothing is read, the jump is reported as
+    /// unresolved, and the one thing the answer carries is the site.
+    #[test]
+    fn a_chained_reading_founds_no_table_bound() {
+        const TABLE: u64 = IMAGE_BASE + 0x9000;
+        const ENTRIES: u64 = IMAGE_BASE + 0x4000;
+        const DEFAULT: u64 = ENTRIES + 0x400;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "sub",
+                vec![reg("w10"), reg("w9"), imm(0x6dc000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "cmp",
+                vec![reg("w10"), imm(3)],
+                Flow::Fallthrough,
+            ),
+            // The link that makes the bound above conditional, and so unusable.
+            conditional(
+                DISPATCH + 0x10,
+                "ccmp",
+                "w10",
+                imm(8),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "b.hi",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "adr",
+                vec![reg("x9"), adr_to(TABLE)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "ldrsw",
+                vec![reg("x8"), table_load("x9", "w10", 4)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "adr",
+                vec![reg("x9"), adr_to(ENTRIES)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "add",
+                vec![reg("x8"), reg("x9"), reg("x8"), lsl(2)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x28, "br", vec![reg("x8")], Flow::Jmp(None)),
+        ];
+        let served = std::cell::Cell::new(0usize);
+        let read = |_: u64, len: usize| {
+            served.set(served.get() + 1);
+            Some(vec![0u8; len])
+        };
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            read,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(found.tables.is_empty(), "{:?}", found.tables);
+        assert!(found.cases.is_empty(), "{:?}", found.cases);
+        assert_eq!(found.unresolved, vec![DISPATCH + 0x28]);
+        assert_eq!(
+            served.get(),
+            0,
+            "a conditional compare's limit is not a limit: nothing was read"
+        );
+    }
+
+    /// **A chain does not cross a block boundary**, and the site says so where it stops.
+    ///
+    /// The forced flags a chain's earlier links are live in are not the flags those compares would
+    /// have left, so a reading that left the block would be answered for by `equality_survives`
+    /// against a state the target never reached. They are dropped at the edge instead -- and the
+    /// loss goes on in their place, so the branch in the next block still reports a test on the
+    /// code it could not be given a value for.
+    ///
+    /// This is a **characterisation** of where the fold stops rather than a rule worth keeping: the
+    /// chain here is readable and its codes are real, and recovering them wants the per-edge facts
+    /// `FOLLOWUPS.md` item 87 is about. The `cbz` is what splits the block, over a register that
+    /// never held the code so that it contributes no case of its own.
+    #[test]
+    fn a_conditional_compare_chain_does_not_cross_a_block_boundary() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            // Not the control code, so this branch recognises nothing -- it is here to make the
+            // `b.eq` below the head of a block.
+            insn(
+                DISPATCH + 0x18,
+                "cbz",
+                vec![reg("w2")],
+                Flow::Branch(Some(DISPATCH + 0x24)),
+            ),
+            insn(
+                DISPATCH + 0x1c,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x20,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "the chain's readings stop at the edge: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x20],
+            "and the branch that read those flags says a code went unnamed"
+        );
+    }
+
+    /// **A chained reading is not split across a branch that reads the flags**, because the flags
+    /// it would be read against are not the ones the chain leaves.
+    ///
+    /// `equality_survives` answers from the state an *equality* leaves -- a comparison that
+    /// borrowed nothing and overflowed nothing. A chain's earlier link is live in the state its
+    /// `nzcv` forced instead, and `#4` is `ZF` alone: on A64 that leaves `C` **clear**, which is
+    /// borrow, so `b.lo` is taken where the comparison it stands in for would not have been. Carry
+    /// the reading to the fall-through and the `b.eq` below turns a code the routine sent to
+    /// `DEFAULT` into a case at the handler, which is the one failure this module is arranged
+    /// against above all others.
+    ///
+    /// So the chain stops at the branch, and the site goes on in its place. The cost is real and is
+    /// the right way round: `w10`'s code **does** reach the handler -- its own compare leaves
+    /// `C` set, so `b.lo` falls through -- and it is lost rather than guessed at, with `untracked`
+    /// saying the list is a lower bound.
+    ///
+    /// The shape is **constructed** rather than measured: it is the flag model's own question, and
+    /// the two chains `rdyboost` has are both read by a `b.eq` in the block that holds them.
+    #[test]
+    fn a_chained_reading_is_not_split_across_a_branch_that_reads_the_flags() {
+        const DEFAULT: u64 = 0xb00;
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "b.lo",
+                Vec::new(),
+                Flow::Branch(Some(DEFAULT)),
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "no code is carried past a branch that read the forced flags: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x1c],
+            "and the chain's site says a code went unnamed"
         );
     }
 
