@@ -2416,15 +2416,17 @@ to collect what does not depend on that step, and then to falsify it before anyt
    before accepting the call. It then captures the exact 19-record VP0 register sequence, validates
    the imported long-mode scalars and UEFI entry point, applies the state in one VID call and reads it
    back. VID's only normalization is setting the architecturally fixed `CR0.ET` bit; all other
-   critical scalars match. Three bounded runs in fresh partitions `0x33` through `0x35` completed
+   critical scalars match. Three bounded runs in fresh partitions `0x4D` through `0x4F` completed
    power-off, reverse reservation release, teardown, RAM destruction and partition deletion. The
    runbook is [`docs/secure-kernel/vdev-firmware-probe.md`](docs/secure-kernel/vdev-firmware-probe.md).
 
-   This is boot-state construction, not firmware execution: VP0 is deliberately never started by
-   the acceptance probe. A separate start without the owner-side VID completion dispatcher left the
-   imported `RIP` unchanged. K1.3 therefore narrows the next boundary to a real SynthStor LUN and
-   the central completion dispatcher; it does not claim a no-boot-device screen, a UEFI instruction,
-   or a Windows boot.
+   VP0 is deliberately never started by the acceptance probe. A private execution check corrected
+   the final ABI detail: `IVmBootMemoryTopology` returns byte addresses and lengths, while the VID
+   block APIs use page units. Page-scaled values caused PEI to call `InstallPeiMemory(0, 0)`;
+   byte-scaled values produced `InstallPeiMemory(0x70A000, 0x4081000)`, reached DXE and an idle
+   `HLT`, and device `Resume` advanced into later timer work. K1.3 therefore narrows the next
+   boundary to a real SynthStor LUN and the central completion dispatcher; it does not claim a
+   Windows boot.
 4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
    experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
    the minimum in-box device graph; firmware and one synthetic disk off an immutable

@@ -28,6 +28,7 @@ import vdev_initialization_probe as contract
 CHILD_TIMEOUT_SECONDS = 45
 REPETITIONS = 3
 POWERED_DEVICES = graph.GRAPH_ORDER[:-1]
+BOOT_MEMORY_RANGES = tuple((start, size) for _name, start, size in graph.RAM_SPANS)
 POWER_LIFECYCLE_RVAS = {
     "vmbus": (0x146B0, 0x145B0),
     "ioapic": (0x781D0, 0x77E80),
@@ -125,6 +126,23 @@ def firmware_acpi_tables() -> dict[str, bytes]:
         ),
     )
     return {"madt": madt, "srat": srat, "slit": b"", "pptt": b""}
+
+
+def encode_boot_memory_range(index: int) -> bytes:
+    """Encode one IVmBootMemoryTopology range in bytes, as UEFI consumes it."""
+
+    if index < 0 or index >= len(BOOT_MEMORY_RANGES):
+        raise IndexError(index)
+    start, length = BOOT_MEMORY_RANGES[index]
+    return struct.pack(
+        "<IIIIQQ",
+        index,
+        int(index + 1 == len(BOOT_MEMORY_RANGES)),
+        0,
+        0,
+        start,
+        length,
+    )
 
 
 @dataclass(frozen=True)
@@ -372,21 +390,18 @@ def install_firmware_services(
             if not output:
                 return E_INVALIDARG
             index = ctypes.c_uint32.from_address(output).value
-            ranges = ((0, 0xF8000), (0x100000, 0x8000))
-            if index >= len(ranges):
+            if index >= len(BOOT_MEMORY_RANGES):
                 return E_INVALIDARG
-            start, pages = ranges[index]
-            value = struct.pack(
-                "<IIIIQQ", index, int(index + 1 == len(ranges)), 0, 0, start, pages
-            )
+            start, length = BOOT_MEMORY_RANGES[index]
+            value = encode_boot_memory_range(index)
             ctypes.memmove(output, value, len(value))
             emit(
                 "firmware_service",
                 service="IVmBootMemoryTopology",
                 slot=6,
                 index=index,
-                start_page=f"0x{start:X}",
-                page_count=pages,
+                start_byte=f"0x{start:X}",
+                length_bytes=length,
             )
             return contract.S_OK
         except BaseException as error:

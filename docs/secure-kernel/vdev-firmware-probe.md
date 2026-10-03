@@ -39,7 +39,7 @@ power path:
 | `IVmMemoryTopology` | 7, 10 | one package and one thread |
 | `IVmMemoryTopology` | 11 | 80-byte MADT |
 | `IVmMemoryTopology` | 13, 14 | empty SLIT and PPTT |
-| `IVmBootMemoryTopology` | 6 | the low and high RAM spans |
+| `IVmBootMemoryTopology` | 6 | the low and high RAM spans, in bytes |
 | `IVmProcessorServices` | 3 | one VP |
 | `IVmBootStateImporter` | 4 | checked, zero-padded GPA-page import |
 | `IVmBootStateImporter` | 5 | 16-byte VP register import |
@@ -59,6 +59,13 @@ interrupt-source override, and the local-APIC NMI. The SRAT describes one
 processor and the two measured RAM affinities. Both tables carry the recovered
 `VRTUAL` / `MICROSOFT` OEM fields, their declared lengths match their buffers,
 and their checksums are zero.
+
+The boot-memory callback uses byte addresses and byte lengths:
+`[0, 0xF8000000)` and `[0x100000000, 0x108000000)`. These values differ from
+the page-number/page-count units used by VID memory-block APIs. A private
+execution check caught this boundary: page-scaled values made PEI call
+`InstallPeiMemory(0, 0)`; byte-scaled values made it call
+`InstallPeiMemory(0x70A000, 0x4081000)` and advance through PEI and DXE.
 
 ## Boot-state import
 
@@ -121,11 +128,13 @@ The acceptance run passed on 2026-10-03:
 
 | run | partition | page imports | VP records | powered devices | VP started | deleted |
 |---:|---:|---:|---:|---:|---|---|
-| 1 | `0x33` | 5, all exact readback | 19 | 5, all `S_OK` | no | yes |
-| 2 | `0x34` | 5, all exact readback | 19 | 5, all `S_OK` | no | yes |
-| 3 | `0x35` | 5, all exact readback | 19 | 5, all `S_OK` | no | yes |
+| 1 | `0x4D` | 5, all exact readback | 19 | 5, all `S_OK` | no | yes |
+| 2 | `0x4E` | 5, all exact readback | 19 | 5, all `S_OK` | no | yes |
+| 3 | `0x4F` | 5, all exact readback | 19 | 5, all `S_OK` | no | yes |
 
-This closes the minimum UEFI configuration and boot-state-import boundary. The
-next gate must attach a real SynthStor LUN and implement the owner-side VID
-completion dispatcher before starting VP0. A start without that dispatcher did
-not advance the imported `RIP`, so it is not evidence of firmware execution.
+This closes the minimum UEFI configuration and boot-state-import boundary. A
+private execution check has also proved the imported state reaches DXE and an
+idle `HLT`; resuming the five powered devices advances it into later timer
+work. That check is diagnostic rather than this preflight's acceptance result.
+The next gate must attach a real SynthStor LUN and implement the owner-side VID
+completion dispatcher before attempting a Windows boot.
