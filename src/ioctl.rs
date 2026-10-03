@@ -6091,6 +6091,242 @@ mod tests {
         );
     }
 
+    /// **A chain whose middle link reads the code against an unread constant marks the case the
+    /// link after it publishes** -- the shape round 5 of #439 reported as unmarked.
+    ///
+    /// `cmp w9,w11` / `ccmpne w9,w12,#4` / `ccmpne w9,w10,#0` / `b.ne`: the fall-through is reached
+    /// by `w10`'s code **unless** the unread `w12` equals it, so the case is uncertain and the site
+    /// of the link nobody could read is what says so. It is already recorded -- a link that reads
+    /// the code against an unresolvable operand comes back as a reading with no code, which the
+    /// forced-clear arm finds and carries -- and this test exists to keep it that way, the finding
+    /// having been filed against the line that *replaces* `lost` rather than against this path.
+    #[test]
+    fn a_chain_with_an_unread_middle_link_marks_the_case_after_it() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            // Reads the code against a register nobody wrote: a reading with no code.
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w9",
+                reg("w12"),
+                4,
+                Condition::NotEqual,
+            ),
+            conditional(
+                DISPATCH + 0x20,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "mov",
+                vec![reg("w0"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x22_4194, DISPATCH + 0x28)],
+            "{:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x1c],
+            "the unread link is the site, and it survives the forced-clear link after it"
+        );
+    }
+
+    /// **And a forced-clear link *resolves* the uncertainty a blind link before it left, so that
+    /// loss is not carried on** -- which is why round 5's finding is declined.
+    ///
+    /// `cmp w9,w11` / `ccmpne w2,w3,#4` / `ccmpne w9,w10,#0` / `b.ne`, where the middle link reads
+    /// neither the code nor anything this walk knows. Work the flags through:
+    ///
+    /// | code | after link 1 | after link 2 | after link 3 | `b.ne` |
+    /// |---|---|---|---|---|
+    /// | `w11`'s | `Z=1` | forced `Z=1` | condition false, forced `Z=0` | taken: **rejected** |
+    /// | `w10`'s | `Z=0` | `Z=(w2==w3)` | `Z=1` if that was clear | falls through: **the case** |
+    /// | any other | `Z=0` | `Z=(w2==w3)` | `Z=0` | taken: rejected |
+    ///
+    /// So the fall-through is reached by `w10`'s code and by nothing else, and the map is complete
+    /// for that block: the third link re-decides everything the second left open, which is what a
+    /// `#0` link *does*. The loss link 2 recorded -- *"the forced arm admits every code"* -- was a
+    /// claim about flags link 3 overwrote, and carrying it on would mark a complete answer as a
+    /// lower bound. That is also the module's standing rule rather than a special case: an ordinary
+    /// `cmp` discards a carried-in loss for the same reason, a flag write replacing what the loss
+    /// was about.
+    #[test]
+    fn a_forced_clear_link_resolves_a_blind_link_before_it() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            // Reads neither the code nor anything known: a blind link.
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w2",
+                reg("w3"),
+                4,
+                Condition::NotEqual,
+            ),
+            conditional(
+                DISPATCH + 0x20,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.ne",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(
+                DISPATCH + 0x28,
+                "mov",
+                vec![reg("w0"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            insn(DISPATCH + 0x2c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found
+                .cases
+                .iter()
+                .map(|case| (case.code, case.lands))
+                .collect::<Vec<_>>(),
+            vec![(0x22_4194, DISPATCH + 0x28)],
+            "{:?}",
+            found.cases
+        );
+        assert!(
+            found.untracked.is_empty(),
+            "nothing else reaches the fall-through, so the answer is not a lower bound: {:?}",
+            found.untracked
+        );
+    }
+
     /// A PC-relative literal load, as dbgscope decodes one: no base, no index, and the address the
     /// encoding names.
     ///

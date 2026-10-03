@@ -4286,10 +4286,19 @@ what the shape is for.
 reported 21 codes with nothing `untracked` on the first commit and reports the same 21 after the
 third round, re-measured rather than recalled. The remedies added **820** lines on the **800**
 submitted -- counted from the diff rather than by adding the rounds up, which gave a different
-number -- and that figure is to be read beside the first one rather than on its own. Five findings
-over four rounds: four were silently incomplete maps and the fifth an unreachable case, which are
-the two failures this module is arranged against, so the surface bought the thing the module exists
-for rather than more of itself. **Two** of the five were against a previous round's own fix, which
+number -- and that figure is to be read beside the first one rather than on its own. Six findings
+over five rounds, five of them taken: four were silently incomplete maps and the fifth an
+unreachable case, which are the two failures this module is arranged against, so the surface bought
+the thing the module exists for rather than more of itself. **The sixth is declined on the fact**,
+which is the only one of these that was not real: it read the forced-clear arm's replacement of
+`lost` as dropping a marker, and the shape it named -- an unread constant compared against the code
+-- is marked by that arm's own reading rather than by `lost`. Where its mechanism does bite, a link
+blind to the code entirely, the forced-clear link **resolves** what the blind one left open: only
+the last link's code reaches the fall-through, so carrying the loss on would mark a complete answer
+as a lower bound. Both are tests rather than an argument
+(`a_chain_with_an_unread_middle_link_marks_the_case_after_it`,
+`a_forced_clear_link_resolves_a_blind_link_before_it`), the second carrying the flag table it rests
+on. **Two** of the five were against a previous round's own fix, which
 is what the class fixes cost: each closed its class and the next round read what the closure could
 not express. The rule going on is that a defect in what is here is worth fixing and a request for new
 machinery is not.
