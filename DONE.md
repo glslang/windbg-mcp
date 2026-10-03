@@ -4298,7 +4298,18 @@ the last link's code reaches the fall-through, so carrying the loss on would mar
 as a lower bound. Both are tests rather than an argument
 (`a_chain_with_an_unread_middle_link_marks_the_case_after_it`,
 `a_forced_clear_link_resolves_a_blind_link_before_it`), the second carrying the flag table it rests
-on. **Two** of the five were against a previous round's own fix, which
+on.
+
+**It was then asked a second time, from the other side**, arguing that the case is conditional on the
+unread comparison -- which it is. What settles that is the **control**: the same source written
+without a conditional compare (`cmp w2,w3` / `b.ne skip` / `cmp code,B` / `b.eq`) publishes the code
+and marks nothing, because the guard tests a value that is not the control code and `untracked` is
+for a test on the code this walk could not attribute. Marking the `ccmp` form would make the map's
+completeness depend on the compiler's instruction selection rather than on the driver, and would
+make an `untracked` entry of every input-dependent guard in every driver that happens to be folded.
+`a_guard_on_something_else_is_not_a_loss_however_it_is_written` is that control, and the pair is
+where this stopped: a third pass over one line, with the answer unmoved for five rounds, is the
+reading the review-round skill says to record rather than escalate. **Two** of the five were against a previous round's own fix, which
 is what the class fixes cost: each closed its class and the next round read what the closure could
 not express. The rule going on is that a defect in what is here is worth fixing and a request for new
 machinery is not.
