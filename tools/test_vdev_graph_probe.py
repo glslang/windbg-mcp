@@ -87,6 +87,7 @@ class FirmwareAcpiTests(unittest.TestCase):
         tables = firmware.firmware_acpi_tables()
         self.assertEqual(len(tables["madt"]), 80)
         self.assertEqual(len(tables["srat"]), 144)
+        self.assertEqual(struct.unpack_from("<I", tables["srat"], 36)[0], 1)
         self.assertEqual(tables["slit"], b"")
         self.assertEqual(tables["pptt"], b"")
         for name in ("madt", "srat"):

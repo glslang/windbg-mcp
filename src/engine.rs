@@ -642,9 +642,35 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
 }
 
 /// One session: a worker process, its queue, and the outstanding calls against it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SecureKernelLiveTarget {
+    vmwp_pid: u32,
+    target: crate::skcontrol::TargetIdentity,
+}
+
+#[derive(Debug, Default)]
+struct ControllerReservations {
+    kernel_endpoint: Option<kdconn::Endpoint>,
+    secure_kernel_live_target: Option<SecureKernelLiveTarget>,
+}
+
+impl SecureKernelLiveTarget {
+    fn new(request: &crate::skdispatch::OpenRequest) -> Self {
+        let mut target = request.target.clone();
+        // A GUID's spelling is case-insensitive. Keep two spellings of the same VM from evading
+        // the exact-target reservation while leaving the provider's original request untouched.
+        target.vm_id.make_ascii_lowercase();
+        Self {
+            vmwp_pid: request.vmwp_pid,
+            target,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Session {
     kernel_endpoint: Option<kdconn::Endpoint>,
+    secure_kernel_live_target: Option<SecureKernelLiveTarget>,
     pub id: String,
     pub kind: SessionKind,
     /// What was opened — the path, connection string, pid, or command line. Reported so a
@@ -1163,9 +1189,9 @@ impl Session {
             .elapsed()
     }
 
-    /// Whether the worker owes a reply, is still opening, or has not been handed to its caller
-    /// yet. An idle session is one that can be reclaimed to make room without abandoning work in
-    /// flight.
+    /// Whether the worker owes a reply, is still opening, has not been handed to its caller yet,
+    /// or retains a controller whose release is unresolved. An idle session is one that can be
+    /// reclaimed to make room without abandoning work or a recovery obligation.
     ///
     /// That last clause covers a window nothing else does. A session goes idle the moment its
     /// opener's waiter is removed — before `open` has returned the handle — so with two opens
@@ -1189,7 +1215,9 @@ impl Session {
     }
 
     fn busy(&self) -> bool {
-        self.kernel_unresolved() || !self.delivered.load(Ordering::Acquire)
+        self.kernel_unresolved()
+            || self.live_control_unresolved()
+            || !self.delivered.load(Ordering::Acquire)
             || !self
                 .waiters
                 .lock()
@@ -2245,12 +2273,20 @@ impl Sessions {
         // Read before the worker exists, because the architecture of the target decides which
         // process that worker's engine lives in — see `worker::TARGET_FLAG`.
         let opening = op.opening();
-        let endpoint = match &op {
+        let kernel_endpoint = match &op {
             EngineOp::AttachKernel { connection, .. } => Some(connection.endpoint()),
             _ => None,
         };
+        let secure_kernel_live_target = match &op {
+            EngineOp::OpenSecureKernelLive(request) => Some(SecureKernelLiveTarget::new(request)),
+            _ => None,
+        };
+        let reservations = ControllerReservations {
+            kernel_endpoint,
+            secure_kernel_live_target,
+        };
         let session = match self
-            .spawn(&id, kind, what, profile, opening.as_ref(), endpoint)
+            .spawn(&id, kind, what, profile, opening.as_ref(), reservations)
             .await
         {
             Ok(session) => session,
@@ -3397,6 +3433,19 @@ impl Sessions {
         {
             return Err("This kernel endpoint is already reserved by a controller. No second attach was sent. Resolve the existing controller before retrying.".into());
         }
+        if let Some(target) = &session.secure_kernel_live_target
+            && registry.all.iter().any(|held| {
+                (held.state().is_live()
+                    || held
+                        .child
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_some())
+                    && held.secure_kernel_live_target.as_ref() == Some(target)
+            })
+        {
+            return Err("This Secure Kernel live target is already reserved by a controller. No second live session was opened. Resolve the existing controller before retrying.".into());
+        }
         registry.all.push_back(Arc::clone(session));
         registry.trim();
         Ok(())
@@ -3417,7 +3466,7 @@ impl Sessions {
         what: String,
         profile: Option<crate::structured::ProfileFacts>,
         target: Option<&crate::target::Opening>,
-        kernel_endpoint: Option<kdconn::Endpoint>,
+        reservations: ControllerReservations,
     ) -> Result<Arc<Session>, String> {
         let images = worker_images(target)?;
         let mut started = None;
@@ -3455,8 +3504,13 @@ impl Sessions {
 
         let (tx, rx) = mpsc::unbounded_channel();
         let waiters: Waiters = Arc::new(Mutex::new(HashMap::new()));
+        let ControllerReservations {
+            kernel_endpoint,
+            secure_kernel_live_target,
+        } = reservations;
         let session = Arc::new(Session {
             kernel_endpoint,
+            secure_kernel_live_target,
             id: id.to_string(),
             kind,
             what,
@@ -7185,6 +7239,22 @@ mod tests {
         Arc::new(session)
     }
 
+    fn secure_kernel_live_double(id: &str, state: SessionState, vmwp_pid: u32) -> Arc<Session> {
+        let mut session = Arc::into_inner(dormant(id, state)).unwrap();
+        session.kind = SessionKind::SecureKernelLive;
+        session.secure_kernel_live_target = Some(SecureKernelLiveTarget {
+            vmwp_pid,
+            target: crate::skcontrol::TargetIdentity {
+                vm_id: "00000000-0000-0000-0000-000000000001".into(),
+                partition_id: crate::skcontrol::HexU64(1),
+                vp: 0,
+                vtl: 1,
+                expected_cr3: crate::skcontrol::HexU64(0x1000),
+            },
+        });
+        Arc::new(session)
+    }
+
     fn kernel_with_child(id: &str) -> Arc<Session> {
         let _spawn = spawn_guard();
         let child = Command::new("ping.exe")
@@ -7512,6 +7582,55 @@ mod tests {
         );
     }
 
+    #[test]
+    fn secure_kernel_live_target_reservation_survives_unresolved_control() {
+        let first = secure_kernel_live_double("first", SessionState::Attaching, 4100);
+        let sessions = registry_of(std::slice::from_ref(&first));
+        assert!(
+            sessions
+                .admit(&secure_kernel_live_double(
+                    "same",
+                    SessionState::Opening,
+                    4100
+                ))
+                .is_err()
+        );
+        assert!(
+            sessions
+                .admit(&secure_kernel_live_double(
+                    "different-process",
+                    SessionState::Opening,
+                    4101
+                ))
+                .is_ok()
+        );
+
+        first.preserve_live_control("test");
+        assert!(
+            sessions
+                .admit(&secure_kernel_live_double(
+                    "retry",
+                    SessionState::Opening,
+                    4100
+                ))
+                .is_err(),
+            "an unresolved controller keeps its exact target reservation"
+        );
+
+        first.released.store(true, Ordering::SeqCst);
+        first.set_state(SessionState::Closed("verified teardown".into()));
+        assert!(
+            sessions
+                .admit(&secure_kernel_live_double(
+                    "after-teardown",
+                    SessionState::Opening,
+                    4100
+                ))
+                .is_ok(),
+            "a settled session with no worker releases its reservation"
+        );
+    }
+
     /// [`dormant`] with a transcript, for the one test that is about what gets recorded.
     fn dormant_recording(
         id: &str,
@@ -7528,6 +7647,7 @@ mod tests {
         };
         Arc::new(Session {
             kernel_endpoint: None,
+            secure_kernel_live_target: None,
             id: id.to_string(),
             kind: SessionKind::Dump,
             what: "test".to_string(),
@@ -8975,6 +9095,44 @@ mod tests {
         assert!(!undelivered.busy());
         sessions.reconcile_capacity(&keeping);
         assert!(!undelivered.state().is_live(), "now it is reclaimable");
+    }
+
+    /// A failed live-control teardown is a recovery obligation, even with no call outstanding.
+    /// `LiveControlUnresolved` refuses the `Closed` transition capacity reclamation uses to claim
+    /// a victim, so treating it as idle would select the same session forever while the registry
+    /// remains over its cap.
+    #[tokio::test]
+    async fn unresolved_secure_kernel_control_is_never_reclaimed() {
+        let sessions = Sessions::new(Duration::from_secs(1));
+        let unresolved = secure_kernel_live_double(
+            "sess-unresolved",
+            SessionState::LiveControlUnresolved("test recovery".into()),
+            4100,
+        );
+        let keeping = dormant("sess-keep", SessionState::Open);
+        {
+            let mut registry = sessions.registry();
+            registry.all.push_back(Arc::clone(&unresolved));
+            for n in 0..MAX_SESSIONS - 1 {
+                registry
+                    .all
+                    .push_back(dormant(&format!("sess-busy-{n}"), SessionState::Attaching));
+            }
+            registry.all.push_back(Arc::clone(&keeping));
+        }
+
+        assert!(unresolved.busy());
+        sessions.reconcile_capacity(&keeping);
+
+        assert!(matches!(
+            unresolved.state(),
+            SessionState::LiveControlUnresolved(_)
+        ));
+        assert_eq!(
+            sessions.registry().live().len(),
+            MAX_SESSIONS + 1,
+            "the overage remains when every possible victim is busy"
+        );
     }
 
     /// Busy sessions are still never taken, so an overage that cannot be paid for is left
