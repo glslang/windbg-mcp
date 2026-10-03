@@ -35,7 +35,7 @@ pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
 const DEBUG_WAIT: u32 = 60_000;
 const COMPLETION_KICK_AFTER: Duration = Duration::from_secs(12);
 const POWERSHELL_WAIT: Duration = Duration::from_secs(60);
-const PAGE_WALK_WAIT: Duration = Duration::from_secs(60);
+const LIVE_MEMORY_WAIT: Duration = Duration::from_secs(60);
 const CLEANUP_SETTLE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
@@ -472,6 +472,20 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
+    fn refuse_unsafe_recovery(&mut self) -> Result<()> {
+        match &self.phase {
+            DispatcherPhase::Registering => {
+                let why = "handler registration did not reach and restore its return boundary; \
+                           the VM remains paused with vmwp contained"
+                    .to_string();
+                self.phase = DispatcherPhase::Contained(why.clone());
+                bail!("{why}");
+            }
+            DispatcherPhase::Contained(why) => bail!("the dispatcher is fail-closed: {why}"),
+            _ => Ok(()),
+        }
+    }
+
     fn finish_completion_kick(&mut self) -> Result<()> {
         let Some(kick) = self.completion_kick.take() else {
             return Ok(());
@@ -503,10 +517,9 @@ impl VmwpDispatcherState {
             .space
             .translate(at)
             .with_context(|| format!("nothing in live VTL1 maps {address:#x}"))?;
-        let reader = sk::Reader::new(&memory.source);
-        let bytes = sk::Space::new(&reader, &memory.space)
-            .read_span(at, size as usize)
-            .map_err(|why| anyhow!("reading live VTL1 at {address:#x} failed: {why:?}"))?;
+        let bytes = memory
+            .read_span(at, size as usize, "stopped live VTL1 memory read")
+            .map_err(|why| anyhow!("reading live VTL1 at {address:#x} failed: {why:#}"))?;
         Ok(LiveMemoryRead {
             epoch,
             address: HexU64(address),
@@ -527,6 +540,7 @@ pub(crate) struct VmwpDispatcher<'a> {
 #[derive(Clone, Debug)]
 enum DispatcherPhase {
     Fresh,
+    Registering,
     ReadyForStop(StopReason),
     Holding(HeldEvent),
     CallbackEntry(HeldEvent),
@@ -580,13 +594,37 @@ struct LiveGuestMemory {
     space: sk::AddressSpace,
 }
 
-struct PageWalkSource<'a> {
+struct DeadlineLiveSource<'a> {
     source: &'a crate::livesrc::LiveSource,
+    operation: &'a str,
     deadline: Instant,
     expired: std::cell::Cell<bool>,
 }
 
-impl RawSource for PageWalkSource<'_> {
+impl<'a> DeadlineLiveSource<'a> {
+    fn new(source: &'a crate::livesrc::LiveSource, operation: &'a str) -> Self {
+        Self {
+            source,
+            operation,
+            deadline: Instant::now() + LIVE_MEMORY_WAIT,
+            expired: std::cell::Cell::new(false),
+        }
+    }
+
+    fn require_within_deadline(&self) -> Result<()> {
+        if self.expired.get() || Instant::now() >= self.deadline {
+            self.expired.set(true);
+            bail!(
+                "{} exceeded its {} second deadline",
+                self.operation,
+                LIVE_MEMORY_WAIT.as_secs()
+            );
+        }
+        Ok(())
+    }
+}
+
+impl RawSource for DeadlineLiveSource<'_> {
     fn shape(&self) -> sk::GuestShape {
         self.source.shape()
     }
@@ -599,11 +637,11 @@ impl RawSource for PageWalkSource<'_> {
         if Instant::now() >= self.deadline {
             self.expired.set(true);
             return Err(sk::ReadFailure::SourceError {
-                detail: "the live VTL1 page-table walk reached its deadline".into(),
+                detail: format!("{} reached its deadline", self.operation),
             });
         }
         let result = self.source.read_chunk_until(gpa, out, self.deadline);
-        if result.is_err() && Instant::now() >= self.deadline {
+        if Instant::now() >= self.deadline {
             self.expired.set(true);
         }
         result
@@ -641,29 +679,32 @@ impl LiveGuestMemory {
         root: sk::Gpa,
         operation: &str,
     ) -> Result<sk::AddressSpace> {
-        let source = PageWalkSource {
-            source,
-            deadline: Instant::now() + PAGE_WALK_WAIT,
-            expired: std::cell::Cell::new(false),
-        };
+        let description = format!("live VTL1 page-table {operation}");
+        let source = DeadlineLiveSource::new(source, &description);
         let reader = sk::Reader::new(&source);
         let (leaves, stats) = sk::walk(&reader, root);
-        if source.expired.get() {
-            bail!(
-                "live VTL1 page-table {operation} exceeded its {} second deadline",
-                PAGE_WALK_WAIT.as_secs()
-            );
-        }
+        source.require_within_deadline()?;
         if !stats.complete() {
             bail!("live VTL1 page-table {operation} was incomplete: {stats:?}");
         }
         Ok(sk::AddressSpace::new(leaves))
     }
 
+    fn read_span(&self, at: sk::Gva, size: usize, operation: &str) -> Result<Vec<u8>> {
+        let source = DeadlineLiveSource::new(&self.source, operation);
+        let reader = sk::Reader::new(&source);
+        let result = sk::Space::new(&reader, &self.space).read_span(at, size);
+        source.require_within_deadline()?;
+        result.map_err(|why| anyhow!("{why:?}"))
+    }
+
     fn read_guard(&self, guard: &InstructionGuard) -> Result<InstructionGuard> {
-        let reader = sk::Reader::new(&self.source);
-        let bytes = sk::Space::new(&reader, &self.space)
-            .read_span(sk::Gva(guard.address.0), guard.bytes.len())
+        let bytes = self
+            .read_span(
+                sk::Gva(guard.address.0),
+                guard.bytes.len(),
+                "live VTL1 instruction guard read",
+            )
             .map_err(|why| anyhow!("reading guarded VTL1 instruction failed: {why:?}"))?;
         Ok(InstructionGuard {
             address: guard.address,
@@ -818,6 +859,7 @@ impl EventDispatcher for VmwpDispatcher<'_> {
     }
 
     fn recover(&mut self, safe_to_resume: bool, event: Option<&HeldEvent>) -> Result<()> {
+        self.state.refuse_unsafe_recovery()?;
         if !safe_to_resume {
             let why = if self.state.vm_paused {
                 "VTL1 restoration was not proved; the VM remains paused"
@@ -861,6 +903,9 @@ impl EventDispatcher for VmwpDispatcher<'_> {
             DispatcherPhase::Closed => return Ok(()),
             DispatcherPhase::Contained(why) => {
                 bail!("refusing to detach a contained dispatcher: {why}")
+            }
+            DispatcherPhase::Registering => {
+                bail!("refusing teardown while handler registration is incomplete")
             }
             DispatcherPhase::Holding(_)
             | DispatcherPhase::CallbackEntry(_)
@@ -1077,6 +1122,10 @@ impl VmwpDispatcher<'_> {
         self.engine.execute_command("~# u").map_err(debugger)?;
         self.state.threads_frozen = true;
         self.set_dynamic_breakpoint(return_address)?;
+        // From the first guest-memory mutation until the return boundary and original stack are
+        // proved, recovery must keep vmwp attached and the VM paused. Detaching would let a
+        // partially injected registration finish without a context this adapter can unregister.
+        self.state.phase = DispatcherPhase::Registering;
         self.write_u64(
             stack_handler,
             self.scratch(self.state.profile.layout.handler_descriptor)?,
@@ -1111,6 +1160,7 @@ impl VmwpDispatcher<'_> {
         self.write_u64(stack_context, saved_context)?;
         self.engine.execute_command("~* u").map_err(debugger)?;
         self.state.threads_frozen = false;
+        self.state.phase = DispatcherPhase::Fresh;
         Ok(())
     }
 
@@ -1837,6 +1887,19 @@ mod tests {
         other.expected_cr3 = HexU64(0x120_2000);
         assert!(state.claim_vm_pause(&other).is_err());
         assert_eq!(state.target.as_ref(), Some(&target));
+    }
+
+    #[test]
+    fn incomplete_registration_is_contained_before_recovery_can_detach() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        state.phase = DispatcherPhase::Registering;
+
+        let error = state.refuse_unsafe_recovery().unwrap_err();
+
+        assert!(error.to_string().contains("registration did not reach"));
+        assert!(matches!(state.phase, DispatcherPhase::Contained(_)));
+        assert!(state.refuse_unsafe_recovery().is_err());
     }
 
     fn target() -> TargetIdentity {
