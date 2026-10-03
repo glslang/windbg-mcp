@@ -1071,8 +1071,13 @@ impl<P: ControlProvider> LiveControl<P> {
             .clone()
             .context("there is no saved VTL1 baseline")?;
         let current = self.read_snapshot()?;
-        for name in [
+        let current_dr7 = current.low(RegisterName::Dr7)?;
+        self.write_one(
             RegisterName::Dr7,
+            current_dr7,
+            current_dr7 & !DR7_ENABLE_MASK,
+        )?;
+        for name in [
             RegisterName::Rflags,
             RegisterName::Rip,
             RegisterName::Rsp,
@@ -1081,21 +1086,15 @@ impl<P: ControlProvider> LiveControl<P> {
             RegisterName::Dr2,
             RegisterName::Dr3,
             RegisterName::Dr6,
-            RegisterName::Dr7,
         ] {
-            let expected = if name == RegisterName::Dr7 {
-                // The first write disables all slots; the last restores the exact original word.
-                self.read_snapshot()?.low(name)?
-            } else {
-                current.low(name)?
-            };
-            let value = if name == RegisterName::Dr7 && expected != baseline.low(name)? {
-                expected & !DR7_ENABLE_MASK
-            } else {
-                baseline.low(name)?
-            };
-            self.write_one(name, expected, value)?;
+            self.write_one(name, current.low(name)?, baseline.low(name)?)?;
         }
+        let disabled_dr7 = self.read_snapshot()?.low(RegisterName::Dr7)?;
+        self.write_one(
+            RegisterName::Dr7,
+            disabled_dr7,
+            baseline.low(RegisterName::Dr7)?,
+        )?;
         let restored = self.read_snapshot()?;
         if restored != baseline {
             bail!("restored VTL1 state does not match the saved baseline");
@@ -1948,6 +1947,35 @@ mod tests {
                 safe: true,
                 owned_event: false,
             })
+        );
+    }
+
+    #[test]
+    fn redirect_restoration_preserves_disabled_dr7_kind_bits() {
+        let baseline_dr7 = 0x0001_0400;
+        let mut provider = FakeProvider::new();
+        set_low(&mut provider.registers, RegisterName::Dr7, baseline_dr7);
+        let mut dispatcher =
+            FakeDispatcher::new([observed(StopReason::HardwareBreakpoint { slot: 0 })]);
+        let mut control = LiveControl::open(provider).unwrap();
+
+        control
+            .arm(&mut dispatcher, instruction(), ArmMode::Redirect)
+            .unwrap();
+        let stopped = control.wait_for_stop(&mut dispatcher).unwrap();
+        control
+            .continue_from(&mut dispatcher, &stopped.epoch)
+            .unwrap();
+
+        assert_eq!(
+            control
+                .provider
+                .registers
+                .iter()
+                .find(|register| register.name == RegisterName::Dr7)
+                .unwrap()
+                .low,
+            HexU64(baseline_dr7)
         );
     }
 
