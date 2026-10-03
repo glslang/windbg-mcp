@@ -4214,6 +4214,22 @@ cross no edge. A chain read by any other branch -- or split across a block bound
 site in `untracked` instead of its codes: that **costs a real code** on the `b.lo` shape, which is
 the right way round and is pinned as a characterisation rather than implied.
 
+**And the fold needs a predecessor the walk read**, which neither the entry nor the first
+implementation asked for. `ccmpne …,#4` defers to the comparison before it, so where that
+comparison is not one of the walk's own readings -- `cmp w2,#0` / `ccmpne w9,w10,#4` / `b.eq`, with
+`w2` holding something else -- the branch is decided by a condition about another value and the
+forced arm sends **every** code to the handler. `w10`'s code is not a false case there, but a list
+carrying it with an empty `untracked` reads as the whole set, which is the one thing this module
+must not do. So a link with no readable predecessor is dropped and its site becomes the loss: the
+answer an unmodelled flag write already gives, and the answer this module gave for that shape
+before a chain could be read at all. Raised as a **P1 by Codex** on
+[#439](https://github.com/glslang/windbg-mcp/pull/439), which offered keeping the case beside a loss
+as the alternative -- declined, because it would publish a code this walk has never published
+before on the strength of reasoning about forced flags, where dropping it changes nothing but the
+chain the fold was written for. One check covers the class, because `compared` is replaced at every
+flag write: it is non-empty at a conditional compare only when the last thing to write the flags was
+a comparison of the control code that the walk read.
+
 **The first draft of that substitution keyed on the terminator's condition alone**, and a `ccmp`
 carries a condition of its own -- so a block *ending* in one looked like a block whose branch had
 just read an equality, and the chain left the answer with no case and no site. The block-boundary

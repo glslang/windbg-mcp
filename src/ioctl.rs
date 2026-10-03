@@ -2746,6 +2746,26 @@ fn chained_compare(
 /// as equality-only readings, which [`Compared::chained`] is what marks, and the loss an unreadable
 /// link recorded is kept **beside** them -- a chain can leave both a case and an `untracked`, where
 /// an ordinary flag write leaves one or the other.
+///
+/// **And the fold needs a predecessor this walk read.** `ccmpne …,#4` says *"if the comparison
+/// before me did not match, compare; otherwise call it equal"*, so where that comparison is not one
+/// of these readings the branch below is decided by a condition about some other value -- and the
+/// forced arm then sends **every** control code to the handler. `cmp w2,#0` / `ccmpne w9,w10,#4` /
+/// `b.eq` is the shape: `w10`'s code does reach that handler, so publishing it is not false, but a
+/// case list carrying it with nothing else set reads as the whole set rather than as a lower bound,
+/// which is the one thing this module must not do. So a link with no readable predecessor is
+/// dropped and its site becomes the loss -- the answer an unmodelled flag write already gives, and
+/// the answer this module gave for that shape before a chain could be read at all. Raised as a P1
+/// by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439), which offered keeping the
+/// case beside a loss as the alternative: that would publish a code this walk has never published
+/// before on the strength of reasoning about forced flags, where dropping it changes nothing but
+/// the chain it was written for.
+///
+/// **One check covers the class**, because `compared` is replaced at every flag write: it is
+/// non-empty at a conditional compare only when the last thing to write the flags was a comparison
+/// *of the control code* that this walk read. A compare of something else leaves it empty
+/// ([`compare`] answers `None`), so does a call ([`simulate`] clears it), so does a block that
+/// begins with the link, and so does an arithmetic flag write.
 fn absorb(
     compared: &mut Vec<Compared>,
     lost: &mut Option<u64>,
@@ -2756,6 +2776,11 @@ fn absorb(
     if !chains {
         *compared = next.into_iter().collect();
         *lost = just_lost.take();
+        return;
+    }
+    if compared.is_empty() {
+        let site = next.as_ref().map(|was| was.at);
+        *lost = just_lost.take().or(site);
         return;
     }
     for was in compared.iter_mut() {
@@ -5268,6 +5293,92 @@ mod tests {
             found.untracked,
             vec![DISPATCH + 0x1c],
             "and the chain's site says a code went unnamed"
+        );
+    }
+
+    /// **A chain with no predecessor this walk read names no code**, because the forced arm is only
+    /// as good as the flags it forces over.
+    ///
+    /// `cmp w2,#0` / `ccmpne w9,w10,#4` / `b.eq`: `w2` never held the control code, so the
+    /// comparison the `ccmpne` defers to is not one this walk read -- and `#4` forces `ZF` where it
+    /// matched, so on that path **every** code reaches the handler. `w10`'s code is not a false case
+    /// there, but a map carrying it with an empty `untracked` reads as the whole set. So the link is
+    /// dropped and its site is the loss, which is what this module answered for that shape before a
+    /// chain could be read at all.
+    ///
+    /// Raised as a P1 by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439). Its
+    /// worked example wrote the code as a `ccmp` **immediate**, which A64 cannot encode -- the field
+    /// is five bits -- so the fixture is the register form the rule is actually about.
+    #[test]
+    fn a_conditional_compare_with_no_predecessor_read_names_no_code() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            // Not the control code, so this comparison is not one of the walk's readings.
+            insn(
+                DISPATCH + 0x10,
+                "cmp",
+                vec![reg("w2"), imm(0)],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x1c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert!(
+            found.cases.is_empty(),
+            "a forced arm over flags nobody read names no code: {:?}",
+            found.cases
+        );
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x14],
+            "and the site says the list is a lower bound"
         );
     }
 
