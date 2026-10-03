@@ -1592,7 +1592,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   a chain ends it, and the loss it leaves is reported the way this walk has always reported one, so
   no `ja` over a lost code anywhere grows an `untracked` entry it did not have. Eleven rules, eleven
   tests, each mutation-verified against the rule it is for; the `rdyboost` figures above were
-  re-measured after the last of them and are unchanged --
+  re-measured after the last of them and are unchanged. **And a forced-clear link's predecessors
+  decide whether its case exists at all**: one that matched the same code makes the case
+  unreachable, so it is dropped (`cmp code,A` / `ccmpne code,A,#0` / `b.ne` rejects every value),
+  and one whose code could not be read leaves that unknown, so the code is published with the
+  unread site recorded beside it -- the marker the fold had dropped, which `note_loss` used to
+  leave. Thirteen rules, thirteen tests, thirteen mutations --
   and the first draft of the one that keeps a dropped chain visible keyed on the terminator's
   *condition* alone, which a `ccmp` carries, so a block ending in one left no case and no site; the
   block-boundary test caught it.

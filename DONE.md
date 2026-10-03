@@ -4264,13 +4264,30 @@ pinned too**: an ordinary flag write after a chain ends it, and the loss it leav
 successor edges and committed only by an equality, as this walk has always done on every target. A
 `b.lo` over a code lost to an `and` gains no `untracked` entry it did not have before.
 
-**What the three rounds cost, as a reading rather than a rule.** The answer never moved: `rdyboost`
+**And the links a forced-clear arm discards are a fact about the case it publishes**, which is the
+fourth round and the first finding that was not a P1. `ZF` forced clear means an earlier match
+leaves the case, so the code this link compares against reaches it only where none of them matched:
+a predecessor that matched the **same** code makes the case unreachable -- `cmp code,A` /
+`ccmpne code,A,#0` / `b.ne` rejects every value -- and one whose code could not be read leaves it
+unknown whether that is so. The first is dead code rather than anything a compiler emits and is
+dropped; the second is `rdyboost`'s own shape with its first constant unread, where the code is
+published and the unread site recorded beside it, because this module publishes a case with its
+caveat (`proved`, `accepted`) rather than withholding one. **That second half is a marker the fold
+had dropped**: before it, the link's own `note_loss` left one, a conditional compare reading a
+register that carries the code. A predecessor matching a *different* code needs neither, which is
+what the shape is for.
+
+**What the four rounds cost, as a reading rather than a rule.** The answer never moved: `rdyboost`
 reported 21 codes with nothing `untracked` on the first commit and reports the same 21 after the
-third round, re-measured rather than recalled. The remedies added **612** lines on the **800**
-submitted, all of them in the diagnostic half -- four findings, every one a silently incomplete map
-rather than a wrong code, which is the failure this module is arranged against and so worth the
-surface. The next round's findings decide whether that stays true: a defect in what is here is worth
-fixing, and a request for new machinery is not.
+third round, re-measured rather than recalled. The remedies added **820** lines on the **800**
+submitted -- counted from the diff rather than by adding the rounds up, which gave a different
+number -- and that figure is to be read beside the first one rather than on its own. Five findings
+over four rounds: four were silently incomplete maps and the fifth an unreachable case, which are
+the two failures this module is arranged against, so the surface bought the thing the module exists
+for rather than more of itself. **Two** of the five were against a previous round's own fix, which
+is what the class fixes cost: each closed its class and the next round read what the closure could
+not express. The rule going on is that a defect in what is here is worth fixing and a request for new
+machinery is not.
 
 **The first draft of that substitution keyed on the terminator's condition alone**, and a `ccmp`
 carries a condition of its own -- so a block *ending* in one looked like a block whose branch had
