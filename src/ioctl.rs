@@ -1447,6 +1447,12 @@ fn simulate(
     // edge that arrived, and what leaves is decided per outgoing edge below.
     let mut compared: Vec<Compared> = std::mem::take(&mut facts.pending);
     let mut lost: Option<u64> = facts.lost.take();
+    // **The other kind of loss: a conditional compare's forced arm, which admits every code.** It
+    // is reported exactly as `lost` is and differs in one place -- a forced-clear link ends it,
+    // because an earlier match then takes the branch *away* from the case. Kept apart from `lost`
+    // because they want opposite treatment there, which is what three findings on one line came
+    // down to ([`absorb`]).
+    let mut forced: Option<u64> = None;
     let mut traced = false;
     let mut untracked = Vec::new();
     // The loss the last flag-writing instruction left, carried exactly as `compared` is: whether
@@ -1507,12 +1513,14 @@ fn simulate(
         if matches!(instruction.flow, Flow::Call(_)) {
             compared.clear();
             lost = None;
+            forced = None;
             chain = None;
             own_flags = false;
         } else if instruction.writes_flags {
             chain = absorb(
                 &mut compared,
                 &mut lost,
+                &mut forced,
                 next,
                 &mut just_lost,
                 chained,
@@ -1537,7 +1545,7 @@ fn simulate(
                 // unreadable operand / `beq` leaves a case for the first link **and** a loss for
                 // the second, and both are wanted -- the code that reaches the handler, and the
                 // site that says the list is a lower bound ([`chained_compare`]).
-                if let Some(at) = lost
+                if let Some(at) = lost.or(forced)
                     && matches!(last.condition, Some(Condition::Equal | Condition::NotEqual))
                 {
                     untracked.push(at);
@@ -1648,11 +1656,13 @@ fn simulate(
                 if matches!(last.flow, Flow::Call(_)) {
                     compared.clear();
                     lost = None;
+                    forced = None;
                     chain = None;
                 } else if last.writes_flags {
                     chain = absorb(
                         &mut compared,
                         &mut lost,
+                        &mut forced,
                         next,
                         &mut just_lost,
                         chained,
@@ -1741,6 +1751,7 @@ fn simulate(
             .find(|was| was.chained)
             .map(|was| was.at)
             .or(lost)
+            .or(forced)
     });
     if let Some(site) = owed {
         match last.map(|last| (last.flow, last.condition)) {
@@ -1756,10 +1767,11 @@ fn simulate(
             Some((Flow::Branch(_), Some(_))) => {
                 untracked.push(site);
                 lost = None;
+                forced = None;
             }
             // A terminator that reads no flags asks nothing of the chain, so the branch that does
             // is in the next block and the loss travels to it, as an unmodelled flag write's does.
-            _ => lost = lost.or(Some(site)),
+            _ => lost = lost.or(forced).or(Some(site)),
         }
     }
     // **The compare that makes a bounds check, asked of each in turn.** A bound is a claim
@@ -1817,6 +1829,10 @@ fn simulate(
         }
         _ => None,
     };
+    // Both kinds of loss cross an edge the same way: a chain is dead across a block boundary (see
+    // [`Compared::chained`]), so a forced arm that outlives this block is an ordinary loss to
+    // whichever branch reads it next.
+    let lost = lost.or(forced);
     if let Some(bound) = bounding {
         let target = bound.default;
         let mut bounded = carried.clone();
@@ -2850,6 +2866,7 @@ fn chained_compare(
 fn absorb(
     compared: &mut Vec<Compared>,
     lost: &mut Option<u64>,
+    forced: &mut Option<u64>,
     next: Option<Compared>,
     just_lost: &mut Option<u64>,
     chained: Option<(u64, bool)>,
@@ -2858,6 +2875,7 @@ fn absorb(
     let Some((at, keeps_earlier)) = chained else {
         *compared = next.into_iter().collect();
         *lost = just_lost.take();
+        *forced = None;
         return None;
     };
     // **Whether the links before this one are comparisons the walk read.** `compared` is replaced
@@ -2877,7 +2895,8 @@ fn absorb(
         // Forced `ZF` over flags this walk did not read.
         (true, false) => {
             compared.clear();
-            *lost = just_lost.take().or(Some(at));
+            *lost = just_lost.take();
+            *forced = Some(at);
         }
         // Forced `ZF` over a comparison it read: the earlier links stay live as equality-only
         // readings. A blind link in the middle leaves the branch reachable by codes no reading
@@ -2888,7 +2907,8 @@ fn absorb(
                 was.chained = true;
             }
             compared.extend(next);
-            *lost = (*lost).or(just_lost.take()).or(blind.then_some(at));
+            *lost = (*lost).or(just_lost.take());
+            *forced = blind.then_some(at);
         }
         // `ZF` forced **clear**: an earlier match leaves the case, so only this link's own
         // comparison can make one -- and where that could not be read, what reaches the case is a
@@ -2940,11 +2960,22 @@ fn absorb(
                 true => Vec::new(),
                 false => next.into_iter().collect(),
             };
-            *lost = just_lost
-                .take()
+            // **A loss about the control code survives this link and a forced arm does not**, which
+            // is one slot's worth of difference and three findings' worth of consequence. A `#0`
+            // link *resolves* a forced arm -- an earlier match now takes the branch away from the
+            // case, which rounds five and six measured -- and resolves nothing about a code nobody
+            // could name: `tst code,#1` / `ccmpne code,B,#0` / `b.eq` reaches the handler only for
+            // an **odd** code, so publishing an even `B` invents a case, and `cmp code,A` /
+            // `ccmnne code,C,#4` / `ccmpne code,B,#0` rejects `B` where `B == -C`. Both raised as
+            // P1s by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439); the first was
+            // declined as exotic on the strength of the `ccmn` alone, and `tst` is what priced it
+            // properly.
+            *lost = (*lost)
+                .or(just_lost.take())
                 .or((blind && predecessor).then_some(at))
                 .or(unnamed)
                 .or(unreachable.then_some(at));
+            *forced = None;
         }
     }
     Some(at)
@@ -6824,24 +6855,22 @@ mod tests {
         assert!(found.untracked.is_empty(), "{:?}", found.untracked);
     }
 
-    /// **The limit of the chain fold, pinned rather than implied**: a forced-clear link does not
-    /// carry the loss a `ccmn` before it left.
+    /// **A forced-clear link carries the loss a `ccmn` before it left**, a code nobody could name
+    /// being nothing it resolves.
     ///
     /// `cmp w9,w11` / `ccmnne w9,w10,#4` / `ccmpne w9,w12,#0` / `b.eq`. The `ccmn` reads the control
     /// code against the **negation** of its operand, which this walk does not model, so it records
-    /// its site; the `#0` link then replaces that loss, a `#0` link being exactly what *resolves*
-    /// the other kind of loss standing before it -- a forced arm that admits every code -- and the
-    /// two share one slot. So `w12`'s code is published with nothing saying it is rejected where
-    /// `w10`'s negation equals it.
+    /// its site -- and `w12`'s code is rejected wherever `w10`'s negation equals it, so the case is
+    /// uncertain and the site is what says so.
     ///
-    /// Raised as a P1 by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439) and
-    /// declined: telling the two losses apart is a fifth distinction on this seam, for a shape that
-    /// needs a negated compare against a control code. **This test exists so that it is a known
-    /// limit rather than an implied one**, and so the next reader meets the argument rather than
-    /// the finding. If it starts failing because a loss was kept, that is the fix landing, and this
-    /// assertion is the thing to update.
+    /// **This test was first written the other way round**, pinning the loss being dropped as a
+    /// known limit after that was declined as a fifth distinction for a shape needing a negated
+    /// compare. The round after it reached the same gap through `tst`, which compilers emit
+    /// constantly, and the decline was wrong on price rather than on fact: separating *a loss about
+    /// the code* from *a forced arm admitting every code* closed both, and this assertion is the
+    /// one the old version said to come back and update.
     #[test]
-    fn a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss() {
+    fn a_forced_clear_link_carries_the_loss_a_ccmn_left() {
         let block = vec![
             insn(
                 DISPATCH,
@@ -6937,10 +6966,88 @@ mod tests {
             "{:?}",
             found.cases
         );
-        assert!(
-            found.untracked.is_empty(),
-            "the known limit: the `ccmn`'s site does not survive the link after it -- {:?}",
-            found.untracked
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x20],
+            "the `ccmn`'s site survives the forced-clear link after it"
+        );
+    }
+
+    /// **And it carries the loss an ordinary code-dependent flag write left**, which is the shape
+    /// that priced the rule properly.
+    ///
+    /// `tst w9,#1` / `ccmpne w9,w10,#0` / `b.eq`: the `tst` leaves `ZF` set for an **even** code, so
+    /// the link's condition is false there and forces `ZF` clear -- an even code never reaches the
+    /// handler. `w10`'s code reaches it only if `w10` is odd, which this walk does not know, so
+    /// publishing it with nothing marked would present an invented case as definitive. A bit test
+    /// before a conditional compare is ordinary A64 codegen, unlike the `ccmn` the same gap was
+    /// first reported through. Raised as a P1 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439).
+    #[test]
+    fn a_forced_clear_link_carries_an_ordinary_code_dependent_loss() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w10"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            // An ordinary unmodelled test of the control code: a loss, and no reading.
+            insn(
+                DISPATCH + 0x10,
+                "test",
+                vec![reg("w9"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x14,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x1c, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x10],
+            "the bit test's site survives the link that reinterprets its flags"
         );
     }
 
