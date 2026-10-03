@@ -1575,9 +1575,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `cmp w2,#0` / `ccmpne w9,w10,#4` / `b.eq` -- the forced arm sends every code to the handler, and a
   case list naming only `w10`'s code with an empty `untracked` would read as the whole set. Such a
   link is dropped and its site becomes the loss, which is what this module answered for that shape
-  before a chain could be read at all (raised as a P1 by Codex on
-  [#439](https://github.com/glslang/windbg-mcp/pull/439)). Six tests, each mutation-verified against
-  the rule it is for --
+  before a chain could be read at all. **And a link whose own comparison could not be read marks the
+  chain it continues** -- with `ZF` forced set the links that *were* read stay cases and the site is
+  a loss beside them, and with it forced clear nothing survives but the site, where a predecessor had
+  established the code. Those three arms came from enumerating the fold's six cases in one pass
+  rather than patching the findings that named two of them, which is also how the third was found.
+  **A dropped chain is recorded at the branch that consumes it**, since leaving the site on the
+  outgoing edges made the answer depend on a later equality branch arriving at all. All three P1s
+  were Codex's, on [#439](https://github.com/glslang/windbg-mcp/pull/439); CodeRabbit reviewed the
+  same head and filed nothing. Nine tests against nine rules, each mutation-verified against the
+  rule it is for --
   and the first draft of the one that keeps a dropped chain visible keyed on the terminator's
   *condition* alone, which a `ccmp` carries, so a block ending in one left no case and no site; the
   block-boundary test caught it.
