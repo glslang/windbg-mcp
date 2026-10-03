@@ -186,10 +186,15 @@ into the clean one above.
 codes only the companion has, at `0xf010` and `0xef14` — which are exactly the two sites
 `ioctl_map` reports in `untracked`, so the two agree about *where* they could not read something.
 The target settles what is there: an A64 **conditional-compare chain**, `cmp` / `ccmpne` / `ccmpne`
-/ `beq`, three codes reaching one handler. Neither implementation reads one. The companion
-publishes the chain's first operand as a case — which is how a meaningless `0x00000000` reached
-its map — and misses the `ccmp` operands; this walk publishes neither and records the site. That
-is `FOLLOWUPS.md` item 92 for this side; the companion's half belongs to its own repository.
+/ `beq`, three codes reaching one handler. Neither implementation read one when the lane found
+it. **This side does now** — item 92, closed 2026-10-02: a conditional compare continues the chain
+rather than replacing it, and the `nzcv` immediate says whether an earlier link's match reaches the
+branch. Measured on the guest's own `rdyboost.sys`, 17 codes with two `untracked` sites became 21
+with none. The companion still publishes the chain's first operand as a case — which is how a
+meaningless `0x00000000` reached its map — and misses the `ccmp` operands
+([its issue 14](https://github.com/glslang/binja-windbg-mcp/issues/14)), so the disagreement about
+this driver now runs the other way, and **the lane has not been re-run against it**: that needs a
+fresh capture of the build the debuggee is running.
 
 **The captures are not checked in.** Each is a reading of the build the debuggee is running at the
 time, and a stale one is the exact failure the identity gate above exists to catch. Make one with

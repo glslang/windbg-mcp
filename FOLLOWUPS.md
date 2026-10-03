@@ -74,9 +74,12 @@ second opinion that had never been diffed (item 85), whose lane, once written, f
 (2026-09-19), and item 91 from the one-sided half of that diff (2026-09-20): after item 82's
 literal-pool read landed, `rdyboost`'s thirteen length checks are all still `exact: false`, because
 the refusal they branch to returns through a shared epilogue the walk stops at the head of. And
-item 92 from item 85's lane finding a driver the two implementations disagree about (2026-09-20):
-A64 writes `a || b || c` as three compares feeding one branch, and this walk reads the last of them
-and files the rest in `untracked`. And item 94 from giving the multiprocessor hypervisor
+item 92 from item 85's lane finding a driver the two implementations disagree about
+(2026-09-20) -- A64 writes `a || b || c` as three compares feeding one branch, and this walk read
+the last of them and filed the rest in `untracked` -- is **now in [`DONE.md`](./DONE.md)**, closed
+2026-10-02 by reading the `nzcv` immediate the chain carries rather than by folding conditions; the
+companion's half of that disagreement is open in its own repository, so the lane's answer for that
+driver now differs in the other direction. And item 94 from giving the multiprocessor hypervisor
 investigation's harness the tools it was written against (2026-09-20) -- that investigation is
 item 93 and is now in [`DONE.md`](./DONE.md): a typed breakpoint listing and removal landed, and
 `bd`/`be` deliberately did not. And item 97 from running the heap tools on ARM64 for the
@@ -1576,61 +1579,6 @@ instructions, which is what the paragraph above reads.
 `(true, [next])` arm that decides which tail jump is followed, and `sizes_in`'s fourth rule --
 *"only the branch target being a refusal says the fall-through is the accepted path"* -- which is
 what consumes the answer.
-
-## 92. [windbg-mcp] An A64 conditional-compare chain is a compare chain the walk does not read
-
-**Repo:** `windbg-mcp`.
-
-A64 has `ccmp`, so a compiler writes `if (code == A || code == B || code == C)` as **one** branch
-fed by three compares. `ioctl_map` reads the instruction before the branch and files the rest in
-`untracked`, so every code in such a chain is lost. Measured on `rdyboost` on the live ARM64
-target, 2026-09-20, against `windbg-mcp 0.18.0+g30c4af94`:
-
-```
-rdyboost+0xef00  mov    w11,#0xC008 / movk w11,#0x56,lsl #0x10   ; w11 = 0x0056c008
-rdyboost+0xef08  mov    w10,#0xA0   / movk w10,#7,lsl #0x10      ; w10 = 0x000700a0
-rdyboost+0xef10  cmp    w8,w11
-rdyboost+0xef14  ccmpne w8,w12,#4
-rdyboost+0xef18  ccmpne w8,w10,#4
-rdyboost+0xef1c  beq    rdyboost+0xef7c
-```
-
-Three codes, one handler. The map reports **`untracked` at `0xef18`** -- the last `ccmp` -- and
-names none of them. The second chain is the same shape: `rdyboost+0xf00c` is `cmp w8,#0` /
-`ccmpne w8,w10,#0` / `bne`, with `w10 = 0x00224194` built two instructions earlier, and
-`untracked` carries `0xf010`. So on this driver the map's 17 cases are short by at least
-**`0x0056c008`**, **`0x000700a0`** and **`0x00224194`** -- `w12`'s value was not read and is left
-out rather than guessed at.
-
-**This is the mirror of the x64 defect that made `tools/ghidra_oracle/` worth building.** There,
-`cmp` / `ja` / `je` was *one* compare feeding two branches, which put the compare in one basic
-block and the equality in the next. Here it is several compares feeding one branch, inside a single
-block. Same seam, opposite side, and this one is A64-shaped because x86 has no `ccmp`.
-
-**Not silently short**, which is the one thing already right: both sites are in `untracked`, so the
-answer says it is a lower bound and points at the instruction. What is missing is the values.
-
-**How it was found, and what that says about the fix.** The ARM64 diff lane (item 85, now in
-[`DONE.md`](./DONE.md)) reported two codes only the Binary Ninja companion had, at exactly the two
-sites this walk had filed as `untracked` -- so the two implementations agreed about *where* they
-could not read something, and reading the target settled what was there. The companion is **also**
-wrong here, differently: it publishes the chain's *first* operand as a case and misses the `ccmp`
-operands -- and on the second chain that first operand is the arm the routine **rejects**, so its
-map carries `0x00000000` and not the `0x00224194` the block actually accepts. Filed as
-[`binja-windbg-mcp` issue 14](https://github.com/glslang/binja-windbg-mcp/issues/14). So there is
-no implementation to copy, and a fix here cannot be validated by agreeing with that one.
-
-**Where it picks up:** `ioctl::compare` and the `Condition` it derives (`src/ioctl.rs`), which
-pairs a branch with the comparison before it. A `ccmp` carries its own condition and an `nzcv`
-immediate for the not-taken case, so reading a chain means folding several comparisons into one
-branch's condition -- and **the immediate is what decides the shape**, which the two chains above
-demonstrate in opposite directions. `ccmpne w8,w10,#4` leaves `Z` *set* when the previous compare
-already matched, so a match at any link reaches the `beq` and the chain is a disjunction of three
-accepted codes. `ccmpne w8,w10,#0` leaves `Z` *clear*, so `w8 == 0` takes the `bne` away from the
-case and only the `ccmp`'s own operand falls into it -- one accepted code, and the first compare's
-operand is the rejected one. An earlier draft of this entry read the first of those onto both,
-which would have had a fix accept `0x00000000`. A fixture has to be the real instruction sequence:
-a hand-written chain of ordinary `cmp`s has no `ccmp` in it and already passes.
 
 ## 88. [windbg-mcp] A call that outlives its budget finishes its work and has the answer discarded
 
