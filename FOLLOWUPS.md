@@ -2265,11 +2265,37 @@ are all there and are the parts that took the review rounds to get right.
 so `securekernel.exe`, `winhvr.sys`, `Vid.sys` and any driver answer offline — which is the mode
 most of item 103's static work has actually run in.
 
-## 110. [windbg-mcp] A stop inside an *initialized* Secure Kernel — filed as a decision, not a schedule
+## 110. [windbg-mcp] Initialized Secure Kernel stop/step — live session remains
 
 **Repo:** `windbg-mcp`. **Origin:** item 103's control axis, 2026-10-01, after the owner-partition
 probe passed and then its `--securekernel-breakpoint` mode stopped and resumed real
 `securekernel.exe` code at VTL1 CPL0 and released the VP cleanly.
+
+**Control result passed 2026-10-03.** The narrower route won: a normal one-VP Hyper-V VBS boot kept
+Windows' existing `vmwp` responsible for firmware, storage, devices, VID receipt and completion. A
+debugger attachment drove one `vmwp` thread through its internal registration call for a temporary
+exception handler; the operator-supplied exact-partition primitive only read and wrote VTL1 VP
+state. The initialized guest first stopped at
+its existing `securekernel.exe!DbgBreakPointWithStatus`, stayed held for two agreeing state reads,
+restored its original state, completed through the native dispatcher, removed the handler after its
+deferred cleanup, and retained heartbeat and monotonic uptime for more than 60 seconds.
+
+The next narrow gate also passed once. DR0/DR7 stopped VTL1 CPL0 before a selected five-byte
+instruction, TF produced the second vector-1 event at exactly the decoded successor, DR6 classified
+the two stops as B0 then BS, and the original RIP/RSP/RFLAGS/debug registers and unchanged text were
+verified before release. No token was duplicated, no helper thread or DLL was injected, and the
+controller consumed no VID queue. Stock OpenVMM remains irrelevant because its Windows path is
+VTL0-only. The direct owner-built Windows boot below is historical work, not the selected route.
+
+What remains is productization. `src/skcontrol.rs` now defines the operator-provider contract with
+exact VM/partition/VP/VTL/CR3 identity, rotating running/arming/stopped epochs, compare-and-write
+register updates, and held-event identity; `--sk-control-probe` checks its non-mutating handshake.
+The dedicated DbgEng worker, MCP tools, broader instruction stepping, multi-VP coordination, and
+repeatability runs are still open. The detailed bench sequence and binary guards remain in the
+ignored private plan.
+
+The record below explains how the route was chosen. Cost and “still open” statements in it describe
+the decision point and are superseded by the result above.
 
 **The whole of what this item owns is the word *initialized*.** That result maps a guarded PE and
 calls into it. It boots no Secure Kernel, initializes no Secure Kernel runtime, and its guard reads
@@ -2427,7 +2453,7 @@ to collect what does not depend on that step, and then to falsify it before anyt
    `HLT`, and device `Resume` advanced into later timer work. K1.3 therefore narrows the next
    boundary to a real SynthStor LUN and the central completion dispatcher; it does not claim a
    Windows boot.
-4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
+4. **Retired after the managed route passed: own the boot, reproduce the completion, then stop.** A fresh partition the
    experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
    the minimum in-box device graph; firmware and one synthetic disk off an immutable
    copy-on-write child; a **VTL0 control boot before the VBS one**, so a firmware or storage failure
@@ -2441,15 +2467,17 @@ to collect what does not depend on that step, and then to falsify it before anyt
    release. Addresses come from the **current** VTL1 `CR3` and symbols every run, and the image
    identity is checked against the **guest** build rather than the host device build — the limit
    above is exactly what that guards against.
-5. **The `windbg-mcp` half is item 103's, not a second surface.** `sk_modules`, `sk_symbol` and
+5. **The `windbg-mcp` half now has a separate live-control contract.** `sk_modules`, `sk_symbol` and
    `sk_read_memory` already exist and are served from a capture, behind the `sk::RawSource` seam
    (`src/sk.rs:312`). A **typed live source now exists** — `src/livesrc.rs`, item 103's gate S5w,
    implementing that seam over a transport the operator supplies and driven by `--sk-live` — while
    **EXDI needs a different lab** (E2). So if this item's work needs a live backend, the seam is
    implemented and what is left is deciding whether it belongs behind a *session*: gate S5x measured
    a page of `securekernel.exe`'s `.data` moving inside 20 seconds, which is why S5w is a
-   command-line role and not a fifth tool. Anything this item adds there lands in a dedicated worker
-   process — never in the supervisor, and never with private VID ABI in a DbgEng worker.
+   command-line role and not a fifth capture tool. `src/skcontrol.rs` adds the versioned child-process
+   contract for live register control and held-event correlation. Its capability probe is implemented;
+   the dedicated worker and MCP session still remain. No private provider or VID ABI enters the
+   supervisor.
 
 6. **The exception branch and completion callback — decoded 2026-10-02.** On guarded `Vid.sys`
    10.0.26100.9278, `VidHandleExceptionIntercept` reads the vector's claim slot, constructs mapped
@@ -2461,18 +2489,16 @@ to collect what does not depend on that step, and then to falsify it before anyt
    VM's receive loop. They reopen only if this item's owned-boot route fails on something the device
    model or guest OS cannot supply.
 
-**The honest summary, because a cost table invites the opposite reading.** A **resumable** stop
-inside a normally initialized Microsoft Secure Kernel still requires owning the boot. Immutable
-minimum disks, the VBS/control discrimination, the six-device graph, the final fixed RAM map, and
-diskless UEFI boot-state construction now pass; firmware execution, synthetic storage, and the
-owner-hosted Windows/VBS boot do not yet. A
-**non-resumable observation** remains cheaper, and **inspection** needs neither route because item
-103 ships it off a capture today. Arm 1 is complete and arm 2 remains independent of the owned-boot
-build.
+**Current summary.** A resumable initialized Secure Kernel stop and a one-instruction hardware
+stop/step both pass on the allowlisted disposable managed VM. That proves the minimum one-VP
+mechanism; it is not yet a supported MCP session. Capture inspection remains the shipped surface.
+The next boundary is a dedicated worker which owns one `vmwp` DbgEng attachment and one provider,
+then a small epoch-bound MCP surface. The direct owner-built Windows boot is no longer on that path.
 
-**Safety rules that are not negotiable per arm.** Never enumerate or open an existing VM from the
-owner-partition probe. Use only flattened clones, fresh copy-on-write children and fresh owned
-partitions. Halt every VP before changing VTL1 code or page-table-derived mappings. Verify every
+**Safety rules that are not negotiable per arm.** The owner-partition probes never enumerate or open
+an existing VM. The managed route targets only its exact allowlisted disposable VM and refuses every
+source and preserved proof VM. Use only flattened clones, fresh copy-on-write children and fresh
+owned partitions. Halt every VP before changing VTL1 code or page-table-derived mappings. Verify every
 write by readback and restore it on an unconditional unwind path. Refuse an unexpected message
 rather than completing traffic the experiment cannot identify as its own — the 2026-09-30 consume
 loop drained 64 of its owner's messages and the guest reset inside ten seconds, with arming and

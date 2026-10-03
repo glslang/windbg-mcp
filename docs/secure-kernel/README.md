@@ -16,8 +16,8 @@ and S2).
 worker holds the file rather than a debuggee, and the debugger tools are refused on it because the
 engine beside it has at most `securekernel.exe` open for symbols —
 [`docs/sessions.md`](../sessions.md#secure-kernel-captures) is the caller's half. What that reaches
-is a **capture**. No *tool* here drives a live guest: a session reads a file, and a file does not
-execute.
+is a **capture**. No released MCP tool here drives a live guest: a session reads a file, and a file
+does not execute.
 
 **A live source does exist since gate S5w, as a command-line role rather than a tool.**
 `src/livesrc.rs` implements the same [`sk::RawSource`] seam over a transport the **operator**
@@ -28,6 +28,15 @@ component it will not distribute, which is the same arrangement as the live-kern
 wiring. It is not a fifth tool on purpose — gate S5x measured a page of `securekernel.exe`'s
 `.data` changing inside twenty seconds, so a live source cannot keep the promise a capture
 session's decode-on-open makes.
+
+**The live execution-control contract now exists too.** `src/skcontrol.rs` is a versioned JSON-line
+client for an operator-supplied provider. Exact VM/partition/VP/VTL/CR3 identity and an opaque epoch
+travel on every request; reads and compare-and-write register updates are refused while running;
+and the debugger-owned process publishes the exact held dispatcher event without giving the
+provider a VID receive loop. `--sk-control-probe` validates the non-mutating handshake. The contract
+and its state machine are documented in
+[`live-control-provider.md`](live-control-provider.md). A dedicated worker and MCP tools still have
+to be built around it.
 
 ## The answer so far
 
@@ -80,8 +89,8 @@ this build's `securekernel.pdb` and gets `+0x1335E0` and `+0x127770`, the same t
 the capture produced. The PDB is therefore where a *different* build's offsets come from — but only
 where one is served, which is why the tag scan stays the primary route and not the fallback.
 
-**What is still open:** turning those reads into tools (gate H5), which is scoped as `FOLLOWUPS.md`
-item 103 and is part-built — **S0** is answered above and **S1**, the decode layer, is now in
+**The capture path is complete; the open work is a live execution session.** Item 103's **S0** is
+answered above and **S1**, the decode layer, is now in
 `src/sk.rs` and reproduces every capture-derived landmark in the table below from a checkpoint, with
 two checks the probe did not run: a structural route to the module list that agrees with the block,
 and the provider's own address translator agreeing with the walk on every page of the image.
@@ -99,12 +108,19 @@ Private VBS and VBS-off disk clones also pass the managed preflight three times
 with one VP, fixed 4 GiB RAM, Secure Boot and TPM off; saved-state reads prove
 the positive clone has an initialized Secure Kernel and the control has no VTL1.
 The first owned-boot gate also passes: all six minimum inbox devices initialize and tear down in
-isolated children outside `vmwp`; five do so against fresh direct-VID partitions. What remains is to
-execute firmware and storage and boot Windows/VBS before reproducing the stop in an initialized
-Secure Kernel. The next composition gate passes too: the six devices share one partition and real
+isolated children outside `vmwp`; five do so against fresh direct-VID partitions. That originally
+left firmware, storage, and Windows/VBS boot before the stop could be reproduced. The next
+composition gate passed too: the six devices share one partition and real
 VMBus/BIOS/IOAPIC interfaces for three runs, including the exact fixed 4 GiB Windows RAM topology,
 the recovered start/finish/free resource lifecycle, the RAM-complete query loop, and reverse
-teardown. Firmware execution and storage I/O are next.
+teardown. The direct owner-built boot was then retired when the narrower managed-Windows route
+passed. A normal Hyper-V VBS boot now reaches its initialized Secure Kernel through the existing
+`vmwp` dispatcher: one run held and released the image's published `DbgBreakPointWithStatus`, and a
+second used DR0/DR7 to stop before a selected five-byte instruction, set TF, held the next vector-1
+event at the decoded successor, restored the original state, completed both events through the
+native dispatcher, removed the handler after deferred cleanup, and survived for more than 60
+seconds. Secure Kernel text was unchanged. The remaining work is repeatable automation and the
+dedicated live-control worker/tool surface, not another boot path.
 Driving a live Secure Kernel target through
 **DbgEng/EXDI is parked**, for two independent reasons: EXDI activation does not work on this bench
 and is unresolved, and — measured separately — DbgEng's Secure Kernel record is unreachable, so even
@@ -131,9 +147,11 @@ refused cleanly with `ERROR_FILE_CORRUPT` — and the container-header and entro
 the input is a well-formed file with an encrypted payload. The remaining case needs no Microsoft involvement and is true today: these `.vmrs` files
 inherit `D:\`'s ACL, so any authenticated local user can read a guest's whole RAM.
 
-**The remaining control question is Secure Kernel, not VTL1 kernel privilege in general.** The
-owner-partition probe supplies the latter; reproducing it in an initialized Secure Kernel remains
-open. The earlier question was narrower than "the port is up and nothing connects to it".
+**The initialized-Secure-Kernel control question is now answered on the guarded bench build.** The
+owner-partition probe first supplied VTL1 kernel privilege; the managed-Windows run then reproduced a
+resumable stop in the normally initialized guest Secure Kernel, and the vector-1 run added a hardware
+execution breakpoint plus one architectural step. The earlier question about the unused VTL1 debug
+port remains useful because it explains why this route is root-driven rather than a native KD link.
 **Those were the same wall**, measured 2026-09-27 as gate S5a:
 Secure Kernel has no hypercall or MSR route to that port. Across ten builds from 19041.207 to
 29667.1000 it never writes the three debug hypercall codes at any instruction boundary the scan
@@ -160,9 +178,10 @@ Read them in this order; each assumes the one before it.
 | 3 | [EXDI stub plan](exdi-stub-plan.md) | Expands Phase 4 of (1). What an EXDI stub would have to be, where each component runs, why the EXDI server is surrogate-hosted, and the analysis of LiveCloudKd as an existing implementation — including its GPL-3.0 licence and its revoked-certificate driver. |
 | 4 | [Hypercall feasibility](secure-kernel-hypercall-feasibility.md) | **The main result.** A falsifiable gate-by-gate plan — H0 to H5 — for reading a guest's VTL1 from the root, each gate with a pass condition, a control and a stop condition written before the work. H0 to H4 pass. H2 passes on its **second** mechanism — its cheap driver-free probe failed, and the Code Integrity policy that blocked it is not the one it looks like. H5's route is decided — **H5b**, exposing the reads directly, because driving DbgEng through EXDI is blocked *and* would add no Secure Kernel awareness — and the record carries the H5b gates run so far: **S4**, which settles writes per route, **S0**, which finds a driver-free source that carries VTL1 and its page-table root, **S1**, the decode layer over that source, **S2**, symbols against the image with no debuggee — which also settles that the public PDB has no types — and **S5a**, which joins the hypervisor's live-but-unused VTL1 debug port to Secure Kernel shipping no KD transport, and finds them to be the same wall. |
 | 5 | [VTL1 control probe runbook](vtl1-control-probe.md) | The build-locked native probe, live procedure, private ABI derivation, safety boundary, successful high-integrity result, and guarded Secure Kernel image breakpoint/return mode. |
-| 6 | [Inbox device initialization probe](vdev-initialization-probe.md) | K1.1's guarded six-device contract and live result: guest emulation, BIOS, RTC, IOAPIC, VMBus, and SynthStor independently initialize and tear down outside `vmwp`; the build-bound JSON records every dependency and minimum configuration. |
-| 7 | [Inbox device graph probe](vdev-graph-probe.md) | K1.2's result: the six devices share one owned partition and the measured two-span 4 GiB Windows RAM map for three clean initialization, RAM-complete, reverse-teardown, memory-destruction, and partition-deletion cycles. Firmware and VP start remain open. |
-| 8 | [Diskless inbox firmware preflight](vdev-firmware-probe.md) | K1.3's result: the inbox BIOS builds five exact-readback UEFI memory regions and 19 VP0 state records, five diskless devices cold-power successfully, and the state applies cleanly in three fresh partitions. The boot-memory callback uses byte ranges; a private execution check reaches DXE. VP0 remains outside the tracked acceptance run; storage and the owner-side completion dispatcher remain open. |
+| 6 | [Live VTL1 control provider](live-control-provider.md) | The repository-owned provider protocol: exact target identity, running/arming/stopped epochs, guarded register access, held-event identity, capability probe, and the boundary that keeps VID receipt in the managed `vmwp` debugger process. |
+| 7 | [Inbox device initialization probe](vdev-initialization-probe.md) | K1.1's guarded six-device contract and live result: guest emulation, BIOS, RTC, IOAPIC, VMBus, and SynthStor independently initialize and tear down outside `vmwp`; the build-bound JSON records every dependency and minimum configuration. |
+| 8 | [Inbox device graph probe](vdev-graph-probe.md) | K1.2's result: the six devices share one owned partition and the measured two-span 4 GiB Windows RAM map for three clean initialization, RAM-complete, reverse-teardown, memory-destruction, and partition-deletion cycles. Firmware and VP start remain open. |
+| 9 | [Diskless inbox firmware preflight](vdev-firmware-probe.md) | K1.3's result: the inbox BIOS builds five exact-readback UEFI memory regions and 19 VP0 state records, five diskless devices cold-power successfully, and the state applies cleanly in three fresh partitions. The boot-memory callback uses byte ranges; a private execution check reaches DXE. VP0 remains outside the tracked acceptance run; storage and the owner-side completion dispatcher remain open. |
 
 Two older side-investigations, kept because they are about the same binary:
 
