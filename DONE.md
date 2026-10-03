@@ -4230,6 +4230,27 @@ chain the fold was written for. One check covers the class, because `compared` i
 flag write: it is non-empty at a conditional compare only when the last thing to write the flags was
 a comparison of the control code that the walk read.
 
+**And the enumeration is what finished it, rather than three more fixes.** Two further Codex P1s on
+the same PR were the same class as the predecessor one -- a forced arm read over flags the walk
+cannot evaluate -- so the fold's arms were counted in one pass instead of patched one at a time. The
+pair *(does the `nzcv` keep the earlier links, were they read)* plus *(was this link's own
+comparison read)* has six cases, and three of them need the site marked: no predecessor (the link
+cannot be folded at all, since every code reaches the branch on the forced arm); a **blind** link
+mid-chain with `ZF` forced set (the links that were read are still true cases, so the site is a loss
+*beside* them rather than instead of them -- `cmp w9,w11` / `ccmpne w2,w3,#4` / `b.eq` is reached by
+`w11`'s code *and* by anything satisfying a comparison nothing read); and a blind link with `ZF`
+forced **clear** where a predecessor had established the code, which is the arm neither finding
+named and only the count found. The other three need nothing: both links read, a readable link that
+forces no equality, and a blind link with no predecessor -- where there is nothing about the control
+code anywhere and nothing to say.
+
+**A dropped chain is also recorded at the branch that consumes it**, not handed to the edges below.
+Leaving the site in `lost` made the answer depend on whether an equality branch happened to come
+later: `cmp code,A` / `ccmpne code,B,#4` / `b.lo` with both successors returning reported no case and
+no warning at all. A conditional branch that reads those flags commits the site itself now;
+`cbz`/`cbnz` deliberately do not, reading a register rather than the flags, so a chain they end is
+still live for a branch further on.
+
 **The first draft of that substitution keyed on the terminator's condition alone**, and a `ccmp`
 carries a condition of its own -- so a block *ending* in one looked like a block whose branch had
 just read an equality, and the chain left the answer with no case and no site. The block-boundary
