@@ -2780,18 +2780,18 @@ fn folded_compare(
 /// its own reading is withheld and only the propagation kept: a chain whose middle link this cannot
 /// read still leaves the links around it readable, with the unreadable one in [`Map::untracked`].
 ///
-/// **That last sentence has one hole, and it is recorded rather than closed.** A link that reads the
-/// code and is not modelled leaves a loss, and a **forced-clear** link after it *replaces* that
-/// loss rather than keeping it -- so `cmp code,A` / `ccmnne code,C,#4` / `ccmpne code,B,#0` /
-/// `b.eq` publishes `B` with nothing saying `B` is rejected where `B == -C`. Raised as a P1 by
-/// Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439) and **declined** there, with
-/// `a_forced_clear_link_after_a_ccmn_does_not_carry_its_loss` pinning the answer so the limit is
-/// known rather than implied. Closing it means telling two losses apart -- *this link lost the
-/// code* against *this link's forced arm admits every code* -- which share one slot and which a
-/// `#0` link treats oppositely: it resolves the second, as the rounds before it established, and
-/// does not resolve the first. That is a fifth distinction on this seam, for a shape that needs a
-/// negated compare against a control code, where the four already here are what read the chains a
-/// driver has.
+/// **And the site such a link leaves survives the links after it**, which is what
+/// [`Compared::chained`]'s neighbour [`absorb`] keeps two slots for. A link that reads the code and
+/// is not modelled -- a `ccmn`, or a `ccmp` whose operand did not resolve -- leaves a loss *about
+/// the control code*, and a forced-clear link reinterprets those flags without resolving it: `cmp
+/// code,A` / `ccmnne code,C,#4` / `ccmpne code,B,#0` / `b.eq` reaches the handler for `B` only
+/// where `B != -C`, so the `ccmn`'s site is what says the case is not definitive. That is the
+/// opposite of what a **forced arm** needs -- an earlier match there is turned into a rejection by
+/// the `#0` link, so its site does not survive -- and the two sharing one slot is what three
+/// findings on [#439](https://github.com/glslang/windbg-mcp/pull/439) came down to.
+/// `a_forced_clear_link_carries_the_loss_a_ccmn_left` and
+/// `a_forced_clear_link_carries_an_ordinary_code_dependent_loss` pin this side of it,
+/// `a_forced_clear_link_resolves_a_blind_link_before_it` the other.
 fn chained_compare(
     facts: &Facts,
     instruction: &Instruction,
