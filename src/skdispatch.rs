@@ -35,6 +35,7 @@ pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
 const DEBUG_WAIT: u32 = 60_000;
 const COMPLETION_KICK_AFTER: Duration = Duration::from_secs(12);
 const POWERSHELL_WAIT: Duration = Duration::from_secs(60);
+const PAGE_WALK_WAIT: Duration = Duration::from_secs(60);
 const CLEANUP_SETTLE: Duration = Duration::from_secs(5);
 const POLL: Duration = Duration::from_millis(20);
 const EVENT_TYPE_VECTOR_1: u64 = 0x0100_0002;
@@ -458,6 +459,19 @@ impl VmwpDispatcherState {
         Ok(())
     }
 
+    fn claim_vm_pause(&mut self, target: &TargetIdentity) -> Result<()> {
+        if let Some(bound) = &self.target
+            && bound != target
+        {
+            bail!("the dispatcher adapter is already bound to another target");
+        }
+        self.target = Some(target.clone());
+        // Claim this before Suspend-VM: a helper timeout or failed final verification cannot tell
+        // whether the VM changed state, so recovery must conservatively issue Resume-VM.
+        self.vm_paused = true;
+        Ok(())
+    }
+
     fn finish_completion_kick(&mut self) -> Result<()> {
         let Some(kick) = self.completion_kick.take() else {
             return Ok(());
@@ -566,6 +580,36 @@ struct LiveGuestMemory {
     space: sk::AddressSpace,
 }
 
+struct PageWalkSource<'a> {
+    source: &'a crate::livesrc::LiveSource,
+    deadline: Instant,
+    expired: std::cell::Cell<bool>,
+}
+
+impl RawSource for PageWalkSource<'_> {
+    fn shape(&self) -> sk::GuestShape {
+        self.source.shape()
+    }
+
+    fn max_read(&self) -> usize {
+        self.source.max_read()
+    }
+
+    fn read_chunk(&self, gpa: sk::Gpa, out: &mut [u8]) -> Result<(), sk::ReadFailure> {
+        if Instant::now() >= self.deadline {
+            self.expired.set(true);
+            return Err(sk::ReadFailure::SourceError {
+                detail: "the live VTL1 page-table walk reached its deadline".into(),
+            });
+        }
+        let result = self.source.read_chunk_until(gpa, out, self.deadline);
+        if result.is_err() && Instant::now() >= self.deadline {
+            self.expired.set(true);
+        }
+        result
+    }
+}
+
 impl LiveGuestMemory {
     fn open(command: &str, target: &TargetIdentity) -> Result<Self> {
         let source = crate::livesrc::LiveSource::spawn(command)?;
@@ -579,26 +623,41 @@ impl LiveGuestMemory {
         }
         let root = sk::walkable(&shape)
             .map_err(|why| anyhow!("live-memory source is not walkable: {why:?}"))?;
-        let reader = sk::Reader::new(&source);
-        let (leaves, stats) = sk::walk(&reader, root);
-        if !stats.complete() {
-            bail!("live VTL1 page-table walk was incomplete: {stats:?}");
-        }
+        let space = Self::walk_space(&source, root, "walk")?;
         Ok(Self {
             source,
             root,
-            space: sk::AddressSpace::new(leaves),
+            space,
         })
     }
 
     fn refresh(&mut self) -> Result<()> {
-        let reader = sk::Reader::new(&self.source);
-        let (leaves, stats) = sk::walk(&reader, self.root);
-        if !stats.complete() {
-            bail!("live VTL1 page-table refresh was incomplete: {stats:?}");
-        }
-        self.space = sk::AddressSpace::new(leaves);
+        self.space = Self::walk_space(&self.source, self.root, "refresh")?;
         Ok(())
+    }
+
+    fn walk_space(
+        source: &crate::livesrc::LiveSource,
+        root: sk::Gpa,
+        operation: &str,
+    ) -> Result<sk::AddressSpace> {
+        let source = PageWalkSource {
+            source,
+            deadline: Instant::now() + PAGE_WALK_WAIT,
+            expired: std::cell::Cell::new(false),
+        };
+        let reader = sk::Reader::new(&source);
+        let (leaves, stats) = sk::walk(&reader, root);
+        if source.expired.get() {
+            bail!(
+                "live VTL1 page-table {operation} exceeded its {} second deadline",
+                PAGE_WALK_WAIT.as_secs()
+            );
+        }
+        if !stats.complete() {
+            bail!("live VTL1 page-table {operation} was incomplete: {stats:?}");
+        }
+        Ok(sk::AddressSpace::new(leaves))
     }
 
     fn read_guard(&self, guard: &InstructionGuard) -> Result<InstructionGuard> {
@@ -850,9 +909,8 @@ impl VmwpDispatcher<'_> {
         target: &TargetIdentity,
         instruction: &InstructionGuard,
     ) -> Result<()> {
+        self.state.claim_vm_pause(target)?;
         run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
-        self.state.vm_paused = true;
-        self.state.target = Some(target.clone());
         verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
         if self.state.memory.is_none() {
             self.state.memory = Some(LiveGuestMemory::open(&self.state.live_transport, target)?);
@@ -888,8 +946,8 @@ impl VmwpDispatcher<'_> {
         if self.state.handler_context.is_none() || !self.state.scratch_allocated {
             bail!("the detached dispatcher no longer owns a registered handler");
         }
+        self.state.claim_vm_pause(target)?;
         run_vm_action(&target.vm_id, VmAction::Pause, POWERSHELL_WAIT)?;
-        self.state.vm_paused = true;
         verify_vmwp_pid(&target.vm_id, self.state.vmwp_pid)?;
         let pending = self
             .engine
@@ -1763,6 +1821,32 @@ mod tests {
         assert!(error.to_string().contains("conservatively retained"));
         assert!(state.vm_paused);
         assert!(state.completion_kick.is_none());
+    }
+
+    #[test]
+    fn pause_ownership_is_claimed_with_the_exact_target_before_suspend() {
+        let mut state =
+            VmwpDispatcherState::new(profile(), 4242, 0x2000_0000_1000, "provider".into()).unwrap();
+        let target = target();
+
+        state.claim_vm_pause(&target).unwrap();
+
+        assert_eq!(state.target.as_ref(), Some(&target));
+        assert!(state.vm_paused);
+        let mut other = target.clone();
+        other.expected_cr3 = HexU64(0x120_2000);
+        assert!(state.claim_vm_pause(&other).is_err());
+        assert_eq!(state.target.as_ref(), Some(&target));
+    }
+
+    fn target() -> TargetIdentity {
+        TargetIdentity {
+            vm_id: "11111111-2222-3333-4444-555555555555".into(),
+            partition_id: HexU64(0x85),
+            vp: 0,
+            vtl: 1,
+            expected_cr3: HexU64(0x120_1000),
+        }
     }
 
     fn profile() -> DispatcherProfile {

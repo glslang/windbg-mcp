@@ -175,8 +175,22 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     }
 
     fn bounded<T>(&mut self, exchange: impl FnOnce(&mut Self) -> T) -> T {
-        if let (Some(wait), Some(set_deadline)) = (self.response_wait, self.set_deadline) {
-            set_deadline(&mut self.reader, Some(Instant::now() + wait));
+        self.bounded_until(None, exchange)
+    }
+
+    fn bounded_until<T>(
+        &mut self,
+        outer_deadline: Option<Instant>,
+        exchange: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let exchange_deadline = self.response_wait.map(|wait| Instant::now() + wait);
+        let deadline = match (exchange_deadline, outer_deadline) {
+            (Some(exchange), Some(outer)) => Some(exchange.min(outer)),
+            (Some(exchange), None) => Some(exchange),
+            (None, outer) => outer,
+        };
+        if let Some(set_deadline) = self.set_deadline {
+            set_deadline(&mut self.reader, deadline);
         }
         let result = exchange(self);
         if let Some(set_deadline) = self.set_deadline {
@@ -264,6 +278,17 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     /// Fill `out` from guest physical memory, or say why not.
     fn read_chunk(&mut self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
         self.bounded(|transport| transport.read_chunk_inner(gpa, out))
+    }
+
+    fn read_chunk_until(
+        &mut self,
+        gpa: Gpa,
+        out: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), ReadFailure> {
+        self.bounded_until(Some(deadline), |transport| {
+            transport.read_chunk_inner(gpa, out)
+        })
     }
 
     fn read_chunk_inner(&mut self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
@@ -730,6 +755,23 @@ impl sk::RawSource for LiveSource {
     }
 }
 
+impl LiveSource {
+    /// Read one transport-width chunk while respecting a larger operation's absolute deadline.
+    pub(crate) fn read_chunk_until(
+        &self,
+        gpa: Gpa,
+        out: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), ReadFailure> {
+        match self.transport.borrow_mut().as_mut() {
+            Some(transport) => transport.read_chunk_until(gpa, out, deadline),
+            None => Err(ReadFailure::SourceError {
+                detail: "the transport has already been closed".to_string(),
+            }),
+        }
+    }
+}
+
 /// Split a command line on whitespace, honouring double quotes.
 ///
 /// Not a shell: there is no expansion, no escaping and no single-quote handling, because the string
@@ -846,7 +888,7 @@ mod tests {
 
     struct DeadlineProbe {
         inner: Cursor<Vec<u8>>,
-        changes: Vec<bool>,
+        changes: Vec<Option<Instant>>,
     }
 
     impl std::io::Read for DeadlineProbe {
@@ -866,7 +908,7 @@ mod tests {
     }
 
     fn record_deadline(reader: &mut DeadlineProbe, deadline: Option<Instant>) {
-        reader.changes.push(deadline.is_some());
+        reader.changes.push(deadline);
     }
 
     /// A canned server: the framing is what can be wrong in ways a live guest would hide, so it is
@@ -893,9 +935,35 @@ mod tests {
 
         assert_eq!(&out, b"wxyz");
         assert_eq!(
-            transport.reader.changes,
+            transport
+                .reader
+                .changes
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
             vec![true, false, true, false, true, false]
         );
+    }
+
+    #[test]
+    fn an_outer_operation_deadline_caps_each_exchange() {
+        let reader = DeadlineProbe {
+            inner: Cursor::new(b"OK 4\nwxyz".to_vec()),
+            changes: Vec::new(),
+        };
+        let mut transport =
+            Transport::with_deadline(reader, Vec::new(), Duration::from_secs(60), record_deadline);
+        let outer_deadline = Instant::now() + Duration::from_secs(1);
+        let mut out = [0u8; 4];
+
+        transport
+            .read_chunk_until(Gpa(0x1000), &mut out, outer_deadline)
+            .unwrap();
+
+        assert_eq!(&out, b"wxyz");
+        let armed = transport.reader.changes[0].unwrap();
+        assert!(armed <= outer_deadline);
+        assert_eq!(transport.reader.changes[1], None);
     }
 
     #[test]
