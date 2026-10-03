@@ -84,7 +84,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   then taking the branch away from the case, and resolves nothing about a code nobody could name. So
   `tst code,#1` / `ccmpne code,B,#0` / `b.eq`, which admits only an odd code, no longer publishes an
   even `B` as definitive, and neither does a chain through a `ccmn`. Each direction is pinned by its
-  own mutation -- and the first draft of the one that keeps a dropped chain visible keyed on the
+  own mutation, and all **four** sites that write either slot were then enumerated rather than
+  fixed one at a time -- the first separation had corrected only the arm the finding named, leaving a
+  forced-set link to drop an incoming loss and a readable link to erase a blind one's site, both of
+  which published an invented case as definitive -- and the first draft of the one that keeps a dropped chain visible keyed on the
   terminator's *condition* alone, which a `ccmp` carries, so a block ending in one left no case
   and no site; the block-boundary test caught it.
 

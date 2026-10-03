@@ -2895,7 +2895,13 @@ fn absorb(
         // Forced `ZF` over flags this walk did not read.
         (true, false) => {
             compared.clear();
-            *lost = just_lost.take();
+            // **The incoming loss is kept, this link being conditioned on the flags it was about.**
+            // `tst code,#1` / `ccmpne code,B,#4` / `ccmpne code,C,#0` / `b.eq` admits only an odd
+            // code, and assigning `just_lost` alone dropped the `tst`'s site here -- after which
+            // the forced-clear link had nothing left to preserve and `C` was published as
+            // definitive. Raised as a P1 by Codex on #439, against the round that separated these
+            // two slots and left this arm assigning them.
+            *lost = (*lost).or(just_lost.take());
             *forced = Some(at);
         }
         // Forced `ZF` over a comparison it read: the earlier links stay live as equality-only
@@ -2908,7 +2914,13 @@ fn absorb(
             }
             compared.extend(next);
             *lost = (*lost).or(just_lost.take());
-            *forced = blind.then_some(at);
+            // **A forced arm outlives a readable link.** Only a forced-clear link or an ordinary
+            // flag write resolves one, so a readable `#4` after a blind one must not erase its
+            // site: `cmp code,A` / `ccmpne w2,w3,#4` / `ccmpne code,B,#4` / `b.eq` is taken by
+            // **any** code where `w2 == w3`, and overwriting with `None` here published `A` and `B`
+            // as the whole set. Raised as a P1 by Codex on #439, beside the one above and from the
+            // same cause.
+            *forced = (*forced).or(blind.then_some(at));
         }
         // `ZF` forced **clear**: an earlier match leaves the case, so only this link's own
         // comparison can make one -- and where that could not be read, what reaches the case is a
@@ -7048,6 +7060,198 @@ mod tests {
             found.untracked,
             vec![DISPATCH + 0x10],
             "the bit test's site survives the link that reinterprets its flags"
+        );
+    }
+
+    /// **A loss survives a forced-set link with no predecessor too**, that link being conditioned on
+    /// the very flags the loss was about.
+    ///
+    /// `tst w9,#1` / `ccmpne w9,w10,#4` / `ccmpne w9,w11,#0` / `b.eq`: the `tst` leaves `ZF` set for
+    /// an **even** code, which the first link's condition then reads -- so an even code is forced
+    /// through, the `#0` link forces it clear again, and only an odd code can reach the handler.
+    /// `w11`'s code is published, and the `tst`'s site is what says it is not definitive. Raised as
+    /// a P1 by Codex on [#439](https://github.com/glslang/windbg-mcp/pull/439), against the round
+    /// that separated the two losses and left this arm **assigning** them rather than keeping what
+    /// arrived.
+    #[test]
+    fn a_forced_set_link_with_no_predecessor_keeps_the_loss_before_it() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w10"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "mov",
+                vec![reg("w11"), imm(0x4194)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "movk",
+                vec![reg("w11"), imm(0x22_0000)],
+                Flow::Fallthrough,
+            ),
+            // An unmodelled test of the code: a loss, and no reading for the link to fold onto.
+            insn(
+                DISPATCH + 0x14,
+                "test",
+                vec![reg("w9"), imm(1)],
+                Flow::Fallthrough,
+            ),
+            conditional(
+                DISPATCH + 0x18,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w9",
+                reg("w11"),
+                0,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x20,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x24, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x14],
+            "the bit test's site survives both links: {:?}",
+            found.cases
+        );
+    }
+
+    /// **And a forced arm outlives a readable link after it**, only a forced-clear link or an
+    /// ordinary flag write resolving one.
+    ///
+    /// `cmp w9,w11` / `ccmpne w2,w3,#4` / `ccmpne w9,w10,#4` / `b.eq`: the middle link is blind, so
+    /// where `w2 == w3` it forces `ZF` set and the link after it forces it set again -- **any** code
+    /// reaches the handler on that path. Publishing `w11`'s and `w10`'s codes as the whole set is
+    /// what overwriting the blind link's site with `None` did, the readable link not being blind
+    /// itself. Raised as a P1 by Codex on
+    /// [#439](https://github.com/glslang/windbg-mcp/pull/439), beside the one above and from the
+    /// same cause: the arm assigned a slot it should have joined.
+    #[test]
+    fn a_forced_arm_outlives_a_readable_link_after_it() {
+        let block = vec![
+            insn(
+                DISPATCH,
+                "ldr",
+                vec![reg("x8"), pointer("x1", 0xb8)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 4,
+                "ldr",
+                vec![reg("w9"), mem("x8", 0x18)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 8,
+                "mov",
+                vec![reg("w11"), imm(0xc008)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0xc,
+                "movk",
+                vec![reg("w11"), imm(0x56_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x10,
+                "mov",
+                vec![reg("w10"), imm(0xa0)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x14,
+                "movk",
+                vec![reg("w10"), imm(0x7_0000)],
+                Flow::Fallthrough,
+            ),
+            insn(
+                DISPATCH + 0x18,
+                "cmp",
+                vec![reg("w9"), reg("w11")],
+                Flow::Fallthrough,
+            ),
+            // Blind: reads neither the code nor anything known.
+            conditional(
+                DISPATCH + 0x1c,
+                "ccmp",
+                "w2",
+                reg("w3"),
+                4,
+                Condition::NotEqual,
+            ),
+            conditional(
+                DISPATCH + 0x20,
+                "ccmp",
+                "w9",
+                reg("w10"),
+                4,
+                Condition::NotEqual,
+            ),
+            insn(
+                DISPATCH + 0x24,
+                "b.eq",
+                Vec::new(),
+                Flow::Branch(Some(0x900)),
+            ),
+            insn(DISPATCH + 0x28, "ret", Vec::new(), Flow::Return),
+        ];
+
+        let found = map(
+            DISPATCH,
+            &block,
+            Layout::ARM64,
+            unreadable,
+            in_image,
+            constant_data,
+            never,
+        );
+
+        assert_eq!(
+            found.untracked,
+            vec![DISPATCH + 0x1c],
+            "the blind link's site is not erased by the readable one: {:?}",
+            found.cases
         );
     }
 

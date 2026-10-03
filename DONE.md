@@ -4348,6 +4348,17 @@ measured, and resolves nothing about the first. Separated, each is pinned by a m
 direction: dropping the code-dependent loss fails the `ccmn` and `tst` tests, and not resolving the
 forced arm fails the blind-link test the declines rest on.
 
+**That separation then had to be finished, which is the lesson worth keeping.** It was applied to the
+arm the finding named and to no other, so a forced-set link with no predecessor still *assigned*
+`lost` -- dropping a `tst`'s site, after which the forced-clear arm had nothing to preserve -- and a
+**readable** link still overwrote `forced` with `None`, erasing the site a blind link before it had
+left. Both published an invented case as definitive, and both came back as P1s in the next round.
+The remedy was to enumerate all **four** sites that write either slot and say what each owes: an
+ordinary flag write replaces `lost` and clears `forced`, because the flags it replaces are what both
+were about; a forced-set link keeps `lost` and keeps a forced arm; a forced-clear link keeps `lost`
+and resolves `forced`. When two conflated things are separated, every site that writes either of
+them is in scope -- not the one where the defect was seen.
+
 Also filed there and declined: a duplicate-constant forced-set chain emits two cases for one code,
 which is `docs/structured-results.md`'s documented **case per site** rather than a defect.
 
