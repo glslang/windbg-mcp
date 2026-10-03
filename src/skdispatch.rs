@@ -26,8 +26,8 @@ use crate::sk;
 use crate::sk::RawSource;
 use crate::skcontrol::{HeldEvent, HexU64, StopReason, TargetIdentity};
 use crate::sklive::{
-    DispatcherProfile, DispatcherSite, EventDispatcher, InstructionGuard, LiveControl, LivePhase,
-    LiveTransition, ObservedStop, ReleaseMode, StopRecord,
+    ArmMode, DispatcherProfile, DispatcherSite, EventDispatcher, InstructionGuard, LiveControl,
+    LivePhase, LiveTransition, ObservedStop, ReleaseMode, StopRecord,
 };
 
 pub(crate) const LIVE_CONTROL_FLAG: &str = "--sk-live-control";
@@ -82,9 +82,10 @@ impl Session {
         &mut self,
         engine: &DebugEngine,
         instruction: InstructionGuard,
+        mode: ArmMode,
     ) -> Result<LiveTransition> {
         let mut dispatcher = self.dispatcher.bind(engine);
-        let epoch = self.control.arm(&mut dispatcher, instruction)?;
+        let epoch = self.control.arm(&mut dispatcher, instruction, mode)?;
         Ok(LiveTransition {
             phase: self.control.phase(),
             epoch,
@@ -100,9 +101,10 @@ impl Session {
         &mut self,
         engine: &DebugEngine,
         epoch: &crate::skcontrol::StopEpoch,
+        guard: crate::sklive::StepGuard,
     ) -> Result<LiveTransition> {
         let mut dispatcher = self.dispatcher.bind(engine);
-        let epoch = self.control.step(&mut dispatcher, epoch)?;
+        let epoch = self.control.step(&mut dispatcher, epoch, guard)?;
         Ok(LiveTransition {
             phase: self.control.phase(),
             epoch,
@@ -213,6 +215,7 @@ pub(crate) fn render_read(read: &LiveMemoryRead) -> String {
 struct AcceptanceRequest {
     open: OpenRequest,
     instruction: InstructionGuard,
+    arm_mode: ArmMode,
 }
 
 impl AcceptanceRequest {
@@ -228,6 +231,7 @@ impl AcceptanceRequest {
         let mut expected_cr3 = None;
         let mut instruction_address = None;
         let mut instruction_bytes = None;
+        let mut arm_mode = ArmMode::Redirect;
         let mut iter = args.iter();
         while let Some(arg) = iter.next() {
             let value = |iter: &mut std::slice::Iter<'_, String>| {
@@ -259,6 +263,15 @@ impl AcceptanceRequest {
                 "--instruction-bytes" => {
                     instruction_bytes = Some(parse_hex_bytes(&value(&mut iter)?)?)
                 }
+                "--arm-mode" => {
+                    arm_mode = match value(&mut iter)?.as_str() {
+                        "redirect" => ArmMode::Redirect,
+                        "natural" => ArmMode::Natural,
+                        other => {
+                            bail!("invalid --arm-mode {other:?}; expected redirect or natural")
+                        }
+                    }
+                }
                 other => bail!("unknown argument {other:?}\n\n{}", live_control_usage()),
             }
         }
@@ -284,6 +297,7 @@ impl AcceptanceRequest {
                 target,
             },
             instruction,
+            arm_mode,
         })
     }
 }
@@ -304,9 +318,16 @@ pub(crate) fn run_acceptance(args: &[String], engine: &DebugEngine) -> Result<()
         eprintln!("control provider: {line}");
     }
     let result = (|| {
-        session.arm(engine, instruction)?;
+        session.arm(engine, instruction, request.arm_mode)?;
         let hardware_stop = session.wait_for_stop(engine)?;
-        session.step(engine, &hardware_stop.epoch)?;
+        session.step(
+            engine,
+            &hardware_stop.epoch,
+            crate::sklive::StepGuard {
+                instruction: None,
+                expected_rips: Vec::new(),
+            },
+        )?;
         let single_step_stop = session.wait_for_stop(engine)?;
         session.continue_from(engine, &single_step_stop.epoch)?;
         session.close(engine)?;
@@ -334,7 +355,8 @@ fn live_control_usage() -> &'static str {
      --control-transport \"<command line>\" --live-transport \"<command line>\" \
      --vmwp-pid <pid> --dispatcher-vnd <address> --vm-id <guid> \
      --partition-id <number> --expected-cr3 <number> \
-     --instruction-address <number> --instruction-bytes <hex> [--vp <number>]"
+     --instruction-address <number> --instruction-bytes <hex> \
+     [--arm-mode <redirect|natural>] [--vp <number>]"
 }
 
 fn cli_word(name: &str, value: &str) -> Result<u64> {
@@ -563,6 +585,10 @@ impl EventDispatcher for VmwpDispatcher<'_> {
         Ok(())
     }
 
+    fn verify_instruction(&mut self, instruction: &InstructionGuard) -> Result<()> {
+        VmwpDispatcher::verify_instruction(self, instruction)
+    }
+
     fn wait_for_stop(
         &mut self,
         target: &TargetIdentity,
@@ -601,8 +627,14 @@ impl EventDispatcher for VmwpDispatcher<'_> {
                     .checked_add(u64::from(self.state.profile.layout.event_context))
                     .context("event context address overflowed")?,
             )?;
+            let vp = self.read_u32(
+                event_pointer
+                    .checked_add(u64::from(self.state.profile.layout.event_vp))
+                    .context("event VP address overflowed")?,
+            )?;
             if message_type == EVENT_TYPE_VECTOR_1
                 && context == self.state.handler_context.context("no handler context")?
+                && vp == target.vp
             {
                 break event_pointer;
             }
@@ -1287,6 +1319,11 @@ impl VmwpDispatcher<'_> {
         Ok(self.engine.read_memory(address, 1).map_err(debugger)?[0])
     }
 
+    fn read_u32(&self, address: u64) -> Result<u32> {
+        let bytes = self.engine.read_memory(address, 4).map_err(debugger)?;
+        Ok(u32::from_le_bytes(bytes.try_into().unwrap()))
+    }
+
     fn read_u64(&self, address: u64) -> Result<u64> {
         let bytes = self.engine.read_memory(address, 8).map_err(debugger)?;
         Ok(u64::from_le_bytes(bytes.try_into().unwrap()))
@@ -1577,6 +1614,7 @@ mod tests {
                 callback_descriptor: 0x200,
                 callback_mirror: 0x30,
                 event_context: 8,
+                event_vp: 0x10,
                 exchange_advance: 0x148,
                 callback_pointer: 0x80,
                 callback_flags: 0x88,

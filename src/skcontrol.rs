@@ -14,8 +14,9 @@
 //! changed register is a refusal rather than a blind overwrite.
 
 use std::fmt;
-use std::io::{BufRead, BufReader, Write};
+use std::io::{self, BufRead, BufReader, Read, Write};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc::{self, Receiver};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
@@ -30,6 +31,7 @@ const MAX_BANNER_LINES: usize = 64;
 const MAX_LINE_BYTES: u64 = 64 * 1024;
 const MAX_REGISTERS: usize = 32;
 const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
+const PROVIDER_REPLY_GRACE: Duration = Duration::from_secs(10);
 
 /// A 64-bit word encoded as a hexadecimal string, so JSON consumers never lose address bits.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, JsonSchema)]
@@ -711,10 +713,123 @@ impl<R: BufRead, W: Write> ControlSession<R, W> {
     }
 }
 
+/// Moves blocking pipe reads off the engine thread and gives each provider line a hard deadline.
+/// The reader owns stdout until the provider exits; dropping the receiver makes its next send end
+/// the thread, and [`ChildGuard`] closes a provider which remains blocked in its own write loop.
+struct TimedChildReader {
+    lines: Receiver<io::Result<Vec<u8>>>,
+    current: Vec<u8>,
+    offset: usize,
+    eof: bool,
+    reply_grace: Duration,
+}
+
+impl TimedChildReader {
+    fn spawn(stdout: ChildStdout) -> Result<Self> {
+        let (send, lines) = mpsc::sync_channel(1);
+        std::thread::Builder::new()
+            .name("sk-control-reader".into())
+            .spawn(move || {
+                let mut reader = BufReader::new(stdout);
+                loop {
+                    let mut line = Vec::new();
+                    let read = {
+                        let mut limited = Read::take(&mut reader, MAX_LINE_BYTES);
+                        limited.read_until(b'\n', &mut line)
+                    };
+                    match read {
+                        Ok(0) => {
+                            let _ = send.send(Ok(Vec::new()));
+                            break;
+                        }
+                        Ok(_) => {
+                            if send.send(Ok(line)).is_err() {
+                                break;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = send.send(Err(error));
+                            break;
+                        }
+                    }
+                }
+            })
+            .context("spawning the control-provider reader failed")?;
+        Ok(Self {
+            lines,
+            current: Vec::new(),
+            offset: 0,
+            eof: false,
+            reply_grace: PROVIDER_REPLY_GRACE,
+        })
+    }
+
+    #[cfg(test)]
+    fn from_receiver(lines: Receiver<io::Result<Vec<u8>>>, reply_grace: Duration) -> Self {
+        Self {
+            lines,
+            current: Vec::new(),
+            offset: 0,
+            eof: false,
+            reply_grace,
+        }
+    }
+
+    fn receive(&mut self) -> io::Result<()> {
+        if self.eof || self.offset < self.current.len() {
+            return Ok(());
+        }
+        self.current.clear();
+        self.offset = 0;
+        match self.lines.recv_timeout(self.reply_grace) {
+            Ok(Ok(line)) if line.is_empty() => self.eof = true,
+            Ok(Ok(line)) => self.current = line,
+            Ok(Err(error)) => return Err(error),
+            Err(mpsc::RecvTimeoutError::Timeout) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    format!(
+                        "control provider sent no complete line within {} seconds",
+                        self.reply_grace.as_secs()
+                    ),
+                ));
+            }
+            Err(mpsc::RecvTimeoutError::Disconnected) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::UnexpectedEof,
+                    "control provider reader stopped",
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
+impl Read for TimedChildReader {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        let available = self.fill_buf()?;
+        let length = output.len().min(available.len());
+        output[..length].copy_from_slice(&available[..length]);
+        self.consume(length);
+        Ok(length)
+    }
+}
+
+impl BufRead for TimedChildReader {
+    fn fill_buf(&mut self) -> io::Result<&[u8]> {
+        self.receive()?;
+        Ok(&self.current[self.offset..])
+    }
+
+    fn consume(&mut self, amount: usize) {
+        self.offset = self.current.len().min(self.offset.saturating_add(amount));
+    }
+}
+
 /// Owns one operator provider and closes its request pipe before applying the bounded child-process
 /// teardown. The live-control worker keeps this object on its engine thread beside its dispatcher.
 pub(crate) struct ControlProcess {
-    session: Option<ControlSession<BufReader<ChildStdout>, ChildStdin>>,
+    session: Option<ControlSession<TimedChildReader, ChildStdin>>,
     child: ChildGuard,
 }
 
@@ -752,7 +867,7 @@ impl ControlProcess {
             .and_then(|child| child.stdout.take())
             .context("the provider has no stdout")?;
         let (session, skipped) =
-            ControlSession::open(BufReader::new(stdout), stdin, expected_target)?;
+            ControlSession::open(TimedChildReader::spawn(stdout)?, stdin, expected_target)?;
         Ok((
             Self {
                 session: Some(session),
@@ -762,13 +877,13 @@ impl ControlProcess {
         ))
     }
 
-    fn session(&self) -> &ControlSession<BufReader<ChildStdout>, ChildStdin> {
+    fn session(&self) -> &ControlSession<TimedChildReader, ChildStdin> {
         self.session
             .as_ref()
             .expect("a live ControlProcess always owns its session")
     }
 
-    fn session_mut(&mut self) -> &mut ControlSession<BufReader<ChildStdout>, ChildStdin> {
+    fn session_mut(&mut self) -> &mut ControlSession<TimedChildReader, ChildStdin> {
         self.session
             .as_mut()
             .expect("a live ControlProcess always owns its session")
@@ -1386,5 +1501,22 @@ mod tests {
         .err()
         .unwrap();
         assert!(format!("{error}").contains("requested by the operator"));
+    }
+
+    #[test]
+    fn a_provider_which_stays_alive_but_sends_no_reply_is_bounded() {
+        let (_writer, lines) = mpsc::sync_channel(1);
+        let mut reader = TimedChildReader::from_receiver(lines, Duration::from_millis(1));
+        let error = read_line(&mut reader).unwrap_err();
+        assert!(format!("{error:#}").contains("no complete line"));
+    }
+
+    #[test]
+    fn a_provider_reader_which_dies_is_an_eof_not_an_unbounded_wait() {
+        let (writer, lines) = mpsc::sync_channel(1);
+        drop(writer);
+        let mut reader = TimedChildReader::from_receiver(lines, Duration::from_secs(1));
+        let error = read_line(&mut reader).unwrap_err();
+        assert!(format!("{error:#}").contains("reader stopped"));
     }
 }

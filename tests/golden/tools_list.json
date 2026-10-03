@@ -1868,6 +1868,7 @@
       "params": [
         "address: string",
         "bytes: string",
+        "mode: ref(#/$defs/ArmMode)",
         "session_id: string|null"
       ],
       "required": [
@@ -1973,8 +1974,10 @@
           {
             "payload": null,
             "required": [
+              "arm_mode",
               "epoch",
               "event",
+              "expected_rips",
               "instruction",
               "registers",
               "status",
@@ -2030,7 +2033,10 @@
         "root": "object"
       },
       "params": [
+        "address: string|null",
+        "bytes: string|null",
         "epoch: string",
+        "expected_rips: array<string>",
         "session_id: string|null"
       ],
       "required": [
@@ -2051,8 +2057,10 @@
           {
             "payload": null,
             "required": [
+              "arm_mode",
               "epoch",
               "event",
+              "expected_rips",
               "instruction",
               "registers",
               "status",

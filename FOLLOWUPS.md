@@ -2280,19 +2280,28 @@ its existing `securekernel.exe!DbgBreakPointWithStatus`, stayed held for two agr
 restored its original state, completed through the native dispatcher, removed the handler after its
 deferred cleanup, and retained heartbeat and monotonic uptime for more than 60 seconds.
 
-The next narrow gate also passed once. DR0/DR7 stopped VTL1 CPL0 before a selected five-byte
+The redirected narrow gate also passed. DR0/DR7 stopped VTL1 CPL0 before a selected five-byte
 instruction, TF produced the second vector-1 event at exactly the decoded successor, DR6 classified
 the two stops as B0 then BS, and the original RIP/RSP/RFLAGS/debug registers and unchanged text were
-verified before release. No token was duplicated, no helper thread or DLL was injected, and the
-controller consumed no VID queue. Stock OpenVMM remains irrelevant because its Windows path is
-VTL0-only. The direct owner-built Windows boot below is historical work, not the selected route.
+verified before release. The natural-flow gate then left RIP unchanged, reached
+`securekernel!KiTimerInterrupt` through guest execution, and made 16 guarded steps through register,
+stack, memory and conditional-branch instructions. Each later step re-proved its current bytes and
+the branch admitted only its two decoded destinations. Continue preserved guest execution progress
+while restoring the debug state and baseline TF/RF bits. No token was duplicated, no helper thread
+or DLL was injected, and the controller consumed no VID queue. Stock OpenVMM remains irrelevant
+because its Windows path is VTL0-only. The direct owner-built Windows boot below is historical work,
+not the selected route.
 
-The minimum MCP surface is implemented; broader hardening remains. `src/skcontrol.rs` defines the operator-provider contract with exact
-VM/partition/VP/VTL/CR3 identity, rotating running/arming/stopped epochs, compare-and-write register
-updates, and held-event identity; `--sk-control-probe` checks its non-mutating handshake.
-`src/sklive.rs` now adds the worker-side one-VP state machine: it owns the outer
+The minimum MCP surface is implemented; broader hardening remains. `src/skcontrol.rs` defines the
+operator-provider contract with exact VM/partition/VP/VTL/CR3 identity, rotating
+running/arming/stopped epochs, compare-and-write register
+updates, and held-event identity; `--sk-control-probe` checks its non-mutating handshake. Provider
+stdout now has a 10-second per-line deadline on a dedicated non-DbgEng reader thread, so silence
+cannot pin the engine worker.
+`src/sklive.rs` now adds the worker-side selected-VP state machine: it owns the outer
 running/arming/stopped/releasing/faulted lifecycle, exact callback-context and instruction guards,
-two-read stop evidence, epoch-consuming step/continue, and fail-closed restoration.
+two-read stop evidence, repeated epoch-consuming steps with bounded destinations, and fail-closed
+restoration.
 `src/skdispatch.rs` now implements the exact-build DbgEng adapter and opt-in
 `--sk-live-control` acceptance role. It verifies the `vmwp` image and every breakpoint site, owns
 handler registration and deferred cleanup, completes both events through the native path, frees
@@ -2301,10 +2310,22 @@ VM; the recorded repeat preserved the same `vmwp` and heartbeat for 60 seconds, 
 crash record, re-read unchanged guest text, and left the VM Off. A separate live session now binds,
 arms, waits, inspects, steps, continues and closes through typed epoch-bound MCP tools; its live MCP
 acceptance also retained the same `vmwp` and healthy advancing heartbeat for 60 seconds, found no
-scoped crash record, preserved the guarded bytes and left the VM Off. Ordinary debugger tools are
-refused because their target would be `vmwp`. Broader instruction stepping,
-multi-VP coordination, and three-fresh-boot hardening remain open. The detailed bench
-sequence, profile, provider and evidence remain in the ignored private plan.
+scoped crash record, preserved the guarded bytes and left the VM Off. A two-vCPU run then bound VP1,
+required the exact-build native vector event to report VP1, stopped and stepped that VP, preserved
+VP0's debug state, restored VP1, and passed the same independent 60-second audit. Its preceding
+natural-flow timeout restored and resumed before faulting, which supplies one live recovery case.
+Two fresh differencing children repeated the 16-step lifecycle and independent survival audit at
+new partitions and image bases, completing the three-run target. The live wrong-build case refused
+before provider mutation and resumed unchanged. A provider exit at stop publication returned
+`target_left_paused=true`; teardown reported recovery required, claimed no release and retained the
+exact worker. Independent VTL1 reads proved the owned DR0 state and guest text remained intact. The
+failure child was then discarded because its dead provider could not restore the state; ending the
+unresolved debugger replaced `vmwp`, so this is containment evidence rather than recovery evidence.
+Ordinary debugger tools are refused because their target would be `vmwp`. Offline injection covers
+dispatcher timeout, provider death, debugger loss after restoration, target identity change, and
+pre-mutation build mismatch. Live debugger-loss-after-restoration and VM-reset identity cases, plus
+broader exact-build profile coverage, remain open. The detailed bench sequence, profile, provider
+and evidence remain in the ignored private plan.
 
 The record below explains how the route was chosen. Cost and “still open” statements in it describe
 the decision point and are superseded by the result above.

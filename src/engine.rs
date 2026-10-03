@@ -4951,6 +4951,10 @@ mod tests {
             },
             EngineOp::SkLiveStep {
                 epoch: epoch.clone(),
+                guard: crate::sklive::StepGuard {
+                    instruction: None,
+                    expected_rips: Vec::new(),
+                },
             },
             EngineOp::SkLiveContinue { epoch },
         ];
