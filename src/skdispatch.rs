@@ -1141,13 +1141,15 @@ impl VmwpDispatcher<'_> {
                 self.state.profile.scratch_size
             ))
             .map_err(debugger)?;
+        // A successful command created target-process state. Claim it before the verification
+        // read so any read failure still makes recovery and teardown issue the matching free.
+        self.state.scratch_allocated = true;
         self.engine
             .read_memory(
                 base,
                 usize::try_from(self.state.profile.scratch_size).unwrap(),
             )
             .map_err(debugger)?;
-        self.state.scratch_allocated = true;
 
         let returned = self.scratch(self.state.profile.layout.returned_context)?;
         let handler = self.scratch(self.state.profile.layout.handler_descriptor)?;
