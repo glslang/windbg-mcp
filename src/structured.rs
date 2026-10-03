@@ -580,6 +580,9 @@ pub enum SessionKindName {
     /// A Hyper-V capture read for its Secure Kernel (VTL1), which is a file and has no
     /// debuggee: nothing executes, and the debugger tools are refused on it.
     SecureKernel,
+    /// A live, one-VP Secure Kernel controller. Its worker owns the provider and any temporary
+    /// `vmwp` debugger attachment; only epoch-bound VTL1 operations are accepted.
+    SecureKernelLive,
 }
 
 impl From<SessionKind> for SessionKindName {
@@ -592,6 +595,7 @@ impl From<SessionKind> for SessionKindName {
             SessionKind::Process => Self::Process,
             SessionKind::Launch => Self::Launch,
             SessionKind::SecureKernel => Self::SecureKernel,
+            SessionKind::SecureKernelLive => Self::SecureKernelLive,
         }
     }
 }
@@ -695,6 +699,9 @@ pub struct SessionInfo {
 pub enum SessionStateInfo {
     /// Controller retained; target state is unknown and ordinary operations are refused.
     KernelUnresolved { why: String },
+    /// Live VTL1 cleanup was not confirmed. Ordinary operations are refused and the worker is
+    /// retained when available so teardown can be retried without discarding adapter state.
+    LiveControlUnresolved { why: String },
     /// The open has started; nothing has been created or claimed yet.
     Opening,
     /// The target has been created or claimed and the debugger is waiting for it to break in.
@@ -728,6 +735,9 @@ impl SessionStateInfo {
     pub fn of(state: &SessionState, waits_indefinitely: bool, overdue: bool) -> Self {
         match state {
             SessionState::KernelUnresolved(why) => Self::KernelUnresolved { why: why.clone() },
+            SessionState::LiveControlUnresolved(why) => {
+                Self::LiveControlUnresolved { why: why.clone() }
+            }
             SessionState::Opening => Self::Opening,
             SessionState::Attaching => Self::Attaching {
                 waits_indefinitely,

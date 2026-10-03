@@ -12,6 +12,7 @@ cargo test --test mcp_smoke              # protocol tier (default)
 $env:WINDBG_MCP_SMOKE_DUMP = "1"; cargo test --test mcp_smoke   # + the debugger tier
 $env:WINDBG_MCP_SMOKE_TTD  = "1"; cargo test --test mcp_smoke   # + the TTD tier (elevated)
 $env:WINDBG_MCP_SMOKE_SK_CAPTURE = "<a .vmrs>"; cargo test --test mcp_smoke   # + the capture tier
+$env:WINDBG_MCP_SMOKE_SK_LIVE = "<private config.json>"; cargo test --test mcp_smoke -- --ignored --exact a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes
 ```
 
 It builds and runs against `target/debug`, so it never touches the `target/release` exe a
@@ -44,6 +45,7 @@ clock says *some* tier had work to do; which one is a `RAN:`/`SKIPPED` line, not
 | **Bounded command** | `--ignored` | `dbgeng.dll`, the sample dump, ~1 minute | the watchdog wiring, which now spans two processes |
 | **Live kernel** | `--ignored` + `WINDBG_MCP_SMOKE_KERNEL` | a live kernel target you can freeze — KDNET, or serial | that a kernel attach *lands*, coexists, and is let go — by `end_session` and by a disconnect; and that a `debug_batch` which patches a byte of the running kernel puts it back |
 | **Live hypervisor** | `--ignored` + `WINDBG_MCP_SMOKE_HYPERVISOR_PROFILE`; two more variables below | a disposable Microsoft hypervisor target, reached by its own configured profile | separate detach-only tests for default and experimental announcement attach; broader identity, inspection, step, and breakpoint-management test; [runbook, independent health checks, and limits](hypervisor-debugging.md#validation) |
+| **Live Secure Kernel** | `--ignored` + `WINDBG_MCP_SMOKE_SK_LIVE` | one exact disposable VBS VM, private provider commands and an exact-build `vmwp` profile | the typed MCP bind/arm/wait/inspect/step/continue/close lifecycle and its worker isolation |
 | **MessageManager CTF** | `--ignored` + live-kernel gate + `WINDBG_MCP_SMOKE_CTF=1` | the challenge VM, WinRM, full `nt` symbols | the real driver and retained `Tgsm` pool objects through the shipped MCP transport |
 | **TTD** | `WINDBG_MCP_SMOKE_TTD=1` | `TTD.exe`, **elevation**, and a WinDbg engine payload beside the binary to replay what it records — both benches' came from `setup.md`'s unpacked `.msixbundle` rather than from an installed package, the ARM64 one as of 2026-08-29 | that `record_trace` records the program it was given and reports a finished recording as one, and that a TTD query returns records rather than bare indices |
 | **32-bit managed target** | a 32-bit `dbgeng.dll` in an `x86` directory beside the binary under test | that engine, `x86\windbg-mcp.exe` beside it, and the `csc.exe` every stock Windows ships — it compiles and dumps its own fixture | that a 32-bit dump **and** a 32-bit live process are each opened by a worker of *their* architecture, so 32-bit SOS loads — which this server's own engine cannot do at all |
@@ -146,6 +148,16 @@ nothing** — a checkpoint reads the same copied off the host as on it, which is
 `FOLLOWUPS.md` item 103 measured. What it asserts is the *shape* of the answer — a decode, or the
 reason there is none, never neither — because whether the capture has VTL1 in it is a property of
 somebody's guest rather than of this server. The figures are in that item.
+
+**The live Secure Kernel tier is a different, explicitly disposable gate.**
+`WINDBG_MCP_SMOKE_SK_LIVE` names a private JSON file containing `profile`, `control_transport`,
+`live_transport`, `vmwp_pid`, `dispatcher_vnd`, `vm_id`, `partition_id`, `expected_cr3`,
+`instruction_address` and `instruction_bytes`; `vp` and `read_size` are optional. The file must also
+carry `"disposable": true`. The ignored test opens a separate live-control session, observes an
+exact DR0 VTL1 CPL0 stop, checks the retained registers and a stopped virtual-memory read, consumes
+the epoch to single-step, consumes the next epoch to restore and continue, then requires teardown
+to report both release and a running target. Run it alone through the bench's independent VM
+heartbeat/crash/unchanged-text wrapper. The repository stores none of the config or evidence.
 
 **The sample they open follows the host.** Four dumps are checked in (below), and the two crashes
 a *memory* read is asserted against are paired with the architecture the tests are running on — so

@@ -6,8 +6,8 @@
       "inputSchema": 1262,
       "modelVisible": 2631,
       "name": "attach_kernel",
-      "outputSchema": 4567,
-      "wire": 7352
+      "outputSchema": 4614,
+      "wire": 7399
     },
     {
       "annotations": 122,
@@ -15,8 +15,8 @@
       "inputSchema": 103,
       "modelVisible": 400,
       "name": "attach_kernel_local",
-      "outputSchema": 4567,
-      "wire": 5120
+      "outputSchema": 4614,
+      "wire": 5167
     },
     {
       "annotations": 117,
@@ -24,8 +24,8 @@
       "inputSchema": 233,
       "modelVisible": 576,
       "name": "attach_process",
-      "outputSchema": 4567,
-      "wire": 5291
+      "outputSchema": 4614,
+      "wire": 5338
     },
     {
       "annotations": 68,
@@ -321,8 +321,8 @@
       "inputSchema": 258,
       "modelVisible": 615,
       "name": "launch",
-      "outputSchema": 4567,
-      "wire": 5342
+      "outputSchema": 4614,
+      "wire": 5389
     },
     {
       "annotations": 65,
@@ -339,8 +339,8 @@
       "inputSchema": 240,
       "modelVisible": 747,
       "name": "open_dump",
-      "outputSchema": 4567,
-      "wire": 5473
+      "outputSchema": 4614,
+      "wire": 5520
     },
     {
       "annotations": 129,
@@ -348,8 +348,17 @@
       "inputSchema": 2433,
       "modelVisible": 3947,
       "name": "open_sk_capture",
-      "outputSchema": 9709,
-      "wire": 13816
+      "outputSchema": 9756,
+      "wire": 13863
+    },
+    {
+      "annotations": 132,
+      "description": 208,
+      "inputSchema": 1341,
+      "modelVisible": 1610,
+      "name": "open_sk_live_control",
+      "outputSchema": 4614,
+      "wire": 6387
     },
     {
       "annotations": 114,
@@ -357,8 +366,8 @@
       "inputSchema": 240,
       "modelVisible": 563,
       "name": "open_trace",
-      "outputSchema": 4567,
-      "wire": 5275
+      "outputSchema": 4614,
+      "wire": 5322
     },
     {
       "annotations": 123,
@@ -465,8 +474,8 @@
       "inputSchema": 343,
       "modelVisible": 1416,
       "name": "session_status",
-      "outputSchema": 3851,
-      "wire": 5371
+      "outputSchema": 4042,
+      "wire": 5562
     },
     {
       "annotations": 114,
@@ -485,6 +494,60 @@
       "name": "set_symbol_path",
       "outputSchema": 0,
       "wire": 2384
+    },
+    {
+      "annotations": 127,
+      "description": 240,
+      "inputSchema": 1148,
+      "modelVisible": 1440,
+      "name": "sk_live_arm",
+      "outputSchema": 1291,
+      "wire": 2889
+    },
+    {
+      "annotations": 127,
+      "description": 156,
+      "inputSchema": 401,
+      "modelVisible": 614,
+      "name": "sk_live_continue",
+      "outputSchema": 1291,
+      "wire": 2063
+    },
+    {
+      "annotations": 129,
+      "description": 183,
+      "inputSchema": 543,
+      "modelVisible": 786,
+      "name": "sk_live_read_memory",
+      "outputSchema": 1446,
+      "wire": 2392
+    },
+    {
+      "annotations": 132,
+      "description": 90,
+      "inputSchema": 343,
+      "modelVisible": 491,
+      "name": "sk_live_registers",
+      "outputSchema": 3830,
+      "wire": 4484
+    },
+    {
+      "annotations": 123,
+      "description": 273,
+      "inputSchema": 1005,
+      "modelVisible": 1331,
+      "name": "sk_live_step",
+      "outputSchema": 1291,
+      "wire": 2776
+    },
+    {
+      "annotations": 132,
+      "description": 173,
+      "inputSchema": 343,
+      "modelVisible": 569,
+      "name": "sk_live_wait",
+      "outputSchema": 3830,
+      "wire": 4562
     },
     {
       "annotations": 126,
@@ -605,15 +668,15 @@
     }
   ],
   "totals": {
-    "annotations": 7180,
-    "description": 40965,
-    "inputSchema": 61093,
+    "annotations": 8082,
+    "description": 42288,
+    "inputSchema": 66217,
     "instructions": 2022,
-    "modelVisible": 105588,
-    "outputSchema": 179919,
-    "payload": 294602,
-    "tools": 67,
-    "wire": 294524,
+    "modelVisible": 112429,
+    "outputSchema": 198032,
+    "payload": 320682,
+    "tools": 74,
+    "wire": 320597,
     "worstTool": "debug_batch",
     "worstToolModelVisible": 10842
   }

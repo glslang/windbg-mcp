@@ -94,6 +94,64 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   terminator's *condition* alone, which a `ccmp` carries, so a block ending in one left no case
   and no site; the block-boundary test caught it.
 
+### Added
+
+- **The immutable minimum Windows/VBS boot inputs pass (`FOLLOWUPS.md` item
+  110, K1.0).** Private flattened bases from the VBS and VBS-off sources each
+  cold-boot three times through disposable differencing children with one VP,
+  fixed 4 GiB RAM, Secure Boot off, no TPM, network, DVD, or Guest Service
+  Interface. Paired saved-state reads distinguish them directly: the positive
+  clone exposes VTL masks `3`, a readable long-mode VTL1 root, and a validated
+  Secure Kernel module list containing `skci.dll`; the control exposes masks
+  `1` and refuses VTL1. This also measures the common two-span physical memory
+  map used by K1.2.
+- **The fatal inbox-device initialization spike for an owned Windows/VBS boot
+  passed for all six minimum devices (`FOLLOWUPS.md` item 110, K1.1).**
+  `tools/vdev_initialization_probe.py` runs guest emulation, BIOS, RTC, IOAPIC,
+  VMBus, and SynthStor in separate bounded children; guards the exact device
+  and VID binaries; and asserts their recovered `IVirtualDevice` vtables,
+  required and optional dependencies, minimum XML, repository reads, and
+  service callbacks. Each independently returns `S_OK` from initialization and
+  teardown. RTC needs no partition; the other five children each create and
+  delete a fresh process-local direct-VID partition. VMBus still proves the
+  ownership link by opening its endpoint after the optional handle broker
+  returns `E_NOTIMPL`. The generated, build-bound contract is committed as
+  `docs/secure-kernel/vdev-contract-26100.8457.json`. This rules out `vmwp`
+  process identity, VMMS-managed repository state, and a second VID receive
+  loop as requirements for all six independent initialization paths. That
+  result opened the composition work recorded in the next entry.
+- **The six-device composition and lifecycle subgate passes three times in one
+  owner partition (`FOLLOWUPS.md` item 110, K1.2).**
+  `tools/vdev_graph_probe.py` supplies the real `IVmbusServices`, `IVmIoApic`,
+  and `IVmBios` interfaces between the inbox objects, initializes in dependency
+  order, mirrors `vmwp`'s recovered `IID_IVirtualDeviceMemoryInfo` notification
+  loop, tears down in reverse, verifies repository release after COM object
+  destruction, and deletes the partition. It now also configures VSM and installs
+  the managed one-VP Windows layout: `0xF8000000` bytes of low RAM, a 128 MiB
+  PCI/MMIO hole, and 128 MiB of high RAM at `0x100000000`. Both VSM-capable
+  memory blocks pass mapped-page readback and are destroyed during unwind. The
+  probe now follows the recovered pre-power sequence: initialize; call slots 6
+  through 8 as `StartReservingResources`, `FinishReservingResources`, and
+  `FreeReservedResources`; then tear down. The final three live runs used fresh
+  partitions `0x1A` through `0x1C`, and every resource call returned `S_OK`.
+  None of the six devices implements the optional memory-info interface, so the
+  RAM-complete phase is an asserted no-op. K1.2 is closed; firmware execution,
+  storage I/O, and VP start remain open.
+- **The owner-partition probe can redirect and restore VTL1 execution state
+  while an exception message is pending (`FOLLOWUPS.md` item 110 arm 1).** The
+  new `--pending-vtl1-state-write` mode receives its marked VTL1 CPL0 `#BP`,
+  writes and reads back `RIP=0x10180`, completes with instruction advance
+  cleared, and receives the next marked trap at exactly that address with the
+  same stack. It then writes the original continuation `RIP=0x10009` while the
+  second message is pending, again completes without advance, and requires the
+  original loop's resume witness. The guarded live run passed on 2026-10-02.
+  Exact-build Ghidra analysis explains the result:
+  `VidExceptionInterceptReturnCallback` calls
+  `VidInterceptAdvanceInstructionPointer` only when exchange-buffer byte
+  `+0x148` is nonzero. An initialized Secure Kernel stop can therefore redirect
+  to its published `DbgBreakPointWithStatus` address and restore the interrupted
+  `RIP` without patching Secure Kernel text.
+
 ## [0.21.0] - 2026-10-02
 
 ### Added

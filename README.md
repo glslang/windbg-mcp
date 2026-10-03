@@ -30,6 +30,7 @@ This file is the map. Each topic is one document, and each document is the whole
 | [Sessions and session handles](docs/sessions.md) | `session_id` routing, the four-session cap, `interrupt`, progress notifications, and recovering a parked attach |
 | [Kernel connection profiles](docs/kernel-profiles.md) | Keeping a KDNET debug key out of tool arguments and out of the client's transcript |
 | [Hypervisor debugging](docs/hypervisor-debugging.md) | Attach to the Microsoft hypervisor through KDNET, with target identity, limitations, and a separate live test |
+| [Secure Kernel research](docs/secure-kernel/README.md) | Capture inspection, live VTL1 reads, the initialized kernel stop/step result, and the operator-provider control contract |
 | [Structured results](docs/structured-results.md) | Which tools answer with `structuredContent`, what each carries, and the error categories a caller can branch on |
 | [Transactional batches](docs/debug-batch.md) | `debug_batch`: a mutating sequence whose cleanup runs on every path it can be aimed at, including a timeout or a disconnect |
 | [Walking a structure](docs/walk-memory.md) | `walk_memory`: lists, arrays and chains where an unreadable node is a row rather than the end of the walk |
@@ -109,7 +110,7 @@ native analysis of it works and always has — and says so in the opener's `limi
 
 ## Tools
 
-Sixty-seven tools in nine `--tools` groups; the rows below split some of those groups by theme. The
+Seventy-four tools in nine `--tools` groups; the rows below split some of those groups by theme. The
 `--tools` column is the name that selects one — see
 [Serving fewer tools](docs/tool-surface.md#serving-fewer-tools---tools).
 
@@ -129,10 +130,10 @@ Sixty-seven tools in nine `--tools` groups; the rows below split some of those g
 | User Segment Heap | `allocator` | `heap_list`, `heap_allocations`, `heap_chunk`, `heap_census`, `heap_diagnostics` |
 | Structure walk | `allocator` | `walk_memory` |
 | Raw     | `inspect` | `execute` — run any debugger command, returns full text output |
-| Secure Kernel | `securekernel` | `open_sk_capture` — open a Hyper-V checkpoint and decode the Secure Kernel in the guest's VTL1: the page-table root read out of the capture, `securekernel.exe`'s base, `KdDebuggerDataBlock`, `SkLoadedModuleList`, and every count the decode made; `sk_modules` — the VTL1 loader list; `sk_read_memory` — VTL1 by guest virtual address; `sk_symbol` — a name or an address, rebased onto the base the decode found. Needs the Windows SDK's saved-state provider; **no driver, no test-signing, and no Hyper-V on the machine reading the file** |
+| Secure Kernel | `securekernel` | Capture: `open_sk_capture`, `sk_modules`, `sk_read_memory`, `sk_symbol`. Live selected-VP control: `open_sk_live_control`, `sk_live_arm`, `sk_live_wait`, `sk_live_registers`, `sk_live_read_memory`, `sk_live_step`, `sk_live_continue`. Capture needs the Windows SDK's saved-state provider; live control needs an operator-supplied privileged provider and an exact-build `vmwp` profile. |
 
-All of them are served unless you say otherwise, and the definitions cost the model **105,276 bytes —
-about 26k tokens — before it has asked anything** (measured 2026-09-27). `--tools
+All of them are served unless you say otherwise, and the definitions cost the model **112,429 bytes —
+about 28k tokens — before it has asked anything** (measured 2026-10-03). `--tools
 session,inspect,crash` cuts that to 33,895 B for twenty-three tools, and a `--listen` client can be
 given a narrower surface than the run's default. [`docs/tool-surface.md`](docs/tool-surface.md) has the arithmetic, the rule that `session`
 is always included, and what a typed operand may not contain.

@@ -2265,11 +2265,70 @@ are all there and are the parts that took the review rounds to get right.
 so `securekernel.exe`, `winhvr.sys`, `Vid.sys` and any driver answer offline — which is the mode
 most of item 103's static work has actually run in.
 
-## 110. [windbg-mcp] A stop inside an *initialized* Secure Kernel — filed as a decision, not a schedule
+## 110. [windbg-mcp] Initialized Secure Kernel stop/step — live session remains
 
 **Repo:** `windbg-mcp`. **Origin:** item 103's control axis, 2026-10-01, after the owner-partition
 probe passed and then its `--securekernel-breakpoint` mode stopped and resumed real
 `securekernel.exe` code at VTL1 CPL0 and released the VP cleanly.
+
+**Control result passed 2026-10-03.** The narrower route won: a normal one-VP Hyper-V VBS boot kept
+Windows' existing `vmwp` responsible for firmware, storage, devices, VID receipt and completion. A
+debugger attachment drove one `vmwp` thread through its internal registration call for a temporary
+exception handler; the operator-supplied exact-partition primitive only read and wrote VTL1 VP
+state. The initialized guest first stopped at
+its existing `securekernel.exe!DbgBreakPointWithStatus`, stayed held for two agreeing state reads,
+restored its original state, completed through the native dispatcher, removed the handler after its
+deferred cleanup, and retained heartbeat and monotonic uptime for more than 60 seconds.
+
+The redirected narrow gate also passed. DR0/DR7 stopped VTL1 CPL0 before a selected five-byte
+instruction, TF produced the second vector-1 event at exactly the decoded successor, DR6 classified
+the two stops as B0 then BS, and the original RIP/RSP/RFLAGS/debug registers and unchanged text were
+verified before release. The natural-flow gate then left RIP unchanged, reached
+`securekernel!KiTimerInterrupt` through guest execution, and made 16 guarded steps through register,
+stack, memory and conditional-branch instructions. Each later step re-proved its current bytes and
+the branch admitted only its two decoded destinations. Continue preserved guest execution progress
+while restoring the debug state and baseline TF/RF bits. No token was duplicated, no helper thread
+or DLL was injected, and the controller consumed no VID queue. Stock OpenVMM remains irrelevant
+because its Windows path is VTL0-only. The direct owner-built Windows boot below is historical work,
+not the selected route.
+
+The minimum MCP surface is implemented; broader hardening remains. `src/skcontrol.rs` defines the
+operator-provider contract with exact VM/partition/VP/VTL/CR3 identity, rotating
+running/arming/stopped epochs, compare-and-write register
+updates, and held-event identity; `--sk-control-probe` checks its non-mutating handshake. Provider
+stdout now has a 10-second per-line deadline on a dedicated non-DbgEng reader thread, so silence
+cannot pin the engine worker.
+`src/sklive.rs` now adds the worker-side selected-VP state machine: it owns the outer
+running/arming/stopped/releasing/faulted lifecycle, exact callback-context and instruction guards,
+two-read stop evidence, repeated epoch-consuming steps with bounded destinations, and fail-closed
+restoration.
+`src/skdispatch.rs` now implements the exact-build DbgEng adapter and opt-in
+`--sk-live-control` acceptance role. It verifies the `vmwp` image and every breakpoint site, owns
+handler registration and deferred cleanup, completes both events through the native path, frees
+callback scratch, and detaches handled. That Rust path passed twice on the allowlisted disposable
+VM; the recorded repeat preserved the same `vmwp` and heartbeat for 60 seconds, found no scoped
+crash record, re-read unchanged guest text, and left the VM Off. A separate live session now binds,
+arms, waits, inspects, steps, continues and closes through typed epoch-bound MCP tools; its live MCP
+acceptance also retained the same `vmwp` and healthy advancing heartbeat for 60 seconds, found no
+scoped crash record, preserved the guarded bytes and left the VM Off. A two-vCPU run then bound VP1,
+required the exact-build native vector event to report VP1, stopped and stepped that VP, preserved
+VP0's debug state, restored VP1, and passed the same independent 60-second audit. Its preceding
+natural-flow timeout restored and resumed before faulting, which supplies one live recovery case.
+Two fresh differencing children repeated the 16-step lifecycle and independent survival audit at
+new partitions and image bases, completing the three-run target. The live wrong-build case refused
+before provider mutation and resumed unchanged. A provider exit at stop publication returned
+`target_left_paused=true`; teardown reported recovery required, claimed no release and retained the
+exact worker. Independent VTL1 reads proved the owned DR0 state and guest text remained intact. The
+failure child was then discarded because its dead provider could not restore the state; ending the
+unresolved debugger replaced `vmwp`, so this is containment evidence rather than recovery evidence.
+Ordinary debugger tools are refused because their target would be `vmwp`. Offline injection covers
+dispatcher timeout, provider death, debugger loss after restoration, target identity change, and
+pre-mutation build mismatch. Live debugger-loss-after-restoration and VM-reset identity cases, plus
+broader exact-build profile coverage, remain open. The detailed bench sequence, profile, provider
+and evidence remain in the ignored private plan.
+
+The record below explains how the route was chosen. Cost and “still open” statements in it describe
+the decision point and are superseded by the result above.
 
 **The whole of what this item owns is the word *initialized*.** That result maps a guarded PE and
 calls into it. It boots no Secure Kernel, initializes no Secure Kernel runtime, and its guard reads
@@ -2297,22 +2356,19 @@ from being this item's pass.
 own recorded failure is a schedule written against the obstacle in front of it. The arms are ordered
 to collect what does not depend on that step, and then to falsify it before anything is built on it.
 
-1. **The redirect primitive, on the tiny image — cheapest, and blocked on nothing.**
-   `VidSetVirtualProcessorStateEx` at **VTL1 while a message is pending**. The selector and VTL
-   semantics are already decoded and exercised: the probe reads VTL-selected state through
-   `HV_INPUT_VTL_EXPLICIT` at VTL0 and VTL1 ([`tools/vtl1_control_probe.c:1073`](tools/vtl1_control_probe.c)
-   and `:1114`) and writes VTL0 state before the VP starts (`:1331`). **Closes when** a saved VTL1
-   `RIP` is redirected to the image's own `int3`, the marked message is held, the saved `RIP` is
-   restored *while it is pending*, the completion does not advance the restored state, and the
-   original loop resumes. **Worth more than it costs**: if it passes, a stop in a real Secure Kernel
-   never has to patch a live Secure Kernel instruction, and an initialized one hands you the
-   address to redirect *to*: `SkdInitDebuggerDataBlock` stores `&DbgBreakPointWithStatus` into
-   `KdDebuggerDataBlock+0x20`, which is measured rather than assumed — `lea rax,[…!DbgBreakPointWithStatus]`
-   at `securekernel+0xAC210` followed by the store, in
-   [`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`](docs/samples/secure-kernel-debugger-investigation/26100.9457.txt),
-   and present on 28000.2952 and 29617.1000 at their own RVAs. **If it fails**, retire
-   redirection and keep the restorable software breakpoint, whose completion semantics then need
-   proving separately.
+1. **The redirect primitive, on the tiny image — passed 2026-10-02.** The new
+   `--pending-vtl1-state-write` mode held the marked VTL1 CPL0 `#BP`, wrote and read back
+   `RIP=0x10180`, completed with the advance byte clear, and received the next marked trap at
+   exactly `0x10180` with the same `RSP`. While that second message was pending it wrote and
+   verified the original continuation at `0x10009`, completed again without advance, and the
+   original loop wrote its resume witness. So `VidSetVirtualProcessorStateEx` works at VTL1 while
+   the message is pending, and completion preserves rather than advances the restored state. A stop
+   in a real Secure Kernel no longer needs to patch its text: an initialized one hands the owner the
+   address to redirect *to*. `SkdInitDebuggerDataBlock` stores
+   `&DbgBreakPointWithStatus` into `KdDebuggerDataBlock+0x20`, measured at
+   `securekernel+0xAC210` in
+   [`docs/samples/secure-kernel-debugger-investigation/26100.9457.txt`](docs/samples/secure-kernel-debugger-investigation/26100.9457.txt)
+   and present on 28000.2952 and 29617.1000 at their own RVAs.
 2. **A one-shot observation of an initialized Secure Kernel — the only cheap thing that touches
    one, 2–5 days.** A disposable checkpointed VBS guest; resolve the live Secure Kernel base from
    the VTL1 `CR3`; halt every VP; install the parent vector-3 intercept; save and patch one byte to
@@ -2343,8 +2399,8 @@ to collect what does not depend on that step, and then to falsify it before anyt
    than this item's**: `CoCreateInstance` one of the 24 and record the `HRESULT` — **run as gate
    S5v, below** — then ask whether `Initialize` can be driven without the context `vmwp.exe`
    supplies (a partition object, a VMBus channel manager).
-   **Half-answered 2026-10-02 by gate S5v, and the half it answers is the one that was expected to
-   fail.** `CoCreateInstance(CLSCTX_INPROC_SERVER, IID_IUnknown)` on all 24, one child process each:
+   **The activation half was answered 2026-10-02 by gate S5v.**
+   `CoCreateInstance(CLSCTX_INPROC_SERVER, IID_IUnknown)` on all 24, one child process each:
    **20 return `S_OK`**, 4 return `CLASS_E_CLASSNOTAVAILABLE`, none faults, with `msxml3` XMLHTTP
    activating as a positive control and an unregistered CLSID giving `REGDB_E_CLASSNOTREG` as the
    negative. The 4 refusals are a registration artefact rather than a policy: their backing DLL loads
@@ -2353,20 +2409,84 @@ to collect what does not depend on that step, and then to falsify it before anyt
    answers `E_NOINTERFACE` with a nulled out-pointer for an unimplemented IID, so it is live rather
    than merely constructed. **And it is not admin-gated**: `BiosVdev` activates under a restricted
    token and again at genuine medium integrity (`S-1-16-8192`) with no `Administrators` membership.
-   **So *"expect the stop to fire"* has to be weakened.** It was a judgement from there being no
-   activation evidence at all, and there now is some, pointing the other way for step one. What it
-   does **not** touch is step two, which is the whole of the risk: these objects implement
-   **private, undocumented interfaces whose IIDs this record has never read**, so `IVirtualDevice::
-   Initialize` being drivable without a partition object and a VMBus channel manager is exactly as
-   unmeasured as before. Activation was the cheap half and it passed; the stop condition stands on
-   the dear half, unchanged.
-   **Stop condition**: a required service exists only in VMMS or in managed-VM state and cannot be
-   constructed locally — in which case this item closes at *measured and declined* for the owned-boot
-   route, and allow 3–5 days for a spike that connects one OpenVMM-derived device to the direct-VID
-   owner before any port is costed. **Expect the stop to fire** — a judgement from there being no
-   activation evidence at all, which is weaker still than the "weak evidence" this line used to claim.
-   The arm is days; everything in 4 is contingent on it.
-4. **Only if 3 passes: own the boot, reproduce the completion, then stop.** A fresh partition the
+   **The fatal initialization half passed later the same day, and the independent census now covers
+   all six minimum devices.**
+   [`tools/vdev_initialization_probe.py`](tools/vdev_initialization_probe.py) requests the recovered
+   `IID_IVirtualDevice`, validates slots 3–5 as `GetDependencies`, `Initialize`, and `Teardown`, and
+   supplies recording repository and service objects in separate 30-second children.
+   `GuestEmulationDevice`, `BiosVdev`, `RtcVdev`, `IoApicVdev`, `VmbusVdev`, and `SynthStor` all
+   return `S_OK` from initialization and teardown and release every supplied dependency. RTC needs
+   no partition; each other child owns and deletes a fresh process-local direct-VID partition.
+   The probe asserts required and optional dependency IIDs, minimum XML, repository calls, the guest
+   and BIOS security-state callbacks, module paths, vtable RVAs, full-file hashes, and CodeView
+   identities. The build-bound record is
+   [`docs/secure-kernel/vdev-contract-26100.8457.json`](docs/secure-kernel/vdev-contract-26100.8457.json).
+
+   VMBus still supplies the ownership discriminator: its handle-broker lookup returns `E_NOTIMPL`,
+   after which it opens `\\.\VMBus\vdev\{vm-id}` against the fresh partition with the same bare GUID.
+   The full six-child run passed live on 2026-10-02. This closes the fatal stop condition in the inbox
+   route's favour: none of the six independent initialization paths requires `vmwp` process identity,
+   an identity-bearing VMMS object, managed-VM state, or a second receive loop. It does **not** prove
+   the complete graph. At that point K1.2 still had to put the six objects in one partition, replace
+   recording stubs with shared services, issue the RAM-construction-complete notification, and
+   unwind that graph three times. The next result records that subgate.
+
+   **The composition and lifecycle subgate passed the same day.**
+   [`tools/vdev_graph_probe.py`](tools/vdev_graph_probe.py) creates one partition, supplies the real
+   `IVmbusServices`, `IVmIoApic`, and `IVmBios` interfaces from the inbox objects, initializes in
+   dependency order, and tears down in reverse. Exact-build `vmwp.exe` analysis recovered
+   `VirtualMotherboard::NotifyAllDevicesRamConstructionComplete` at RVA `0x218780`: it queries every
+   device for `IID_IVirtualDeviceMemoryInfo` and, when present, calls slot 4 with the value `0` passed
+   by its caller. None of the six minimum objects exposes that interface after initialization, so the
+   matching notification phase is a measured six-device no-op.
+
+   **K1.0 and the remaining K1.2 RAM gate now pass as a paired control.** D: was expanded, so both
+   source chains were flattened into private immutable bases and used only through differencing
+   children. A one-VP, fixed-4-GiB, Secure-Boot-off, TPM-free shape with no network, DVD, or Guest
+   Service Interface cold-booted three times for each disk. The positive capture reports VTL masks
+   `3`, a distinct readable long-mode VTL1 `CR3`, and a closed module list rooted at
+   `securekernel.exe` with `skci.dll`, `vmsvc.dll`, and `vmsvcext.sys`; the control reports masks `1`
+   and refuses VTL1. Both captures expose the same RAM chunks: `0xF8000` pages at zero and `0x8000`
+   pages at page `0x100000`, leaving the 128 MiB hole below 4 GiB.
+
+   The graph probe now follows the recovered pre-power lifecycle: it initializes the graph, calls
+   `StartReservingResources` on every device, creates those two VSM-capable VA-backed blocks, binds
+   their notification queue, creates the protected GPA ranges, verifies mapped-page readback and
+   issues RAM-complete, then calls `FinishReservingResources` and frees every reservation before
+   teardown. Slots 6 through 8 are guarded by exact per-device RVAs. Three bounded acceptance runs
+   passed in fresh partitions `0x1A` through `0x1C`; all 18 resource calls, every initialize, and
+   every teardown returned `S_OK`, repository references returned to the owner after COM destruction,
+   both RAM ranges and blocks were destroyed, and every partition was deleted. The runbook is
+   [`docs/secure-kernel/vdev-graph-probe.md`](docs/secure-kernel/vdev-graph-probe.md).
+
+   K1.2 is closed. At that point the next owner-side gate was the minimum firmware configuration and
+   a deterministic no-boot-device outcome before attaching SynthStor to a private disk child. No
+   irreducible managed service appeared, so the OpenVMM-derived contingency remains closed.
+
+   **The K1.3 diskless firmware preflight passed on 2026-10-03.**
+   [`tools/vdev_firmware_probe.py`](tools/vdev_firmware_probe.py) replaces the firmware-time stubs
+   with the exact one-VP topology and importer contracts recovered from the guarded inbox binaries.
+   It supplies checksummed 80-byte MADT and 144-byte SRAT tables, leaves optional services absent,
+   and cold-powers VMBus, IOAPIC, BIOS, RTC and guest emulation. All five return `S_OK`; SynthStor
+   remains initialized and reserved but is deliberately not powered without a LUN.
+
+   `BiosVdev` imports the 6 MiB UEFI image and four loader regions in five nonoverlapping calls. The
+   probe writes and reads back every requested page, including the two explicitly zero-filled pages,
+   before accepting the call. It then captures the exact 19-record VP0 register sequence, validates
+   the imported long-mode scalars and UEFI entry point, applies the state in one VID call and reads it
+   back. VID's only normalization is setting the architecturally fixed `CR0.ET` bit; all other
+   critical scalars match. Three bounded runs in fresh partitions `0x4D` through `0x4F` completed
+   power-off, reverse reservation release, teardown, RAM destruction and partition deletion. The
+   runbook is [`docs/secure-kernel/vdev-firmware-probe.md`](docs/secure-kernel/vdev-firmware-probe.md).
+
+   VP0 is deliberately never started by the acceptance probe. A private execution check corrected
+   the final ABI detail: `IVmBootMemoryTopology` returns byte addresses and lengths, while the VID
+   block APIs use page units. Page-scaled values caused PEI to call `InstallPeiMemory(0, 0)`;
+   byte-scaled values produced `InstallPeiMemory(0x70A000, 0x4081000)`, reached DXE and an idle
+   `HLT`, and device `Resume` advanced into later timer work. K1.3 therefore narrows the next
+   boundary to a real SynthStor LUN and the central completion dispatcher; it does not claim a
+   Windows boot.
+4. **Retired after the managed route passed: own the boot, reproduce the completion, then stop.** A fresh partition the
    experiment owns and is the sole VID client of, with VSM configured before the first VP starts;
    the minimum in-box device graph; firmware and one synthetic disk off an immutable
    copy-on-write child; a **VTL0 control boot before the VBS one**, so a firmware or storage failure
@@ -2380,37 +2500,40 @@ to collect what does not depend on that step, and then to falsify it before anyt
    release. Addresses come from the **current** VTL1 `CR3` and symbols every run, and the image
    identity is checked against the **guest** build rather than the host device build — the limit
    above is exactly what that guards against.
-5. **The `windbg-mcp` half is item 103's, not a second surface.** `sk_modules`, `sk_symbol` and
+5. **The `windbg-mcp` half now has a separate live-control contract.** `sk_modules`, `sk_symbol` and
    `sk_read_memory` already exist and are served from a capture, behind the `sk::RawSource` seam
    (`src/sk.rs:312`). A **typed live source now exists** — `src/livesrc.rs`, item 103's gate S5w,
    implementing that seam over a transport the operator supplies and driven by `--sk-live` — while
    **EXDI needs a different lab** (E2). So if this item's work needs a live backend, the seam is
    implemented and what is left is deciding whether it belongs behind a *session*: gate S5x measured
    a page of `securekernel.exe`'s `.data` moving inside 20 seconds, which is why S5w is a
-   command-line role and not a fifth tool. Anything this item adds there lands in a dedicated worker
-   process — never in the supervisor, and never with private VID ABI in a DbgEng worker.
+   command-line role and not a fifth capture tool. `src/skcontrol.rs` adds the versioned child-process
+   contract for live register control and held-event correlation. Its capability probe is implemented,
+   `src/sklive.rs` adds the worker-side epoch state machine and recovery policy, and
+   `src/skdispatch.rs` supplies the concrete DbgEng adapter. The adapter's exact-build profile stays
+   local, the opt-in role has passed live, and the minimum MCP session surface is implemented with
+   fail-closed teardown. No private provider or VID ABI enters the supervisor.
 
-6. **Decompile `VidHandleExceptionIntercept`'s branch — inherited from item 103 on 2026-10-02.** It
-   is the one route to *which* branch a delivered message took, which sampling cannot supply at any
-   cadence, and it is this item's rather than 103's because this item arms its own intercepts on its
-   own partition. Parked once as *"not answerable by sampling"*, which is not the same as
-   unanswerable: Ghidra is on this bench and settled three other questions on 2026-09-30 that had
-   been recorded as limits. Item 103's other two control arms — the `[partition+0x10]` writer census
-   and separating the partition reset's two causes — were **declined** when it closed, because both
-   are about retrofitting a **managed** VM's receive loop and this item owns its partition instead.
-   They reopen if this item's owned-boot route fails on something the device model or the guest OS
-   cannot supply, which is arm 3's stop condition.
+6. **The exception branch and completion callback — decoded 2026-10-02.** On guarded `Vid.sys`
+   10.0.26100.9278, `VidHandleExceptionIntercept` reads the vector's claim slot, constructs mapped
+   type `0x01000002`, and enqueues `VidExceptionInterceptReturnCallback`. That callback tests only
+   exchange-buffer byte `+0x148`: nonzero calls `VidInterceptAdvanceInstructionPointer`; zero skips
+   it and goes directly to the common completion. Arm 1 then confirmed the zero branch dynamically.
+   Item 103's other two control arms — the `[partition+0x10]` writer census and separating the
+   partition reset's two causes — remain **declined** because both concern retrofitting a managed
+   VM's receive loop. They reopen only if this item's owned-boot route fails on something the device
+   model or guest OS cannot supply.
 
-**The honest summary, because a cost table invites the opposite reading.** A **resumable** stop
-inside a normally initialized Microsoft Secure Kernel is not reachable on this bench without owning
-the boot, and owning the boot is unvalidated at precisely one step. A **non-resumable observation**
-of one is reachable for days of work. And **inspection** needs neither: item 103 ships it off a
-capture today. **Arms 1 and 2 are worth running whatever arm 3 says**, which is why they are first
-rather than sequenced behind it.
+**Current summary.** A resumable initialized Secure Kernel stop and a one-instruction hardware
+stop/step both pass on the allowlisted disposable managed VM. The repository now has the provider
+owner, dedicated worker state machine, exact-build adapter and separate epoch-bound MCP session
+surface. Capture inspection remains independent. The next boundary is natural-flow, repeated-step
+and multi-VP hardening. The direct owner-built Windows boot is no longer on that path.
 
-**Safety rules that are not negotiable per arm.** Never enumerate or open an existing VM from the
-owner-partition probe. Use only flattened clones, fresh copy-on-write children and fresh owned
-partitions. Halt every VP before changing VTL1 code or page-table-derived mappings. Verify every
+**Safety rules that are not negotiable per arm.** The owner-partition probes never enumerate or open
+an existing VM. The managed route targets only its exact allowlisted disposable VM and refuses every
+source and preserved proof VM. Use only flattened clones, fresh copy-on-write children and fresh
+owned partitions. Halt every VP before changing VTL1 code or page-table-derived mappings. Verify every
 write by readback and restore it on an unconditional unwind path. Refuse an unexpected message
 rather than completing traffic the experiment cannot identify as its own — the 2026-09-30 consume
 loop drained 64 of its owner's messages and the guest reset inside ten seconds, with arming and

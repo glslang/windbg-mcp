@@ -42,6 +42,11 @@
 //!   `debug_batch` which patches a byte of the running kernel puts it back — a dump has nothing
 //!   worth restoring, so a rollback that did nothing would pass every check the tier above can
 //!   make. Run it last, on its own.
+//! * **Live Secure Kernel** (`#[ignore]`d and
+//!   `WINDBG_MCP_SMOKE_SK_LIVE=<private JSON config>`) — one exact disposable Hyper-V VM. It
+//!   drives the complete typed MCP lifecycle through a worker: bind, guarded DR0 stop, inspect,
+//!   trap-flag step, restore, continue and teardown. The profile and privileged provider stay
+//!   outside the repository. Run it alone under the bench health wrapper.
 //! * **MessageManager CTF** (`#[ignore]`d, `WINDBG_MCP_SMOKE_CTF=1`, and the live-kernel gate)
 //!   — deploys a benign allocation fixture over WinRM, then verifies that the real driver and its
 //!   pool objects are visible through the structured MCP tools. The PowerShell orchestrator owns
@@ -2044,7 +2049,18 @@ fn budget_report(result: &Value, instructions: &str) -> Value {
 /// for the same reason. [`WIRE_CEILING`] is **not** raised with it: the payload moved by the same
 /// 1,955 to 292,196 and has 2,804 B left, and a ceiling raised before something needs it absorbs
 /// the next regression in silence.
-const MODEL_VISIBLE_CEILING: usize = 108_000;
+///
+/// **108,000 -> 114,000 for the minimum live VTL1 control surface** (2026-10-03). Seven tools
+/// take the measured surface from 105,588 to 111,056 B. That buys the complete bounded lifecycle:
+/// bind, arm, wait, inspect registers or memory, consume one epoch to step, and consume the next
+/// to continue. Keeping these as distinct typed operations is part of the safety boundary: the
+/// model never supplies debugger command text, and a stale stopped epoch cannot be reused. The
+/// new ceiling leaves 2,944 B (2.7%) rather than absorbing another tool-sized change silently.
+///
+/// Natural arming and guarded repeated steps then move 111,056 -> 112,429 B without another
+/// ceiling raise. The 1,373 B is the `mode`, current-instruction and bounded-destination inputs plus
+/// the descriptions that explain their fail-closed use. The ceiling now leaves 1,571 B (1.4%).
+const MODEL_VISIBLE_CEILING: usize = 114_000;
 
 /// Ceiling on the whole `tools/list` payload — the serialized result, not the sum of its tools, so
 /// the array's own punctuation and every result-level field are inside it. 216,839 bytes as of
@@ -2182,7 +2198,14 @@ const MODEL_VISIBLE_CEILING: usize = 108_000;
 /// The new figure leaves 4,787 B, 1.6%.
 // 2026-09-20: unresolved-kernel state, one error enum variant per output closure, and the
 // explicit handoff field make the measured payload 254,925 B. No schema descriptions added.
-const WIRE_CEILING: usize = 295_000;
+///
+/// **295,000 -> 330,000 for the same seven live-control tools** (2026-10-03). The measured payload
+/// moves 294,602 -> 318,855 B; its 24,253 B growth is the input constraints and output schemas for target
+/// identity, complete stop evidence, memory reads, and epoch transitions. Those fields are the
+/// machine-readable proof that a stop belongs to the configured VTL1 target. The new ceiling
+/// first left 11,145 B. Natural mode, bounded repeated-step inputs and the stop's mode/destination
+/// evidence move it another 1,827 B to 320,682 B, leaving 9,318 B (2.8%).
+const WIRE_CEILING: usize = 330_000;
 
 /// Ceiling on any single tool's model-visible definition. `debug_batch` is the worst at 10,842
 /// bytes (2026-09-26), because its `inputSchema` pulls the whole `StepAction`/`Check` vocabulary
@@ -3183,6 +3206,23 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
             json!({ "vmrs": "Z:\\no\\such.vmrs", "image": "Z:\\no\\such.exe" }),
             "error",
         ),
+        // The live opener rejects a zero host process id after validating all identity fields, so
+        // this exercises its structured open refusal without starting a provider or touching a
+        // VM.
+        (
+            "open_sk_live_control",
+            json!({
+                "profile": "Z:\\no\\such-profile.json",
+                "control_transport": "provider-that-must-not-start",
+                "live_transport": "memory-provider-that-must-not-start",
+                "vmwp_pid": 0,
+                "dispatcher_vnd": "0xfffff80000001000",
+                "vm_id": "00000000-0000-0000-0000-000000000001",
+                "partition_id": "0x1",
+                "expected_cr3": "0x1000"
+            }),
+            "error",
+        ),
         // Both are answered from this server's own bookkeeping, so they succeed with nothing
         // open — and `server_log` has records to answer with whatever else has happened, this
         // server having logged its own startup.
@@ -3263,6 +3303,31 @@ fn every_tool_with_an_output_schema_answers_with_structured_content() {
         (
             "sk_symbol",
             json!({ "name": "SkLoadedModuleList" }),
+            "error",
+        ),
+        // The live-control calls are well formed and therefore reach the common no-session
+        // refusal. Their state and epoch validation paths are covered by the state-machine unit
+        // tests; the opt-in live tier covers successful transitions.
+        (
+            "sk_live_arm",
+            json!({ "address": "0xfffff80000001000", "bytes": "90" }),
+            "error",
+        ),
+        ("sk_live_wait", json!({}), "error"),
+        ("sk_live_registers", json!({}), "error"),
+        (
+            "sk_live_read_memory",
+            json!({ "address": "0xfffff80000001000", "size": 16 }),
+            "error",
+        ),
+        (
+            "sk_live_step",
+            json!({ "epoch": "0123456789abcdef" }),
+            "error",
+        ),
+        (
+            "sk_live_continue",
+            json!({ "epoch": "fedcba9876543210" }),
             "error",
         ),
         ("pool_find_tag", json!({ "tag": "Tgsm" }), "error"),
@@ -4324,7 +4389,7 @@ fn a_listener_serves_the_narrowed_surface_it_was_started_with() {
     // was typed — `session` is added whatever it said.
     let log = listener.stderr();
     assert!(
-        log.contains("serving 13 of 67 tools (session, crash)"),
+        log.contains("serving 13 of 74 tools (session, crash)"),
         "the listener does not report the surface it ended up with: {log}"
     );
 }
@@ -4356,7 +4421,7 @@ fn two_clients_on_one_listener_are_served_two_surfaces() {
     let local_token = server.token.clone();
     assert!(
         server.wait_for_stderr(
-            "serving 20 of 67 tools (session, inspect) — except bench serves 13 of 67 tools \
+            "serving 20 of 74 tools (session, inspect) — except bench serves 13 of 74 tools \
              (session, crash)",
             Duration::from_secs(30)
         ),
@@ -19036,6 +19101,203 @@ fn secure_kernel_tier() -> Option<(String, String)> {
         return None;
     }
     Some((capture, image))
+}
+
+fn secure_kernel_live_tier() -> Option<Value> {
+    let Some(path) = std::env::var_os("WINDBG_MCP_SMOKE_SK_LIVE") else {
+        skip(
+            "set WINDBG_MCP_SMOKE_SK_LIVE=<private JSON config> to run the disposable live VTL1 \
+             control tier",
+        );
+        return None;
+    };
+    let path = std::path::PathBuf::from(path);
+    let text = std::fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("cannot read live VTL1 config {}: {error}", path.display()));
+    let config: Value = serde_json::from_str(&text)
+        .unwrap_or_else(|error| panic!("invalid live VTL1 config {}: {error}", path.display()));
+    assert_eq!(
+        config["disposable"],
+        json!(true),
+        "the live VTL1 tier requires an explicit `disposable: true` guard"
+    );
+    Some(config)
+}
+
+/// The typed MCP form of the narrow live gate: one guarded hardware stop, one instruction step,
+/// full stopped-state inspection, restoration, continue and proved teardown.
+///
+/// The test owns no provider and names no machine. Its ignored private config supplies the exact
+/// VM identity, current partition/CR3, `vmwp` PID and dispatcher pointer, provider commands,
+/// exact-build profile, and guarded instruction. The opener repeats those coordinates to each
+/// provider and the adapter revalidates the VM-to-`vmwp` binding before mutation.
+#[test]
+#[ignore = "controls one explicitly disposable VBS VM; set WINDBG_MCP_SMOKE_SK_LIVE and run alone"]
+fn a_live_secure_kernel_session_stops_steps_inspects_resumes_and_closes() {
+    let Some(config) = secure_kernel_live_tier() else {
+        return;
+    };
+    let required = |name: &str| {
+        config
+            .get(name)
+            .unwrap_or_else(|| panic!("live VTL1 config omits `{name}`"))
+            .clone()
+    };
+    let address = required("instruction_address");
+    let instruction_bytes = required("instruction_bytes");
+    let open = json!({
+        "profile": required("profile"),
+        "control_transport": required("control_transport"),
+        "live_transport": required("live_transport"),
+        "vmwp_pid": required("vmwp_pid"),
+        "dispatcher_vnd": required("dispatcher_vnd"),
+        "vm_id": required("vm_id"),
+        "partition_id": required("partition_id"),
+        "vp": config.get("vp").cloned().unwrap_or(json!(0)),
+        "expected_cr3": required("expected_cr3")
+    });
+
+    let mut server = Server::started();
+    let mut session: Option<String> = None;
+    let run = catch_unwind(AssertUnwindSafe(|| {
+        let opened = server.tool_data("open_sk_live_control", open, TARGET_STEP);
+        session = Some(
+            opened["session_id"]
+                .as_str()
+                .expect("the live opener mints a handle")
+                .to_string(),
+        );
+        let id = session.as_deref().expect("the handle was just stored");
+
+        let armed = server.tool_data(
+            "sk_live_arm",
+            json!({
+                "session_id": id,
+                "address": address,
+                "bytes": instruction_bytes,
+                "mode": config.get("arm_mode").cloned().unwrap_or(json!("redirect"))
+            }),
+            TARGET_STEP,
+        );
+        assert_eq!(armed["phase"], "running", "{armed}");
+
+        let hardware = server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
+        assert_eq!(
+            hardware["event"]["reason"]["reason"], "hardware_breakpoint",
+            "{hardware}"
+        );
+        assert_eq!(hardware["event"]["reason"]["slot"], 0, "{hardware}");
+        assert_eq!(hardware["event"]["vtl"], 1, "{hardware}");
+        assert_eq!(hardware["event"]["cpl"], 0, "{hardware}");
+        assert_eq!(
+            hardware["arm_mode"],
+            config.get("arm_mode").cloned().unwrap_or(json!("redirect")),
+            "{hardware}"
+        );
+        let hardware_epoch = hardware["epoch"]
+            .as_str()
+            .expect("a stop carries its epoch")
+            .to_string();
+
+        let registers = server.tool_data(
+            "sk_live_registers",
+            json!({ "session_id": id }),
+            TARGET_STEP,
+        );
+        assert_eq!(registers["epoch"], hardware["epoch"], "{registers}");
+        assert_eq!(registers["registers"], hardware["registers"], "{registers}");
+
+        let read_size = config
+            .get("read_size")
+            .and_then(Value::as_u64)
+            .unwrap_or(16);
+        let read = server.tool_data(
+            "sk_live_read_memory",
+            json!({ "session_id": id, "address": address, "size": read_size }),
+            TARGET_STEP,
+        );
+        assert_eq!(read["epoch"], hardware["epoch"], "{read}");
+        let expected_prefix = instruction_bytes
+            .as_str()
+            .expect("instruction_bytes is a string")
+            .replace([' ', '-'], "")
+            .to_ascii_uppercase();
+        assert!(
+            read["data"]
+                .as_str()
+                .unwrap_or_default()
+                .starts_with(&expected_prefix),
+            "the stopped read does not begin with the guarded instruction: {read}"
+        );
+
+        let configured_steps = config.get("steps").and_then(Value::as_array);
+        let perform_step = config
+            .get("perform_step")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let default_step = json!({});
+        let steps: Vec<&Value> = match configured_steps {
+            Some(steps) => steps.iter().collect(),
+            None if perform_step => vec![&default_step],
+            None => Vec::new(),
+        };
+        let mut final_epoch = hardware_epoch;
+        for step in steps {
+            let mut arguments = json!({ "session_id": id, "epoch": final_epoch });
+            let object = arguments
+                .as_object_mut()
+                .expect("step arguments begin as an object");
+            for field in ["address", "bytes", "expected_rips"] {
+                if let Some(value) = step.get(field) {
+                    object.insert(field.to_string(), value.clone());
+                }
+            }
+            let stepping = server.tool_data("sk_live_step", arguments, TARGET_STEP);
+            assert_eq!(stepping["phase"], "running", "{stepping}");
+            let single_step =
+                server.tool_data("sk_live_wait", json!({ "session_id": id }), TARGET_STEP);
+            assert_eq!(
+                single_step["event"]["reason"]["reason"], "single_step",
+                "{single_step}"
+            );
+            assert_ne!(single_step["epoch"], final_epoch, "{single_step}");
+            if let Some(address) = step.get("address") {
+                assert_eq!(
+                    single_step["instruction"]["address"], *address,
+                    "{single_step}"
+                );
+            }
+            if let Some(expected_rips) = step.get("expected_rips") {
+                assert_eq!(
+                    single_step["expected_rips"], *expected_rips,
+                    "{single_step}"
+                );
+            }
+            final_epoch = single_step["epoch"]
+                .as_str()
+                .expect("the single-step stop carries its epoch")
+                .to_string();
+        }
+        let resumed = server.tool_data(
+            "sk_live_continue",
+            json!({ "session_id": id, "epoch": final_epoch }),
+            TARGET_STEP,
+        );
+        assert_eq!(resumed["phase"], "running", "{resumed}");
+    }));
+
+    // Cleanup is attempted after every failure that got far enough to mint a handle. A failed
+    // teardown is allowed to panic here: the worker's fail-closed retention is the evidence the
+    // bench operator needs, and hiding it behind the first assertion would invite a second owner.
+    if let Some(id) = session.as_deref() {
+        let ended = server.tool_data("end_session", json!({ "session_id": id }), TARGET_STEP);
+        assert_eq!(ended["released"], json!(true), "{ended}");
+        assert_eq!(ended["target_left_running"], json!(true), "{ended}");
+    }
+    if let Err(panic) = run {
+        resume_unwind(panic);
+    }
+    ran("live Secure Kernel MCP stop/step/resume lifecycle");
 }
 
 /// **A capture opens as a session, and answers about the guest rather than about the image.**

@@ -72,10 +72,13 @@
 //! whole point of the trait: a source that collapsed them would produce silent zeros exactly where
 //! the protected memory is.
 
-use std::io::{BufRead, BufReader, Write};
+use std::io::{BufRead, BufReader, Read, Write};
+use std::os::windows::io::AsRawHandle;
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use windows_sys::Win32::System::Pipes::PeekNamedPipe;
 
 use crate::sk::{self, Gpa, GuestShape, PagingMode, ReadFailure, Reader};
 
@@ -89,23 +92,21 @@ pub(crate) const READY_LINE: &str = "windbg-mcp-gpa/1";
 /// A bound rather than reading until it appears: a transport that prints the wrong thing — the wrong
 /// program, or one writing a log to stdout — is refused instead of being read until it exits.
 ///
-/// **It bounds completed lines and not time, and there is no read deadline anywhere in this module.**
-/// A transport that starts and then produces no newline at all blocks this role indefinitely: the
-/// length bound in [`Transport::line`] only fires once [`MAX_LINE_BYTES`] have *arrived*, and
-/// [`TEARDOWN_GRACE`] applies after `Drop` has begun, which a blocked read never reaches. So a
-/// provider that hangs during startup leaves `--sk-live` and its child running until the operator
-/// interrupts it.
-///
-/// That is **declined rather than unnoticed** (raised in review on #434). The remedy is a watchdog —
-/// a reader thread, or non-blocking IO plus a deadline on every exchange — which is real machinery in
-/// a role that is a foreground command, run by the operator who wrote the transport, and
-/// interruptible from the terminal where its diagnostics are already printing. The same hang in the
-/// MCP server would be a different judgement, and this module is deliberately not reachable from it:
-/// see `main.rs`'s dispatch, and gate S5x for the other reason.
+/// Completed lines are bounded by count and every complete response exchange is bounded by
+/// [`EXCHANGE_WAIT`]. `ChildStdout` has no standard-library read deadline, so the live source wraps
+/// it in [`DeadlineChildStdout`], which polls the pipe without entering a blocking read until bytes
+/// are available. The absolute deadline covers a whole banner, shape or physical-read response, so
+/// a provider cannot keep the worker occupied indefinitely by sending one byte at a time.
 const MAX_BANNER_LINES: usize = 64;
 
 /// The most one line of a transport's output may be. See [`Transport::line`].
 const MAX_LINE_BYTES: u64 = 64 * 1024;
+
+/// Maximum wall time for one complete response from the operator-supplied transport.
+const EXCHANGE_WAIT: Duration = Duration::from_secs(60);
+
+/// Polling cadence while child stdout has no bytes available.
+const PIPE_POLL: Duration = Duration::from_millis(20);
 
 /// How long [`LiveSource`]'s teardown waits for the transport to exit before killing it.
 ///
@@ -129,6 +130,8 @@ pub(crate) struct Transport<R: BufRead, W: Write> {
     reader: R,
     writer: W,
     max_read: usize,
+    response_wait: Option<Duration>,
+    set_deadline: Option<fn(&mut R, Option<Instant>)>,
     /// Set by a framing fault, after which the stream's position is unknown.
     poisoned: bool,
 }
@@ -141,6 +144,7 @@ pub(crate) struct ShapeReply {
 }
 
 impl<R: BufRead, W: Write> Transport<R, W> {
+    #[cfg(test)]
     pub(crate) fn new(reader: R, writer: W) -> Transport<R, W> {
         Transport {
             reader,
@@ -148,8 +152,51 @@ impl<R: BufRead, W: Write> Transport<R, W> {
             // Until `SHAPE` answers. One byte is a legal transfer width and a useless one, which is
             // the right default for a field that must not be guessed generously.
             max_read: 1,
+            response_wait: None,
+            set_deadline: None,
             poisoned: false,
         }
+    }
+
+    fn with_deadline(
+        reader: R,
+        writer: W,
+        response_wait: Duration,
+        set_deadline: fn(&mut R, Option<Instant>),
+    ) -> Transport<R, W> {
+        Transport {
+            reader,
+            writer,
+            max_read: 1,
+            response_wait: Some(response_wait),
+            set_deadline: Some(set_deadline),
+            poisoned: false,
+        }
+    }
+
+    fn bounded<T>(&mut self, exchange: impl FnOnce(&mut Self) -> T) -> T {
+        self.bounded_until(None, exchange)
+    }
+
+    fn bounded_until<T>(
+        &mut self,
+        outer_deadline: Option<Instant>,
+        exchange: impl FnOnce(&mut Self) -> T,
+    ) -> T {
+        let exchange_deadline = self.response_wait.map(|wait| Instant::now() + wait);
+        let deadline = match (exchange_deadline, outer_deadline) {
+            (Some(exchange), Some(outer)) => Some(exchange.min(outer)),
+            (Some(exchange), None) => Some(exchange),
+            (None, outer) => outer,
+        };
+        if let Some(set_deadline) = self.set_deadline {
+            set_deadline(&mut self.reader, deadline);
+        }
+        let result = exchange(self);
+        if let Some(set_deadline) = self.set_deadline {
+            set_deadline(&mut self.reader, None);
+        }
+        result
     }
 
     /// Read past whatever the transport printed while starting, up to its sentinel.
@@ -157,6 +204,10 @@ impl<R: BufRead, W: Write> Transport<R, W> {
     /// Returns the lines it skipped, so the caller can show them: they are the only explanation a
     /// misconfigured provider gives.
     pub(crate) fn await_ready(&mut self) -> Result<Vec<String>> {
+        self.bounded(Self::await_ready_inner)
+    }
+
+    fn await_ready_inner(&mut self) -> Result<Vec<String>> {
         let mut skipped = Vec::new();
         for _ in 0..MAX_BANNER_LINES {
             let line = self.line()?;
@@ -213,6 +264,10 @@ impl<R: BufRead, W: Write> Transport<R, W> {
 
     /// Ask for the processor state, and remember the transfer width it declares.
     pub(crate) fn shape(&mut self) -> Result<ShapeReply> {
+        self.bounded(Self::shape_inner)
+    }
+
+    fn shape_inner(&mut self) -> Result<ShapeReply> {
         self.send("SHAPE\n")?;
         let line = self.line()?;
         let reply = parse_shape(&line)?;
@@ -222,6 +277,21 @@ impl<R: BufRead, W: Write> Transport<R, W> {
 
     /// Fill `out` from guest physical memory, or say why not.
     fn read_chunk(&mut self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
+        self.bounded(|transport| transport.read_chunk_inner(gpa, out))
+    }
+
+    fn read_chunk_until(
+        &mut self,
+        gpa: Gpa,
+        out: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), ReadFailure> {
+        self.bounded_until(Some(deadline), |transport| {
+            transport.read_chunk_inner(gpa, out)
+        })
+    }
+
+    fn read_chunk_inner(&mut self, gpa: Gpa, out: &mut [u8]) -> Result<(), ReadFailure> {
         self.send(&format!("READ {:#X} {}\n", gpa.0, out.len()))
             .map_err(|e| ReadFailure::SourceError {
                 detail: format!("sending the request failed: {e}"),
@@ -320,6 +390,82 @@ impl<R: BufRead, W: Write> Transport<R, W> {
         }
         Ok(line.trim_end_matches(['\r', '\n']).to_string())
     }
+}
+
+/// Child stdout with an absolute deadline for the response currently being read.
+///
+/// `ReadFile` on an anonymous pipe can wait forever. `PeekNamedPipe` reports the bytes already
+/// available without consuming them, so the actual read is issued only for a count the pipe says is
+/// ready. One deadline is installed around the whole response by [`Transport::bounded`].
+struct DeadlineChildStdout {
+    stdout: ChildStdout,
+    deadline: Option<Instant>,
+}
+
+impl DeadlineChildStdout {
+    fn new(stdout: ChildStdout) -> Self {
+        Self {
+            stdout,
+            deadline: None,
+        }
+    }
+
+    fn set_deadline(&mut self, deadline: Option<Instant>) {
+        self.deadline = deadline;
+    }
+
+    fn available(&self) -> std::io::Result<usize> {
+        let deadline = self.deadline.ok_or_else(|| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "the live-memory response has no read deadline",
+            )
+        })?;
+        loop {
+            let mut available = 0u32;
+            // SAFETY: `ChildStdout` owns a valid readable pipe handle for this call's duration. No
+            // output buffer is supplied; `available` is a valid out-parameter.
+            let ok = unsafe {
+                PeekNamedPipe(
+                    self.stdout.as_raw_handle(),
+                    std::ptr::null_mut(),
+                    0,
+                    std::ptr::null_mut(),
+                    &mut available,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if available != 0 {
+                return Ok(available as usize);
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "the live-memory transport response deadline expired",
+                ));
+            }
+            std::thread::sleep(PIPE_POLL.min(deadline.saturating_duration_since(now)));
+        }
+    }
+}
+
+impl Read for DeadlineChildStdout {
+    fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+        if out.is_empty() {
+            return Ok(0);
+        }
+        let available = self.available()?;
+        let take = out.len().min(available);
+        self.stdout.read(&mut out[..take])
+    }
+}
+
+fn set_pipe_deadline(reader: &mut BufReader<DeadlineChildStdout>, deadline: Option<Instant>) {
+    reader.get_mut().set_deadline(deadline);
 }
 
 /// `SHAPE cr3=0x... max_read=...` into the shape the decode takes.
@@ -467,7 +613,7 @@ pub(crate) struct LiveSource {
     /// until that pipe closes a well-behaved transport is still waiting for a request, so a `wait()`
     /// with it open hangs. `Drop::drop` runs before any field is dropped, so field order cannot do
     /// this for us.
-    transport: std::cell::RefCell<Option<Transport<BufReader<ChildStdout>, ChildStdin>>>,
+    transport: std::cell::RefCell<Option<Transport<BufReader<DeadlineChildStdout>, ChildStdin>>>,
     shape: GuestShape,
     max_read: usize,
 }
@@ -520,7 +666,12 @@ impl LiveSource {
         // and so reaches no `Reader`.
         let mut source = LiveSource {
             child,
-            transport: std::cell::RefCell::new(Some(Transport::new(BufReader::new(stdout), stdin))),
+            transport: std::cell::RefCell::new(Some(Transport::with_deadline(
+                BufReader::new(DeadlineChildStdout::new(stdout)),
+                stdin,
+                EXCHANGE_WAIT,
+                set_pipe_deadline,
+            ))),
             shape: GuestShape::default(),
             max_read: 1,
         };
@@ -604,6 +755,23 @@ impl sk::RawSource for LiveSource {
     }
 }
 
+impl LiveSource {
+    /// Read one transport-width chunk while respecting a larger operation's absolute deadline.
+    pub(crate) fn read_chunk_until(
+        &self,
+        gpa: Gpa,
+        out: &mut [u8],
+        deadline: Instant,
+    ) -> Result<(), ReadFailure> {
+        match self.transport.borrow_mut().as_mut() {
+            Some(transport) => transport.read_chunk_until(gpa, out, deadline),
+            None => Err(ReadFailure::SourceError {
+                detail: "the transport has already been closed".to_string(),
+            }),
+        }
+    }
+}
+
 /// Split a command line on whitespace, honouring double quotes.
 ///
 /// Not a shell: there is no expansion, no escaping and no single-quote handling, because the string
@@ -614,7 +782,7 @@ impl sk::RawSource for LiveSource {
 /// accumulated something, so `""` contributes no argument at all and an explicit empty positional
 /// cannot be expressed here — a transport needing one is named through a wrapper script instead.
 /// Raised in review on #435, against the shipped skill that documented this grammar.
-fn split_command(command: &str) -> Vec<String> {
+pub(crate) fn split_command(command: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
@@ -718,10 +886,84 @@ mod tests {
     use super::*;
     use std::io::Cursor;
 
+    struct DeadlineProbe {
+        inner: Cursor<Vec<u8>>,
+        changes: Vec<Option<Instant>>,
+    }
+
+    impl std::io::Read for DeadlineProbe {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            self.inner.read(out)
+        }
+    }
+
+    impl BufRead for DeadlineProbe {
+        fn fill_buf(&mut self) -> std::io::Result<&[u8]> {
+            self.inner.fill_buf()
+        }
+
+        fn consume(&mut self, amount: usize) {
+            self.inner.consume(amount);
+        }
+    }
+
+    fn record_deadline(reader: &mut DeadlineProbe, deadline: Option<Instant>) {
+        reader.changes.push(deadline);
+    }
+
     /// A canned server: the framing is what can be wrong in ways a live guest would hide, so it is
     /// exercised against bytes rather than only against the bench.
     fn exchange(script: &str) -> Transport<Cursor<Vec<u8>>, Vec<u8>> {
         Transport::new(Cursor::new(script.as_bytes().to_vec()), Vec::new())
+    }
+
+    #[test]
+    fn every_live_exchange_arms_one_absolute_response_deadline() {
+        let reader = DeadlineProbe {
+            inner: Cursor::new(
+                b"banner\nwindbg-mcp-gpa/1\nSHAPE cr3=0x1201000 max_read=4\nOK 4\nwxyz".to_vec(),
+            ),
+            changes: Vec::new(),
+        };
+        let mut transport =
+            Transport::with_deadline(reader, Vec::new(), Duration::from_secs(1), record_deadline);
+
+        assert_eq!(transport.await_ready().unwrap(), vec!["banner"]);
+        transport.shape().unwrap();
+        let mut out = [0u8; 4];
+        transport.read_chunk(Gpa(0x1000), &mut out).unwrap();
+
+        assert_eq!(&out, b"wxyz");
+        assert_eq!(
+            transport
+                .reader
+                .changes
+                .iter()
+                .map(Option::is_some)
+                .collect::<Vec<_>>(),
+            vec![true, false, true, false, true, false]
+        );
+    }
+
+    #[test]
+    fn an_outer_operation_deadline_caps_each_exchange() {
+        let reader = DeadlineProbe {
+            inner: Cursor::new(b"OK 4\nwxyz".to_vec()),
+            changes: Vec::new(),
+        };
+        let mut transport =
+            Transport::with_deadline(reader, Vec::new(), Duration::from_secs(60), record_deadline);
+        let outer_deadline = Instant::now() + Duration::from_secs(1);
+        let mut out = [0u8; 4];
+
+        transport
+            .read_chunk_until(Gpa(0x1000), &mut out, outer_deadline)
+            .unwrap();
+
+        assert_eq!(&out, b"wxyz");
+        let armed = transport.reader.changes[0].unwrap();
+        assert!(armed <= outer_deadline);
+        assert_eq!(transport.reader.changes[1], None);
     }
 
     #[test]
@@ -991,6 +1233,33 @@ mod tests {
             exchange("short, no newline").line().unwrap(),
             "short, no newline"
         );
+    }
+
+    #[test]
+    fn a_silent_child_pipe_expires_at_its_response_deadline() {
+        let mut child = {
+            let _guard = crate::engine::spawn_guard();
+            Command::new("cmd")
+                .args(["/d", "/c", "ping -n 30 127.0.0.1 >nul"])
+                .stdin(Stdio::null())
+                .stdout(Stdio::piped())
+                .stderr(Stdio::null())
+                .spawn()
+                .expect("cmd is on every Windows host")
+        };
+        let stdout = child.stdout.take().expect("stdout was piped");
+        let mut reader = DeadlineChildStdout::new(stdout);
+        reader.set_deadline(Some(Instant::now() + Duration::from_millis(50)));
+        let started = Instant::now();
+        let error = reader.read(&mut [0u8; 1]).unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::TimedOut);
+        assert!(
+            started.elapsed() < Duration::from_secs(10),
+            "the pipe read blocked for {:?}",
+            started.elapsed()
+        );
+        reap(&mut child, Duration::ZERO);
     }
 
     #[test]

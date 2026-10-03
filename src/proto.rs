@@ -99,6 +99,33 @@ pub enum EngineOp {
         name: Option<String>,
         address: Option<u64>,
     },
+    /// Bind the live Secure Kernel controller to one selected VP. The opener validates the
+    /// provider identity and build profile but does not alter guest execution; arming is separate.
+    OpenSecureKernelLive(Box<crate::skdispatch::OpenRequest>),
+    /// Save the VTL1 baseline and arm DR0 for one guarded instruction.
+    SkLiveArm {
+        instruction: crate::sklive::InstructionGuard,
+        #[serde(default)]
+        mode: crate::sklive::ArmMode,
+    },
+    /// Pump the existing `vmwp` dispatcher until it holds the exact owned vector-1 event.
+    SkLiveWait,
+    /// Re-read the complete evidence retained for the current stop without touching the target.
+    SkLiveRegisters,
+    /// Read live VTL1 through the validated page-table walk while the named stop is held.
+    SkLiveRead {
+        address: u64,
+        size: u32,
+    },
+    /// Consume the current stop epoch and arm exactly one trap-flag step.
+    SkLiveStep {
+        epoch: crate::skcontrol::StopEpoch,
+        guard: crate::sklive::StepGuard,
+    },
+    /// Consume the current stop epoch, restore the complete baseline and resume.
+    SkLiveContinue {
+        epoch: crate::skcontrol::StopEpoch,
+    },
 
     // ---- ordinary work ----
     /// A raw command run with **no watchdog at all** — `index_trace`'s, and nothing else's.
@@ -681,6 +708,7 @@ impl EngineOp {
                 | Self::AttachProcess { .. }
                 | Self::Launch { .. }
                 | Self::OpenSecureKernel(_)
+                | Self::OpenSecureKernelLive(_)
         )
     }
 
@@ -713,7 +741,7 @@ impl EngineOp {
             // A guest's kernel: the process ids in it are the captured machine's and were never
             // this host's, which is exactly what this variant means and what keeps
             // `may_ask_the_os` from asking Windows about one.
-            Self::OpenSecureKernel(_) => Some(TargetOrigin::Kernel),
+            Self::OpenSecureKernel(_) | Self::OpenSecureKernelLive(_) => Some(TargetOrigin::Kernel),
             _ => None,
         }
     }

@@ -1041,7 +1041,7 @@ pub fn fingerprint(token: &str) -> String {
 /// a refusal: `BCryptHash` against the SHA-256 pseudo-handle with a correctly sized output buffer
 /// has no failure that is not a bug here, and threading an error out of it would spread a
 /// `Result` through every line that prints a fingerprint.
-fn sha256(data: &[u8]) -> [u8; 32] {
+pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     use windows_sys::Win32::Security::Cryptography::{BCRYPT_SHA256_ALG_HANDLE, BCryptHash};
 
     let mut digest = [0u8; 32];
@@ -1917,7 +1917,7 @@ mod tests {
         ][..];
         assert_eq!(
             surface(configured, "bench").as_deref(),
-            Some("13 of 67 tools (session, crash)"),
+            Some("13 of 74 tools (session, crash)"),
             "`bench` is served the surface its own variable names"
         );
         assert_eq!(
@@ -1935,7 +1935,7 @@ mod tests {
                 "local"
             )
             .as_deref(),
-            Some("20 of 67 tools (session, inspect)")
+            Some("20 of 74 tools (session, inspect)")
         );
     }
 
@@ -2022,7 +2022,7 @@ mod tests {
             creds
                 .surface_for("ci")
                 .map(crate::toolset::Toolset::summary),
-            Some("13 of 67 tools (session, crash)".to_string()),
+            Some("13 of 74 tools (session, crash)".to_string()),
             "the file's surface stands, not the variable's"
         );
     }
@@ -2042,7 +2042,7 @@ mod tests {
         assert_eq!(creds.surface_for("ci"), None);
         assert_eq!(
             creds.surfaces(),
-            vec![("bench", "10 of 67 tools (session)".to_string())],
+            vec![("bench", "10 of 74 tools (session)".to_string())],
             "only the client that named one is listed"
         );
     }

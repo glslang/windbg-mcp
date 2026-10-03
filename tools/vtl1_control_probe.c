@@ -54,6 +54,7 @@
 #define SECURE_KERNEL_PD_GPA 0x7000ull
 #define SECURE_KERNEL_PT_GPA 0x8000ull
 #define VTL1_CODE_GPA 0x10000ull
+#define VTL1_REDIRECT_GPA 0x10180ull
 #define VTL1_IDLE_GPA 0x10100ull
 #define VTL0_CODE_GPA 0x11000ull
 #define VTL1_WITNESS_GPA 0x12000ull
@@ -895,16 +896,28 @@ static void build_guest_image(unsigned char *image,
     set_idt_gate(image, VTL_ENTRY_VECTOR, VTL1_CODE_GPA);
     set_idt_gate(image, BREAKPOINT_VECTOR, VTL1_CODE_GPA + 9);
 
-    /* VTL1 handler: write a direct witness, select INT3, then halt. */
+    /* VTL1 handler: write a direct witness, select INT3, then record its continuation. */
     image[VTL1_CODE_GPA + 0] = 0xC6;
     image[VTL1_CODE_GPA + 1] = 0x04;
     image[VTL1_CODE_GPA + 2] = 0x25;
     store_u32(image, VTL1_CODE_GPA + 3, (uint32_t)VTL1_WITNESS_GPA);
     image[VTL1_CODE_GPA + 7] = VTL1_WITNESS_VALUE;
     image[VTL1_CODE_GPA + 8] = 0xCC;
-    image[VTL1_CODE_GPA + 9] = 0xF4;
-    image[VTL1_CODE_GPA + 10] = 0xEB;
-    image[VTL1_CODE_GPA + 11] = 0xFD;
+    image[VTL1_CODE_GPA + 9] = 0xC6;
+    image[VTL1_CODE_GPA + 10] = 0x04;
+    image[VTL1_CODE_GPA + 11] = 0x25;
+    store_u32(image, VTL1_CODE_GPA + 12,
+              (uint32_t)VTL1_RESUME_WITNESS_GPA);
+    image[VTL1_CODE_GPA + 16] = VTL1_RESUME_WITNESS_VALUE;
+    image[VTL1_CODE_GPA + 17] = 0xF4;
+    image[VTL1_CODE_GPA + 18] = 0xEB;
+    image[VTL1_CODE_GPA + 19] = 0xFD;
+
+    /* A second selected INT3 used only by the pending-state-write experiment. */
+    image[VTL1_REDIRECT_GPA + 0] = 0xCC;
+    image[VTL1_REDIRECT_GPA + 1] = 0xF4;
+    image[VTL1_REDIRECT_GPA + 2] = 0xEB;
+    image[VTL1_REDIRECT_GPA + 3] = 0xFD;
 
     /* VTL0 records entry, then waits for the host's VTL1 interrupt. */
     image[VTL0_CODE_GPA + 0] = 0xC6;
@@ -918,7 +931,7 @@ static void build_guest_image(unsigned char *image,
     image[VTL0_CODE_GPA + 11] = 0xFD;
 
     initialize_context(vtl0, VTL0_CODE_GPA, VTL0_STACK_GPA);
-    initialize_context(vtl1, VTL1_CODE_GPA + 9, VTL1_STACK_GPA);
+    initialize_context(vtl1, VTL1_CODE_GPA + 17, VTL1_STACK_GPA);
 }
 
 static void configure_secure_kernel_breakpoint(
@@ -1119,8 +1132,8 @@ static void report_vp_state(const VID_API *api, HANDLE partition)
 }
 
 static BOOL verify_vtl1_breakpoint_state(const VID_API *api,
-                                         HANDLE partition,
-                                         uint64_t expected_rip,
+                                          HANDLE partition,
+                                          uint64_t expected_rip,
                                          uint64_t *observed_rip,
                                          uint64_t *observed_rsp)
 {
@@ -1160,6 +1173,93 @@ static BOOL verify_vtl1_breakpoint_state(const VID_API *api,
     }
     *observed_rip = rip;
     *observed_rsp = values[1].Reg64;
+    return TRUE;
+}
+
+static BOOL set_vtl1_rip_while_pending(const VID_API *api,
+                                       HANDLE partition, uint64_t rip)
+{
+    const uint32_t names[] = {HV_X64_REGISTER_RIP};
+    WHV_REGISTER_VALUE value;
+    WHV_REGISTER_VALUE observed;
+
+    memset(&value, 0, sizeof(value));
+    value.Reg64 = rip;
+    if (!api->set_virtual_processor_state_ex(
+            partition, 0, HV_INPUT_VTL_EXPLICIT(TARGET_VTL), names,
+            (uint8_t)ARRAYSIZE(names), &value)) {
+        fwprintf(stderr,
+                 L"VidSetVirtualProcessorStateEx(VTL1 pending RIP=0x%llx) "
+                 L"failed: win32=%lu\n",
+                 (unsigned long long)rip, GetLastError());
+        return FALSE;
+    }
+
+    memset(&observed, 0, sizeof(observed));
+    if (!api->get_virtual_processor_state_ex(
+            partition, 0, HV_INPUT_VTL_EXPLICIT(TARGET_VTL), names,
+            (uint8_t)ARRAYSIZE(names), &observed)) {
+        fwprintf(stderr,
+                 L"cannot verify pending VTL1 RIP write: win32=%lu\n",
+                 GetLastError());
+        return FALSE;
+    }
+    if (observed.Reg64 != rip) {
+        fwprintf(stderr,
+                 L"pending VTL1 RIP write did not stick: wrote=0x%llx "
+                 L"read=0x%llx\n",
+                 (unsigned long long)rip,
+                 (unsigned long long)observed.Reg64);
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
+    wprintf(L"pending VTL1 RIP write verified: rip=0x%llx\n",
+            (unsigned long long)rip);
+    return TRUE;
+}
+
+static BOOL clear_resume_witness(const VID_API *api, HANDLE partition,
+                                 uint64_t memory_block)
+{
+    unsigned char page[4096];
+    size_t offset = VTL1_RESUME_WITNESS_GPA & 0xFFFu;
+
+    memset(page, 0, sizeof(page));
+    if (!api->read_memory_block_page_range(
+            partition, memory_block, VTL1_RESUME_WITNESS_GPA / 4096u, 1,
+            page, sizeof(page))) {
+        fwprintf(stderr,
+                 L"cannot read the resume-witness page before redirect: "
+                 L"win32=%lu\n",
+                 GetLastError());
+        return FALSE;
+    }
+    page[offset] = 0;
+    if (!api->write_memory_block_page_range(
+            partition, memory_block, VTL1_RESUME_WITNESS_GPA / 4096u, 1,
+            page, sizeof(page))) {
+        fwprintf(stderr,
+                 L"cannot clear the resume witness before redirect: "
+                 L"win32=%lu\n",
+                 GetLastError());
+        return FALSE;
+    }
+    memset(page, 0xAA, sizeof(page));
+    if (!api->read_memory_block_page_range(
+            partition, memory_block, VTL1_RESUME_WITNESS_GPA / 4096u, 1,
+            page, sizeof(page))) {
+        fwprintf(stderr,
+                 L"cannot verify the cleared resume witness: win32=%lu\n",
+                 GetLastError());
+        return FALSE;
+    }
+    if (page[offset] != 0) {
+        fwprintf(stderr,
+                 L"resume witness remained 0x%02x after clear\n",
+                 page[offset]);
+        SetLastError(ERROR_INVALID_DATA);
+        return FALSE;
+    }
     return TRUE;
 }
 
@@ -1469,7 +1569,8 @@ cleanup:
 
 static int run_controlled_stop(const VID_API *api, unsigned char *setup,
                                DWORD timeout_ms, DWORD hold_ms,
-                               const wchar_t *secure_kernel_path)
+                               const wchar_t *secure_kernel_path,
+                               BOOL pending_state_write)
 {
     HANDLE partition = INVALID_HANDLE_VALUE;
     unsigned char vsm_config[VSM_CONFIG_BYTES];
@@ -1499,6 +1600,8 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
     uint64_t first_rsp = 0;
     uint64_t held_rip = 0;
     uint64_t held_rsp = 0;
+    uint64_t redirected_rip = 0;
+    uint64_t redirected_rsp = 0;
     ULONGLONG stopped_at;
     int result = 1;
 
@@ -1752,19 +1855,148 @@ static int run_controlled_stop(const VID_API *api, unsigned char *setup,
     wprintf(L"held pending intercept for %llu ms\n",
             (unsigned long long)(GetTickCount64() - stopped_at));
 
-    *(volatile uint32_t *)(slot.exchange_buffer +
-                          MESSAGE_RETURN_STATUS_OFFSET) = 0;
-    slot.exchange_buffer[MESSAGE_ADVANCE_IP_OFFSET] = 1;
-    MemoryBarrier();
-    if (!report_call(api->message_slot_handle_and_get_next(
-                         partition, MESSAGE_SLOT, COMPLETE_MESSAGE_FLAGS, NULL),
-                     L"VidMessageSlotHandleAndGetNext")) {
-        abandon_partition = TRUE;
-        goto cleanup;
+    if (pending_state_write) {
+        if (!clear_resume_witness(api, partition, memory_block) ||
+            !set_vtl1_rip_while_pending(api, partition,
+                                        VTL1_REDIRECT_GPA)) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        *(volatile uint32_t *)(slot.exchange_buffer +
+                              MESSAGE_RETURN_STATUS_OFFSET) = 0;
+        slot.exchange_buffer[MESSAGE_ADVANCE_IP_OFFSET] = 0;
+        MemoryBarrier();
+        if (!report_call(api->message_slot_handle_and_get_next(
+                             partition, MESSAGE_SLOT,
+                             COMPLETE_MESSAGE_FLAGS, NULL),
+                         L"VidMessageSlotHandleAndGetNext(redirect)")) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        wprintf(L"completed the first breakpoint without advancing the "
+                L"redirected VTL1 RIP\n");
+
+        CloseHandle(receiver_thread);
+        receiver_thread = NULL;
+        receiver_thread = start_message_receiver(
+            api, partition, receiver_ready, &receiver);
+        if (receiver_thread == NULL) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        if (WaitForSingleObject(receiver_thread, timeout_ms) != WAIT_OBJECT_0) {
+            report_execution_witnesses(api, partition, memory_block);
+            report_live_vp_diagnostics(api, partition);
+            report_vp_state(api, partition);
+            fwprintf(stderr,
+                     L"timed out after %lu ms waiting for the redirected "
+                     L"VTL1 breakpoint\n",
+                     timeout_ms);
+            abandon_partition = TRUE;
+            SetLastError(WAIT_TIMEOUT);
+            goto cleanup;
+        }
+        if (!receiver.succeeded) {
+            fwprintf(stderr,
+                     L"redirected message receive failed: win32=%lu\n",
+                     receiver.error);
+            abandon_partition = TRUE;
+            SetLastError(receiver.error);
+            goto cleanup;
+        }
+        match = match_message(slot.exchange_buffer);
+        if (match != MESSAGE_EXPECTED) {
+            fwprintf(stderr,
+                     L"refusing redirected VID message: match=%u "
+                     L"type=0x%08lx vector=%u\n",
+                     (unsigned int)match,
+                     (unsigned long)volatile_u32(slot.exchange_buffer,
+                                                  MESSAGE_TYPE_OFFSET),
+                     (unsigned int)slot.exchange_buffer[MESSAGE_VECTOR_OFFSET]);
+            abandon_partition = TRUE;
+            SetLastError(ERROR_INVALID_DATA);
+            goto cleanup;
+        }
+        if (!verify_vtl1_breakpoint_state(
+                api, partition, VTL1_REDIRECT_GPA, &redirected_rip,
+                &redirected_rsp) ||
+            redirected_rsp != first_rsp) {
+            fwprintf(stderr,
+                     L"redirected breakpoint did not preserve the selected "
+                     L"VTL1 stack\n");
+            abandon_partition = TRUE;
+            SetLastError(ERROR_INVALID_DATA);
+            goto cleanup;
+        }
+        wprintf(L"received redirected VTL1 breakpoint: rip=0x%llx "
+                L"rsp=0x%llx\n",
+                (unsigned long long)redirected_rip,
+                (unsigned long long)redirected_rsp);
+
+        if (!set_vtl1_rip_while_pending(api, partition,
+                                        VTL1_CODE_GPA + 9)) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        *(volatile uint32_t *)(slot.exchange_buffer +
+                              MESSAGE_RETURN_STATUS_OFFSET) = 0;
+        slot.exchange_buffer[MESSAGE_ADVANCE_IP_OFFSET] = 0;
+        MemoryBarrier();
+        if (!report_call(api->message_slot_handle_and_get_next(
+                             partition, MESSAGE_SLOT,
+                             COMPLETE_MESSAGE_FLAGS, NULL),
+                         L"VidMessageSlotHandleAndGetNext(restore)")) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        wprintf(L"restored the original VTL1 continuation while the "
+                L"redirected breakpoint was pending\n");
+
+        CloseHandle(receiver_thread);
+        receiver_thread = NULL;
+        receiver_thread = start_message_receiver(
+            api, partition, receiver_ready, &receiver);
+        if (receiver_thread == NULL) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        if (!wait_for_resume_witness(api, partition, memory_block,
+                                     timeout_ms)) {
+            report_live_vp_diagnostics(api, partition);
+            report_vp_state(api, partition);
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        cancel_message_receiver(api, partition, &receiver,
+                                receiver_thread);
+        if (receiver.succeeded) {
+            fwprintf(stderr,
+                     L"refusing an unexpected VID message while proving "
+                     L"post-restore resume\n");
+            abandon_partition = TRUE;
+            SetLastError(ERROR_INVALID_DATA);
+            goto cleanup;
+        }
+        wprintf(L"pending VTL1 state write passed: redirected, restored, "
+                L"and resumed without instruction advance\n");
     }
-    wprintf(L"completed the owned VTL1 breakpoint intercept\n");
+    else {
+        *(volatile uint32_t *)(slot.exchange_buffer +
+                              MESSAGE_RETURN_STATUS_OFFSET) = 0;
+        slot.exchange_buffer[MESSAGE_ADVANCE_IP_OFFSET] = 1;
+        MemoryBarrier();
+        if (!report_call(api->message_slot_handle_and_get_next(
+                             partition, MESSAGE_SLOT,
+                             COMPLETE_MESSAGE_FLAGS, NULL),
+                         L"VidMessageSlotHandleAndGetNext")) {
+            abandon_partition = TRUE;
+            goto cleanup;
+        }
+        wprintf(L"completed the owned VTL1 breakpoint intercept\n");
+    }
     if (secure_kernel_path != NULL) {
         CloseHandle(receiver_thread);
+        receiver_thread = NULL;
         receiver_thread = start_message_receiver(
             api, partition, receiver_ready, &receiver);
         if (receiver_thread == NULL) {
@@ -1925,8 +2157,12 @@ static int self_test(void)
     ok &= expect(load_u64(guest, PD_GPA) == 0x83, L"2 MiB PDE");
     ok &= expect(guest[VTL1_CODE_GPA] == 0xC6 &&
                      guest[VTL1_CODE_GPA + 7] == VTL1_WITNESS_VALUE &&
-                     guest[VTL1_CODE_GPA + 8] == 0xCC,
-                 L"selected VTL1 instruction");
+                     guest[VTL1_CODE_GPA + 8] == 0xCC &&
+                     guest[VTL1_CODE_GPA + 9] == 0xC6 &&
+                     guest[VTL1_CODE_GPA + 16] ==
+                         VTL1_RESUME_WITNESS_VALUE &&
+                     guest[VTL1_REDIRECT_GPA] == 0xCC,
+                 L"selected VTL1 instructions and continuation");
     memcpy(&gate, guest + IDT_GPA + VTL_ENTRY_VECTOR * sizeof(gate),
            sizeof(gate));
     ok &= expect(gate.selector == 8 && gate.type_attributes == 0x8E &&
@@ -1940,7 +2176,7 @@ static int self_test(void)
                      vtl0.Cr3 == PML4_GPA && vtl0.Cs.Long == 1 &&
                      vtl0.Cs.Default == 0,
                  L"VTL0 initial context");
-    ok &= expect(vtl1.Rip == VTL1_CODE_GPA + 9 &&
+    ok &= expect(vtl1.Rip == VTL1_CODE_GPA + 17 &&
                      vtl1.Idtr.Base == IDT_GPA &&
                      vtl1.Cs.DescriptorPrivilegeLevel == 0 &&
                      vtl1.Cs.Long == 1 && vtl1.Cs.Default == 0 &&
@@ -2038,12 +2274,14 @@ static void usage(const wchar_t *program)
 {
     fwprintf(stderr,
              L"usage:\n"
-             L"  %ls --self-test\n"
-             L"  %ls --create-only\n"
-             L"  %ls --controlled-stop [--timeout-ms N] [--hold-ms N]\n"
-             L"  %ls --securekernel-breakpoint [--image PATH] "
-             L"[--timeout-ms N] [--hold-ms N]\n",
-             program, program, program, program);
+              L"  %ls --self-test\n"
+              L"  %ls --create-only\n"
+              L"  %ls --controlled-stop [--timeout-ms N] [--hold-ms N]\n"
+              L"  %ls --pending-vtl1-state-write [--timeout-ms N] "
+              L"[--hold-ms N]\n"
+              L"  %ls --securekernel-breakpoint [--image PATH] "
+              L"[--timeout-ms N] [--hold-ms N]\n",
+              program, program, program, program, program);
 }
 
 int wmain(int argc, wchar_t **argv)
@@ -2054,6 +2292,7 @@ int wmain(int argc, wchar_t **argv)
     DWORD hold_ms = 250;
     BOOL controlled_stop = FALSE;
     BOOL secure_kernel_breakpoint = FALSE;
+    BOOL pending_state_write = FALSE;
     wchar_t secure_kernel_default[MAX_PATH];
     const wchar_t *secure_kernel_path = NULL;
     int result;
@@ -2064,10 +2303,13 @@ int wmain(int argc, wchar_t **argv)
     }
     if (argc >= 2 &&
         (wcscmp(argv[1], L"--controlled-stop") == 0 ||
+         wcscmp(argv[1], L"--pending-vtl1-state-write") == 0 ||
          wcscmp(argv[1], L"--securekernel-breakpoint") == 0)) {
         controlled_stop = TRUE;
         secure_kernel_breakpoint =
             wcscmp(argv[1], L"--securekernel-breakpoint") == 0;
+        pending_state_write =
+            wcscmp(argv[1], L"--pending-vtl1-state-write") == 0;
         for (i = 2; i < argc; i++) {
             if (wcscmp(argv[i], L"--timeout-ms") == 0 && i + 1 < argc) {
                 /* INFINITE (0xFFFFFFFF) is a legal DWORD and the one value that defeats every wait
@@ -2131,7 +2373,8 @@ int wmain(int argc, wchar_t **argv)
     if (controlled_stop) {
         result = run_controlled_stop(
             &api, setup, timeout_ms, hold_ms,
-            secure_kernel_breakpoint ? secure_kernel_path : NULL);
+            secure_kernel_breakpoint ? secure_kernel_path : NULL,
+            pending_state_write);
     }
     else {
         result = run_create_only(&api, setup);

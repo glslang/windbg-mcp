@@ -7,10 +7,13 @@
 //! is what dbgeng.dll's one-session-per-process rule makes the natural unit, and what lets a
 //! session that cannot be unwound be killed without taking the server with it.
 //!
-//! There are also two that are not servers at all, and they are here rather than in a second
-//! binary for the same reason: each reads a format this crate defines, and a reader that could
-//! drift out of step with the writer is a reader that will. [`cast::RENDER_FLAG`] turns a recorded
-//! transcript into a terminal recording and exits, touching neither DbgEng nor MCP.
+//! There are also foreground roles that are not servers. They are here rather than in a second
+//! binary because each reads a format this crate defines, and a reader that could drift out of step
+//! with the writer is a reader that will. [`cast::RENDER_FLAG`] turns a recorded transcript into a
+//! terminal recording and exits, touching neither DbgEng nor MCP. [`livesrc::LIVE_FLAG`] drives the
+//! VTL1 decoder over an operator-supplied source, and [`skcontrol::CONTROL_PROBE_FLAG`] validates an
+//! operator-supplied live-control provider's non-mutating handshake; neither loads DbgEng or starts
+//! MCP.
 //! [`skinspect::INSPECT_FLAG`] reads a Hyper-V saved state's VTL1 and reports what is in it
 //! (`FOLLOWUPS.md` item 103); it speaks no MCP, and with `--symbols` it *does* load DbgEng — **one**
 //! target, and that target is a **file**: an image opened for its symbols, with no process behind it
@@ -43,7 +46,10 @@ mod sd;
 mod server;
 mod service;
 mod sk;
+mod skcontrol;
+mod skdispatch;
 mod skinspect;
+mod sklive;
 mod sksession;
 mod sksym;
 mod structured;
@@ -113,16 +119,25 @@ fn main() -> Result<()> {
     // engine thread must be free to block in DbgEng indefinitely.
     let args: Vec<String> = std::env::args().collect();
     let is_worker = args.iter().any(|arg| arg == worker::WORKER_FLAG);
+    let is_live_control = args.iter().any(|arg| arg == skdispatch::LIVE_CONTROL_FLAG);
     // A service has no console, so its stderr goes nowhere at all — and the failure most worth
     // seeing is a listener that refuses to start, which happens before `server_log` can be asked
     // anything. Decided here because logging is initialised before the role is acted on.
     let to_file =
         matches!(service::requested(&args), Some(service::Role::Run)).then(service::log_path);
-    init_logging(is_worker, to_file);
+    init_logging(is_worker || is_live_control, to_file);
     if is_worker {
         // The rest of the command line is the worker's half of the protocol channel — two
         // inherited pipe handles, which is why a worker started by hand cannot get anywhere.
         worker::run(&args);
+    }
+    if let Some(at) = args
+        .iter()
+        .position(|arg| arg == skdispatch::LIVE_CONTROL_FLAG)
+    {
+        // K4.2b acceptance uses the worker's engine constructor and runs synchronously on this
+        // thread. It speaks no MCP and accepts no debugger command text.
+        return worker::run_sk_live_control(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == cast::RENDER_FLAG) {
         // Before the runtime: this reads a file and writes a file, and neither wants one.
@@ -136,6 +151,14 @@ fn main() -> Result<()> {
         // one behind that opener would quietly change what a session's figures mean. What that
         // costs the session model is measured in item 103 rather than assumed here.
         return livesrc::run(&args[at + 1..]);
+    }
+    if let Some(at) = args
+        .iter()
+        .position(|arg| arg == skcontrol::CONTROL_PROBE_FLAG)
+    {
+        // Contract probe only: the operator supplies the privileged provider, and this role checks
+        // its identity/epoch/capability handshake before any MCP runtime or DbgEng session exists.
+        return skcontrol::run_probe(&args[at + 1..]);
     }
     if let Some(at) = args.iter().position(|arg| arg == skinspect::INSPECT_FLAG) {
         // The same shape and the same reason: it reads a Hyper-V capture and writes a report,
