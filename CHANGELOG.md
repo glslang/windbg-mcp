@@ -85,7 +85,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `tst code,#1` / `ccmpne code,B,#0` / `b.eq`, which admits only an odd code, no longer publishes an
   even `B` as definitive, and neither does a chain through a `ccmn`. Each direction is pinned by its
   own mutation, and all **four** sites that write either slot were then enumerated rather than
-  fixed one at a time -- the first separation had corrected only the arm the finding named, leaving a
+  fixed one at a time, and two sharper readings followed: within one chain **any** earlier link
+  matching a code excludes it (*every path* being a test for readings that arrived from other
+  paths), and the site reported for a dropped chain is the link that made it incomplete rather than
+  the comparison that was understood -- the first separation had corrected only the arm the finding named, leaving a
   forced-set link to drop an incoming loss and a readable link to erase a blind one's site, both of
   which published an invented case as definitive -- and the first draft of the one that keeps a dropped chain visible keyed on the
   terminator's *condition* alone, which a `ccmp` carries, so a block ending in one left no case
