@@ -19,6 +19,7 @@ use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 pub(crate) const CONTROL_PROBE_FLAG: &str = "--sk-control-probe";
@@ -31,8 +32,8 @@ const MAX_REGISTERS: usize = 32;
 const TEARDOWN_GRACE: Duration = Duration::from_secs(10);
 
 /// A 64-bit word encoded as a hexadecimal string, so JSON consumers never lose address bits.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub(crate) struct HexU64(pub(crate) u64);
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, JsonSchema)]
+pub(crate) struct HexU64(#[schemars(with = "String")] pub(crate) u64);
 
 impl Serialize for HexU64 {
     fn serialize<S>(&self, serializer: S) -> std::result::Result<S::Ok, S::Error>
@@ -64,7 +65,7 @@ impl<'de> Deserialize<'de> for HexU64 {
 }
 
 /// Exact guest coordinate bound to one provider process.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct TargetIdentity {
     pub(crate) vm_id: String,
@@ -99,8 +100,9 @@ impl TargetIdentity {
 }
 
 /// Opaque, bounded token which changes at every running/stopped transition.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(transparent)]
+#[schemars(transparent)]
 pub(crate) struct StopEpoch(String);
 
 impl StopEpoch {
@@ -122,7 +124,7 @@ impl fmt::Display for StopEpoch {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum RegisterName {
     Rip,
@@ -156,7 +158,7 @@ impl RegisterName {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisterValue {
     pub(crate) name: RegisterName,
@@ -165,7 +167,7 @@ pub(crate) struct RegisterValue {
     pub(crate) high: HexU64,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisterWrite {
     pub(crate) name: RegisterName,
@@ -173,7 +175,7 @@ pub(crate) struct RegisterWrite {
     pub(crate) value: HexU64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Capability {
     BeginArm,
@@ -185,7 +187,7 @@ pub(crate) enum Capability {
     Release,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct Capabilities {
     pub(crate) capabilities: Vec<Capability>,
@@ -242,14 +244,14 @@ impl Capabilities {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "reason", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum StopReason {
     HardwareBreakpoint { slot: u8 },
     SingleStep,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct HeldEvent {
     pub(crate) message_type: HexU64,

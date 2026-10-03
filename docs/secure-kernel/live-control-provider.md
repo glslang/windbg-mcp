@@ -4,11 +4,12 @@
 The operator supplies the privileged provider as a child process. The repository ships no driver,
 private VID layout, or provider DLL.
 
-This is an implementation boundary, not an MCP session yet. `--sk-control-probe` validates a
-provider's startup identity, epoch, and capabilities. `src/sklive.rs` supplies the worker-side
-state machine over that contract, and `src/skdispatch.rs` supplies the build-guarded `vmwp` adapter.
-The opt-in `--sk-live-control` role runs the complete narrow acceptance lifecycle through the same
-engine constructor and thread ownership as an engine worker. The MCP tools remain a later gate.
+`--sk-control-probe` validates a provider's startup identity, epoch, and capabilities.
+`src/sklive.rs` supplies the worker-side state machine over that contract, and `src/skdispatch.rs`
+supplies the build-guarded `vmwp` adapter. The opt-in `--sk-live-control` role runs the complete
+narrow acceptance lifecycle through the same engine constructor and thread ownership as an engine
+worker. The same state machine is also exposed as a separate MCP session kind whose worker owns
+the provider, adapter and DbgEng attachment.
 
 ## Process boundary
 
@@ -102,8 +103,8 @@ operator-supplied provider.
 ## Worker state machine
 
 `src/sklive.rs` joins one provider to one debugger-owned dispatcher. It contains no DbgEng engine
-and no private VID layout; its production owner will be the existing engine worker, on the thread
-which created that worker's engine. The dispatcher boundary must return the exact registered
+and no private VID layout; its owner is the existing engine worker, on the thread which created
+that worker's engine. The dispatcher boundary must return the exact registered
 callback context, a bounded observation of the held event, and a second read of the guarded guest
 instruction.
 
@@ -130,6 +131,46 @@ must leave the disposable target paused. Teardown does not erase the fault recor
 The offline state-machine tests cover hardware stop to step to continue, stale epochs, instruction
 guard failure, non-owned callback context, unstable held registers, completion failure, stopped
 close, restoration, and idempotent close.
+
+## MCP live-control session
+
+The `securekernel` tool group now includes the minimum one-VP live surface:
+
+1. `open_sk_live_control` binds the exact VM, partition, VP, CR3, `vmwp` PID, dispatcher pointer,
+   profile and two provider commands. It validates and starts the provider but does not pause the
+   VM or install a breakpoint.
+2. `sk_live_arm` re-reads one exact instruction, saves the complete writable baseline and installs
+   the slot-0 execution breakpoint.
+3. `sk_live_wait` pumps `vmwp` until it owns the matching vector-1 event and returns the complete
+   stop evidence with a fresh epoch.
+4. `sk_live_registers` and `sk_live_read_memory` inspect only that stopped epoch. The memory path
+   uses the bound VTL1 CR3 and refuses an unmapped range whole.
+5. `sk_live_step` consumes the stopped epoch once, clears the hardware breakpoint and arms TF.
+   The next wait must stop at the guarded instruction's exact successor.
+6. `sk_live_continue` consumes that new epoch, restores and verifies the complete baseline, clears
+   execution control and completes the owned event. The session can then be armed again.
+7. `end_session` restores any held state, removes the handler and scratch allocation, and performs
+   the handled `vmwp` detach.
+
+Ordinary debugger and capture operations are refused on this session: its DbgEng target is the
+host `vmwp`, while its answers describe the guest VTL1. Conversely, the live operations are
+refused on every other session kind. Mutating stopped operations require the exact opaque epoch,
+so a stale or replayed step/continue request is rejected before mutation.
+
+Teardown is fail closed. The supervisor does not terminate a worker when restoration, handler
+cleanup and handled detach were not confirmed; the session moves to `live_control_unresolved` and
+admits another teardown attempt only. If the supervisor disappears, the worker performs the same
+cleanup itself and remains resident if it cannot prove it. Once adapter cleanup succeeds, a later
+failure ending the worker's idle image target cannot relabel the proved VTL1 release as unresolved.
+
+The opt-in smoke test reads all machine-specific inputs from `WINDBG_MCP_SMOKE_SK_LIVE`, whose JSON
+must explicitly say `"disposable": true`. It drives the seven calls above through the built MCP
+binary. The profile, privileged provider and bench evidence remain outside version control.
+
+On 2026-10-03 that MCP test completed the full bind, arm, stop, inspect, step, second-stop,
+continue and close lifecycle against the allowlisted disposable K3 VM. An independent wrapper then
+observed the same `vmwp` PID and a healthy advancing heartbeat for 60 seconds, found no scoped crash
+record, verified the guarded Secure Kernel bytes were unchanged, and confirmed that the VM was Off.
 
 ## Build-guarded dispatcher adapter
 

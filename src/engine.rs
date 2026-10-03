@@ -376,6 +376,9 @@ pub enum SessionKind {
     /// holds no debuggee: what it holds is a file, opened through the saved-state provider, and
     /// the engine beside it has at most the *image* open for symbols.
     SecureKernel,
+    /// A one-VP live VTL1 controller. Its worker may attach DbgEng to `vmwp`, but its tools answer
+    /// about the Secure Kernel guest state held by the provider and live-memory transports.
+    SecureKernelLive,
 }
 
 impl SessionKind {
@@ -388,6 +391,7 @@ impl SessionKind {
             Self::Process => "attached process",
             Self::Launch => "launched process",
             Self::SecureKernel => "Secure Kernel capture",
+            Self::SecureKernelLive => "live Secure Kernel",
         }
     }
 
@@ -446,6 +450,9 @@ impl OpenPhase {
 pub enum SessionState {
     /// Sticky until confirmed release or an explicitly acknowledged recovery handoff.
     KernelUnresolved(String),
+    /// A live VTL1 teardown could not prove restoration and handled detach. The worker remains
+    /// alive so a later explicit teardown can retry; ordinary calls are refused.
+    LiveControlUnresolved(String),
     /// The opener is running and has not created or claimed anything yet. Opening again is the
     /// correct recovery from a failure here.
     Opening,
@@ -506,7 +513,11 @@ impl SessionState {
     /// "may this handle end its session" — and a state that ever wants one without the other
     /// should be a change here rather than a surprise there.
     fn accepts_teardown(&self) -> bool {
-        self.accepts_handle() || matches!(self, Self::Retired(_) | Self::KernelUnresolved(_))
+        self.accepts_handle()
+            || matches!(
+                self,
+                Self::Retired(_) | Self::KernelUnresolved(_) | Self::LiveControlUnresolved(_)
+            )
     }
 
     /// May this handle **collect a result this server already recorded** for it?
@@ -540,6 +551,7 @@ impl SessionState {
     pub fn name(&self) -> &'static str {
         match self {
             Self::KernelUnresolved(_) => "kernel_unresolved",
+            Self::LiveControlUnresolved(_) => "live_control_unresolved",
             Self::Opening => "opening",
             Self::Attaching => "attaching",
             Self::Open => "open",
@@ -552,7 +564,7 @@ impl SessionState {
     /// Why it is in this state, for the three that carry a reason.
     pub fn detail(&self) -> Option<&str> {
         match self {
-            Self::KernelUnresolved(why) => Some(why),
+            Self::KernelUnresolved(why) | Self::LiveControlUnresolved(why) => Some(why),
             Self::Opening | Self::Attaching | Self::Open => None,
             Self::Failed(why) | Self::Retired(why) | Self::Closed(why) => Some(why),
         }
@@ -562,7 +574,7 @@ impl SessionState {
 /// Whether this op may run against a session of this kind, and what to say when it may not.
 ///
 /// **An allow-list, in both directions, and that is the whole of the design.** A Secure Kernel
-/// session (`FOLLOWUPS.md` item 103, gate S3) holds a *file* read through the Hyper-V saved-state
+/// capture session (`FOLLOWUPS.md` item 103, gate S3) holds a *file* read through the Hyper-V saved-state
 /// provider; the DbgEng engine in its worker holds either nothing or `securekernel.exe` as an
 /// image, so `read_memory` there would read the file rather than the guest and `registers` would
 /// answer about no thread at all. Neither fails: they answer, about the wrong thing.
@@ -584,23 +596,45 @@ fn refuse_op_on_kind(kind: SessionKind, op: &EngineOp) -> Option<String> {
             | EngineOp::SkRead { .. }
             | EngineOp::SkSymbol { .. }
     );
+    let live_op = matches!(
+        op,
+        EngineOp::OpenSecureKernelLive(_)
+            | EngineOp::SkLiveArm { .. }
+            | EngineOp::SkLiveWait
+            | EngineOp::SkLiveRegisters
+            | EngineOp::SkLiveRead { .. }
+            | EngineOp::SkLiveStep { .. }
+            | EngineOp::SkLiveContinue { .. }
+    );
     let always = matches!(
         op,
         EngineOp::EndSession | EngineOp::Interrupt { .. } | EngineOp::PreserveKernel
     );
-    match (kind, capture_op, always) {
-        (_, _, true) => None,
-        (SessionKind::SecureKernel, true, _) => None,
-        (SessionKind::SecureKernel, false, _) => Some(
+    match (kind, capture_op, live_op, always) {
+        (_, _, _, true) => None,
+        (SessionKind::SecureKernel, true, _, _) => None,
+        (SessionKind::SecureKernel, false, _, _) => Some(
             "The debugger tools answer about the engine's target, which in this session is \
              the Secure Kernel image on disk — not the guest's VTL1 — so they would answer about \
              the wrong thing rather than fail. Use this session's own capture tools, or end it \
              and open the target you meant."
                 .to_string(),
         ),
-        (_, true, _) => Some(
+        (SessionKind::SecureKernelLive, _, true, _) => None,
+        (SessionKind::SecureKernelLive, _, false, _) => Some(
+            "This live Secure Kernel session exposes only its epoch-bound VTL1 operations. The \
+             debugger target behind the adapter is `vmwp`, so an ordinary debugger tool would \
+             answer about the host process rather than the guest."
+                .to_string(),
+        ),
+        (_, true, _, _) => Some(
             "The Secure Kernel capture tools read a Hyper-V saved state, and this session \
              holds a debugger target instead. Open a capture in a session of its own."
+                .to_string(),
+        ),
+        (_, _, true, _) => Some(
+            "The live Secure Kernel tools require a live-control session of their own; this \
+             session holds a different target."
                 .to_string(),
         ),
         _ => None,
@@ -943,6 +977,10 @@ impl Session {
         matches!(self.state(), SessionState::KernelUnresolved(_))
     }
 
+    fn live_control_unresolved(&self) -> bool {
+        matches!(self.state(), SessionState::LiveControlUnresolved(_))
+    }
+
     fn preserve_kernel(&self, why: &str) -> String {
         let message = format!(
             "Remote kernel session `{}` is unresolved: {why}. Controller reservation for worker PID {} is retained; \
@@ -964,6 +1002,23 @@ impl Session {
             startup_symbol_path: None,
             submitted: Instant::now(),
             gate: Call::supervisor(EngineOp::PreserveKernel).gate,
+        });
+        message
+    }
+
+    fn preserve_live_control(&self, why: &str) -> String {
+        let message = format!(
+            "Live Secure Kernel session `{}` requires recovery: {why}. Worker PID {} will not be \
+             terminated automatically because that could discard a fail-closed `vmwp` attachment \
+             beside a paused disposable VM. Do not attach another controller. Inspect the VM and \
+             worker out of band, or retry `end_session` with this session_id if the worker remains \
+             alive.",
+            self.id, self.pid
+        );
+        self.update_state(|state| {
+            (!self.released.load(Ordering::SeqCst)
+                && !matches!(state, SessionState::LiveControlUnresolved(_)))
+            .then(|| SessionState::LiveControlUnresolved(message.clone()))
         });
         message
     }
@@ -998,9 +1053,14 @@ impl Session {
     /// cannot undo or relabel the teardown.
     fn set_state(&self, next: SessionState) {
         self.update_state(|state| {
-            if matches!(state, SessionState::KernelUnresolved(_))
-                && !self.released.load(Ordering::SeqCst)
-                && !matches!(next, SessionState::KernelUnresolved(_))
+            if matches!(
+                state,
+                SessionState::KernelUnresolved(_) | SessionState::LiveControlUnresolved(_)
+            ) && !self.released.load(Ordering::SeqCst)
+                && !matches!(
+                    next,
+                    SessionState::KernelUnresolved(_) | SessionState::LiveControlUnresolved(_)
+                )
             {
                 return None;
             }
@@ -1022,8 +1082,9 @@ impl Session {
 
     /// Recomputes the state *from itself*, under a single lock acquisition, and reports where it
     /// ended up. `next` returns `None` to leave it alone. Settled states cannot move, with one
-    /// narrow exception: a `Closed` state may be refined to another `Closed` state so an
-    /// `end_session` marked closed at dispatch can later record how its teardown finished.
+    /// narrow exceptions: a `Closed` state may be refined to another `Closed` state so an
+    /// `end_session` marked closed at dispatch can later record how its teardown finished, and a
+    /// guarded controller whose release was not proved may enter its sticky unresolved state.
     ///
     /// The atomicity is the whole point, and check-then-set through two acquisitions is not good
     /// enough: `pump` retires a session from another task the instant it forwards a
@@ -1048,6 +1109,9 @@ impl Session {
                 || (self.kind == SessionKind::Kernel
                     && !self.released.load(Ordering::SeqCst)
                     && matches!(proposed, Some(SessionState::KernelUnresolved(_))))
+                || (self.kind == SessionKind::SecureKernelLive
+                    && !self.released.load(Ordering::SeqCst)
+                    && matches!(proposed, Some(SessionState::LiveControlUnresolved(_))))
                 || matches!(
                     (&slot.0, &proposed),
                     (SessionState::Closed(_), Some(SessionState::Closed(_)))
@@ -1832,9 +1896,12 @@ impl Sessions {
                 crate::record::routed_to(&session.id);
                 Ok(session)
             }
-            Some(session) if session.kernel_unresolved() => Err(EngineError::RecoveryRequired(
-                stale_handle(want, &session.state()),
-            )),
+            Some(session) if session.kernel_unresolved() || session.live_control_unresolved() => {
+                Err(EngineError::RecoveryRequired(stale_handle(
+                    want,
+                    &session.state(),
+                )))
+            }
             Some(session) => Err(EngineError::Stale(stale_handle(want, &session.state()))),
             None => Err(EngineError::Stale(unknown_handle(want))),
         }
@@ -2911,15 +2978,26 @@ impl Sessions {
                 "the worker did not confirm release; automatic termination was refused",
             ));
         }
+        if session.kind == SessionKind::SecureKernelLive
+            && out.is_err()
+            && !session.released.load(Ordering::SeqCst)
+        {
+            return Release::Preserved(session.preserve_live_control(
+                "the worker did not confirm register restoration, handler cleanup and handled detach",
+            ));
+        }
         // Recorded **before** `fail_outstanding`, and the order is the whole point: that call is
         // what turns another teardown's wait on this same session into `Lost`, so the flag has to
         // be visible by the time anyone is failed out of it. Reordering these two lines silently
         // restores a warning that says a target may be halted when it was just released.
         if out.is_ok() {
             session.released.store(true, Ordering::SeqCst);
-            if session.kind == SessionKind::Kernel {
+            if matches!(
+                session.kind,
+                SessionKind::Kernel | SessionKind::SecureKernelLive
+            ) {
                 session.set_state(SessionState::Closed(
-                    "worker confirmed kernel release".into(),
+                    "worker confirmed target release".into(),
                 ));
             }
         }
@@ -2960,8 +3038,8 @@ impl Sessions {
         outcome
     }
 
-    /// Attempts release for every session. Unresolved remote kernel workers survive disconnect;
-    /// non-kernel workers that do not let go are terminated after the grace.
+    /// Attempts release for every session. Unresolved remote kernel and live-control workers
+    /// survive disconnect; ordinary workers that do not let go are terminated after the grace.
     ///
     /// A disconnect is treated as `end_session` on everything, which is both the simplest rule to
     /// explain and the only safe one: see [`SHUTDOWN_RELEASE_TIMEOUT`] for what killing a live
@@ -3439,6 +3517,7 @@ impl Sessions {
 fn stale_handle(want: &str, state: &SessionState) -> String {
     match state {
         SessionState::KernelUnresolved(why) => why.clone(),
+        SessionState::LiveControlUnresolved(why) => why.clone(),
         SessionState::Failed(why) => format!(
             "session `{want}` never opened:\n  {why}\n\nOpening again is how you get a target — \
              but read the reason first, since some failures leave one behind."
@@ -3522,7 +3601,9 @@ fn unknown_handle(want: &str) -> String {
 fn settle_uncommitted(session: &Session, why: &str) -> bool {
     if matches!(
         session.state(),
-        SessionState::Retired(_) | SessionState::KernelUnresolved(_)
+        SessionState::Retired(_)
+            | SessionState::KernelUnresolved(_)
+            | SessionState::LiveControlUnresolved(_)
     ) {
         return true;
     }
@@ -3537,7 +3618,7 @@ fn settle_uncommitted(session: &Session, why: &str) -> bool {
 /// Returns whether the session was left **live**: its worker still holds a target, so it still
 /// owes its slot and capacity has to be reconciled against it.
 fn settle_open(session: &Session, result: &Result<Output, EngineError>) -> bool {
-    if session.kernel_unresolved() {
+    if session.kernel_unresolved() || session.live_control_unresolved() {
         return true;
     }
     if session.kind == SessionKind::Kernel
@@ -4415,7 +4496,9 @@ fn pump(
 
         // The gate, at the front of the queue. See `Gate`.
         let state = session.state();
-        if session.kernel_unresolved() && !matches!(job.op, EngineOp::PreserveKernel) {
+        if (session.kernel_unresolved() && !matches!(job.op, EngineOp::PreserveKernel))
+            || (session.live_control_unresolved() && !matches!(job.op, EngineOp::EndSession))
+        {
             answer(Err(EngineError::RecoveryRequired(stale_handle(
                 &session.id,
                 &state,
@@ -4430,12 +4513,16 @@ fn pump(
             session.set_state(SessionState::Retired(why.clone()));
         }
         if let Some(why) = &job.gate.closes {
-            session.set_state(if session.kind == SessionKind::Kernel {
-                SessionState::KernelUnresolved(
+            session.set_state(match session.kind {
+                SessionKind::Kernel => SessionState::KernelUnresolved(
                     "kernel release is in progress; completion is unconfirmed".into(),
-                )
-            } else {
-                SessionState::Closed(why.clone())
+                ),
+                SessionKind::SecureKernelLive => SessionState::LiveControlUnresolved(
+                    "live Secure Kernel release is in progress; register restoration, handler \
+                     cleanup and handled detach are unconfirmed"
+                        .into(),
+                ),
+                _ => SessionState::Closed(why.clone()),
             });
         }
 
@@ -4679,14 +4766,18 @@ async fn reader(
                 else {
                     continue;
                 };
-                let confirmed_kernel_release =
-                    ending && session.kind == SessionKind::Kernel && result.is_ok();
-                if confirmed_kernel_release {
+                let confirmed_guarded_release = ending
+                    && matches!(
+                        session.kind,
+                        SessionKind::Kernel | SessionKind::SecureKernelLive
+                    )
+                    && result.is_ok();
+                if confirmed_guarded_release {
                     // Publish before waking the caller or any racing timeout/preservation.
                     session.released.store(true, Ordering::SeqCst);
                     session.update_state(|_| {
                         Some(SessionState::Closed(
-                            "worker confirmed kernel release".into(),
+                            "worker confirmed target release".into(),
                         ))
                     });
                 }
@@ -4706,7 +4797,7 @@ async fn reader(
                     // `open` runs, which nobody is left here to run for it.
                     sessions.reconcile_capacity(&session);
                 }
-                if confirmed_kernel_release {
+                if confirmed_guarded_release {
                     session.fail_outstanding(&format!("session `{}` was ended", session.id));
                     session.kill();
                 }
@@ -4735,6 +4826,18 @@ async fn reader(
             session.preserve_kernel(
                 "the worker exited without confirming release; endpoint reservation retained",
             );
+        } else if session.kind == SessionKind::SecureKernelLive
+            && !session.released.load(Ordering::SeqCst)
+        {
+            session.update_state(|_| {
+                Some(SessionState::LiveControlUnresolved(format!(
+                    "Live Secure Kernel session `{}` lost worker PID {} without confirmation of \
+                     VTL1 restoration and handled detach. The disposable VM may remain paused; \
+                     inspect it out of band and do not attach another controller until ownership \
+                     is resolved.",
+                    session.id, session.pid
+                )))
+            });
         } else {
             session.set_state(SessionState::Closed(
                 "the engine worker process exited".to_string(),
@@ -4832,6 +4935,50 @@ mod tests {
                     "{op:?} must reach every kind of session"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn a_live_secure_kernel_session_accepts_only_epoch_bound_live_ops() {
+        let epoch = crate::skcontrol::StopEpoch::new("0123456789abcdef")
+            .expect("the fixture epoch is valid");
+        let live_ops = [
+            EngineOp::SkLiveWait,
+            EngineOp::SkLiveRegisters,
+            EngineOp::SkLiveRead {
+                address: 0xfffff80000000000,
+                size: 16,
+            },
+            EngineOp::SkLiveStep {
+                epoch: epoch.clone(),
+            },
+            EngineOp::SkLiveContinue { epoch },
+        ];
+        for op in &live_ops {
+            assert!(
+                refuse_op_on_kind(SessionKind::SecureKernelLive, op).is_none(),
+                "a live Secure Kernel session refused one of its own ops: {op:?}"
+            );
+            let refused = refuse_op_on_kind(SessionKind::Dump, op)
+                .unwrap_or_else(|| panic!("a dump session accepted a live-control op: {op:?}"));
+            assert!(refused.contains("live-control session"), "{refused}");
+        }
+
+        for op in [EngineOp::CurrentLocation, EngineOp::Breakpoints] {
+            let refused = refuse_op_on_kind(SessionKind::SecureKernelLive, &op)
+                .unwrap_or_else(|| panic!("a live-control session accepted {op:?}"));
+            assert!(refused.contains("`vmwp`"), "{refused}");
+        }
+
+        for op in [
+            EngineOp::EndSession,
+            EngineOp::Interrupt { job: None },
+            EngineOp::PreserveKernel,
+        ] {
+            assert!(
+                refuse_op_on_kind(SessionKind::SecureKernelLive, &op).is_none(),
+                "{op:?} must reach a live-control session"
+            );
         }
     }
 
@@ -5603,11 +5750,15 @@ mod tests {
     /// out a result — or route work — for a target whose ownership is still unresolved.
     #[test]
     fn the_widened_predicates_are_not_one_predicate() {
-        let unresolved = SessionState::KernelUnresolved("attach unconfirmed".to_string());
-        assert!(unresolved.accepts_teardown());
-        assert!(!unresolved.accepts_execution_read());
-        assert!(!unresolved.accepts_default());
-        assert!(!unresolved.accepts_handle());
+        for unresolved in [
+            SessionState::KernelUnresolved("attach unconfirmed".to_string()),
+            SessionState::LiveControlUnresolved("restore unconfirmed".to_string()),
+        ] {
+            assert!(unresolved.accepts_teardown());
+            assert!(!unresolved.accepts_execution_read());
+            assert!(!unresolved.accepts_default());
+            assert!(!unresolved.accepts_handle());
+        }
 
         // A session that has finished is past all four, whichever way it finished.
         for over in [
@@ -5667,6 +5818,8 @@ mod tests {
             SessionState::Attaching,
             SessionState::Open,
             SessionState::Retired("`.opendump`".to_string()),
+            SessionState::KernelUnresolved("attach unconfirmed".to_string()),
+            SessionState::LiveControlUnresolved("restore unconfirmed".to_string()),
             SessionState::Failed("boom".to_string()),
             SessionState::Closed("ended".to_string()),
         ] {

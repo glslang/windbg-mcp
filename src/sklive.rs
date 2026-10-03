@@ -16,6 +16,7 @@
 )]
 
 use anyhow::{Context, Result, anyhow, bail};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::skcontrol::{
@@ -392,7 +393,7 @@ impl DispatcherProfile {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum LivePhase {
     Running,
@@ -404,7 +405,7 @@ pub(crate) enum LivePhase {
 }
 
 /// Exact bytes for the one instruction this first revision may stop before and step over.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct InstructionGuard {
     pub(crate) address: HexU64,
@@ -412,7 +413,7 @@ pub(crate) struct InstructionGuard {
 }
 
 impl InstructionGuard {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         if self.address.0 == 0 {
             bail!("the breakpoint address must be nonzero");
         }
@@ -433,7 +434,7 @@ impl InstructionGuard {
 
 /// Complete register evidence retained for one stop. Status and high halves remain visible instead
 /// of being discarded after validation.
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct RegisterSnapshot {
     pub(crate) values: Vec<RegisterValue>,
@@ -482,7 +483,7 @@ impl RegisterSnapshot {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct StopRecord {
     pub(crate) epoch: StopEpoch,
@@ -492,12 +493,22 @@ pub(crate) struct StopRecord {
     pub(crate) instruction: InstructionGuard,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FaultRecord {
     pub(crate) cause: String,
     pub(crate) recovery_errors: Vec<String>,
     pub(crate) target_left_paused: bool,
+}
+
+/// The running-side result of arming, stepping or continuing. `epoch` names this exact transition;
+/// the next stop returns a different epoch which is the only one a mutating stopped operation
+/// accepts.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct LiveTransition {
+    pub(crate) phase: LivePhase,
+    pub(crate) epoch: StopEpoch,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
